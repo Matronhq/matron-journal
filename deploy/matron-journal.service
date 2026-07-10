@@ -1,0 +1,17 @@
+[Unit]
+Description=Matron journal server
+After=network.target
+
+[Service]
+Type=simple
+User=danbarker
+WorkingDirectory=/home/danbarker/matron-journal
+Environment=MATRON_DB=/home/danbarker/matron-journal/data/matron.db
+Environment=MATRON_PORT=9810
+Environment=MATRON_BIND=127.0.0.1
+ExecStart=/usr/bin/node src/server.js
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
