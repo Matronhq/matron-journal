@@ -23,6 +23,9 @@ test('login → snapshot → pagination over HTTP', async (t) => {
 
   const page = await s.http('/convo/c1/messages?limit=10', { token: ok.json.token })
   assert.equal(page.json.events[0].payload.body, 'hi')
+  // pagination shape must match the WS journal frame shape (minus `kind`) and must not
+  // leak internal columns like user_id, idem_key, blob_ref
+  assert.deepEqual(Object.keys(page.json.events[0]).sort(), ['convo_id', 'payload', 'sender', 'seq', 'ts', 'type'])
 
   await createUser(s.db, 'pat', 'pw')
   const pat = await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'x' } })
@@ -38,6 +41,29 @@ test('login rate limit returns 429', async (t) => {
   }
   const r = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'x' } })
   assert.equal(r.status, 429)
+})
+
+test('login rate limit keys on cf-connecting-ip, not the tunnel-shared socket address', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'pw')
+
+  const loginAs = (cfIp, password) => fetch(s.base + '/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'cf-connecting-ip': cfIp },
+    body: JSON.stringify({ username: 'dan', password, device_name: 'x' }),
+  })
+
+  // Behind the tunnel every request arrives from the same socket (127.0.0.1), so
+  // without per-header keying this would lock out every client after 5 bad logins
+  // from any one of them. Exhaust the limit for client A...
+  for (let i = 0; i < 5; i++) await loginAs('1.1.1.1', 'wrong')
+  const blockedA = await loginAs('1.1.1.1', 'wrong')
+  assert.equal(blockedA.status, 429)
+
+  // ...client B, a different cf-connecting-ip, must still be able to log in.
+  const okB = await loginAs('2.2.2.2', 'pw')
+  assert.equal(okB.status, 200)
 })
 
 test('oversized login body gets 413 and server stays responsive', async (t) => {

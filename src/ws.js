@@ -1,11 +1,8 @@
 import { WebSocketServer } from 'ws'
 import { authToken } from './auth.js'
-import { eventsAfter, append, markRead, upsertConversation } from './journal.js'
+import { eventsAfter, append, markRead, upsertConversation, toEventShape } from './journal.js'
 
-const journalFrame = (e) => ({
-  kind: 'journal', seq: e.seq, convo_id: e.convo_id, ts: e.ts,
-  sender: e.sender, type: e.type, payload: e.payload,
-})
+const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
 const CLIENT_SEND_TYPES = new Set(['text'])
 
@@ -143,7 +140,7 @@ export function handleOp({ db, hub, conn, msg }) {
         const r = markRead(db, conn.userId, msg.convo_id, msg.up_to_seq)
         hub.broadcastJournal(conn.userId, journalFrame({
           seq: r.seq, convo_id: msg.convo_id, ts: r.ts,
-          sender: `user:${conn.userId}`, type: 'read_marker',
+          sender: `user:${conn.username}`, type: 'read_marker',
           payload: { convo_id: msg.convo_id, up_to_seq: msg.up_to_seq },
         }))
         break

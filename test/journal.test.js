@@ -83,6 +83,8 @@ test('snapshot, replay, pagination, read markers', async () => {
   const rm = markRead(db, dan.id, 'c1', 4)
   assert.equal(rm.seq, 6) // read_marker is itself a journal event
   assert.equal(db.prepare("SELECT unread_count FROM conversations WHERE id='c1'").get().unread_count, 1)
+  // sender must match the username format used by send/prompt_reply, not the numeric id
+  assert.equal(db.prepare('SELECT sender FROM events WHERE seq=?').get(rm.seq).sender, 'user:dan')
 })
 
 test('messagesBefore rejects foreign convo', async () => {
