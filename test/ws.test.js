@@ -80,3 +80,33 @@ test('replay of a multi-batch backlog arrives complete and in order', async (t) 
   seqs.forEach((v, i) => assert.equal(v, i + 1))
   c.close()
 })
+
+test('send, prompt_reply, read_marker round-trip to a second device', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id })
+  const l1 = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const l2 = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'phone' } })
+  const mac = await makeWsClient(s.base, { token: l1.json.token, cursor: 0 })
+  const phone = await makeWsClient(s.base, { token: l2.json.token, cursor: 0 })
+
+  mac.send({ op: 'send', convo_id: 'c1', payload: { body: 'do it' }, local_id: 'x1' })
+  const f = await phone.waitFor((x) => x.kind === 'journal' && x.type === 'text')
+  assert.equal(f.payload.body, 'do it')
+  assert.equal(f.sender, 'user:dan')
+
+  mac.send({ op: 'read_marker', convo_id: 'c1', up_to_seq: f.seq })
+  await phone.waitFor((x) => x.kind === 'journal' && x.type === 'read_marker')
+
+  mac.send({ op: 'ack', cursor: f.seq })
+  await new Promise((r) => setTimeout(r, 50))
+  assert.equal(s.db.prepare('SELECT cursor FROM devices WHERE id=?').get(l1.json.device_id).cursor, f.seq)
+
+  // foreign convo rejected
+  const pat = await createUser(s.db, 'pat', 'pw')
+  upsertConversation(s.db, { id: 'cp', ownerUserId: pat.id })
+  mac.send({ op: 'send', convo_id: 'cp', payload: { body: 'nope' } })
+  await mac.waitFor((x) => x.kind === 'control' && x.op === 'error' && x.code === 'forbidden')
+  mac.close(); phone.close()
+})

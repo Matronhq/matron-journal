@@ -1,6 +1,6 @@
 import { WebSocketServer } from 'ws'
 import { authToken } from './auth.js'
-import { eventsAfter } from './journal.js'
+import { eventsAfter, append, markRead } from './journal.js'
 
 const journalFrame = (e) => ({
   kind: 'journal', seq: e.seq, convo_id: e.convo_id, ts: e.ts,
@@ -49,6 +49,7 @@ export function attachWs({ server, db, hub, pingMs = 20000 }) {
           // than the in-flight cursor, so it's picked up by a later replay batch rather
           // than lost. Revisit this assumption if a future op has other side effects.
           conn = { ws, ...who, viewingConvoId: null }
+          conn.username = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId).name
           const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(who.userId)
           ws.send(JSON.stringify({ kind: 'control', op: 'hello_ok', seq: head ? head.seq : 0 }))
           if (msg.cursor != null) {
@@ -93,8 +94,61 @@ export function attachWs({ server, db, hub, pingMs = 20000 }) {
 
 // Extended by Tasks 7-8 with client and agent operations.
 export function handleOp({ db, hub, conn, msg }) {
-  if (msg.op === 'viewing') {
-    conn.viewingConvoId = msg.convo_id ?? null
+  const fail = (code) =>
+    conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code, ref: msg.op }))
+  const appendAndFan = (args) => {
+    const r = append(db, args)
+    if (!r.duplicate) {
+      hub.broadcastJournal(conn.userId, journalFrame({
+        seq: r.seq, convo_id: args.convoId, ts: r.ts,
+        sender: args.sender, type: args.type, payload: args.payload,
+      }))
+    }
+    return r
+  }
+  try {
+    switch (msg.op) {
+      case 'viewing':
+        conn.viewingConvoId = msg.convo_id ?? null
+        break
+      case 'ack':
+        db.prepare('UPDATE devices SET cursor=? WHERE id=?').run(msg.cursor, conn.deviceId)
+        break
+      case 'send': {
+        if (conn.kind !== 'client') return fail('forbidden')
+        appendAndFan({
+          userId: conn.userId, convoId: msg.convo_id,
+          sender: `user:${conn.username}`, type: msg.type || 'text',
+          payload: msg.payload,
+          idemKey: msg.local_id ? `client:${conn.deviceId}:${msg.local_id}` : null,
+        })
+        break
+      }
+      case 'prompt_reply': {
+        if (conn.kind !== 'client') return fail('forbidden')
+        appendAndFan({
+          userId: conn.userId, convoId: msg.convo_id,
+          sender: `user:${conn.username}`, type: 'prompt_reply',
+          payload: { target_seq: msg.target_seq, choice: msg.choice ?? null, text: msg.text ?? null },
+        })
+        break
+      }
+      case 'read_marker': {
+        if (conn.kind !== 'client') return fail('forbidden')
+        const r = markRead(db, conn.userId, msg.convo_id, msg.up_to_seq)
+        hub.broadcastJournal(conn.userId, journalFrame({
+          seq: r.seq, convo_id: msg.convo_id, ts: r.ts,
+          sender: `user:${conn.userId}`, type: 'read_marker',
+          payload: { convo_id: msg.convo_id, up_to_seq: msg.up_to_seq },
+        }))
+        break
+      }
+      default:
+        break
+    }
+  } catch (e) {
+    if (/not authorized/.test(e.message)) return fail('forbidden')
+    throw e
   }
 }
 
