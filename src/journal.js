@@ -60,6 +60,11 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
 
 const parseRow = (r) => ({ ...r, payload: JSON.parse(r.payload) })
 
+// Single source of truth for the public event shape shared by WS journal frames
+// and HTTP pagination — strips internal columns (user_id, idem_key, blob_ref).
+export const toEventShape = ({ seq, convo_id, ts, sender, type, payload }) =>
+  ({ seq, convo_id, ts, sender, type, payload })
+
 export function snapshot(db, userId) {
   const conversations = db.prepare(
     `SELECT id, title, session_state, last_seq, unread_count, snippet, created_at
@@ -85,8 +90,9 @@ export function messagesBefore(db, userId, convoId, { beforeSeq = null, limit = 
 
 export function markRead(db, userId, convoId, upToSeq) {
   return db.transaction(() => {
+    const uname = db.prepare('SELECT name FROM users WHERE id=?').get(userId).name
     const r = append(db, {
-      userId, convoId, sender: `user:${userId}`, type: 'read_marker',
+      userId, convoId, sender: `user:${uname}`, type: 'read_marker',
       payload: { convo_id: convoId, up_to_seq: upToSeq },
     })
     const placeholders = MESSAGE_TYPES.map(() => '?').join(',')

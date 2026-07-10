@@ -1,5 +1,5 @@
 import { login, authToken } from './auth.js'
-import { snapshot, messagesBefore } from './journal.js'
+import { snapshot, messagesBefore, toEventShape } from './journal.js'
 
 const json = (res, status, obj) => {
   if (res.writableEnded || res.destroyed) return
@@ -36,7 +36,10 @@ export function makeHttpHandler({ db, rateLimiter }) {
     try {
       const url = new URL(req.url, 'http://x')
       if (req.method === 'POST' && url.pathname === '/login') {
-        const ip = req.socket.remoteAddress || 'unknown'
+        // Behind the cloudflared tunnel, req.socket.remoteAddress is always 127.0.0.1
+        // (the tunnel is the only route in, so this header is trustworthy here).
+        // Fall back to remoteAddress for direct/local connections (e.g. tests).
+        const ip = req.headers['cf-connecting-ip'] || req.socket.remoteAddress || 'unknown'
         if (!rateLimiter.allow(ip)) return json(res, 429, { error: 'rate_limited' })
         const { username, password, device_name } = await readBody(req)
         const s = await login(db, { username, password, deviceName: device_name })
@@ -53,7 +56,8 @@ export function makeHttpHandler({ db, rateLimiter }) {
         const beforeSeq = url.searchParams.has('before_seq') ? Number(url.searchParams.get('before_seq')) : null
         const limit = Math.min(Number(url.searchParams.get('limit') || 50), 200)
         try {
-          return json(res, 200, { events: messagesBefore(db, who.userId, decodeURIComponent(m[1]), { beforeSeq, limit }) })
+          const events = messagesBefore(db, who.userId, decodeURIComponent(m[1]), { beforeSeq, limit }).map(toEventShape)
+          return json(res, 200, { events })
         } catch (e) {
           if (/not authorized/.test(e.message)) return json(res, 403, { error: 'forbidden' })
           throw e

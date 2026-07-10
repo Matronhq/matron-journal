@@ -97,7 +97,10 @@ test('send, prompt_reply, read_marker round-trip to a second device', async (t) 
   assert.equal(f.sender, 'user:dan')
 
   mac.send({ op: 'read_marker', convo_id: 'c1', up_to_seq: f.seq })
-  await phone.waitFor((x) => x.kind === 'journal' && x.type === 'read_marker')
+  const rm = await phone.waitFor((x) => x.kind === 'journal' && x.type === 'read_marker')
+  // broadcast frame must be byte-identical to the persisted row: username, not user id
+  assert.equal(rm.sender, 'user:dan')
+  assert.equal(s.db.prepare('SELECT sender FROM events WHERE seq=?').get(rm.seq).sender, rm.sender)
 
   mac.send({ op: 'ack', cursor: f.seq })
   await new Promise((r) => setTimeout(r, 50))

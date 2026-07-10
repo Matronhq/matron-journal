@@ -62,6 +62,14 @@ export function makeRateLimiter({ max = 5, windowMs = 60000 } = {}) {
   return {
     allow(key) {
       const now = Date.now()
+      // Unbounded key growth guard (e.g. many distinct IPs hitting /login once each):
+      // once the map gets large, sweep out keys whose most recent hit has already
+      // aged out of the window. Simple full-scan sweep is fine at this scale.
+      if (hits.size > 10000) {
+        for (const [k, list] of hits) {
+          if (list.length === 0 || now - list[list.length - 1] >= windowMs) hits.delete(k)
+        }
+      }
       const list = (hits.get(key) || []).filter((t) => now - t < windowMs)
       if (list.length >= max) { hits.set(key, list); return false }
       list.push(now)
