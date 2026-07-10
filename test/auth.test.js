@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { openDb } from '../src/db.js'
 import {
   createUser, login, createAgent, authToken, revokeDevice,
-  authorize, makeRateLimiter,
+  authorize, makeRateLimiter, setPassword,
 } from '../src/auth.js'
 
 test('login issues a device token; authToken resolves it', async () => {
@@ -35,4 +35,28 @@ test('rate limiter blocks 6th attempt in window', () => {
   for (let i = 0; i < 5; i++) assert.equal(rl.allow('1.2.3.4'), true)
   assert.equal(rl.allow('1.2.3.4'), false)
   assert.equal(rl.allow('5.6.7.8'), true)
+})
+
+test('createUser throws on duplicate name', async () => {
+  const db = openDb(':memory:')
+  await createUser(db, 'dan', 'pw')
+  await assert.rejects(() => createUser(db, 'dan', 'pw2'), /UNIQUE/)
+})
+
+test('setPassword rotates the password and rejects unknown users', async () => {
+  const db = openDb(':memory:')
+  await createUser(db, 'dan', 'oldpw')
+  await setPassword(db, 'dan', 'newpw')
+  assert.equal(await login(db, { username: 'dan', password: 'oldpw', deviceName: 'x' }), null)
+  assert.notEqual(await login(db, { username: 'dan', password: 'newpw', deviceName: 'x' }), null)
+  await assert.rejects(() => setPassword(db, 'nobody', 'pw'), /no such user/)
+})
+
+test('rate limiter window actually expires', async () => {
+  const rl = makeRateLimiter({ max: 2, windowMs: 50 })
+  assert.equal(rl.allow('k'), true)
+  assert.equal(rl.allow('k'), true)
+  assert.equal(rl.allow('k'), false)
+  await new Promise((r) => setTimeout(r, 60))
+  assert.equal(rl.allow('k'), true)
 })
