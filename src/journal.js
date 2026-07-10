@@ -1,3 +1,5 @@
+import { authorize } from './auth.js'
+
 export const MESSAGE_TYPES = [
   'text', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image',
 ]
@@ -53,5 +55,46 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
       db.prepare('UPDATE conversations SET last_seq=? WHERE id=?').run(seq, convoId)
     }
     return { seq, ts, duplicate: false }
+  })()
+}
+
+const parseRow = (r) => ({ ...r, payload: JSON.parse(r.payload) })
+
+export function snapshot(db, userId) {
+  const conversations = db.prepare(
+    `SELECT id, title, session_state, last_seq, unread_count, snippet, created_at
+     FROM conversations WHERE owner_user_id=? ORDER BY last_seq DESC`
+  ).all(userId)
+  const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)
+  return { conversations, seq: head ? head.seq : 0 }
+}
+
+export function eventsAfter(db, userId, cursor, limit = 500) {
+  return db.prepare(
+    'SELECT * FROM events WHERE user_id=? AND seq>? ORDER BY seq LIMIT ?'
+  ).all(userId, cursor, limit).map(parseRow)
+}
+
+export function messagesBefore(db, userId, convoId, { beforeSeq = null, limit = 50 } = {}) {
+  if (!authorize(db, userId, convoId)) throw new Error('not authorized')
+  const rows = beforeSeq == null
+    ? db.prepare('SELECT * FROM events WHERE convo_id=? ORDER BY seq DESC LIMIT ?').all(convoId, limit)
+    : db.prepare('SELECT * FROM events WHERE convo_id=? AND seq<? ORDER BY seq DESC LIMIT ?').all(convoId, beforeSeq, limit)
+  return rows.reverse().map(parseRow)
+}
+
+export function markRead(db, userId, convoId, upToSeq) {
+  return db.transaction(() => {
+    const r = append(db, {
+      userId, convoId, sender: `user:${userId}`, type: 'read_marker',
+      payload: { convo_id: convoId, up_to_seq: upToSeq },
+    })
+    const placeholders = MESSAGE_TYPES.map(() => '?').join(',')
+    db.prepare(
+      `UPDATE conversations SET unread_count=(
+         SELECT COUNT(*) FROM events e WHERE e.convo_id=? AND e.seq>? AND e.type IN (${placeholders})
+       ) WHERE id=?`
+    ).run(convoId, upToSeq, ...MESSAGE_TYPES, convoId)
+    return r
   })()
 }
