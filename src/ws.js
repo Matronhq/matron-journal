@@ -1,6 +1,6 @@
 import { WebSocketServer } from 'ws'
 import { authToken } from './auth.js'
-import { eventsAfter, append, markRead } from './journal.js'
+import { eventsAfter, append, markRead, upsertConversation } from './journal.js'
 
 const journalFrame = (e) => ({
   kind: 'journal', seq: e.seq, convo_id: e.convo_id, ts: e.ts,
@@ -146,6 +146,48 @@ export function handleOp({ db, hub, conn, msg }) {
           sender: `user:${conn.userId}`, type: 'read_marker',
           payload: { convo_id: msg.convo_id, up_to_seq: msg.up_to_seq },
         }))
+        break
+      }
+      case 'convo_upsert': {
+        if (conn.kind !== 'agent') return fail('forbidden')
+        upsertConversation(db, {
+          id: msg.convo_id, ownerUserId: conn.userId,
+          title: msg.title, sessionState: msg.session_state,
+        })
+        if (msg.session_state) {
+          appendAndFan({
+            userId: conn.userId, convoId: msg.convo_id,
+            sender: `agent:${conn.name}`, type: 'session_status',
+            payload: { state: msg.session_state },
+          })
+        }
+        break
+      }
+      case 'publish': {
+        if (conn.kind !== 'agent') return fail('forbidden')
+        appendAndFan({
+          userId: conn.userId, convoId: msg.convo_id,
+          sender: `agent:${conn.name}`, type: msg.type, payload: msg.payload,
+          blobRef: msg.blob_ref ?? null,
+          idemKey: msg.idem_key ? `agent:${conn.deviceId}:${msg.idem_key}` : null,
+        })
+        break
+      }
+      case 'stream': {
+        if (conn.kind !== 'agent') return fail('forbidden')
+        hub.sendEphemeral(conn.userId, msg.convo_id, {
+          kind: 'ephemeral', convo_id: msg.convo_id, message_ref: msg.message_ref,
+          text: msg.text, replace_text: msg.replace_text,
+        })
+        break
+      }
+      case 'finalize': {
+        if (conn.kind !== 'agent') return fail('forbidden')
+        appendAndFan({
+          userId: conn.userId, convoId: msg.convo_id,
+          sender: `agent:${conn.name}`, type: msg.type || 'text', payload: msg.payload,
+          idemKey: `agent:${conn.deviceId}:fin:${msg.message_ref}`,
+        })
         break
       }
       default:
