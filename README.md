@@ -64,10 +64,54 @@ Spec: docs/superpowers/specs/2026-07-10-matron-protocol-design.md
   `finalize`'s internally composed `fin:<ref>` keys) with
   `{op:'error', code:'bad_request', detail:'idem_key prefix fin: is
   reserved'}`; nothing is appended.
+- `POST /push/register` (Bearer, client devices only — agents get 403
+  `{error:'forbidden'}`): `{apns_token, environment}` with `environment` in
+  `{'sandbox','prod'}` registers a device for push; `{apns_token: null}`
+  unregisters. 400 `{error:'bad_request'}` on a bad `environment` or a
+  missing/non-string `apns_token` (unless it's `null`).
+
+## Push notifications (APNs)
+
+Direct HTTP/2 APNs (ES256 provider JWT, `node:http2` — no sygnal, no extra
+dependencies). Disabled unless all four are set:
+
+    MATRON_APNS_KEY_FILE=/path/to/AuthKey_XXXX.p8
+    MATRON_APNS_KEY_ID=...
+    MATRON_APNS_TEAM_ID=...
+    MATRON_APNS_TOPIC=chat.matron.x
+
+Missing any of them logs one warn line at boot and the push pipeline is an
+inert no-op — everything else on the server works as normal.
+
+After a journal event fans out to a user's connections, the push pipeline
+considers each of that user's *client* devices with a registered token
+(agent devices are never pushed to):
+
+- skipped when that device is connected and actively `viewing` the event's
+  conversation, or when its acked cursor already covers the event's `seq`.
+- `prompt` / `permission_request`, and `session_status` with
+  `payload.state:'done'`, push immediately at priority 10.
+- everything else (`text`, `tool_output`, `diff`, `convo_meta`, ...) pushes
+  at priority 5, coalesced per (device, conversation): a leading push when
+  idle, then at most one trailing push per 10s window while events keep
+  arriving (in-memory only — a restart loses a pending trailing push).
+- `read_marker` rows trigger a silent background push
+  (`content-available: 1`, no alert) to the user's *other* devices so they
+  clear their badge — never back to the device whose read_marker it was.
+- alert title is the conversation title (falling back to its id), body is
+  the event's snippet, badge is `SUM(unread_count)` over the owner's
+  conversations.
+- a 410 response prunes that device's `apns_token`/`apns_env` (dead token,
+  logged once); a 400 keeps the token but logs loudly — almost always a
+  sandbox/prod `apns_env` mismatch (the sygnal lesson), not a dead token.
+
+Per-device `apns_env` (`'sandbox'|'prod'`) exists because Xcode dev builds
+register sandbox tokens, which prod APNs answers with 400 `BadDeviceToken` —
+environment has to travel with the token, never be assumed from the topic.
 
 ## Test
 
     npm test
 
-Deferred to v1 completion: APNs push, retention offload, /metrics,
-conformance fixtures (see the spec, §15 and plan docs).
+Deferred to v1 completion: retention offload, /metrics, conformance fixtures
+(see the spec, §15 and plan docs).
