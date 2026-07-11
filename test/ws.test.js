@@ -367,6 +367,42 @@ test('revoked device: its next WS frame gets error {code:"revoked"} and closes 4
   assert.equal(httpAfter.status, 401)
 })
 
+test('revocation sweep: a silently-listening revoked device is closed (error frame + 4001) within the sweep interval; other connections stay registered and functional', async (t) => {
+  // A revoked device that never sends another frame would otherwise keep
+  // receiving live journal broadcasts forever — the per-frame recheck only
+  // fires on ITS OWN next inbound frame. The sweep is the backstop for
+  // silent listeners (lost/compromised devices).
+  const s = await startTestServer({ revocationSweepMs: 60 })
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id })
+  const l1 = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'lost-phone' } })
+  const l2 = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const lost = await makeWsClient(s.base, { token: l1.json.token, cursor: 0 })
+  const mac = await makeWsClient(s.base, { token: l2.json.token, cursor: 0 })
+  await lost.waitFor((f) => f.op === 'hello_ok')
+  await mac.waitFor((f) => f.op === 'hello_ok')
+  assert.equal(s.hub.connsOf(dan.id).length, 2)
+
+  let lostCloseCode = null
+  lost.ws.on('close', (code) => { lostCloseCode = code })
+
+  // Revoke the lost device's row directly; the lost connection sends NOTHING
+  // from here on — only the sweep can enforce this.
+  s.db.prepare('DELETE FROM devices WHERE id=?').run(l1.json.device_id)
+  await lost.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'revoked', 3000)
+  await new Promise((r) => setTimeout(r, 100))
+  assert.equal(lostCloseCode, 4001)
+
+  // The other device survived the sweep: still registered and fully functional.
+  assert.equal(s.hub.connsOf(dan.id).length, 1)
+  mac.send({ op: 'send', convo_id: 'c1', payload: { body: 'still here' } })
+  const f = await mac.waitFor((x) => x.kind === 'journal' && x.type === 'text')
+  assert.equal(f.payload.body, 'still here')
+  assert.equal(mac.ws.readyState, 1)
+  mac.close()
+})
+
 test('a socket that closes mid-replay is never left registered in the hub', async (t) => {
   // replayBackpressureBytes: -1 parks the replay loop in waitForDrain at the
   // first batch boundary indefinitely (bufferedAmount >= 0 is always > -1)

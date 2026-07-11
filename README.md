@@ -26,8 +26,13 @@ per request, so a deleted row 401s on the very next call. On the WS side,
 every inbound frame *after* hello re-checks the device row still exists
 (one cheap prepared `SELECT`); if it's gone, the server sends
 `{kind:'control', op:'error', code:'revoked'}` and closes with code `4001`
-(close-on-next-frame). `matron-admin device list <username>` shows each
-device's kind, cursor, and last-seen time.
+(close-on-next-frame). A periodic sweep (every 60s) additionally checks
+every *registered* connection's device row, so a revoked device that just
+listens without ever sending — a lost or compromised phone — is cut off
+too, with the same error frame and `4001` close. WS enforcement is
+therefore **next-frame or ≤60s, whichever comes first**.
+`matron-admin device list <username>` shows each device's kind, cursor,
+and last-seen time.
 
 ## Protocol (v1 core)
 
