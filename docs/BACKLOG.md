@@ -9,14 +9,6 @@ trusted first-party code, iPhones on the public internet.
 
 ## Follow-ups from the PR #2 final whole-branch review
 
-- `MATRON_MEDIA_MAX_BYTES` garbage value → NaN → upload size cap silently
-  disabled (fails open). One-line validator: non-integer/<=0 → default+warn.
-- Push: a user's own `send` still triggers routine alert pushes to their
-  other devices — mirror the unread predicate (own messages aren't unread)
-  into the push decision, or advance suppression via the sender device's
-  cursor. Product wart, not a defect.
-- `GET /media/:id`: stat the file before writeHead so a DB-vs-disk size
-  mismatch (ops error) yields a clean 5xx instead of 200-then-reset.
 - `upsertConversation` runs SELECT-then-write outside `db.transaction()` —
   safe only because the server is single-process/synchronous; add the
   one-line invariant comment.
@@ -50,5 +42,6 @@ snapshot recovers); buildOpts-throw could strand a coalesce entry
 (unreachable today); matron-admin status db-size via db.name vs /metrics
 dbPath (same file by construction); offload scan concurrency (see README
 follow-up above); raw SqliteError on duplicate admin user; per-call
-db.prepare rebuilds; password on admin argv (single-user boxes); 429 body
-drain; utf8 cap counting chars not bytes.
+db.prepare rebuilds; password on admin argv (single-user boxes); utf8 cap
+counting chars not bytes; edit events don't update snippet/unread
+(MESSAGE_TYPES) — by design, an edit is not new activity.
