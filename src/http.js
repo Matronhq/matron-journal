@@ -53,6 +53,20 @@ const readBody = (req) => new Promise((resolve, reject) => {
 
 const bearer = (req) => (req.headers.authorization || '').replace(/^Bearer /, '') || null
 
+// For a reject that fires BEFORE anything has ever read the request body
+// (rate-limited /login, unauthenticated everything-else) — the body (if
+// any) is sitting there unconsumed. Draining it with `req.resume()` would
+// work but reads an attacker-controlled, potentially unbounded body to
+// completion before the socket could be reused (no size cap applies pre-auth
+// here, unlike readBody's own 413 path). Simpler and safer: send the
+// response, then destroy the connection once it's flushed — this also
+// avoids leaving unread bytes on a keep-alive socket to desync the next
+// request's parse, same concern as readBody's existing 413 handling below.
+const rejectEarly = (req, res, status, obj) => {
+  res.on('finish', () => req.destroy())
+  return json(res, status, obj)
+}
+
 export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, hub, pushPipeline, dbPath }) {
   return async (req, res) => {
     try {
@@ -62,7 +76,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // (the tunnel is the only route in, so this header is trustworthy here).
         // Fall back to remoteAddress for direct/local connections (e.g. tests).
         const ip = req.headers['cf-connecting-ip'] || req.socket.remoteAddress || 'unknown'
-        if (!rateLimiter.allow(ip)) return json(res, 429, { error: 'rate_limited' })
+        if (!rateLimiter.allow(ip)) return rejectEarly(req, res, 429, { error: 'rate_limited' })
         const { username, password, device_name } = await readBody(req)
         const guardKey = String(username ?? '')
         const gate = loginGuard.check(guardKey)
@@ -77,7 +91,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         return json(res, 200, { token: s.token, device_id: s.deviceId, user_id: s.userId })
       }
       const who = bearer(req) && authToken(db, bearer(req))
-      if (!who) return json(res, 401, { error: 'unauthenticated' })
+      if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       if (req.method === 'GET' && url.pathname === '/snapshot') {
         return json(res, 200, snapshot(db, who.userId))
       }
@@ -150,14 +164,25 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           throw e
         }
         const contentType = req.headers['content-type'] || 'application/octet-stream'
-        insertBlob(db, {
-          id: received.id,
-          ownerUserId: who.userId,
-          contentType,
-          size: received.size,
-          sha256: received.sha256,
-          diskPath: received.diskPath,
-        })
+        try {
+          insertBlob(db, {
+            id: received.id,
+            ownerUserId: who.userId,
+            contentType,
+            size: received.size,
+            sha256: received.sha256,
+            diskPath: received.diskPath,
+          })
+        } catch (e) {
+          // receiveBlob already renamed the tmp file into its final sharded
+          // path before this runs — if the DB insert throws (e.g. a
+          // transient SQLite error), that file would otherwise be orphaned
+          // on disk with no row ever pointing at it. Best-effort cleanup
+          // (nothing more useful to do if the unlink itself fails) before
+          // falling through to the outer catch's generic 500.
+          await fs.promises.unlink(received.diskPath).catch(() => {})
+          throw e
+        }
         return json(res, 200, { media_id: received.id, size: received.size, content_type: contentType, sha256: received.sha256 })
       }
       const mm = url.pathname.match(/^\/media\/([^/]+)$/)
@@ -168,6 +193,23 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // and callers can't probe for the existence of someone else's blob.
         const blob = getBlob(db, mm[1])
         if (!blob || blob.owner_user_id !== who.userId) return json(res, 404, { error: 'not_found' })
+        // Stat the file before ever committing to a 200: the DB row can
+        // outlive/disagree with the file on disk (deleted out from under
+        // it, truncated by a disk issue, etc). Catching that here means a
+        // clean 500 instead of writeHead(200) + a declared content-length
+        // followed by the stream erroring mid-flight and resetting the
+        // connection.
+        let stat
+        try {
+          stat = await fs.promises.stat(blob.disk_path)
+        } catch (e) {
+          console.error(`media: blob ${blob.id} row exists but its disk_path is unreadable`, e)
+          return json(res, 500, { error: 'internal' })
+        }
+        if (stat.size !== blob.size) {
+          console.error(`media: blob ${blob.id} on-disk size (${stat.size}) does not match the DB row (${blob.size})`)
+          return json(res, 500, { error: 'internal' })
+        }
         res.writeHead(200, {
           'content-type': blob.content_type,
           'content-length': String(blob.size),
