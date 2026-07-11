@@ -271,10 +271,15 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline }
       }
       case 'finalize': {
         if (conn.kind !== 'agent') return fail('forbidden')
+        // finalize's type is raw agent input just like publish's — without
+        // the same whitelist it would be a bypass route for forging
+        // server-generated types (session_status/read_marker/convo_meta).
+        const type = msg.type || 'text'
+        if (!AGENT_PUBLISH_TYPES.has(type)) return fail('bad_request')
         if (typeof msg.payload !== 'object' || msg.payload === null) return fail('bad_request')
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
-          sender: `agent:${conn.name}`, type: msg.type || 'text', payload: msg.payload,
+          sender: `agent:${conn.name}`, type, payload: msg.payload,
           idemKey: `agent:${conn.deviceId}:fin:${msg.message_ref}`,
         })
         break
