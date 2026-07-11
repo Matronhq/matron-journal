@@ -4,27 +4,41 @@ export const MESSAGE_TYPES = [
   'text', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image',
 ]
 
-function snippetOf(type, payload) {
-  if (type === 'text') return String(payload.body || '').slice(0, 120)
-  if (type === 'prompt') return `? ${String(payload.question || '').slice(0, 110)}`
-  if (type === 'permission_request') return `permission: ${String(payload.description || '').slice(0, 100)}`
-  if (payload && payload.snippet) return String(payload.snippet).slice(0, 120)
+export function snippetOf(type, payload) {
+  // Tolerate whatever an agent hands us — null/undefined/a bare string or
+  // number — rather than crashing on `payload.body` etc. A malformed
+  // payload just yields an empty/placeholder snippet, never a thrown error.
+  const p = payload && typeof payload === 'object' ? payload : {}
+  if (type === 'text') return String(p.body || '').slice(0, 120)
+  if (type === 'prompt') return `? ${String(p.question || '').slice(0, 110)}`
+  if (type === 'permission_request') return `permission: ${String(p.description || '').slice(0, 100)}`
+  if (p.snippet) return String(p.snippet).slice(0, 120)
   return `[${type}]`
 }
 
+// Returns the conversation row plus `titleChanged`: true when this call set a
+// new, different title — either an existing convo's title actually changed,
+// or a brand-new convo was created with a non-empty title. Callers (ws.js)
+// use that flag to decide whether to fan out a `convo_meta` journal event;
+// no event on an unchanged title, an absent title, or a state-only upsert.
 export function upsertConversation(db, { id, ownerUserId, title, sessionState }) {
   const existing = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
+  let titleChanged = false
   if (existing) {
     if (existing.owner_user_id !== ownerUserId) throw new Error('not authorized: convo owned by another user')
+    if (title != null && title !== existing.title) titleChanged = true
     db.prepare(
       'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state) WHERE id=?'
     ).run(title ?? null, sessionState ?? null, id)
   } else {
+    const initialTitle = title || ''
     db.prepare(
       'INSERT INTO conversations(id, owner_user_id, title, session_state, created_at) VALUES(?,?,?,?,?)'
-    ).run(id, ownerUserId, title || '', sessionState || 'running', Date.now())
+    ).run(id, ownerUserId, initialTitle, sessionState || 'running', Date.now())
+    if (initialTitle) titleChanged = true
   }
-  return db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
+  const convo = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
+  return { ...convo, titleChanged }
 }
 
 const nextSeq = (db, userId) =>
@@ -42,15 +56,33 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
     }
     const seq = nextSeq(db, userId)
     const ts = Date.now()
+    // JSON.stringify(undefined) is the JS value `undefined`, not a string —
+    // binding that would hit the payload column's NOT NULL constraint as a
+    // raw SQLite error. A caller that omits `payload` entirely gets `null`
+    // stored instead, so this always fails at the same clean layer as an
+    // explicit null/non-object payload (see the guards below).
+    const payloadJson = JSON.stringify(payload === undefined ? null : payload)
     db.prepare(
       'INSERT INTO events(user_id, seq, convo_id, ts, sender, type, payload, blob_ref, idem_key) VALUES(?,?,?,?,?,?,?,?,?)'
-    ).run(userId, seq, convoId, ts, sender, type, JSON.stringify(payload), blobRef, idemKey)
+    ).run(userId, seq, convoId, ts, sender, type, payloadJson, blobRef, idemKey)
     if (type === 'session_status') {
+      // Guard against a malformed agent payload (null/undefined/non-object,
+      // or an object with no string `state`) reaching the DB as a raw
+      // bind-type or CHECK-constraint crash — fail with one clear, expected
+      // error instead (still rolls back the whole transaction).
+      const state = payload && typeof payload === 'object' ? payload.state : undefined
+      if (typeof state !== 'string') throw new Error('invalid session_status payload: state must be a string')
       db.prepare('UPDATE conversations SET last_seq=?, session_state=? WHERE id=?')
-        .run(seq, payload.state, convoId)
+        .run(seq, state, convoId)
     } else if (MESSAGE_TYPES.includes(type)) {
-      db.prepare('UPDATE conversations SET last_seq=?, unread_count=unread_count+1, snippet=? WHERE id=?')
-        .run(seq, snippetOf(type, payload), convoId)
+      // A user's own message (sender `user:*`) never inflates their own unread
+      // badge — only content from someone/something else (an agent, mirroring
+      // a bridge's remote participant) counts as unread. Keep this predicate in
+      // sync with the recompute query in markRead() below.
+      const sql = sender.startsWith('user:')
+        ? 'UPDATE conversations SET last_seq=?, snippet=? WHERE id=?'
+        : 'UPDATE conversations SET last_seq=?, unread_count=unread_count+1, snippet=? WHERE id=?'
+      db.prepare(sql).run(seq, snippetOf(type, payload), convoId)
     } else {
       db.prepare('UPDATE conversations SET last_seq=? WHERE id=?').run(seq, convoId)
     }
@@ -88,19 +120,36 @@ export function messagesBefore(db, userId, convoId, { beforeSeq = null, limit = 
   return rows.reverse().map(parseRow)
 }
 
-export function markRead(db, userId, convoId, upToSeq) {
+// `sender` defaults to the caller's own `user:<name>` identity (the original
+// client-only behavior) but callers may pass an explicit identity string —
+// ws.js does, so an agent connection marking read on behalf of its user gets
+// `agent:<name>` instead (see the read_marker op handler).
+//
+// `upToSeq: null` means "resolve to this conversation's current last_seq at
+// processing time" — a bridge mirroring a user's own messages publishes
+// fire-and-forget and never learns the seq it was assigned, so it can't pass
+// an explicit cursor. Resolution happens inside this transaction so it's
+// consistent with the recompute below.
+export function markRead(db, userId, convoId, upToSeq, sender = null) {
   return db.transaction(() => {
-    const uname = db.prepare('SELECT name FROM users WHERE id=?').get(userId).name
+    const convo = db.prepare('SELECT owner_user_id, last_seq FROM conversations WHERE id=?').get(convoId)
+    if (!convo || convo.owner_user_id !== userId) throw new Error('not authorized: convo missing or not owned')
+    const resolvedUpToSeq = upToSeq == null ? convo.last_seq : upToSeq
+    const finalSender = sender ?? `user:${db.prepare('SELECT name FROM users WHERE id=?').get(userId).name}`
     const r = append(db, {
-      userId, convoId, sender: `user:${uname}`, type: 'read_marker',
-      payload: { convo_id: convoId, up_to_seq: upToSeq },
+      userId, convoId, sender: finalSender, type: 'read_marker',
+      payload: { convo_id: convoId, up_to_seq: resolvedUpToSeq },
     })
     const placeholders = MESSAGE_TYPES.map(() => '?').join(',')
+    // Mirrors append()'s unread predicate: only non-`user:*`-sender messages
+    // count as unread, so a recompute after read never resurrects the
+    // reader's own messages as unread.
     db.prepare(
       `UPDATE conversations SET unread_count=(
          SELECT COUNT(*) FROM events e WHERE e.convo_id=? AND e.seq>? AND e.type IN (${placeholders})
+           AND e.sender NOT LIKE 'user:%'
        ) WHERE id=?`
-    ).run(convoId, upToSeq, ...MESSAGE_TYPES, convoId)
-    return r
+    ).run(convoId, resolvedUpToSeq, ...MESSAGE_TYPES, convoId)
+    return { ...r, upToSeq: resolvedUpToSeq }
   })()
 }
