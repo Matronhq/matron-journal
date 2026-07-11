@@ -208,6 +208,59 @@ test('a session torn down between sends is not reused — the next send reconnec
   assert.equal(connectCount, 2, 'expected a fresh session after the old one was torn down')
 })
 
+test('a request that never gets a response settles {status: 0, reason: "timeout"} after requestTimeoutMs', async () => {
+  const { keyFile } = makeTestKey()
+  const session = new EventEmitter()
+  session.destroyed = false
+  session.closed = false
+  let closedStreams = 0
+  session.request = () => {
+    // A stream that accepts the request but never responds — the shape of a
+    // stalled connection where neither 'end', 'error', nor 'close' arrives.
+    const stream = new EventEmitter()
+    stream.setEncoding = () => {}
+    stream.write = () => {}
+    stream.end = () => {}
+    stream.close = () => { closedStreams += 1 }
+    return stream
+  }
+  const client = makeApnsClient({
+    keyFile, keyId: 'k', teamId: 't', topic: 'chat.matron.x',
+    connect: () => session, requestTimeoutMs: 50,
+  })
+
+  // The per-request timeout is deliberately unref'd (it must never keep the
+  // server process alive), so in a bare test — unlike the real server, whose
+  // listen handles keep the loop running — something ref'd has to hold the
+  // event loop open long enough for it to fire.
+  const keepAlive = setTimeout(() => {}, 5000)
+  try {
+    const result = await client.send({ deviceToken: 'a'.repeat(64), env: 'prod', payload: {}, priority: 5, pushType: 'alert' })
+    assert.deepEqual(result, { status: 0, reason: 'timeout' })
+    assert.equal(closedStreams, 1, 'the timed-out stream must be torn down, not leaked')
+  } finally {
+    clearTimeout(keepAlive)
+  }
+})
+
+test('a stream torn down with only a close event (no end/error) settles transport failure', async () => {
+  const { keyFile } = makeTestKey()
+  const session = new EventEmitter()
+  session.destroyed = false
+  session.closed = false
+  session.request = () => {
+    const stream = new EventEmitter()
+    stream.setEncoding = () => {}
+    stream.write = () => {}
+    stream.end = () => { queueMicrotask(() => stream.emit('close')) }
+    return stream
+  }
+  const client = makeApnsClient({ keyFile, keyId: 'k', teamId: 't', topic: 'chat.matron.x', connect: () => session })
+
+  const result = await client.send({ deviceToken: 'a'.repeat(64), env: 'prod', payload: {}, priority: 5, pushType: 'alert' })
+  assert.deepEqual(result, { status: 0, reason: 'transport' })
+})
+
 test('a send whose stream errors mid-flight resolves transport failure without throwing', async () => {
   const { keyFile } = makeTestKey()
   const session = new EventEmitter()
