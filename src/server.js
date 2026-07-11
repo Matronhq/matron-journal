@@ -1,5 +1,7 @@
 import http from 'node:http'
 import path from 'node:path'
+import { realpathSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
 import { makeLoginGuard, makeRateLimiter } from './auth.js'
 import { makeHttpHandler } from './http.js'
@@ -61,7 +63,11 @@ export function startServer({ dbPath, port = 0, bind = '127.0.0.1', mediaDir, me
   })
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+let isMain = false
+try {
+  isMain = !!process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)
+} catch { /* argv[1] missing or unresolvable: not the entrypoint */ }
+if (isMain) {
   const port = Number(process.env.MATRON_PORT || 9810)
   const bind = process.env.MATRON_BIND || '127.0.0.1'
   startServer({ port, bind }).then((s) => console.log(`matron-journal listening on ${bind}:${s.port}`))
