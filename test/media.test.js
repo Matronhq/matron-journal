@@ -153,6 +153,33 @@ test('POST /media with an empty body -> 400 empty, nothing persisted', async (t)
   assert.deepEqual(listMediaFiles(mediaDir), [])
 })
 
+test('a write-stream error during the final flush rejects instead of hanging (fails closed)', async () => {
+  const { receiveBlob } = await import('../src/media.js')
+  const { PassThrough, Writable } = await import('node:stream')
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-media-flush-'))
+
+  // A sink that accepts every chunk but fails at end()-time flush — the shape
+  // of ENOSPC/EIO surfacing only when buffered data is forced out on close.
+  const failing = new Writable({
+    write(chunk, enc, cb) { cb() },
+    final(cb) { cb(Object.assign(new Error('no space left on device'), { code: 'ENOSPC' })) },
+  })
+
+  const req = new PassThrough()
+  const p = receiveBlob(req, { root, maxBytes: 1000, createWriteStream: () => failing })
+  req.end('some bytes')
+
+  // The buggy behavior is a promise that never settles (the HTTP request would
+  // hang forever), so race against a timeout instead of awaiting bare.
+  const outcome = await Promise.race([
+    p.then(() => 'resolved', (e) => e),
+    new Promise((r) => setTimeout(() => r('hung'), 2000)),
+  ])
+  assert.notEqual(outcome, 'hung', 'receiveBlob never settled after a flush-time write error')
+  assert.notEqual(outcome, 'resolved', 'receiveBlob resolved despite a flush-time write error')
+  assert.match(outcome.message, /no space left/)
+})
+
 test('an agent-kind device can also upload media (not just client devices)', async (t) => {
   const { createAgent } = await import('../src/auth.js')
   const s = await startTestServer({ dbPath: tmpDbPath() })
