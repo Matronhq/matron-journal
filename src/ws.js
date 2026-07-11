@@ -46,6 +46,9 @@ export function attachWs({
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
 }) {
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES })
+  // Prepared once, reused for the per-frame revocation recheck below — one
+  // cheap SELECT per inbound frame, not a fresh db.prepare() call each time.
+  const deviceExistsStmt = db.prepare('SELECT 1 FROM devices WHERE id=?')
   const interval = setInterval(() => {
     for (const ws of wss.clients) {
       if (ws._alive === false) { ws.terminate(); continue }
@@ -144,6 +147,17 @@ export function attachWs({
           if (conn.closed) return
           hub.register(conn)
           conn.registered = true
+          return
+        }
+        // Spec §8 close-on-next-frame: revocation is just deleting the
+        // devices row (matron-admin device revoke); this is the socket-side
+        // half — every frame AFTER hello re-checks that row still exists
+        // (hello itself already does the equivalent check via authToken's
+        // token-hash lookup, so this must only run post-hello or a revoked
+        // token's hello would get checked twice for no benefit).
+        if (!deviceExistsStmt.get(conn.deviceId)) {
+          conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
+          conn.ws.close(4001)
           return
         }
         handleOp({ db, hub, conn, msg, pushPipeline })

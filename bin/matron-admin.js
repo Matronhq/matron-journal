@@ -2,7 +2,7 @@
 import fs, { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { openDb } from '../src/db.js'
-import { createUser, setPassword, createAgent } from '../src/auth.js'
+import { createUser, setPassword, createAgent, revokeDevice } from '../src/auth.js'
 import { resolveMediaDir } from '../src/media.js'
 import { runOffload } from '../src/retention.js'
 
@@ -10,6 +10,8 @@ const USAGE = `usage:
   matron-admin user add <name> --password <pw>
   matron-admin user passwd <name> --password <pw>
   matron-admin agent add <username> <agent-name>
+  matron-admin device list <username>
+  matron-admin device revoke <device_id>
   matron-admin offload [--days N]
   matron-admin status`
 
@@ -41,6 +43,27 @@ export async function runAdmin(db, argv) {
     if (!user) throw new Error(`no such user: ${username}`)
     const { token } = createAgent(db, user.id, agentName)
     return `agent ${agentName} token: ${token}\n(store in the bridge credentials file; it is not shown again)`
+  }
+  if (a === 'device' && b === 'list') {
+    const username = argv[2]
+    if (!username) throw new Error(USAGE)
+    const user = db.prepare('SELECT id FROM users WHERE name=?').get(username)
+    if (!user) throw new Error(`no such user: ${username}`)
+    const devices = db.prepare('SELECT id, kind, name, cursor, last_seen_at FROM devices WHERE user_id=? ORDER BY id').all(user.id)
+    if (devices.length === 0) return `no devices for ${username}`
+    return devices.map((d) => `${d.id} kind=${d.kind} name=${d.name} cursor=${d.cursor} last_seen_at=${d.last_seen_at ?? 'never'}`).join('\n')
+  }
+  // Spec §8: "Revocation: delete the device/agent row; its socket is closed
+  // on next frame." This just deletes the row — WS enforcement (the
+  // per-frame device recheck) and HTTP (token-hash lookup per request) both
+  // key off that row existing, so deleting it is the entire revocation.
+  if (a === 'device' && b === 'revoke') {
+    const deviceId = Number(argv[2])
+    if (!Number.isInteger(deviceId)) throw new Error(USAGE)
+    const existing = db.prepare('SELECT id FROM devices WHERE id=?').get(deviceId)
+    if (!existing) throw new Error(`no such device: ${deviceId}`)
+    revokeDevice(db, deviceId)
+    return `device ${deviceId} revoked`
   }
   if (a === 'offload') {
     const daysFlag = flag(argv, '--days')
