@@ -4,7 +4,7 @@ export const MESSAGE_TYPES = [
   'text', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image',
 ]
 
-function snippetOf(type, payload) {
+export function snippetOf(type, payload) {
   if (type === 'text') return String(payload.body || '').slice(0, 120)
   if (type === 'prompt') return `? ${String(payload.question || '').slice(0, 110)}`
   if (type === 'permission_request') return `permission: ${String(payload.description || '').slice(0, 100)}`

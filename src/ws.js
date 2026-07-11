@@ -6,7 +6,9 @@ const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
 const CLIENT_SEND_TYPES = new Set(['text'])
 
-export function attachWs({ server, db, hub, pingMs = 20000 }) {
+const noopPushPipeline = { onAppend() {} }
+
+export function attachWs({ server, db, hub, pingMs = 20000, pushPipeline = noopPushPipeline }) {
   const wss = new WebSocketServer({ server, path: '/ws' })
   const interval = setInterval(() => {
     for (const ws of wss.clients) {
@@ -71,7 +73,7 @@ export function attachWs({ server, db, hub, pingMs = 20000 }) {
           conn.registered = true
           return
         }
-        handleOp({ db, hub, conn, msg })
+        handleOp({ db, hub, conn, msg, pushPipeline })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -92,13 +94,21 @@ export function attachWs({ server, db, hub, pingMs = 20000 }) {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export function handleOp({ db, hub, conn, msg }) {
+export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline }) {
   const fail = (code, detail) =>
     conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code, ref: msg.op, ...(detail ? { detail } : {}) }))
+  // Single choke point: every journal event becomes a WS frame AND (fire and
+  // forget) a candidate push, right here — nowhere else calls
+  // hub.broadcastJournal for a freshly-appended event. pushPipeline.onAppend
+  // never throws and is not awaited; it does its own async error handling.
+  const fanOut = (frame) => {
+    hub.broadcastJournal(conn.userId, frame)
+    pushPipeline.onAppend(conn.userId, frame, conn.deviceId)
+  }
   const appendAndFan = (args) => {
     const r = append(db, args)
     if (!r.duplicate) {
-      hub.broadcastJournal(conn.userId, journalFrame({
+      fanOut(journalFrame({
         seq: r.seq, convo_id: args.convoId, ts: r.ts,
         sender: args.sender, type: args.type, payload: args.payload,
       }))
@@ -143,7 +153,7 @@ export function handleOp({ db, hub, conn, msg }) {
         // follows each connection's normal identity convention.
         const sender = conn.kind === 'agent' ? `agent:${conn.name}` : `user:${conn.username}`
         const r = markRead(db, conn.userId, msg.convo_id, msg.up_to_seq, sender)
-        hub.broadcastJournal(conn.userId, journalFrame({
+        fanOut(journalFrame({
           seq: r.seq, convo_id: msg.convo_id, ts: r.ts,
           sender, type: 'read_marker',
           payload: { convo_id: msg.convo_id, up_to_seq: r.upToSeq },

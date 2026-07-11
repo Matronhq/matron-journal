@@ -5,10 +5,29 @@ import { makeLoginGuard, makeRateLimiter } from './auth.js'
 import { makeHttpHandler } from './http.js'
 import { makeHub } from './hub.js'
 import { attachWs } from './ws.js'
+import { makeApnsClient } from './apns.js'
+import { makePushPipeline } from './push.js'
 
 const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 
-export function startServer({ dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes } = {}) {
+// Direct APNs push is wired ONLY when all four MATRON_APNS_* vars are set
+// (same disabled-by-default pattern as the rest of the server); otherwise a
+// single warn log at boot and the push pipeline is an inert no-op.
+function resolveApnsClient(injected) {
+  if (injected) return { client: injected, owned: false }
+  const { MATRON_APNS_KEY_FILE, MATRON_APNS_KEY_ID, MATRON_APNS_TEAM_ID, MATRON_APNS_TOPIC } = process.env
+  if (MATRON_APNS_KEY_FILE && MATRON_APNS_KEY_ID && MATRON_APNS_TEAM_ID && MATRON_APNS_TOPIC) {
+    const client = makeApnsClient({
+      keyFile: MATRON_APNS_KEY_FILE, keyId: MATRON_APNS_KEY_ID,
+      teamId: MATRON_APNS_TEAM_ID, topic: MATRON_APNS_TOPIC,
+    })
+    return { client, owned: true }
+  }
+  console.warn('apns: MATRON_APNS_KEY_FILE/MATRON_APNS_KEY_ID/MATRON_APNS_TEAM_ID/MATRON_APNS_TOPIC not all set — push notifications disabled')
+  return { client: undefined, owned: false }
+}
+
+export function startServer({ dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, apnsClient } = {}) {
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
   const db = openDb(resolvedDbPath)
   const rateLimiter = makeRateLimiter()
@@ -19,7 +38,9 @@ export function startServer({ dbPath, port = 0, bind = '127.0.0.1', mediaDir, me
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
   }))
   const hub = makeHub()
-  const wss = attachWs({ server, db, hub })
+  const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
+  const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient })
+  const wss = attachWs({ server, db, hub, pushPipeline })
   return new Promise((resolve) => {
     server.listen(port, bind, () => {
       resolve({
@@ -27,9 +48,12 @@ export function startServer({ dbPath, port = 0, bind = '127.0.0.1', mediaDir, me
         db,
         server,
         hub,
+        pushPipeline,
         close: () => new Promise((r) => {
           wss.close()
           for (const c of wss.clients) c.terminate()
+          pushPipeline.close()
+          if (ownsApnsClient) resolvedApnsClient.close()
           server.close(() => { db.close(); r() })
         }),
       })

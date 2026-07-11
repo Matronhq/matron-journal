@@ -14,6 +14,15 @@ export function makeHub({ coalesceMs = 200 } = {}) {
     connsOf(userId) {
       return [...(byUser.get(userId) || [])]
     },
+    // Per-device "is this device connected AND looking at this convo right
+    // now" — the push pipeline's suppression rule. conn.deviceId is already
+    // carried on every registered connection (see ws.js hello handling).
+    isViewing(userId, deviceId, convoId) {
+      for (const c of byUser.get(userId) || []) {
+        if (c.deviceId === deviceId && c.viewingConvoId === convoId && c.ws.readyState === 1) return true
+      }
+      return false
+    },
     broadcastJournal(userId, frame) {
       for (const c of byUser.get(userId) || []) {
         if (c.ws.readyState === 1) c.ws.send(JSON.stringify(frame))
