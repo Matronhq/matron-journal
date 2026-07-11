@@ -1,0 +1,94 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { openDb } from '../src/db.js'
+import { createUser } from '../src/auth.js'
+import { append, upsertConversation, snapshot, eventsAfter, messagesBefore, markRead } from '../src/journal.js'
+
+async function setup() {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  upsertConversation(db, { id: 'c1', ownerUserId: dan.id, title: 'fix tests' })
+  return { db, dan }
+}
+
+test('append allocates contiguous per-user seq and updates summary', async () => {
+  const { db, dan } = await setup()
+  upsertConversation(db, { id: 'c2', ownerUserId: dan.id })
+  const a = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:dev-2', type: 'text', payload: { body: 'hello' } })
+  const b = append(db, { userId: dan.id, convoId: 'c2', sender: 'agent:dev-2', type: 'text', payload: { body: 'world' } })
+  assert.equal(a.seq, 1)
+  assert.equal(b.seq, 2)
+  const c1 = db.prepare("SELECT * FROM conversations WHERE id='c1'").get()
+  assert.equal(c1.last_seq, 1)
+  assert.equal(c1.unread_count, 1)
+  assert.equal(c1.snippet, 'hello')
+})
+
+test('session_status updates state without bumping unread', async () => {
+  const { db, dan } = await setup()
+  append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:dev-2', type: 'session_status', payload: { state: 'waiting' } })
+  const c1 = db.prepare("SELECT * FROM conversations WHERE id='c1'").get()
+  assert.equal(c1.session_state, 'waiting')
+  assert.equal(c1.unread_count, 0)
+})
+
+test('idempotency key dedupes', async () => {
+  const { db, dan } = await setup()
+  const p = { userId: dan.id, convoId: 'c1', sender: 'agent:dev-2', type: 'text', payload: { body: 'x' }, idemKey: 'a1:m1' }
+  const first = append(db, p)
+  const again = append(db, p)
+  assert.equal(again.seq, first.seq)
+  assert.equal(again.duplicate, true)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM events').get().n, 1)
+  const c1 = db.prepare("SELECT last_seq, unread_count FROM conversations WHERE id='c1'").get()
+  assert.equal(c1.last_seq, first.seq)
+  assert.equal(c1.unread_count, 1)
+})
+
+test('same idemKey in different conversations inserts both', async () => {
+  const { db, dan } = await setup()
+  upsertConversation(db, { id: 'c2', ownerUserId: dan.id })
+  const a = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'one' }, idemKey: 'fin:m1' })
+  const b = append(db, { userId: dan.id, convoId: 'c2', sender: 'agent:a', type: 'text', payload: { body: 'two' }, idemKey: 'fin:m1' })
+  assert.equal(b.duplicate, false)
+  assert.notEqual(a.seq, b.seq)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM events').get().n, 2)
+})
+
+test('append to unowned convo throws', async () => {
+  const { db } = await setup()
+  const pat = await createUser(db, 'pat', 'pw')
+  assert.throws(
+    () => append(db, { userId: pat.id, convoId: 'c1', sender: 'user:pat', type: 'text', payload: {} }),
+    /not authorized/
+  )
+})
+
+test('snapshot, replay, pagination, read markers', async () => {
+  const { db, dan } = await setup()
+  for (let i = 1; i <= 5; i++) {
+    append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:dev-2', type: 'text', payload: { body: `m${i}` } })
+  }
+  const snap = snapshot(db, dan.id)
+  assert.equal(snap.seq, 5)
+  assert.equal(snap.conversations[0].unread_count, 5)
+
+  const replay = eventsAfter(db, dan.id, 2)
+  assert.deepEqual(replay.map((e) => e.seq), [3, 4, 5])
+  assert.equal(replay[0].payload.body, 'm3')
+
+  const page = messagesBefore(db, dan.id, 'c1', { beforeSeq: 5, limit: 2 })
+  assert.deepEqual(page.map((e) => e.seq), [3, 4])
+
+  const rm = markRead(db, dan.id, 'c1', 4)
+  assert.equal(rm.seq, 6) // read_marker is itself a journal event
+  assert.equal(db.prepare("SELECT unread_count FROM conversations WHERE id='c1'").get().unread_count, 1)
+  // sender must match the username format used by send/prompt_reply, not the numeric id
+  assert.equal(db.prepare('SELECT sender FROM events WHERE seq=?').get(rm.seq).sender, 'user:dan')
+})
+
+test('messagesBefore rejects foreign convo', async () => {
+  const { db } = await setup()
+  const pat = await createUser(db, 'pat2', 'pw')
+  assert.throws(() => messagesBefore(db, pat.id, 'c1', {}), /not authorized/)
+})
