@@ -17,7 +17,7 @@ const base64url = (buf) => buf.toString('base64').replace(/\+/g, '-').replace(/\
 // node:http2 client sessions, one per environment host. `connect` is
 // injectable so tests can run against an in-process fake h2 server instead
 // of Apple.
-export function makeApnsClient({ keyFile, keyId, teamId, topic, connect = http2.connect }) {
+export function makeApnsClient({ keyFile, keyId, teamId, topic, connect = http2.connect, requestTimeoutMs = 30000 }) {
   const privateKey = crypto.createPrivateKey(fs.readFileSync(keyFile, 'utf8'))
 
   let cachedJwt = null
@@ -56,13 +56,26 @@ export function makeApnsClient({ keyFile, keyId, teamId, topic, connect = http2.
     return connectEnv(env)
   }
 
-  // One HTTP/2 request/response cycle. Never rejects: any failure (session
-  // gone mid-request, stream error, malformed response) resolves
-  // {status: 0, reason: 'transport'} instead.
+  // One HTTP/2 request/response cycle. Never rejects AND always settles:
+  // failures (session gone mid-request, stream error, stream closed without
+  // a response) resolve {status: 0, reason: 'transport'}, and a response
+  // that simply never arrives resolves {status: 0, reason: 'timeout'} after
+  // requestTimeoutMs — a permanently-pending promise here would leak the
+  // stream and silently skew the pipeline's counters.
   function requestOnce(session, { deviceToken, topic: pushTopic, payload, collapseId, priority, pushType }) {
     return new Promise((resolve) => {
       let settled = false
-      const settle = (result) => { if (!settled) { settled = true; resolve(result) } }
+      let req = null
+      let timer = null
+      const settle = (result) => {
+        if (settled) return
+        settled = true
+        if (timer) clearTimeout(timer)
+        // Tear the stream down if it's still open (timeout / early-settle
+        // paths); harmless after a normal 'end'.
+        try { if (req && req.close) req.close() } catch { /* already gone */ }
+        resolve(result)
+      }
 
       const headers = {
         ':method': 'POST',
@@ -75,12 +88,14 @@ export function makeApnsClient({ keyFile, keyId, teamId, topic, connect = http2.
       }
       if (collapseId) headers['apns-collapse-id'] = collapseId
 
-      let req
       try {
         req = session.request(headers)
       } catch {
         return settle({ status: 0, reason: 'transport' })
       }
+
+      timer = setTimeout(() => settle({ status: 0, reason: 'timeout' }), requestTimeoutMs)
+      timer.unref()
 
       let status = null
       let body = ''
@@ -95,6 +110,10 @@ export function makeApnsClient({ keyFile, keyId, teamId, topic, connect = http2.
         settle({ status, reason })
       })
       req.on('error', () => settle({ status: 0, reason: 'transport' }))
+      // Backstop: a stream torn down with only 'close' (no 'end'/'error' —
+      // e.g. the session dying mid-flight) must still settle. On the normal
+      // path 'end' fires first and the settled guard makes this a no-op.
+      req.on('close', () => settle({ status: 0, reason: 'transport' }))
       req.write(JSON.stringify(payload))
       req.end()
     })
