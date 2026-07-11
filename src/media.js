@@ -13,17 +13,19 @@ export function shardedPath(root, id) {
 // temp file is atomically renamed into its sharded final path. Rejects with
 // a `code`-tagged Error for the two statuses http.js maps directly
 // ('too_large' | 'empty'); any other error (disk I/O, dropped connection)
-// propagates as-is.
-export function receiveBlob(req, { root, maxBytes }) {
+// propagates as-is. `createWriteStream` is injectable so tests can exercise
+// flush-time disk errors (ENOSPC/EIO) without filling a real filesystem.
+export function receiveBlob(req, { root, maxBytes, createWriteStream = fs.createWriteStream }) {
   const id = crypto.randomBytes(16).toString('hex')
   const finalPath = shardedPath(root, id)
   const tmpPath = `${finalPath}.tmp`
 
   return fs.promises.mkdir(path.dirname(finalPath), { recursive: true }).then(() => new Promise((resolve, reject) => {
-    const out = fs.createWriteStream(tmpPath)
+    const out = createWriteStream(tmpPath)
     const hash = crypto.createHash('sha256')
     let size = 0
     let settled = false
+    let bodyDone = false // request body fully received; a later req 'close' is benign
 
     // Stop consuming the request body (mirrors http.js's readBody 413 handling):
     // we do NOT call req.destroy() here, since that would tear down the shared
@@ -56,8 +58,17 @@ export function receiveBlob(req, { root, maxBytes }) {
 
     req.on('end', () => {
       if (settled) return
-      settled = true
-      out.end(() => {
+      bodyDone = true
+      // Not settled yet: the final flush is still pending and can fail
+      // (ENOSPC/EIO). Settling only inside the callback keeps both failure
+      // routes live — `out`'s 'error' handler aborts if it fires first, and
+      // the callback's error argument aborts otherwise. Ignoring that
+      // argument would rename a truncated temp file into place and report a
+      // size/sha256 the on-disk bytes don't match.
+      out.end((flushErr) => {
+        if (settled) return
+        if (flushErr) return abort(flushErr)
+        settled = true
         if (size === 0) {
           fs.promises.unlink(tmpPath).catch(() => {})
             .finally(() => reject(Object.assign(new Error('empty media upload'), { code: 'empty' })))
@@ -69,7 +80,10 @@ export function receiveBlob(req, { root, maxBytes }) {
       })
     })
     req.on('error', abort)
-    req.on('close', () => abort(new Error('connection closed')))
+    // On a normally-completed request 'close' fires after 'end', while the
+    // flush may still be in flight — only treat 'close' as a client abort
+    // when the body never finished arriving.
+    req.on('close', () => { if (!bodyDone) abort(new Error('connection closed')) })
     out.on('error', abort)
   }))
 }
