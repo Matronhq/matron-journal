@@ -44,6 +44,7 @@ export async function waitForDrain(ws, thresholdBytes, pollMs = 20) {
 export function attachWs({
   server, db, hub, pingMs = 20000, pushPipeline = noopPushPipeline,
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
+  revocationSweepMs = 60000,
 }) {
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES })
   // Prepared once, reused for the per-frame revocation recheck below — one
@@ -56,7 +57,31 @@ export function attachWs({
       ws.ping()
     }
   }, pingMs)
-  wss.on('close', () => clearInterval(interval))
+  // Revocation sweep — the backstop for SILENT listeners. The per-frame
+  // recheck (below) only fires on a connection's own next inbound frame, so
+  // a revoked device that just listens would otherwise keep receiving live
+  // journal broadcasts forever. Every registered connection's device id is
+  // compared against the devices table in one query; gone → same error
+  // frame + 4001 close as the per-frame path. Enforcement is therefore
+  // next-frame or ≤ one sweep interval (60s default), whichever comes
+  // first. unref'd — never keeps the process alive on its own.
+  const sweep = setInterval(() => {
+    const conns = hub.allConns()
+    if (conns.length === 0) return
+    const ids = [...new Set(conns.map((c) => c.deviceId))]
+    const existing = new Set(
+      db.prepare(`SELECT id FROM devices WHERE id IN (${ids.map(() => '?').join(',')})`)
+        .all(...ids).map((r) => r.id)
+    )
+    for (const c of conns) {
+      if (existing.has(c.deviceId)) continue
+      if (c.ws.readyState !== 1) continue // already closing; its 'close' handler unregisters it
+      c.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
+      c.ws.close(4001)
+    }
+  }, revocationSweepMs)
+  sweep.unref()
+  wss.on('close', () => { clearInterval(interval); clearInterval(sweep) })
 
   wss.on('connection', (ws) => {
     ws._alive = true
