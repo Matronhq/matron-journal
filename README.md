@@ -13,7 +13,21 @@ Spec: docs/superpowers/specs/2026-07-10-matron-protocol-design.md
 
     MATRON_DB=./matron.db npx matron-admin user add dan --password '...'
     MATRON_DB=./matron.db npx matron-admin agent add dan dev-2
+    MATRON_DB=./matron.db npx matron-admin device list dan
+    MATRON_DB=./matron.db npx matron-admin device revoke <device_id>
+    MATRON_DB=./matron.db npx matron-admin offload [--days N]
     MATRON_DB=./matron.db npx matron-admin status
+
+### Device revocation
+
+`matron-admin device revoke <device_id>` deletes the device/agent row (spec
+§8) — that's the entire revocation. HTTP handlers look up the token hash
+per request, so a deleted row 401s on the very next call. On the WS side,
+every inbound frame *after* hello re-checks the device row still exists
+(one cheap prepared `SELECT`); if it's gone, the server sends
+`{kind:'control', op:'error', code:'revoked'}` and closes with code `4001`
+(close-on-next-frame). `matron-admin device list <username>` shows each
+device's kind, cursor, and last-seen time.
 
 ## Protocol (v1 core)
 

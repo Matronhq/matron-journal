@@ -334,6 +334,39 @@ test('snapshot_required: a replay gap at or under MATRON_MAX_REPLAY still replay
   c.close()
 })
 
+test('revoked device: its next WS frame gets error {code:"revoked"} and closes 4001; the same token also 401s over HTTP', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id })
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const c = await makeWsClient(s.base, { token: login.json.token, cursor: 0 })
+  await c.waitFor((f) => f.op === 'hello_ok')
+  assert.equal(s.hub.connsOf(dan.id).length, 1)
+
+  // A normal frame still works fine before revocation (proves the per-frame
+  // device recheck doesn't itself break the happy path).
+  c.send({ op: 'viewing', convo_id: 'c1' })
+  await new Promise((r) => setTimeout(r, 50))
+  assert.equal(c.ws.readyState, 1)
+
+  // Revoke the device (what `matron-admin device revoke` does under the hood).
+  s.db.prepare('DELETE FROM devices WHERE id=?').run(login.json.device_id)
+
+  let closeCode = null
+  c.ws.on('close', (code) => { closeCode = code })
+  c.send({ op: 'viewing', convo_id: 'c1' })
+  await c.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'revoked')
+  await new Promise((r) => setTimeout(r, 100))
+  assert.equal(closeCode, 4001)
+  assert.equal(s.hub.connsOf(dan.id).length, 0, 'a revoked connection must be unregistered from the hub')
+
+  // HTTP handlers look up by token hash per request — the deleted row kills
+  // the token there too, with no separate revocation-list bookkeeping needed.
+  const httpAfter = await s.http('/snapshot', { token: login.json.token })
+  assert.equal(httpAfter.status, 401)
+})
+
 test('a socket that closes mid-replay is never left registered in the hub', async (t) => {
   // replayBackpressureBytes: -1 parks the replay loop in waitForDrain at the
   // first batch boundary indefinitely (bufferedAmount >= 0 is always > -1)

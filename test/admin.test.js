@@ -5,7 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { openDb } from '../src/db.js'
-import { authToken, createUser } from '../src/auth.js'
+import { authToken, createUser, createAgent, login } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
 import { runAdmin } from '../bin/matron-admin.js'
 
@@ -73,6 +73,37 @@ test('admin CLI: status prints per-device kind/cursor/lag/last_seen_at and db fi
 
   db.close()
   fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('admin CLI: device list and device revoke', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const s = await login(db, { username: 'dan', password: 'pw', deviceName: 'mac' })
+  const { token: agentToken, deviceId: agentDeviceId } = createAgent(db, dan.id, 'bridge')
+
+  await assert.rejects(runAdmin(db, ['device', 'list', 'ghost']), /no such user: ghost/)
+
+  const listOut = await runAdmin(db, ['device', 'list', 'dan'])
+  assert.match(listOut, new RegExp(`${s.deviceId} kind=client name=mac cursor=0 last_seen_at=`))
+  assert.match(listOut, new RegExp(`${agentDeviceId} kind=agent name=bridge cursor=0 last_seen_at=`))
+
+  await assert.rejects(runAdmin(db, ['device', 'revoke', '999999']), /no such device: 999999/)
+  await assert.rejects(runAdmin(db, ['device', 'revoke', 'not-a-number']), /usage/i)
+
+  const revokeOut = await runAdmin(db, ['device', 'revoke', String(agentDeviceId)])
+  assert.match(revokeOut, new RegExp(`device ${agentDeviceId} revoked`))
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM devices WHERE id=?').get(agentDeviceId).n, 0)
+  assert.equal(authToken(db, agentToken), null)
+
+  const listAfter = await runAdmin(db, ['device', 'list', 'dan'])
+  assert.ok(!listAfter.includes(`${agentDeviceId} kind=agent`))
+  assert.match(listAfter, new RegExp(`${s.deviceId} kind=client`)) // the un-revoked device is untouched
+
+  const noUser = await createUser(db, 'lonely', 'pw')
+  const noneOut = await runAdmin(db, ['device', 'list', 'lonely'])
+  assert.match(noneOut, /no devices/i)
+
+  db.close()
 })
 
 test('CLI entrypoint works directly and via symlink (npx-style)', () => {
