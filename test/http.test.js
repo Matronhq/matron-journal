@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { startTestServer } from './helpers.js'
-import { createUser } from '../src/auth.js'
+import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
 
 test('login → snapshot → pagination over HTTP', async (t) => {
@@ -30,6 +30,53 @@ test('login → snapshot → pagination over HTTP', async (t) => {
   await createUser(s.db, 'pat', 'pw')
   const pat = await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'x' } })
   assert.equal((await s.http('/convo/c1/messages', { token: pat.json.token })).status, 403)
+})
+
+test('POST /push/register: client devices can register/unregister an apns token; agents get 403', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'phone' } })
+  const token = login.json.token
+  const deviceId = login.json.device_id
+
+  const reg = await s.http('/push/register', { method: 'POST', token, body: { apns_token: 'abc123', environment: 'sandbox' } })
+  assert.equal(reg.status, 200)
+  let row = s.db.prepare('SELECT apns_token, apns_env FROM devices WHERE id=?').get(deviceId)
+  assert.equal(row.apns_token, 'abc123')
+  assert.equal(row.apns_env, 'sandbox')
+
+  // {apns_token: null} unregisters (both columns cleared)
+  const unreg = await s.http('/push/register', { method: 'POST', token, body: { apns_token: null } })
+  assert.equal(unreg.status, 200)
+  row = s.db.prepare('SELECT apns_token, apns_env FROM devices WHERE id=?').get(deviceId)
+  assert.equal(row.apns_token, null)
+  assert.equal(row.apns_env, null)
+
+  // bad environment -> 400, nothing stored
+  const badEnv = await s.http('/push/register', { method: 'POST', token, body: { apns_token: 'abc123', environment: 'staging' } })
+  assert.equal(badEnv.status, 400)
+  assert.deepEqual(badEnv.json, { error: 'bad_request' })
+
+  // missing/non-string apns_token -> 400
+  const missingToken = await s.http('/push/register', { method: 'POST', token, body: { environment: 'prod' } })
+  assert.equal(missingToken.status, 400)
+  const numericToken = await s.http('/push/register', { method: 'POST', token, body: { apns_token: 12345, environment: 'prod' } })
+  assert.equal(numericToken.status, 400)
+
+  // still unregistered after all the rejected attempts
+  row = s.db.prepare('SELECT apns_token, apns_env FROM devices WHERE id=?').get(deviceId)
+  assert.equal(row.apns_token, null)
+
+  // agent (kind='agent') devices are forbidden, not just unauthenticated
+  const ag = createAgent(s.db, dan.id, 'bridge')
+  const agentReg = await s.http('/push/register', { method: 'POST', token: ag.token, body: { apns_token: 'xyz', environment: 'prod' } })
+  assert.equal(agentReg.status, 403)
+  assert.deepEqual(agentReg.json, { error: 'forbidden' })
+
+  // no bearer token -> 401
+  const noAuth = await s.http('/push/register', { method: 'POST', body: { apns_token: 'x', environment: 'prod' } })
+  assert.equal(noAuth.status, 401)
 })
 
 test('login rate limit returns 429', async (t) => {
