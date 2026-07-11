@@ -18,6 +18,24 @@ export async function setPassword(db, name, password) {
   if (r.changes === 0) throw new Error(`no such user: ${name}`)
 }
 
+// POST /password's server-side logic: verify old_password against the REAL
+// hash unconditionally — unlike login() there's no user-enumeration oracle
+// to close here (Bearer auth already proves who's asking, and every caller
+// with a valid device token has a real password_hash row to verify
+// against), so no dummy-hash path is needed. Returns {ok:false} on a bad
+// old password rather than throwing, so http.js can map it to 401 cleanly.
+export async function changePassword(db, userId, { oldPassword, newPassword }) {
+  const user = db.prepare('SELECT password_hash FROM users WHERE id=?').get(userId)
+  // Defensive only: Bearer auth (authToken) already guarantees a devices row
+  // whose user_id references a real users row — this should be unreachable.
+  if (!user) return { ok: false }
+  const verified = await argon2.verify(user.password_hash, oldPassword)
+  if (!verified) return { ok: false }
+  const hash = await argon2.hash(newPassword, { type: argon2.argon2id })
+  db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hash, userId)
+  return { ok: true }
+}
+
 function issueDevice(db, userId, kind, name) {
   const token = newToken()
   const r = db.prepare(

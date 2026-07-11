@@ -92,6 +92,17 @@ Spec: docs/superpowers/specs/2026-07-10-matron-protocol-design.md
   APNs counters only exist in a running server's memory, so those are
   `/metrics`-only.
 
+- `POST /password` (Bearer, client devices only — agents get 403
+  `{error:'forbidden'}`): `{old_password, new_password}`. `old_password` is
+  always verified against the real argon2 hash (no shortcuts); a wrong one
+  is 401 `{error:'bad_password'}`. `new_password` must be a string of at
+  least 8 characters, otherwise 400 `{error:'weak_password'}`; a
+  missing/non-string `old_password` is 400 `{error:'bad_request'}`. On
+  success the user's hash is rotated to a fresh argon2id hash; **existing
+  device tokens (including the one used to make this request) stay valid**
+  — a password change does not revoke sessions, only the credential used to
+  mint new ones via `/login`.
+
 ## Push notifications (APNs)
 
 Direct HTTP/2 APNs (ES256 provider JWT, `node:http2` — no sygnal, no extra

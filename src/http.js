@@ -1,5 +1,5 @@
 import fs from 'node:fs'
-import { login, authToken } from './auth.js'
+import { login, authToken, changePassword } from './auth.js'
 import { snapshot, messagesBefore, toEventShape } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration } from './db.js'
 import { receiveBlob } from './media.js'
@@ -99,6 +99,17 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         if (typeof apns_token !== 'string' || !apns_token) return json(res, 400, { error: 'bad_request' })
         if (environment !== 'sandbox' && environment !== 'prod') return json(res, 400, { error: 'bad_request' })
         setApnsRegistration(db, who.deviceId, { apnsToken: apns_token, apnsEnv: environment })
+        return json(res, 200, { ok: true })
+      }
+      if (req.method === 'POST' && url.pathname === '/password') {
+        // Self-service change, client devices only — an agent (the bridge)
+        // never holds/knows a user's password.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const { old_password, new_password } = await readBody(req)
+        if (typeof old_password !== 'string' || !old_password) return json(res, 400, { error: 'bad_request' })
+        if (typeof new_password !== 'string' || new_password.length < 8) return json(res, 400, { error: 'weak_password' })
+        const r = await changePassword(db, who.userId, { oldPassword: old_password, newPassword: new_password })
+        if (!r.ok) return json(res, 401, { error: 'bad_password' })
         return json(res, 200, { ok: true })
       }
       const m = url.pathname.match(/^\/convo\/([^/]+)\/messages$/)
