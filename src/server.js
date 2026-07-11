@@ -1,5 +1,4 @@
 import http from 'node:http'
-import path from 'node:path'
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
@@ -9,8 +8,53 @@ import { makeHub } from './hub.js'
 import { attachWs } from './ws.js'
 import { makeApnsClient } from './apns.js'
 import { makePushPipeline } from './push.js'
+import { resolveMediaDir } from './media.js'
+import { runOffload } from './retention.js'
 
 const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
+const DEFAULT_RETENTION_DAYS = 30
+const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
+
+// `override` is startServer's `retentionDays` opt — when given (including
+// `0`), it wins outright (this is how tests disable/shrink the window
+// without touching process.env). Otherwise: unset env means ENABLED at the
+// 30-day default; `0` or anything that doesn't parse to a non-negative
+// integer disables it with one log line (an invalid value fails closed
+// rather than silently retaining everything forever).
+function resolveRetentionDays(override) {
+  if (override !== undefined) return override
+  const raw = process.env.MATRON_RETENTION_DAYS
+  if (raw === undefined) return DEFAULT_RETENTION_DAYS
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 0) {
+    console.warn(`retention: MATRON_RETENTION_DAYS=${JSON.stringify(raw)} is invalid — retention disabled`)
+    return null
+  }
+  return n
+}
+
+// Runs at boot (called after `server.listen` succeeds) and every 6h
+// thereafter (unref'd — never keeps the process alive on its own). Returns
+// the interval handle (for close()) or null when retention is disabled.
+function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs }) {
+  const days = resolveRetentionDays(retentionDays)
+  if (!days) {
+    if (days === 0) console.warn('retention: MATRON_RETENTION_DAYS=0 — retention disabled')
+    return null
+  }
+  const run = () => {
+    try {
+      const r = runOffload(db, { days, mediaDir })
+      if (r.offloaded > 0) console.log(`retention: offloaded ${r.offloaded} tool_output payload(s) older than ${days}d`)
+    } catch (err) {
+      console.error('retention: offload run failed', err)
+    }
+  }
+  run()
+  const interval = setInterval(run, retentionIntervalMs ?? RETENTION_INTERVAL_MS)
+  interval.unref()
+  return interval
+}
 
 // Direct APNs push is wired ONLY when all four MATRON_APNS_* vars are set
 // (same disabled-by-default pattern as the rest of the server); otherwise a
@@ -29,12 +73,15 @@ function resolveApnsClient(injected) {
   return { client: undefined, owned: false }
 }
 
-export function startServer({ dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, apnsClient, replayBackpressureBytes } = {}) {
+export function startServer({
+  dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, apnsClient, replayBackpressureBytes,
+  retentionDays, retentionIntervalMs,
+} = {}) {
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
   const db = openDb(resolvedDbPath)
   const rateLimiter = makeRateLimiter()
   const loginGuard = makeLoginGuard()
-  const resolvedMediaDir = mediaDir || process.env.MATRON_MEDIA_DIR || path.join(path.dirname(resolvedDbPath), 'media')
+  const resolvedMediaDir = resolveMediaDir(resolvedDbPath, mediaDir)
   const resolvedMediaMaxBytes = mediaMaxBytes ?? (process.env.MATRON_MEDIA_MAX_BYTES ? Number(process.env.MATRON_MEDIA_MAX_BYTES) : DEFAULT_MEDIA_MAX_BYTES)
   const server = http.createServer(makeHttpHandler({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
@@ -43,8 +90,10 @@ export function startServer({ dbPath, port = 0, bind = '127.0.0.1', mediaDir, me
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
   const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient })
   const wss = attachWs({ server, db, hub, pushPipeline, replayBackpressureBytes })
+  let retentionInterval = null
   return new Promise((resolve) => {
     server.listen(port, bind, () => {
+      retentionInterval = scheduleRetention(db, { mediaDir: resolvedMediaDir, retentionDays, retentionIntervalMs })
       resolve({
         port: server.address().port,
         db,
@@ -52,6 +101,7 @@ export function startServer({ dbPath, port = 0, bind = '127.0.0.1', mediaDir, me
         hub,
         pushPipeline,
         close: () => new Promise((r) => {
+          if (retentionInterval) clearInterval(retentionInterval)
           wss.close()
           for (const c of wss.clients) c.terminate()
           pushPipeline.close()

@@ -115,9 +115,24 @@ Per-device `apns_env` (`'sandbox'|'prod'`) exists because Xcode dev builds
 register sandbox tokens, which prod APNs answers with 400 `BadDeviceToken` —
 environment has to travel with the token, never be assumed from the topic.
 
+## Retention (payload offload)
+
+A scheduled job (runs at boot, then every 6h) offloads `tool_output` event
+payloads older than `MATRON_RETENTION_DAYS` (default 30) from the hot
+`events` table to blob files, leaving `{type:'tool_output', snippet,
+blob_ref}` in the row — journal replay carries that shape from then on, and
+clients fetch the full body via `GET /media/<blob_ref>` on demand. `journal`
+rows themselves are never deleted; only payloads move. Idempotent — a row
+already offloaded (or one whose payload already has the offloaded shape) is
+never reprocessed.
+
+`MATRON_RETENTION_DAYS=0`, or an unset/invalid value, disables retention
+(one warn log line at boot); any other non-negative integer sets the window
+in days. Manual run: `matron-admin offload [--days N]` (default 30).
+
 ## Test
 
     npm test
 
-Deferred to v1 completion: retention offload, /metrics, conformance fixtures
-(see the spec, §15 and plan docs).
+Deferred to v1 completion: conformance fixtures (see the spec, §15 and plan
+docs).
