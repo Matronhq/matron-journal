@@ -14,6 +14,31 @@ export function makeHub({ coalesceMs = 200 } = {}) {
     connsOf(userId) {
       return [...(byUser.get(userId) || [])]
     },
+    // Global connected-socket count across every user — a /metrics-only
+    // aggregate (no per-user scoping concern: it's just a number, not
+    // anyone's identity).
+    totalConnections() {
+      let n = 0
+      for (const set of byUser.values()) n += set.size
+      return n
+    },
+    // Every registered connection, across all users — the revocation
+    // sweep's input (see ws.js): it needs each conn's deviceId to compare
+    // against the devices table in one query.
+    allConns() {
+      const out = []
+      for (const set of byUser.values()) for (const c of set) out.push(c)
+      return out
+    },
+    // Per-device "is this device connected AND looking at this convo right
+    // now" — the push pipeline's suppression rule. conn.deviceId is already
+    // carried on every registered connection (see ws.js hello handling).
+    isViewing(userId, deviceId, convoId) {
+      for (const c of byUser.get(userId) || []) {
+        if (c.deviceId === deviceId && c.viewingConvoId === convoId && c.ws.readyState === 1) return true
+      }
+      return false
+    },
     broadcastJournal(userId, frame) {
       for (const c of byUser.get(userId) || []) {
         if (c.ws.readyState === 1) c.ws.send(JSON.stringify(frame))

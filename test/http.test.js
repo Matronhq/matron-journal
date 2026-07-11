@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { startTestServer } from './helpers.js'
-import { createUser } from '../src/auth.js'
+import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
 
 test('login → snapshot → pagination over HTTP', async (t) => {
@@ -29,7 +29,212 @@ test('login → snapshot → pagination over HTTP', async (t) => {
 
   await createUser(s.db, 'pat', 'pw')
   const pat = await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'x' } })
-  assert.equal((await s.http('/convo/c1/messages', { token: pat.json.token })).status, 403)
+  // Unauthorized and missing are indistinguishable: both 404, same body as
+  // GET /media/:id's unknown-id response — never 403 (that would leak that
+  // the convo id exists at all).
+  const forbidden = await s.http('/convo/c1/messages', { token: pat.json.token })
+  assert.equal(forbidden.status, 404)
+  assert.deepEqual(forbidden.json, { error: 'not_found' })
+  const unknown = await s.http('/convo/does-not-exist/messages', { token: ok.json.token })
+  assert.equal(unknown.status, 404)
+  assert.deepEqual(unknown.json, { error: 'not_found' })
+})
+
+test('GET /convo/:id/messages validates limit, before_seq, and percent-encoding', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id })
+  for (let i = 0; i < 5; i++) {
+    append(s.db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: `m${i}` } })
+  }
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const token = login.json.token
+
+  for (const limit of ['0', '-1', 'abc', '1.5', 'NaN']) {
+    const r = await s.http(`/convo/c1/messages?limit=${limit}`, { token })
+    assert.equal(r.status, 400, `limit=${limit} should be 400`)
+    assert.deepEqual(r.json, { error: 'bad_request' })
+  }
+  // over 200 is clamped, not rejected
+  const clamped = await s.http('/convo/c1/messages?limit=500', { token })
+  assert.equal(clamped.status, 200)
+  const atCap = await s.http('/convo/c1/messages?limit=200', { token })
+  assert.equal(atCap.status, 200)
+
+  for (const beforeSeq of ['abc', '1.5', 'Infinity']) {
+    const r = await s.http(`/convo/c1/messages?before_seq=${beforeSeq}`, { token })
+    assert.equal(r.status, 400, `before_seq=${beforeSeq} should be 400`)
+    assert.deepEqual(r.json, { error: 'bad_request' })
+  }
+  const validBeforeSeq = await s.http('/convo/c1/messages?before_seq=3', { token })
+  assert.equal(validBeforeSeq.status, 200)
+
+  // malformed percent-encoding in the convo id path segment
+  const badEncoding = await fetch(s.base + '/convo/%zz/messages', { headers: { authorization: `Bearer ${token}` } })
+  assert.equal(badEncoding.status, 400)
+  assert.deepEqual(await badEncoding.json(), { error: 'bad_request' })
+})
+
+test('POST /login and /push/register reject a non-object JSON body (null, array, bare primitive) with 400, not 500', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'pw')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const token = login.json.token
+
+  // Each /login attempt gets its own cf-connecting-ip so this loop doesn't
+  // trip the 5/min per-IP rate limiter (unrelated to what's under test here).
+  let nextIp = 1
+  const postRaw = (path, rawBody, tok) => fetch(s.base + path, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'cf-connecting-ip': `10.9.9.${nextIp++}`,
+      ...(tok ? { authorization: `Bearer ${tok}` } : {}),
+    },
+    body: rawBody,
+  })
+
+  for (const rawBody of ['null', '"a string"', '42', 'true', '[1,2,3]']) {
+    const r1 = await postRaw('/login', rawBody)
+    assert.equal(r1.status, 400, `/login body=${rawBody}`)
+    assert.deepEqual(await r1.json(), { error: 'bad_request' })
+
+    const r2 = await postRaw('/push/register', rawBody, token)
+    assert.equal(r2.status, 400, `/push/register body=${rawBody}`)
+    assert.deepEqual(await r2.json(), { error: 'bad_request' })
+  }
+  // genuinely malformed JSON syntax also 400s at the same shared guard, not 500
+  const r3 = await postRaw('/login', '{not json')
+  assert.equal(r3.status, 400)
+  assert.deepEqual(await r3.json(), { error: 'bad_request' })
+})
+
+test('an unexpected internal error responds 500 with a generic body only, no message leak, and the server stays up', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const mute = t.mock.method(console, 'error', () => {}) // the catch is expected to log; keep test output clean
+  s.db.exec('DROP TABLE conversations')
+  const r = await s.http('/snapshot', { token: login.json.token })
+  assert.equal(r.status, 500)
+  assert.deepEqual(r.json, { error: 'internal' })
+  assert.ok(mute.mock.callCount() >= 1, 'expected the error to be logged server-side')
+  // server keeps answering other requests after an internal error
+  assert.equal((await s.http('/snapshot', {})).status, 401)
+})
+
+test('login for an unknown username still gets the normal rejection, not a 500', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const r = await s.http('/login', { method: 'POST', body: { username: 'nobody-here', password: 'x', device_name: 'y' } })
+  assert.equal(r.status, 403)
+  assert.deepEqual(r.json, { error: 'bad_credentials' })
+})
+
+test('POST /push/register: client devices can register/unregister an apns token; agents get 403', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'phone' } })
+  const token = login.json.token
+  const deviceId = login.json.device_id
+
+  const reg = await s.http('/push/register', { method: 'POST', token, body: { apns_token: 'abc123', environment: 'sandbox' } })
+  assert.equal(reg.status, 200)
+  let row = s.db.prepare('SELECT apns_token, apns_env FROM devices WHERE id=?').get(deviceId)
+  assert.equal(row.apns_token, 'abc123')
+  assert.equal(row.apns_env, 'sandbox')
+
+  // {apns_token: null} unregisters (both columns cleared)
+  const unreg = await s.http('/push/register', { method: 'POST', token, body: { apns_token: null } })
+  assert.equal(unreg.status, 200)
+  row = s.db.prepare('SELECT apns_token, apns_env FROM devices WHERE id=?').get(deviceId)
+  assert.equal(row.apns_token, null)
+  assert.equal(row.apns_env, null)
+
+  // bad environment -> 400, nothing stored
+  const badEnv = await s.http('/push/register', { method: 'POST', token, body: { apns_token: 'abc123', environment: 'staging' } })
+  assert.equal(badEnv.status, 400)
+  assert.deepEqual(badEnv.json, { error: 'bad_request' })
+
+  // missing/non-string apns_token -> 400
+  const missingToken = await s.http('/push/register', { method: 'POST', token, body: { environment: 'prod' } })
+  assert.equal(missingToken.status, 400)
+  const numericToken = await s.http('/push/register', { method: 'POST', token, body: { apns_token: 12345, environment: 'prod' } })
+  assert.equal(numericToken.status, 400)
+
+  // still unregistered after all the rejected attempts
+  row = s.db.prepare('SELECT apns_token, apns_env FROM devices WHERE id=?').get(deviceId)
+  assert.equal(row.apns_token, null)
+
+  // agent (kind='agent') devices are forbidden, not just unauthenticated
+  const ag = createAgent(s.db, dan.id, 'bridge')
+  const agentReg = await s.http('/push/register', { method: 'POST', token: ag.token, body: { apns_token: 'xyz', environment: 'prod' } })
+  assert.equal(agentReg.status, 403)
+  assert.deepEqual(agentReg.json, { error: 'forbidden' })
+
+  // no bearer token -> 401
+  const noAuth = await s.http('/push/register', { method: 'POST', body: { apns_token: 'x', environment: 'prod' } })
+  assert.equal(noAuth.status, 401)
+})
+
+test('POST /password: happy path, all three rejects, agent 403, and the old device token stays valid after change', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'hunter22')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'hunter22', device_name: 'mac' } })
+  const token = login.json.token
+
+  // missing/non-string old_password -> 400 bad_request, nothing changed
+  const noOld = await s.http('/password', { method: 'POST', token, body: { new_password: 'newlongpw1' } })
+  assert.equal(noOld.status, 400)
+  assert.deepEqual(noOld.json, { error: 'bad_request' })
+
+  // weak/missing new_password -> 400 weak_password
+  const weak = await s.http('/password', { method: 'POST', token, body: { old_password: 'hunter22', new_password: 'short' } })
+  assert.equal(weak.status, 400)
+  assert.deepEqual(weak.json, { error: 'weak_password' })
+  const missingNew = await s.http('/password', { method: 'POST', token, body: { old_password: 'hunter22' } })
+  assert.equal(missingNew.status, 400)
+  assert.deepEqual(missingNew.json, { error: 'weak_password' })
+
+  // wrong old_password -> 401, after a real verify (not an oracle shortcut)
+  const badOld = await s.http('/password', { method: 'POST', token, body: { old_password: 'nope-wrong', new_password: 'newlongpw1' } })
+  assert.equal(badOld.status, 401)
+  assert.deepEqual(badOld.json, { error: 'bad_password' })
+
+  // agent tokens are forbidden outright, even with valid old/new passwords
+  const ag = createAgent(s.db, dan.id, 'bridge')
+  const agentAttempt = await s.http('/password', { method: 'POST', token: ag.token, body: { old_password: 'hunter22', new_password: 'newlongpw1' } })
+  assert.equal(agentAttempt.status, 403)
+  assert.deepEqual(agentAttempt.json, { error: 'forbidden' })
+
+  // no bearer token -> 401
+  const noAuth = await s.http('/password', { method: 'POST', body: { old_password: 'hunter22', new_password: 'newlongpw1' } })
+  assert.equal(noAuth.status, 401)
+
+  // none of the rejects actually changed the password
+  const stillOld = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'hunter22', device_name: 'x' } })
+  assert.equal(stillOld.status, 200)
+
+  // happy path
+  const ok = await s.http('/password', { method: 'POST', token, body: { old_password: 'hunter22', new_password: 'newlongpw1' } })
+  assert.equal(ok.status, 200)
+  assert.deepEqual(ok.json, { ok: true })
+
+  // the old password no longer logs in, the new one does
+  const oldFails = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'hunter22', device_name: 'x' } })
+  assert.equal(oldFails.status, 403)
+  const newWorks = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'newlongpw1', device_name: 'x' } })
+  assert.equal(newWorks.status, 200)
+
+  // the device token used to change the password stays valid (documented:
+  // existing device tokens are unaffected by a password change)
+  const stillAuthed = await s.http('/snapshot', { token })
+  assert.equal(stillAuthed.status, 200)
 })
 
 test('login rate limit returns 429', async (t) => {

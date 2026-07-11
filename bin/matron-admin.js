@@ -1,13 +1,18 @@
 #!/usr/bin/env node
-import { realpathSync } from 'node:fs'
+import fs, { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { openDb } from '../src/db.js'
-import { createUser, setPassword, createAgent } from '../src/auth.js'
+import { createUser, setPassword, createAgent, revokeDevice } from '../src/auth.js'
+import { resolveMediaDir } from '../src/media.js'
+import { runOffload } from '../src/retention.js'
 
 const USAGE = `usage:
   matron-admin user add <name> --password <pw>
   matron-admin user passwd <name> --password <pw>
   matron-admin agent add <username> <agent-name>
+  matron-admin device list <username>
+  matron-admin device revoke <device_id>
+  matron-admin offload [--days N]
   matron-admin status`
 
 function flag(argv, name) {
@@ -39,17 +44,71 @@ export async function runAdmin(db, argv) {
     const { token } = createAgent(db, user.id, agentName)
     return `agent ${agentName} token: ${token}\n(store in the bridge credentials file; it is not shown again)`
   }
+  if (a === 'device' && b === 'list') {
+    const username = argv[2]
+    if (!username) throw new Error(USAGE)
+    const user = db.prepare('SELECT id FROM users WHERE name=?').get(username)
+    if (!user) throw new Error(`no such user: ${username}`)
+    const devices = db.prepare('SELECT id, kind, name, cursor, last_seen_at FROM devices WHERE user_id=? ORDER BY id').all(user.id)
+    if (devices.length === 0) return `no devices for ${username}`
+    return devices.map((d) => `${d.id} kind=${d.kind} name=${d.name} cursor=${d.cursor} last_seen_at=${d.last_seen_at ?? 'never'}`).join('\n')
+  }
+  // Spec §8: "Revocation: delete the device/agent row; its socket is closed
+  // on next frame." This just deletes the row — WS enforcement (the
+  // per-frame device recheck) and HTTP (token-hash lookup per request) both
+  // key off that row existing, so deleting it is the entire revocation.
+  if (a === 'device' && b === 'revoke') {
+    const deviceId = Number(argv[2])
+    if (!Number.isInteger(deviceId)) throw new Error(USAGE)
+    const existing = db.prepare('SELECT id FROM devices WHERE id=?').get(deviceId)
+    if (!existing) throw new Error(`no such device: ${deviceId}`)
+    revokeDevice(db, deviceId)
+    return `device ${deviceId} revoked`
+  }
+  if (a === 'offload') {
+    const daysFlag = flag(argv, '--days')
+    const days = daysFlag != null ? Number(daysFlag) : 30
+    // Matches the env-var semantics elsewhere (MATRON_RETENTION_DAYS /
+    // MATRON_MAX_REPLAY / MATRON_MEDIA_MAX_BYTES): a non-integer or <=0
+    // value is a misconfiguration, not "process everything now". `--days 0`
+    // (or negative/garbage) would otherwise compute a cutoff of now (or the
+    // future), offloading every tool_output row including brand-new ones —
+    // refuse outright instead of silently doing that on a one-shot CLI run.
+    if (!Number.isInteger(days) || days <= 0) {
+      throw new Error(`${USAGE}\n\n--days must be a positive integer (got ${JSON.stringify(daysFlag)})`)
+    }
+    const mediaDir = resolveMediaDir(db.name)
+    const r = runOffload(db, { days, mediaDir })
+    return `offloaded ${r.offloaded} tool_output payload(s) older than ${days}d`
+  }
   if (a === 'status') {
+    // DB-derived stats only (this reads the SQLite file directly, no
+    // running server involved) — connected-socket count and APNs counters
+    // live in server-process memory and are only available via the running
+    // server's GET /metrics, not here.
     const rows = db.prepare(
-      `SELECT u.name,
+      `SELECT u.id, u.name,
          (SELECT COUNT(*) FROM devices d WHERE d.user_id=u.id AND d.kind='client') AS devices,
          (SELECT COUNT(*) FROM devices d WHERE d.user_id=u.id AND d.kind='agent') AS agents,
          COALESCE((SELECT seq FROM user_seq s WHERE s.user_id=u.id), 0) AS head_seq
        FROM users u ORDER BY u.name`
     ).all()
+    const lines = []
+    for (const r of rows) {
+      lines.push(`${r.name} devices=${r.devices} agents=${r.agents} head_seq=${r.head_seq}`)
+      const devices = db.prepare('SELECT id, kind, cursor, last_seen_at FROM devices WHERE user_id=? ORDER BY id').all(r.id)
+      for (const d of devices) {
+        lines.push(`  device ${d.id} kind=${d.kind} cursor=${d.cursor} lag=${r.head_seq - d.cursor} last_seen_at=${d.last_seen_at ?? 'never'}`)
+      }
+    }
     const total = db.prepare('SELECT COUNT(*) n FROM events').get().n
-    return rows.map((r) => `${r.name} devices=${r.devices} agents=${r.agents} head_seq=${r.head_seq}`)
-      .concat(`total events: ${total}`).join('\n')
+    lines.push(`total events: ${total}`)
+    let dbSize = 'n/a'
+    try {
+      if (db.name && db.name !== ':memory:') dbSize = fs.statSync(db.name).size
+    } catch { /* file missing/unreadable — report n/a rather than crash the CLI */ }
+    lines.push(`db file size: ${dbSize}`)
+    return lines.join('\n')
   }
   throw new Error(USAGE)
 }
