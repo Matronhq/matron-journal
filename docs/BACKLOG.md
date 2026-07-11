@@ -8,7 +8,11 @@ a Cloudflare tunnel, bridge agents are trusted first-party code.
 ## Deferred spec features (plan follows spec §14/§15)
 
 - Media upload/download (`POST /media`, `GET /media/:id`) with authorize on reads
-- APNs push (direct HTTP/2 with the existing .p8; collapse-id coalescing; §9 rules)
+- APNs push (direct HTTP/2 with the existing .p8; collapse-id coalescing; §9 rules).
+  Lessons from sygnal's dead tokens (2026-07-11): store the APNs environment
+  (sandbox vs prod) per device — Xcode dev builds register sandbox tokens that
+  prod APNs rejects as 400 BadDeviceToken — and prune device tokens on 410
+  Unregistered instead of retrying them forever.
 - Retention/offload job (tool_output payloads → blob files after window)
 - `/metrics` (or `matron-admin status` extension): per-device cursor lag, socket counts, head seq
 - Golden conformance fixtures (shared with the Matron Swift client's CI)
