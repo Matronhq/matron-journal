@@ -181,6 +181,62 @@ test('POST /push/register: client devices can register/unregister an apns token;
   assert.equal(noAuth.status, 401)
 })
 
+test('POST /password: happy path, all three rejects, agent 403, and the old device token stays valid after change', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'hunter22')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'hunter22', device_name: 'mac' } })
+  const token = login.json.token
+
+  // missing/non-string old_password -> 400 bad_request, nothing changed
+  const noOld = await s.http('/password', { method: 'POST', token, body: { new_password: 'newlongpw1' } })
+  assert.equal(noOld.status, 400)
+  assert.deepEqual(noOld.json, { error: 'bad_request' })
+
+  // weak/missing new_password -> 400 weak_password
+  const weak = await s.http('/password', { method: 'POST', token, body: { old_password: 'hunter22', new_password: 'short' } })
+  assert.equal(weak.status, 400)
+  assert.deepEqual(weak.json, { error: 'weak_password' })
+  const missingNew = await s.http('/password', { method: 'POST', token, body: { old_password: 'hunter22' } })
+  assert.equal(missingNew.status, 400)
+  assert.deepEqual(missingNew.json, { error: 'weak_password' })
+
+  // wrong old_password -> 401, after a real verify (not an oracle shortcut)
+  const badOld = await s.http('/password', { method: 'POST', token, body: { old_password: 'nope-wrong', new_password: 'newlongpw1' } })
+  assert.equal(badOld.status, 401)
+  assert.deepEqual(badOld.json, { error: 'bad_password' })
+
+  // agent tokens are forbidden outright, even with valid old/new passwords
+  const ag = createAgent(s.db, dan.id, 'bridge')
+  const agentAttempt = await s.http('/password', { method: 'POST', token: ag.token, body: { old_password: 'hunter22', new_password: 'newlongpw1' } })
+  assert.equal(agentAttempt.status, 403)
+  assert.deepEqual(agentAttempt.json, { error: 'forbidden' })
+
+  // no bearer token -> 401
+  const noAuth = await s.http('/password', { method: 'POST', body: { old_password: 'hunter22', new_password: 'newlongpw1' } })
+  assert.equal(noAuth.status, 401)
+
+  // none of the rejects actually changed the password
+  const stillOld = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'hunter22', device_name: 'x' } })
+  assert.equal(stillOld.status, 200)
+
+  // happy path
+  const ok = await s.http('/password', { method: 'POST', token, body: { old_password: 'hunter22', new_password: 'newlongpw1' } })
+  assert.equal(ok.status, 200)
+  assert.deepEqual(ok.json, { ok: true })
+
+  // the old password no longer logs in, the new one does
+  const oldFails = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'hunter22', device_name: 'x' } })
+  assert.equal(oldFails.status, 403)
+  const newWorks = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'newlongpw1', device_name: 'x' } })
+  assert.equal(newWorks.status, 200)
+
+  // the device token used to change the password stays valid (documented:
+  // existing device tokens are unaffected by a password change)
+  const stillAuthed = await s.http('/snapshot', { token })
+  assert.equal(stillAuthed.status, 200)
+})
+
 test('login rate limit returns 429', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())
