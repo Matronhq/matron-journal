@@ -5,6 +5,7 @@ import { makeHub } from '../src/hub.js'
 import { makePushPipeline } from '../src/push.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
+import { handleOp } from '../src/ws.js'
 import { startTestServer, makeWsClient } from './helpers.js'
 
 // A stub apnsClient recording every send() call. `respond` maps a call to a
@@ -103,6 +104,31 @@ test('type mapping: prompt/permission_request and session_status:done push prior
   assert.equal(routine.priority, 5)
   assert.equal(routine.pushType, 'alert')
   assert.equal(routine.collapseId, 'c1')
+})
+
+test('convo_meta and non-done session_status never push at all (no alert, no background)', async (t) => {
+  const { db, dan, stub, pipeline } = await setup(t, { coalesceMs: 30 })
+  registerDevice(db, dan.id, 'phone')
+
+  const send = (type, payload) => {
+    const r = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type, payload })
+    pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type, payload }, null)
+  }
+
+  send('convo_meta', { title: 'renamed while you were away' })
+  send('session_status', { state: 'running' })
+  send('session_status', { state: 'waiting' })
+  // Long enough for both an immediate send AND a would-be trailing
+  // coalesced push to have fired if these were (wrongly) classified routine.
+  await new Promise((res) => setTimeout(res, 80))
+  assert.equal(stub.calls.length, 0, 'convo_meta / non-done session_status are journal-sync material, not notifications')
+
+  // ...and they must not have claimed the coalescing slot either: a real
+  // routine event right after still gets its immediate leading push.
+  send('text', { body: 'actual content' })
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(stub.calls.length, 1)
+  assert.equal(stub.calls[0].payload.aps.alert.body, 'actual content')
 })
 
 test('alert body: title falls back to convo id, body is the event snippet, badge is the owner unread sum', async (t) => {
@@ -227,6 +253,30 @@ test('coalescing: a burst of routine events within the window collapses to exact
   assert.equal(stub.calls[1].payload.aps.alert.body, 'e4')
 })
 
+test('coalescing state is evicted once a (device, convo) pair goes idle', async (t) => {
+  const { db, dan, stub, pipeline } = await setup(t, { coalesceMs: 40 })
+  registerDevice(db, dan.id, 'phone')
+  const send = (body) => {
+    const r = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body } })
+    pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body } }, null)
+  }
+
+  send('first')
+  assert.equal(pipeline._coalesceState.size, 1, 'a leading send should latch coalescing state for its window')
+
+  // Once the window elapses with nothing pending, the entry must be evicted —
+  // otherwise every (device, convo) pair ever pushed to accumulates forever.
+  await new Promise((res) => setTimeout(res, 120))
+  assert.equal(pipeline._coalesceState.size, 0, 'idle coalescing entries must be evicted, not retained forever')
+
+  // A later event on the same pair behaves like a fresh idle pair: immediate
+  // leading push again.
+  send('after idle')
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(stub.calls.length, 2)
+  assert.equal(stub.calls[1].payload.aps.alert.body, 'after idle')
+})
+
 test('read_marker triggers a background badge-clearing push to other devices, never back to the originating device', async (t) => {
   const { db, dan, stub, pipeline } = await setup(t)
   const originDeviceId = registerDevice(db, dan.id, 'origin-phone')
@@ -292,6 +342,44 @@ test('counters track sent and failed pushes', async (t) => {
   assert.equal(pipeline.counters.byReason.InternalServerError, 1)
 })
 
+test('a pipeline that throws in onAppend never surfaces an error frame after a successful append', async (t) => {
+  const db = openDb(':memory:')
+  const hub = makeHub()
+  const dan = await createUser(db, 'dan', 'pw')
+  upsertConversation(db, { id: 'c1', ownerUserId: dan.id })
+
+  // The publishing agent connection: capture everything sent back to it.
+  const agentFrames = []
+  const agentConn = {
+    ws: { readyState: 1, send: (s) => agentFrames.push(JSON.parse(s)) },
+    userId: dan.id, deviceId: 7, kind: 'agent', name: 'dev-2', viewingConvoId: null, registered: true,
+  }
+  // A second (client) connection registered with the hub, to prove the
+  // broadcast itself still went out despite the pipeline blowing up.
+  const clientFrames = []
+  const clientConn = {
+    ws: { readyState: 1, send: (s) => clientFrames.push(JSON.parse(s)) },
+    userId: dan.id, deviceId: 8, viewingConvoId: null,
+  }
+  hub.register(clientConn)
+  t.after(() => hub.unregister(clientConn))
+
+  const throwingPipeline = { onAppend() { throw new Error('pipeline boom') } }
+  const mute = t.mock.method(console, 'error', () => {}) // the catch is expected to log
+
+  assert.doesNotThrow(() => handleOp({
+    db, hub, conn: agentConn, pushPipeline: throwingPipeline,
+    msg: { op: 'publish', convo_id: 'c1', type: 'text', payload: { body: 'still lands' } },
+  }))
+
+  // The append landed and was broadcast normally...
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM events WHERE type='text'").get().n, 1)
+  assert.equal(clientFrames.filter((f) => f.kind === 'journal' && f.type === 'text').length, 1)
+  // ...and the publisher got no spurious error frame for its successful op.
+  assert.deepEqual(agentFrames.filter((f) => f.kind === 'control' && f.op === 'error'), [])
+  assert.ok(mute.mock.callCount() >= 1, 'the swallowed pipeline error should still be logged')
+})
+
 test('end-to-end wiring: real WS ops reach the push pipeline through both ws.js fanOut call sites', async (t) => {
   const stub = makeStubApnsClient()
   const s = await startTestServer({ apnsClient: stub })
@@ -305,20 +393,20 @@ test('end-to-end wiring: real WS ops reach the push pipeline through both ws.js 
 
   const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
   await agent.waitFor((f) => f.op === 'hello_ok')
-  // No title here deliberately: a titled convo_upsert would itself fan out a
-  // convo_meta event and claim the leading (immediate) coalescing slot for
-  // this (device, convo) pair, pushing the `publish` below into a ~10s
-  // trailing timer this test isn't waiting for.
-  agent.send({ op: 'convo_upsert', convo_id: 'wire-1' })
+  // The titled upsert fans out a convo_meta event — which must NOT push (and
+  // must not claim the coalescing slot); only the text publish below does.
+  agent.send({ op: 'convo_upsert', convo_id: 'wire-1', title: 'wiring test' })
   agent.send({ op: 'publish', convo_id: 'wire-1', type: 'text', payload: { body: 'hello from agent' } })
   await agent.waitFor((f) => f.kind === 'journal' && f.type === 'text')
   await new Promise((res) => setTimeout(res, 50))
 
   // appendAndFan choke point: the agent's publish reached the pipeline and
-  // pushed to the registered-but-disconnected phone device.
+  // pushed to the registered-but-disconnected phone device — exactly once
+  // (the convo_meta from the titled upsert produced no push of its own).
   const publishCalls = stub.calls.filter((c) => c.deviceToken === 'phone-token' && c.payload.aps.alert)
   assert.equal(publishCalls.length, 1)
   assert.equal(publishCalls[0].payload.aps.alert.body, 'hello from agent')
+  assert.equal(publishCalls[0].payload.aps.alert.title, 'wiring test')
 
   // Second device, registered but never connected — read_marker's fanOut
   // call site (which bypasses appendAndFan entirely) must be wired too.
