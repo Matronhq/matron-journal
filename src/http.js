@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import { login, authToken } from './auth.js'
 import { snapshot, messagesBefore, toEventShape } from './journal.js'
-import { insertBlob, getBlob } from './db.js'
+import { insertBlob, getBlob, setApnsRegistration } from './db.js'
 import { receiveBlob } from './media.js'
 
 const json = (res, status, obj) => {
@@ -61,6 +61,21 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       if (!who) return json(res, 401, { error: 'unauthenticated' })
       if (req.method === 'GET' && url.pathname === '/snapshot') {
         return json(res, 200, snapshot(db, who.userId))
+      }
+      if (req.method === 'POST' && url.pathname === '/push/register') {
+        // Only client devices carry push tokens — agents run on the dev box
+        // itself and are never pushed to.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const body = await readBody(req)
+        const { apns_token, environment } = body
+        if (apns_token === null) {
+          setApnsRegistration(db, who.deviceId, { apnsToken: null, apnsEnv: null })
+          return json(res, 200, { ok: true })
+        }
+        if (typeof apns_token !== 'string' || !apns_token) return json(res, 400, { error: 'bad_request' })
+        if (environment !== 'sandbox' && environment !== 'prod') return json(res, 400, { error: 'bad_request' })
+        setApnsRegistration(db, who.deviceId, { apnsToken: apns_token, apnsEnv: environment })
+        return json(res, 200, { ok: true })
       }
       const m = url.pathname.match(/^\/convo\/([^/]+)\/messages$/)
       if (req.method === 'GET' && m) {

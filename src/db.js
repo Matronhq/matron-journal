@@ -64,6 +64,13 @@ export function openDb(path) {
   db.pragma('journal_mode = WAL')
   db.pragma('foreign_keys = ON')
   db.exec(SCHEMA)
+  // The live DB on dev-2 predates apns_env (only apns_token existed) — in-place
+  // migration, never a destructive rebuild. Sygnal lesson: environment
+  // ('sandbox'|'prod') has to be tracked per device, not assumed from topic.
+  const deviceCols = db.prepare('PRAGMA table_info(devices)').all()
+  if (!deviceCols.some((c) => c.name === 'apns_env')) {
+    db.exec('ALTER TABLE devices ADD COLUMN apns_env TEXT')
+  }
   return db
 }
 
@@ -75,4 +82,30 @@ export function insertBlob(db, { id, ownerUserId, contentType, size, sha256, dis
 
 export function getBlob(db, id) {
   return db.prepare('SELECT * FROM blobs WHERE id=?').get(id)
+}
+
+// `apnsToken: null` unregisters (both columns cleared together — a token
+// without a known environment is unsendable, so they're always set/cleared
+// as a pair).
+export function setApnsRegistration(db, deviceId, { apnsToken, apnsEnv }) {
+  db.prepare('UPDATE devices SET apns_token=?, apns_env=? WHERE id=?').run(apnsToken, apnsEnv, deviceId)
+}
+
+// Called by the push pipeline on a 410 Unregistered response — the token is
+// dead, so stop trying it rather than retrying forever (sygnal lesson).
+export function pruneApnsToken(db, deviceId) {
+  db.prepare('UPDATE devices SET apns_token=NULL, apns_env=NULL WHERE id=?').run(deviceId)
+}
+
+// Client devices (never agent — agents are never pushed to) with a
+// registered token, for the push pipeline to fan a journal event out to.
+export function clientDevicesForPush(db, userId) {
+  return db.prepare(
+    "SELECT id, apns_token, apns_env, cursor FROM devices WHERE user_id=? AND kind='client' AND apns_token IS NOT NULL"
+  ).all(userId)
+}
+
+// The unread badge = SUM(unread_count) over the owner's conversations.
+export function unreadBadge(db, userId) {
+  return db.prepare('SELECT COALESCE(SUM(unread_count),0) AS n FROM conversations WHERE owner_user_id=?').get(userId).n
 }

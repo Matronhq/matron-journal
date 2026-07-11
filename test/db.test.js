@@ -1,5 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import Database from 'better-sqlite3'
 import { openDb } from '../src/db.js'
 
 test('openDb creates schema idempotently', () => {
@@ -22,4 +26,41 @@ test('events PK is (user_id, seq)', () => {
   )
   ins.run()
   assert.throws(() => ins.run(), /UNIQUE|PRIMARY/)
+})
+
+test('openDb migrates a pre-apns_env devices table in place (live-DB upgrade path)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-migration-'))
+  const dbPath = path.join(dir, 'pre-migration.db')
+
+  const raw = new Database(dbPath)
+  raw.exec(`
+    CREATE TABLE devices(
+      id INTEGER PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      cursor INTEGER NOT NULL DEFAULT 0,
+      apns_token TEXT,
+      created_at INTEGER NOT NULL,
+      last_seen_at INTEGER
+    );
+  `)
+  raw.prepare(
+    "INSERT INTO devices(id, user_id, kind, name, token_hash, apns_token, created_at) VALUES(1,1,'client','phone','hash','pre-existing-token',0)"
+  ).run()
+  raw.close()
+
+  const db = openDb(dbPath)
+  const cols = db.prepare('PRAGMA table_info(devices)').all().map((c) => c.name)
+  assert.ok(cols.includes('apns_env'), 'apns_env column missing after migration')
+  // Pre-existing row survives untouched, with apns_env now NULL rather than
+  // the row being wiped or rebuilt.
+  const row = db.prepare('SELECT apns_token, apns_env FROM devices WHERE id=1').get()
+  assert.equal(row.apns_token, 'pre-existing-token')
+  assert.equal(row.apns_env, null)
+  db.close()
+
+  // Re-opening again (schema already migrated) must be a no-op, not an error.
+  assert.doesNotThrow(() => openDb(dbPath).close())
 })
