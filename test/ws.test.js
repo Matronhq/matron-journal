@@ -211,13 +211,16 @@ test('read_marker requires up_to_seq to be null or a non-negative integer', asyn
   c.close()
 })
 
-test('hello with a non-integer, non-null cursor gets a bad_request error frame and the socket is closed', async (t) => {
+test('hello with a non-integer, non-null, or negative cursor gets a bad_request error frame and the socket is closed', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())
   await createUser(s.db, 'dan', 'pw')
   const l = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
 
-  for (const badCursor of ['abc', 1.5, {}, []]) {
+  // Negative integers alongside the pre-existing non-integer/non-null cases:
+  // `ack` already rejects a negative cursor (msg.cursor < 0) — hello's own
+  // cursor validation must be just as strict, not just "is it an integer".
+  for (const badCursor of ['abc', 1.5, {}, [], -1, -5]) {
     const raw = new (await import('ws')).default(s.base.replace('http', 'ws') + '/ws')
     await new Promise((r) => raw.on('open', r))
     const frames = []
