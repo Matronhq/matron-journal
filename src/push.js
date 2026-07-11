@@ -4,12 +4,20 @@ import { clientDevicesForPush, pruneApnsToken, unreadBadge } from './db.js'
 // Min gap between routine (priority-5) pushes to the same (device, convo).
 const ROUTINE_COALESCE_MS = 10000
 
+// Returns null for event types that must not push at all. Product call
+// (dispatcher decision): convo_meta (a title rename) and session_status with
+// state != 'done' (running/waiting flips) are journal-sync material — every
+// connected device learns them from the journal frame, and nothing about
+// them warrants buzzing a pocket. prompt/permission_request already cover
+// "the session needs you", and the 'done' alert stays.
 function classify(type, payload) {
   if (type === 'prompt' || type === 'permission_request') return { priority: 10, coalesce: false }
-  if (type === 'session_status' && payload && payload.state === 'done') return { priority: 10, coalesce: false }
-  // Everything else routine: text/tool_output/diff/convo_meta/prompt_reply/
-  // non-done session_status/etc. — batched so a busy session is one updating
-  // notification, not hundreds.
+  if (type === 'session_status') {
+    return payload && payload.state === 'done' ? { priority: 10, coalesce: false } : null
+  }
+  if (type === 'convo_meta') return null
+  // Routine content: text/tool_output/diff/prompt_reply/file/image/etc. —
+  // batched so a busy session is one updating notification, not hundreds.
   return { priority: 5, coalesce: true }
 }
 
@@ -23,7 +31,7 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
   // Coalescing state lives in memory only, keyed by `${deviceId}:${convoId}`.
   // A process restart loses any pending trailing push — acceptable for v1;
   // the next routine event after restart just does a fresh leading-edge
-  // send since there's no recorded lastSentAt for it.
+  // send since no window is latched for it.
   const coalesceState = new Map()
 
   const bumpReason = (key) => { counters.byReason[key] = (counters.byReason[key] || 0) + 1 }
@@ -51,46 +59,59 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
 
   function doSend(device, opts) {
     // Fire and forget from the caller's perspective: apnsClient.send() is
-    // documented to never reject, but the .catch() is a backstop so a bug
-    // there can never leak an unhandled rejection out of the push pipeline.
-    Promise.resolve(apnsClient.send({ deviceToken: device.apns_token, env: device.apns_env, ...opts }))
-      .then((result) => handleResult(device, result))
-      .catch((err) => {
-        counters.failed += 1
-        bumpReason('internal')
-        console.error('apns: send threw unexpectedly', err)
-      })
+    // documented to never reject, but the .catch() (and the sync try/catch —
+    // doSend is also called from timer callbacks, where an escaped throw
+    // would crash the process) are backstops so a bug there can never leak
+    // an unhandled rejection or exception out of the push pipeline.
+    try {
+      Promise.resolve(apnsClient.send({ deviceToken: device.apns_token, env: device.apns_env, ...opts }))
+        .then((result) => handleResult(device, result))
+        .catch((err) => {
+          counters.failed += 1
+          bumpReason('internal')
+          console.error('apns: send threw unexpectedly', err)
+        })
+    } catch (err) {
+      counters.failed += 1
+      bumpReason('internal')
+      console.error('apns: send threw synchronously', err)
+    }
   }
 
   // Trailing-edge coalescing with a leading send when idle: the first
-  // routine event for a (device, convo) pair sends immediately; further
-  // routine events within `coalesceMs` are held (latest wins) and flushed
-  // once as a single trailing push when the window elapses.
+  // routine event for a (device, convo) pair sends immediately and latches
+  // a window; further routine events within `coalesceMs` are held (latest
+  // wins) and flushed once as a single trailing push when the window
+  // elapses. Invariant: an entry exists in coalesceState iff its window
+  // timer is armed — a timer that fires with nothing pending evicts the
+  // entry, so the map never grows unboundedly across (device, convo) pairs.
   function scheduleRoutine(device, convoId, buildOpts) {
     const key = `${device.id}:${convoId}`
-    const now = Date.now()
-    let state = coalesceState.get(key)
-    if (!state) { state = { lastSentAt: 0, timer: null, pendingBuild: null }; coalesceState.set(key, state) }
-
-    if (!state.timer && now - state.lastSentAt >= coalesceMs) {
-      state.lastSentAt = now
-      doSend(device, buildOpts())
+    const state = coalesceState.get(key)
+    if (state) {
+      state.pendingBuild = buildOpts // within the window: latest wins
       return
     }
-    state.pendingBuild = buildOpts // latest wins
-    if (!state.timer) {
-      const delay = Math.max(coalesceMs - (now - state.lastSentAt), 0)
-      state.timer = setTimeout(() => {
-        state.timer = null
-        state.lastSentAt = Date.now()
-        const build = state.pendingBuild
-        state.pendingBuild = null
-        if (build) doSend(device, build())
-      }, delay)
-      // Never keep the process alive for a pending trailing push; the state
-      // is memory-only anyway (see comment above coalesceState).
-      state.timer.unref()
-    }
+    const fresh = { timer: null, pendingBuild: null }
+    coalesceState.set(key, fresh)
+    doSend(device, buildOpts()) // idle: leading send
+    armWindow(key, fresh, device)
+  }
+
+  function armWindow(key, state, device) {
+    state.timer = setTimeout(() => {
+      const build = state.pendingBuild
+      state.pendingBuild = null
+      if (build) {
+        doSend(device, build()) // trailing push, then a fresh window
+        armWindow(key, state, device)
+      } else {
+        coalesceState.delete(key) // idle window: evict
+      }
+    }, coalesceMs)
+    // Never keep the process alive for a pending trailing push; the state
+    // is memory-only anyway (see comment above coalesceState).
+    state.timer.unref()
   }
 
   function onAppend(userId, event, originDeviceId) {
@@ -116,6 +137,7 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     }
 
     const cls = classify(event.type, event.payload)
+    if (!cls) return // journal-sync-only type (convo_meta, non-done session_status)
     const title = convo.title || convo.id
     const body = snippetOf(event.type, event.payload)
     for (const device of devices) {
@@ -143,5 +165,7 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     coalesceState.clear()
   }
 
-  return { onAppend, counters, close }
+  // _coalesceState is exposed for tests (eviction assertions) and as a
+  // cheap gauge candidate for Task 5's /metrics; not part of the public API.
+  return { onAppend, counters, close, _coalesceState: coalesceState }
 }

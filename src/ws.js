@@ -99,11 +99,18 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline }
     conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code, ref: msg.op, ...(detail ? { detail } : {}) }))
   // Single choke point: every journal event becomes a WS frame AND (fire and
   // forget) a candidate push, right here — nowhere else calls
-  // hub.broadcastJournal for a freshly-appended event. pushPipeline.onAppend
-  // never throws and is not awaited; it does its own async error handling.
+  // hub.broadcastJournal for a freshly-appended event. The push pipeline runs
+  // strictly after the append+broadcast have succeeded, so a failure inside
+  // it is a server-side delivery concern only — swallow and log rather than
+  // letting it bubble up and surface as a spurious {op:'error'} frame for an
+  // op that, from the client's perspective, already succeeded.
   const fanOut = (frame) => {
     hub.broadcastJournal(conn.userId, frame)
-    pushPipeline.onAppend(conn.userId, frame, conn.deviceId)
+    try {
+      pushPipeline.onAppend(conn.userId, frame, conn.deviceId)
+    } catch (err) {
+      console.error('push pipeline onAppend failed (append/broadcast already succeeded)', err)
+    }
   }
   const appendAndFan = (args) => {
     const r = append(db, args)

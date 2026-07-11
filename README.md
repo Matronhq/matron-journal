@@ -91,10 +91,13 @@ considers each of that user's *client* devices with a registered token
   conversation, or when its acked cursor already covers the event's `seq`.
 - `prompt` / `permission_request`, and `session_status` with
   `payload.state:'done'`, push immediately at priority 10.
-- everything else (`text`, `tool_output`, `diff`, `convo_meta`, ...) pushes
-  at priority 5, coalesced per (device, conversation): a leading push when
-  idle, then at most one trailing push per 10s window while events keep
-  arriving (in-memory only — a restart loses a pending trailing push).
+- `convo_meta` and `session_status` with any other state never push at all —
+  a title rename or a running/waiting flip is journal-sync material, not a
+  notification (connected devices learn it from the journal frame).
+- routine content (`text`, `tool_output`, `diff`, ...) pushes at priority 5,
+  coalesced per (device, conversation): a leading push when idle, then at
+  most one trailing push per 10s window while events keep arriving
+  (in-memory only — a restart loses a pending trailing push).
 - `read_marker` rows trigger a silent background push
   (`content-available: 1`, no alert) to the user's *other* devices so they
   clear their badge — never back to the device whose read_marker it was.
