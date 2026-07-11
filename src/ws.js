@@ -114,7 +114,13 @@ export function attachWs({
             ws.close()
             return
           }
-          if (msg.cursor !== undefined && msg.cursor !== null && !Number.isInteger(msg.cursor)) {
+          // Same shape as ack's own cursor validation below (`!Number.isInteger(msg.cursor)
+          // || msg.cursor < 0`) — a negative cursor is exactly as invalid here as a
+          // non-integer one; without this, a negative `msg.cursor` sails through as a
+          // "valid" replay start point (headSeq - negativeCursor is even LARGER than the
+          // real gap, so it'd either wrongly trip snapshot_required or, for a small
+          // negative value, attempt an eventsAfter() scan with a bogus lower bound).
+          if (msg.cursor !== undefined && msg.cursor !== null && (!Number.isInteger(msg.cursor) || msg.cursor < 0)) {
             ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'bad_request', ref: 'hello' }))
             ws.close()
             return
@@ -149,6 +155,20 @@ export function attachWs({
               // A slow/paused reader must not let the server buffer an unbounded amount
               // of replay data in the socket's outgoing queue — wait for it to drain
               // below the threshold before fetching/sending the next batch.
+              //
+              // VERIFIED: a reader that never drains at all (not just slow — fully
+              // stalled, e.g. the client process stopped reading the socket) is still
+              // bounded, by the ping/pong heartbeat above. `wss.clients` is populated by
+              // the `ws` library at handshake time (websocket-server.js), before our
+              // 'connection' handler even runs — so this socket is already a member of
+              // the heartbeat sweep despite not yet being `hub.register()`ed. If no pong
+              // arrives within two ping intervals (worst case ~2×pingMs), the sweep calls
+              // `ws.terminate()`, which sets `readyState = CLOSING` *synchronously*
+              // (websocket.js) regardless of whatever is stuck in the OS socket buffer —
+              // so `waitForDrain`'s `ws.readyState === 1` check fails on its very next
+              // poll, this loop's `conn.closed` check (a few lines down) returns shortly
+              // after, and the replay never has to be resumed. No separate bounded-stall
+              // timer or test needed here — it would just be re-testing the heartbeat.
               await waitForDrain(ws, replayBackpressureBytes)
               // Yield between batches only — a large backlog must not block the event
               // loop (and starve other connections' pings) while replaying.
