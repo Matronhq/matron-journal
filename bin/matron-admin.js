@@ -3,11 +3,14 @@ import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { openDb } from '../src/db.js'
 import { createUser, setPassword, createAgent } from '../src/auth.js'
+import { resolveMediaDir } from '../src/media.js'
+import { runOffload } from '../src/retention.js'
 
 const USAGE = `usage:
   matron-admin user add <name> --password <pw>
   matron-admin user passwd <name> --password <pw>
   matron-admin agent add <username> <agent-name>
+  matron-admin offload [--days N]
   matron-admin status`
 
 function flag(argv, name) {
@@ -38,6 +41,14 @@ export async function runAdmin(db, argv) {
     if (!user) throw new Error(`no such user: ${username}`)
     const { token } = createAgent(db, user.id, agentName)
     return `agent ${agentName} token: ${token}\n(store in the bridge credentials file; it is not shown again)`
+  }
+  if (a === 'offload') {
+    const daysFlag = flag(argv, '--days')
+    const days = daysFlag != null ? Number(daysFlag) : 30
+    if (!Number.isInteger(days) || days < 0) throw new Error(USAGE)
+    const mediaDir = resolveMediaDir(db.name)
+    const r = runOffload(db, { days, mediaDir })
+    return `offloaded ${r.offloaded} tool_output payload(s) older than ${days}d`
   }
   if (a === 'status') {
     const rows = db.prepare(

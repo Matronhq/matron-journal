@@ -8,6 +8,31 @@ export function shardedPath(root, id) {
   return path.join(root, id.slice(0, 2), id)
 }
 
+// Shared storage-root resolution for anything that needs to read/write blobs
+// outside a request handler (retention offload, the admin CLI) as well as
+// server.js itself — one rule, not three copies of it: an explicit override
+// wins, then MATRON_MEDIA_DIR, then `<dirname(dbPath)>/media`.
+export function resolveMediaDir(dbPath, override) {
+  return override || process.env.MATRON_MEDIA_DIR || path.join(path.dirname(dbPath), 'media')
+}
+
+// Writes `data` (a Buffer) as a new immutable blob under `root`, atomically
+// (tmp file + rename, same pattern as receiveBlob). Used by retention offload,
+// which already holds the full payload in memory (unlike a media upload,
+// there's no request stream to pipe) — id/sha256/size are computed here
+// rather than by the caller so this stays a single source of truth for the
+// on-disk layout.
+export function writeBlobSync(root, data) {
+  const id = crypto.randomBytes(16).toString('hex')
+  const finalPath = shardedPath(root, id)
+  const tmpPath = `${finalPath}.tmp`
+  fs.mkdirSync(path.dirname(finalPath), { recursive: true })
+  fs.writeFileSync(tmpPath, data)
+  fs.renameSync(tmpPath, finalPath) // atomic — see receiveBlob's comment on why
+  const sha256 = crypto.createHash('sha256').update(data).digest('hex')
+  return { id, size: data.length, sha256, diskPath: finalPath }
+}
+
 // Streams `req` to a temp file under `root`, hashing and counting bytes as
 // they arrive so the body is never buffered whole in memory. On success the
 // temp file is atomically renamed into its sharded final path. Rejects with

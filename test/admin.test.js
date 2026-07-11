@@ -5,7 +5,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { openDb } from '../src/db.js'
-import { authToken } from '../src/auth.js'
+import { authToken, createUser } from '../src/auth.js'
+import { upsertConversation, append } from '../src/journal.js'
 import { runAdmin } from '../bin/matron-admin.js'
 
 test('admin CLI: user add, agent add, status', async () => {
@@ -25,6 +26,33 @@ test('admin CLI: user add, agent add, status', async () => {
   assert.match(status, /dan devices=0 agents=1 head_seq=0/)
 
   await assert.rejects(runAdmin(db, ['bogus']), /usage/i)
+})
+
+test('admin CLI: offload runs runOffload with --days (default 30), second run no-ops, bad --days rejected', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-offload-'))
+  const dbPath = path.join(dir, 'cli.db')
+  const db = openDb(dbPath)
+  const dan = await createUser(db, 'dan', 'pw')
+  upsertConversation(db, { id: 'c1', ownerUserId: dan.id })
+  const r = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { snippet: 'old output' } })
+  db.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 40 * 86400000, dan.id, r.seq)
+
+  const out = await runAdmin(db, ['offload', '--days', '30'])
+  assert.match(out, /offloaded 1 tool_output payload/)
+  const row = db.prepare('SELECT blob_ref FROM events WHERE user_id=? AND seq=?').get(dan.id, r.seq)
+  assert.ok(row.blob_ref)
+
+  const out2 = await runAdmin(db, ['offload', '--days', '30'])
+  assert.match(out2, /offloaded 0 tool_output payload/)
+
+  await assert.rejects(runAdmin(db, ['offload', '--days', 'abc']), /usage/i)
+
+  // no --days at all defaults to 30
+  const out3 = await runAdmin(db, ['offload'])
+  assert.match(out3, /older than 30d/)
+
+  db.close()
+  fs.rmSync(dir, { recursive: true, force: true })
 })
 
 test('CLI entrypoint works directly and via symlink (npx-style)', () => {
