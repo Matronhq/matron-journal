@@ -183,22 +183,39 @@ test('agent publish type whitelist: rejects server-generated/unknown types, acce
   agent.close()
 })
 
-test('agent finalize with type session_status and a payload missing a valid state fails cleanly, connection survives', async (t) => {
+test('finalize type whitelist: server-generated types are rejected even with well-formed payloads; text and default still work', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())
   const dan = await createUser(s.db, 'dan', 'pw')
   const ag = createAgent(s.db, dan.id, 'dev-2')
   const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
   await agent.waitFor((f) => f.op === 'hello_ok')
-  agent.send({ op: 'convo_upsert', convo_id: 's-fin-ss' })
+  agent.send({ op: 'convo_upsert', convo_id: 's-fin-wl' })
 
-  // finalize isn't subject to the publish whitelist, so this is the one
-  // remaining agent-reachable path to append()'s session_status branch with
-  // an arbitrary payload shape — must fail cleanly, not crash the process.
-  agent.send({ op: 'finalize', convo_id: 's-fin-ss', message_ref: 'm1', type: 'session_status', payload: {} })
-  await agent.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.ref === 'finalize')
+  // The publish whitelist must not be bypassable via finalize: finalize's
+  // type is raw agent input too, so without its own whitelist an agent
+  // could forge server-generated event types with a well-formed payload
+  // (e.g. type session_status with {state:'done'} would flip the
+  // conversation's state). The payload here is deliberately well-formed
+  // for all three server types, so a rejection can only come from the type
+  // whitelist, not from payload validation.
+  const forged = { state: 'done', convo_id: 's-fin-wl', up_to_seq: 1, title: 'forged' }
+  const rejected = ['session_status', 'read_marker', 'convo_meta', 'bogus']
+  rejected.forEach((type, i) => {
+    agent.send({ op: 'finalize', convo_id: 's-fin-wl', message_ref: `m${i}`, type, payload: forged })
+  })
+  await agent.waitFor((f) =>
+    agent.frames.filter((x) => x.kind === 'control' && x.op === 'error' && x.code === 'bad_request' && x.ref === 'finalize').length >= rejected.length)
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM events WHERE convo_id='s-fin-wl'").get().n, 0)
+  assert.equal(s.db.prepare("SELECT session_state FROM conversations WHERE id='s-fin-wl'").get().session_state, 'running')
   assert.equal(agent.ws.readyState, 1)
-  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM events WHERE convo_id='s-fin-ss' AND type='session_status'").get().n, 0)
+
+  // explicit 'text' and an absent type (defaults to text) both still work
+  agent.send({ op: 'finalize', convo_id: 's-fin-wl', message_ref: 'ok1', type: 'text', payload: { body: 'explicit' } })
+  await agent.waitFor((f) => f.kind === 'journal' && f.type === 'text' && f.payload.body === 'explicit')
+  agent.send({ op: 'finalize', convo_id: 's-fin-wl', message_ref: 'ok2', payload: { body: 'default' } })
+  await agent.waitFor((f) => f.kind === 'journal' && f.type === 'text' && f.payload.body === 'default')
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM events WHERE convo_id='s-fin-wl' AND type='text'").get().n, 2)
   agent.close()
 })
 
