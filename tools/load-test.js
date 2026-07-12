@@ -64,7 +64,7 @@ import { startServer } from '../src/server.js'
 import { createUser, createAgent, login } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 
-const DEFAULTS = {
+export const DEFAULTS = {
   durationMs: 60000,
   numAgents: 10,
   numConvos: 300,
@@ -84,7 +84,7 @@ const nowMs = () => Number(process.hrtime.bigint()) / 1e6
 const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)))
 const jitter = (intervalMs, spread = 0.3) => intervalMs * (1 - spread / 2 + Math.random() * spread)
 
-function percentiles(values) {
+export function percentiles(values) {
   if (values.length === 0) return { p50: null, p95: null, p99: null, max: null, count: 0 }
   const sorted = [...values].sort((a, b) => a - b)
   const at = (p) => sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))]
@@ -101,7 +101,7 @@ const randSentence = (n = 8) => Array.from({ length: n }, randWord).join(' ')
 // matches the id back off the journal frame's echoed payload and records
 // send -> observed latency, bucketed by phase (pre/during/post cold-replay)
 // so a starvation regression during the cold client's replay is visible.
-function makeLatencyTracker() {
+export function makeLatencyTracker() {
   let counter = 0
   const pending = new Map()
   const samples = []
@@ -114,12 +114,16 @@ function makeLatencyTracker() {
   return {
     phase,
     nextProbeId: () => ++counter,
-    mark(id) { pending.set(id, { sentMs: nowMs(), phase: currentPhase() }) },
+    // sentAt/observedAt are wall-clock (Date.now()) epochs alongside the
+    // hrtime-based latency math: tools/wal-profile.js correlates samples
+    // against GC/checkpoint/loop-stall logs (possibly from another process),
+    // which needs a shared clock. Extra fields are inert for this tool.
+    mark(id) { pending.set(id, { sentMs: nowMs(), sentAt: Date.now(), phase: currentPhase() }) },
     observe(id) {
       const p = pending.get(id)
       if (!p) return
       pending.delete(id)
-      samples.push({ latencyMs: nowMs() - p.sentMs, phase: p.phase })
+      samples.push({ latencyMs: nowMs() - p.sentMs, phase: p.phase, sentAt: p.sentAt, observedAt: Date.now() })
     },
     pendingCount: () => pending.size,
     samples,
@@ -136,7 +140,7 @@ function makeLatencyTracker() {
 // `await connectWs(...)` ever runs. A listener attached only after the
 // await would silently drop them (this was a real bug: the cold client
 // undercounted its replay by exactly the frames emitted in that window).
-function connectWs(base, { token, cursor, onFrame }) {
+export function connectWs(base, { token, cursor, onFrame }) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(base.replace('http', 'ws') + '/ws')
     let settled = false
@@ -163,7 +167,7 @@ function connectWs(base, { token, cursor, onFrame }) {
 // scheduler covering stream/publish/finalize/sprinkle, jittered around their
 // target per-second rates so the four kinds interleave the way a real
 // bridge's traffic would rather than firing in lockstep bursts.
-async function runAgentSession({ id, ws, hot, convoIds, rates, endAtMs, latency, ephemeral }) {
+export async function runAgentSession({ id, ws, hot, convoIds, rates, endAtMs, latency, ephemeral }) {
   let convoIdx = 0
   let currentConvo = convoIds[convoIdx]
   let turnCounter = 0
@@ -239,7 +243,7 @@ async function runAgentSession({ id, ws, hot, convoIds, rates, endAtMs, latency,
   }
 }
 
-function assignConvoPools(restConvos, nonHotAgentCount) {
+export function assignConvoPools(restConvos, nonHotAgentCount) {
   const pools = Array.from({ length: nonHotAgentCount }, () => [])
   restConvos.forEach((cid, idx) => pools[idx % nonHotAgentCount].push(cid))
   for (const p of pools) if (p.length === 0) p.push(restConvos[0] ?? 'convo-0')

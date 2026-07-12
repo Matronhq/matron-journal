@@ -63,6 +63,16 @@ export function openDb(path) {
   const db = new Database(path)
   db.pragma('journal_mode = WAL')
   db.pragma('foreign_keys = ON')
+  // Half of the WAL-checkpoint tail mitigation (measured, not guessed; full
+  // method and numbers in docs/wal-checkpoint-profile.md): the WAL file
+  // truncates back to <=4MiB on checkpoint reset instead of holding its
+  // high-water size forever. Safe and useful for EVERY opener (server, admin
+  // CLI, tests). The other half — wal_autocheckpoint=0 — is applied by
+  // startServer only, because it is only correct alongside the server's 1s
+  // PASSIVE-checkpoint timer; a standalone opener like the admin CLI keeps
+  // SQLite's stock inline auto-checkpoint so a long one-shot run (e.g. a
+  // backlog retention offload) cannot grow the WAL unbounded.
+  db.pragma('journal_size_limit = 4194304')
   db.exec(SCHEMA)
   // The live DB on dev-2 predates apns_env (only apns_token existed) — in-place
   // migration, never a destructive rebuild. Sygnal lesson: environment
