@@ -1,0 +1,18 @@
+{
+  "name": "snapshot: a brand-new user has an empty conversation list",
+  "description": "GET /snapshot for a user with no conversations returns {conversations: [], seq: 0}.",
+  "seed": {
+    "users": [{ "as": "dan", "name": "dan", "password": "fixture-pw-1" }]
+  },
+  "steps": [
+    { "kind": "http", "method": "POST", "path": "/login",
+      "body": { "username": "dan", "password": "fixture-pw-1", "device_name": "mac" },
+      "expect": { "status": 200, "body": {
+        "token": { "$bind": "dan_token" },
+        "device_id": { "$type": "integer" },
+        "user_id": { "$ref": "dan.user_id" }
+      } } },
+    { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "dan_token" },
+      "expect": { "status": 200, "body": { "conversations": [], "seq": 0 } } }
+  ]
+}

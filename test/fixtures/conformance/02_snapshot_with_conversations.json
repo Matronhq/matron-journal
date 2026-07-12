@@ -1,0 +1,38 @@
+{
+  "name": "snapshot: conversations carry title/session_state/unread_count/snippet, ordered by last_seq desc",
+  "description": "Two conversations, one advanced by an agent (bumps unread + snippet), one advanced by the user's own send (does not bump unread). GET /snapshot's seq is the user's journal head; conversations are ordered most-recently-active first.",
+  "seed": {
+    "users": [{ "as": "dan", "name": "dan", "password": "fixture-pw-2" }],
+    "conversations": [
+      { "id": "c1", "owner": "dan", "title": "Fix login bug", "sessionState": "running" },
+      { "id": "c2", "owner": "dan", "title": "Notes", "sessionState": "done" }
+    ],
+    "events": [
+      { "convo": "c1", "sender": "agent:dev-2", "type": "text", "payload": { "body": "starting work" } },
+      { "convo": "c2", "sender": "user:dan", "type": "text", "payload": { "body": "a note to self" } }
+    ]
+  },
+  "steps": [
+    { "kind": "http", "method": "POST", "path": "/login",
+      "body": { "username": "dan", "password": "fixture-pw-2", "device_name": "mac" },
+      "expect": { "status": 200, "body": {
+        "token": { "$bind": "dan_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "dan.user_id" }
+      } } },
+    { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "dan_token" },
+      "expect": { "status": 200, "body": {
+        "seq": 2,
+        "conversations": [
+          {
+            "id": "c2", "title": "Notes", "session_state": "done",
+            "last_seq": 2, "unread_count": 0, "snippet": "a note to self",
+            "created_at": { "$type": "integer" }
+          },
+          {
+            "id": "c1", "title": "Fix login bug", "session_state": "running",
+            "last_seq": 1, "unread_count": 1, "snippet": "starting work",
+            "created_at": { "$type": "integer" }
+          }
+        ]
+      } } }
+  ]
+}
