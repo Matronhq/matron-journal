@@ -1,0 +1,34 @@
+{
+  "name": "ws hello: cursor null means live-only, no replay of pre-existing events",
+  "description": "A journal event exists before the client ever connects. hello with cursor:null skips replay entirely (unlike cursor:0, which would replay everything) — the client sees hello_ok and nothing else until a NEW event happens live.",
+  "seed": {
+    "users": [{ "as": "dan", "name": "dan", "password": "fixture-pw-3" }],
+    "agents": [{ "as": "bridge", "user": "dan", "name": "dev-2" }],
+    "conversations": [{ "id": "c1", "owner": "dan", "title": "session" }],
+    "events": [
+      { "convo": "c1", "sender": "agent:dev-2", "type": "text", "payload": { "body": "before you connected" } }
+    ]
+  },
+  "steps": [
+    { "kind": "http", "method": "POST", "path": "/login",
+      "body": { "username": "dan", "password": "fixture-pw-3", "device_name": "mac" },
+      "expect": { "status": 200, "body": {
+        "token": { "$bind": "dan_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "dan.user_id" }
+      } } },
+
+    { "kind": "ws_open", "conn": "client" },
+    { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "dan_token" }, "cursor": null } },
+    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 1 } },
+    { "kind": "ws_expect_none", "conn": "client", "ms": 150 },
+
+    { "kind": "ws_open", "conn": "agent" },
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
+    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "seq": 1 } },
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "publish", "convo_id": "c1", "type": "text", "payload": { "body": "live now" } } },
+
+    { "kind": "ws_expect", "conn": "client", "frame": {
+      "kind": "journal", "seq": 2, "convo_id": "c1", "ts": { "$type": "integer" },
+      "sender": "agent:dev-2", "type": "text", "payload": { "body": "live now" }
+    } }
+  ]
+}
