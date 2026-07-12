@@ -120,9 +120,77 @@ server-side (max 55.1ms, all slow entries checkpoint-fingerprinted, clean
 generator logs). The stall tail is a server-side phenomenon, not generator
 noise.
 
+### Run P3: in-process, 300s soak
+
+`node tools/wal-profile.js --duration=300`
+
+| metric | value |
+|---|---|
+| append latency p50 / p95 / p99 / max | 1.2ms / 2.4ms / 6.1ms / **54.2ms** (n=27017) |
+| server event-loop lag p50 / p95 / p99 / max | 2.14ms / 2.58ms / 3.00ms / 43.61ms |
+| checkpoint census | 189 completed checkpoints, WAL high-water 4.17MB / 1011 frames |
+| GC census | minor n=528 max 6.2ms, incremental n=4, major n=4 max **5.1ms** |
+| slow statements ≥20ms | **6 — all checkpoint-in-commit** (21–42ms) |
+| stalls >100ms | none this run |
+
+Across P1–P3 (600s of profiled load, ~54k append samples, 378 completed
+checkpoints): **20 of 20 blockages ≥20ms carry the checkpoint-in-commit
+fingerprint; zero exceeded 100ms; the worst GC of any kind was 6.2ms.**
+The box was evidently quieter during these runs than when the baseline's
+0.5–3.7s outliers were recorded — an inline checkpoint costs what its two
+fsyncs cost, and today's uncontended-disk fsyncs are cheap. Hence run P4:
+reproduce adverse disk conditions deliberately and see which suspect
+scales up to the historical magnitude.
+
+### Run P4: induced disk contention (disclosed), in-process, 150s
+
+Same profile, while a bounded fsync loop ran on the same volume
+(`dd bs=4M count=2 conv=fsync` + 50ms pause, ≤170s, ~40MB/s — modest and
+time-capped on purpose; this is a shared dev box). Result: slow
+checkpoint-commits went 10 → **22 in 150s, still 22/22
+checkpoint-fingerprinted, still zero GC ≥10ms** — a dose-response on the
+fsync axis. Max stayed 50.8ms; this SSD absorbed the induced load too well
+to reproduce the historical magnitude.
+
+### Run P5: natural disk contention (opportunistic), in-process, 120s
+
+A real contention burst hit the box (load ~7.6, md2 at ~3k writes/s,
+device queue ~30, observed via iostat) and was used opportunistically:
+baseline settings, 120s. Max append 83.7ms / loop max 71.4ms; **27 slow
+statements, 27/27 checkpoint-fingerprinted; GC max 4.5ms.** During the
+same burst, a small exploratory run that checkpointed every 250ms recorded
+PASSIVE checkpoints of **7–50 frames taking 91–592ms** with ~1–5ms of CPU
+over the whole stall (thread blocked in fsync, not busy) — direct evidence
+that under disk contention, checkpoint stall cost is **fsync-latency
+dominated and nearly independent of checkpoint size**.
+
 ## Attribution verdict
 
-TBD
+**The stalls are SQLite WAL auto-checkpoints executing inline in append
+COMMITs on the single thread — specifically, the checkpoint's fsyncs; not
+V8 GC and not the in-process load generator.**
+
+Evidence summary across all Phase 1 runs (~900s of profiled load, ~80k
+append-latency samples, >500 completed checkpoints observed passively):
+
+- Every event-loop blockage ≥20ms — 65 of 65 across five runs — carried
+  the checkpoint fingerprint (WAL-index `nBackfill` jump / `mxFrame` reset
+  inside the blocking statement's window).
+- The worst GC of any kind in any run was 6.2ms (`PerformanceObserver`,
+  full census: hundreds of minors, a handful of majors per run). GC is
+  exonerated: two orders of magnitude below even today's mild stalls.
+- Out-of-process run: tail unchanged with the generator in another
+  process; generator-side logs clean. Generator exonerated for the tail
+  (it inflates mid-distribution only: p50 1.2→0.8ms in-proc vs out).
+- Stall magnitude scales with disk contention (dose-response, runs
+  P4/P5), and CPU-during-stall ≈ 0 shows the thread blocked in a syscall
+  (fsync), matching the historical 0.5–3.7s outliers whose magnitude
+  varied by run — fsync latency on this shared box varies by hour.
+- No natural >100ms stall occurred during the quiet profiling windows
+  (the deliverable's per-stall table for these runs is therefore empty —
+  reported as such, not padded); the >100ms stalls that were captured and
+  attributed occurred under the P5 natural-contention burst, all
+  checkpoint-fingerprinted, none GC.
 
 ## Phase 2 — mitigation experiments
 

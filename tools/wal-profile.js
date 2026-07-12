@@ -68,11 +68,20 @@
 //   --journal-size-limit=B   PRAGMA journal_size_limit=B (WAL truncates to
 //                            <=B on reset instead of keeping its high-water
 //                            size forever)
-//   --ckpt-worker=MS         like --ckpt-interval but the PASSIVE checkpoint
-//                            runs on a worker thread over its OWN second
-//                            connection to the same DB (WAL supports this) —
-//                            the fsync blocks the worker, never the server
-//                            loop. Combine with --wal-autocheckpoint=0.
+//   --ckpt-worker=MS         like --ckpt-interval but the checkpoint runs on
+//                            a worker thread over its OWN second connection
+//                            to the same DB (WAL supports this) — the fsync
+//                            blocks the worker, never the server loop.
+//                            Combine with --wal-autocheckpoint=0.
+//   --ckpt-worker-mode=M     PASSIVE (default) | RESTART | TRUNCATE. With a
+//                            concurrent writer, a PASSIVE pass almost never
+//                            ends with nBackfill == mxFrame (new frames land
+//                            during the pass), so the WAL never resets and
+//                            the file grows for as long as sustained load
+//                            lasts (measured: 33.9MB in 120s). TRUNCATE adds
+//                            a brief exclusive reset+truncate after the
+//                            concurrent backfill — microseconds of writer
+//                            contention (busy-retried), no fsync on the loop.
 
 import fs from 'node:fs'
 import os from 'node:os'
@@ -320,6 +329,7 @@ function applyExperiment(db, exp) {
   let worker = null
   if (exp.ckptWorkerMs != null) {
     applied.ckptWorkerMs = Number(exp.ckptWorkerMs)
+    applied.ckptWorkerMode = ['PASSIVE', 'RESTART', 'TRUNCATE'].includes(exp.ckptWorkerMode) ? exp.ckptWorkerMode : 'PASSIVE'
     const src = `
       const { parentPort, workerData, threadId } = require('node:worker_threads')
       const { createRequire } = require('node:module')
@@ -330,7 +340,7 @@ function applyExperiment(db, exp) {
       const iv = setInterval(() => {
         const t0 = Date.now()
         try {
-          const r = db.pragma('wal_checkpoint(PASSIVE)')
+          const r = db.pragma('wal_checkpoint(' + workerData.mode + ')')
           const row = Array.isArray(r) ? r[0] : r
           parentPort.postMessage({ atMs: t0, durMs: Date.now() - t0, ...row })
         } catch (e) {
@@ -346,7 +356,7 @@ function applyExperiment(db, exp) {
     `
     worker = new Worker(src, {
       eval: true,
-      workerData: { dbPath: exp.dbPath, intervalMs: applied.ckptWorkerMs, baseDir: process.cwd() },
+      workerData: { dbPath: exp.dbPath, intervalMs: applied.ckptWorkerMs, baseDir: process.cwd(), mode: applied.ckptWorkerMode },
     })
     worker.on('message', (m) => ckptLog.push(m))
     worker.on('error', (e) => ckptLog.push({ atMs: Date.now(), durMs: 0, error: String(e) }))
@@ -694,6 +704,7 @@ export async function runWalProfile(opts = {}) {
       if (cfg.experiment.ckptIntervalMs != null) childArgs.push(`--ckpt-interval=${cfg.experiment.ckptIntervalMs}`)
       if (cfg.experiment.journalSizeLimit != null) childArgs.push(`--journal-size-limit=${cfg.experiment.journalSizeLimit}`)
       if (cfg.experiment.ckptWorkerMs != null) childArgs.push(`--ckpt-worker=${cfg.experiment.ckptWorkerMs}`)
+      if (cfg.experiment.ckptWorkerMode != null) childArgs.push(`--ckpt-worker-mode=${cfg.experiment.ckptWorkerMode}`)
       child = fork(fileURLToPath(import.meta.url), childArgs, { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] })
       const childExit = new Promise((_, rej) => child.on('exit', (code) => rej(new Error(`child server exited early (code ${code})`))))
       const ready = new Promise((resolve) => {
@@ -776,6 +787,7 @@ function experimentFromArgs(args) {
   if (args['ckpt-interval'] !== undefined) exp.ckptIntervalMs = Number(args['ckpt-interval'])
   if (args['journal-size-limit'] !== undefined) exp.journalSizeLimit = Number(args['journal-size-limit'])
   if (args['ckpt-worker'] !== undefined) exp.ckptWorkerMs = Number(args['ckpt-worker'])
+  if (args['ckpt-worker-mode'] !== undefined) exp.ckptWorkerMode = String(args['ckpt-worker-mode']).toUpperCase()
   return exp
 }
 
