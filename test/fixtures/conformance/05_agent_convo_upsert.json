@@ -1,0 +1,48 @@
+{
+  "name": "agent convo_upsert: create, title change -> convo_meta, state change -> session_status, no-op emits nothing",
+  "description": "convo_upsert creating a convo with a title appends convo_meta; a later title change appends another convo_meta; a session_state-only upsert appends session_status instead; an upsert with neither field is a true no-op — the following title-change's seq proves it consumed no seq at all.",
+  "seed": {
+    "users": [{ "as": "dan", "name": "dan", "password": "fixture-pw-8" }],
+    "agents": [{ "as": "bridge", "user": "dan", "name": "dev-2" }]
+  },
+  "steps": [
+    { "kind": "http", "method": "POST", "path": "/login",
+      "body": { "username": "dan", "password": "fixture-pw-8", "device_name": "mac" },
+      "expect": { "status": 200, "body": {
+        "token": { "$bind": "dan_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "dan.user_id" }
+      } } },
+    { "kind": "ws_open", "conn": "agent" },
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
+    { "kind": "ws_expect", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "seq": 0 } },
+    { "kind": "ws_open", "conn": "client" },
+    { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "dan_token" }, "cursor": 0 } },
+    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 0 } },
+
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "title": "first title" } },
+    { "kind": "ws_expect", "conn": "client", "frame": {
+      "kind": "journal", "seq": 1, "convo_id": "sess-cm", "ts": { "$type": "integer" },
+      "sender": "agent:dev-2", "type": "convo_meta", "payload": { "title": "first title" }
+    } },
+
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "title": "renamed" } },
+    { "kind": "ws_expect", "conn": "client", "frame": {
+      "kind": "journal", "seq": 2, "convo_id": "sess-cm", "ts": { "$type": "integer" },
+      "sender": "agent:dev-2", "type": "convo_meta", "payload": { "title": "renamed" }
+    } },
+
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "session_state": "waiting" } },
+    { "kind": "ws_expect", "conn": "client", "frame": {
+      "kind": "journal", "seq": 3, "convo_id": "sess-cm", "ts": { "$type": "integer" },
+      "sender": "agent:dev-2", "type": "session_status", "payload": { "state": "waiting" }
+    } },
+
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm" } },
+    { "kind": "ws_expect_none", "conn": "client", "ms": 150 },
+
+    { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "title": "final title" } },
+    { "kind": "ws_expect", "conn": "client", "frame": {
+      "kind": "journal", "seq": 4, "convo_id": "sess-cm", "ts": { "$type": "integer" },
+      "sender": "agent:dev-2", "type": "convo_meta", "payload": { "title": "final title" }
+    } }
+  ]
+}

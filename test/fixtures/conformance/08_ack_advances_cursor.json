@@ -1,0 +1,52 @@
+{
+  "name": "ack advances the device's server-side cursor copy, observable via GET /metrics",
+  "description": "ack has no dedicated confirmation frame — its effect (devices.cursor / lag) is only observable via GET /metrics (or an admin CLI status read of the same DB row). Before ack, cursor is 0 and lag equals head_seq (3). No wall-clock waits: after `ack` the client sends a durable `send` on the SAME connection and waits for its journal echo — per-connection FIFO means the echo proves the earlier ack was already applied, so the following /metrics read is deterministic: cursor 3, head_seq 4 (the barrier send took seq 4), lag 1.",
+  "seed": {
+    "users": [{ "as": "dan", "name": "dan", "password": "fixture-pw-12" }],
+    "conversations": [{ "id": "c1", "owner": "dan" }],
+    "events": [
+      { "convo": "c1", "sender": "agent:dev-2", "type": "text", "payload": { "body": "m0" } },
+      { "convo": "c1", "sender": "agent:dev-2", "type": "text", "payload": { "body": "m1" } },
+      { "convo": "c1", "sender": "agent:dev-2", "type": "text", "payload": { "body": "m2" } }
+    ]
+  },
+  "steps": [
+    { "kind": "http", "method": "POST", "path": "/login",
+      "body": { "username": "dan", "password": "fixture-pw-12", "device_name": "mac" },
+      "expect": { "status": 200, "body": {
+        "token": { "$bind": "dan_token" }, "device_id": { "$bind": "dan_device_id" }, "user_id": { "$ref": "dan.user_id" }
+      } } },
+
+    { "kind": "http", "method": "GET", "path": "/metrics", "token": { "$ref": "dan_token" },
+      "expect": { "status": 200, "body": {
+        "user": { "head_seq": 3, "devices": [
+          { "device_id": { "$ref": "dan_device_id" }, "kind": "client", "cursor": 0, "last_seen_at": { "$type": "integer" }, "lag": 3 }
+        ] },
+        "sockets_connected": 0,
+        "journal_row_count": 3,
+        "db_file_size_bytes": 0,
+        "push": { "sent": 0, "failed": 0, "pruned": 0, "by_reason": {} }
+      } } },
+
+    { "kind": "ws_open", "conn": "client" },
+    { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "dan_token" }, "cursor": null } },
+    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 3 } },
+    { "kind": "ws_send", "conn": "client", "frame": { "op": "ack", "cursor": 3 } },
+    { "kind": "ws_send", "conn": "client", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "barrier: ack applied" }, "local_id": "b1" } },
+    { "kind": "ws_expect", "conn": "client", "frame": {
+      "kind": "journal", "seq": 4, "convo_id": "c1", "ts": { "$type": "integer" },
+      "sender": "user:dan", "type": "text", "payload": { "body": "barrier: ack applied" }
+    } },
+
+    { "kind": "http", "method": "GET", "path": "/metrics", "token": { "$ref": "dan_token" },
+      "expect": { "status": 200, "body": {
+        "user": { "head_seq": 4, "devices": [
+          { "device_id": { "$ref": "dan_device_id" }, "kind": "client", "cursor": 3, "last_seen_at": { "$type": "integer" }, "lag": 1 }
+        ] },
+        "sockets_connected": 1,
+        "journal_row_count": 4,
+        "db_file_size_bytes": 0,
+        "push": { "sent": 0, "failed": 0, "pruned": 0, "by_reason": {} }
+      } } }
+  ]
+}

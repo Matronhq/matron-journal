@@ -1,0 +1,23 @@
+{
+  "name": "media: an upload over MATRON_MEDIA_MAX_BYTES is 413, an empty body is 400",
+  "description": "With the cap forced small (mediaMaxBytes:16), a 38-byte upload is rejected 413 too_large; a zero-byte body is rejected 400 empty. Neither persists anything.",
+  "server": { "tmpDb": true, "mediaMaxBytes": 16 },
+  "seed": {
+    "users": [{ "as": "dan", "name": "dan", "password": "fixture-pw-15" }]
+  },
+  "steps": [
+    { "kind": "http", "method": "POST", "path": "/login",
+      "body": { "username": "dan", "password": "fixture-pw-15", "device_name": "mac" },
+      "expect": { "status": 200, "body": {
+        "token": { "$bind": "dan_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "dan.user_id" }
+      } } },
+
+    { "kind": "http", "method": "POST", "path": "/media", "token": { "$ref": "dan_token" },
+      "body_base64": "bWF0cm9uLWNvbmZvcm1hbmNlLWZpeHR1cmUtbWVkaWEtYnl0ZXM=",
+      "expect": { "status": 413, "body": { "error": "too_large" } } },
+
+    { "kind": "http", "method": "POST", "path": "/media", "token": { "$ref": "dan_token" },
+      "body_base64": "",
+      "expect": { "status": 400, "body": { "error": "empty" } } }
+  ]
+}
