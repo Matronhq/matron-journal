@@ -130,6 +130,19 @@ export function startServer({
 } = {}) {
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
   const db = openDb(resolvedDbPath)
+  // WAL-checkpoint tail mitigation, server half (docs/wal-checkpoint-profile.md;
+  // journal_size_limit lives in openDb). With synchronous=NORMAL the
+  // auto-checkpoint is the only steady-state fsync and it runs INLINE in
+  // whichever append COMMIT crosses the 1000-page mark: 69/69 profiled
+  // event-loop blockages >=20ms carried that fingerprint, worst 1.22s under
+  // real disk contention (GC max 6.2ms — exonerated). Disabling it here and
+  // checkpointing from scheduleWalCheckpoint's 1s PASSIVE timer instead moves
+  // the fsync out of append COMMITs: matched-window A/B improved append p99
+  // 9.7->3.1ms, contended-round max 1221.7->26.8ms, zero >100ms stall events
+  // in every mitigated run, WAL bounded <=4.8MB. Server-only on purpose — a
+  // standalone opener (admin CLI) has no timer and keeps the stock inline
+  // auto-checkpoint (see openDb).
+  db.pragma('wal_autocheckpoint = 0')
   const rateLimiter = makeRateLimiter()
   const loginGuard = makeLoginGuard()
   const resolvedMediaDir = resolveMediaDir(resolvedDbPath, mediaDir)

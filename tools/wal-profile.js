@@ -59,7 +59,8 @@
 //
 // Mitigation experiment flags (applied to the SERVER's db handle so
 // candidates can be measured before any src/ change is committed).
-// NOTE: candidate B is now shipped in src/ (openDb pragmas + server timer),
+// NOTE: candidate B is now shipped in src/ (journal_size_limit in openDb;
+// wal_autocheckpoint=0 + the 1s timer in startServer),
 // so this tool explicitly REVERTS the server to pre-mitigation baseline
 // settings unless experiment flags say otherwise — a no-flags run still
 // measures the true baseline, and the shipped 1s timer is neutralized at
@@ -307,8 +308,8 @@ function instrumentDb(db, walSampler, { slowMs = 20 } = {}) {
 // loop while it runs, so its full duration distribution is part of the data.
 function applyExperiment(db, exp) {
   const applied = {}
-  // Candidate B shipped (src/db.js sets wal_autocheckpoint=0 +
-  // journal_size_limit, src/server.js runs the 1s PASSIVE timer), so a
+  // Candidate B shipped (src/db.js sets journal_size_limit; src/server.js
+  // sets wal_autocheckpoint=0 and runs the 1s PASSIVE timer), so a
   // freshly started server already carries the mitigation. This tool's
   // no-flags run must still mean BASELINE — the pre-mitigation SQLite
   // defaults the Phase 1/2 numbers were measured against — so the shipped
