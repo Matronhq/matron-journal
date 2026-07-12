@@ -1,0 +1,39 @@
+{
+  "name": "ws hello: an integer cursor replays only events after it, strictly in seq order",
+  "description": "5 pre-existing events (seq 1..5); hello with cursor:2 replays exactly seq 3, 4, 5, in that order.",
+  "seed": {
+    "users": [{ "as": "dan", "name": "dan", "password": "fixture-pw-4" }],
+    "conversations": [{ "id": "c1", "owner": "dan" }],
+    "events": [
+      { "convo": "c1", "sender": "agent:dev-2", "type": "text", "payload": { "body": "m0" } },
+      { "convo": "c1", "sender": "agent:dev-2", "type": "text", "payload": { "body": "m1" } },
+      { "convo": "c1", "sender": "agent:dev-2", "type": "text", "payload": { "body": "m2" } },
+      { "convo": "c1", "sender": "agent:dev-2", "type": "text", "payload": { "body": "m3" } },
+      { "convo": "c1", "sender": "agent:dev-2", "type": "text", "payload": { "body": "m4" } }
+    ]
+  },
+  "steps": [
+    { "kind": "http", "method": "POST", "path": "/login",
+      "body": { "username": "dan", "password": "fixture-pw-4", "device_name": "mac" },
+      "expect": { "status": 200, "body": {
+        "token": { "$bind": "dan_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "dan.user_id" }
+      } } },
+
+    { "kind": "ws_open", "conn": "client" },
+    { "kind": "ws_send", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "dan_token" }, "cursor": 2 } },
+    { "kind": "ws_expect", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "seq": 5 } },
+    { "kind": "ws_expect", "conn": "client", "frame": {
+      "kind": "journal", "seq": 3, "convo_id": "c1", "ts": { "$type": "integer" },
+      "sender": "agent:dev-2", "type": "text", "payload": { "body": "m2" }
+    } },
+    { "kind": "ws_expect", "conn": "client", "frame": {
+      "kind": "journal", "seq": 4, "convo_id": "c1", "ts": { "$type": "integer" },
+      "sender": "agent:dev-2", "type": "text", "payload": { "body": "m3" }
+    } },
+    { "kind": "ws_expect", "conn": "client", "frame": {
+      "kind": "journal", "seq": 5, "convo_id": "c1", "ts": { "$type": "integer" },
+      "sender": "agent:dev-2", "type": "text", "payload": { "body": "m4" }
+    } },
+    { "kind": "ws_expect_none", "conn": "client", "ms": 150 }
+  ]
+}
