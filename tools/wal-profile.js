@@ -68,12 +68,18 @@
 //   --journal-size-limit=B   PRAGMA journal_size_limit=B (WAL truncates to
 //                            <=B on reset instead of keeping its high-water
 //                            size forever)
+//   --ckpt-worker=MS         like --ckpt-interval but the PASSIVE checkpoint
+//                            runs on a worker thread over its OWN second
+//                            connection to the same DB (WAL supports this) —
+//                            the fsync blocks the worker, never the server
+//                            loop. Combine with --wal-autocheckpoint=0.
 
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { fork } from 'node:child_process'
+import { Worker } from 'node:worker_threads'
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import {
@@ -305,7 +311,55 @@ function applyExperiment(db, exp) {
     }, applied.ckptIntervalMs)
     timer.unref()
   }
-  return { applied, ckptLog, stop: () => { if (timer) clearInterval(timer) } }
+  // Candidate C: the checkpoint runs on a worker thread over a SECOND
+  // connection to the same database. WAL explicitly supports concurrent
+  // connections; a PASSIVE checkpoint takes only the checkpointer lock, so
+  // the main connection keeps writing while it runs — its fsyncs block the
+  // worker, never the server's event loop. Durations are measured inside
+  // the worker and streamed back for the same distribution reporting.
+  let worker = null
+  if (exp.ckptWorkerMs != null) {
+    applied.ckptWorkerMs = Number(exp.ckptWorkerMs)
+    const src = `
+      const { parentPort, workerData, threadId } = require('node:worker_threads')
+      const { createRequire } = require('node:module')
+      const req = createRequire(workerData.baseDir + '/')
+      const Database = req('better-sqlite3')
+      const db = new Database(workerData.dbPath)
+      db.pragma('busy_timeout = 100')
+      const iv = setInterval(() => {
+        const t0 = Date.now()
+        try {
+          const r = db.pragma('wal_checkpoint(PASSIVE)')
+          const row = Array.isArray(r) ? r[0] : r
+          parentPort.postMessage({ atMs: t0, durMs: Date.now() - t0, ...row })
+        } catch (e) {
+          parentPort.postMessage({ atMs: t0, durMs: Date.now() - t0, error: String(e) })
+        }
+      }, workerData.intervalMs)
+      parentPort.on('message', (m) => {
+        if (m !== 'stop') return
+        clearInterval(iv)
+        db.close()
+        process.exit(0)
+      })
+    `
+    worker = new Worker(src, {
+      eval: true,
+      workerData: { dbPath: exp.dbPath, intervalMs: applied.ckptWorkerMs, baseDir: process.cwd() },
+    })
+    worker.on('message', (m) => ckptLog.push(m))
+    worker.on('error', (e) => ckptLog.push({ atMs: Date.now(), durMs: 0, error: String(e) }))
+    worker.unref()
+  }
+  return {
+    applied,
+    ckptLog,
+    stop: () => {
+      if (timer) clearInterval(timer)
+      if (worker) { try { worker.postMessage('stop') } catch { /* already gone */ } }
+    },
+  }
 }
 
 // --- server-side instrumentation bundle ----------------------------------------
@@ -315,7 +369,7 @@ function attachServerInstrumentation(db, dbPath, { slowStmtMs, loopStallMs, expe
   const loopLog = makeLoopStallLog({ thresholdMs: loopStallMs })
   const { slowStmts } = instrumentDb(db, walSampler, { slowMs: slowStmtMs })
   // after instrumentDb so the timer's pragma calls also hit the slow log
-  const exp = applyExperiment(db, experiment)
+  const exp = applyExperiment(db, { ...experiment, dbPath })
   const loopDelay = monitorEventLoopDelay({ resolution: 2 })
   loopDelay.enable()
   return {
@@ -541,6 +595,7 @@ async function runChildServer(args) {
   const instr = attachServerInstrumentation(s.db, dbPath, {
     slowStmtMs: Number(args['slow-stmt'] ?? 20),
     loopStallMs: Number(args['loop-stall'] ?? 50),
+    experiment: experimentFromArgs(args),
   })
   process.send({ op: 'ready', port: s.port, pid: process.pid })
   process.on('message', async (msg) => {
@@ -569,6 +624,15 @@ function formatProfileReport(r) {
   for (const g of r.server.gc) { gcByKind[g.gcKind] = gcByKind[g.gcKind] || { n: 0, maxMs: 0 }; gcByKind[g.gcKind].n++; gcByKind[g.gcKind].maxMs = Math.max(gcByKind[g.gcKind].maxMs, g.durMs) }
   L.push(`server GC census: ${Object.entries(gcByKind).map(([k, v]) => `${k} n=${v.n} max=${fmt(v.maxMs)}ms`).join(', ') || 'none observed'}`)
   L.push(`server slow statements (>=${r.config.slowStmtMs}ms): ${r.server.slowStmts.length}  |  server loop stalls (>=${r.config.loopStallMs}ms): ${r.server.loopStalls.length}`)
+  if (Object.keys(r.server.experiment).length > 0) {
+    L.push(`experiment applied: ${JSON.stringify(r.server.experiment)}`)
+  }
+  if (r.server.timerCheckpoints.length > 0) {
+    const d = percentiles(r.server.timerCheckpoints.map((c) => c.durMs))
+    const busy = r.server.timerCheckpoints.filter((c) => c.busy > 0).length
+    const maxLog = Math.max(...r.server.timerCheckpoints.map((c) => c.log))
+    L.push(`timer checkpoints: n=${d.count} dur p50=${fmt(d.p50)} p99=${fmt(d.p99)} max=${fmt(d.max)}ms, busy=${busy}, max WAL frames at ckpt=${maxLog}`)
+  }
   L.push('')
   L.push(`-- stalls > ${r.config.stallThresholdMs}ms (append-probe clusters + uncovered server loop stalls) --`)
   if (r.stalls.length === 0) {
@@ -592,6 +656,7 @@ export async function runWalProfile(opts = {}) {
     slowStmtMs: 20,
     loopStallMs: 50,
     keepDb: false,
+    experiment: {}, // { walAutocheckpoint, ckptIntervalMs, journalSizeLimit }
     ...opts,
   }
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-walprof-'))
@@ -622,9 +687,14 @@ export async function runWalProfile(opts = {}) {
       const { agents, clients } = await provision(provDb, cfg)
       provDb.close()
 
-      child = fork(fileURLToPath(import.meta.url), [
+      const childArgs = [
         '--child-server', `--db=${dbPath}`, `--slow-stmt=${cfg.slowStmtMs}`, `--loop-stall=${cfg.loopStallMs}`,
-      ], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] })
+      ]
+      if (cfg.experiment.walAutocheckpoint != null) childArgs.push(`--wal-autocheckpoint=${cfg.experiment.walAutocheckpoint}`)
+      if (cfg.experiment.ckptIntervalMs != null) childArgs.push(`--ckpt-interval=${cfg.experiment.ckptIntervalMs}`)
+      if (cfg.experiment.journalSizeLimit != null) childArgs.push(`--journal-size-limit=${cfg.experiment.journalSizeLimit}`)
+      if (cfg.experiment.ckptWorkerMs != null) childArgs.push(`--ckpt-worker=${cfg.experiment.ckptWorkerMs}`)
+      child = fork(fileURLToPath(import.meta.url), childArgs, { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] })
       const childExit = new Promise((_, rej) => child.on('exit', (code) => rej(new Error(`child server exited early (code ${code})`))))
       const ready = new Promise((resolve) => {
         child.on('message', (m) => { if (m && m.op === 'ready') resolve(m) })
@@ -673,6 +743,8 @@ export async function runWalProfile(opts = {}) {
       checkpoints: checkpointCensus(serverData.walSamples),
       server: {
         pragmas: serverData.pragmas,
+        experiment: serverData.experiment || {},
+        timerCheckpoints: serverData.timerCheckpoints || [],
         eventLoopLagMs: serverData.eventLoopLagMs,
         rssMb: serverData.rssMb,
         gc: serverData.gc,
@@ -698,6 +770,15 @@ function parseArgs(argv) {
   return out
 }
 
+function experimentFromArgs(args) {
+  const exp = {}
+  if (args['wal-autocheckpoint'] !== undefined) exp.walAutocheckpoint = Number(args['wal-autocheckpoint'])
+  if (args['ckpt-interval'] !== undefined) exp.ckptIntervalMs = Number(args['ckpt-interval'])
+  if (args['journal-size-limit'] !== undefined) exp.journalSizeLimit = Number(args['journal-size-limit'])
+  if (args['ckpt-worker'] !== undefined) exp.ckptWorkerMs = Number(args['ckpt-worker'])
+  return exp
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2))
   if (args['child-server']) { await runChildServer(args); return }
@@ -711,6 +792,7 @@ async function main() {
   if (args['slow-stmt'] !== undefined) opts.slowStmtMs = Number(args['slow-stmt'])
   if (args['loop-stall'] !== undefined) opts.loopStallMs = Number(args['loop-stall'])
   if (args['keep-db']) opts.keepDb = true
+  opts.experiment = experimentFromArgs(args)
 
   const summary = await runWalProfile(opts)
   console.log(formatProfileReport(summary))
