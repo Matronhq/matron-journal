@@ -142,6 +142,14 @@ replay demonstrably does not starve live traffic.
 
 ### Concern worth flagging honestly (does not fail a gate)
 
+> **Follow-up (2026-07-12): closed.** The stalls were attributed — SQLite
+> WAL auto-checkpoints (their fsyncs) executing inline in append COMMITs;
+> GC and the in-process generator were exonerated — and mitigated
+> (auto-checkpoint disabled, 1s PASSIVE-checkpoint timer,
+> `journal_size_limit`). Method, evidence, candidate comparison, and
+> before/after numbers: [wal-checkpoint-profile.md](wal-checkpoint-profile.md).
+> The historical numbers below are unchanged.
+
 Both runs show rare, isolated stalls where the **max** append latency and
 the **max** event-loop lag spike together: this soak's worst append was
 751.1ms against a loop-lag max of 660.1ms; run 1's worst was 562.9ms against

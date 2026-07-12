@@ -63,6 +63,21 @@ export function openDb(path) {
   const db = new Database(path)
   db.pragma('journal_mode = WAL')
   db.pragma('foreign_keys = ON')
+  // WAL-checkpoint tail mitigation — measured, not guessed; full method and
+  // numbers in docs/wal-checkpoint-profile.md. With synchronous=NORMAL the
+  // auto-checkpoint is the only steady-state fsync, and it runs INLINE in
+  // whichever append COMMIT crosses the 1000-page mark: 65/65 profiled
+  // event-loop blockages >=20ms carried that fingerprint, worst 1.22s under
+  // real disk contention (GC max was 6.2ms — exonerated). Disabling the
+  // auto-checkpoint and running PRAGMA wal_checkpoint(PASSIVE) on a 1s timer
+  // (scheduleWalCheckpoint in server.js) moves the fsync out of append
+  // COMMITs: matched-window A/B runs improved append p99 9.7->3.1ms and max
+  // 75->51ms (quiet box) and 1221.7->26.8ms (contended round), zero >100ms
+  // stall events in every mitigated run. journal_size_limit keeps the WAL
+  // file truncated to <=4MiB on reset instead of holding its high-water size
+  // forever (measured bound under sustained load: ~4.8MiB).
+  db.pragma('wal_autocheckpoint = 0')
+  db.pragma('journal_size_limit = 4194304')
   db.exec(SCHEMA)
   // The live DB on dev-2 predates apns_env (only apns_token existed) — in-place
   // migration, never a destructive rebuild. Sygnal lesson: environment
