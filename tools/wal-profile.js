@@ -58,7 +58,14 @@
 //     [--loop-stall=50] [--json-out=path] [--keep-db]
 //
 // Mitigation experiment flags (applied to the SERVER's db handle so
-// candidates can be measured before any src/ change is committed):
+// candidates can be measured before any src/ change is committed).
+// NOTE: candidate B is now shipped in src/ (openDb pragmas + server timer),
+// so this tool explicitly REVERTS the server to pre-mitigation baseline
+// settings unless experiment flags say otherwise — a no-flags run still
+// measures the true baseline, and the shipped 1s timer is neutralized at
+// boot so experiment timers are the only checkpointers. To profile the
+// SHIPPED configuration, pass the candidate-B flags:
+//   --wal-autocheckpoint=0 --ckpt-interval=1000 --journal-size-limit=4194304
 //   --wal-autocheckpoint=N   PRAGMA wal_autocheckpoint=N (0 disables)
 //   --ckpt-interval=MS       run PRAGMA wal_checkpoint(PASSIVE) on a timer;
 //                            every timer checkpoint's duration + result
@@ -300,6 +307,16 @@ function instrumentDb(db, walSampler, { slowMs = 20 } = {}) {
 // loop while it runs, so its full duration distribution is part of the data.
 function applyExperiment(db, exp) {
   const applied = {}
+  // Candidate B shipped (src/db.js sets wal_autocheckpoint=0 +
+  // journal_size_limit, src/server.js runs the 1s PASSIVE timer), so a
+  // freshly started server already carries the mitigation. This tool's
+  // no-flags run must still mean BASELINE — the pre-mitigation SQLite
+  // defaults the Phase 1/2 numbers were measured against — so the shipped
+  // pragmas are unconditionally reverted here and only reapplied by explicit
+  // experiment flags. (The shipped server timer is neutralized at
+  // startServer time via walCheckpointIntervalMs — see the boot sites.)
+  db.pragma('wal_autocheckpoint = 1000')
+  db.pragma('journal_size_limit = -1')
   if (exp.walAutocheckpoint != null) {
     db.pragma(`wal_autocheckpoint = ${Number(exp.walAutocheckpoint)}`)
     applied.walAutocheckpoint = Number(exp.walAutocheckpoint)
@@ -601,7 +618,7 @@ function buildStallTable({ latencySamples, serverData, genData, mode, stallThres
 // --- child-server role ------------------------------------------------------------
 async function runChildServer(args) {
   const dbPath = args.db
-  const s = await startServer({ dbPath, port: 0, bind: '127.0.0.1' })
+  const s = await startServer({ dbPath, port: 0, bind: '127.0.0.1', walCheckpointIntervalMs: 2 ** 31 - 1 })
   const instr = attachServerInstrumentation(s.db, dbPath, {
     slowStmtMs: Number(args['slow-stmt'] ?? 20),
     loopStallMs: Number(args['loop-stall'] ?? 50),
@@ -681,7 +698,7 @@ export async function runWalProfile(opts = {}) {
     let base
 
     if (!cfg.outOfProc) {
-      s = await startServer({ dbPath, port: 0, bind: '127.0.0.1' })
+      s = await startServer({ dbPath, port: 0, bind: '127.0.0.1', walCheckpointIntervalMs: 2 ** 31 - 1 })
       base = `http://127.0.0.1:${s.port}`
       const { agents, clients } = await provision(s.db, cfg)
       // instrumentation attaches AFTER provisioning so argon2/setup noise

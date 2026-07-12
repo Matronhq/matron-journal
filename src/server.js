@@ -80,6 +80,33 @@ function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs })
   return interval
 }
 
+// The explicit-checkpoint half of the WAL mitigation (the pragma half —
+// wal_autocheckpoint=0 + journal_size_limit — lives in openDb; measured
+// rationale in docs/wal-checkpoint-profile.md). PASSIVE never blocks readers
+// or the writer, and on an empty WAL it is sub-ms, so a 1s cadence costs
+// nothing when idle; under load it keeps backfills small and the WAL bounded
+// (~4.8MiB worst observed vs unbounded growth without it, since autockpt is
+// now off). It still runs the fsync on this thread — profiled cost p99 46ms,
+// max 59ms per pass under load — but appends themselves no longer carry it.
+// Unref'd like the retention timer; cleared in close().
+const WAL_CHECKPOINT_INTERVAL_MS = 1000
+
+function scheduleWalCheckpoint(db, walCheckpointIntervalMs) {
+  const run = () => {
+    try {
+      db.pragma('wal_checkpoint(PASSIVE)')
+    } catch (err) {
+      // A failed passive pass is retried by the next tick; log once per tick
+      // rather than crash — the DB itself is still healthy (busy/locked are
+      // expected transient outcomes).
+      console.error('wal-checkpoint: passive pass failed', err)
+    }
+  }
+  const interval = setInterval(run, walCheckpointIntervalMs ?? WAL_CHECKPOINT_INTERVAL_MS)
+  interval.unref()
+  return interval
+}
+
 // Direct APNs push is wired ONLY when all four MATRON_APNS_* vars are set
 // (same disabled-by-default pattern as the rest of the server); otherwise a
 // single warn log at boot and the push pipeline is an inert no-op.
@@ -99,7 +126,7 @@ function resolveApnsClient(injected) {
 
 export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, apnsClient, replayBackpressureBytes,
-  retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs,
+  retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, walCheckpointIntervalMs,
 } = {}) {
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
   const db = openDb(resolvedDbPath)
@@ -117,9 +144,11 @@ export function startServer({
   }))
   const wss = attachWs({ server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, ...(revocationSweepMs !== undefined ? { revocationSweepMs } : {}) })
   let retentionInterval = null
+  let walCheckpointInterval = null
   return new Promise((resolve) => {
     server.listen(port, bind, () => {
       retentionInterval = scheduleRetention(db, { mediaDir: resolvedMediaDir, retentionDays, retentionIntervalMs })
+      walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
       resolve({
         port: server.address().port,
         db,
@@ -128,6 +157,7 @@ export function startServer({
         pushPipeline,
         close: () => new Promise((r) => {
           if (retentionInterval) clearInterval(retentionInterval)
+          if (walCheckpointInterval) clearInterval(walCheckpointInterval)
           wss.close()
           for (const c of wss.clients) c.terminate()
           pushPipeline.close()

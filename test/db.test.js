@@ -64,3 +64,21 @@ test('openDb migrates a pre-apns_env devices table in place (live-DB upgrade pat
   // Re-opening again (schema already migrated) must be a no-op, not an error.
   assert.doesNotThrow(() => openDb(dbPath).close())
 })
+
+// WAL mitigation pragmas (docs/wal-checkpoint-profile.md): the inline
+// auto-checkpoint is disabled — checkpoints run only from server.js's 1s
+// PASSIVE timer — and the WAL file truncates back to <=4MiB on reset instead
+// of keeping its high-water size. Asserted on a file-backed DB because
+// :memory: databases silently ignore WAL mode.
+test('openDb applies the WAL checkpoint mitigation pragmas', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-walpragma-'))
+  const db = openDb(path.join(dir, 'm.db'))
+  try {
+    assert.equal(db.pragma('journal_mode', { simple: true }), 'wal')
+    assert.equal(db.pragma('wal_autocheckpoint', { simple: true }), 0)
+    assert.equal(db.pragma('journal_size_limit', { simple: true }), 4194304)
+  } finally {
+    db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})

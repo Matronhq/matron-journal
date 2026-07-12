@@ -148,3 +148,49 @@ test('MATRON_MAX_REPLAY garbage in the env does not silently disable the snapsho
   assert.equal(frames.filter((f) => f.kind === 'journal').length, 3)
   raw.close()
 })
+
+// The timer half of the WAL mitigation (scheduleWalCheckpoint): PASSIVE
+// checkpoints actually run on the configured cadence, actually backfill WAL
+// frames produced by appends (autocheckpoint is disabled in openDb, so
+// nothing else checkpoints), and stop when the server closes. db.pragma is
+// shadowed with a counting wrapper — the timer resolves the method at call
+// time, so the wrapper observes every pass and its real result.
+test('WAL checkpoint timer runs PASSIVE passes, backfills appends, and stops on close', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-walckpt-'))
+  const s = await startTestServer({ dbPath: path.join(dir, 'm.db'), walCheckpointIntervalMs: 50 })
+  let closed = false
+  try {
+    const passes = []
+    const origPragma = s.db.pragma.bind(s.db)
+    s.db.pragma = (sql, ...rest) => {
+      const out = origPragma(sql, ...rest)
+      if (/wal_checkpoint/i.test(String(sql))) passes.push(out)
+      return out
+    }
+
+    // Generate WAL frames, then give the timer a few ticks to backfill them.
+    const user = await createUser(s.db, 'walckpt-user', 'pw-walckpt-user')
+    upsertConversation(s.db, { id: 'walckpt-convo', ownerUserId: user.id, title: 't' })
+    for (let i = 0; i < 25; i++) {
+      append(s.db, { userId: user.id, convoId: 'walckpt-convo', sender: 'agent:a', type: 'text', payload: { body: `m${i}` } })
+    }
+    await new Promise((r) => setTimeout(r, 300))
+    assert.ok(passes.length >= 2, `expected >=2 timer passes, saw ${passes.length}`)
+    // At least one pass backfilled the frames the appends produced.
+    assert.ok(
+      passes.some((p) => Array.isArray(p) && p[0] && p[0].checkpointed > 0),
+      `no pass reported checkpointed>0: ${JSON.stringify(passes.slice(0, 5))}`
+    )
+
+    await s.close()
+    closed = true
+    const after = passes.length
+    await new Promise((r) => setTimeout(r, 250))
+    assert.equal(passes.length, after, 'timer kept firing after close()')
+  } finally {
+    // An assertion failure above must not leak the server (an open listener
+    // keeps the node:test process alive forever).
+    if (!closed) await s.close().catch(() => {})
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
