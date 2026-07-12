@@ -27,16 +27,31 @@ test('load-test tool: a short run completes and produces a well-formed summary',
   assert.ok(summary.ephemeral.streamSent > 0, 'expected the hot agent to have sent stream ephemerals')
   assert.ok(summary.ephemeral.streamReceived <= summary.ephemeral.streamSent, 'coalescing must never deliver more than was sent')
 
+  // Replay accounting must reconcile EXACTLY: a completed cursor-0 replay
+  // delivers every seq 1..helloSeq once, so eventsReplayed === helloSeq.
   assert.equal(summary.replay.completed, true, 'cold client should finish its replay within the run+drain window')
+  assert.equal(summary.replay.eventsReplayed, summary.replay.helloSeq,
+    'cold-client replay count must equal the hello_ok head seq exactly')
+  assert.equal(summary.replay.reconciles, true)
   assert.ok(summary.replay.throughputEventsPerSec >= 0)
+
+  // The probe train must have produced during-cold samples — a starvation
+  // gate that cannot be assessed (insufficient_data) is a failure.
+  assert.ok(summary.appendLatencyByPhaseMs.duringCold.count > 0,
+    'probe train should guarantee at least one during-cold-replay latency sample')
 
   assert.ok(summary.eventLoopLagMs.p95 >= 0)
   assert.ok(summary.memory.rssBeforeMb > 0)
   assert.ok(summary.memory.rssAfterMb > 0)
 
-  assert.ok(summary.gates.appendP99)
-  assert.ok(summary.gates.eventLoopP95)
-  assert.ok(summary.gates.replayStarvation)
+  // Gates must actually PASS (.ok === true), not merely exist — asserting
+  // object truthiness would let a failing or vacuous gate slip through.
+  assert.equal(summary.gates.appendP99.ok, true,
+    `appendP99 gate failed: ${JSON.stringify(summary.gates.appendP99)}`)
+  assert.equal(summary.gates.eventLoopP95.ok, true,
+    `eventLoopP95 gate failed: ${JSON.stringify(summary.gates.eventLoopP95)}`)
+  assert.equal(summary.gates.replayStarvation.ok, true,
+    `replayStarvation gate failed: ${JSON.stringify(summary.gates.replayStarvation)}`)
 
   // formatReport must not throw on a real summary shape.
   const report = formatReport(summary)
