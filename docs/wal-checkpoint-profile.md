@@ -173,7 +173,7 @@ V8 GC and not the in-process load generator.**
 Evidence summary across all Phase 1 runs (~900s of profiled load, ~80k
 append-latency samples, >500 completed checkpoints observed passively):
 
-- Every event-loop blockage ≥20ms — 65 of 65 across five runs — carried
+- Every event-loop blockage ≥20ms — 69 of 69 across five runs (10+4+6+22+27) — carried
   the checkpoint fingerprint (WAL-index `nBackfill` jump / `mxFrame` reset
   inside the blocking statement's window).
 - The worst GC of any kind in any run was 6.2ms (`PerformanceObserver`,
@@ -223,7 +223,7 @@ Three rounds, spanning box conditions:
 |---|---|---|---|
 | E0 baseline `autockpt=1000` | 0.69 / 2.80 / 26.98 / **1221.7** | **19 events, worst 1222ms** (17 checkpoint-fingerprinted, 2 sqlite-stmt) | reproduces the historical stall magnitude, same fingerprint as Phase 1 |
 | EC worker TRUNCATE | 0.67 / 2.09 / 9.76 / 528.5 | 12 events, worst 814ms | writer-lock stalls persist under contention |
-| EB = B timer 1s | 0.59 / 1.58 / 3.27 / **26.8** | **0** | 120 passes, max 59ms |
+| EB = B timer 1s | 0.59 / 1.58 / 3.27 / **26.8** | **0** | 120 passes, max 59ms; WAL bounded 4.53MB |
 | EA `autockpt=200` | 1.18 / 4.79 / 12.12 / 59.1 | 0 | mid-distribution tax again (p99 3.7× B's) |
 
 Confound disclosure: the burst was decaying across the sequence (worst-hit
@@ -241,9 +241,13 @@ and Round 3 provides a matched-window pair.
 
 ### Choice: candidate B
 
-`wal_autocheckpoint=0` + `journal_size_limit=4194304` (src/db.js `openDb`) +
-`PRAGMA wal_checkpoint(PASSIVE)` on an unref'd 1s timer
-(`scheduleWalCheckpoint` in src/server.js, cleared in `close()`).
+`journal_size_limit=4194304` (src/db.js `openDb` — every opener) +
+`wal_autocheckpoint=0` and `PRAGMA wal_checkpoint(PASSIVE)` on an unref'd
+1s timer (`startServer`/`scheduleWalCheckpoint` in src/server.js, cleared
+in `close()` — server only). The split matters: a standalone opener like
+the admin CLI has no timer, so it keeps SQLite's stock inline
+auto-checkpoint — otherwise a long one-shot run (backlog retention
+offload) would grow the WAL unbounded.
 
 - Best append latencies in every round it appeared in; zero >100ms stall
   events in all three of its runs; WAL bounded ≤4.8MB in all of them.

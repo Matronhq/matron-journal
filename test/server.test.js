@@ -160,6 +160,9 @@ test('WAL checkpoint timer runs PASSIVE passes, backfills appends, and stops on 
   const s = await startTestServer({ dbPath: path.join(dir, 'm.db'), walCheckpointIntervalMs: 50 })
   let closed = false
   try {
+    // The server half of the pragma split: startServer (not openDb) disables
+    // the inline auto-checkpoint, since only the server runs the timer.
+    assert.equal(s.db.pragma('wal_autocheckpoint', { simple: true }), 0)
     const passes = []
     const origPragma = s.db.pragma.bind(s.db)
     s.db.pragma = (sql, ...rest) => {
