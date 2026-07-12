@@ -21,11 +21,30 @@
 //     probe observer), and a cold client that connects mid-run with
 //     cursor 0 (full replay while load keeps flowing).
 //
+// Replay accounting is exact: every frame on the cold socket is counted
+// from the moment the socket opens (the frame listener is attached BEFORE
+// hello is sent — see connectWs), and since a cursor-0 replay delivers
+// every seq 1..helloSeq in order, `eventsReplayed` must equal `helloSeq`
+// exactly on a completed replay. Any mismatch is a delivery bug, not
+// measurement noise.
+//
+// While the cold client's replay is in flight, a dedicated probe train
+// fires a publish every 5ms on the hot agent's socket, so the
+// "during-cold-replay" append-latency bucket always has samples even when
+// the replay window is only a few ms wide — otherwise the replay-starvation
+// gate could never be assessed on a fast replay. Gates with empty sample
+// sets FAIL with reason 'insufficient_data' rather than passing vacuously.
+//
 // Reports append latency (publish/finalize -> journal frame observed on the
 // live-follower) p50/p95/p99, ephemeral coalescing ratio (delivered/sent to
 // the hot viewer), cold-client replay throughput/wall time, server-process
 // event-loop lag (monitorEventLoopDelay), final head_seq, and RSS
 // before/after. Machine-readable JSON + a human table go to stdout.
+//
+// NOTE on measurement bias: server and load generator share one Node
+// process and one event-loop thread, so every reported number (append
+// latency included, not just loop lag) carries generator overhead — treat
+// all results as conservative/pessimistic for the server alone.
 //
 // Usage:
 //   node tools/load-test.js [--duration=60] [--agents=10] [--convos=300]
@@ -57,6 +76,8 @@ const DEFAULTS = {
   rates: { stream: 30, publish: 8, finalize: 1, sprinkle: 1 }, // events/s per agent session
   drainMs: 1500, // grace period after the load window before measuring final state
   ackIntervalMs: 1000,
+  probeTrainIntervalMs: 5, // cadence of the during-cold-replay probe train
+  probeTrainMax: 2000, // hard cap on train probes (safety valve)
 }
 
 const nowMs = () => Number(process.hrtime.bigint()) / 1e6
@@ -105,29 +126,36 @@ function makeLatencyTracker() {
   }
 }
 
-function connectWs(base, { token, cursor }) {
+// Opens a socket, sends hello, resolves on hello_ok with {ws, helloSeq}.
+//
+// The single 'message' listener is attached at socket creation — BEFORE
+// hello is even sent — and forwards every frame (hello_ok included) to
+// `onFrame`. This matters: the server sends hello_ok and up to a full
+// replay batch synchronously, so those frames can land in the same TCP
+// read and be emitted back-to-back before the microtask that resumes an
+// `await connectWs(...)` ever runs. A listener attached only after the
+// await would silently drop them (this was a real bug: the cold client
+// undercounted its replay by exactly the frames emitted in that window).
+function connectWs(base, { token, cursor, onFrame }) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(base.replace('http', 'ws') + '/ws')
-    const onError = (e) => { cleanup(); reject(e) }
-    const onOpen = () => ws.send(JSON.stringify({ op: 'hello', token, cursor }))
-    const onMessage = (data) => {
+    let settled = false
+    ws.on('message', (data) => {
       let msg
       try { msg = JSON.parse(data) } catch { return }
+      if (onFrame) onFrame(msg)
+      if (settled) return
       if (msg.kind === 'control' && msg.op === 'hello_ok') {
-        cleanup()
+        settled = true
         resolve({ ws, helloSeq: msg.seq })
       } else if (msg.kind === 'control' && msg.op === 'error') {
-        cleanup()
+        settled = true
         reject(new Error(`ws hello failed: ${msg.code}`))
+        ws.terminate()
       }
-    }
-    function cleanup() {
-      ws.off('error', onError)
-      ws.off('message', onMessage)
-    }
-    ws.on('error', onError)
-    ws.on('open', onOpen)
-    ws.on('message', onMessage)
+    })
+    ws.on('error', (e) => { if (!settled) { settled = true; reject(e) } })
+    ws.on('open', () => ws.send(JSON.stringify({ op: 'hello', token, cursor })))
   })
 }
 
@@ -230,10 +258,18 @@ export async function runLoadTest(opts = {}) {
   const runStartedAt = new Date().toISOString()
   const t0 = nowMs()
 
-  const s = await startServer({ dbPath, port: cfg.port, bind: cfg.bind })
-  const base = `http://127.0.0.1:${s.port}`
+  // Everything that must be torn down lands in these, so the finally block
+  // below can clean up on ANY exit path (success or exception) — leaked
+  // timers/sockets/server would otherwise hang the process on error.
+  let s = null
+  const sockets = []
+  const timers = []
+  let loop = null
 
   try {
+    s = await startServer({ dbPath, port: cfg.port, bind: cfg.bind })
+    const base = `http://127.0.0.1:${s.port}`
+
     // --- provisioning: 1 user + N agent devices + 3 client devices,
     // directly via the db/admin modules against the server's own db
     // handle (same in-process better-sqlite3 connection) -----------------
@@ -262,71 +298,106 @@ export async function runLoadTest(opts = {}) {
     const pools = restConvos.length > 0 ? assignConvoPools(restConvos, nonHotAgents) : Array.from({ length: nonHotAgents }, () => [hotConvoId])
 
     // --- client sockets: hot viewer + live-follower connect BEFORE any
-    // agent so no probe/ephemeral is ever missed ---------------------------
-    const hot = await connectWs(base, { token: clientDevices['hot-viewer'].token, cursor: null })
+    // agent so no probe/ephemeral is ever missed. All frame handling goes
+    // through connectWs's onFrame (attached pre-hello) so frames arriving
+    // in the same TCP read as hello_ok are never dropped. -----------------
+    const ephemeral = { streamSent: 0, activitySent: 0, streamReceived: 0, activityReceived: 0 }
+    const hot = await connectWs(base, {
+      token: clientDevices['hot-viewer'].token, cursor: null,
+      onFrame: (msg) => {
+        if (msg.kind !== 'ephemeral' || msg.convo_id !== hotConvoId) return
+        if (msg.activity) ephemeral.activityReceived++
+        else ephemeral.streamReceived++
+      },
+    })
+    sockets.push(hot.ws)
     hot.ws.send(JSON.stringify({ op: 'viewing', convo_id: hotConvoId }))
 
-    const ephemeral = { streamSent: 0, activitySent: 0, streamReceived: 0, activityReceived: 0 }
-    hot.ws.on('message', (data) => {
-      let msg
-      try { msg = JSON.parse(data) } catch { return }
-      if (msg.kind !== 'ephemeral' || msg.convo_id !== hotConvoId) return
-      if (msg.activity) ephemeral.activityReceived++
-      else ephemeral.streamReceived++
-    })
-
     const latency = makeLatencyTracker()
-    const live = await connectWs(base, { token: clientDevices['live-follower'].token, cursor: 0 })
     let liveMaxSeq = 0
-    live.ws.on('message', (data) => {
-      let msg
-      try { msg = JSON.parse(data) } catch { return }
-      if (msg.kind !== 'journal') return
-      if (msg.seq > liveMaxSeq) liveMaxSeq = msg.seq
-      if (msg.payload && typeof msg.payload._probe === 'number') latency.observe(msg.payload._probe)
+    const live = await connectWs(base, {
+      token: clientDevices['live-follower'].token, cursor: 0,
+      onFrame: (msg) => {
+        if (msg.kind !== 'journal') return
+        if (msg.seq > liveMaxSeq) liveMaxSeq = msg.seq
+        if (msg.payload && typeof msg.payload._probe === 'number') latency.observe(msg.payload._probe)
+      },
     })
+    sockets.push(live.ws)
     const ackInterval = setInterval(() => {
       if (live.ws.readyState === 1) live.ws.send(JSON.stringify({ op: 'ack', cursor: liveMaxSeq }))
     }, cfg.ackIntervalMs)
+    ackInterval.unref()
+    timers.push(ackInterval)
 
     // --- agent sockets ------------------------------------------------------
     const agentConns = await Promise.all(agentDevices.map(async (a) => {
       const c = await connectWs(base, { token: a.token, cursor: null })
+      sockets.push(c.ws)
       return { ...a, ws: c.ws }
     }))
 
-    // --- cold client: scheduled to connect partway through the run --------
-    const cold = { state: 'pending', count: 0, doneCount: 0, wallMs: null, throughputPerSec: null, helloSeq: null }
+    // --- cold client: scheduled to connect partway through the run.
+    // Replay accounting: the onFrame listener counts every journal frame
+    // from socket open. A cursor-0 replay delivers every seq 1..helloSeq in
+    // order, so on completion eventsReplayed === helloSeq exactly.
+    const cold = { state: 'pending', count: 0, doneCount: 0, wallMs: null, throughputPerSec: null, helloSeq: null, ws: null }
     const coldConnectDelayMs = cfg.durationMs * cfg.coldConnectFraction
-    let coldTimer = null
     const connectColdClient = async () => {
       const connectStartMs = nowMs()
       latency.phase.coldConnectAt = connectStartMs
       cold.state = 'connecting'
-      const c = await connectWs(base, { token: clientDevices['cold-client'].token, cursor: 0 })
-      cold.helloSeq = c.helloSeq
-      cold.ws = c.ws
-      cold.state = 'replaying'
-      if (c.helloSeq === 0) {
+      const markDone = () => {
         cold.state = 'done'
         cold.wallMs = nowMs() - connectStartMs
-        cold.doneCount = 0
-        cold.throughputPerSec = 0
+        cold.doneCount = cold.count
+        cold.throughputPerSec = cold.wallMs > 0 ? cold.doneCount / (cold.wallMs / 1000) : cold.doneCount
         latency.phase.coldDoneAt = nowMs()
       }
-      c.ws.on('message', (data) => {
-        let msg
-        try { msg = JSON.parse(data) } catch { return }
-        if (msg.kind !== 'journal') return
-        cold.count++
-        if (cold.state === 'replaying' && msg.seq >= cold.helloSeq) {
-          cold.state = 'done'
-          cold.wallMs = nowMs() - connectStartMs
-          cold.doneCount = cold.count
-          cold.throughputPerSec = cold.wallMs > 0 ? cold.doneCount / (cold.wallMs / 1000) : cold.doneCount
-          latency.phase.coldDoneAt = nowMs()
-        }
+      // Probe train: while the replay is in flight, fire a publish every
+      // probeTrainIntervalMs on the hot agent's socket (first one
+      // synchronously, so even a sub-5ms replay window gets a sample).
+      // Guarantees the duringCold latency bucket is never empty — without
+      // it, a fast replay yields zero samples and the starvation gate
+      // could not be assessed. The train also guarantees a live frame with
+      // seq > helloSeq arrives promptly after replay, bounding the
+      // done-detection slack to ~one train interval.
+      let trainN = 0
+      const probeAgentWs = agentConns[0].ws
+      const fireTrainProbe = () => {
+        if (probeAgentWs.readyState !== 1) return
+        trainN++
+        const probeId = latency.nextProbeId()
+        latency.mark(probeId)
+        probeAgentWs.send(JSON.stringify({
+          op: 'publish', convo_id: hotConvoId, type: 'text',
+          payload: { body: 'cold-replay probe', _probe: probeId }, idem_key: `coldprobe-${trainN}`,
+        }))
+      }
+      fireTrainProbe()
+      const train = setInterval(() => {
+        if (cold.state === 'done' || trainN >= cfg.probeTrainMax) { clearInterval(train); return }
+        fireTrainProbe()
+      }, cfg.probeTrainIntervalMs)
+      train.unref()
+      timers.push(train)
+
+      const c = await connectWs(base, {
+        token: clientDevices['cold-client'].token, cursor: 0,
+        onFrame: (msg) => {
+          if (msg.kind === 'control' && msg.op === 'hello_ok') {
+            cold.helloSeq = msg.seq
+            cold.state = 'replaying'
+            if (msg.seq === 0) markDone() // empty journal: nothing to replay
+            return
+          }
+          if (msg.kind !== 'journal') return
+          cold.count++
+          if (cold.state === 'replaying' && msg.seq >= cold.helloSeq) markDone()
+        },
       })
+      cold.ws = c.ws
+      sockets.push(c.ws)
     }
 
     // --- run the load window ------------------------------------------------
@@ -334,12 +405,14 @@ export async function runLoadTest(opts = {}) {
     // shows a ~20ms floor even fully idle (verified separately), which
     // swamps any real load-induced signal; 2ms keeps the idle floor near
     // ~2ms so genuine event-loop pressure is actually visible.
-    const loop = monitorEventLoopDelay({ resolution: 2 })
+    loop = monitorEventLoopDelay({ resolution: 2 })
     loop.enable()
     const rssBeforeBytes = process.memoryUsage().rss
     const loadStartMs = nowMs()
     const endAtMs = loadStartMs + cfg.durationMs
-    coldTimer = setTimeout(() => { connectColdClient().catch((e) => console.error('cold client connect failed', e)) }, coldConnectDelayMs)
+    const coldTimer = setTimeout(() => { connectColdClient().catch((e) => console.error('cold client connect failed', e)) }, coldConnectDelayMs)
+    coldTimer.unref()
+    timers.push(coldTimer)
 
     await Promise.all(agentConns.map((a) => runAgentSession({
       id: a.idx, ws: a.ws, hot: a.idx === 0,
@@ -352,20 +425,12 @@ export async function runLoadTest(opts = {}) {
     const drainDeadline = nowMs() + cfg.drainMs
     while (nowMs() < drainDeadline && latency.pendingCount() > 0) await sleep(50)
 
-    clearInterval(ackInterval)
-    clearTimeout(coldTimer)
     loop.disable()
     const rssAfterBytes = process.memoryUsage().rss
 
     const headRow = s.db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(user.id)
     const headSeqFinal = headRow ? headRow.seq : 0
     const journalRowCount = s.db.prepare('SELECT COUNT(*) n FROM events').get().n
-
-    // --- close everything ---------------------------------------------------
-    for (const c of [hot.ws, live.ws, cold.ws, ...agentConns.map((a) => a.ws)]) {
-      if (c && (c.readyState === 0 || c.readyState === 1)) c.close()
-    }
-    await s.close()
 
     const allLatency = percentiles(latency.samples.map((x) => x.latencyMs))
     const byPhase = (phase) => percentiles(latency.samples.filter((x) => x.phase === phase).map((x) => x.latencyMs))
@@ -379,28 +444,45 @@ export async function runLoadTest(opts = {}) {
 
     const preCold = byPhase('preCold')
     const duringCold = byPhase('duringCold')
-    const starved = duringCold.count > 0 && (
-      (duringCold.p99 != null && duringCold.p99 > 250) ||
-      (preCold.p99 != null && preCold.p99 > 0 && duringCold.p99 != null && duringCold.p99 > preCold.p99 * 2 && duringCold.p99 > 20)
-    )
 
+    // Gates. An empty sample set is never a pass — it means the measurement
+    // didn't happen, which is itself a failure (reason: insufficient_data).
     const gates = {
-      appendP99: { thresholdMs: 250, actualMs: allLatency.p99, ok: allLatency.p99 == null || allLatency.p99 <= 250 },
+      appendP99: allLatency.count === 0
+        ? { thresholdMs: 250, actualMs: null, sampleCount: 0, ok: false, reason: 'insufficient_data' }
+        : { thresholdMs: 250, actualMs: allLatency.p99, sampleCount: allLatency.count, ok: allLatency.p99 <= 250 },
       eventLoopP95: { thresholdMs: 200, actualMs: eventLoopLagMs.p95, ok: eventLoopLagMs.p95 <= 200 },
-      replayStarvation: {
-        ok: !starved,
-        preColdP99Ms: preCold.p99, duringColdP99Ms: duringCold.p99,
-        detail: starved
-          ? 'append p99 during cold-client replay is elevated vs. steady-state — see appendLatencyByPhaseMs'
-          : 'no material append-latency regression observed during cold-client replay',
-      },
+      replayStarvation: (() => {
+        if (duringCold.count === 0) {
+          return {
+            ok: false, reason: 'insufficient_data',
+            preColdP99Ms: preCold.p99, duringColdP99Ms: null, sampleCount: 0,
+            detail: 'no append-latency samples landed in the cold-replay window — starvation cannot be assessed (the probe train should prevent this; investigate)',
+          }
+        }
+        const starved =
+          duringCold.p99 > 250 ||
+          (preCold.p99 != null && preCold.p99 > 0 && duringCold.p99 > preCold.p99 * 2 && duringCold.p99 > 20)
+        return {
+          ok: !starved,
+          preColdP99Ms: preCold.p99, duringColdP99Ms: duringCold.p99, sampleCount: duringCold.count,
+          detail: starved
+            ? 'append p99 during cold-client replay is elevated vs. steady-state — see appendLatencyByPhaseMs'
+            : 'no material append-latency regression observed during cold-client replay',
+        }
+      })(),
     }
+
+    // Reconciliation: a completed cursor-0 replay must have delivered every
+    // seq 1..helloSeq exactly once, so eventsReplayed === helloSeq.
+    const replayReconciles = cold.state === 'done' && cold.doneCount === (cold.helloSeq ?? 0)
 
     return {
       runStartedAt,
       config: {
         durationMs: cfg.durationMs, numAgents: cfg.numAgents, numConvos: cfg.numConvos,
         coldConnectFraction: cfg.coldConnectFraction, rates: cfg.rates, dbPath,
+        probeTrainIntervalMs: cfg.probeTrainIntervalMs,
       },
       runtime: {
         node: process.version, platform: `${os.platform()} ${os.release()} ${os.arch()}`,
@@ -418,6 +500,7 @@ export async function runLoadTest(opts = {}) {
         eventsReplayed: cold.doneCount, wallTimeMs: cold.wallMs != null ? +cold.wallMs.toFixed(1) : null,
         throughputEventsPerSec: cold.throughputPerSec != null ? +cold.throughputPerSec.toFixed(1) : null,
         completed: cold.state === 'done',
+        reconciles: replayReconciles,
       },
       eventLoopLagMs,
       memory: {
@@ -429,6 +512,13 @@ export async function runLoadTest(opts = {}) {
       gates,
     }
   } finally {
+    // All teardown lives here so it runs on every exit path — a throw
+    // anywhere above must not leave live timers/sockets/a listening server
+    // behind (which would hang the process and leak the temp DB).
+    for (const t of timers) clearInterval(t) // clearInterval also clears timeouts
+    if (loop) { try { loop.disable() } catch { /* already disabled */ } }
+    for (const ws of sockets) { try { ws.terminate() } catch { /* already dead */ } }
+    if (s) { try { await s.close() } catch (e) { console.error('server close failed during teardown', e) } }
     if (!cfg.keepDb) {
       try { fs.rmSync(tmpDir, { recursive: true, force: true }) } catch { /* best effort cleanup */ }
     }
@@ -454,7 +544,7 @@ export function formatReport(summary) {
   lines.push(`  activity sent=${summary.ephemeral.activitySent} received=${summary.ephemeral.activityReceived}`)
   lines.push('')
   lines.push('-- cold client replay (mid-run connect, cursor 0) --')
-  lines.push(`  connected at +${summary.replay.coldConnectDelayMs}ms, target seq=${summary.replay.helloSeq}, events replayed=${summary.replay.eventsReplayed}`)
+  lines.push(`  connected at +${summary.replay.coldConnectDelayMs}ms, target seq=${summary.replay.helloSeq}, events replayed=${summary.replay.eventsReplayed} (reconciles=${summary.replay.reconciles})`)
   lines.push(`  wall time=${fmt(summary.replay.wallTimeMs)}ms throughput=${fmt(summary.replay.throughputEventsPerSec)} events/s completed=${summary.replay.completed}`)
   lines.push('')
   lines.push('-- server event-loop lag, ms --')
@@ -467,7 +557,8 @@ export function formatReport(summary) {
   lines.push('')
   lines.push('-- gates --')
   for (const [name, g] of Object.entries(summary.gates)) {
-    lines.push(`  ${name}: ${g.ok ? 'PASS' : 'CONCERN'}${g.detail ? ' — ' + g.detail : ''}`)
+    const status = g.ok ? 'PASS' : `CONCERN${g.reason ? ` (${g.reason})` : ''}`
+    lines.push(`  ${name}: ${status}${g.detail ? ' — ' + g.detail : ''}`)
   }
   return lines.join('\n')
 }
