@@ -1,19 +1,19 @@
 # Runbook: team rollout of matron-journal
 
-Roll matron-journal out from Dan's single-user deployment on dev-2 to the
-whole team, replacing the tuwunel Matrix homeserver. The journal side is
+Roll matron-journal out from a single-user deployment to the whole team,
+replacing the tuwunel Matrix homeserver. The journal side is
 **additive** throughout: every bridge dual-posts to Matrix and the journal
 until per-user cutover, so a journal problem never affects Matrix
 (`claude-matrix-bridge/.env.example`).
 
 Every step states **WHERE** it runs:
 
-- **[CENTRAL]** — the journal server host, dev-2 (`systemd
-  matron-journal.service`, DB `/home/youruser/matron-journal/data/matron.db`,
+- **[CENTRAL]** — the journal server host (`systemd
+  matron-journal.service`, DB `/opt/matron-journal/data/matron.db`,
   bound `127.0.0.1:9810`, public `https://chat.example.com`).
 - **[BOX:&lt;host&gt;]** — a teammate's dev box running `claude-matrix-bridge`.
-- **[CHEF]** — the `infra-repo` repo (`dev_server` cookbook). PROPOSED
-  only — no change lands from this repo.
+- **[CONFIG-MGMT]** — your configuration-management repo (Chef, Ansible, …).
+  PROPOSED only — no change lands from this repo.
 
 Placeholders to fill in per site: `<username>`, `<dev-box-host>` (short
 hostname used as the agent name), `<device_id>`.
@@ -29,14 +29,15 @@ hostname used as the agent name), `<device_id>`.
 
 ## Current deployed reality (starting point)
 
-- One journal server process on dev-2 (`matron-journal.service`), listening
-  `127.0.0.1:9810`, published at `https://chat.example.com` through a
-  **remotely-managed** Cloudflare tunnel (`dev-2-server`). Routes are edited
-  in the Zero Trust dashboard under **Published applications** on that tunnel
-  — **not** `/etc/cloudflared/config.yml`.
+- One journal server process on the central host (`matron-journal.service`),
+  listening `127.0.0.1:9810`, published at `https://chat.example.com` through
+  a Cloudflare tunnel (or any TLS-terminating reverse proxy). If the tunnel
+  is **remotely managed**, routes are edited in the Zero Trust dashboard
+  under **Published applications** on that tunnel — **not**
+  `/etc/cloudflared/config.yml`.
 - **No Cloudflare Access** on `chat.example.com` by design — native-client
   auth is first-party passwords + device/agent tokens (spec §8).
-- One user (`dan`) and one agent token (dev-2's own bridge). Token/password
+- One user and one agent token (the central box's own bridge). Token/password
   files live under `~/.config/matron/`, mode `600`.
 - Every team member already runs `claude-matrix-bridge` on their own dev
   box, today pointed at the tuwunel homeserver. Rollout points each box's
@@ -51,10 +52,9 @@ hostname used as the agent name), `<device_id>`.
 
 Collect before starting. **[CENTRAL] + planning**
 
-- [ ] Team roster: one journal `<username>` per person (lowercase, matches
-      existing convention for `dan`).
-- [ ] Dev-box inventory: every `<dev-box-host>` and **who owns it**. Dan
-      owns three dev boxes + a laptop/phone client; most teammates own one
+- [ ] Team roster: one journal `<username>` per person (lowercase).
+- [ ] Dev-box inventory: every `<dev-box-host>` and **who owns it**. Some
+      users own several dev boxes plus laptop/phone clients; most own one
       box + client(s).
 - [ ] Confirm each box currently runs `claude-matrix-bridge`
       (`sudo systemctl status claude-matrix-bridge.service`) and dual-post
@@ -65,7 +65,7 @@ Collect before starting. **[CENTRAL] + planning**
       sudo systemctl status matron-journal.service
       curl -fsS http://127.0.0.1:9810/metrics -H "Authorization: Bearer <a-valid-device-token>" | head
       ```
-      (`/metrics` requires any valid device token; use `dan`'s.)
+      (`/metrics` requires any valid device token; use an existing user's.)
 - [ ] A secure out-of-band channel to deliver initial passwords (secret vault
       / 1Password) — **never chat, never a repo** (§10).
 
@@ -78,8 +78,8 @@ pointed at the live DB. Syntax is exactly `bin/matron-admin.js` (README §Admin)
 
 ```
 # [CENTRAL]
-cd /home/youruser/matron-journal
-export MATRON_DB=/home/youruser/matron-journal/data/matron.db
+cd /opt/matron-journal
+export MATRON_DB=/opt/matron-journal/data/matron.db
 
 # create the account with an initial password
 npx matron-admin user add <username> --password '<initial-password>'
@@ -123,8 +123,8 @@ hostname; the journal sender becomes `agent:<dev-box-host>`.
 
 ```
 # [CENTRAL]
-cd /home/youruser/matron-journal
-MATRON_DB=/home/youruser/matron-journal/data/matron.db \
+cd /opt/matron-journal
+MATRON_DB=/opt/matron-journal/data/matron.db \
   npx matron-admin agent add <username> <dev-box-host>
 # -> "agent <dev-box-host> token: <TOKEN>
 #     (store in the bridge credentials file; it is not shown again)"
@@ -189,15 +189,14 @@ Then verify enrollment per §6.
 
 ---
 
-## 4. Chef automation — PROPOSED (infra-repo `dev_server` cookbook)
+## 4. Config-management automation — PROPOSED
 
-**[CHEF] — this section is a proposal; the change lands in `infra-repo`,
-not in this repo.** Goal: a rebuilt dev box comes up journal-ready without
-hand enrollment.
+**[CONFIG-MGMT] — this section is a proposal; the change lands in your
+configuration-management repo, not in this one.** Goal: a rebuilt dev box
+comes up journal-ready without hand enrollment.
 
-The cookbook already provisions each box (role `dev_server`; host + attribute
-data bags per `~/.claude/DEV-MACHINE-SETUP.md`; `./scripts/provision-server
-<host> --update`). Propose adding, per box:
+If your dev boxes are already provisioned by config management, propose
+adding, per box:
 
 - Template the bridge journal env into `~/claude-matrix-bridge/.env`:
   `JOURNAL_WS_URL=wss://chat.example.com/ws`, `JOURNAL_TOKEN_FILE`,
@@ -205,23 +204,20 @@ data bags per `~/.claude/DEV-MACHINE-SETUP.md`; `./scripts/provision-server
 - Place the per-box agent token at
   `~/.config/matron/agent.<dev-box-host>.token`, mode `600`, owner-only.
 
-Secret mechanism: DEV-MACHINE-SETUP.md states host secrets (RDP password,
-CircleCI token, tunnel credentials) live in the **encrypted `development`
-credentials data bag**; separately, it notes the GitHub MCP token
-(`GITHUB_PERSONAL_ACCESS_TOKEN`) is injected into a service by a **systemd
-drop-in from `gh auth token`** — a locally-derived value, not a data-bag
-secret. For the agent token, follow the data-bag pattern: store each box's
-token in the encrypted credentials data bag and have the recipe render it to
-the `600` token file (or a bridge systemd drop-in).
+Secret mechanism: store each box's agent token in your encrypted secret
+store (e.g. Chef encrypted data bags, Ansible Vault) and have the recipe
+render it to the `600` token file (or inject it as `JOURNAL_TOKEN` via a
+bridge systemd drop-in). Never commit a token to the config repo in the
+clear.
 
-- **OPEN (Chef):** exact data-bag key layout for a per-host agent token, and
-  whether the token is rendered to the file vs. injected as `JOURNAL_TOKEN`
-  via a drop-in, are not determined by the sources here — decide in
-  `infra-repo` review. Do **not** invent a key path.
-- **OPEN (Chef):** token issuance is a stateful central-server action
-  (`matron-admin agent add`, §3a) that returns a one-time token — Chef cannot
-  mint it. Decide whether provisioning consumes a pre-issued token from the
-  data bag (issued once by an operator) or triggers issuance out of band.
+- **OPEN (config-mgmt):** exact secret-store layout for a per-host agent
+  token, and whether the token is rendered to the file vs. injected via a
+  drop-in — decide in your infra repo's review.
+- **OPEN (config-mgmt):** token issuance is a stateful central-server action
+  (`matron-admin agent add`, §3a) that returns a one-time token — config
+  management cannot mint it. Decide whether provisioning consumes a
+  pre-issued token from the secret store (issued once by an operator) or
+  triggers issuance out of band.
 
 ---
 
@@ -257,8 +253,8 @@ Run after each enrollment. Mix of **[CENTRAL]** and client checks.
       cursor and recent `last_seen_at`:
       ```
       # [CENTRAL]
-      cd /home/youruser/matron-journal
-      MATRON_DB=/home/youruser/matron-journal/data/matron.db \
+      cd /opt/matron-journal
+      MATRON_DB=/opt/matron-journal/data/matron.db \
         npx matron-admin device list <username>
       # -> a line "kind=agent name=<dev-box-host> cursor=… last_seen_at=…"
       ```
@@ -285,7 +281,7 @@ Run after each enrollment. Mix of **[CENTRAL]** and client checks.
       so check it incremented via the `/metrics` curl:
       ```
       # [CENTRAL]
-      MATRON_DB=/home/youruser/matron-journal/data/matron.db npx matron-admin status
+      MATRON_DB=/opt/matron-journal/data/matron.db npx matron-admin status
       curl -fsS http://127.0.0.1:9810/metrics -H "Authorization: Bearer <token>"   # -> sockets_connected
       ```
 
@@ -303,7 +299,7 @@ Criteria to end dual-post for a user (all must hold):
 - [ ] `matron-admin status` shows their agents' `lag` steadily ~0.
 
 Ordering:
-1. Cut over willing single-box users first; Dan's multi-box setup last (most
+1. Cut over willing single-box users first; multi-box users last (most
    moving parts).
 2. Only after the **last** user is off Matrix do you decommission tuwunel.
 3. Matrix history stays readable in old clients until decommission — nothing is
@@ -366,21 +362,21 @@ counters (README).
 ```
 curl -fsS http://127.0.0.1:9810/metrics -H "Authorization: Bearer <token>"
 # DB-derived subset without a token, straight from SQLite:
-cd /home/youruser/matron-journal
-MATRON_DB=/home/youruser/matron-journal/data/matron.db npx matron-admin status
+cd /opt/matron-journal
+MATRON_DB=/opt/matron-journal/data/matron.db npx matron-admin status
 ```
 
 **Device revocation — [CENTRAL].** `<device_id>` is the integer id from
 `device list`. Deleting the row is the entire revocation: HTTP 401s on the next
 call, WS is cut on the next frame or within ≤60s (README §Device revocation).
 ```
-MATRON_DB=/home/youruser/matron-journal/data/matron.db npx matron-admin device list <username>
-MATRON_DB=/home/youruser/matron-journal/data/matron.db npx matron-admin device revoke <device_id>
+MATRON_DB=/opt/matron-journal/data/matron.db npx matron-admin device list <username>
+MATRON_DB=/opt/matron-journal/data/matron.db npx matron-admin device revoke <device_id>
 ```
 
 **Lost password reset — [CENTRAL].**
 ```
-MATRON_DB=/home/youruser/matron-journal/data/matron.db npx matron-admin user passwd <username> --password '<new-password>'
+MATRON_DB=/opt/matron-journal/data/matron.db npx matron-admin user passwd <username> --password '<new-password>'
 ```
 Deliver out-of-band; note this does **not** revoke existing device tokens
 (README) — revoke devices separately if the account is compromised.
@@ -390,17 +386,17 @@ offloads `tool_output` payloads older than `MATRON_RETENTION_DAYS` (default 30)
 to blob files, leaving `{type, snippet, blob_ref}` in the row; journal rows are
 never deleted (README §Retention, spec §5). Manual run:
 ```
-MATRON_DB=/home/youruser/matron-journal/data/matron.db npx matron-admin offload [--days N]
+MATRON_DB=/opt/matron-journal/data/matron.db npx matron-admin offload [--days N]
 ```
 `--days` must be a positive integer. `MATRON_RETENTION_DAYS=0` (or a
 non-integer) disables the scheduled job.
 
 **Backup — [CENTRAL].** Two things: the SQLite DB and the blob/media dir.
-- DB: `MATRON_DB` = `/home/youruser/matron-journal/data/matron.db` (committed
+- DB: `MATRON_DB` = `/opt/matron-journal/data/matron.db` (committed
   unit). WAL mode — back up with the DB stopped or via SQLite online backup, so
   the `-wal`/`-shm` sidecars are consistent.
 - Blobs: `MATRON_MEDIA_DIR`, or its default `<dirname of the DB>/media`
-  (README, `src/media.js`), i.e. `/home/youruser/matron-journal/data/media`
+  (README, `src/media.js`), i.e. `/opt/matron-journal/data/media`
   by default. Offloaded payloads and uploads both live here.
   - **OPEN (backup):** confirm the effective media dir on the live host with
     `systemctl show matron-journal.service -p Environment` (do not read secret
@@ -424,7 +420,7 @@ non-integer) disables the scheduled job.
 - **TLS-only public edge.** The only public exposure is
   `https://chat.example.com` via the Cloudflare tunnel; the server itself
   binds `127.0.0.1:9810` (committed unit) and is not otherwise reachable
-  (dev-box UFW opens only SSH + RDP).
+  (the host firewall exposes nothing else).
 - **No Cloudflare Access on the chat hostname — by design.** CF Access is
   cookie-based and hostile to native clients, WebSockets, and headless agents
   (spec §8 "Explicitly rejected"). Auth is first-party: passwords mint device
