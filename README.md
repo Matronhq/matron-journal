@@ -27,7 +27,7 @@ thousand lines of Node with SQLite underneath.
   connect as **agent** devices: they create conversations, publish Claude's
   output into the journal, and receive the user's messages for the
   conversations they own.
-- Apps ([matron-iOS-app](https://github.com/Matronhq/matron-iOS-app),
+- Apps ([matron-apple](https://github.com/Matronhq/matron-apple),
   [matron-desktop](https://github.com/Matronhq/matron-desktop),
   [matron-web](https://github.com/Matronhq/matron-web)) connect as **client**
   devices: they render the journal, send user messages, and get push
