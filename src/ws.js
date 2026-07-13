@@ -49,7 +49,7 @@ export async function waitForDrain(ws, thresholdBytes, pollMs = 20) {
 export function attachWs({
   server, db, hub, pingMs = 20000, pushPipeline = noopPushPipeline,
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
-  revocationSweepMs = 60000,
+  revocationSweepMs = 60000, toolStreams,
 }) {
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES })
   // Prepared once, reused for the per-frame revocation recheck below — one
@@ -227,7 +227,7 @@ export function attachWs({
           conn.ws.close(4001)
           return
         }
-        handleOp({ db, hub, conn, msg, pushPipeline })
+        handleOp({ db, hub, conn, msg, pushPipeline, toolStreams })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -254,8 +254,19 @@ export function attachWs({
   return wss
 }
 
+// A buffer freed WITHOUT a durable completion event (idle sweep, count-cap
+// eviction) — tell anyone watching so the client doesn't render a live
+// terminal forever. Normal completion needs no ephemeral: the finalized
+// tool_output journal frame retires the overlay by message_ref.
+export function notifyStale(hub, entry) {
+  hub.sendEphemeral(entry.userId, entry.convoId, {
+    kind: 'ephemeral', convo_id: entry.convoId, message_ref: entry.ref,
+    tool_stream: { event: 'end', reason: 'stale' },
+  })
+}
+
 // Extended by Tasks 7-8 with client and agent operations.
-export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline }) {
+export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams }) {
   const fail = (code, detail) =>
     conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code, ref: msg.op, ...(detail ? { detail } : {}) }))
   // Single choke point: every journal event becomes a WS frame AND (fire and
@@ -387,6 +398,31 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline }
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id, message_ref: msg.message_ref,
           text: msg.text, replace_text: msg.replace_text,
+        })
+        break
+      }
+      case 'stream_append': {
+        if (conn.kind !== 'agent') return fail('forbidden')
+        if (!authorize(db, conn.userId, msg.convo_id)) return fail('forbidden')
+        if (typeof msg.message_ref !== 'string' || !msg.message_ref) return fail('bad_request')
+        if (typeof msg.chunk !== 'string' || !Number.isInteger(msg.offset) || msg.offset < 0) return fail('bad_request')
+        const r = toolStreams.append({
+          userId: conn.userId, convoId: msg.convo_id, ref: msg.message_ref,
+          offset: msg.offset, chunk: msg.chunk, meta: msg.meta,
+        })
+        if (r.status === 'need_meta') return fail('bad_request', 'meta required on buffer-creating frame')
+        if (r.status === 'resync') {
+          conn.ws.send(JSON.stringify({
+            kind: 'control', op: 'stream_resync',
+            convo_id: msg.convo_id, message_ref: msg.message_ref, have: r.have,
+          }))
+          break
+        }
+        if (r.status === 'duplicate') break
+        for (const ev of r.evicted) notifyStale(hub, ev)
+        hub.sendEphemeral(conn.userId, msg.convo_id, {
+          kind: 'ephemeral', convo_id: msg.convo_id, message_ref: msg.message_ref,
+          tool_stream: { event: 'append', offset: r.offset, chunk: r.accepted },
         })
         break
       }

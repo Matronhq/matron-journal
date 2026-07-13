@@ -6,6 +6,7 @@ import { makeLoginGuard, makeRateLimiter } from './auth.js'
 import { makeHttpHandler } from './http.js'
 import { makeHub } from './hub.js'
 import { attachWs } from './ws.js'
+import { makeToolStreamStore } from './tool-stream.js'
 import { makeApnsClient } from './apns.js'
 import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
@@ -126,7 +127,7 @@ function resolveApnsClient(injected) {
 
 export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, apnsClient, replayBackpressureBytes,
-  retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, walCheckpointIntervalMs,
+  retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, walCheckpointIntervalMs, toolStreamOpts,
 } = {}) {
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
   const db = openDb(resolvedDbPath)
@@ -149,13 +150,19 @@ export function startServer({
   const resolvedMediaMaxBytes = mediaMaxBytes ?? resolveNumericEnv('MATRON_MEDIA_MAX_BYTES', process.env.MATRON_MEDIA_MAX_BYTES, DEFAULT_MEDIA_MAX_BYTES)
   const resolvedMaxReplay = maxReplay ?? resolveNumericEnv('MATRON_MAX_REPLAY', process.env.MATRON_MAX_REPLAY, DEFAULT_MAX_REPLAY)
   const hub = makeHub()
+  const toolStreams = makeToolStreamStore({
+    maxBytes: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BYTES', process.env.MATRON_TOOL_STREAM_MAX_BYTES, 1048576),
+    maxBuffers: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BUFFERS', process.env.MATRON_TOOL_STREAM_MAX_BUFFERS, 64),
+    idleMs: resolveNumericEnv('MATRON_TOOL_STREAM_IDLE_MS', process.env.MATRON_TOOL_STREAM_IDLE_MS, 1800000),
+    ...(toolStreamOpts || {}),
+  })
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
   const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient })
   const server = http.createServer(makeHttpHandler({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     hub, pushPipeline, dbPath: resolvedDbPath,
   }))
-  const wss = attachWs({ server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, ...(revocationSweepMs !== undefined ? { revocationSweepMs } : {}) })
+  const wss = attachWs({ server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams, ...(revocationSweepMs !== undefined ? { revocationSweepMs } : {}) })
   let retentionInterval = null
   let walCheckpointInterval = null
   return new Promise((resolve) => {
@@ -167,6 +174,7 @@ export function startServer({
         db,
         server,
         hub,
+        toolStreams,
         pushPipeline,
         close: () => new Promise((r) => {
           if (retentionInterval) clearInterval(retentionInterval)
