@@ -10,7 +10,7 @@ feat/v1-completion off master (post PR #1 merge).
   only). Tests: node:test via `npm test`. Style: match existing src/ (no
   semicolons is NOT the rule — match what's there).
 - TDD per task: failing test first, then implement.
-- The live DB on dev-2 already exists — every schema change must include an
+- The live production DB already exists — every schema change must include an
   in-place migration path in `openDb` (guard with `PRAGMA table_info` /
   `CREATE TABLE IF NOT EXISTS`), never a destructive rebuild.
 - Every read path passes `authorize(user, convo)` semantics: v1 rule is
