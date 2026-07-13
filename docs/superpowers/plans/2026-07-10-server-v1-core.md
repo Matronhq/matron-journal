@@ -1639,9 +1639,9 @@ After=network.target
 
 [Service]
 Type=simple
-User=danbarker
-WorkingDirectory=/home/danbarker/matron-journal
-Environment=MATRON_DB=/home/danbarker/matron-journal/data/matron.db
+User=matron
+WorkingDirectory=/opt/matron-journal
+Environment=MATRON_DB=/opt/matron-journal/data/matron.db
 Environment=MATRON_PORT=9810
 Environment=MATRON_BIND=127.0.0.1
 ExecStart=/usr/bin/node src/server.js

@@ -60,7 +60,7 @@ steady state**, which is what makes it the natural stall suspect.
 
 ## Phase 1 — attribution runs
 
-All runs on dev-2.yearbook.com (same box and same caveats as
+All runs on the same shared dev box (same box and same caveats as
 load-test-results.md), standard profile: 10 agents, 300 convos, default
 rates, temp DB under /tmp. One run at a time.
 

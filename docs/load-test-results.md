@@ -54,8 +54,8 @@ check that the tool itself works, not a substitute for the runs below.
 
 ## Hardware / environment context
 
-Both runs below were executed on **dev-2.yearbook.com**, the dev box this
-report lives on — not dedicated benchmarking hardware.
+Both runs below were executed on a **shared Linux dev box** — not
+dedicated benchmarking hardware.
 
 **Measurement bias, stated plainly:** the server and the load generator run
 in the **same Node process on one shared event-loop thread**. This inflates

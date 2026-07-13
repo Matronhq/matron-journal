@@ -4,7 +4,7 @@ Rewritten after the v1-completion branch (2026-07-11) — the previous backlog
 (media, APNs push, retention, /metrics, snapshot_required, /password, device
 revocation, protocol decisions, hardening pass) shipped in PR #2. Deployment
 context for severity calls: internal team tool (~10 users), behind a
-Cloudflare tunnel (chat.yearbooks.be, no CF Access), bridge agents are
+Cloudflare tunnel (no CF Access), bridge agents are
 trusted first-party code, iPhones on the public internet.
 
 ## Follow-ups from the PR #2 final whole-branch review

@@ -7,7 +7,7 @@
 
 ## 1. Background
 
-The Claude bridge currently runs over Matrix: per-dev-box Node bridges (`claude-matrix-bridge`) post Claude Code session traffic into rooms on a self-hosted tuwunel homeserver on dev-2; the team reads them in an Element X fork and a native Swift client (Matron, Mac + iOS), both built on matrix-rust-sdk.
+The Claude bridge currently runs over Matrix: per-dev-box Node bridges (`claude-matrix-bridge`) post Claude Code session traffic into rooms on a self-hosted tuwunel homeserver on a central dev box; the team reads them in an Element X fork and a native Swift client (Matron, Mac + iOS), both built on matrix-rust-sdk.
 
 Two problems drove this design:
 
@@ -37,12 +37,12 @@ The replacement is a purpose-built, server-authoritative protocol whose sync mod
 ```
 dev-box bridges (publisher agents, N boxes)          clients (per user)
   bridge on box A ──┐                                  Matron iOS ──┐
-  bridge on box B ──┼──► journal server (dev-2) ◄──────Matron Mac ──┤
+  bridge on box B ──┼──► journal server (central) ◄──────Matron Mac ──┤
   bridge on box C ──┘      Node + SQLite               web (later) ─┘
                            APNs push (direct)
 ```
 
-- One **journal server** process on dev-2, replacing tuwunel and sygnal. Exposed via the existing Cloudflare tunnel on a dedicated hostname (e.g. `chat.yearbooks.be` → a localhost port, same pattern as the existing viewer ingress rules). No Cloudflare Access on this hostname — auth is first-party (§8).
+- One **journal server** process on the central box, replacing tuwunel and sygnal. Exposed via the existing Cloudflare tunnel on a dedicated hostname (e.g. `chat.example.com` → a localhost port, same pattern as the existing viewer ingress rules). No Cloudflare Access on this hostname — auth is first-party (§8).
 - Each dev box's bridge becomes a **publisher agent**: an outbound WebSocket to the server, authenticated by an agent token scoped to its owner's journal. A user with several dev boxes has several agents publishing into one journal.
 - **Clients** hold a local store (SQLite/GRDB in Matron) that mirrors the user's journal from their cursor forward.
 
@@ -161,7 +161,7 @@ Rules: push only for journal events in conversations the device isn't actively v
 
 ## 11. Migration
 
-1. Server v1 deployed on dev-2 alongside tuwunel (different port/hostname). Synthetic-load soak.
+1. Server v1 deployed on the central box alongside tuwunel (different port/hostname). Synthetic-load soak.
 2. Bridge gains a **dual-post output layer**: every session posts to Matrix (unchanged) and publishes to the journal server. Bridge input (user replies) is accepted from both paths during transition.
 3. Matron's data layer swaps matrix-rust-sdk for the journal protocol (WebSocket + GRDB store + cursor). Dan daily-drives it against real traffic while the team stays on Element X/Matrix, untouched.
 4. Per-user cutover: enroll a user's devices, flip their bridge(s) to journal-primary. No flag day; Matrix history stays readable in old clients until decommission.
