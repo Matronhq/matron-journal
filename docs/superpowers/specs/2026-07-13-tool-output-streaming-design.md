@@ -112,8 +112,9 @@ and at-least-once retries — no acks, no sequence numbers.
 
 ### 5.2 Server → client ephemerals
 
-Delivered only to the owning user's **client** connections whose
-`viewing` conversation matches — the same scoping as `stream`/`activity`.
+Delivered only to the owning user's connections whose `viewing`
+conversation matches — the same scoping as `stream`/`activity` (sync
+frames are additionally sent to client connections only; see §8).
 Tool-stream ephemerals are distinguished from assistant-text overlays by the
 `tool_stream` key (text overlays carry `text`/`replace_text`).
 
