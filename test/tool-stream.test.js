@@ -49,6 +49,17 @@ test('per-buffer cap drops the head; start advances; sync flags head_truncated',
     { start: 5, end: 15, content: '56789abcde', headTruncated: true })
 })
 
+test('head drop never splits a multi-byte character', () => {
+  const s = makeToolStreamStore({ maxBytes: 8 })
+  s.append({ userId: 1, convoId: 'c1', ref: 'r1', offset: 0, chunk: '😀😀', meta: META }) // 8 bytes
+  s.append({ userId: 1, convoId: 'c1', ref: 'r1', offset: 8, chunk: 'X' })
+  const [b] = s.buffersFor(1, 'c1')
+  assert.equal(b.content, '😀X')
+  assert.equal(b.start, 4)
+  assert.equal(b.end, 9)
+  assert.equal(b.headTruncated, true)
+})
+
 test('buffer count cap evicts oldest-idle; evicted entries are reported', () => {
   let t = 1000
   const s = makeToolStreamStore({ maxBuffers: 2, now: () => t })

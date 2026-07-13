@@ -15,7 +15,7 @@ export const DEFAULT_IDLE_MS = 30 * 60 * 1000 // 30 min
 const COMMAND_MAX_CHARS = 2000
 const TOOL_MAX_CHARS = 40
 
-const keyOf = (convoId, ref) => `${convoId} ${ref}`
+const keyOf = (convoId, ref) => `${convoId}\x00${ref}`
 
 export function makeToolStreamStore({
   maxBytes = DEFAULT_MAX_BYTES, maxBuffers = DEFAULT_MAX_BUFFERS,
@@ -36,8 +36,14 @@ export function makeToolStreamStore({
         e.chunks.shift()
         e.start += first.length
       } else {
-        e.chunks[0] = first.subarray(excess)
-        e.start += excess
+        // The excess cut can land mid-character (a chunk may hold several
+        // characters). Walk forward past UTF-8 continuation bytes (10xxxxxx)
+        // so the retained content always starts on a character boundary —
+        // e.start absorbs the extra bytes dropped (at most 3) to stay honest.
+        let cut = excess
+        while (cut < first.length && (first[cut] & 0xC0) === 0x80) cut++
+        e.chunks[0] = first.subarray(cut)
+        e.start += cut
       }
     }
   }
