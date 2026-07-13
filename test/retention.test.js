@@ -3,10 +3,11 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
-import { openDb, getBlob } from '../src/db.js'
+import { openDb, getBlob, insertBlob } from '../src/db.js'
 import { createUser } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
-import { runOffload } from '../src/retention.js'
+import { runOffload, runExpireLogs } from '../src/retention.js'
+import { writeBlobSync } from '../src/media.js'
 
 function tmpMediaDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'matron-retention-'))
@@ -177,4 +178,68 @@ test('default retention (no override, no env) is enabled at 30 days', async (t) 
   t.after(() => s.close())
   const row = s.db.prepare('SELECT blob_ref FROM events WHERE seq=?').get(r.seq)
   assert.ok(row.blob_ref, 'default (unset env) retention did not offload a 40-day-old row against the 30-day default')
+})
+
+// helper: append a finalized live-log tool_output event whose blob exists on disk
+function seedLiveLog(db, mediaDir, { userId, convoId, ts, content = 'full log bytes' }) {
+  const blob = writeBlobSync(mediaDir, Buffer.from(content, 'utf8'))
+  insertBlob(db, { id: blob.id, ownerUserId: userId, contentType: 'text/plain', size: blob.size, sha256: blob.sha256, diskPath: blob.diskPath })
+  const payload = { message_ref: 'tu-x', command: 'make', exit_code: 0, denied: false, truncated: false, snippet: 'tail', blob_ref: blob.id, live_log: true }
+  const r = append(db, { userId, convoId, sender: 'agent:dev-2', type: 'tool_output', payload, blobRef: blob.id })
+  db.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(ts, userId, r.seq)
+  return { blob, seq: r.seq }
+}
+
+test('runExpireLogs deletes old live_log blobs, rewrites payload, NULLs the column', async () => {
+  const { db, dan } = await setup()
+  const userId = dan.id
+  const convoId = 'c1'
+  const mediaDir = tmpMediaDir()
+  const old = seedLiveLog(db, mediaDir, { userId, convoId, ts: Date.now() - 48 * 3600000 })
+  const fresh = seedLiveLog(db, mediaDir, { userId, convoId, ts: Date.now() - 1 * 3600000 })
+
+  const r = runExpireLogs(db, { hours: 24, mediaDir })
+  assert.equal(r.expired, 1)
+
+  const oldRow = db.prepare('SELECT payload, blob_ref FROM events WHERE user_id=? AND seq=?').get(userId, old.seq)
+  assert.equal(oldRow.blob_ref, null)
+  const p = JSON.parse(oldRow.payload)
+  assert.equal(p.blob_ref, null)
+  assert.equal(p.blob_expired, true)
+  assert.equal(p.snippet, 'tail') // rest of the payload preserved
+  assert.equal(getBlob(db, old.blob.id), undefined)
+  assert.equal(fs.existsSync(old.blob.diskPath), false)
+
+  // the fresh one is untouched
+  const freshRow = db.prepare('SELECT blob_ref FROM events WHERE user_id=? AND seq=?').get(userId, fresh.seq)
+  assert.equal(freshRow.blob_ref, fresh.blob.id)
+  assert.equal(fs.existsSync(fresh.blob.diskPath), true)
+
+  // idempotent: second run finds nothing
+  assert.equal(runExpireLogs(db, { hours: 24, mediaDir }).expired, 0)
+})
+
+test('runOffload skips blob_expired payloads (no pointless re-blob at 30d)', async () => {
+  const { db, dan } = await setup()
+  const userId = dan.id
+  const convoId = 'c1'
+  const mediaDir = tmpMediaDir()
+  const old = seedLiveLog(db, mediaDir, { userId, convoId, ts: Date.now() - 40 * 86400000 })
+  runExpireLogs(db, { hours: 24, mediaDir })
+  const r = runOffload(db, { days: 30, mediaDir })
+  assert.equal(r.offloaded, 0)
+  const row = db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(userId, old.seq)
+  assert.equal(JSON.parse(row.payload).blob_expired, true) // untouched
+})
+
+test('runExpireLogs never touches offload-created blobs (no live_log flag)', async () => {
+  const { db, dan } = await setup()
+  const userId = dan.id
+  const convoId = 'c1'
+  const mediaDir = tmpMediaDir()
+  // an inline tool_output old enough for offload, which creates a NON-live_log blob
+  const r0 = append(db, { userId, convoId, sender: 'agent:dev-2', type: 'tool_output', payload: { snippet: 'big', body: 'B'.repeat(500) } })
+  db.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 40 * 86400000, userId, r0.seq)
+  runOffload(db, { days: 30, mediaDir })
+  assert.equal(runExpireLogs(db, { hours: 24, mediaDir }).expired, 0)
 })
