@@ -6,15 +6,17 @@ import { makeLoginGuard, makeRateLimiter } from './auth.js'
 import { makeHttpHandler } from './http.js'
 import { makeHub } from './hub.js'
 import { attachWs } from './ws.js'
+import { makeToolStreamStore } from './tool-stream.js'
 import { makeApnsClient } from './apns.js'
 import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
-import { runOffload } from './retention.js'
+import { runOffload, runExpireLogs } from './retention.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 export const DEFAULT_MAX_REPLAY = 50000
 const DEFAULT_RETENTION_DAYS = 30
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
+const DEFAULT_TOOL_LOG_TTL_HOURS = 24
 
 // Shared validator for small numeric env knobs that guard a size/gap check
 // (`size > mediaMaxBytes`, `gap > maxReplay`): an unset var is the normal,
@@ -60,18 +62,56 @@ function resolveRetentionDays(override) {
   return n
 }
 
+// `override` is startServer's `toolLogTtlHours` opt — mirrors
+// resolveRetentionDays exactly (same precedence, same fail-closed
+// validation): unset means ENABLED at the 24h default; `0` disables; and
+// anything that isn't a non-negative integer disables with one log line.
+// Returns the TTL window in hours, or null when the TTL pass is disabled.
+function resolveToolLogTtlHours(override) {
+  const fromEnv = override === undefined
+  const raw = fromEnv ? process.env.MATRON_TOOL_LOG_TTL_HOURS : override
+  if (raw === undefined) return DEFAULT_TOOL_LOG_TTL_HOURS
+  const name = fromEnv ? 'MATRON_TOOL_LOG_TTL_HOURS' : 'toolLogTtlHours'
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 0) {
+    console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid — retention disabled`)
+    return null
+  }
+  if (n === 0) {
+    console.warn(`retention: ${name}=0 — retention disabled`)
+    return null
+  }
+  return n
+}
+
 // Runs at boot (called after `server.listen` succeeds) and every 6h
-// thereafter (unref'd — never keeps the process alive on its own). Returns
-// the interval handle (for close()) or null when retention is disabled.
-function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs }) {
+// thereafter (unref'd — never keeps the process alive on its own). Runs the
+// offload pass and the live-log TTL pass as two independent knobs — either
+// can be disabled on its own (see resolveRetentionDays / resolveToolLogTtlHours)
+// without affecting the other — each with its own try/catch so one pass
+// failing (e.g. a disk error) never prevents the other from running on this
+// tick or being scheduled for the next. Returns the interval handle (for
+// close()) or null only when BOTH passes are disabled.
+function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours }) {
   const days = resolveRetentionDays(retentionDays)
-  if (days === null) return null
+  const ttlHours = resolveToolLogTtlHours(toolLogTtlHours)
+  if (days === null && ttlHours === null) return null
   const run = () => {
-    try {
-      const r = runOffload(db, { days, mediaDir })
-      if (r.offloaded > 0) console.log(`retention: offloaded ${r.offloaded} tool_output payload(s) older than ${days}d`)
-    } catch (err) {
-      console.error('retention: offload run failed', err)
+    if (days !== null) {
+      try {
+        const r = runOffload(db, { days, mediaDir })
+        if (r.offloaded > 0) console.log(`retention: offloaded ${r.offloaded} tool_output payload(s) older than ${days}d`)
+      } catch (err) {
+        console.error('retention: offload run failed', err)
+      }
+    }
+    if (ttlHours !== null) {
+      try {
+        const r = runExpireLogs(db, { hours: ttlHours, mediaDir })
+        if (r.expired > 0) console.log(`retention: expired ${r.expired} live_log blob(s) older than ${ttlHours}h`)
+      } catch (err) {
+        console.error('retention: expire-logs run failed', err)
+      }
     }
   }
   run()
@@ -126,7 +166,8 @@ function resolveApnsClient(injected) {
 
 export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, apnsClient, replayBackpressureBytes,
-  retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, walCheckpointIntervalMs,
+  retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, walCheckpointIntervalMs, toolStreamOpts,
+  toolLogTtlHours,
 } = {}) {
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
   const db = openDb(resolvedDbPath)
@@ -149,24 +190,31 @@ export function startServer({
   const resolvedMediaMaxBytes = mediaMaxBytes ?? resolveNumericEnv('MATRON_MEDIA_MAX_BYTES', process.env.MATRON_MEDIA_MAX_BYTES, DEFAULT_MEDIA_MAX_BYTES)
   const resolvedMaxReplay = maxReplay ?? resolveNumericEnv('MATRON_MAX_REPLAY', process.env.MATRON_MAX_REPLAY, DEFAULT_MAX_REPLAY)
   const hub = makeHub()
+  const toolStreams = makeToolStreamStore({
+    maxBytes: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BYTES', process.env.MATRON_TOOL_STREAM_MAX_BYTES, 1048576),
+    maxBuffers: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BUFFERS', process.env.MATRON_TOOL_STREAM_MAX_BUFFERS, 64),
+    idleMs: resolveNumericEnv('MATRON_TOOL_STREAM_IDLE_MS', process.env.MATRON_TOOL_STREAM_IDLE_MS, 1800000),
+    ...(toolStreamOpts || {}),
+  })
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
   const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient })
   const server = http.createServer(makeHttpHandler({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     hub, pushPipeline, dbPath: resolvedDbPath,
   }))
-  const wss = attachWs({ server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, ...(revocationSweepMs !== undefined ? { revocationSweepMs } : {}) })
+  const wss = attachWs({ server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams, ...(revocationSweepMs !== undefined ? { revocationSweepMs } : {}) })
   let retentionInterval = null
   let walCheckpointInterval = null
   return new Promise((resolve) => {
     server.listen(port, bind, () => {
-      retentionInterval = scheduleRetention(db, { mediaDir: resolvedMediaDir, retentionDays, retentionIntervalMs })
+      retentionInterval = scheduleRetention(db, { mediaDir: resolvedMediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
       resolve({
         port: server.address().port,
         db,
         server,
         hub,
+        toolStreams,
         pushPipeline,
         close: () => new Promise((r) => {
           if (retentionInterval) clearInterval(retentionInterval)
