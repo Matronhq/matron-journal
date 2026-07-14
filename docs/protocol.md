@@ -213,10 +213,25 @@ Unset `MATRON_RETENTION_DAYS` means ENABLED at the 30-day default.
 disables retention instead (one warn log line at boot). Manual run:
 `matron-admin offload [--days N]` (default 30).
 
-Live-log blobs (`tool_output` payloads with `live_log: true`, uploaded by
-bridges at command completion) are deleted after
+Live-streamed tool output (`tool_output` payloads with `live_log: true`,
+uploaded by bridges at command completion) is purged entirely after
 `MATRON_TOOL_LOG_TTL_HOURS` (default 24; 0/invalid disables): the blob file
-and its `blobs` row are removed and the payload is rewritten to
-`{..., blob_ref: null, blob_expired: true}` — the snippet stays forever.
-Offload skips `blob_expired` payloads. Manual run:
+and its `blobs` row are deleted and the payload is rewritten to the tombstone
+`{message_ref, command, exit_code, denied, truncated, live_log: true,
+expired: true, blob_ref: null}` — the snippet is removed; what a command ran
+and whether it succeeded survive forever, what it printed does not. If the
+purged event is still the newest message-type event (text, tool_output,
+diff, prompt, permission_request, file, image) in its conversation, the
+conversation-list preview is rewritten to `$ <command>`. Offload skips
+`expired` payloads. Manual run:
 `matron-admin expire-logs [--hours N]`.
+
+Client rules (binding on all client implementations):
+
+- Render `expired: true` as an "output expired" affordance — show command and
+  exit code, no snippet area, no fetch button.
+- Any client-side persistence of `tool_output` payloads must enforce the same
+  TTL locally: drop a cached snippet once `ts + 24h` passes, without waiting
+  for a server re-sync — otherwise the server purge is defeated by device
+  caches. In-memory display of a currently-open conversation is exempt.
+- The TTL is not communicated in-protocol; clients assume the 24h default.

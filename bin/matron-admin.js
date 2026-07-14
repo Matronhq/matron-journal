@@ -93,7 +93,7 @@ export async function runAdmin(db, argv) {
     }
     const mediaDir = resolveMediaDir(db.name)
     const r = runExpireLogs(db, { hours, mediaDir })
-    return `expired ${r.expired} live_log blob(s) older than ${hours}h`
+    return `purged ${r.expired} live_log payload(s) older than ${hours}h`
   }
   if (a === 'status') {
     // DB-derived stats only (this reads the SQLite file directly, no

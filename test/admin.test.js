@@ -92,7 +92,7 @@ test('admin CLI: expire-logs deletes old live_log blobs and reports the count', 
   db.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 48 * 3600000, dan.id, r0.seq)
 
   const out = await runAdmin(db, ['expire-logs', '--hours', '24'])
-  assert.match(out, /expired 1 live_log blob\(s\) older than 24h/)
+  assert.match(out, /purged 1 live_log payload\(s\) older than 24h/)
 
   db.close()
   fs.rmSync(dir, { recursive: true, force: true })

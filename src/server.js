@@ -86,8 +86,14 @@ function resolveToolLogTtlHours(override) {
 
 // Runs at boot (called after `server.listen` succeeds) and every 6h
 // thereafter (unref'd — never keeps the process alive on its own). Runs the
-// offload pass and the live-log TTL pass as two independent knobs — either
-// can be disabled on its own (see resolveRetentionDays / resolveToolLogTtlHours)
+// live-log TTL pass BEFORE the offload pass (opposite of declaration order
+// above) so that even a mis-configured-then-re-enabled system tombstones a
+// stale inline live_log row before offload ever gets a chance to see it —
+// runOffload's `blob_ref IS NULL` scan can't otherwise distinguish a
+// long-overdue live_log row from a genuinely-inline one, and offloading it
+// would permanently exempt it from the TTL pass (see runOffload's live_log
+// skip). The two passes remain independent knobs otherwise — either can be
+// disabled on its own (see resolveRetentionDays / resolveToolLogTtlHours)
 // without affecting the other — each with its own try/catch so one pass
 // failing (e.g. a disk error) never prevents the other from running on this
 // tick or being scheduled for the next. Returns the interval handle (for
@@ -97,20 +103,20 @@ function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, t
   const ttlHours = resolveToolLogTtlHours(toolLogTtlHours)
   if (days === null && ttlHours === null) return null
   const run = () => {
+    if (ttlHours !== null) {
+      try {
+        const r = runExpireLogs(db, { hours: ttlHours, mediaDir })
+        if (r.expired > 0) console.log(`retention: purged ${r.expired} live_log payload(s) older than ${ttlHours}h`)
+      } catch (err) {
+        console.error('retention: expire-logs run failed', err)
+      }
+    }
     if (days !== null) {
       try {
         const r = runOffload(db, { days, mediaDir })
         if (r.offloaded > 0) console.log(`retention: offloaded ${r.offloaded} tool_output payload(s) older than ${days}d`)
       } catch (err) {
         console.error('retention: offload run failed', err)
-      }
-    }
-    if (ttlHours !== null) {
-      try {
-        const r = runExpireLogs(db, { hours: ttlHours, mediaDir })
-        if (r.expired > 0) console.log(`retention: expired ${r.expired} live_log blob(s) older than ${ttlHours}h`)
-      } catch (err) {
-        console.error('retention: expire-logs run failed', err)
       }
     }
   }
