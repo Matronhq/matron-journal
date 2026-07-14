@@ -48,10 +48,14 @@ export function runOffload(db, { days = 30, mediaDir }) {
     }
     if (looksAlreadyOffloaded(payload)) continue
 
-    // A live-log payload the TTL pass already tombstoned (`expired`), or one
-    // in the pre-purge shape (`blob_expired`) that the next TTL pass will
-    // tombstone: re-blobbing either would undo the purge for zero value.
-    if (payload && (payload.expired || payload.blob_expired)) continue
+    // A live-log payload the TTL pass already tombstoned (`expired`), one in
+    // the pre-purge shape (`blob_expired`) that the next TTL pass will
+    // tombstone, or any other live-log row (`live_log`) — inline or not —
+    // whose lifecycle belongs solely to runExpireLogs: re-blobbing any of
+    // these would strand the snippet in a permanent blob and, for the
+    // inline case, drop the `live_log` key so runExpireLogs can never select
+    // the row again, permanently exempting it from the TTL purge.
+    if (payload && (payload.expired || payload.blob_expired || payload.live_log)) continue
 
     const blob = writeBlobSync(mediaDir, Buffer.from(row.payload, 'utf8'))
     const snippet = snippetOf(OFFLOAD_TYPE, payload)
@@ -131,7 +135,17 @@ export function runExpireLogs(db, { hours = 24, mediaDir }) {
         updateConvoSnippet.run(snippetOf('tool_output', tombstone), row.convo_id)
       }
     })()
-    if (blob) { try { fs.unlinkSync(blob.disk_path) } catch { /* already gone */ } }
+    if (blob) {
+      try {
+        fs.unlinkSync(blob.disk_path)
+      } catch (err) {
+        // ENOENT ("already gone") is the expected steady state — the DB row
+        // is the source of truth and is already committed as purged. Any
+        // other error (EACCES/EIO/...) means the bytes are still on disk
+        // while the DB claims purged, which is worth surfacing loudly.
+        if (err.code !== 'ENOENT') console.error(`retention: failed to unlink blob ${blob.id} at ${blob.disk_path}`, err)
+      }
+    }
     expired += 1
   }
   return { expired }

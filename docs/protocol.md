@@ -220,7 +220,8 @@ and its `blobs` row are deleted and the payload is rewritten to the tombstone
 `{message_ref, command, exit_code, denied, truncated, live_log: true,
 expired: true, blob_ref: null}` — the snippet is removed; what a command ran
 and whether it succeeded survive forever, what it printed does not. If the
-purged event is still the newest message-type event in its conversation, the
+purged event is still the newest message-type event (text, tool_output,
+diff, prompt, permission_request, file, image) in its conversation, the
 conversation-list preview is rewritten to `$ <command>`. Offload skips
 `expired` payloads. Manual run:
 `matron-admin expire-logs [--hours N]`.

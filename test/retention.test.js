@@ -7,7 +7,7 @@ import { openDb, getBlob, insertBlob } from '../src/db.js'
 import { createUser } from '../src/auth.js'
 import { upsertConversation, append, markRead } from '../src/journal.js'
 import { runOffload, runExpireLogs } from '../src/retention.js'
-import { writeBlobSync } from '../src/media.js'
+import { writeBlobSync, resolveMediaDir } from '../src/media.js'
 
 function tmpMediaDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'matron-retention-'))
@@ -233,6 +233,54 @@ test('runOffload skips expired tombstones (no pointless re-blob at 30d)', async 
   assert.equal(JSON.parse(row.payload).expired, true) // untouched tombstone
 })
 
+test('runOffload skips a pre-upgrade blob_expired payload (disabled-TTL window where the row is already snippet-purged but not yet migrated)', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const payload = {
+    message_ref: 'tu-pre', command: 'npm ci', exit_code: 1, denied: false,
+    truncated: false, snippet: 'old tail', blob_ref: null, blob_expired: true, live_log: true,
+  }
+  const r = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:dev-2', type: 'tool_output', payload })
+  backdate(db, r.seq, dan.id, 40) // past the 30-day offload window
+
+  const before = db.prepare('SELECT payload, blob_ref FROM events WHERE user_id=? AND seq=?').get(dan.id, r.seq)
+  const result = runOffload(db, { days: 30, mediaDir })
+  assert.equal(result.offloaded, 0)
+  const after = db.prepare('SELECT payload, blob_ref FROM events WHERE user_id=? AND seq=?').get(dan.id, r.seq)
+  assert.deepEqual(after, before, 'blob_expired payload must be left untouched by offload')
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM blobs').get().n, 0)
+})
+
+test('runOffload skips an inline live_log row (blob_ref column NULL, never offloaded) — live_log rows are governed solely by the TTL pass; runExpireLogs then tombstones it', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  // Simulates an empty-output finalize / failed media upload: a live_log
+  // payload that landed inline (blob_ref column NULL) and, via a disabled
+  // TTL window or a long outage, reached the 30-day offload cutoff without
+  // ever being tombstoned. Offload must not re-blob it (that would strand
+  // the snippet in a permanent blob and drop the live_log key, exempting
+  // the row from runExpireLogs forever) — only runExpireLogs may touch it.
+  const payload = {
+    message_ref: 'tu-inline', command: 'echo hi', exit_code: 0, denied: false,
+    truncated: false, snippet: '', blob_ref: null, live_log: true,
+  }
+  const r = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:dev-2', type: 'tool_output', payload })
+  backdate(db, r.seq, dan.id, 40) // past the 30-day offload window
+
+  const before = db.prepare('SELECT payload, blob_ref FROM events WHERE user_id=? AND seq=?').get(dan.id, r.seq)
+  const offloadResult = runOffload(db, { days: 30, mediaDir })
+  assert.equal(offloadResult.offloaded, 0)
+  const after = db.prepare('SELECT payload, blob_ref FROM events WHERE user_id=? AND seq=?').get(dan.id, r.seq)
+  assert.deepEqual(after, before, 'inline live_log payload must be left untouched by offload')
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM blobs').get().n, 0)
+
+  const expireResult = runExpireLogs(db, { hours: 24, mediaDir })
+  assert.equal(expireResult.expired, 1, 'runExpireLogs must still be able to tombstone the row offload skipped')
+  const tombstoned = JSON.parse(db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(dan.id, r.seq).payload)
+  assert.equal(tombstoned.expired, true)
+  assert.equal(tombstoned.blob_ref, null)
+})
+
 test('runExpireLogs tombstones a pre-upgrade blob_expired row (snippet purged, no blob to delete)', async () => {
   const { db, dan } = await setup()
   const payload = {
@@ -294,4 +342,65 @@ test('runExpireLogs never touches offload-created blobs (no live_log flag)', asy
   db.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 40 * 86400000, userId, r0.seq)
   runOffload(db, { days: 30, mediaDir })
   assert.equal(runExpireLogs(db, { hours: 24, mediaDir }).expired, 0)
+})
+
+test('MATRON_TOOL_LOG_TTL_HOURS=0 (toolLogTtlHours: 0) disables the TTL pass — an old live_log row is not tombstoned at boot', async (t) => {
+  const { startTestServer } = await import('./helpers.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-ttl-disabled-'))
+  const dbPath = path.join(dir, 'test.db')
+  const mediaDir = resolveMediaDir(dbPath)
+  const preDb = openDb(dbPath)
+  const dan = await createUser(preDb, 'dan', 'pw')
+  upsertConversation(preDb, { id: 'c1', ownerUserId: dan.id })
+  const seeded = seedLiveLog(preDb, mediaDir, { userId: dan.id, convoId: 'c1', ts: Date.now() - 48 * 3600000 })
+  preDb.close()
+
+  const s = await startTestServer({ dbPath, toolLogTtlHours: 0 })
+  t.after(() => s.close())
+  const row = s.db.prepare('SELECT payload, blob_ref FROM events WHERE seq=?').get(seeded.seq)
+  assert.equal(row.blob_ref, seeded.blob.id, 'TTL disabled must not tombstone the row')
+  assert.equal(JSON.parse(row.payload).expired, undefined)
+})
+
+test('an invalid toolLogTtlHours override (negative/non-integer) disables the TTL pass — it must NOT compute a future cutoff and tombstone everything', async (t) => {
+  const { startTestServer } = await import('./helpers.js')
+  for (const badHours of [-5, 1.5, 'abc']) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-ttl-badopt-'))
+    const dbPath = path.join(dir, 'test.db')
+    const mediaDir = resolveMediaDir(dbPath)
+    const preDb = openDb(dbPath)
+    const dan = await createUser(preDb, 'dan', 'pw')
+    upsertConversation(preDb, { id: 'c1', ownerUserId: dan.id })
+    // A RECENT row: with hours=-5 the cutoff lands 5 hours in the future, so
+    // a buggy pass-through would tombstone even this brand-new payload.
+    const seeded = seedLiveLog(preDb, mediaDir, { userId: dan.id, convoId: 'c1', ts: Date.now() })
+    preDb.close()
+
+    const mute = t.mock.method(console, 'warn', () => {}) // expected one disabled-log line; keep output clean
+    const s = await startTestServer({ dbPath, toolLogTtlHours: badHours })
+    const row = s.db.prepare('SELECT payload, blob_ref FROM events WHERE seq=?').get(seeded.seq)
+    await s.close()
+    mute.mock.restore()
+    assert.equal(row.blob_ref, seeded.blob.id, `toolLogTtlHours=${JSON.stringify(badHours)} must disable the TTL pass, not tombstone`)
+    assert.equal(JSON.parse(row.payload).expired, undefined)
+  }
+})
+
+test('default TTL (no override, no env) is enabled at 24h — an old live_log row IS tombstoned at boot', async (t) => {
+  const { startTestServer } = await import('./helpers.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-ttl-default-'))
+  const dbPath = path.join(dir, 'test.db')
+  const mediaDir = resolveMediaDir(dbPath)
+  const preDb = openDb(dbPath)
+  const dan = await createUser(preDb, 'dan', 'pw')
+  upsertConversation(preDb, { id: 'c1', ownerUserId: dan.id })
+  const seeded = seedLiveLog(preDb, mediaDir, { userId: dan.id, convoId: 'c1', ts: Date.now() - 48 * 3600000 })
+  preDb.close()
+
+  delete process.env.MATRON_TOOL_LOG_TTL_HOURS
+  const s = await startTestServer({ dbPath })
+  t.after(() => s.close())
+  const row = s.db.prepare('SELECT payload, blob_ref FROM events WHERE seq=?').get(seeded.seq)
+  assert.equal(row.blob_ref, null, 'default (unset env) TTL did not tombstone a 48h-old row against the 24h default')
+  assert.equal(JSON.parse(row.payload).expired, true)
 })
