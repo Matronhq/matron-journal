@@ -22,6 +22,33 @@ const AGENT_PUBLISH_TYPES = new Set([
 const ACTIVITY_STATES = new Set(['thinking', 'tool', 'idle'])
 const ACTIVITY_DETAIL_MAX_CHARS = 200
 
+// status op (session header data — model, context gauge, rate limits):
+// ephemeral like activity, but the last one per convo is cached and replayed
+// on viewing so client headers populate on open. The payload is passed
+// through opaquely (the bridge owns the shape; see the bridge's
+// lib/session-status.js) but size-capped — it's held in server memory, so an
+// unbounded status would be an unbounded hold.
+const STATUS_MAX_BYTES = 4096
+const STATUS_CACHE_MAX = 2048
+
+// Last status per (user, convo). In-memory only and bounded (oldest-written
+// evicted first): a lost entry just means the header stays blank until the
+// next turn end repaints it. Exported for direct unit testing.
+export function makeStatusCache(max = STATUS_CACHE_MAX) {
+  const map = new Map()
+  return {
+    set(userId, convoId, status) {
+      const key = `${userId}:${convoId}`
+      if (map.has(key)) map.delete(key)
+      map.set(key, status)
+      if (map.size > max) map.delete(map.keys().next().value)
+    },
+    get(userId, convoId) {
+      return map.get(`${userId}:${convoId}`)
+    },
+  }
+}
+
 const MAX_WS_PAYLOAD_BYTES = 1048576 // 1 MiB
 
 // Between replay batches, a slow/paused reader must not let the server
@@ -52,6 +79,7 @@ export function attachWs({
   revocationSweepMs = 60000, toolStreams,
 }) {
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES })
+  const statusCache = makeStatusCache()
   // Prepared once, reused for the per-frame revocation recheck below — one
   // cheap SELECT per inbound frame, not a fresh db.prepare() call each time.
   const deviceExistsStmt = db.prepare('SELECT 1 FROM devices WHERE id=?')
@@ -232,7 +260,7 @@ export function attachWs({
           conn.ws.close(4001)
           return
         }
-        handleOp({ db, hub, conn, msg, pushPipeline, toolStreams })
+        handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -271,7 +299,7 @@ export function notifyStale(hub, entry) {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams }) {
+export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache() }) {
   const fail = (code, detail) =>
     conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code, ref: msg.op, ...(detail ? { detail } : {}) }))
   // Single choke point: every journal event becomes a WS frame AND (fire and
@@ -320,6 +348,15 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
                 event: 'sync', meta: b.meta, offset: b.start,
                 content: b.content, head_truncated: b.headTruncated,
               },
+            }))
+          }
+          // Header catch-up: replay the last cached status (same direct-send
+          // reasoning as the tool-stream syncs above) so the header populates
+          // on open instead of waiting for the next turn end.
+          const cachedStatus = statusCache.get(conn.userId, conn.viewingConvoId)
+          if (cachedStatus) {
+            conn.ws.send(JSON.stringify({
+              kind: 'ephemeral', convo_id: conn.viewingConvoId, status: cachedStatus,
             }))
           }
         }
@@ -461,6 +498,26 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id,
           activity: { state: msg.state, detail },
+        })
+        break
+      }
+      case 'status': {
+        // Same ownership stance and delivery path as `activity`, with one
+        // difference: the last status per convo is cached (bounded, memory
+        // only) and replayed on `viewing`, so a client opening a convo gets
+        // a populated header immediately instead of waiting for the next
+        // turn end. The payload is opaque to the server — validated only as
+        // a size-capped object, so the bridge can evolve the shape without
+        // a server deploy.
+        if (conn.kind !== 'agent') return fail('forbidden')
+        if (typeof msg.status !== 'object' || msg.status === null) return fail('bad_request')
+        if (!authorize(db, conn.userId, msg.convo_id)) return fail('forbidden')
+        let encoded
+        try { encoded = JSON.stringify(msg.status) } catch { return fail('bad_request') }
+        if (Buffer.byteLength(encoded, 'utf8') > STATUS_MAX_BYTES) return fail('bad_request', 'status too large')
+        statusCache.set(conn.userId, msg.convo_id, msg.status)
+        hub.sendEphemeral(conn.userId, msg.convo_id, {
+          kind: 'ephemeral', convo_id: msg.convo_id, status: msg.status,
         })
         break
       }
