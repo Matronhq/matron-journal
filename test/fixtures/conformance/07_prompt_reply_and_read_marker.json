@@ -29,7 +29,7 @@
     { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "dan_token" },
       "expect": { "status": 200, "body": { "seq": { "$ref": "prompt_seq" }, "conversations": [
         { "id": "c1", "title": "", "session_state": "running", "last_seq": { "$ref": "prompt_seq" },
-          "unread_count": 1, "snippet": "? ship it?", "created_at": { "$type": "integer" } }
+          "unread_count": 1, "snippet": "? ship it?", "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" } }
       ] } } },
 
     { "kind": "ws_send", "conn": "client", "frame": { "op": "prompt_reply", "convo_id": "c1", "target_seq": { "$ref": "prompt_seq" }, "choice": "yes" } },
@@ -69,7 +69,7 @@
     { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "dan_token" },
       "expect": { "status": 200, "body": { "seq": 7, "conversations": [
         { "id": "c1", "title": "", "session_state": "running", "last_seq": 7,
-          "unread_count": 0, "snippet": "done", "created_at": { "$type": "integer" } }
+          "unread_count": 0, "snippet": "done", "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" } }
       ] } } }
   ]
 }

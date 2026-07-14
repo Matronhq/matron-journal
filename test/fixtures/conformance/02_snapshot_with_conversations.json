@@ -25,12 +25,12 @@
           {
             "id": "c2", "title": "Notes", "session_state": "done",
             "last_seq": 2, "unread_count": 0, "snippet": "a note to self",
-            "created_at": { "$type": "integer" }
+            "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" }
           },
           {
             "id": "c1", "title": "Fix login bug", "session_state": "running",
             "last_seq": 1, "unread_count": 1, "snippet": "starting work",
-            "created_at": { "$type": "integer" }
+            "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" }
           }
         ]
       } } }
