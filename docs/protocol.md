@@ -68,7 +68,8 @@ the machine-checkable version of this page.
   efficiency valve, not a data-loss boundary.
   Client ops: send, prompt_reply, read_marker, ack, viewing.
   Agent ops: convo_upsert, publish, stream (ephemeral), stream_append,
-  finalize, activity (ephemeral). `read_marker` is available to both kinds:
+  finalize, activity (ephemeral), status (ephemeral, cached). `read_marker`
+  is available to both kinds:
   an agent (bridge) connection may advance its user's read marker too —
   e.g. after mirroring the user's own message into the journal, so that
   mirrored round-trip doesn't inflate the unread badge.
@@ -111,6 +112,16 @@ the machine-checkable version of this page.
   activity:{state, detail}}` only to the owning user's client connections
   currently `viewing` that conversation, via the same hub fan-out `stream`
   uses — never written to the journal (no seq, no unread/push effects).
+- Agent `status {convo_id, status}` publishes the session's header data
+  (model, context-window gauge, rate limits — the shape is owned by the
+  bridge and passed through opaquely). Validated only as a non-null object
+  whose JSON encoding is ≤ 4096 bytes (else `bad_request`); ownership as
+  `activity` (`forbidden`); agent connections only. Delivered as
+  `{kind:'ephemeral', convo_id, status:{...}}` to viewing clients, same as
+  `activity` — never journaled. Unlike `activity`, the server caches the
+  last status per conversation (in-memory, bounded) and replays it to a
+  client immediately after it sends `viewing`, so headers populate on open
+  instead of waiting for the next turn end.
 - Agent `stream_append {convo_id, message_ref, offset, chunk, meta?}` streams
   live tool output (never journaled). `message_ref` is the tool_use_id;
   `offset` is the UTF-8 byte position of `chunk` in the command's output.

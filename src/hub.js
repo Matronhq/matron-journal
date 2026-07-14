@@ -78,7 +78,12 @@ export function makeHub({ coalesceMs = 200 } = {}) {
     sendEphemeral(userId, convoId, frame) {
       for (const c of byUser.get(userId) || []) {
         if (c.viewingConvoId !== convoId || c.ws.readyState !== 1) continue
-        const key = `${frame.convo_id}:${frame.message_ref}`
+        // One pending slot per (convo, message_ref, frame family): activity,
+        // status, and text/tool-stream overlays are distinct families that
+        // must not clobber each other inside one coalesce window — the
+        // bridge fires status AND idle-activity back-to-back at turn end.
+        const family = frame.activity ? 'activity' : frame.status ? 'status' : 'stream'
+        const key = `${frame.convo_id}:${frame.message_ref}:${family}`
         c._pending.set(key, mergeEphemeral(c._pending.get(key), frame))
         if (!c._flushTimer) {
           c._flushTimer = setTimeout(() => {
