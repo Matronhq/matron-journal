@@ -99,6 +99,21 @@ protocol's envelope vocabulary plus one addition (`agent_unreachable`).
   from the sender's authenticated connection, never taken from the frame.
 - If the target has no live connection: reply immediately
   `{op:'error', code:'agent_unreachable', request_id}` — no queueing.
+  "Live connection" means **registered for live delivery** (hello replay
+  complete) — a mid-replay agent socket is unreachable, which is correct:
+  it isn't serving yet.
+- **A connection may send `agent_request` only once it is itself registered
+  for live delivery.** The server accepts ops during a connection's own
+  post-`hello_ok` journal replay, before hub registration — but a request
+  accepted there would be forwarded while the matching response's hub scan
+  cannot see the still-unregistered socket, silently dropping it and
+  inviting a timeout-retry of a non-idempotent `start`. So a pre-registration
+  `agent_request` is rejected with `{op:'error', code:'not_ready',
+  request_id}` — nothing was forwarded, so re-sending the same frame
+  verbatim after a short backoff (or after replay completes) is always safe.
+  Connections that hello with `cursor: null` register synchronously and
+  never see this. (`agent_response` needs no such gate: delivery scans the
+  *target's* registered sockets, so an unregistered *sender* delivers fine.)
 - At-most-once, fire-and-forget past that point: the server keeps no record.
   If the agent crashes mid-request the client's own timeout fires. A re-send
   is a new request; for non-idempotent methods (`start`) the app disables
@@ -219,6 +234,9 @@ pairs as in existing ws tests):
   `not_found`
 - malformed: missing/oversize `request_id` or `method`, non-boolean `ok`,
   `ok:false` without `error.code` → `bad_request`
+- `agent_request` on a connection not yet registered for live delivery
+  (mid-replay) → `not_ready` carrying `request_id`, and the target agent
+  receives nothing
 - frame over 16 KiB → `bad_request`
 - response after requesting client disconnected → dropped, no crash
 - two live connections on the target agent device → only the most recently
