@@ -34,6 +34,13 @@ const ACTIVITY_DETAIL_MAX_CHARS = 200
 const STATUS_MAX_BYTES = 4096
 const STATUS_CACHE_MAX = 2048
 
+// Agent RPC (spec 2026-07-15-agent-rpc-design.md): opaque client->agent
+// request/response relay, never journaled. Whole-frame byte cap — larger
+// payloads belong in POST /media with a blob_ref inside params.
+const RPC_MAX_BYTES = 16384
+const RPC_ID_MAX_CHARS = 128
+const RPC_NAME_MAX_CHARS = 64 // method and error.code
+
 // Last status per (user, convo). In-memory only and bounded (oldest-written
 // evicted first): a lost entry just means the header stays blank until the
 // next turn end repaints it. Exported for direct unit testing.
@@ -79,7 +86,7 @@ export async function waitForDrain(ws, thresholdBytes, pollMs = 20) {
 export function attachWs({
   server, db, hub, pingMs = 20000, pushPipeline = noopPushPipeline,
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
-  revocationSweepMs = 60000, toolStreams,
+  revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES,
 }) {
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES })
   const statusCache = makeStatusCache()
@@ -263,7 +270,7 @@ export function attachWs({
           conn.ws.close(4001)
           return
         }
-        handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache })
+        handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -302,7 +309,7 @@ export function notifyStale(hub, entry) {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache() }) {
+export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES }) {
   const fail = (code, detail) =>
     conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code, ref: msg.op, ...(detail ? { detail } : {}) }))
   // Single choke point: every journal event becomes a WS frame AND (fire and
@@ -396,6 +403,39 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
           sender: `user:${conn.username}`, type: 'prompt_reply',
           payload: { target_seq: msg.target_seq, choice: msg.choice ?? null, text: msg.text ?? null },
         })
+        break
+      }
+      case 'agent_request': {
+        if (conn.kind !== 'client') return fail('forbidden')
+        const rid = msg.request_id
+        // request_id is echoed on every correlated frame, so it validates
+        // first — errors after this point can carry it.
+        if (typeof rid !== 'string' || rid.length === 0 || rid.length > RPC_ID_MAX_CHARS) return fail('bad_request', 'bad request_id')
+        const failRpc = (code, detail) => conn.ws.send(JSON.stringify(
+          { kind: 'control', op: 'error', code, ref: msg.op, request_id: rid, ...(detail ? { detail } : {}) }))
+        // Ops are dispatched during this connection's own hello replay,
+        // BEFORE hub.register (see the hello handler's comment: "revisit
+        // this assumption if a future op has other side effects" — this is
+        // that op). A request accepted mid-replay would forward fine, but
+        // the response's hub scan couldn't see this unregistered socket and
+        // the reply would silently vanish — inviting a timeout-retry of a
+        // non-idempotent `start`. Reject instead: nothing forwarded, so a
+        // verbatim re-send after replay is always safe.
+        if (!conn.registered) return failRpc('not_ready')
+        if (typeof msg.method !== 'string' || msg.method.length === 0 || msg.method.length > RPC_NAME_MAX_CHARS) return failRpc('bad_request', 'bad method')
+        if (!Number.isInteger(msg.agent_device_id)) return failRpc('bad_request', 'bad agent_device_id')
+        if (Buffer.byteLength(JSON.stringify(msg), 'utf8') > rpcMaxBytes) return failRpc('bad_request', 'frame too large')
+        // Unknown id, another user's device, and a client-kind device are
+        // indistinguishable — anti-enumeration, same stance as the HTTP 404s.
+        const target = db.prepare('SELECT user_id, kind FROM devices WHERE id=?').get(msg.agent_device_id)
+        if (!target || target.user_id !== conn.userId || target.kind !== 'agent') return failRpc('not_found')
+        // Single-consumer delivery (see hub.sendRpcRequest): false means no
+        // live socket — no queueing, the client hears it immediately.
+        const delivered = hub.sendRpcRequest(conn.userId, msg.agent_device_id, {
+          kind: 'rpc',
+          request: { request_id: rid, from_device_id: conn.deviceId, method: msg.method, params: msg.params ?? null },
+        })
+        if (!delivered) return failRpc('agent_unreachable')
         break
       }
       case 'read_marker': {
