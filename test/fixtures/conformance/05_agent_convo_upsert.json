@@ -21,13 +21,13 @@
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "title": "first title" } },
     { "kind": "ws_expect", "conn": "client", "frame": {
       "kind": "journal", "seq": 1, "convo_id": "sess-cm", "ts": { "$type": "integer" },
-      "sender": "agent:dev-2", "type": "convo_meta", "payload": { "title": "first title" }
+      "sender": "agent:dev-2", "type": "convo_meta", "payload": { "title": "first title", "parent_convo_id": null }
     } },
 
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "title": "renamed" } },
     { "kind": "ws_expect", "conn": "client", "frame": {
       "kind": "journal", "seq": 2, "convo_id": "sess-cm", "ts": { "$type": "integer" },
-      "sender": "agent:dev-2", "type": "convo_meta", "payload": { "title": "renamed" }
+      "sender": "agent:dev-2", "type": "convo_meta", "payload": { "title": "renamed", "parent_convo_id": null }
     } },
 
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "session_state": "waiting" } },
@@ -42,7 +42,7 @@
     { "kind": "ws_send", "conn": "agent", "frame": { "op": "convo_upsert", "convo_id": "sess-cm", "title": "final title" } },
     { "kind": "ws_expect", "conn": "client", "frame": {
       "kind": "journal", "seq": 4, "convo_id": "sess-cm", "ts": { "$type": "integer" },
-      "sender": "agent:dev-2", "type": "convo_meta", "payload": { "title": "final title" }
+      "sender": "agent:dev-2", "type": "convo_meta", "payload": { "title": "final title", "parent_convo_id": null }
     } }
   ]
 }

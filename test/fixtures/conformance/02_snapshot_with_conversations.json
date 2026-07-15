@@ -25,11 +25,13 @@
           {
             "id": "c2", "title": "Notes", "session_state": "done",
             "last_seq": 2, "unread_count": 0, "snippet": "a note to self",
+            "parent_convo_id": null,
             "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" }
           },
           {
             "id": "c1", "title": "Fix login bug", "session_state": "running",
             "last_seq": 1, "unread_count": 1, "snippet": "starting work",
+            "parent_convo_id": null,
             "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" }
           }
         ]

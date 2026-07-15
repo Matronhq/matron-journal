@@ -105,6 +105,65 @@ test('convo_meta fans out on title change, not on same-title or state-only upser
   agent.close(); client.close()
 })
 
+test('convo_upsert accepts parent_convo_id: convo_meta payload and snapshot carry it; it is immutable', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const ag = createAgent(s.db, dan.id, 'dev-2')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
+  const client = await makeWsClient(s.base, { token: login.json.token, cursor: 0 })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+  await client.waitFor((f) => f.op === 'hello_ok')
+
+  // parent must exist as a row for a realistic setup (not required by server, but tidy)
+  agent.send({ op: 'convo_upsert', convo_id: 'parent-1', title: 'parent' })
+  await client.waitFor((f) => f.kind === 'journal' && f.convo_id === 'parent-1' && f.type === 'convo_meta')
+
+  // child creation with a title -> convo_meta payload carries parent_convo_id
+  agent.send({ op: 'convo_upsert', convo_id: 'child-1', title: 'sub-chat', parent_convo_id: 'parent-1' })
+  const meta = await client.waitFor((f) => f.kind === 'journal' && f.convo_id === 'child-1' && f.type === 'convo_meta')
+  assert.equal(meta.payload.title, 'sub-chat')
+  assert.equal(meta.payload.parent_convo_id, 'parent-1')
+
+  // immutable: a later upsert with a different parent must not change it
+  agent.send({ op: 'convo_upsert', convo_id: 'child-1', title: 'renamed', parent_convo_id: 'other' })
+  await client.waitFor((f) => f.kind === 'journal' && f.convo_id === 'child-1' && f.type === 'convo_meta' && f.payload.title === 'renamed')
+  assert.equal(s.db.prepare("SELECT parent_convo_id FROM conversations WHERE id='child-1'").get().parent_convo_id, 'parent-1')
+
+  // snapshot carries parent_convo_id (set for the child, null for the parent)
+  const snap = await s.http('/snapshot', { token: login.json.token })
+  assert.equal(snap.json.conversations.find((c) => c.id === 'child-1').parent_convo_id, 'parent-1')
+  assert.equal(snap.json.conversations.find((c) => c.id === 'parent-1').parent_convo_id, null)
+
+  agent.close(); client.close()
+})
+
+test('convo_upsert rejects a malformed parent_convo_id with bad_request, connection survives', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const ag = createAgent(s.db, dan.id, 'dev-2')
+  const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+
+  for (const bad of [42, '', 'x'.repeat(129), {}, []]) {
+    agent.send({ op: 'convo_upsert', convo_id: `bad-${Math.random()}`, parent_convo_id: bad })
+    await agent.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'bad_request' && f.ref === 'convo_upsert')
+  }
+  assert.equal(agent.ws.readyState, 1)
+  // Nothing landed: no conversation row and no journal event from the rejected upserts.
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM conversations').get().n, 0)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM events').get().n, 0)
+
+  // A valid null/omitted parent still works (normal convo).
+  agent.send({ op: 'convo_upsert', convo_id: 'ok-1', parent_convo_id: null })
+  agent.send({ op: 'convo_upsert', convo_id: 'ok-1', session_state: 'running' })
+  await agent.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
+  assert.equal(s.db.prepare("SELECT parent_convo_id FROM conversations WHERE id='ok-1'").get().parent_convo_id, null)
+  agent.close()
+})
+
 test('agent publish with a fin:-prefixed idem_key is rejected, nothing lands', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())

@@ -46,7 +46,7 @@
 
     { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "mac_token" },
       "expect": { "status": 200, "body": { "seq": 2, "conversations": [
-        { "id": "c1", "title": "", "session_state": "running", "last_seq": 2, "unread_count": 0, "snippet": "do it again", "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" } }
+        { "id": "c1", "title": "", "session_state": "running", "last_seq": 2, "unread_count": 0, "snippet": "do it again", "parent_convo_id": null, "created_at": { "$type": "integer" }, "last_ts": { "$type": "integer" } }
       ] } } }
   ]
 }

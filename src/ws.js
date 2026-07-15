@@ -40,6 +40,10 @@ const STATUS_CACHE_MAX = 2048
 const RPC_MAX_BYTES = 16384
 const RPC_ID_MAX_CHARS = 128
 const RPC_NAME_MAX_CHARS = 64 // method and error.code
+// Cap for a parent_convo_id sent by a bridge — same 128-char id ceiling as
+// RPC request ids. Convo ids are conventionally Claude session UUIDs (36
+// chars); this is a defensive upper bound, not a format assertion.
+const CONVO_ID_MAX_CHARS = 128
 
 // Last status per (user, convo). In-memory only and bounded (oldest-written
 // evicted first): a lost entry just means the header stays blank until the
@@ -512,10 +516,23 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
       }
       case 'convo_upsert': {
         if (conn.kind !== 'agent') return fail('forbidden')
+        // parent_convo_id is optional; when present it must be a non-empty
+        // string within the id length cap (a parent row need not exist yet —
+        // ordering between a child's upsert and its parent's is not guaranteed,
+        // so a dangling reference is stored as-is). Only agent connections
+        // reach here, but validate defensively like every other agent input.
+        if (msg.parent_convo_id != null && (
+          typeof msg.parent_convo_id !== 'string'
+          || msg.parent_convo_id.length === 0
+          || msg.parent_convo_id.length > CONVO_ID_MAX_CHARS
+        )) {
+          return fail('bad_request', 'bad parent_convo_id')
+        }
         const convo = upsertConversation(db, {
           id: msg.convo_id, ownerUserId: conn.userId,
           title: msg.title, sessionState: msg.session_state,
           agentDeviceId: conn.deviceId,
+          parentConvoId: msg.parent_convo_id ?? null,
         })
         if (msg.session_state) {
           appendAndFan({
@@ -531,7 +548,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
           appendAndFan({
             userId: conn.userId, convoId: msg.convo_id,
             sender: `agent:${conn.name}`, type: 'convo_meta',
-            payload: { title: convo.title },
+            payload: { title: convo.title, parent_convo_id: convo.parent_convo_id ?? null },
           })
         }
         break
