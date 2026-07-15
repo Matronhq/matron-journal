@@ -1,7 +1,7 @@
 import fs from 'node:fs'
-import { login, authToken, changePassword } from './auth.js'
+import { login, authToken, changePassword, revokeOwnedDevice, createAgent } from './auth.js'
 import { snapshot, messagesBefore, toEventShape } from './journal.js'
-import { insertBlob, getBlob, setApnsRegistration } from './db.js'
+import { insertBlob, getBlob, setApnsRegistration, listDevices } from './db.js'
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
 
@@ -67,7 +67,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, hub, pushPipeline, dbPath }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, hub, pushPipeline, dbPath, pairs }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -111,6 +111,36 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         loginGuard.ok(username)
         return json(res, 200, { token: s.token, device_id: s.deviceId, user_id: s.userId })
       }
+      if (req.method === 'POST' && url.pathname === '/pair/start') {
+        // Unauthenticated by design: this grants nothing — the pair becomes
+        // an agent only if an authenticated client approves the code, and
+        // it binds to whichever user approves. Shares /login's per-IP
+        // limiter instance (spec: same budget class) so the whole
+        // unauthenticated surface sits under one throttle.
+        const ip = req.headers['cf-connecting-ip'] || req.socket.remoteAddress || 'unknown'
+        if (!rateLimiter.allow(ip)) return rejectEarly(req, res, 429, { error: 'rate_limited' })
+        await readBody(req) // no fields today; still drains/validates the body
+        const p = pairs.start()
+        // Pending-map cap: same envelope as the limiter — a caller can't
+        // tell which throttle it hit, and shouldn't need to.
+        if (!p) return json(res, 429, { error: 'rate_limited' })
+        return json(res, 200, { pair_code: p.pairCode, poll_token: p.pollToken, expires_in: p.expiresIn })
+      }
+      if (req.method === 'POST' && url.pathname === '/pair/claim') {
+        // Deliberately not rate-limited: the box polls this every few
+        // seconds for up to the TTL, and each miss costs one Map.get on a
+        // 256-bit key — guessing poll_tokens is not a realistic attack.
+        const { poll_token } = await readBody(req)
+        if (typeof poll_token !== 'string' || !poll_token) return json(res, 400, { error: 'bad_request' })
+        const c = pairs.claim(poll_token)
+        if (c.status === 'not_found') return json(res, 404, { error: 'not_found' })
+        if (c.status === 'pending') return json(res, 200, { status: 'pending' })
+        // Mint at claim (spec): the devices row first exists HERE. The pair
+        // is already deleted; if createAgent somehow threw, the box retries
+        // with a fresh code and no orphan row exists either way.
+        const d = createAgent(db, c.userId, c.agentName)
+        return json(res, 200, { status: 'approved', token: d.token, device_id: d.deviceId })
+      }
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       if (req.method === 'GET' && url.pathname === '/snapshot') {
@@ -146,6 +176,38 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const r = await changePassword(db, who.userId, { oldPassword: old_password, newPassword: new_password })
         if (!r.ok) return json(res, 401, { error: 'bad_password' })
         return json(res, 200, { ok: true })
+      }
+      if (req.method === 'GET' && url.pathname === '/devices') {
+        // Management surface: client devices only, same gating as /password —
+        // an agent has no business enumerating its user's other devices.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const devices = listDevices(db, who.userId).map((d) => ({ ...d, is_self: d.device_id === who.deviceId }))
+        return json(res, 200, { devices })
+      }
+      const dm = url.pathname.match(/^\/devices\/(\d+)\/revoke$/)
+      if (req.method === 'POST' && dm) {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        // Deleting the row IS the revocation (docs/protocol.md "Device
+        // revocation"): HTTP 401s on the next call, WS closes next-frame or
+        // via the ≤60s sweep. Not-owned and nonexistent are indistinguishable.
+        if (!revokeOwnedDevice(db, who.userId, Number(dm[1]))) return json(res, 404, { error: 'not_found' })
+        return json(res, 200, { ok: true })
+      }
+      if (req.method === 'POST' && url.pathname === '/pair/approve') {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const { pair_code, agent_name } = await readBody(req)
+        if (typeof pair_code !== 'string' || !pair_code ||
+            typeof agent_name !== 'string' || !agent_name) {
+          return json(res, 400, { error: 'bad_request' })
+        }
+        const r = pairs.approve(pair_code, { userId: who.userId, agentName: agent_name })
+        // conflict (already approved) is distinguishable — the caller is
+        // authenticated, so this leaks nothing exploitable and tells a
+        // double-tapping user the truth. Unknown and expired stay merged
+        // into 404, same anti-enumeration stance as everywhere else.
+        if (r === 'conflict') return json(res, 409, { error: 'conflict' })
+        if (r === 'not_found') return json(res, 404, { error: 'not_found' })
+        return json(res, 200, { status: 'approved' })
       }
       const m = url.pathname.match(/^\/convo\/([^/]+)\/messages$/)
       if (req.method === 'GET' && m) {

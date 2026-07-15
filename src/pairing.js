@@ -1,0 +1,72 @@
+import crypto from 'node:crypto'
+
+// Pair-code alphabet: Crockford base32 (no I/L/O/U lookalikes) minus the
+// remaining vowels A/E so codes can't spell words. 30 chars; 8 chars ≈ 39
+// bits — plenty for a code that grants nothing without an authenticated
+// approval and dies in ttlMs anyway.
+const ALPHABET = '0123456789BCDFGHJKMNPQRSTVWXYZ'
+const CODE_LEN = 8
+
+// crypto.randomInt is unbiased (rejection sampling), unlike bytes % 30.
+const randomCode = () => Array.from({ length: CODE_LEN }, () => ALPHABET[crypto.randomInt(ALPHABET.length)]).join('')
+
+// Boxes display XXXX-XXXX; humans type variations. Comparison happens on
+// this normal form only.
+export function normalizeCode(input) {
+  return String(input).toUpperCase().replace(/[^0-9A-Z]/g, '')
+}
+
+// In-memory pending-pair store (spec: device-authorization flow, mint at
+// claim). Same in-memory-factory shape as makeRateLimiter/makeLoginGuard:
+// a restart forgets pending pairs, which is fine — the box CLI retries
+// with a fresh code, and nothing durable exists until claim.
+//
+// Keyed by pollToken (the 256-bit claim secret) so claim() is a direct
+// Map.get on the high-entropy value. approve() scans for the low-entropy
+// display code instead — bounded by maxPending (≤64) and only reachable
+// with an authenticated client bearer, so the scan is fine.
+export function makePairStore({ ttlMs = 600000, maxPending = 64 } = {}) {
+  const pairs = new Map() // pollToken -> { code, userId, agentName, approved, expiresAt }
+
+  const sweep = (now) => {
+    for (const [k, p] of pairs) if (now >= p.expiresAt) pairs.delete(k)
+  }
+
+  return {
+    start() {
+      const now = Date.now()
+      sweep(now)
+      if (pairs.size >= maxPending) return null
+      let code
+      do { code = randomCode() } while ([...pairs.values()].some((p) => p.code === code))
+      const pollToken = crypto.randomBytes(32).toString('hex')
+      pairs.set(pollToken, { code, userId: null, agentName: null, approved: false, expiresAt: now + ttlMs })
+      return { pairCode: `${code.slice(0, 4)}-${code.slice(4)}`, pollToken, expiresIn: Math.floor(ttlMs / 1000) }
+    },
+    approve(codeInput, { userId, agentName }) {
+      const now = Date.now()
+      const code = normalizeCode(codeInput)
+      for (const p of pairs.values()) {
+        if (p.code !== code) continue
+        if (now >= p.expiresAt) break // expired is indistinguishable from unknown
+        if (p.approved) return 'conflict'
+        p.approved = true
+        p.userId = userId
+        p.agentName = agentName
+        return 'approved'
+      }
+      return 'not_found'
+    },
+    claim(pollToken) {
+      const p = pairs.get(pollToken)
+      if (!p || Date.now() >= p.expiresAt) {
+        if (p) pairs.delete(pollToken)
+        return { status: 'not_found' }
+      }
+      if (!p.approved) return { status: 'pending' }
+      pairs.delete(pollToken) // one-shot: the pair is gone before the caller sees the identity
+      return { status: 'approved', userId: p.userId, agentName: p.agentName }
+    },
+    size() { return pairs.size },
+  }
+}
