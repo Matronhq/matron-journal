@@ -78,16 +78,37 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const ip = req.headers['cf-connecting-ip'] || req.socket.remoteAddress || 'unknown'
         if (!rateLimiter.allow(ip)) return rejectEarly(req, res, 429, { error: 'rate_limited' })
         const { username, password, device_name } = await readBody(req)
-        const guardKey = String(username ?? '')
-        const gate = loginGuard.check(guardKey)
+        // Structural validation BEFORE the login guard and user lookup: a
+        // missing/non-string/empty username or password can never be valid
+        // credentials, so rejecting here leaks nothing about which users
+        // exist (anti-enumeration preserved) and keeps garbage out of the
+        // guard's per-username state. Without this, undefined fields reach
+        // login() and throw deep inside it (argon2/SQLite bind) → a 500
+        // from the generic catch — on an endpoint whose own auth is the
+        // only guard. Note readBody has already consumed the body, so a
+        // plain json() reject is right here (rejectEarly is for pre-body
+        // rejects only); the per-IP rate limiter above has already counted
+        // this request, matching the existing convention for malformed
+        // bodies (readBody's own 400s are counted the same way).
+        // device_name is optional (login() defaults it), but when present it
+        // must be a string or null — a non-primitive would otherwise 500 in
+        // issueDevice's INSERT bind, and even with valid credentials a 500
+        // there is wrong. Numbers previously bound fine (200); rejecting
+        // them too is a deliberate tightening to one canonical shape.
+        if (typeof username !== 'string' || !username ||
+            typeof password !== 'string' || !password ||
+            (device_name != null && typeof device_name !== 'string')) {
+          return json(res, 400, { error: 'bad_request' })
+        }
+        const gate = loginGuard.check(username)
         if (!gate.allowed) {
           const retryAfter = Math.ceil(gate.retryAfterMs / 1000)
           res.setHeader('Retry-After', retryAfter)
           return json(res, 429, { error: 'locked_out', retry_after: retryAfter })
         }
         const s = await login(db, { username, password, deviceName: device_name })
-        if (!s) { loginGuard.fail(guardKey); return json(res, 403, { error: 'bad_credentials' }) }
-        loginGuard.ok(guardKey)
+        if (!s) { loginGuard.fail(username); return json(res, 403, { error: 'bad_credentials' }) }
+        loginGuard.ok(username)
         return json(res, 200, { token: s.token, device_id: s.deviceId, user_id: s.userId })
       }
       const who = bearer(req) && authToken(db, bearer(req))
