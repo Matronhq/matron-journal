@@ -93,7 +93,7 @@ POST /pair/start   {}                          (unauthenticated, rate-limited pe
   -> { pair_code, poll_token, expires_in }
 
 POST /pair/approve { pair_code, agent_name }   (Bearer, client devices only)
-  -> { device_id }
+  -> { status: 'approved' }
 
 POST /pair/claim   { poll_token }              (unauthenticated)
   -> { status: 'pending' }
@@ -106,27 +106,42 @@ POST /pair/claim   { poll_token }              (unauthenticated)
 - `poll_token`: 32 random bytes hex — the claim secret. Never displayed.
 - Pending pairs live in an **in-memory map** with a 10-minute TTL, lazy
   expiry. No DB table: a server restart dropping pending pairs is acceptable
-  (the box CLI just retries with a fresh code). The `devices` row is only
-  created at approve time via the existing `issueDevice(db, userId, 'agent',
-  name)`; the minted token parks in the pending-pair slot until claimed.
+  (the box CLI just retries with a fresh code).
+- **The `devices` row is minted at CLAIM time, not approve time.** Approve
+  only transitions the pair `pending → approved`, recording the approving
+  caller's `user_id` and the `agent_name`; `pair/claim` then calls the
+  existing `issueDevice(db, userId, 'agent', name)` and returns the token in
+  the same response, atomically deleting the pair. Consequences, all
+  deliberate: an approved-but-never-claimed pair (box died, TTL expiry,
+  server restart) leaves **zero DB residue** — no orphan agent rows in
+  `GET /devices` with unrecoverable tokens; the agent appears in the roster
+  only once a box actually holds its token, which is when "connected server"
+  starts being true.
+- A pair can be approved **exactly once**: `pair/approve` on an
+  already-approved pair returns 409 `conflict` (the caller is authenticated,
+  so distinguishing this from 404 leaks nothing exploitable); unknown or
+  expired codes are 404 `not_found` (indistinguishable, anti-enumeration as
+  elsewhere). The code itself names no user — approval binds the pair to
+  the approving caller's user_id.
 - `/pair/start` is rate-limited per IP through the existing `rateLimiter`
   (same budget class as `/login`), and the pending map is capped (e.g. 64
   outstanding pairs) — start returns 429 `rate_limited` beyond either limit.
-- `/pair/approve` with an unknown or expired code: 404 `not_found`
-  (indistinguishable, anti-enumeration as elsewhere). Approving binds the
-  pair to **the approving caller's user_id** — the code itself names no user.
 - `/pair/claim` returns the token exactly once and deletes the pair;
   a second claim is 404. Unknown/expired poll_token: 404.
 
-**Security analysis.** `pair/start` grants nothing and stores nothing durable.
-A guessed or phished `pair_code` becomes an agent only if a real user approves
-it in the app, and it becomes an agent **of the approving user** — so the
-approval screen must show the code and the requesting IP, and the human types
-the code they can see on their own box's terminal. Token exfiltration requires
-the 256-bit `poll_token`, which transits only TLS responses. The residual risk
-is the classic device-flow phish ("approve this code for me") — mitigated by
-approval-screen wording (agent name + requester IP), acceptable for a
-first-party population of three.
+**Security analysis.** `pair/start` grants nothing and stores nothing durable;
+nothing durable exists anywhere until claim. A guessed or phished `pair_code`
+becomes an agent only if a real user approves it in the app, and it becomes an
+agent **of the approving user** — so the approval screen must show the code
+and the requesting IP, and the human types the code they can see on their own
+box's terminal. Token exfiltration requires the 256-bit `poll_token`, which
+transits only TLS responses. The residual risk is the classic device-flow
+phish ("approve this code for me") — mitigated by approval-screen wording
+(agent name + requester IP), acceptable for a first-party population of three.
+An approval the user regrets cannot be un-approved (there is no device to
+revoke until the box claims); the exposure is bounded by the pair TTL, and the
+moment the box claims, the agent appears in the roster and is revocable
+instantly. This regret window (≤10 minutes) is accepted in v1.
 
 ### 4. Consumers
 
@@ -146,9 +161,12 @@ first-party population of three.
 Conformance-style tests alongside the existing suite (`:memory:` DBs):
 
 - happy path: start → approve → claim returns token once → agent connects
-  over ws with it
+  over ws with it; the device row does not exist before the claim
 - claim before approve → `pending`; claim twice → second is 404
-- expiry: claim/approve after TTL → 404
+- expiry: claim/approve after TTL → 404; an approved-but-unclaimed pair that
+  expires leaves no `devices` row (no orphans in `GET /devices`)
+- approve twice with the same code → second is 409 `conflict`, and exactly
+  one device row exists after the eventual claim
 - approve with an **agent**-kind bearer → 403; approve with unknown code → 404
 - start beyond the per-IP rate limit / pending-map cap → 429
 - `GET /devices` as agent → 403; roster shows `is_self` correctly
