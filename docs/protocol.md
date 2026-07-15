@@ -61,6 +61,19 @@ the machine-checkable version of this page.
   only; `is_self` marks the requesting device. Overlaps `/metrics`'
   `user.devices` deliberately — metrics is observability (agents may read
   it, no `name`), this is the management roster.
+- `POST /pair/start` (unauthenticated; shares /login's per-IP rate limit) ->
+  `{pair_code, poll_token, expires_in}`. Pending pairs are in-memory only
+  (10-minute TTL, 64 outstanding max — 429 `rate_limited` beyond either);
+  a restart forgets them.
+- `POST /pair/approve {pair_code, agent_name}` (Bearer, client devices
+  only) -> `{status:'approved'}`. Binds the pair to the approving caller's
+  user. Exactly once per pair: already-approved is 409 `{error:'conflict'}`;
+  unknown and expired are indistinguishable 404s. Codes are normalized
+  (case/hyphens/spaces) before lookup.
+- `POST /pair/claim {poll_token}` (unauthenticated) -> `{status:'pending'}`
+  until approval, then exactly once `{status:'approved', token, device_id}`
+  — the agent device row is minted at claim, not approve, so an unclaimed
+  pair leaves no DB residue. Second claim / unknown / expired: 404.
 
 ## WebSocket
 
@@ -180,6 +193,21 @@ deletes the row exactly like `matron-admin device revoke`; not-owned and
 nonexistent ids are indistinguishable (404 `{error:'not_found'}`).
 Self-revocation is allowed and acts as a logout. WS enforcement is the
 same next-frame-or-≤60s-sweep described above.
+
+## Agent pairing (device authorization)
+
+`gh auth login`-style enrollment for headless boxes (spec:
+`docs/superpowers/specs/2026-07-15-app-managed-agent-enrollment-design.md`).
+The box calls `pair/start` and displays the `pair_code` (`XXXX-XXXX`,
+Crockford base32 minus vowels); the human approves that code in an
+authenticated client app with `pair/approve`, naming the agent; the box
+polls `pair/claim` with its secret `poll_token` (32 random bytes hex,
+never displayed) and receives the agent token exactly once, straight into
+its token file — no human ever sees it. Nothing durable exists until
+claim: approve only flips the in-memory pair's state, and the `devices`
+row is created by the claim response itself. The approve→claim regret
+window (≤ TTL) is accepted in v1; once claimed, the agent appears in
+`GET /devices` and is revocable instantly.
 
 ## Push notifications (APNs)
 

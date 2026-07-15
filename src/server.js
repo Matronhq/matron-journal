@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
 import { makeLoginGuard, makeRateLimiter } from './auth.js'
 import { makeHttpHandler } from './http.js'
+import { makePairStore } from './pairing.js'
 import { makeHub } from './hub.js'
 import { attachWs } from './ws.js'
 import { makeToolStreamStore } from './tool-stream.js'
@@ -173,7 +174,7 @@ function resolveApnsClient(injected) {
 export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, apnsClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, walCheckpointIntervalMs, toolStreamOpts,
-  toolLogTtlHours,
+  toolLogTtlHours, pairs,
 } = {}) {
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
   const db = openDb(resolvedDbPath)
@@ -192,6 +193,7 @@ export function startServer({
   db.pragma('wal_autocheckpoint = 0')
   const rateLimiter = makeRateLimiter()
   const loginGuard = makeLoginGuard()
+  const resolvedPairs = pairs || makePairStore()
   const resolvedMediaDir = resolveMediaDir(resolvedDbPath, mediaDir)
   const resolvedMediaMaxBytes = mediaMaxBytes ?? resolveNumericEnv('MATRON_MEDIA_MAX_BYTES', process.env.MATRON_MEDIA_MAX_BYTES, DEFAULT_MEDIA_MAX_BYTES)
   const resolvedMaxReplay = maxReplay ?? resolveNumericEnv('MATRON_MAX_REPLAY', process.env.MATRON_MAX_REPLAY, DEFAULT_MAX_REPLAY)
@@ -206,7 +208,7 @@ export function startServer({
   const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient })
   const server = http.createServer(makeHttpHandler({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
-    hub, pushPipeline, dbPath: resolvedDbPath,
+    hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs,
   }))
   const wss = attachWs({ server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams, ...(revocationSweepMs !== undefined ? { revocationSweepMs } : {}) })
   let retentionInterval = null
