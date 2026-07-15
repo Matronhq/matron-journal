@@ -183,7 +183,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // Management surface: client devices only, same gating as /password —
         // an agent has no business enumerating its user's other devices.
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
-        const devices = listDevices(db, who.userId).map((d) => ({ ...d, is_self: d.device_id === who.deviceId }))
+        // connected = has a live WS right now (hub scan, no persistence) —
+        // the roster's "which agents can I start a session on" signal.
+        const live = new Set(hub.connsOf(who.userId).filter((c) => c.ws.readyState === 1).map((c) => c.deviceId))
+        const devices = listDevices(db, who.userId).map((d) => ({
+          ...d, is_self: d.device_id === who.deviceId, connected: live.has(d.device_id),
+        }))
         return json(res, 200, { devices })
       }
       const dm = url.pathname.match(/^\/devices\/(\d+)\/revoke$/)

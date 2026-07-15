@@ -210,7 +210,11 @@ export function startServer({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs,
   }))
-  const wss = attachWs({ server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams, ...(revocationSweepMs !== undefined ? { revocationSweepMs } : {}) })
+  const wss = attachWs({
+    server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
+    rpcMaxBytes: resolveNumericEnv('MATRON_RPC_MAX_BYTES', process.env.MATRON_RPC_MAX_BYTES, 16384),
+    ...(revocationSweepMs !== undefined ? { revocationSweepMs } : {}),
+  })
   let retentionInterval = null
   let walCheckpointInterval = null
   return new Promise((resolve) => {

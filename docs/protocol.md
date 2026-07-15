@@ -57,10 +57,12 @@ the machine-checkable version of this page.
   `/metrics`-only.
 - `GET /devices` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`) -> `{devices: [{device_id, kind, name, created_at,
-  cursor, lag, last_seen_at, is_self}]}`. The caller's own user's devices
-  only; `is_self` marks the requesting device. Overlaps `/metrics`'
+  cursor, lag, last_seen_at, is_self, connected}]}`. The caller's own user's
+  devices only; `is_self` marks the requesting device. Overlaps `/metrics`'
   `user.devices` deliberately — metrics is observability (agents may read
-  it, no `name`), this is the management roster.
+  it, no `name`), this is the management roster. `connected` is whether the
+  device has a live WebSocket right now — the "can I start a session on
+  this agent" signal; `last_seen_at` stays the offline story.
 - `POST /pair/start` (unauthenticated; shares /login's per-IP rate limit) ->
   `{pair_code, poll_token, expires_in}`. Pending pairs are in-memory only
   (10-minute TTL, 64 outstanding max — 429 `rate_limited` beyond either);
@@ -214,6 +216,43 @@ claim: approve only flips the in-memory pair's state, and the `devices`
 row is created by the claim response itself. The approve→claim regret
 window (≤ TTL) is accepted in v1; once claimed, the agent appears in
 `GET /devices` and is revocable instantly.
+
+## Agent RPC (client->agent request/response)
+
+Structured app->bridge calls (spec:
+`docs/superpowers/specs/2026-07-15-agent-rpc-design.md`) — how the app asks a
+bridge for its recent folders or to start a session in a folder, without
+typing text commands into the control conversation.
+
+- Client op: `agent_request {request_id, agent_device_id, method, params?}`
+  (client connections only). `request_id`: <=128 chars, echoed verbatim on
+  every correlated frame. `method`/`params` are opaque to the server (the
+  bridge owns the vocabulary — same stance as `status`). Whole frame <=16 KiB
+  (`MATRON_RPC_MAX_BYTES`). Unknown/foreign/client-kind targets are
+  indistinguishable `not_found`; an agent with no live registered socket is
+  `agent_unreachable` immediately (no queueing). A connection may send
+  `agent_request` only once registered for live delivery itself — mid-replay
+  requests draw `not_ready` (nothing forwarded; re-send verbatim after
+  replay). `cursor: null` hellos register synchronously and never see it.
+- Delivery to the agent: `{kind:'rpc', request:{request_id, from_device_id,
+  method, params}}` — to exactly ONE socket, the device's most recently
+  registered live connection (single-consumer: reconnect overlap must not
+  double-execute a non-idempotent `start`). `from_device_id` is stamped
+  server-side.
+- Agent op: `agent_response {request_id, to_device_id, ok, result?, error?}`
+  (agent connections only). `to_device_id` must be a client device of the
+  same user (else `not_found`); `ok:false` requires `error.code`. Delivered
+  as `{kind:'rpc', response:{request_id, agent_device_id, ok, result?|
+  error?}}` to ALL live sockets of that device (responses are
+  side-effect-free; clients dedupe by `request_id`).
+- The relay is stateless and nothing is journaled: no seq, no unread/push
+  effects, no retention surface. Timeouts are the client's job; at-most-once
+  delivery, re-asking is the retry.
+- v1 method vocabulary (bridge-owned, normative in the spec):
+  `recent_folders {} -> {folders:[{path, last_used}]}` and
+  `start {workdir?, browser?} -> {convo_id}` (errors `bad_workdir`,
+  `spawn_failed`; unknown methods `unknown_method`). Cross-channel ordering
+  between the `start` response and its `convo_upsert` is not guaranteed.
 
 ## Push notifications (APNs)
 

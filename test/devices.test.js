@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { startTestServer } from './helpers.js'
+import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 
 test('GET /devices lists only the caller user devices, marks is_self, gates agents', async (t) => {
@@ -26,7 +26,7 @@ test('GET /devices lists only the caller user devices, marks is_self, gates agen
   assert.equal(agentRow.name, 'dev-9')
   // roster shape: exactly these keys, no token_hash/user_id leakage
   assert.deepEqual(Object.keys(agentRow).sort(),
-    ['created_at', 'cursor', 'device_id', 'is_self', 'kind', 'lag', 'last_seen_at', 'name'])
+    ['connected', 'created_at', 'cursor', 'device_id', 'is_self', 'kind', 'lag', 'last_seen_at', 'name'])
 
   // agent bearers are gated like /password: 403 forbidden
   const asAgent = await s.http('/devices', { token: agent.token })
@@ -75,4 +75,31 @@ test('POST /devices/:id/revoke: owner-scoped, 404 for not-owned/nonexistent, sel
   const self = await s.http(`/devices/${dan1.json.device_id}/revoke`, { method: 'POST', token: dan1.json.token })
   assert.equal(self.status, 200)
   assert.equal((await s.http('/devices', { token: dan1.json.token })).status, 401)
+})
+
+test('GET /devices connected reflects live WS sockets', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const ag = createAgent(s.db, dan.id, 'dev-2')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+
+  let r = await s.http('/devices', { token: login.json.token })
+  assert.equal(r.json.devices.find((d) => d.kind === 'agent').connected, false)
+  // The HTTP-only caller itself holds no socket either:
+  assert.equal(r.json.devices.find((d) => d.is_self).connected, false)
+
+  const agentWs = await makeWsClient(s.base, { token: ag.token, cursor: null })
+  await agentWs.waitFor((f) => f.op === 'hello_ok')
+  r = await s.http('/devices', { token: login.json.token })
+  assert.equal(r.json.devices.find((d) => d.kind === 'agent').connected, true)
+
+  agentWs.close()
+  // close propagates asynchronously — poll until the hub unregisters it
+  for (let i = 0; i < 100; i++) {
+    r = await s.http('/devices', { token: login.json.token })
+    if (r.json.devices.find((d) => d.kind === 'agent').connected === false) break
+    await new Promise((res) => setTimeout(res, 20))
+  }
+  assert.equal(r.json.devices.find((d) => d.kind === 'agent').connected, false)
 })

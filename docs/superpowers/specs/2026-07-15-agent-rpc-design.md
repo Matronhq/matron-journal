@@ -1,7 +1,7 @@
 # Agent RPC & connected roster — design (SP2 journal ops)
 
 **Date:** 2026-07-15
-**Status:** draft — awaiting review
+**Status:** implemented (see docs/protocol.md "Agent RPC")
 **Depends on:** protocol v1 (`docs/protocol.md`); device roster
 (`2026-07-15-app-managed-agent-enrollment-design.md`)
 **Consumed by:** SP3 (bridge method handlers), SP2 app UI (folder picker +
@@ -159,8 +159,10 @@ re-validates the *counterparty* against the devices table.
 ### Roster: `connected` flag
 
 `GET /devices` rows gain `connected: true|false` — whether that device has at
-least one open WS connection right now (hub scan at request time; the hub
-already indexes connections per user with `deviceId` on each). This is the
+least one connection **registered for live delivery** right now (the same
+rule RPC delivery uses, so `connected: true` ⟺ an `agent_request` would find
+a socket; hub scan at request time — the hub only indexes registered
+connections, so a mid-replay socket correctly reads as not connected). This is the
 "connected-servers roster": the app enables *Start session here* only for
 agents with `connected: true`, and renders offline agents with their existing
 `last_seen_at`. `/metrics` is unchanged.
