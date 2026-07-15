@@ -145,6 +145,10 @@ POST /pair/approve  { "pair_code": "KTNM-3VQ8", "agent_name": "dev-7" }   (Beare
 - `agent_name` is chosen by the approving user in this modal — convention is
   the box's short hostname (`dev-7`, `dan-mac`). It becomes the `name` in the
   roster and is not renameable later; say so next to the field.
+- The server does **not** enforce unique names. The app already holds the
+  roster — warn inline if the chosen name matches an existing device
+  ("You already have an agent called dev-7") but allow it; duplicates are
+  legal, just confusing.
 - Exactly-once: a 409 means someone (you, on another device?) already
   approved this code. Copy: "This code was already approved."
 - Approval does **not** create the device. Nothing appears in the roster
@@ -155,8 +159,12 @@ POST /pair/approve  { "pair_code": "KTNM-3VQ8", "agent_name": "dev-7" }   (Beare
 ### 3d. Waiting for the box
 
 After a 200 from approve, show a "waiting for agent to connect" state and
-poll `GET /devices` (every 2–3s, capped at the pair's remaining TTL) until a
-device with `kind: "agent"` and the chosen name appears — then success. If
+poll `GET /devices` (every 2–3s, capped at the pair's remaining TTL) until
+the new device appears — then success. **Detect it by id, not by name:**
+snapshot the roster's `device_id` set before approving, and succeed when an
+agent-kind row with a `device_id` outside that snapshot shows up. Names are
+not unique, so matching on the chosen name could "succeed" instantly against
+a pre-existing device that happens to share it. If
 the TTL runs out first: "The box never collected its token. Start again with
 a fresh code." Make the wait dismissible; the roster will show the agent
 whenever it lands.
