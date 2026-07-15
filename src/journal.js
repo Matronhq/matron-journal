@@ -164,12 +164,14 @@ export function markRead(db, userId, convoId, upToSeq, sender = null) {
     const placeholders = MESSAGE_TYPES.map(() => '?').join(',')
     // Mirrors append()'s unread predicate: only non-`user:*`-sender messages
     // count as unread, so a recompute after read never resurrects the
-    // reader's own messages as unread.
+    // reader's own messages as unread — and silent children
+    // (parent_convo_id set) are skipped entirely, so a partial read_marker
+    // can never resurrect a positive count append() would not have made.
     db.prepare(
       `UPDATE conversations SET unread_count=(
          SELECT COUNT(*) FROM events e WHERE e.convo_id=? AND e.seq>? AND e.type IN (${placeholders})
            AND e.sender NOT LIKE 'user:%'
-       ) WHERE id=?`
+       ) WHERE id=? AND parent_convo_id IS NULL`
     ).run(convoId, resolvedUpToSeq, ...MESSAGE_TYPES, convoId)
     return { ...r, upToSeq: resolvedUpToSeq }
   })()

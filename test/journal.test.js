@@ -177,6 +177,17 @@ test('snapshot rows carry parent_convo_id (null for normal convos, set for child
   assert.equal(snap.conversations.find((c) => c.id === 'child').parent_convo_id, 'c1')
 })
 
+test('a partial markRead on a child convo cannot resurrect unread_count', async () => {
+  const { db, dan } = await setup()
+  upsertConversation(db, { id: 'child', ownerUserId: dan.id, parentConvoId: 'c1' })
+  const first = append(db, { userId: dan.id, convoId: 'child', sender: 'agent:dev-2', type: 'text', payload: { body: 'one' } })
+  append(db, { userId: dan.id, convoId: 'child', sender: 'agent:dev-2', type: 'text', payload: { body: 'two' } })
+  // Reading only up to the first event leaves one agent message beyond
+  // up_to_seq — the recompute must not count it for a silent child.
+  markRead(db, dan.id, 'child', first.seq)
+  assert.equal(db.prepare("SELECT unread_count FROM conversations WHERE id='child'").get().unread_count, 0)
+})
+
 test('a child convo (parent_convo_id set) never increments unread_count; the same event in a normal convo does', async () => {
   const { db, dan } = await setup()
   upsertConversation(db, { id: 'child', ownerUserId: dan.id, parentConvoId: 'c1' })
