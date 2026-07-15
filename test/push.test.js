@@ -74,6 +74,27 @@ test('agent devices are never pushed to', async (t) => {
   assert.equal(stub.calls.length, 0)
 })
 
+test('child conversations (parent_convo_id set) are silent: onAppend never pushes', async (t) => {
+  const { db, dan, stub, pipeline } = await setup(t, { coalesceMs: 50 })
+  registerDevice(db, dan.id, 'phone')
+  upsertConversation(db, { id: 'child', ownerUserId: dan.id, title: 'sub', parentConvoId: 'c1' })
+
+  // An alert-worthy event (prompt) in a child convo pushes nothing...
+  const r = append(db, { userId: dan.id, convoId: 'child', sender: 'agent:a', type: 'prompt', payload: { question: 'go?' } })
+  pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'child', ts: r.ts, sender: 'agent:a', type: 'prompt', payload: { question: 'go?' } }, null)
+  // ...nor does a read_marker in a child trigger a background push.
+  const rm = append(db, { userId: dan.id, convoId: 'child', sender: 'user:dan', type: 'read_marker', payload: { convo_id: 'child', up_to_seq: r.seq } })
+  pipeline.onAppend(dan.id, { seq: rm.seq, convo_id: 'child', ts: rm.ts, sender: 'user:dan', type: 'read_marker', payload: { convo_id: 'child', up_to_seq: r.seq } }, null)
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(stub.calls.length, 0, 'no push of any kind for a child convo')
+
+  // Control: the same prompt in the normal parent convo DOES push.
+  const p = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'prompt', payload: { question: 'go?' } })
+  pipeline.onAppend(dan.id, { seq: p.seq, convo_id: 'c1', ts: p.ts, sender: 'agent:a', type: 'prompt', payload: { question: 'go?' } }, null)
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(stub.calls.length, 1)
+})
+
 test('type mapping: prompt/permission_request and session_status:done push priority 10, others priority 5', async (t) => {
   const { db, dan, stub, pipeline } = await setup(t, { coalesceMs: 50 })
   registerDevice(db, dan.id, 'phone')

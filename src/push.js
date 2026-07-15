@@ -135,8 +135,14 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
 
   function onAppend(userId, event, originDeviceId) {
     if (!apnsClient) return
-    const convo = db.prepare('SELECT id, title FROM conversations WHERE id=? AND owner_user_id=?').get(event.convo_id, userId)
+    const convo = db.prepare('SELECT id, title, parent_convo_id FROM conversations WHERE id=? AND owner_user_id=?').get(event.convo_id, userId)
     if (!convo) return
+    // Silent children: a subagent's child conversation is exempt from APNs
+    // entirely (mirrors the unread short-circuit in journal.js append()). This
+    // short-circuits the whole pipeline — alerts, routine coalesced pushes, and
+    // the read_marker background wake alike — before any device is considered,
+    // so stale app versions stay silent for children too.
+    if (convo.parent_convo_id != null) return
     // kind='client' only — agent devices are never pushed to.
     const devices = clientDevicesForPush(db, userId)
     if (devices.length === 0) return
