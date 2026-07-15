@@ -270,7 +270,12 @@ export function attachWs({
           conn.ws.close(4001)
           return
         }
-        handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes })
+        // frameBytes = the inbound frame's size as received on the wire —
+        // the RPC ops cap THAT (spec: whole inbound frame <= 16 KiB), not a
+        // reserialization, which JSON.parse's whitespace-stripping would
+        // shrink. `data` is a Buffer here (ws delivers text frames as
+        // Buffers), so .length is the byte count.
+        handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes, frameBytes: data.length })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -309,7 +314,7 @@ export function notifyStale(hub, entry) {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES }) {
+export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0 }) {
   const fail = (code, detail) =>
     conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code, ref: msg.op, ...(detail ? { detail } : {}) }))
   // Single choke point: every journal event becomes a WS frame AND (fire and
@@ -424,13 +429,15 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (!conn.registered) return failRpc('not_ready')
         if (typeof msg.method !== 'string' || msg.method.length === 0 || msg.method.length > RPC_NAME_MAX_CHARS) return failRpc('bad_request', 'bad method')
         if (!Number.isInteger(msg.agent_device_id)) return failRpc('bad_request', 'bad agent_device_id')
-        // Guarded stringify (same precedent as the status op): a deeply
-        // nested params/result overflows JSON.stringify's call stack, which
-        // must surface as a correlated bad_request, not an uncorrelated
-        // internal error.
-        let frameBytes
-        try { frameBytes = Buffer.byteLength(JSON.stringify(msg), 'utf8') } catch { return failRpc('bad_request', 'unserializable frame') }
+        // Wire-byte cap (spec: whole inbound frame <= 16 KiB as received) —
+        // measured on the raw payload, not a reserialization that
+        // JSON.parse's whitespace-stripping would shrink.
         if (frameBytes > rpcMaxBytes) return failRpc('bad_request', 'frame too large')
+        // Serializability guard (status-op precedent): a deeply nested
+        // params/result would overflow JSON.stringify's call stack at
+        // delivery — surface it as a correlated bad_request here instead of
+        // an uncorrelated internal error there.
+        try { JSON.stringify(msg) } catch { return failRpc('bad_request', 'unserializable frame') }
         // Unknown id, another user's device, and a client-kind device are
         // indistinguishable — anti-enumeration, same stance as the HTTP 404s.
         const target = db.prepare('SELECT user_id, kind FROM devices WHERE id=?').get(msg.agent_device_id)
@@ -459,13 +466,15 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
             || msg.error.code.length > RPC_NAME_MAX_CHARS)) {
           return failRpc('bad_request', 'error.code required when ok is false')
         }
-        // Guarded stringify (same precedent as the status op): a deeply
-        // nested params/result overflows JSON.stringify's call stack, which
-        // must surface as a correlated bad_request, not an uncorrelated
-        // internal error.
-        let frameBytes
-        try { frameBytes = Buffer.byteLength(JSON.stringify(msg), 'utf8') } catch { return failRpc('bad_request', 'unserializable frame') }
+        // Wire-byte cap (spec: whole inbound frame <= 16 KiB as received) —
+        // measured on the raw payload, not a reserialization that
+        // JSON.parse's whitespace-stripping would shrink.
         if (frameBytes > rpcMaxBytes) return failRpc('bad_request', 'frame too large')
+        // Serializability guard (status-op precedent): a deeply nested
+        // params/result would overflow JSON.stringify's call stack at
+        // delivery — surface it as a correlated bad_request here instead of
+        // an uncorrelated internal error there.
+        try { JSON.stringify(msg) } catch { return failRpc('bad_request', 'unserializable frame') }
         const target = db.prepare('SELECT user_id, kind FROM devices WHERE id=?').get(msg.to_device_id)
         if (!target || target.user_id !== conn.userId || target.kind !== 'client') return failRpc('not_found')
         // Multicast (see hub.sendRpcResponse); a fully disconnected client

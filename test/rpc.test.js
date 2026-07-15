@@ -114,6 +114,21 @@ test('frame over 16 KiB -> bad_request', async (t) => {
   assert.equal(agent.frames.filter((f) => f.kind === 'rpc').length, 0)
 })
 
+test('whitespace-padded wire frame over the cap -> bad_request (cap is wire bytes)', async (t) => {
+  const { s, ag, login } = await setup(t)
+  const client = await open(s, login.json.token)
+  const agent = await open(s, ag.token)
+  // 17 KB of insignificant whitespace: JSON.parse strips it, so a
+  // reserialized-size check would pass this frame — the cap must measure
+  // the wire payload.
+  const pad = ' '.repeat(17000)
+  client.ws.send(`{"op":"agent_request",${pad}"request_id":"pad1","agent_device_id":${ag.deviceId},"method":"start","params":{}}`)
+  const err = await client.waitFor((f) => f.op === 'error')
+  assert.equal(err.code, 'bad_request')
+  assert.equal(err.request_id, 'pad1')
+  assert.equal(agent.frames.filter((f) => f.kind === 'rpc').length, 0)
+})
+
 test('deeply nested params -> correlated bad_request, not internal', async (t) => {
   const { s, ag, login } = await setup(t)
   const client = await open(s, login.json.token)
