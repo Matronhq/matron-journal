@@ -424,7 +424,13 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (!conn.registered) return failRpc('not_ready')
         if (typeof msg.method !== 'string' || msg.method.length === 0 || msg.method.length > RPC_NAME_MAX_CHARS) return failRpc('bad_request', 'bad method')
         if (!Number.isInteger(msg.agent_device_id)) return failRpc('bad_request', 'bad agent_device_id')
-        if (Buffer.byteLength(JSON.stringify(msg), 'utf8') > rpcMaxBytes) return failRpc('bad_request', 'frame too large')
+        // Guarded stringify (same precedent as the status op): a deeply
+        // nested params/result overflows JSON.stringify's call stack, which
+        // must surface as a correlated bad_request, not an uncorrelated
+        // internal error.
+        let frameBytes
+        try { frameBytes = Buffer.byteLength(JSON.stringify(msg), 'utf8') } catch { return failRpc('bad_request', 'unserializable frame') }
+        if (frameBytes > rpcMaxBytes) return failRpc('bad_request', 'frame too large')
         // Unknown id, another user's device, and a client-kind device are
         // indistinguishable — anti-enumeration, same stance as the HTTP 404s.
         const target = db.prepare('SELECT user_id, kind FROM devices WHERE id=?').get(msg.agent_device_id)
@@ -453,7 +459,13 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
             || msg.error.code.length > RPC_NAME_MAX_CHARS)) {
           return failRpc('bad_request', 'error.code required when ok is false')
         }
-        if (Buffer.byteLength(JSON.stringify(msg), 'utf8') > rpcMaxBytes) return failRpc('bad_request', 'frame too large')
+        // Guarded stringify (same precedent as the status op): a deeply
+        // nested params/result overflows JSON.stringify's call stack, which
+        // must surface as a correlated bad_request, not an uncorrelated
+        // internal error.
+        let frameBytes
+        try { frameBytes = Buffer.byteLength(JSON.stringify(msg), 'utf8') } catch { return failRpc('bad_request', 'unserializable frame') }
+        if (frameBytes > rpcMaxBytes) return failRpc('bad_request', 'frame too large')
         const target = db.prepare('SELECT user_id, kind FROM devices WHERE id=?').get(msg.to_device_id)
         if (!target || target.user_id !== conn.userId || target.kind !== 'client') return failRpc('not_found')
         // Multicast (see hub.sendRpcResponse); a fully disconnected client

@@ -114,6 +114,21 @@ test('frame over 16 KiB -> bad_request', async (t) => {
   assert.equal(agent.frames.filter((f) => f.kind === 'rpc').length, 0)
 })
 
+test('deeply nested params -> correlated bad_request, not internal', async (t) => {
+  const { s, ag, login } = await setup(t)
+  const client = await open(s, login.json.token)
+  const agent = await open(s, ag.token)
+  // ~7000 nested arrays: JSON.parse accepts it, but JSON.stringify of the
+  // parsed value overflows the call stack — the size check's stringify must
+  // catch that and answer a correlated bad_request (status-op precedent).
+  const nested = '['.repeat(7000) + ']'.repeat(7000)
+  client.ws.send(`{"op":"agent_request","request_id":"deep1","agent_device_id":${ag.deviceId},"method":"start","params":${nested}}`)
+  const err = await client.waitFor((f) => f.op === 'error')
+  assert.equal(err.code, 'bad_request')
+  assert.equal(err.request_id, 'deep1')
+  assert.equal(agent.frames.filter((f) => f.kind === 'rpc').length, 0)
+})
+
 test('two live agent sockets: only the most recently registered receives the request', async (t) => {
   const { s, ag, login } = await setup(t)
   const client = await open(s, login.json.token)
