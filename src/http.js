@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import { login, authToken, changePassword } from './auth.js'
 import { snapshot, messagesBefore, toEventShape } from './journal.js'
-import { insertBlob, getBlob, setApnsRegistration } from './db.js'
+import { insertBlob, getBlob, setApnsRegistration, listDevices } from './db.js'
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
 
@@ -146,6 +146,13 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const r = await changePassword(db, who.userId, { oldPassword: old_password, newPassword: new_password })
         if (!r.ok) return json(res, 401, { error: 'bad_password' })
         return json(res, 200, { ok: true })
+      }
+      if (req.method === 'GET' && url.pathname === '/devices') {
+        // Management surface: client devices only, same gating as /password —
+        // an agent has no business enumerating its user's other devices.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const devices = listDevices(db, who.userId).map((d) => ({ ...d, is_self: d.device_id === who.deviceId }))
+        return json(res, 200, { devices })
       }
       const m = url.pathname.match(/^\/convo\/([^/]+)\/messages$/)
       if (req.method === 'GET' && m) {

@@ -55,6 +55,12 @@ the machine-checkable version of this page.
   DB file size) directly from the SQLite file — connected-socket count and
   APNs counters only exist in a running server's memory, so those are
   `/metrics`-only.
+- `GET /devices` (Bearer, client devices only — agents get 403
+  `{error:'forbidden'}`) -> `{devices: [{device_id, kind, name, created_at,
+  cursor, lag, last_seen_at, is_self}]}`. The caller's own user's devices
+  only; `is_self` marks the requesting device. Overlaps `/metrics`'
+  `user.devices` deliberately — metrics is observability (agents may read
+  it, no `name`), this is the management roster.
 
 ## WebSocket
 

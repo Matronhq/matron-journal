@@ -130,3 +130,14 @@ export function clientDevicesForPush(db, userId) {
 export function unreadBadge(db, userId) {
   return db.prepare('SELECT COALESCE(SUM(unread_count),0) AS n FROM conversations WHERE owner_user_id=?').get(userId).n
 }
+
+// Roster for GET /devices — same devices+user_seq read as buildMetrics
+// (src/metrics.js), plus name/created_at, which metrics deliberately omits.
+// token_hash and user_id never leave this function.
+export function listDevices(db, userId) {
+  const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)
+  const headSeq = head ? head.seq : 0
+  return db.prepare(
+    'SELECT id AS device_id, kind, name, created_at, cursor, last_seen_at FROM devices WHERE user_id=? ORDER BY id'
+  ).all(userId).map((d) => ({ ...d, lag: headSeq - d.cursor }))
+}
