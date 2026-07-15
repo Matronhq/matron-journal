@@ -17,32 +17,39 @@ export function snippetOf(type, payload) {
   return `[${type}]`
 }
 
-// Returns the conversation row plus `titleChanged`: true when this call set a
-// new, different title — either an existing convo's title actually changed,
-// or a brand-new convo was created with a non-empty title. Callers (ws.js)
-// use that flag to decide whether to fan out a `convo_meta` journal event;
-// no event on an unchanged title, an absent title, or a state-only upsert.
-export function upsertConversation(db, { id, ownerUserId, title, sessionState, agentDeviceId }) {
+// Returns the conversation row plus `metaChanged`: true when this call set
+// metadata other devices must learn live — an existing convo's title actually
+// changed, a brand-new convo was created with a non-empty title, or a child
+// was created (parent_convo_id set: the linkage must ride the journal even
+// titleless, or a live client would list the child as a normal conversation
+// until its next /snapshot). Callers (ws.js) use the flag to decide whether
+// to fan out a `convo_meta` journal event; no event on an unchanged title,
+// an absent title, or a state-only upsert.
+export function upsertConversation(db, { id, ownerUserId, title, sessionState, agentDeviceId, parentConvoId }) {
   const existing = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
-  let titleChanged = false
+  let metaChanged = false
   if (existing) {
     if (existing.owner_user_id !== ownerUserId) throw new Error('not authorized: convo owned by another user')
-    if (title != null && title !== existing.title) titleChanged = true
+    if (title != null && title !== existing.title) metaChanged = true
     // agent_device_id: last upsert wins — the device currently managing the
     // session owns delivery (see hub.js). An absent agentDeviceId leaves the
     // recorded owner untouched.
+    // parent_convo_id is set once at creation and IMMUTABLE thereafter — it is
+    // deliberately never written on the update path, so a later upsert that
+    // omits it does not clear it and one carrying a different value does not
+    // change it (child linkage is a fixed structural fact of the conversation).
     db.prepare(
       'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id) WHERE id=?'
     ).run(title ?? null, sessionState ?? null, agentDeviceId ?? null, id)
   } else {
     const initialTitle = title || ''
     db.prepare(
-      'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, created_at) VALUES(?,?,?,?,?,?)'
-    ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, Date.now())
-    if (initialTitle) titleChanged = true
+      'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, created_at) VALUES(?,?,?,?,?,?,?)'
+    ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, Date.now())
+    if (initialTitle || parentConvoId) metaChanged = true
   }
   const convo = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
-  return { ...convo, titleChanged }
+  return { ...convo, metaChanged }
 }
 
 const nextSeq = (db, userId) =>
@@ -52,7 +59,7 @@ const nextSeq = (db, userId) =>
 
 export function append(db, { userId, convoId, sender, type, payload, blobRef = null, idemKey = null }) {
   return db.transaction(() => {
-    const convo = db.prepare('SELECT owner_user_id FROM conversations WHERE id=?').get(convoId)
+    const convo = db.prepare('SELECT owner_user_id, parent_convo_id FROM conversations WHERE id=?').get(convoId)
     if (!convo || convo.owner_user_id !== userId) throw new Error('not authorized: convo missing or not owned')
     if (idemKey) {
       const dup = db.prepare('SELECT seq, ts FROM events WHERE user_id=? AND convo_id=? AND idem_key=?').get(userId, convoId, idemKey)
@@ -83,7 +90,12 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
       // badge — only content from someone/something else (an agent, mirroring
       // a bridge's remote participant) counts as unread. Keep this predicate in
       // sync with the recompute query in markRead() below.
-      const sql = sender.startsWith('user:')
+      // Child conversations (parent_convo_id set) are silent: a subagent's
+      // sub-chat rides the journal for durability but must never bump the
+      // owner's unread badge (server-side "silent children", mirrored by the
+      // push pipeline's short-circuit in push.js). last_seq/snippet still
+      // advance — only the unread increment is exempt.
+      const sql = sender.startsWith('user:') || convo.parent_convo_id != null
         ? 'UPDATE conversations SET last_seq=?, snippet=? WHERE id=?'
         : 'UPDATE conversations SET last_seq=?, unread_count=unread_count+1, snippet=? WHERE id=?'
       db.prepare(sql).run(seq, snippetOf(type, payload), convoId)
@@ -109,7 +121,7 @@ export function snapshot(db, userId) {
   // events (just created, or history pruned by retention) — clients fall
   // back to created_at. The (convo_id, seq) index makes the subquery a seek.
   const conversations = db.prepare(
-    `SELECT id, title, session_state, last_seq, unread_count, snippet, created_at,
+    `SELECT id, title, session_state, last_seq, unread_count, snippet, parent_convo_id, created_at,
             (SELECT ts FROM events e WHERE e.convo_id = conversations.id
              ORDER BY e.seq DESC LIMIT 1) AS last_ts
      FROM conversations WHERE owner_user_id=? ORDER BY last_seq DESC`
@@ -155,12 +167,14 @@ export function markRead(db, userId, convoId, upToSeq, sender = null) {
     const placeholders = MESSAGE_TYPES.map(() => '?').join(',')
     // Mirrors append()'s unread predicate: only non-`user:*`-sender messages
     // count as unread, so a recompute after read never resurrects the
-    // reader's own messages as unread.
+    // reader's own messages as unread — and silent children
+    // (parent_convo_id set) are skipped entirely, so a partial read_marker
+    // can never resurrect a positive count append() would not have made.
     db.prepare(
       `UPDATE conversations SET unread_count=(
          SELECT COUNT(*) FROM events e WHERE e.convo_id=? AND e.seq>? AND e.type IN (${placeholders})
            AND e.sender NOT LIKE 'user:%'
-       ) WHERE id=?`
+       ) WHERE id=? AND parent_convo_id IS NULL`
     ).run(convoId, resolvedUpToSeq, ...MESSAGE_TYPES, convoId)
     return { ...r, upToSeq: resolvedUpToSeq }
   })()
