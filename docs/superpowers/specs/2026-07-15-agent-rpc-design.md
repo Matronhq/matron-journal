@@ -1,7 +1,7 @@
 # Agent RPC & connected roster — design (SP2 journal ops)
 
 **Date:** 2026-07-15
-**Status:** draft — awaiting review
+**Status:** implemented (see docs/protocol.md "Agent RPC")
 **Depends on:** protocol v1 (`docs/protocol.md`); device roster
 (`2026-07-15-app-managed-agent-enrollment-design.md`)
 **Consumed by:** SP3 (bridge method handlers), SP2 app UI (folder picker +
