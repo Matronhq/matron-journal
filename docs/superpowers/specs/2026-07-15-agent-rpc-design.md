@@ -83,7 +83,9 @@ protocol's envelope vocabulary plus one addition (`agent_unreachable`).
 - Size cap: the whole inbound frame ≤ **16 KiB** UTF-8
   (`MATRON_RPC_MAX_BYTES`, default 16384) → `code:'bad_request'` beyond.
   Large payloads belong in `POST /media` with a `blob_ref` inside `params`.
-- Delivery: if the target agent device has ≥1 open WS connection, forward
+- Delivery: if the target agent device has ≥1 connection **registered for
+  live delivery** (open AND past hello replay — a mid-replay socket is not
+  serving yet and counts as unreachable), forward
 
   ```
   { kind:'rpc', request: { request_id, from_device_id, method, params } }
