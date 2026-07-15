@@ -90,20 +90,25 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // rejects only); the per-IP rate limiter above has already counted
         // this request, matching the existing convention for malformed
         // bodies (readBody's own 400s are counted the same way).
+        // device_name is optional (login() defaults it), but when present it
+        // must be a string or null — a non-primitive would otherwise 500 in
+        // issueDevice's INSERT bind, and even with valid credentials a 500
+        // there is wrong. Numbers previously bound fine (200); rejecting
+        // them too is a deliberate tightening to one canonical shape.
         if (typeof username !== 'string' || !username ||
-            typeof password !== 'string' || !password) {
+            typeof password !== 'string' || !password ||
+            (device_name != null && typeof device_name !== 'string')) {
           return json(res, 400, { error: 'bad_request' })
         }
-        const guardKey = String(username ?? '')
-        const gate = loginGuard.check(guardKey)
+        const gate = loginGuard.check(username)
         if (!gate.allowed) {
           const retryAfter = Math.ceil(gate.retryAfterMs / 1000)
           res.setHeader('Retry-After', retryAfter)
           return json(res, 429, { error: 'locked_out', retry_after: retryAfter })
         }
         const s = await login(db, { username, password, deviceName: device_name })
-        if (!s) { loginGuard.fail(guardKey); return json(res, 403, { error: 'bad_credentials' }) }
-        loginGuard.ok(guardKey)
+        if (!s) { loginGuard.fail(username); return json(res, 403, { error: 'bad_credentials' }) }
+        loginGuard.ok(username)
         return json(res, 200, { token: s.token, device_id: s.deviceId, user_id: s.userId })
       }
       const who = bearer(req) && authToken(db, bearer(req))

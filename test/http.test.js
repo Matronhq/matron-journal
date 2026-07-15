@@ -153,6 +153,22 @@ test('POST /login rejects structurally invalid bodies with 400 bad_request, neve
   const wrong = await postRaw(JSON.stringify({ username: 'dan', password: 'wrong', device_name: 'mac' }))
   assert.equal(wrong.status, 403)
   assert.deepEqual(await wrong.json(), { error: 'bad_credentials' })
+
+  // device_name: optional, but when present it must be a string (or null).
+  // A non-primitive here used to reach issueDevice's INSERT bind and 500 —
+  // with VALID credentials. A numeric one used to bind fine and return 200;
+  // that is now deliberately tightened to 400 (junk shape).
+  const objDevice = await postRaw(JSON.stringify({ username: 'dan', password: 'hunter22', device_name: { a: 1 } }))
+  assert.equal(objDevice.status, 400, 'object device_name should be 400')
+  assert.deepEqual(await objDevice.json(), { error: 'bad_request' })
+  const numDevice = await postRaw(JSON.stringify({ username: 'dan', password: 'hunter22', device_name: 42 }))
+  assert.equal(numDevice.status, 400, 'numeric device_name should be 400')
+  assert.deepEqual(await numDevice.json(), { error: 'bad_request' })
+  // absent and null device_name stay valid logins (default device name)
+  const absentDevice = await postRaw(JSON.stringify({ username: 'dan', password: 'hunter22' }))
+  assert.equal(absentDevice.status, 200, 'absent device_name should be 200')
+  const nullDevice = await postRaw(JSON.stringify({ username: 'dan', password: 'hunter22', device_name: null }))
+  assert.equal(nullDevice.status, 200, 'null device_name should be 200')
 })
 
 test('an unexpected internal error responds 500 with a generic body only, no message leak, and the server stays up', async (t) => {
