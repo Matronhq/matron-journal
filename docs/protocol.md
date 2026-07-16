@@ -33,7 +33,17 @@ the machine-checkable version of this page.
   `{error:'forbidden'}`): `{apns_token, environment}` with `environment` in
   `{'sandbox','prod'}` registers a device for push; `{apns_token: null}`
   unregisters. 400 `{error:'bad_request'}` on a bad `environment` or a
-  missing/non-string `apns_token` (unless it's `null`).
+  missing/non-string `apns_token` (unless it's `null`). Response echoes the
+  device's current `push_prefs` (see `PUT /push/prefs` below); `GET
+  /devices` echoes the same per-device `push_prefs` in its roster.
+- `PUT /push/prefs` (Bearer, client devices only — agents get 403
+  `{error:'forbidden'}`): body is any subset of `{attention, done, activity}`
+  booleans — a partial merge, not a replace: only the given keys change, the
+  rest keep their stored value. 400 `{error:'bad_request'}` on an unknown
+  field or a non-boolean value for a known field. Response `{ok:true,
+  push_prefs}` echoes the full merged three-key shape. Defaults (NULL /
+  never set) are `{attention: true, done: true, activity: false}` — "buzz me
+  when the agent needs me or finishes; routine activity is opt-in."
 - `POST /password` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`): `{old_password, new_password}`. `old_password` is
   always verified against the real argon2 hash (no shortcuts); a wrong one
@@ -59,8 +69,10 @@ the machine-checkable version of this page.
   `/metrics`-only.
 - `GET /devices` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`) -> `{devices: [{device_id, kind, name, created_at,
-  cursor, lag, last_seen_at, is_self, connected}]}`. The caller's own user's
-  devices only; `is_self` marks the requesting device. Overlaps `/metrics`'
+  cursor, lag, last_seen_at, is_self, connected, push_prefs}]}`. The
+  caller's own user's devices only; `is_self` marks the requesting device.
+  `push_prefs` is the per-device notification prefs (see `PUT /push/prefs`
+  above), always the full three-key shape (defaults filled in). Overlaps `/metrics`'
   `user.devices` deliberately — metrics is observability (agents may read
   it, no `name`), this is the management roster. `connected` is whether the
   device has a live WebSocket right now — the "can I start a session on

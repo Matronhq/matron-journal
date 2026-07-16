@@ -81,7 +81,7 @@ journal can't pre-register):
 
 - Device tokens are unguessable 32-byte values known only to the user's own
   journal — possession is the credential.
-- Per-device-token token bucket: burst 20, refill 1/min, 429 when empty.
+- Per-device-token token bucket: burst 20, refill 1 per 10s, 429 when empty.
   Journal-side coalescing keeps legitimate traffic far below this.
 - Body limit 1 KB, JSON only, strict field validation.
 - No logging of tokens beyond a truncated prefix; no request bodies logged.
@@ -122,7 +122,8 @@ APNs client ignores the extra field.
 ## Component 3 — notification settings
 
 **Journal (v1):** `devices` gains `push_prefs TEXT` (JSON
-`{"attention": bool, "done": bool, "activity": bool}`, NULL = all on),
+`{"attention": bool, "done": bool, "activity": bool}`, NULL = defaults —
+attention and done on, activity off),
 added via the same in-place ALTER pattern as `apns_env`. Enforced in the
 `onAppend` device loop: skip the device when its prefs disable the event's
 category. `wake` pushes (read_marker badge sync) are invisible to the user
@@ -136,7 +137,8 @@ lives.
 
 **Apps (v2):** Settings → Notifications section on iPhone and Mac — three
 toggles ("Needs your input", "Session finished", "Agent activity") — plus
-`JournalAPI` get/set methods. Defaults all on.
+`JournalAPI` get/set methods. Defaults match the server: "Needs your input"
+and "Session finished" on, "Agent activity" off.
 
 ## Component 4 — NSE content fetch (v2, matron-apple)
 

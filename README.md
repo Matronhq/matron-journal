@@ -129,7 +129,8 @@ key, so this is for the hosted one's operator):
 
 The wire protocol is small: a handful of Bearer-authenticated HTTP endpoints
 (`/login`, `/snapshot`, `/convo/:id/messages`, `/media`, `/push/register`,
-`/password`, `/metrics`) and one WebSocket (`/ws`) speaking journal frames.
+`/push/prefs`, `/password`, `/metrics`) and one WebSocket (`/ws`) speaking
+journal frames.
 
 - Operational reference: [docs/protocol.md](docs/protocol.md)
 - Design spec (the why): [docs/superpowers/specs/2026-07-10-matron-protocol-design.md](docs/superpowers/specs/2026-07-10-matron-protocol-design.md)
