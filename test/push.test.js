@@ -102,19 +102,19 @@ test('child conversations (parent_convo_id set) are silent: onAppend never pushe
   assert.equal(stub.calls.length, 1)
 })
 
-test('type mapping: prompt/permission_request and session_status:done push priority 10, others priority 5', async (t) => {
+test('type mapping: prompt/permission_request and turn-finished session_status push priority 10, others priority 5', async (t) => {
   const { db, dan, stub, pipeline } = await setup(t, { coalesceMs: 50 })
   registerDevice(db, dan.id, 'phone')
 
-  const send = (type, payload) => {
+  const send = (type, payload, hint) => {
     const r = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type, payload })
-    pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type, payload }, null)
+    pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type, payload }, null, hint)
     return r
   }
 
   send('prompt', { question: 'go ahead?' })
   send('permission_request', { description: 'write file' })
-  send('session_status', { state: 'done' })
+  send('session_status', { state: 'done' }, { prevSessionState: 'running' })
   await new Promise((res) => setTimeout(res, 10))
   assert.equal(stub.calls.length, 3, 'prompt/permission_request/session_status:done must not be coalesced')
   for (const c of stub.calls) {
@@ -134,22 +134,27 @@ test('type mapping: prompt/permission_request and session_status:done push prior
   assert.equal(routine.collapseId, 'c1')
 })
 
-test('convo_meta and non-done session_status never push at all (no alert, no background)', async (t) => {
+test('convo_meta and non-turn-finished session_status never push at all (no alert, no background)', async (t) => {
   const { db, dan, stub, pipeline } = await setup(t, { coalesceMs: 30 })
   registerDevice(db, dan.id, 'phone')
 
-  const send = (type, payload) => {
+  const send = (type, payload, hint) => {
     const r = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type, payload })
-    pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type, payload }, null)
+    pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type, payload }, null, hint)
   }
 
   send('convo_meta', { title: 'renamed while you were away' })
-  send('session_status', { state: 'running' })
-  send('session_status', { state: 'waiting' })
+  send('session_status', { state: 'running' }, { prevSessionState: 'waiting' })
+  // waiting -> done: teardown of an already-idle session (idle reaper,
+  // /stop) — the user was already told the turn finished; silent.
+  send('session_status', { state: 'done' }, { prevSessionState: 'waiting' })
+  // No hint at all (a call site that can't know the previous state) fails
+  // closed for session_status, even at state 'done'.
+  send('session_status', { state: 'done' })
   // Long enough for both an immediate send AND a would-be trailing
   // coalesced push to have fired if these were (wrongly) classified routine.
   await new Promise((res) => setTimeout(res, 80))
-  assert.equal(stub.calls.length, 0, 'convo_meta / non-done session_status are journal-sync material, not notifications')
+  assert.equal(stub.calls.length, 0, 'convo_meta / non-turn-finished session_status are journal-sync material, not notifications')
 
   // ...and they must not have claimed the coalescing slot either: a real
   // routine event right after still gets its immediate leading push.
@@ -563,15 +568,15 @@ test('category threading: classify kind reaches apnsClient.send as opts.category
   const { db, dan, stub, pipeline } = await setup(t, { coalesceMs: 50 })
   const deviceId = registerDevice(db, dan.id, 'phone')
 
-  const send = (type, payload, sender = 'agent:a') => {
-    const r = append(db, { userId: dan.id, convoId: 'c1', sender, type, payload })
-    pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender, type, payload }, null)
+  const send = (type, payload, hint) => {
+    const r = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type, payload })
+    pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type, payload }, null, hint)
     return r
   }
 
   send('prompt', { question: 'go?' })                 // attention
   send('permission_request', { description: 'write' }) // attention
-  send('session_status', { state: 'done' })            // done
+  send('session_status', { state: 'done' }, { prevSessionState: 'running' }) // done (turn finished)
   send('text', { body: 'hi' })                          // activity (leading send)
   await new Promise((res) => setImmediate(res))
   assert.deepEqual(stub.calls.map((c) => c.category), ['attention', 'attention', 'done', 'activity'])
@@ -593,9 +598,9 @@ test('push_prefs: a disabled category skips that device only; wake is never filt
   const open = registerDevice(db, dan.id, 'ipad', { token: 'ipad-token' })
   setPushPrefs(db, muted, { attention: false, activity: false })
 
-  const fire = (type, payload, sender = 'agent:a', origin = null) => {
+  const fire = (type, payload, sender = 'agent:a', origin = null, hint = undefined) => {
     const r = append(db, { userId: dan.id, convoId: 'c1', sender, type, payload })
-    pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender, type, payload }, origin)
+    pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender, type, payload }, origin, hint)
   }
 
   // attention off on `muted`: only `open` gets the prompt push.
@@ -604,7 +609,7 @@ test('push_prefs: a disabled category skips that device only; wake is never filt
   assert.deepEqual(stub.calls.map((c) => c.deviceToken), ['ipad-token'])
 
   // done still on for both.
-  fire('session_status', { state: 'done' })
+  fire('session_status', { state: 'done' }, 'agent:a', null, { prevSessionState: 'running' })
   await new Promise((res) => setImmediate(res))
   assert.equal(stub.calls.length, 3)
 
@@ -627,9 +632,9 @@ test('push_prefs: NULL prefs default activity off — routine pushes are skipped
   const { db, dan, stub, pipeline } = await setup(t, { coalesceMs: 50 })
   registerDevice(db, dan.id, 'phone', { prefs: null }) // exercise the real defaults, not this file's fixture-level all-on override
 
-  const fire = (type, payload) => {
+  const fire = (type, payload, hint) => {
     const r = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type, payload })
-    pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type, payload }, null)
+    pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type, payload }, null, hint)
   }
 
   // activity: default off. Long enough for both an immediate AND a would-be
@@ -645,7 +650,7 @@ test('push_prefs: NULL prefs default activity off — routine pushes are skipped
   assert.equal(stub.calls[0].category, 'attention')
 
   // done: default on.
-  fire('session_status', { state: 'done' })
+  fire('session_status', { state: 'done' }, { prevSessionState: 'running' })
   await new Promise((res) => setImmediate(res))
   assert.equal(stub.calls.length, 2)
   assert.equal(stub.calls[1].category, 'done')
@@ -683,4 +688,76 @@ test('push_prefs: a kind unknown to the prefs object fails OPEN, not silently mu
   await new Promise((res) => setImmediate(res))
   assert.equal(stub.calls.length, 1, 'a kind absent from prefs must fail open, not be silently filtered')
   assert.equal(stub.calls[0].category, 'some_future_kind')
+})
+
+test('session_status pushes on the turn-finished TRANSITION, not the state alone', async (t) => {
+  const { db, dan, stub, pipeline } = await setup(t, { coalesceMs: 30 })
+  registerDevice(db, dan.id, 'phone')
+
+  const fire = (state, prevSessionState) => {
+    const payload = { state }
+    const r = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'session_status', payload })
+    pipeline.onAppend(dan.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'session_status', payload },
+      null, { prevSessionState })
+  }
+
+  // running -> waiting: the agent finished its turn — push, kind 'done',
+  // with the fixed turn-finished body (matches the relay's 'done' string).
+  fire('waiting', 'running')
+  await new Promise((res) => setImmediate(res))
+  assert.equal(stub.calls.length, 1)
+  assert.equal(stub.calls[0].category, 'done')
+  assert.equal(stub.calls[0].priority, 10)
+  assert.equal(stub.calls[0].payload.aps.alert.body, 'Session finished')
+
+  // running -> done (crash/stop mid-work): also a turn ending — push.
+  fire('done', 'running')
+  await new Promise((res) => setImmediate(res))
+  assert.equal(stub.calls.length, 2)
+  assert.equal(stub.calls[1].category, 'done')
+
+  // Silent transitions: teardown of an already-idle session, a turn
+  // starting, an idle no-op, and a brand-new convo's first state.
+  fire('done', 'waiting')
+  fire('running', 'waiting')
+  fire('waiting', 'waiting')
+  fire('waiting', undefined)
+  await new Promise((res) => setTimeout(res, 60))
+  assert.equal(stub.calls.length, 2, 'only turn-finished transitions may push')
+})
+
+test('end-to-end wiring: convo_upsert threads the previous session state into the push pipeline', async (t) => {
+  const stub = makeStubApnsClient()
+  const s = await startTestServer({ apnsClient: stub })
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const ag = createAgent(s.db, dan.id, 'dev-2')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'phone' } })
+  await s.http('/push/register', { method: 'POST', token: login.json.token, body: { apns_token: 'phone-token', environment: 'prod' } })
+
+  const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+  const upsert = async (state) => {
+    agent.send({ op: 'convo_upsert', convo_id: 'wire-3', session_state: state })
+    await agent.waitFor((f) => f.kind === 'journal' && f.type === 'session_status' && f.payload.state === state)
+  }
+
+  // Creation (first state 'running') is not a finished turn.
+  await upsert('running')
+  await new Promise((res) => setTimeout(res, 30))
+  assert.equal(stub.calls.filter((c) => c.category === 'done').length, 0)
+
+  // running -> waiting: turn finished, exactly one 'done' push.
+  await upsert('waiting')
+  await new Promise((res) => setTimeout(res, 30))
+  const doneCalls = stub.calls.filter((c) => c.category === 'done')
+  assert.equal(doneCalls.length, 1, 'running -> waiting must push through the real convo_upsert path')
+  assert.equal(doneCalls[0].payload.aps.alert.body, 'Session finished')
+
+  // waiting -> done: already-idle teardown, still exactly one.
+  await upsert('done')
+  await new Promise((res) => setTimeout(res, 30))
+  assert.equal(stub.calls.filter((c) => c.category === 'done').length, 1, 'waiting -> done must stay silent')
+
+  agent.close()
 })

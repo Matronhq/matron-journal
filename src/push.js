@@ -5,12 +5,25 @@ import { clientDevicesForPush, parsePushPrefs, pruneApnsToken, unreadBadge } fro
 const ROUTINE_COALESCE_MS = 10000
 
 // Returns null for event types that must not push at all. Product call
-// (dispatcher decision): convo_meta (a title rename) and session_status with
-// state != 'done' (running/waiting flips) are journal-sync material — every
-// connected device learns them from the journal frame, and nothing about
-// them warrants buzzing a pocket. prompt/permission_request already cover
-// "the session needs you", and the 'done' alert stays.
-function classify(type, payload, sender) {
+// (dispatcher decision): convo_meta (a title rename) is always journal-sync
+// material — every connected device learns it from the journal frame, and
+// nothing about a rename warrants buzzing a pocket. prompt/permission_request
+// already cover "the session needs you" and always push.
+//
+// session_status is keyed off the TRANSITION, not the new state alone: a
+// 'done' push must fire when the agent FINISHES ITS TURN, not whenever the
+// session table happens to read 'done'. running -> waiting (turn finished)
+// and running -> done (crashed, or stopped mid-work) both push kind 'done'.
+// Every other transition is silent — in particular waiting -> done (the
+// idle-reaper or /stop tearing down a session that was already waiting on
+// the user) and a brand-new conversation's first state; those are
+// journal-sync material other devices pick up from the frame itself.
+// `prevState` is an in-memory-only hint threaded from ws.js's convo_upsert
+// handler through onAppend's `pushHint` param (see below) — it is never
+// stored in the event payload or broadcast on the wire, so the protocol
+// surface is unchanged. Absent (e.g. a call site that doesn't pass one) is
+// treated as "not running" — fails closed for this rule specifically.
+function classify(type, payload, sender, prevState) {
   // A user's own words/actions (sender `user:*`) must never trigger an
   // alert push, to ANY of that user's devices — not just the originating
   // one (that's origin-device exclusion, a separate, narrower rule below).
@@ -23,7 +36,9 @@ function classify(type, payload, sender) {
   if (typeof sender === 'string' && sender.startsWith('user:')) return null
   if (type === 'prompt' || type === 'permission_request') return { priority: 10, coalesce: false, kind: 'attention' }
   if (type === 'session_status') {
-    return payload && payload.state === 'done' ? { priority: 10, coalesce: false, kind: 'done' } : null
+    const state = payload && payload.state
+    const turnFinished = prevState === 'running' && (state === 'waiting' || state === 'done')
+    return turnFinished ? { priority: 10, coalesce: false, kind: 'done' } : null
   }
   if (type === 'convo_meta') return null
   // Routine content: text/tool_output/diff/prompt_reply/file/image/etc. —
@@ -137,7 +152,10 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     state.timer.unref()
   }
 
-  function onAppend(userId, event, originDeviceId) {
+  // `pushHint` is optional, in-memory-only extra context a caller (today:
+  // ws.js's convo_upsert handler, for session_status's prevSessionState)
+  // can pass through to classify(). Every other call site omits it.
+  function onAppend(userId, event, originDeviceId, pushHint) {
     if (!apnsClient) return
     const convo = db.prepare('SELECT id, title, parent_convo_id FROM conversations WHERE id=? AND owner_user_id=?').get(event.convo_id, userId)
     if (!convo) return
@@ -168,8 +186,8 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
       return
     }
 
-    const cls = classifyEvent(event.type, event.payload, event.sender)
-    if (!cls) return // journal-sync-only type (convo_meta, non-done session_status), or a user's own event (T2)
+    const cls = classifyEvent(event.type, event.payload, event.sender, pushHint && pushHint.prevSessionState)
+    if (!cls) return // journal-sync-only type (convo_meta, a session_status transition that isn't turn-finished), or a user's own event (T2)
     const title = convo.title || convo.id
     const body = snippetOf(event.type, event.payload)
     for (const device of devices) {

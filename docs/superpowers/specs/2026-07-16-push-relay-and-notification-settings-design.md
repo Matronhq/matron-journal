@@ -107,10 +107,12 @@ the APNs client, so `push.js` needs almost no changes.
 content never crosses the wire.
 
 **`push.js` change (the one real edit):** `classify()` gains a `kind` field
-(`'attention'` for prompt/permission_request, `'done'` for session_status
-done, `'activity'` for routine), threaded through `buildOpts` as
-`category`; the read_marker branch passes `category: 'wake'`. The direct
-APNs client ignores the extra field.
+(`'attention'` for prompt/permission_request, `'done'` for a turn-finished
+session_status transition — previous state running moving to waiting or
+done; every other transition, notably waiting -> done teardown, is silent —
+`'activity'` for routine), threaded through `buildOpts` as `category`; the
+read_marker branch passes `category: 'wake'`. The direct APNs client
+ignores the extra field.
 
 **`server.js` selection order** in `resolveApnsClient()`:
 
