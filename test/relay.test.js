@@ -131,7 +131,7 @@ test('APNs status passthrough: 410 body/status reach the caller for pruning; APN
 
 test('rate limit: burst then 429 per token, independent tokens unaffected, refill restores', async (t) => {
   let clock = 0
-  const limiter = makeRelayLimiter({ burst: 3, refillMs: 60000, now: () => clock })
+  const limiter = makeRelayLimiter({ burst: 3, refillMs: 10000, now: () => clock })
   const { post, stub } = await startTestRelay(t, { limiter })
 
   for (let i = 0; i < 3; i++) assert.equal((await post(GOOD)).status, 200)
@@ -143,7 +143,7 @@ test('rate limit: burst then 429 per token, independent tokens unaffected, refil
   assert.equal((await post({ ...GOOD, device_token: 'ef'.repeat(32) })).status, 200)
 
   // One refill interval restores exactly one send.
-  clock += 60000
+  clock += 10000
   assert.equal((await post(GOOD)).status, 200)
   assert.equal((await post(GOOD)).status, 429)
 })

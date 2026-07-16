@@ -27,12 +27,14 @@ const REQUIRED = ['device_token', 'env', 'category', 'priority', 'push_type']
 const OPTIONAL = ['badge', 'thread_id', 'collapse_id']
 const KNOWN = new Set([...REQUIRED, ...OPTIONAL])
 
-// Per-device-token token bucket: burst 20, refill 1/min. Journal-side
-// coalescing keeps legitimate traffic far below this. Buckets live in
-// memory only (the relay is stateless by design); a full-capacity bucket is
+// Per-device-token token bucket: burst 20, refill 1 per 10s. Sustained
+// activity+wake traffic can reach ~5+/min even with journal-side coalescing
+// — this refill rate covers that with headroom while still capping abuse at
+// ~6/min sustained once the burst is spent. Buckets live in memory only
+// (the relay is stateless by design); a full-capacity bucket is
 // indistinguishable from an absent one, so those are evicted on sweep and
 // the map stays bounded by the number of RECENTLY throttled tokens.
-export function makeRelayLimiter({ burst = 20, refillMs = 60000, now = Date.now } = {}) {
+export function makeRelayLimiter({ burst = 20, refillMs = 10000, now = Date.now } = {}) {
   const buckets = new Map()
 
   function allow(token) {
