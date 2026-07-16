@@ -22,13 +22,19 @@ the machine-checkable version of this page.
 - `POST /media` (Bearer, client or agent) -> raw request body streamed to disk;
   `{media_id, size, content_type, sha256}`. Content-Type header captured
   (default `application/octet-stream`). 400 `{error:'empty'}` on a zero-byte
-  body; 413 `{error:'too_large'}` over `MATRON_MEDIA_MAX_BYTES` (default 50 MB).
+  body; 413 `{error:'too_large'}` over `MATRON_MEDIA_MAX_BYTES` (default 50 MB);
+  413 `{error:'quota_exceeded'}` when the user's total blob bytes would exceed
+  `MATRON_MEDIA_USER_QUOTA_BYTES` (default 2 GiB) — checked up front (rejected
+  before the body streams) when already at the ceiling, and precisely after the
+  size is known otherwise (the just-written file is deleted on rejection).
   Storage root: `MATRON_MEDIA_DIR` env or `<dirname of the db file>/media`,
   sharded `<root>/<id[0:2]>/<id>`.
 - `GET /media/:id` (Bearer) -> streams the blob with its Content-Type,
   Content-Length and a long-lived `Cache-Control` (ids are immutable random
-  handles). Owner-only; missing or not-owned are indistinguishable, both
-  404 `{error:'not_found'}`.
+  handles), plus `X-Content-Type-Options: nosniff` and
+  `Content-Disposition: attachment` so an uploader-chosen content-type can never
+  render as active content on the API origin. Owner-only; missing or not-owned
+  are indistinguishable, both 404 `{error:'not_found'}`.
 - `POST /push/register` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`): `{apns_token, environment}` with `environment` in
   `{'sandbox','prod'}` registers a device for push; `{apns_token: null}`
@@ -149,6 +155,13 @@ the machine-checkable version of this page.
   `finalize`'s internally composed `fin:<ref>` keys) with
   `{op:'error', code:'bad_request', detail:'idem_key prefix fin: is
   reserved'}`; nothing is appended.
+- Agent `stream {convo_id, message_ref, text?, replace_text?}` broadcasts a
+  live message overlay (never journaled). Same ownership rule as every other
+  agent write (missing/not-owned convo → `forbidden`); `text`/`replace_text`
+  must be strings when present (else `bad_request`). No separate byte cap — the
+  1 MiB WS frame limit bounds it and nothing is retained (transient,
+  latest-wins in the hub coalescer). Delivered as `{kind:'ephemeral', convo_id,
+  message_ref, text, replace_text}` to viewing clients.
 - Agent `activity {convo_id, state, detail?}` broadcasts a typing/tool-use
   indicator: `state` must be one of `thinking`/`tool`/`idle` (else
   `bad_request`); `detail` is an optional string, truncated (not rejected) at

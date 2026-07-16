@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import { login, authToken, changePassword, revokeOwnedDevice, createAgent } from './auth.js'
 import { snapshot, messagesBefore, toEventShape } from './journal.js'
-import { insertBlob, getBlob, setApnsRegistration, listDevices } from './db.js'
+import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes } from './db.js'
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
 
@@ -67,7 +67,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, hub, pushPipeline, dbPath, pairs }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -262,6 +262,17 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         }
       }
       if (req.method === 'POST' && url.pathname === '/media') {
+        // Per-user disk quota (finding: media has no TTL, so unbounded uploads
+        // fill the disk). Read the user's current footprint once, up front:
+        // if it's already at/over quota, reject BEFORE streaming a body we'd
+        // only delete (rejectEarly closes the socket since the body is unread).
+        // The precise `used + size` check comes after receiveBlob knows the
+        // size — a single upload can overshoot by at most mediaMaxBytes, which
+        // is fine (the ceiling is a safety valve, not a byte-exact accountant),
+        // and concurrent same-user uploads can each pass this snapshot read, a
+        // bounded soft-overrun we accept rather than serializing uploads.
+        const usedBytes = userBlobBytes(db, who.userId)
+        if (usedBytes >= mediaUserQuotaBytes) return rejectEarly(req, res, 413, { error: 'quota_exceeded' })
         let received
         try {
           received = await receiveBlob(req, { root: mediaDir, maxBytes: mediaMaxBytes })
@@ -269,6 +280,13 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           if (e.code === 'empty') return json(res, 400, { error: 'empty' })
           if (e.code === 'too_large') throw Object.assign(new Error('too large'), { statusCode: 413 })
           throw e
+        }
+        if (usedBytes + received.size > mediaUserQuotaBytes) {
+          // Body is fully consumed by now (receiveBlob resolved), so a plain
+          // json() reject is right — no keep-alive desync concern. Delete the
+          // just-written blob file so a rejected upload leaves nothing behind.
+          await fs.promises.unlink(received.diskPath).catch(() => {})
+          return json(res, 413, { error: 'quota_exceeded' })
         }
         const contentType = req.headers['content-type'] || 'application/octet-stream'
         try {
@@ -321,6 +339,13 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           'content-type': blob.content_type,
           'content-length': String(blob.size),
           'cache-control': 'private, max-age=31536000, immutable',
+          // The content-type is uploader-chosen and echoed verbatim, on the
+          // same origin as the API. nosniff stops a browser from re-sniffing a
+          // mislabeled blob into active content, and attachment forces a
+          // download rather than inline rendering — so a blob can never execute
+          // as script/HTML in this origin even though media is owner-scoped.
+          'x-content-type-options': 'nosniff',
+          'content-disposition': 'attachment',
         })
         await new Promise((resolve) => {
           const stream = fs.createReadStream(blob.disk_path)

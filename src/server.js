@@ -14,6 +14,11 @@ import { resolveMediaDir } from './media.js'
 import { runOffload, runExpireLogs } from './retention.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
+// Per-user total blob budget (all uploads + retention-offloaded payloads for a
+// user, summed). Unlike tool_output, user-uploaded media has no TTL, so without
+// a ceiling a single valid device token could fill the disk. 2 GiB is ~75x the
+// busiest user's current footprint on dev-2 — generous headroom, not a squeeze.
+export const DEFAULT_MEDIA_USER_QUOTA_BYTES = 2147483648 // 2 GiB
 export const DEFAULT_MAX_REPLAY = 50000
 const DEFAULT_RETENTION_DAYS = 30
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
@@ -171,11 +176,33 @@ function resolveApnsClient(injected) {
   return { client: undefined, owned: false }
 }
 
+// The per-IP rate limiter and the pairing "who's asking" IP both trust the
+// `cf-connecting-ip` header (see http.js). That is only sound because the sole
+// route to this process is the cloudflared tunnel to a LOOPBACK bind —
+// Cloudflare overwrites the header, so it can't be spoofed. If the process is
+// ever bound to a non-loopback address, that header becomes attacker-supplied
+// and both defenses are defeated. Warn loudly at boot rather than silently
+// weakening them. Not a hard refuse — a deliberate reverse-proxy setup that
+// sets cf-connecting-ip itself is legitimate — but it must be a conscious choice.
+function warnIfBindTrustsSpoofableIp(bind) {
+  const loopback = bind === '127.0.0.1' || bind === '::1' || bind === 'localhost'
+  if (!loopback) {
+    console.warn(
+      `SECURITY: MATRON_BIND=${JSON.stringify(bind)} is not loopback. The cf-connecting-ip ` +
+      'header is only trustworthy when the sole ingress is the cloudflared tunnel; on a ' +
+      'directly-reachable bind a client can spoof it, defeating the per-IP rate limiter and ' +
+      'the pairing requester-IP display. Ensure a trusted proxy sets cf-connecting-ip and the ' +
+      'port is firewalled off from untrusted networks.'
+    )
+  }
+}
+
 export function startServer({
-  dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, apnsClient, replayBackpressureBytes,
+  dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, walCheckpointIntervalMs, toolStreamOpts,
   toolLogTtlHours, pairs,
 } = {}) {
+  warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
   const db = openDb(resolvedDbPath)
   // WAL-checkpoint tail mitigation, server half (docs/wal-checkpoint-profile.md;
@@ -196,6 +223,7 @@ export function startServer({
   const resolvedPairs = pairs || makePairStore()
   const resolvedMediaDir = resolveMediaDir(resolvedDbPath, mediaDir)
   const resolvedMediaMaxBytes = mediaMaxBytes ?? resolveNumericEnv('MATRON_MEDIA_MAX_BYTES', process.env.MATRON_MEDIA_MAX_BYTES, DEFAULT_MEDIA_MAX_BYTES)
+  const resolvedMediaUserQuotaBytes = mediaUserQuotaBytes ?? resolveNumericEnv('MATRON_MEDIA_USER_QUOTA_BYTES', process.env.MATRON_MEDIA_USER_QUOTA_BYTES, DEFAULT_MEDIA_USER_QUOTA_BYTES)
   const resolvedMaxReplay = maxReplay ?? resolveNumericEnv('MATRON_MAX_REPLAY', process.env.MATRON_MAX_REPLAY, DEFAULT_MAX_REPLAY)
   const hub = makeHub()
   const toolStreams = makeToolStreamStore({
@@ -208,6 +236,7 @@ export function startServer({
   const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient })
   const server = http.createServer(makeHttpHandler({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
+    mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs,
   }))
   const wss = attachWs({
