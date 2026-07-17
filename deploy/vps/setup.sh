@@ -30,6 +30,58 @@ if ! command -v cloudflared >/dev/null; then
   apt-get update -qq && apt-get install -y -qq cloudflared
 fi
 
+# --- security baseline (mirrors dev-boxer 01_security, minus postfix/exporter) ---
+timedatectl set-timezone Etc/UTC
+
+# unattended-upgrades: installing the package is not enough — this file is
+# what turns the daily run on. Debian's stock 50unattended-upgrades already
+# limits it to security origins.
+cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+systemctl enable unattended-upgrades >/dev/null
+
+# sshd: key-only. Guarded so a box provisioned without a root key can't be
+# locked out. Port stays 22 — ufw + fail2ban cover it, and a surprise port
+# change on a headless VPS is its own outage.
+if [ -s /root/.ssh/authorized_keys ]; then
+  cat > /etc/ssh/sshd_config.d/90-matron.conf <<'EOF'
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin prohibit-password
+EOF
+  systemctl reload ssh || systemctl reload sshd
+else
+  echo ">> no /root/.ssh/authorized_keys — skipping sshd key-only hardening" >&2
+fi
+
+# ufw: deny inbound except SSH. Everything else arrives via the cloudflared
+# tunnel (outbound-only), so no service ports are ever opened.
+apt-get install -y -qq ufw
+if ! ufw status | grep -q 'Status: active'; then
+  ufw default deny incoming
+  ufw default allow outgoing
+fi
+ufw allow 22/tcp comment 'SSH' >/dev/null
+ufw --force enable >/dev/null
+
+# fail2ban: Debian 12 minimal has no auth.log (no rsyslog) — backend must be
+# systemd or the sshd jail silently watches a file that never exists.
+apt-get install -y -qq fail2ban
+cat > /etc/fail2ban/jail.local <<'EOF'
+[DEFAULT]
+backend = systemd
+
+[sshd]
+enabled = true
+port = 22
+maxretry = 6
+bantime = 300
+EOF
+systemctl enable fail2ban >/dev/null
+systemctl restart fail2ban
+
 # --- users & directories -----------------------------------------------------
 for u in matron-relay matron-demo; do
   id "$u" >/dev/null 2>&1 || useradd --system --shell /usr/sbin/nologin --home-dir /nonexistent --no-create-home "$u"

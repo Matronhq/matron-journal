@@ -29,6 +29,21 @@ tunnel — the VPS needs **no open inbound ports** except SSH.
 key is readable by the relay user only — the demo journal (the larger
 attack surface: HTTP + WS API) cannot read it.
 
+## Security baseline
+
+`setup.sh` applies the same host hardening as our other server setups
+(dev-boxer's security module / chef `base_server`): ufw with deny-inbound +
+SSH only, fail2ban on sshd (systemd backend — Debian 12 minimal has no
+auth.log), key-only sshd (guarded: skipped if root has no authorized_keys),
+unattended-upgrades enabled via `20auto-upgrades`, timezone UTC.
+
+Intentionally not carried over from those setups: postfix/Resend mail
+relay, node_exporter/promtail/crowdsec, custom SSH port, extra user
+accounts — this is a single-purpose box with two loopback-bound services
+behind an outbound-only tunnel, and each of those adds surface or ops
+burden it doesn't pay for here. Add node_exporter first if monitoring ever
+becomes worth it.
+
 ## One-time setup
 
 1. **Create the VPS** (Debian 12 / Ubuntu 24.04, smallest tier is plenty)
