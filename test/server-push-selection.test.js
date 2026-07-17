@@ -69,6 +69,13 @@ test('MATRON_PUSH_GATEWAY_URL alone → gateway client that POSTs /push to that 
   assert.deepEqual(hits, ['/push'])
 })
 
+test('malformed MATRON_PUSH_GATEWAY_URL → disabled, not a boot crash', (t) => {
+  withEnv(t, { MATRON_PUSH_GATEWAY_URL: 'push.matron.chat' }) // missing scheme
+  const { client, owned } = resolveApnsClient(undefined)
+  assert.equal(client, undefined)
+  assert.equal(owned, false)
+})
+
 test('all four MATRON_APNS_* set beats the gateway URL (direct APNs wins)', async (t) => {
   // If the gateway were (wrongly) selected, it would POST here — it must not.
   const hits = []

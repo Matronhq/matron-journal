@@ -175,7 +175,14 @@ export function resolveApnsClient(injected) {
     return { client, owned: true }
   }
   if (MATRON_PUSH_GATEWAY_URL) {
-    return { client: makeGatewayClient({ url: MATRON_PUSH_GATEWAY_URL }), owned: true }
+    // A typo'd URL (e.g. missing scheme) degrades to push-disabled like the
+    // other misconfigurations — new URL() in makeGatewayClient would
+    // otherwise throw and take the whole journal down at boot.
+    if (URL.canParse('/push', MATRON_PUSH_GATEWAY_URL)) {
+      return { client: makeGatewayClient({ url: MATRON_PUSH_GATEWAY_URL }), owned: true }
+    }
+    console.warn(`push: disabled — MATRON_PUSH_GATEWAY_URL is not a valid URL: ${MATRON_PUSH_GATEWAY_URL}`)
+    return { client: undefined, owned: false }
   }
   console.warn('push: disabled — set all four MATRON_APNS_* vars (direct APNs) or MATRON_PUSH_GATEWAY_URL (relay) to enable')
   return { client: undefined, owned: false }
