@@ -232,3 +232,56 @@ test('store cap surfaces as the limiter 429 shape on start', async (t) => {
   // the first starter can still refresh its own session (replacement is cap-exempt)
   assert.equal((await s.http('/link/start', { method: 'POST', token: me.token, body: {} })).status, 200)
 })
+
+test('preapprove: mints a code that signs a claimant in with no approve tap', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+
+  const pre = await s.http('/link/preapprove', { method: 'POST', body: { username: 'dan' } })
+  assert.equal(pre.status, 200)
+  assert.match(pre.json.link_code, /^[0-9BCDFGHJKMNPQRSTVWXYZ]{4}-[0-9BCDFGHJKMNPQRSTVWXYZ]{4}$/)
+  assert.equal(pre.json.expires_in, 600)
+
+  const claim = await s.http('/link/claim', { method: 'POST', body: { link_code: pre.json.link_code, device_name: 'First Phone' } })
+  assert.equal(claim.status, 200)
+  // no /link/approve happens — the very first poll mints the device
+  const poll = await s.http('/link/poll', { method: 'POST', body: { claim_token: claim.json.claim_token } })
+  assert.equal(poll.status, 200)
+  assert.equal(poll.json.status, 'approved')
+  assert.match(poll.json.token, /^[0-9a-f]{64}$/)
+  assert.equal(poll.json.username, 'dan')
+  // one-shot: second poll 404
+  assert.equal((await s.http('/link/poll', { method: 'POST', body: { claim_token: claim.json.claim_token } })).status, 404)
+  // the minted device is a working client bearer
+  assert.equal((await s.http('/devices', { token: poll.json.token })).status, 200)
+})
+
+test('preapprove guard: any proxy-forwarding header (or unknown user, or bad body) is rejected', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+
+  // Loopback without forwarding headers is the accept path (covered above).
+  // Each forwarding header alone must 404 — external traffic always arrives
+  // via the reverse proxy, which adds one of these.
+  for (const headers of [
+    { 'x-forwarded-for': '203.0.113.9' },
+    { 'x-forwarded-proto': 'https' },
+    { forwarded: 'for=203.0.113.9' },
+    { 'cf-connecting-ip': '203.0.113.9' },
+  ]) {
+    const r = await fetch(`${s.base}/link/preapprove`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...headers },
+      body: JSON.stringify({ username: 'dan' }),
+    })
+    assert.equal(r.status, 404, JSON.stringify(headers))
+    assert.deepEqual(await r.json(), { error: 'not_found' })
+  }
+
+  assert.equal((await s.http('/link/preapprove', { method: 'POST', body: { username: 'nobody' } })).status, 404)
+  for (const body of [{}, { username: 7 }, { username: '' }]) {
+    assert.equal((await s.http('/link/preapprove', { method: 'POST', body })).status, 400, JSON.stringify(body))
+  }
+})

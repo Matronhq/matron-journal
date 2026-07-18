@@ -182,6 +182,28 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const d = createClientDevice(db, p.userId, p.deviceName)
         return json(res, 200, { status: 'approved', token: d.token, device_id: d.deviceId, user_id: p.userId, username: user.name })
       }
+      if (req.method === 'POST' && url.pathname === '/link/preapprove') {
+        // Root-on-the-box only (spec §3): accepted ONLY from a loopback
+        // socket with no proxy-forwarding header. External traffic always
+        // arrives via the reverse proxy, which adds X-Forwarded-* (or
+        // cf-connecting-ip through the tunnel) — so a forwarded request can
+        // never look local. To the outside world this endpoint does not
+        // exist: everything rejected is a plain 404.
+        const remote = req.socket.remoteAddress
+        const loopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1'
+        const forwarded = Object.keys(req.headers).some((h) => h.startsWith('x-forwarded-')) ||
+          req.headers.forwarded !== undefined || req.headers['cf-connecting-ip'] !== undefined
+        if (!loopback || forwarded) return rejectEarly(req, res, 404, { error: 'not_found' })
+        const { username } = await readBody(req)
+        if (typeof username !== 'string' || !username) return json(res, 400, { error: 'bad_request' })
+        const user = db.prepare('SELECT id FROM users WHERE name=?').get(username)
+        if (!user) return json(res, 404, { error: 'not_found' })
+        const l = links.startPreapproved(user.id)
+        // Pending-map cap: same envelope as the limiter — a caller can't
+        // tell which throttle it hit, and shouldn't need to.
+        if (!l) return json(res, 429, { error: 'rate_limited' })
+        return json(res, 200, { link_code: l.linkCode, expires_in: l.expiresIn })
+      }
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       if (req.method === 'GET' && url.pathname === '/snapshot') {
