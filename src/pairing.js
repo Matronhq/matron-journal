@@ -8,7 +8,8 @@ const ALPHABET = '0123456789BCDFGHJKMNPQRSTVWXYZ'
 const CODE_LEN = 8
 
 // crypto.randomInt is unbiased (rejection sampling), unlike bytes % 30.
-const randomCode = () => Array.from({ length: CODE_LEN }, () => ALPHABET[crypto.randomInt(ALPHABET.length)]).join('')
+// Exported for src/link.js: link codes share the pairing alphabet exactly.
+export const randomCode = () => Array.from({ length: CODE_LEN }, () => ALPHABET[crypto.randomInt(ALPHABET.length)]).join('')
 
 // Boxes display XXXX-XXXX; humans type variations. Comparison happens on
 // this normal form only.
