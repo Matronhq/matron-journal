@@ -43,7 +43,7 @@ Lives in the existing push-relay process (`src/relay.js`'s HTTP server, same
 
 ### `POST /link/rendezvous`
 
-Called by the signed-out device. Response `201 { rid, secret, expiresIn }`.
+Called by the signed-out device. Response `201 { rid, secret, expires_in }`.
 
 - `rid`: 26 chars from the pairing alphabet (`0123456789BCDFGHJKMNPQRSTVWXYZ`,
   ~128 bits, unguessable, no lookalike glyphs). Key of the entry.
@@ -89,6 +89,21 @@ The creator's poll (every 2 s).
   caller-controlled is logged.
 - The relay stays stateless across restarts; a restart forgets pending
   rendezvous and the devices regenerate, mirroring link-session behavior.
+
+### Implementation notes (2026-07-18)
+
+Two deliberate deviations from the letter of this spec, both in the shipped
+`src/relay.js`:
+
+- Oversized offer bodies return `413`, not `400` — the relay's existing
+  body-size guard (shared with the push endpoints) responds `413` before the
+  body is even parsed, which is the established relay convention for
+  over-limit requests.
+- The offer's `server` value is validated (https any host, http
+  localhost-only, ≤200 chars) but stored and echoed back verbatim, not
+  re-normalized — the scanning phone already sends its session's normalized
+  homeserver URL, so re-normalizing on the relay would only risk disagreeing
+  with the value the phone itself is using.
 
 ## 2. App flows
 
@@ -138,7 +153,7 @@ three apps; forks change the constant (no UI override).
   session jumps straight to `approved` and mints the claim token, so the
   claimant's first poll returns the device token. No approve card — at
   provisioning time there is no other device.
-- `POST /link/preapprove` `{ username }` → `{ linkCode, expiresIn }`.
+- `POST /link/preapprove` `{ username }` → `{ link_code, expires_in }`.
   Accepted **only** when the socket remote address is loopback **and** no
   `X-Forwarded-*` header is present (external traffic always arrives via
   the reverse proxy, which adds them). No new secret to provision.
