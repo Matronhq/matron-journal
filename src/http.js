@@ -1,5 +1,5 @@
 import fs from 'node:fs'
-import { login, authToken, changePassword, revokeOwnedDevice, createAgent } from './auth.js'
+import { login, authToken, changePassword, revokeOwnedDevice, createAgent, createClientDevice } from './auth.js'
 import { snapshot, messagesBefore, toEventShape } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, setPushPrefs, getPushPrefs } from './db.js'
 import { receiveBlob } from './media.js'
@@ -67,7 +67,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, hub, pushPipeline, dbPath, pairs }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, hub, pushPipeline, dbPath, pairs, links }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -142,6 +142,45 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // with a fresh code and no orphan row exists either way.
         const d = createAgent(db, c.userId, c.agentName)
         return json(res, 200, { status: 'approved', token: d.token, device_id: d.deviceId })
+      }
+      if (req.method === 'POST' && url.pathname === '/link/claim') {
+        // Unauthenticated by design: claiming grants nothing — the session
+        // signs a device in only after the starter approves on its own
+        // screen. Shares /login's per-IP limiter instance so the whole
+        // unauthenticated surface sits under one throttle.
+        const ip = req.headers['cf-connecting-ip'] || req.socket.remoteAddress || 'unknown'
+        if (!rateLimiter.allow(ip)) return rejectEarly(req, res, 429, { error: 'rate_limited' })
+        const { link_code, device_name } = await readBody(req)
+        const name = typeof device_name === 'string' ? device_name.trim() : ''
+        if (typeof link_code !== 'string' || !link_code || !name || name.length > 64) {
+          return json(res, 400, { error: 'bad_request' })
+        }
+        const c = links.claim(link_code, { deviceName: name, requesterIp: ip })
+        // conflict (already claimed) is distinguishable from 404: telling
+        // the second claimant the code was used leaks nothing useful and
+        // produces the right UI message. Unknown/expired stay merged.
+        if (c.status === 'not_found') return json(res, 404, { error: 'not_found' })
+        if (c.status === 'conflict') return json(res, 409, { error: 'conflict' })
+        return json(res, 200, { status: 'claimed', claim_token: c.claimToken, expires_in: c.expiresIn })
+      }
+      if (req.method === 'POST' && url.pathname === '/link/poll') {
+        // Deliberately not rate-limited: the claimant polls every few
+        // seconds for up to the TTL, and each miss costs one bounded scan
+        // keyed on a 256-bit token — same stance as /pair/claim.
+        const { claim_token } = await readBody(req)
+        if (typeof claim_token !== 'string' || !claim_token) return json(res, 400, { error: 'bad_request' })
+        const p = links.poll(claim_token)
+        if (p.status === 'not_found') return json(res, 404, { error: 'not_found' })
+        if (p.status === 'pending') return json(res, 200, { status: 'pending' })
+        if (p.status === 'denied') return json(res, 200, { status: 'denied' })
+        // Mint at poll (spec §1): the devices row first exists HERE, and the
+        // session is already deleted (one-shot). username rides along because
+        // the apps store the typed username as UserSession.userID and a link
+        // claimant never types one.
+        const user = db.prepare('SELECT name FROM users WHERE id=?').get(p.userId)
+        if (!user) return json(res, 404, { error: 'not_found' }) // user row gone mid-flow; claimant rescans
+        const d = createClientDevice(db, p.userId, p.deviceName)
+        return json(res, 200, { status: 'approved', token: d.token, device_id: d.deviceId, user_id: p.userId, username: user.name })
       }
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
@@ -244,6 +283,45 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const v = pairs.preview(pair_code)
         if (!v) return json(res, 404, { error: 'not_found' })
         return json(res, 200, { requester_ip: v.requesterIp, expires_in: v.expiresIn })
+      }
+      if (req.method === 'POST' && url.pathname === '/link/start') {
+        // Show-QR side. Client devices only: an agent can't invite devices.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        await readBody(req) // no fields today; still drains/validates the body
+        const l = links.start(who.deviceId, who.userId)
+        // Pending-map cap: same envelope as the limiter — a caller can't
+        // tell which throttle it hit, and shouldn't need to.
+        if (!l) return json(res, 429, { error: 'rate_limited' })
+        return json(res, 200, { link_code: l.linkCode, expires_in: l.expiresIn })
+      }
+      if (req.method === 'POST' && url.pathname === '/link/status') {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        await readBody(req)
+        // Starter-device bound: keyed by who.deviceId, so another device of
+        // the same user simply has no session here (404, not 403).
+        const st = links.status(who.deviceId)
+        if (!st) return json(res, 404, { error: 'not_found' })
+        if (st.status === 'waiting') return json(res, 200, { status: 'waiting', expires_in: st.expiresIn })
+        return json(res, 200, { status: 'claimed', device_name: st.deviceName, requester_ip: st.requesterIp, expires_in: st.expiresIn })
+      }
+      if (req.method === 'POST' && url.pathname === '/link/approve') {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const { link_code } = await readBody(req)
+        if (typeof link_code !== 'string' || !link_code) return json(res, 400, { error: 'bad_request' })
+        const r = links.approve(who.deviceId, link_code)
+        // conflict = "nothing claimed yet, or already resolved" — the caller
+        // is the authenticated starter, so the truth leaks nothing.
+        if (r === 'conflict') return json(res, 409, { error: 'conflict' })
+        if (r === 'not_found') return json(res, 404, { error: 'not_found' })
+        return json(res, 200, { status: 'approved' })
+      }
+      if (req.method === 'POST' && url.pathname === '/link/deny') {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const { link_code } = await readBody(req)
+        if (typeof link_code !== 'string' || !link_code) return json(res, 400, { error: 'bad_request' })
+        const r = links.deny(who.deviceId, link_code)
+        if (r === 'not_found') return json(res, 404, { error: 'not_found' })
+        return json(res, 200, { status: 'denied' })
       }
       const m = url.pathname.match(/^\/convo\/([^/]+)\/messages$/)
       if (req.method === 'GET' && m) {
