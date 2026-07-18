@@ -115,7 +115,9 @@ export async function runAdmin(db, argv) {
       `  server: ${serverUrl}`,
       `  code:   ${link_code}`,
       `(${uri})`,
-      `The code expires in ${Math.round(expires_in / 60)} minutes and works once.`,
+      // expires_in may be absent from an older/nonstandard journal response;
+      // print the code either way rather than "expires in NaN minutes".
+      Number.isFinite(expires_in) ? `The code expires in ${Math.round(expires_in / 60)} minutes and works once.` : 'The code works once.',
     ].join('\n')
   }
   if (a === 'offload') {

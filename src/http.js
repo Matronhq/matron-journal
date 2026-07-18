@@ -185,14 +185,15 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       if (req.method === 'POST' && url.pathname === '/link/preapprove') {
         // Root-on-the-box only (spec §3): accepted ONLY from a loopback
         // socket with no proxy-forwarding header. External traffic always
-        // arrives via the reverse proxy, which adds X-Forwarded-* (or
-        // cf-connecting-ip through the tunnel) — so a forwarded request can
+        // arrives via the reverse proxy, which adds X-Forwarded-*, X-Real-IP,
+        // or cf-connecting-ip through the tunnel — so a forwarded request can
         // never look local. To the outside world this endpoint does not
         // exist: everything rejected is a plain 404.
         const remote = req.socket.remoteAddress
         const loopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1'
         const forwarded = Object.keys(req.headers).some((h) => h.startsWith('x-forwarded-')) ||
-          req.headers.forwarded !== undefined || req.headers['cf-connecting-ip'] !== undefined
+          req.headers.forwarded !== undefined || req.headers['cf-connecting-ip'] !== undefined ||
+          req.headers['x-real-ip'] !== undefined
         if (!loopback || forwarded) return rejectEarly(req, res, 404, { error: 'not_found' })
         const { username } = await readBody(req)
         if (typeof username !== 'string' || !username) return json(res, 400, { error: 'bad_request' })

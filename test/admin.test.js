@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { openDb, insertBlob } from '../src/db.js'
@@ -231,6 +232,22 @@ test('link-code: --server-url validation matches the apps\' stance (https any ho
     () => runAdmin(s.db, ['link-code', 'dan', '--server-url', longUrl, '--port', String(s.port)]),
     /--server-url/
   )
+})
+
+test('link-code: missing expires_in in the journal response is not printed as "NaN minutes"', async (t) => {
+  // A stand-in for the journal that answers /link/preapprove without an
+  // expires_in field, e.g. an older or nonstandard journal build.
+  const fake = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ link_code: 'ABCD-EFGH' }))
+  })
+  await new Promise((resolve) => fake.listen(0, '127.0.0.1', resolve))
+  t.after(() => fake.close())
+
+  const db = openDb(':memory:')
+  const out = await runAdmin(db, ['link-code', 'dan', '--server-url', 'https://chat.example.com', '--port', String(fake.address().port)])
+  assert.ok(!/NaN/.test(out), `expected no "NaN" in output:\n${out}`)
+  assert.match(out, /code:\s+ABCD-EFGH/)
 })
 
 test('CLI entrypoint works directly and via symlink (npx-style)', () => {

@@ -270,6 +270,7 @@ test('preapprove guard: any proxy-forwarding header (or unknown user, or bad bod
     { 'x-forwarded-proto': 'https' },
     { forwarded: 'for=203.0.113.9' },
     { 'cf-connecting-ip': '203.0.113.9' },
+    { 'x-real-ip': '203.0.113.9' },
   ]) {
     const r = await fetch(`${s.base}/link/preapprove`, {
       method: 'POST',
