@@ -57,6 +57,13 @@ CREATE TABLE IF NOT EXISTS blobs(
   disk_path TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS link_preapprovals(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  code_hash TEXT NOT NULL UNIQUE,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
 `
 
 export function openDb(path) {

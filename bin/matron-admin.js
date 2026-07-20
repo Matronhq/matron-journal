@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import fs, { realpathSync } from 'node:fs'
+import os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import qrcode from 'qrcode-terminal'
+import QRCode from 'qrcode'
 import { openDb } from '../src/db.js'
 import { createUser, setPassword, createAgent, revokeDevice } from '../src/auth.js'
 import { resolveMediaDir } from '../src/media.js'
@@ -14,7 +16,7 @@ const USAGE = `usage:
   matron-admin agent add <username> <agent-name>
   matron-admin device list <username>
   matron-admin device revoke <device_id>
-  matron-admin link-code <username> --server-url <url> [--port <n>]
+  matron-admin link-code <username> --server-url <url> [--port <n>] [--expires <30m|24h>] [--png <path>]
   matron-admin offload [--days N]
   matron-admin expire-logs [--hours N]
   matron-admin status`
@@ -37,7 +39,22 @@ function isValidServerUrl(serverUrl) {
   return u.protocol === 'https:' || (u.protocol === 'http:' && LOCALHOST_HOSTS.has(u.hostname))
 }
 
-export async function runAdmin(db, argv) {
+// --expires durations: Nm/Nh only, 1 minute to 24 hours — mirrors the
+// server-side ttl_seconds bounds so a value we accept is never refused.
+export function parseExpiresSeconds(text) {
+  const m = /^(\d+)([mh])$/.exec(text ?? '')
+  if (!m) return null
+  const secs = Number(m[1]) * (m[2] === 'm' ? 60 : 3600)
+  return secs >= 60 && secs <= 86400 ? secs : null
+}
+
+function formatExpiry(expiresInSeconds) {
+  const mins = Math.round(expiresInSeconds / 60)
+  return mins >= 120 ? `expires in ${Math.round(mins / 60)} hours` : `expires in ${mins} minutes`
+}
+
+export async function runAdmin(db, argv, deps = {}) {
+  const renderPng = deps.renderPng ?? ((uri) => QRCode.toBuffer(uri, { type: 'png', scale: 8 }))
   const [a, b] = argv
   if (a === 'user' && b === 'add') {
     const name = argv[2]
@@ -91,6 +108,37 @@ export async function runAdmin(db, argv) {
     }
     const port = Number(flag(argv, '--port') ?? process.env.MATRON_PORT ?? 9810)
     if (!Number.isInteger(port) || port <= 0) throw new Error(`${USAGE}\n\n--port must be a positive integer`)
+    const expiresFlag = flag(argv, '--expires')
+    let ttlSeconds = null
+    if (expiresFlag != null) {
+      ttlSeconds = parseExpiresSeconds(expiresFlag)
+      if (ttlSeconds == null) {
+        throw new Error(`${USAGE}\n\n--expires must be minutes or hours between 1m and 24h, like 30m or 24h (got ${JSON.stringify(expiresFlag)})`)
+      }
+    }
+    const wantsPng = argv.includes('--png')
+    const pngPath = flag(argv, '--png')
+    if (wantsPng && !pngPath) throw new Error(`${USAGE}\n\n--png needs a file path`)
+    let pngFd = null
+    if (wantsPng) {
+      // Open (and 0600) the file BEFORE minting: an unwritable path must
+      // never orphan a live pre-approved code on the server.
+      try {
+        pngFd = fs.openSync(pngPath, 'w', 0o600)
+        fs.fchmodSync(pngFd, 0o600) // openSync's mode only applies to newly created files
+      } catch (e) {
+        throw new Error(`cannot write --png file at ${pngPath} (${e.code || e.message})`)
+      }
+    }
+    // Opening for write truncated whatever was at pngPath — if anything
+    // fails from here on, don't leak the fd or leave that empty file
+    // around looking like a usable QR.
+    const cleanupPng = () => {
+      if (pngFd == null) return
+      try { fs.closeSync(pngFd) } catch {}
+      try { fs.unlinkSync(pngPath) } catch {}
+      pngFd = null
+    }
     // Finding 1 hardening (Bugbot, PR #29): /link/preapprove now also
     // requires the auto-minted key that lives next to the journal's DB
     // file (src/preapprove-key.js) — the same file the running server
@@ -103,43 +151,85 @@ export async function runAdmin(db, argv) {
     // fail loudly (not silently mint a fresh, non-matching key) if it
     // can't read it.
     const keyPath = resolvePreapproveKeyPath(db.name)
-    let key
+    let link_code, expires_in
     try {
-      key = fs.readFileSync(keyPath, 'utf8').trim()
+      let key
+      try {
+        key = fs.readFileSync(keyPath, 'utf8').trim()
+      } catch (e) {
+        throw new Error(
+          `cannot read the pre-approve key at ${keyPath} (${e.code || e.message}) — ` +
+          'this command must run on the journal host, as the journal service user (or root)'
+        )
+      }
+      // The pre-approved session lives in the RUNNING server's memory — the
+      // admin CLI is a separate process, so this must be an HTTP call, and
+      // /link/preapprove only answers loopback callers with no proxy headers
+      // and the correct x-preapprove-key.
+      let r
+      try {
+        r = await fetch(`http://127.0.0.1:${port}/link/preapprove`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-preapprove-key': key },
+          body: JSON.stringify(ttlSeconds != null ? { username, ttl_seconds: ttlSeconds } : { username }),
+        })
+      } catch {
+        throw new Error(`journal not reachable on 127.0.0.1:${port} — is it running? (set --port or MATRON_PORT)`)
+      }
+      // A guard failure and an unknown username are indistinguishable on the
+      // wire (both a plain 404) — say so rather than claim confidently that
+      // the user doesn't exist (Bugbot finding 2, PR #29). With the key
+      // above in place a guard-404 for a genuinely local caller should be
+      // rare, but the message stays honest either way.
+      if (r.status === 404) {
+        throw new Error(
+          `no such user "${username}" — or the journal refused the request as non-local ` +
+          '(run this on the journal host itself)'
+        )
+      }
+      if (!r.ok) throw new Error(`journal refused the request (HTTP ${r.status})`)
+      ;({ link_code, expires_in } = await r.json())
     } catch (e) {
-      throw new Error(
-        `cannot read the pre-approve key at ${keyPath} (${e.code || e.message}) — ` +
-        'this command must run on the journal host, as the journal service user (or root)'
-      )
+      cleanupPng()
+      throw e
     }
-    // The pre-approved session lives in the RUNNING server's memory — the
-    // admin CLI is a separate process, so this must be an HTTP call, and
-    // /link/preapprove only answers loopback callers with no proxy headers
-    // and the correct x-preapprove-key.
-    let r
-    try {
-      r = await fetch(`http://127.0.0.1:${port}/link/preapprove`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-preapprove-key': key },
-        body: JSON.stringify({ username }),
-      })
-    } catch {
-      throw new Error(`journal not reachable on 127.0.0.1:${port} — is it running? (set --port or MATRON_PORT)`)
-    }
-    // A guard failure and an unknown username are indistinguishable on the
-    // wire (both a plain 404) — say so rather than claim confidently that
-    // the user doesn't exist (Bugbot finding 2, PR #29). With the key
-    // above in place a guard-404 for a genuinely local caller should be
-    // rare, but the message stays honest either way.
-    if (r.status === 404) {
-      throw new Error(
-        `no such user "${username}" — or the journal refused the request as non-local ` +
-        '(run this on the journal host itself)'
-      )
-    }
-    if (!r.ok) throw new Error(`journal refused the request (HTTP ${r.status})`)
-    const { link_code, expires_in } = await r.json()
     const uri = `matron://link?v=1&server=${encodeURIComponent(serverUrl)}&code=${link_code}`
+    // expires_in may be absent from an older/nonstandard journal response;
+    // print the code either way rather than "expires in NaN minutes".
+    const expiryLine = Number.isFinite(expires_in) ? `The code ${formatExpiry(expires_in)} and works once.` : 'The code works once.'
+    if (pngFd != null) {
+      try {
+        fs.writeSync(pngFd, await renderPng(uri))
+        fs.closeSync(pngFd)
+      } catch (e) {
+        // The mint already happened — the code is live and single-use, so
+        // it must reach the operator even though the PNG never will.
+        cleanupPng()
+        return [
+          `Could not write the QR PNG to ${pngPath} (${e.code || e.message}) — printing the code instead.`,
+          `It signs a device in as ${username} with no approval step — treat it like a password.`,
+          expiryLine,
+          '',
+          'Manual entry (sign-in screen):',
+          `  server: ${serverUrl}`,
+          `  code:   ${link_code}`,
+        ].join('\n')
+      }
+      const host = os.hostname()
+      return [
+        `Wrote sign-in QR to ${pngPath} (mode 0600).`,
+        `Scanning it signs a phone in as ${username} with no approval step — treat it like a password.`,
+        expiryLine,
+        '',
+        'Copy it off this box, then delete it:',
+        `  scp ${host}:${pngPath} .`,
+        `  ssh ${host} rm ${pngPath}`,
+        '',
+        'Manual entry fallback (sign-in screen):',
+        `  server: ${serverUrl}`,
+        `  code:   ${link_code}`,
+      ].join('\n')
+    }
     const qr = await new Promise((resolve) => qrcode.generate(uri, { small: true }, resolve))
     return [
       qr,
@@ -148,9 +238,7 @@ export async function runAdmin(db, argv) {
       `  server: ${serverUrl}`,
       `  code:   ${link_code}`,
       `(${uri})`,
-      // expires_in may be absent from an older/nonstandard journal response;
-      // print the code either way rather than "expires in NaN minutes".
-      Number.isFinite(expires_in) ? `The code expires in ${Math.round(expires_in / 60)} minutes and works once.` : 'The code works once.',
+      expiryLine,
     ].join('\n')
   }
   if (a === 'offload') {
