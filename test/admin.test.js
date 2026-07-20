@@ -408,6 +408,49 @@ test('link-code --png: writes a 0600 PNG, prints scp+rm hints, suppresses the AN
   assert.equal(claim.status, 200)
 })
 
+test('link-code --png: pre-mint failure removes the truncated file and leaks no fd', async (t) => {
+  const db = openDb(':memory:')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-png-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const pngPath = path.join(dir, 'link.png')
+  fs.writeFileSync(pngPath, 'stale contents from a previous run')
+
+  // port 1: fd opens (truncating the file) but the mint never succeeds.
+  await assert.rejects(
+    () => runAdmin(db, ['link-code', 'dan', '--server-url', 'https://x.example.com', '--port', '1', '--png', pngPath]),
+    /journal not reachable/
+  )
+
+  assert.equal(fs.existsSync(pngPath), false, 'truncated PNG file should be removed on failure')
+  db.close()
+})
+
+test('link-code --png: post-mint render failure still prints the manual-entry code', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-png-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const pngPath = path.join(dir, 'link.png')
+
+  const out = await runAdmin(
+    s.db,
+    ['link-code', 'dan', '--server-url', 'https://chat.example.com', '--port', String(s.port), '--png', pngPath],
+    { renderPng: async () => { throw new Error('encoder exploded') } }
+  )
+
+  // The code is already live and single-use — it must reach the operator.
+  assert.match(out, /could not write the qr png/i)
+  assert.match(out, /server: https:\/\/chat\.example\.com/)
+  const code = out.match(/code:\s+([0-9BCDFGHJKMNPQRSTVWXYZ]{4}-[0-9BCDFGHJKMNPQRSTVWXYZ]{4})/)?.[1]
+  assert.ok(code, `expected a dashed code in output:\n${out}`)
+  assert.equal(fs.existsSync(pngPath), false, 'failed PNG should not leave an empty file behind')
+
+  // ...and the printed code actually works.
+  const claim = await s.http('/link/claim', { method: 'POST', body: { link_code: code, device_name: 'p' } })
+  assert.equal(claim.status, 200)
+})
+
 test('link-code --png: unwritable path fails before minting (unreachable port never contacted)', async (t) => {
   const db = openDb(':memory:')
   await assert.rejects(
