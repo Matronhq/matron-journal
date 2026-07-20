@@ -75,6 +75,13 @@ export function createAgent(db, userId, name) {
   return issueDevice(db, userId, 'agent', name)
 }
 
+// The /link/* claimant mint: same issuance path /login uses (kind='client'),
+// called at the first poll after approval — mirror of createAgent's role in
+// the pairing flow.
+export function createClientDevice(db, userId, name) {
+  return issueDevice(db, userId, 'client', name)
+}
+
 export function authToken(db, token) {
   const row = db.prepare(
     'SELECT id, user_id, kind, name FROM devices WHERE token_hash=?'

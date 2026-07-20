@@ -39,7 +39,17 @@ the machine-checkable version of this page.
   `{error:'forbidden'}`): `{apns_token, environment}` with `environment` in
   `{'sandbox','prod'}` registers a device for push; `{apns_token: null}`
   unregisters. 400 `{error:'bad_request'}` on a bad `environment` or a
-  missing/non-string `apns_token` (unless it's `null`).
+  missing/non-string `apns_token` (unless it's `null`). Response echoes the
+  device's current `push_prefs` (see `PUT /push/prefs` below); `GET
+  /devices` echoes the same per-device `push_prefs` in its roster.
+- `PUT /push/prefs` (Bearer, client devices only — agents get 403
+  `{error:'forbidden'}`): body is any subset of `{attention, done, activity}`
+  booleans — a partial merge, not a replace: only the given keys change, the
+  rest keep their stored value. 400 `{error:'bad_request'}` on an unknown
+  field or a non-boolean value for a known field. Response `{ok:true,
+  push_prefs}` echoes the full merged three-key shape. Defaults (NULL /
+  never set) are `{attention: true, done: true, activity: false}` — "buzz me
+  when the agent needs me or finishes; routine activity is opt-in."
 - `POST /password` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`): `{old_password, new_password}`. `old_password` is
   always verified against the real argon2 hash (no shortcuts); a wrong one
@@ -65,8 +75,10 @@ the machine-checkable version of this page.
   `/metrics`-only.
 - `GET /devices` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`) -> `{devices: [{device_id, kind, name, created_at,
-  cursor, lag, last_seen_at, is_self, connected}]}`. The caller's own user's
-  devices only; `is_self` marks the requesting device. Overlaps `/metrics`'
+  cursor, lag, last_seen_at, is_self, connected, push_prefs}]}`. The
+  caller's own user's devices only; `is_self` marks the requesting device.
+  `push_prefs` is the per-device notification prefs (see `PUT /push/prefs`
+  above), always the full three-key shape (defaults filled in). Overlaps `/metrics`'
   `user.devices` deliberately — metrics is observability (agents may read
   it, no `name`), this is the management roster. `connected` is whether the
   device has a live WebSocket right now — the "can I start a session on
@@ -90,6 +102,33 @@ the machine-checkable version of this page.
   until approval, then exactly once `{status:'approved', token, device_id}`
   — the agent device row is minted at claim, not approve, so an unclaimed
   pair leaves no DB residue. Second claim / unknown / expired: 404.
+- `POST /link/start` (Bearer, client devices only) -> `{link_code, expires_in}`.
+  Starts a device-link session for QR sign-in (TTL 120s). One active session
+  per starter device: a new start replaces the previous one. Store cap 64
+  pending -> 429 `{error:'rate_limited'}`.
+- `POST /link/claim {link_code, device_name}` (unauthenticated; shares
+  /login's per-IP rate limit) -> `{status:'claimed', claim_token, expires_in}`.
+  First claim wins: already-claimed is 409 `{error:'conflict'}`; unknown and
+  expired merge into 404. `device_name` is trimmed, non-empty, max 64 chars.
+  A successful claim extends the session TTL to at least 60s remaining.
+- `POST /link/poll {claim_token}` (unauthenticated, not rate-limited) ->
+  `{status:'pending'}` until the starter acts, then exactly once
+  `{status:'approved', token, device_id, user_id, username}` (the `client`
+  device is minted at this poll; the session is deleted first) or
+  `{status:'denied'}` (observed once, then the session is deleted). Unknown /
+  expired / already-observed: 404. `username` is included because link
+  claimants never type one.
+- `POST /link/status` (Bearer, client devices only; starter device only) ->
+  `{status:'waiting', expires_in}` or
+  `{status:'claimed', device_name, requester_ip, expires_in}`. 404 when the
+  device has no active session (none started, expired, or already resolved).
+- `POST /link/approve {link_code}` (Bearer, client devices only; starter
+  device only, and the code must match its active session) ->
+  `{status:'approved'}`. 409 `{error:'conflict'}` when the session is not in
+  the `claimed` state (nothing to approve yet, or already resolved); 404 for
+  unknown/expired/other-device.
+- `POST /link/deny {link_code}` (Bearer, same binding as approve) ->
+  `{status:'denied'}`. 404 for unknown/expired/other-device/already-resolved.
 
 ## WebSocket
 
@@ -270,6 +309,85 @@ row is created by the claim response itself. The approve→claim regret
 window (≤ TTL) is accepted in v1; once claimed, the agent appears in
 `GET /devices` and is revocable instantly.
 
+## Device link (QR sign-in)
+
+The reverse of agent pairing: here the *signed-in* side starts. A signed-in
+client ("starter") calls `link/start` and renders the `link_code` as a QR
+(`matron://link?v=1&server=<url-encoded base URL>&code=XXXX-XXXX`) plus the
+code as text. The new device ("claimant") scans or types the code and calls
+`link/claim` with its device name, then polls `link/poll` with its secret
+`claim_token` (32 random bytes hex). The starter polls `link/status`, sees
+`claimed` with the claimant's name and IP, and the user taps Approve
+(`link/approve`) or Deny (`link/deny`). Scanning alone never signs anything
+in: only the approve tap — from the starter device itself, holding a live
+bearer — releases an identity.
+
+Like pairing, no `devices` row exists before the final step: approve only
+flips the in-memory session's state, and the `kind='client'` row is minted
+at the claimant's next `link/poll`, exactly once (the session is deleted
+before the token is returned). Sessions live 120s (extended to ≥60s
+remaining on claim so a last-second scan still leaves time for the tap),
+are in-memory only, and die with a restart or with the starter's token —
+`link/approve` requires a live starter bearer at tap time, so a revoked or
+signed-out starter can never complete a link.
+
+### Pre-approved link codes (provisioning)
+
+`POST /link/preapprove {username}` mints a link session that is born
+approved: the claimant runs the ordinary `link/claim` → `link/poll` flow
+and the FIRST poll returns the device token — no approve tap (at
+provisioning time there is no other device to tap on). The granting
+authority is root on the box: the endpoint answers only loopback sockets
+carrying no `X-Forwarded-*`/`Forwarded`/`CF-Connecting-IP` header (external
+traffic always arrives via the reverse proxy, which adds one), and 404s
+for everyone else.
+
+That header check alone is defeated by a headerless reverse proxy (a
+default-config nginx `proxy_pass` with no `proxy_set_header` lines forwards
+none of them), so the endpoint additionally requires the header
+`x-preapprove-key` to match a 64-hex-char secret the journal auto-mints on
+first boot at `<dirname(db path)>/preapprove.key` (mode 0600, compared with
+`crypto.timingSafeEqual`) — no operator provisioning step, nothing to
+configure. Missing or wrong key gets the same 404 as every other guard
+failure. `matron-admin link-code` reads that file itself (it must run on
+the journal host, as the journal's service user or root) and sends the
+header automatically.
+
+Codes live 10 minutes, are one-shot, and count toward the same in-memory
+cap as normal link sessions. `matron-admin link-code <username>
+--server-url <url>` wraps this and prints the
+`matron://link?v=1&server=…&code=XXXX-XXXX` QR on the terminal.
+
+## Link rendezvous (relay)
+
+The reverse direction, for signed-out devices that can't scan (spec:
+`docs/superpowers/specs/2026-07-18-link-rendezvous-design.md`). Served by
+the push relay (`push.matron.chat`), NOT the journal — a brand-new install
+has no configuration, and the shared relay is the one address every Matron
+app knows. The relay never carries a token: only `{server, code}`, the
+same two values the shipped QR displays on screen. The confirm-tap on the
+signed-in phone remains the only credential-granting gate.
+
+- `POST /link/rendezvous` (empty body) → `201 {rid, secret, expires_in}`.
+  `rid`: 26 chars of the pairing alphabet (~128 bits), shown in the QR as
+  `matron://rlink?v=1&rid=<rid>`. `secret`: 256-bit hex poll gate, never
+  in the QR. TTL 3 minutes, in-memory only, `maxPending` 256. Per-IP
+  token bucket (burst 10, refill 1/30 s) plus a global ceiling (burst
+  100, refill 1/100 ms) that also bounds offers and polls.
+- `POST /link/rendezvous/:rid/offer {server, code}` — the scanning
+  phone's move, after calling `link/start` on its own journal. First
+  offer wins → 204; later offers 409; unknown/expired rid 404. `server`
+  must be https (http allowed to localhost-ish dev hosts only), ≤ 200
+  chars; `code` is normalized to `XXXX-XXXX`. Validation reasons are
+  machine strings that never echo caller values.
+- `GET /link/rendezvous/:rid?secret=<hex>` — the creator's 2 s poll.
+  204 waiting; `200 {server, code}` once offered (NOT one-shot — the
+  entry survives to TTL so a dropped response is retryable; it releases
+  no credential); 403 on secret mismatch (constant-time); 404 after TTL.
+
+A relay restart forgets pending rendezvous; the signed-out device
+regenerates its QR, mirroring link-session behavior.
+
 ## Agent RPC (client->agent request/response)
 
 Structured app->bridge calls (spec:
@@ -325,12 +443,20 @@ considers each of that user's *client* devices with a registered token
 (agent devices are never pushed to):
 
 - skipped when that device is connected and actively `viewing` the event's
-  conversation, or when its acked cursor already covers the event's `seq`.
-- `prompt` / `permission_request`, and `session_status` with
-  `payload.state:'done'`, push immediately at priority 10.
-- `convo_meta` and `session_status` with any other state never push at all —
-  a title rename or a running/waiting flip is journal-sync material, not a
-  notification (connected devices learn it from the journal frame).
+  conversation, or when its acked cursor already covers the event's `seq`,
+  or when its `push_prefs` (see `PUT /push/prefs`) explicitly disable the
+  event's category — `wake` background pushes are never prefs-filtered.
+- `prompt` / `permission_request` push immediately at priority 10
+  (category `attention`).
+- `session_status` pushes on the turn-finished TRANSITION, not the new
+  state alone: previous state `running` moving to `waiting` or `done`
+  pushes immediately at priority 10 (category `done`, body "Session
+  finished"). Every other transition is silent — in particular
+  `waiting` -> `done` (tearing down an already-idle session) and a
+  brand-new conversation's first state.
+- `convo_meta` never pushes at all — a title rename is journal-sync
+  material, not a notification (connected devices learn it from the
+  journal frame).
 - routine content (`text`, `tool_output`, `diff`, ...) pushes at priority 5,
   coalesced per (device, conversation): a leading push when idle, then at
   most one trailing push per 10s window while events keep arriving

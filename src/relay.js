@@ -1,0 +1,330 @@
+import http from 'node:http'
+import { makeRendezvousStore } from './rendezvous.js'
+
+// The push.matron.chat relay: the one piece of shared infrastructure Matron
+// runs. Holds the APNs key for the chat.matron.app bundle id and forwards
+// pushes on behalf of self-hosted journals (which cannot have that key).
+//
+// Privacy is structural, not policy: the wire protocol below has NO field
+// that can carry a title, body, snippet, or conversation name — the relay
+// maps a category to one of three fixed strings. mutable-content: 1 is set
+// on every alert now so the v2 NSE fetch can enrich these on-device without
+// any relay change.
+//
+// The endpoint is deliberately open (a self-hosted journal has nowhere to
+// pre-register): possession of a device token — an unguessable 32-byte value
+// known only to that user's own journal — is the credential, and the
+// per-token bucket below bounds what a stolen token is worth.
+
+// Must stay >= the largest valid offer body: a 1024-char box plus its JSON
+// envelope (`{"box":""}`, ~10 bytes) is ~1034 bytes, so a 1024-char box (the
+// cap validateOffer accepts) must fit under this to reach validation and 204
+// rather than being 413'd first. Do NOT drop this back to 1024. A 2000-char
+// box (~2010 bytes) still 413s, so oversized bodies are bounded as before.
+const BODY_LIMIT = 1100
+
+const APS_ALERTS = {
+  attention: { title: 'Matron', body: 'Your agent needs you' },
+  done: { title: 'Matron', body: 'Session finished' },
+  activity: { title: 'Matron', body: 'New activity from your agent' },
+}
+
+const REQUIRED = ['device_token', 'env', 'category', 'priority', 'push_type']
+const OPTIONAL = ['badge', 'thread_id', 'collapse_id']
+const KNOWN = new Set([...REQUIRED, ...OPTIONAL])
+
+// Two token buckets gate every send:
+//
+// Per-device-token — burst 20, refill 1 per 10s. Sustained activity+wake
+// traffic can reach ~5+/min even with journal-side coalescing — this refill
+// rate covers that with headroom while still capping abuse at ~6/min
+// sustained once the burst is spent. Buckets live in memory only (the relay
+// is stateless by design); a full-capacity bucket is indistinguishable from
+// an absent one, so those are evicted on sweep and the map stays bounded by
+// the number of RECENTLY throttled tokens.
+//
+// Global — burst 200, refill 1 per 20ms (50/s sustained). The per-token
+// bucket is useless against a spray of unique fabricated tokens (each gets a
+// fresh bucket), and every sprayed send would reach APNs as BadDeviceToken —
+// sustained streams of those get the relay's APNs connection terminated for
+// abuse. The global ceiling bounds what the relay can emit toward APNs no
+// matter the traffic shape; it is far above legit v1 volume.
+export function makeRelayLimiter({ burst = 20, refillMs = 10000, globalBurst = 200, globalRefillMs = 20, now = Date.now } = {}) {
+  const buckets = new Map()
+  const global = { tokens: globalBurst, at: now() }
+  let globalDenied = 0
+
+  function refill(b, cap, perMs, t) {
+    const refilled = Math.floor((t - b.at) / perMs)
+    if (refilled > 0) {
+      b.tokens = Math.min(cap, b.tokens + refilled)
+      b.at = b.tokens === cap ? t : b.at + refilled * perMs
+    }
+  }
+
+  function allow(token) {
+    const t = now()
+    let b = buckets.get(token)
+    if (!b) {
+      b = { tokens: burst, at: t }
+      buckets.set(token, b)
+    } else {
+      refill(b, burst, refillMs, t)
+    }
+    // Per-token check first, and only a fully allowed request consumes the
+    // global budget — a flood against one exhausted token must not starve
+    // everyone else.
+    if (b.tokens <= 0) return false
+    refill(global, globalBurst, globalRefillMs, t)
+    if (global.tokens <= 0) {
+      globalDenied += 1
+      return false
+    }
+    b.tokens -= 1
+    global.tokens -= 1
+    return true
+  }
+
+  // Global-bucket-only gate, for surfaces that must not carry a per-key
+  // bucket (rendezvous offers/polls: a poller hits every 2 s for minutes,
+  // and rid existence already bounds what a request can do).
+  function allowGlobal() {
+    const t = now()
+    refill(global, globalBurst, globalRefillMs, t)
+    if (global.tokens <= 0) {
+      globalDenied += 1
+      return false
+    }
+    global.tokens -= 1
+    return true
+  }
+
+  function sweep() {
+    const t = now()
+    for (const [token, b] of buckets) {
+      const refilled = Math.floor((t - b.at) / refillMs)
+      if (b.tokens + refilled >= burst) buckets.delete(token)
+    }
+    // The global ceiling tripping at all is the early-warning signal for a
+    // token-spray attack — surface it, but at sweep cadence, never per hit.
+    if (globalDenied > 0) {
+      console.error(`relay: global rate ceiling denied ${globalDenied} requests since last sweep`)
+      globalDenied = 0
+    }
+  }
+
+  return { allow, allowGlobal, sweep, _buckets: buckets }
+}
+
+// Rendezvous creation is the relay's second unauthenticated surface. One
+// sign-in needs exactly one creation, so the per-IP budget is tiny; the
+// global ceiling (10/s sustained) is far above legitimate volume and
+// bounds offers/polls too (spec §1).
+export const makeRendezvousLimiter = (opts = {}) =>
+  makeRelayLimiter({ burst: 10, refillMs: 30000, globalBurst: 100, globalRefillMs: 100, ...opts })
+
+// null = valid; otherwise a machine reason (relay convention: never echoes
+// caller values). The box is opaque app ciphertext — the relay checks only
+// that it is a non-empty, length-capped string and never inspects it.
+function validateOffer(body) {
+  for (const k of Object.keys(body)) {
+    if (k !== 'box') return 'unknown_field'
+  }
+  if (body.box === undefined) return 'missing_field'
+  if (typeof body.box !== 'string' || body.box.length < 1 || body.box.length > 1024) return 'bad_box'
+  return null
+}
+
+// null = valid; otherwise a short machine reason (never echoes field VALUES —
+// nothing caller-controlled is reflected or logged).
+function validate(body) {
+  for (const k of Object.keys(body)) {
+    if (!KNOWN.has(k)) return 'unknown_field'
+  }
+  for (const k of REQUIRED) {
+    if (body[k] === undefined) return 'missing_field'
+  }
+  if (typeof body.device_token !== 'string' || !/^[0-9a-f]{16,200}$/i.test(body.device_token)) return 'bad_device_token'
+  if (body.env !== 'prod' && body.env !== 'sandbox') return 'bad_env'
+  if (body.category !== 'wake' && !APS_ALERTS[body.category]) return 'bad_category'
+  if (body.priority !== 5 && body.priority !== 10) return 'bad_priority'
+  if (body.push_type !== 'alert' && body.push_type !== 'background') return 'bad_push_type'
+  // The payload table is keyed by category; a push_type that disagrees with
+  // it is a protocol violation, not a preference.
+  if ((body.category === 'wake') !== (body.push_type === 'background')) return 'category_push_type_mismatch'
+  if (body.badge !== undefined && (!Number.isInteger(body.badge) || body.badge < 0)) return 'bad_badge'
+  for (const k of ['thread_id', 'collapse_id']) {
+    if (body[k] !== undefined && (typeof body[k] !== 'string' || body[k].length < 1 || body[k].length > 200)) return `bad_${k}`
+  }
+  return null
+}
+
+function buildPayload({ category, badge, thread_id }) {
+  if (category === 'wake') {
+    const aps = { 'content-available': 1 }
+    if (badge !== undefined) aps.badge = badge
+    return { aps }
+  }
+  const aps = { alert: APS_ALERTS[category], 'mutable-content': 1 }
+  if (badge !== undefined) aps.badge = badge
+  if (thread_id !== undefined) aps['thread-id'] = thread_id
+  return { aps }
+}
+
+// Every response body is {status, reason} with the HTTP status mirroring the
+// APNs status, so the journal's existing handleResult logic (410 → prune
+// token, 400 → env-mismatch warning) works against the relay unchanged. An
+// APNs-side transport failure has status 0, which is not an HTTP status —
+// surfaced as 502 with the true {status: 0, reason} in the body.
+export function makeRelayHandler({ apnsClient, limiter = makeRelayLimiter(), rendezvous = makeRendezvousStore(), rendezvousLimiter = makeRendezvousLimiter() }) {
+  const respond = (res, httpStatus, obj) => {
+    res.writeHead(httpStatus, { 'content-type': 'application/json' })
+    res.end(JSON.stringify(obj))
+  }
+  const empty = (res, httpStatus) => {
+    res.writeHead(httpStatus)
+    res.end()
+  }
+
+  // Streaming JSON body read under BODY_LIMIT. Resolves the parsed object,
+  // or null after having already responded (413/400). An empty body
+  // resolves {} (creation POSTs carry no fields).
+  const readJsonBody = (req, res) => new Promise((resolve) => {
+    let data = ''
+    let overflowed = false
+    req.setEncoding('utf8')
+    req.on('data', (c) => {
+      data += c
+      if (data.length > BODY_LIMIT) {
+        overflowed = true
+        req.removeAllListeners('data')
+        req.pause()
+        // Partially-unconsumed body: never reuse this socket (same
+        // keep-alive desync concern as the journal's readBody 413 path).
+        res.setHeader('Connection', 'close')
+        respond(res, 413, { status: 413, reason: 'too_large' })
+        resolve(null)
+      }
+    })
+    req.on('error', () => resolve(null)) // peer went away: nothing to respond to
+    req.on('end', () => {
+      if (overflowed) return
+      if (!data) { resolve({}); return }
+      let body
+      try {
+        body = JSON.parse(data)
+      } catch {
+        respond(res, 400, { status: 400, reason: 'bad_json' })
+        resolve(null)
+        return
+      }
+      if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+        respond(res, 400, { status: 400, reason: 'bad_json' })
+        resolve(null)
+        return
+      }
+      resolve(body)
+    })
+  })
+
+  async function handlePush(req, res) {
+    const body = await readJsonBody(req, res)
+    if (body === null) return
+    const invalid = validate(body)
+    if (invalid) return respond(res, 400, { status: 400, reason: invalid })
+    if (!limiter.allow(body.device_token)) return respond(res, 429, { status: 429, reason: 'rate_limited' })
+
+    // apnsClient.send never rejects (contract) — the catch is a backstop so
+    // a bug there can never crash the relay or hang the response.
+    let result
+    try {
+      result = await apnsClient.send({
+        deviceToken: body.device_token,
+        env: body.env,
+        payload: buildPayload(body),
+        collapseId: body.collapse_id,
+        priority: body.priority,
+        pushType: body.push_type,
+      })
+    } catch (err) {
+      console.error('relay: apns send threw unexpectedly', err)
+      result = { status: 0, reason: 'internal' }
+    }
+    if (result.status < 200) {
+      // Truncated token prefix only — a full token is a push credential.
+      console.error(`relay: apns transport failure for token ${body.device_token.slice(0, 8)}… (${result.reason})`)
+      return respond(res, 502, { status: result.status, reason: result.reason ?? null })
+    }
+    return respond(res, result.status, { status: result.status, reason: result.reason ?? null })
+  }
+
+  async function handleRendezvousCreate(req, res) {
+    const body = await readJsonBody(req, res)
+    if (body === null) return
+    if (Object.keys(body).length > 0) return respond(res, 400, { status: 400, reason: 'unknown_field' })
+    const ip = req.headers['cf-connecting-ip'] || req.socket.remoteAddress || 'unknown'
+    if (!rendezvousLimiter.allow(ip)) return respond(res, 429, { status: 429, reason: 'rate_limited' })
+    const r = rendezvous.create()
+    // Pending-map cap: same envelope as the limiter — a caller can't tell
+    // which throttle it hit, and shouldn't need to.
+    if (!r) return respond(res, 429, { status: 429, reason: 'rate_limited' })
+    return respond(res, 201, { rid: r.rid, secret: r.secret, expires_in: r.expiresIn })
+  }
+
+  async function handleOffer(req, res, rid) {
+    const body = await readJsonBody(req, res)
+    if (body === null) return
+    const invalid = validateOffer(body)
+    if (invalid) return respond(res, 400, { status: 400, reason: invalid })
+    if (!rendezvousLimiter.allowGlobal()) return respond(res, 429, { status: 429, reason: 'rate_limited' })
+    const r = rendezvous.offer(rid, body.box)
+    if (r === 'not_found') return respond(res, 404, { status: 404, reason: 'not_found' })
+    if (r === 'conflict') return respond(res, 409, { status: 409, reason: 'conflict' })
+    return empty(res, 204)
+  }
+
+  function handlePoll(req, res, rid, secret) {
+    if (!rendezvousLimiter.allowGlobal()) return respond(res, 429, { status: 429, reason: 'rate_limited' })
+    const p = rendezvous.poll(rid, secret)
+    if (p.status === 'not_found') return respond(res, 404, { status: 404, reason: 'not_found' })
+    if (p.status === 'forbidden') return respond(res, 403, { status: 403, reason: 'forbidden' })
+    if (p.status === 'waiting') return empty(res, 204)
+    return respond(res, 200, { box: p.box })
+  }
+
+  return (req, res) => {
+    const url = new URL(req.url, 'http://relay')
+    if (req.method === 'POST' && url.pathname === '/push') return handlePush(req, res)
+    if (req.method === 'POST' && url.pathname === '/link/rendezvous') return handleRendezvousCreate(req, res)
+    const om = url.pathname.match(/^\/link\/rendezvous\/([0-9A-Z]{26})\/offer$/)
+    if (req.method === 'POST' && om) return handleOffer(req, res, om[1])
+    const pm = url.pathname.match(/^\/link\/rendezvous\/([0-9A-Z]{26})$/)
+    if (req.method === 'GET' && pm) return handlePoll(req, res, pm[1], url.searchParams.get('secret'))
+    return respond(res, 404, { status: 404, reason: 'not_found' })
+  }
+}
+
+const SWEEP_INTERVAL_MS = 10 * 60 * 1000
+
+export function startRelay({ apnsClient, port = 0, bind = '127.0.0.1', limiter = makeRelayLimiter(), rendezvous = makeRendezvousStore(), rendezvousLimiter = makeRendezvousLimiter() } = {}) {
+  const server = http.createServer(makeRelayHandler({ apnsClient, limiter, rendezvous, rendezvousLimiter }))
+  const sweepTimer = setInterval(() => {
+    limiter.sweep()
+    rendezvousLimiter.sweep()
+    rendezvous.sweep()
+  }, SWEEP_INTERVAL_MS)
+  sweepTimer.unref()
+  return new Promise((resolve) => {
+    server.listen(port, bind, () => {
+      resolve({
+        port: server.address().port,
+        server,
+        close() {
+          clearInterval(sweepTimer)
+          server.close()
+          apnsClient.close()
+        },
+      })
+    })
+  })
+}

@@ -1,7 +1,8 @@
+import crypto from 'node:crypto'
 import fs from 'node:fs'
-import { login, authToken, changePassword, revokeOwnedDevice, createAgent } from './auth.js'
+import { login, authToken, changePassword, revokeOwnedDevice, createAgent, createClientDevice } from './auth.js'
 import { snapshot, messagesBefore, toEventShape } from './journal.js'
-import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes } from './db.js'
+import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs } from './db.js'
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
 
@@ -53,6 +54,15 @@ const readBody = (req) => new Promise((resolve, reject) => {
 
 const bearer = (req) => (req.headers.authorization || '').replace(/^Bearer /, '') || null
 
+// Constant-time compare, same idiom as src/rendezvous.js's secretMatches:
+// the length check leaks only the key's length, which is public (always 64
+// hex chars minted by ensurePreapproveKey).
+function preapproveKeyMatches(expected, given) {
+  const a = Buffer.from(String(expected))
+  const b = Buffer.from(String(given))
+  return a.length === b.length && crypto.timingSafeEqual(a, b)
+}
+
 // For a reject that fires BEFORE anything has ever read the request body
 // (rate-limited /login, unauthenticated everything-else) — the body (if
 // any) is sitting there unconsumed. Draining it with `req.resume()` would
@@ -67,7 +77,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -143,6 +153,82 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const d = createAgent(db, c.userId, c.agentName)
         return json(res, 200, { status: 'approved', token: d.token, device_id: d.deviceId })
       }
+      if (req.method === 'POST' && url.pathname === '/link/claim') {
+        // Unauthenticated by design: claiming grants nothing — the session
+        // signs a device in only after the starter approves on its own
+        // screen. Shares /login's per-IP limiter instance so the whole
+        // unauthenticated surface sits under one throttle.
+        const ip = req.headers['cf-connecting-ip'] || req.socket.remoteAddress || 'unknown'
+        if (!rateLimiter.allow(ip)) return rejectEarly(req, res, 429, { error: 'rate_limited' })
+        const { link_code, device_name } = await readBody(req)
+        const name = typeof device_name === 'string' ? device_name.trim() : ''
+        if (typeof link_code !== 'string' || !link_code || !name || name.length > 64) {
+          return json(res, 400, { error: 'bad_request' })
+        }
+        const c = links.claim(link_code, { deviceName: name, requesterIp: ip })
+        // conflict (already claimed) is distinguishable from 404: telling
+        // the second claimant the code was used leaks nothing useful and
+        // produces the right UI message. Unknown/expired stay merged.
+        if (c.status === 'not_found') return json(res, 404, { error: 'not_found' })
+        if (c.status === 'conflict') return json(res, 409, { error: 'conflict' })
+        return json(res, 200, { status: 'claimed', claim_token: c.claimToken, expires_in: c.expiresIn })
+      }
+      if (req.method === 'POST' && url.pathname === '/link/poll') {
+        // Deliberately not rate-limited: the claimant polls every few
+        // seconds for up to the TTL, and each miss costs one bounded scan
+        // keyed on a 256-bit token — same stance as /pair/claim.
+        const { claim_token } = await readBody(req)
+        if (typeof claim_token !== 'string' || !claim_token) return json(res, 400, { error: 'bad_request' })
+        const p = links.poll(claim_token)
+        if (p.status === 'not_found') return json(res, 404, { error: 'not_found' })
+        if (p.status === 'pending') return json(res, 200, { status: 'pending' })
+        if (p.status === 'denied') return json(res, 200, { status: 'denied' })
+        // Mint at poll (spec §1): the devices row first exists HERE, and the
+        // session is already deleted (one-shot). username rides along because
+        // the apps store the typed username as UserSession.userID and a link
+        // claimant never types one.
+        const user = db.prepare('SELECT name FROM users WHERE id=?').get(p.userId)
+        if (!user) return json(res, 404, { error: 'not_found' }) // user row gone mid-flow; claimant rescans
+        const d = createClientDevice(db, p.userId, p.deviceName)
+        return json(res, 200, { status: 'approved', token: d.token, device_id: d.deviceId, user_id: p.userId, username: user.name })
+      }
+      if (req.method === 'POST' && url.pathname === '/link/preapprove') {
+        // Root-on-the-box only (spec §3): accepted ONLY from a loopback
+        // socket with no proxy-forwarding header. External traffic always
+        // arrives via the reverse proxy, which adds X-Forwarded-*, X-Real-IP,
+        // or cf-connecting-ip through the tunnel — so a forwarded request can
+        // never look local. To the outside world this endpoint does not
+        // exist: everything rejected is a plain 404.
+        //
+        // That guard alone is defeated by a headerless reverse proxy (a
+        // default-config nginx `proxy_pass` with no `proxy_set_header`
+        // lines adds none of the above) — traffic proxied straight through
+        // to a loopback-bound journal would then pass unnoticed (Bugbot
+        // finding, PR #29). x-preapprove-key is the independent second
+        // factor: a 64-hex-char secret auto-minted next to the DB
+        // (src/preapprove-key.js) that never leaves the box except via a
+        // local file read, so a headerless proxy still can't forge it.
+        // Missing/wrong key gets the exact same 404 as the other guard
+        // failures — indistinguishable from the outside.
+        const remote = req.socket.remoteAddress
+        const loopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1'
+        const forwarded = Object.keys(req.headers).some((h) => h.startsWith('x-forwarded-')) ||
+          req.headers.forwarded !== undefined || req.headers['cf-connecting-ip'] !== undefined ||
+          req.headers['x-real-ip'] !== undefined
+        const suppliedKey = req.headers['x-preapprove-key']
+        const keyOk = typeof suppliedKey === 'string' && suppliedKey.length > 0 &&
+          preapproveKeyMatches(preapproveKey, suppliedKey)
+        if (!loopback || forwarded || !keyOk) return rejectEarly(req, res, 404, { error: 'not_found' })
+        const { username } = await readBody(req)
+        if (typeof username !== 'string' || !username) return json(res, 400, { error: 'bad_request' })
+        const user = db.prepare('SELECT id FROM users WHERE name=?').get(username)
+        if (!user) return json(res, 404, { error: 'not_found' })
+        const l = links.startPreapproved(user.id)
+        // Pending-map cap: same envelope as the limiter — a caller can't
+        // tell which throttle it hit, and shouldn't need to.
+        if (!l) return json(res, 429, { error: 'rate_limited' })
+        return json(res, 200, { link_code: l.linkCode, expires_in: l.expiresIn })
+      }
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       if (req.method === 'GET' && url.pathname === '/snapshot') {
@@ -161,12 +247,24 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const { apns_token, environment } = body
         if (apns_token === null) {
           setApnsRegistration(db, who.deviceId, { apnsToken: null, apnsEnv: null })
-          return json(res, 200, { ok: true })
+          return json(res, 200, { ok: true, push_prefs: getPushPrefs(db, who.deviceId) })
         }
         if (typeof apns_token !== 'string' || !apns_token) return json(res, 400, { error: 'bad_request' })
         if (environment !== 'sandbox' && environment !== 'prod') return json(res, 400, { error: 'bad_request' })
         setApnsRegistration(db, who.deviceId, { apnsToken: apns_token, apnsEnv: environment })
-        return json(res, 200, { ok: true })
+        return json(res, 200, { ok: true, push_prefs: getPushPrefs(db, who.deviceId) })
+      }
+      if (req.method === 'PUT' && url.pathname === '/push/prefs') {
+        // Prefs live on the device row next to the APNs token they gate —
+        // same client-only surface as /push/register.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const body = await readBody(req)
+        for (const [k, v] of Object.entries(body)) {
+          if (!['attention', 'done', 'activity'].includes(k) || typeof v !== 'boolean') {
+            return json(res, 400, { error: 'bad_request' })
+          }
+        }
+        return json(res, 200, { ok: true, push_prefs: setPushPrefs(db, who.deviceId, body) })
       }
       if (req.method === 'POST' && url.pathname === '/password') {
         // Self-service change, client devices only — an agent (the bridge)
@@ -232,6 +330,45 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const v = pairs.preview(pair_code)
         if (!v) return json(res, 404, { error: 'not_found' })
         return json(res, 200, { requester_ip: v.requesterIp, expires_in: v.expiresIn })
+      }
+      if (req.method === 'POST' && url.pathname === '/link/start') {
+        // Show-QR side. Client devices only: an agent can't invite devices.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        await readBody(req) // no fields today; still drains/validates the body
+        const l = links.start(who.deviceId, who.userId)
+        // Pending-map cap: same envelope as the limiter — a caller can't
+        // tell which throttle it hit, and shouldn't need to.
+        if (!l) return json(res, 429, { error: 'rate_limited' })
+        return json(res, 200, { link_code: l.linkCode, expires_in: l.expiresIn })
+      }
+      if (req.method === 'POST' && url.pathname === '/link/status') {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        await readBody(req)
+        // Starter-device bound: keyed by who.deviceId, so another device of
+        // the same user simply has no session here (404, not 403).
+        const st = links.status(who.deviceId)
+        if (!st) return json(res, 404, { error: 'not_found' })
+        if (st.status === 'waiting') return json(res, 200, { status: 'waiting', expires_in: st.expiresIn })
+        return json(res, 200, { status: 'claimed', device_name: st.deviceName, requester_ip: st.requesterIp, expires_in: st.expiresIn })
+      }
+      if (req.method === 'POST' && url.pathname === '/link/approve') {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const { link_code } = await readBody(req)
+        if (typeof link_code !== 'string' || !link_code) return json(res, 400, { error: 'bad_request' })
+        const r = links.approve(who.deviceId, link_code)
+        // conflict = "nothing claimed yet, or already resolved" — the caller
+        // is the authenticated starter, so the truth leaks nothing.
+        if (r === 'conflict') return json(res, 409, { error: 'conflict' })
+        if (r === 'not_found') return json(res, 404, { error: 'not_found' })
+        return json(res, 200, { status: 'approved' })
+      }
+      if (req.method === 'POST' && url.pathname === '/link/deny') {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const { link_code } = await readBody(req)
+        if (typeof link_code !== 'string' || !link_code) return json(res, 400, { error: 'bad_request' })
+        const r = links.deny(who.deviceId, link_code)
+        if (r === 'not_found') return json(res, 404, { error: 'not_found' })
+        return json(res, 200, { status: 'denied' })
       }
       const m = url.pathname.match(/^\/convo\/([^/]+)\/messages$/)
       if (req.method === 'GET' && m) {

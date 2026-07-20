@@ -4,11 +4,14 @@ import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
 import { makeLoginGuard, makeRateLimiter } from './auth.js'
 import { makeHttpHandler } from './http.js'
+import { ensurePreapproveKey } from './preapprove-key.js'
 import { makePairStore } from './pairing.js'
+import { makeLinkStore } from './link.js'
 import { makeHub } from './hub.js'
 import { attachWs } from './ws.js'
 import { makeToolStreamStore } from './tool-stream.js'
 import { makeApnsClient } from './apns.js'
+import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
 import { runOffload, runExpireLogs } from './retention.js'
@@ -159,12 +162,18 @@ function scheduleWalCheckpoint(db, walCheckpointIntervalMs) {
   return interval
 }
 
-// Direct APNs push is wired ONLY when all four MATRON_APNS_* vars are set
-// (same disabled-by-default pattern as the rest of the server); otherwise a
-// single warn log at boot and the push pipeline is an inert no-op.
-function resolveApnsClient(injected) {
+// Push client selection, in strict priority order:
+//   1. injected (tests) — caller owns its lifecycle.
+//   2. all four MATRON_APNS_* set → direct APNs (Dan's journal: full-content
+//      alerts, exactly the pre-relay behavior).
+//   3. MATRON_PUSH_GATEWAY_URL set → the push.matron.chat relay (self-hosted
+//      journals with no APNs key; generic alert text, content never leaves
+//      the box — see src/gateway.js).
+//   4. neither → push disabled, one warn log at boot, pipeline is inert.
+// Exported for the selection-order tests only.
+export function resolveApnsClient(injected) {
   if (injected) return { client: injected, owned: false }
-  const { MATRON_APNS_KEY_FILE, MATRON_APNS_KEY_ID, MATRON_APNS_TEAM_ID, MATRON_APNS_TOPIC } = process.env
+  const { MATRON_APNS_KEY_FILE, MATRON_APNS_KEY_ID, MATRON_APNS_TEAM_ID, MATRON_APNS_TOPIC, MATRON_PUSH_GATEWAY_URL } = process.env
   if (MATRON_APNS_KEY_FILE && MATRON_APNS_KEY_ID && MATRON_APNS_TEAM_ID && MATRON_APNS_TOPIC) {
     const client = makeApnsClient({
       keyFile: MATRON_APNS_KEY_FILE, keyId: MATRON_APNS_KEY_ID,
@@ -172,7 +181,17 @@ function resolveApnsClient(injected) {
     })
     return { client, owned: true }
   }
-  console.warn('apns: MATRON_APNS_KEY_FILE/MATRON_APNS_KEY_ID/MATRON_APNS_TEAM_ID/MATRON_APNS_TOPIC not all set — push notifications disabled')
+  if (MATRON_PUSH_GATEWAY_URL) {
+    // A typo'd URL (e.g. missing scheme) degrades to push-disabled like the
+    // other misconfigurations — new URL() in makeGatewayClient would
+    // otherwise throw and take the whole journal down at boot.
+    if (URL.canParse('/push', MATRON_PUSH_GATEWAY_URL)) {
+      return { client: makeGatewayClient({ url: MATRON_PUSH_GATEWAY_URL }), owned: true }
+    }
+    console.warn(`push: disabled — MATRON_PUSH_GATEWAY_URL is not a valid URL: ${MATRON_PUSH_GATEWAY_URL}`)
+    return { client: undefined, owned: false }
+  }
+  console.warn('push: disabled — set all four MATRON_APNS_* vars (direct APNs) or MATRON_PUSH_GATEWAY_URL (relay) to enable')
   return { client: undefined, owned: false }
 }
 
@@ -200,7 +219,7 @@ function warnIfBindTrustsSpoofableIp(bind) {
 export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, walCheckpointIntervalMs, toolStreamOpts,
-  toolLogTtlHours, pairs,
+  toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
@@ -221,7 +240,17 @@ export function startServer({
   const rateLimiter = makeRateLimiter()
   const loginGuard = makeLoginGuard()
   const resolvedPairs = pairs || makePairStore()
+  const resolvedLinks = links || makeLinkStore()
   const resolvedMediaDir = resolveMediaDir(resolvedDbPath, mediaDir)
+  // Finding 1 hardening (Bugbot, PR #29): /link/preapprove's loopback +
+  // no-forwarding-header guard alone is defeated by a headerless reverse
+  // proxy (default nginx `proxy_pass` adds nothing). This key is the
+  // second, independent factor — auto-minted next to the DB, never
+  // operator-provisioned (see src/preapprove-key.js). `preapproveKey` lets
+  // a caller (tests) inject a known value directly with zero disk I/O;
+  // otherwise it's read from (or minted into) the file at `preapproveKeyPath`
+  // (or its default, derived from resolvedDbPath).
+  const resolvedPreapproveKey = preapproveKey || ensurePreapproveKey(resolvedDbPath, preapproveKeyPath)
   const resolvedMediaMaxBytes = mediaMaxBytes ?? resolveNumericEnv('MATRON_MEDIA_MAX_BYTES', process.env.MATRON_MEDIA_MAX_BYTES, DEFAULT_MEDIA_MAX_BYTES)
   const resolvedMediaUserQuotaBytes = mediaUserQuotaBytes ?? resolveNumericEnv('MATRON_MEDIA_USER_QUOTA_BYTES', process.env.MATRON_MEDIA_USER_QUOTA_BYTES, DEFAULT_MEDIA_USER_QUOTA_BYTES)
   const resolvedMaxReplay = maxReplay ?? resolveNumericEnv('MATRON_MAX_REPLAY', process.env.MATRON_MAX_REPLAY, DEFAULT_MAX_REPLAY)
@@ -237,7 +266,8 @@ export function startServer({
   const server = http.createServer(makeHttpHandler({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
-    hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs,
+    hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
+    preapproveKey: resolvedPreapproveKey,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
@@ -257,6 +287,7 @@ export function startServer({
         hub,
         toolStreams,
         pushPipeline,
+        preapproveKey: resolvedPreapproveKey,
         close: () => new Promise((r) => {
           if (retentionInterval) clearInterval(retentionInterval)
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)

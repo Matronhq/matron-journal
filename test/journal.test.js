@@ -211,6 +211,20 @@ test('a child convo (parent_convo_id set) never increments unread_count; the sam
   assert.equal(db.prepare("SELECT unread_count FROM conversations WHERE id='c1'").get().unread_count, 1)
 })
 
+test('snippetOf shows a captioned attachment as what the user said, not [image]', () => {
+  assert.equal(
+    snippetOf('image', { blob_ref: 'b1', name: 'shot.png', caption: 'why is this rotated?' }),
+    'why is this rotated?')
+  assert.equal(
+    snippetOf('file', { blob_ref: 'b2', name: 'contract.pdf', caption: 'review before Friday' }),
+    'review before Friday')
+  // No caption: the placeholder is still the best available description.
+  assert.equal(snippetOf('image', { blob_ref: 'b1', name: 'shot.png' }), '[image]')
+  assert.equal(snippetOf('file', { blob_ref: 'b2' }), '[file]')
+  // Long captions are truncated like every other snippet.
+  assert.equal(snippetOf('image', { caption: 'x'.repeat(200) }).length, 120)
+})
+
 test('snippetOf tolerates null/undefined/non-object payloads for every type, without throwing', () => {
   for (const type of ['text', 'prompt', 'permission_request', 'tool_output', 'diff', 'unknown_type']) {
     assert.doesNotThrow(() => snippetOf(type, null), `type=${type} payload=null`)
@@ -222,6 +236,15 @@ test('snippetOf tolerates null/undefined/non-object payloads for every type, wit
   assert.equal(snippetOf('prompt', undefined), '? ')
   assert.equal(snippetOf('permission_request', null), 'permission: ')
   assert.equal(snippetOf('unknown_type', null), '[unknown_type]')
+})
+
+test('snippetOf session_status reads as the turn-finished alert, matching the relay fixed string', () => {
+  // The only session_status events that ever reach a push body are
+  // turn-finished ones (see push.js classify()), so the state itself
+  // doesn't vary the wording.
+  assert.equal(snippetOf('session_status', { state: 'waiting' }), 'Session finished')
+  assert.equal(snippetOf('session_status', { state: 'done' }), 'Session finished')
+  assert.equal(snippetOf('session_status', null), 'Session finished')
 })
 
 test('append with type session_status and a malformed payload throws a clean, descriptive error (not a raw DB crash)', async () => {
