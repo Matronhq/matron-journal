@@ -110,6 +110,41 @@ test('cap counts live db rows; expired rows do not count', (t) => {
   assert.ok(store.startPreapproved(3)) // expired row swept before the cap check
 })
 
+// Forcing an actual random collision between start()'s in-memory code and a
+// live db row isn't practical to do deterministically (8 chars from a
+// 30-char alphabet, and module-local randomCode() can't be stubbed without
+// touching production code just to make it testable). Instead this proves
+// *why* start()'s db-collision check matters: claim() scans in-memory
+// sessions before the db, so if the two stores ever shared a code, the
+// interactive session would silently shadow the db-backed one. The retry
+// loop that prevents the collision in the first place is exercised the same
+// way as startPreapproved's own collision loop — by construction, not by
+// test (accepted in review for the same reason).
+test('cross-store claim precedence: an in-memory session would shadow a same-code db row (why start() must exclude live db codes)', (t) => {
+  const db = openDb(tmpDbPath(t))
+  t.after(() => db.close())
+  seedUsers(db, [1, 2])
+  const store = makeLinkStore({ db })
+  const started = store.start('starter-1', 1)
+
+  // Manufacture the collision the retry loop exists to prevent: give a live
+  // db row the exact code the interactive session already holds.
+  const bareCode = started.linkCode.replace('-', '')
+  const hash = crypto.createHash('sha256').update(bareCode).digest('hex')
+  db.prepare('INSERT INTO link_preapprovals(user_id, code_hash, expires_at, created_at) VALUES(?,?,?,?)')
+    .run(2, hash, Date.now() + 60000, Date.now())
+
+  const c = store.claim(started.linkCode, { deviceName: 'Handoff Phone' })
+  assert.equal(c.status, 'claimed')
+  // If claim() had matched the preapproved db row, status would jump
+  // straight to 'approved' and the row would be gone (consumed). Instead it
+  // lands on the interactive session's 'claimed' (pending approve()) and the
+  // db row is left untouched — proof the in-memory scan won, exactly the
+  // shadowing the fix in start() prevents.
+  assert.equal(store.poll(c.claimToken).status, 'pending')
+  assert.equal(rowCount(db), 1)
+})
+
 test('without a db handle, startPreapproved stays in-memory (unchanged behaviour)', () => {
   const store = makeLinkStore()
   const s = store.startPreapproved(7)

@@ -46,7 +46,9 @@ CREATE TABLE IF NOT EXISTS link_preapprovals(
 ```
 
 - `code_hash` = hex SHA-256 of the normalized 8-char code. The plaintext
-  code never touches disk — a leaked DB backup cannot mint devices.
+  code never touches disk — a leaked backup exposes only SHA-256 hashes of
+  ~39-bit codes (brute-forceable offline while a row is live, but never
+  readable directly).
 - `expires_at` / `created_at` are epoch milliseconds (matches the rest of
   the codebase, e.g. `devices.created_at`).
 

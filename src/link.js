@@ -4,8 +4,9 @@ import { normalizeCode, randomCode } from './pairing.js'
 const MIN_PREAPPROVED_TTL_MS = 60000
 const MAX_PREAPPROVED_TTL_MS = 86400000
 
-// Only the SHA-256 of a pre-approved code touches disk — a leaked DB
-// backup must not be able to mint devices.
+// Only the SHA-256 of a pre-approved code touches disk — a leaked backup
+// exposes only hashes of ~39-bit codes (brute-forceable offline while a row
+// is live, but never readable directly).
 const hashCode = (code) => crypto.createHash('sha256').update(code).digest('hex')
 
 // In-memory link-session store (spec §1: QR device-link login). Same
@@ -37,8 +38,15 @@ export function makeLinkStore({ ttlMs = 120000, claimExtensionMs = 60000, maxPen
       sessions.delete(starterDeviceId)
       sweep(now)
       if (sessions.size >= maxPending) return null
+      // Claim scans in-memory sessions before the db (see claim() below), so
+      // an interactive code must also exclude any live db-backed preapproved
+      // row — otherwise it would silently shadow that row and attach the
+      // hand-off recipient to this stranger's session instead.
       let code
-      do { code = randomCode() } while ([...sessions.values()].some((s) => s.code === code))
+      do { code = randomCode() } while (
+        [...sessions.values()].some((s) => s.code === code) ||
+        (db && db.prepare('SELECT 1 FROM link_preapprovals WHERE code_hash = ?').get(hashCode(code)))
+      )
       sessions.set(starterDeviceId, {
         code, userId, status: 'waiting', claimToken: null, deviceName: null, requesterIp: null, expiresAt: now + ttlMs,
       })
