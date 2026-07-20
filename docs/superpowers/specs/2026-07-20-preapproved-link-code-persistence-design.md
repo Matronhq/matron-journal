@@ -115,8 +115,10 @@ next mint.
 an optional body field:
 
 - `ttl_seconds`: integer, **60 ≤ ttl_seconds ≤ 86400**. Absent → 600 (today's
-  default). Present but invalid (non-integer, out of range) → plain 404, the
-  endpoint's uniform rejection. Valid → passed to
+  default). Present but invalid (non-integer, out of range) → 400
+  `bad_request`, matching the endpoint's existing body validation (a bad
+  `username` is 400 too; the uniform 404 is for the access guards, which run
+  before the body is read). Valid → passed to
   `startPreapproved(user.id, { ttlMs: ttl_seconds * 1000 })`.
 
 Response shape unchanged: `{ link_code, expires_in }` (with `expires_in` now
@@ -174,7 +176,7 @@ Link a phone later:
 
 | Failure | Behaviour |
 | --- | --- |
-| `ttl_seconds` invalid at HTTP layer | plain 404 (uniform rejection posture) |
+| `ttl_seconds` invalid at HTTP layer | 400 `bad_request` (matches existing body validation) |
 | `--expires` unparseable / out of range | CLI exits 1 with usage, no network call |
 | `--png` path unwritable | CLI exits 1 before minting a code |
 | Preapproval cap (64 live rows) hit | 429, as today |
@@ -191,7 +193,7 @@ Link a phone later:
 - Expired row is not claimable; boot sweep removes it.
 - TTL clamp: below-minimum and above-maximum requests clamp at the store.
 - HTTP: `ttl_seconds: 86400` reflected in `expires_in`; `ttl_seconds: 99999`
-  and `"abc"` → 404.
+  and `"abc"` → 400.
 - Cap counts live DB rows; expired rows don't count.
 - In-memory interactive flow: existing tests unchanged and passing.
 
