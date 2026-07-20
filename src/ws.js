@@ -581,7 +581,19 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
       }
       case 'stream': {
         if (conn.kind !== 'agent') return fail('forbidden')
-        // TODO(grants): add an ownership check (authorize(), as `activity` does) when grants/sharing lands — inert today only because sendEphemeral is scoped to the agent's own user.
+        // Ownership check, matching every other agent write path (activity/
+        // status/stream_append all call authorize()). Previously omitted here
+        // on the theory that sendEphemeral's own user-scoping made it inert —
+        // but that only bounds the blast radius to the agent's own user; within
+        // that user, a bridge could still spoof a live text overlay into a
+        // conversation it does not own. Fail closed instead, uniformly.
+        if (!authorize(db, conn.userId, msg.convo_id)) return fail('forbidden')
+        // Overlay text is bounded by the 1 MiB WS frame cap and is never
+        // retained (transient, latest-wins in the coalescer), so no separate
+        // byte cap is needed — but reject a non-string text/replace_text rather
+        // than forwarding a mistyped frame verbatim to viewers.
+        if (msg.text != null && typeof msg.text !== 'string') return fail('bad_request')
+        if (msg.replace_text != null && typeof msg.replace_text !== 'string') return fail('bad_request')
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id, message_ref: msg.message_ref,
           text: msg.text, replace_text: msg.replace_text,

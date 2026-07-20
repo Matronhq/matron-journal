@@ -294,3 +294,41 @@ test("agent read_marker on a convo the agent's user does not own fails closed", 
   assert.equal(s.db.prepare("SELECT unread_count FROM conversations WHERE id='cp-rm'").get().unread_count, 0)
   agent.close()
 })
+
+test("agent stream on a convo the agent's user does not own fails closed (forbidden)", async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const pat = await createUser(s.db, 'pat5', 'pw')
+  const agDan = createAgent(s.db, dan.id, 'dev-2')
+  // A convo owned by pat, not dan — dan's agent must not be able to push a live
+  // overlay into it, same as read_marker/activity/status.
+  upsertConversation(s.db, { id: 'cp-stream', ownerUserId: pat.id })
+  const agent = await makeWsClient(s.base, { token: agDan.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+
+  agent.send({ op: 'stream', convo_id: 'cp-stream', message_ref: 'm1', replace_text: 'leak' })
+  await agent.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'forbidden' && f.ref === 'stream')
+  agent.close()
+})
+
+test('agent stream with a non-string replace_text is rejected (bad_request), connection survives', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const agDan = createAgent(s.db, dan.id, 'dev-2')
+  const agent = await makeWsClient(s.base, { token: agDan.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+  agent.send({ op: 'convo_upsert', convo_id: 'sess-st', title: 't', session_state: 'running' })
+  await agent.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
+
+  agent.send({ op: 'stream', convo_id: 'sess-st', message_ref: 'm1', replace_text: { not: 'a string' } })
+  await agent.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'bad_request' && f.ref === 'stream')
+
+  // The connection is still usable: a well-formed stream on an owned convo goes through.
+  agent.send({ op: 'stream', convo_id: 'sess-st', message_ref: 'm1', replace_text: 'ok now' })
+  agent.send({ op: 'ack', cursor: 0 })
+  await new Promise((r) => setTimeout(r, 50))
+  assert.ok(!agent.frames.some((f) => f.op === 'error' && f.code === 'internal'), 'no internal error frame')
+  agent.close()
+})

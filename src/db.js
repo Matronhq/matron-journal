@@ -110,6 +110,9 @@ export function openDb(path) {
     db.exec('ALTER TABLE conversations ADD COLUMN parent_convo_id TEXT')
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_conversations_parent ON conversations(parent_convo_id)')
+  // Keeps the per-user quota SUM (see userBlobBytes) a cheap index scan rather
+  // than a full-table read as the blob store grows.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_blobs_owner ON blobs(owner_user_id)')
   return db
 }
 
@@ -121,6 +124,15 @@ export function insertBlob(db, { id, ownerUserId, contentType, size, sha256, dis
 
 export function getBlob(db, id) {
   return db.prepare('SELECT * FROM blobs WHERE id=?').get(id)
+}
+
+// Total on-disk bytes attributed to a user's blobs — the input to the
+// per-user media quota enforced in POST /media (http.js). Counts every blob
+// the user owns, including retention-offloaded tool_output payloads, since
+// they consume the same disk. COALESCE so a user with no blobs reads 0, not
+// NULL.
+export function userBlobBytes(db, userId) {
+  return db.prepare('SELECT COALESCE(SUM(size),0) AS bytes FROM blobs WHERE owner_user_id=?').get(userId).bytes
 }
 
 // `apnsToken: null` unregisters (both columns cleared together — a token
