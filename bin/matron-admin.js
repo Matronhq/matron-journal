@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import fs, { realpathSync } from 'node:fs'
+import os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import qrcode from 'qrcode-terminal'
+import QRCode from 'qrcode'
 import { openDb } from '../src/db.js'
 import { createUser, setPassword, createAgent, revokeDevice } from '../src/auth.js'
 import { resolveMediaDir } from '../src/media.js'
@@ -113,6 +115,20 @@ export async function runAdmin(db, argv) {
         throw new Error(`${USAGE}\n\n--expires must be minutes or hours between 1m and 24h, like 30m or 24h (got ${JSON.stringify(expiresFlag)})`)
       }
     }
+    const wantsPng = argv.includes('--png')
+    const pngPath = flag(argv, '--png')
+    if (wantsPng && !pngPath) throw new Error(`${USAGE}\n\n--png needs a file path`)
+    let pngFd = null
+    if (wantsPng) {
+      // Open (and 0600) the file BEFORE minting: an unwritable path must
+      // never orphan a live pre-approved code on the server.
+      try {
+        pngFd = fs.openSync(pngPath, 'w', 0o600)
+        fs.fchmodSync(pngFd, 0o600) // openSync's mode only applies to newly created files
+      } catch (e) {
+        throw new Error(`cannot write --png file at ${pngPath} (${e.code || e.message})`)
+      }
+    }
     // Finding 1 hardening (Bugbot, PR #29): /link/preapprove now also
     // requires the auto-minted key that lives next to the journal's DB
     // file (src/preapprove-key.js) — the same file the running server
@@ -162,6 +178,27 @@ export async function runAdmin(db, argv) {
     if (!r.ok) throw new Error(`journal refused the request (HTTP ${r.status})`)
     const { link_code, expires_in } = await r.json()
     const uri = `matron://link?v=1&server=${encodeURIComponent(serverUrl)}&code=${link_code}`
+    // expires_in may be absent from an older/nonstandard journal response;
+    // print the code either way rather than "expires in NaN minutes".
+    const expiryLine = Number.isFinite(expires_in) ? `The code ${formatExpiry(expires_in)} and works once.` : 'The code works once.'
+    if (pngFd != null) {
+      fs.writeSync(pngFd, await QRCode.toBuffer(uri, { type: 'png', scale: 8 }))
+      fs.closeSync(pngFd)
+      const host = os.hostname()
+      return [
+        `Wrote sign-in QR to ${pngPath} (mode 0600).`,
+        `Scanning it signs a phone in as ${username} with no approval step — treat it like a password.`,
+        expiryLine,
+        '',
+        'Copy it off this box, then delete it:',
+        `  scp ${host}:${pngPath} .`,
+        `  ssh ${host} rm ${pngPath}`,
+        '',
+        'Manual entry fallback (sign-in screen):',
+        `  server: ${serverUrl}`,
+        `  code:   ${link_code}`,
+      ].join('\n')
+    }
     const qr = await new Promise((resolve) => qrcode.generate(uri, { small: true }, resolve))
     return [
       qr,
@@ -170,9 +207,7 @@ export async function runAdmin(db, argv) {
       `  server: ${serverUrl}`,
       `  code:   ${link_code}`,
       `(${uri})`,
-      // expires_in may be absent from an older/nonstandard journal response;
-      // print the code either way rather than "expires in NaN minutes".
-      Number.isFinite(expires_in) ? `The code ${formatExpiry(expires_in)} and works once.` : 'The code works once.',
+      expiryLine,
     ].join('\n')
   }
   if (a === 'offload') {

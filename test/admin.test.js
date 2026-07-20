@@ -381,3 +381,42 @@ test('CLI entrypoint works directly and via symlink (npx-style)', () => {
 
   fs.rmSync(dir, { recursive: true, force: true })
 })
+
+test('link-code --png: writes a 0600 PNG, prints scp+rm hints, suppresses the ANSI QR', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-png-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const pngPath = path.join(dir, 'link.png')
+
+  const out = await runAdmin(s.db, ['link-code', 'dan', '--server-url', 'https://chat.example.com', '--port', String(s.port), '--expires', '24h', '--png', pngPath])
+
+  const buf = fs.readFileSync(pngPath)
+  assert.deepEqual([...buf.subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47]) // PNG magic
+  assert.equal(fs.statSync(pngPath).mode & 0o777, 0o600)
+  assert.match(out, /scp .*link\.png/)
+  assert.match(out, /rm .*link\.png/)
+  assert.match(out, /treat it like a password/)
+  assert.match(out, /expires in 24 hours/)
+  assert.doesNotMatch(out, /▄|█/) // no ANSI QR in file mode
+
+  // the manual-entry fallback still carries a working code
+  const code = out.match(/code:\s+([0-9BCDFGHJKMNPQRSTVWXYZ]{4}-[0-9BCDFGHJKMNPQRSTVWXYZ]{4})/)?.[1]
+  assert.ok(code, `expected a dashed code in output:\n${out}`)
+  const claim = await s.http('/link/claim', { method: 'POST', body: { link_code: code, device_name: 'p' } })
+  assert.equal(claim.status, 200)
+})
+
+test('link-code --png: unwritable path fails before minting (unreachable port never contacted)', async (t) => {
+  const db = openDb(':memory:')
+  await assert.rejects(
+    () => runAdmin(db, ['link-code', 'dan', '--server-url', 'https://x.example.com', '--port', '1', '--png', '/nonexistent-dir/never/link.png']),
+    /cannot write --png file/
+  )
+  await assert.rejects(
+    () => runAdmin(db, ['link-code', 'dan', '--server-url', 'https://x.example.com', '--port', '1', '--png']),
+    /--png needs a file path/
+  )
+  db.close()
+})
