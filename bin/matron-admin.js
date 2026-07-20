@@ -14,7 +14,7 @@ const USAGE = `usage:
   matron-admin agent add <username> <agent-name>
   matron-admin device list <username>
   matron-admin device revoke <device_id>
-  matron-admin link-code <username> --server-url <url> [--port <n>]
+  matron-admin link-code <username> --server-url <url> [--port <n>] [--expires <30m|24h>] [--png <path>]
   matron-admin offload [--days N]
   matron-admin expire-logs [--hours N]
   matron-admin status`
@@ -35,6 +35,20 @@ function isValidServerUrl(serverUrl) {
   let u
   try { u = new URL(serverUrl) } catch { return false }
   return u.protocol === 'https:' || (u.protocol === 'http:' && LOCALHOST_HOSTS.has(u.hostname))
+}
+
+// --expires durations: Nm/Nh only, 1 minute to 24 hours — mirrors the
+// server-side ttl_seconds bounds so a value we accept is never refused.
+export function parseExpiresSeconds(text) {
+  const m = /^(\d+)([mh])$/.exec(text ?? '')
+  if (!m) return null
+  const secs = Number(m[1]) * (m[2] === 'm' ? 60 : 3600)
+  return secs >= 60 && secs <= 86400 ? secs : null
+}
+
+function formatExpiry(expiresInSeconds) {
+  const mins = Math.round(expiresInSeconds / 60)
+  return mins >= 120 ? `expires in ${Math.round(mins / 60)} hours` : `expires in ${mins} minutes`
 }
 
 export async function runAdmin(db, argv) {
@@ -91,6 +105,14 @@ export async function runAdmin(db, argv) {
     }
     const port = Number(flag(argv, '--port') ?? process.env.MATRON_PORT ?? 9810)
     if (!Number.isInteger(port) || port <= 0) throw new Error(`${USAGE}\n\n--port must be a positive integer`)
+    const expiresFlag = flag(argv, '--expires')
+    let ttlSeconds = null
+    if (expiresFlag != null) {
+      ttlSeconds = parseExpiresSeconds(expiresFlag)
+      if (ttlSeconds == null) {
+        throw new Error(`${USAGE}\n\n--expires must be minutes or hours between 1m and 24h, like 30m or 24h (got ${JSON.stringify(expiresFlag)})`)
+      }
+    }
     // Finding 1 hardening (Bugbot, PR #29): /link/preapprove now also
     // requires the auto-minted key that lives next to the journal's DB
     // file (src/preapprove-key.js) — the same file the running server
@@ -121,7 +143,7 @@ export async function runAdmin(db, argv) {
       r = await fetch(`http://127.0.0.1:${port}/link/preapprove`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-preapprove-key': key },
-        body: JSON.stringify({ username }),
+        body: JSON.stringify(ttlSeconds != null ? { username, ttl_seconds: ttlSeconds } : { username }),
       })
     } catch {
       throw new Error(`journal not reachable on 127.0.0.1:${port} — is it running? (set --port or MATRON_PORT)`)
@@ -150,7 +172,7 @@ export async function runAdmin(db, argv) {
       `(${uri})`,
       // expires_in may be absent from an older/nonstandard journal response;
       // print the code either way rather than "expires in NaN minutes".
-      Number.isFinite(expires_in) ? `The code expires in ${Math.round(expires_in / 60)} minutes and works once.` : 'The code works once.',
+      Number.isFinite(expires_in) ? `The code ${formatExpiry(expires_in)} and works once.` : 'The code works once.',
     ].join('\n')
   }
   if (a === 'offload') {

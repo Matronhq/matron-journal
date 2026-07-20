@@ -9,7 +9,7 @@ import { openDb, insertBlob } from '../src/db.js'
 import { authToken, createUser, createAgent, login } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
 import { resolveMediaDir, writeBlobSync } from '../src/media.js'
-import { runAdmin } from '../bin/matron-admin.js'
+import { runAdmin, parseExpiresSeconds } from '../bin/matron-admin.js'
 import { startTestServer } from './helpers.js'
 
 test('admin CLI: user add, agent add, status', async () => {
@@ -327,6 +327,42 @@ test('link-code: missing expires_in in the journal response is not printed as "N
   const out = await runAdmin(db, ['link-code', 'dan', '--server-url', 'https://chat.example.com', '--port', String(fake.address().port)])
   assert.ok(!/NaN/.test(out), `expected no "NaN" in output:\n${out}`)
   assert.match(out, /code:\s+ABCD-EFGH/)
+})
+
+test('parseExpiresSeconds: Nm/Nh within 1m-24h, null otherwise', () => {
+  assert.equal(parseExpiresSeconds('30m'), 1800)
+  assert.equal(parseExpiresSeconds('1m'), 60)
+  assert.equal(parseExpiresSeconds('24h'), 86400)
+  assert.equal(parseExpiresSeconds('2h'), 7200)
+  for (const bad of ['0m', '25h', '1441m', 'bananas', '90', 'h', '', null, '1d', '-5m', '1.5h']) {
+    assert.equal(parseExpiresSeconds(bad), null, JSON.stringify(bad))
+  }
+})
+
+test('link-code --expires: sends ttl_seconds and prints the expiry in hours', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'hunter22')
+  const out = await runAdmin(s.db, ['link-code', 'dan', '--server-url', 'https://chat.example.com', '--port', String(s.port), '--expires', '24h'])
+  assert.match(out, /expires in 24 hours and works once/)
+  // the minted code really carries the long TTL
+  const code = out.match(/code:\s+([0-9BCDFGHJKMNPQRSTVWXYZ]{4}-[0-9BCDFGHJKMNPQRSTVWXYZ]{4})/)?.[1]
+  assert.ok(code, `expected a dashed code in output:\n${out}`)
+  const claim = await s.http('/link/claim', { method: 'POST', body: { link_code: code, device_name: 'p' } })
+  assert.equal(claim.status, 200)
+})
+
+test('link-code --expires: invalid duration fails with usage before any network call', async (t) => {
+  const db = openDb(':memory:')
+  // port 1 is unreachable — if the CLI tried the network first we would see
+  // "not reachable" instead of the --expires usage error
+  for (const bad of ['25h', '0m', 'bananas']) {
+    await assert.rejects(
+      () => runAdmin(db, ['link-code', 'dan', '--server-url', 'https://x.example.com', '--port', '1', '--expires', bad]),
+      /--expires/
+    )
+  }
+  db.close()
 })
 
 test('CLI entrypoint works directly and via symlink (npx-style)', () => {
