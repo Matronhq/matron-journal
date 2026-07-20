@@ -240,7 +240,7 @@ export function startServer({
   const rateLimiter = makeRateLimiter()
   const loginGuard = makeLoginGuard()
   const resolvedPairs = pairs || makePairStore()
-  const resolvedLinks = links || makeLinkStore()
+  const resolvedLinks = links || makeLinkStore({ db })
   const resolvedMediaDir = resolveMediaDir(resolvedDbPath, mediaDir)
   // Finding 1 hardening (Bugbot, PR #29): /link/preapprove's loopback +
   // no-forwarding-header guard alone is defeated by a headerless reverse

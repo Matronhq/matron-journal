@@ -219,11 +219,17 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const keyOk = typeof suppliedKey === 'string' && suppliedKey.length > 0 &&
           preapproveKeyMatches(preapproveKey, suppliedKey)
         if (!loopback || forwarded || !keyOk) return rejectEarly(req, res, 404, { error: 'not_found' })
-        const { username } = await readBody(req)
+        const { username, ttl_seconds } = await readBody(req)
         if (typeof username !== 'string' || !username) return json(res, 400, { error: 'bad_request' })
+        // Optional hand-off TTL (spec §3): bounded here so the store clamp
+        // is belt-and-braces, not the operator's error report.
+        if (ttl_seconds !== undefined &&
+            (!Number.isInteger(ttl_seconds) || ttl_seconds < 60 || ttl_seconds > 86400)) {
+          return json(res, 400, { error: 'bad_request' })
+        }
         const user = db.prepare('SELECT id FROM users WHERE name=?').get(username)
         if (!user) return json(res, 404, { error: 'not_found' })
-        const l = links.startPreapproved(user.id)
+        const l = links.startPreapproved(user.id, ttl_seconds !== undefined ? { ttlMs: ttl_seconds * 1000 } : {})
         // Pending-map cap: same envelope as the limiter — a caller can't
         // tell which throttle it hit, and shouldn't need to.
         if (!l) return json(res, 429, { error: 'rate_limited' })
