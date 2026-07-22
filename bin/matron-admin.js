@@ -11,8 +11,8 @@ import { resolvePreapproveKeyPath } from '../src/preapprove-key.js'
 import { runOffload, runExpireLogs } from '../src/retention.js'
 
 const USAGE = `usage:
-  matron-admin user add <name> --password <pw>
-  matron-admin user passwd <name> --password <pw>
+  matron-admin user add <name> (--password <pw> | --password-stdin | env MATRON_PASSWORD)
+  matron-admin user passwd <name> (--password <pw> | --password-stdin | env MATRON_PASSWORD)
   matron-admin agent add <username> <agent-name>
   matron-admin device list <username>
   matron-admin device revoke <device_id>
@@ -24,6 +24,32 @@ const USAGE = `usage:
 function flag(argv, name) {
   const i = argv.indexOf(name)
   return i >= 0 ? argv[i + 1] : null
+}
+
+async function readAllStdin() {
+  const chunks = []
+  for await (const chunk of process.stdin) chunks.push(chunk)
+  return Buffer.concat(chunks).toString('utf8')
+}
+
+// Resolve the password for `user add`/`user passwd` from an OFF-ARGV source
+// when asked, so the plaintext never lands in this process's argv (readable
+// by any local user via `ps`/`/proc/<pid>/cmdline`). Precedence:
+//   1. --password-stdin : read it from stdin (strip one trailing newline so
+//      `echo "$pw" | ...` and `printf %s "$pw" | ...` both work)
+//   2. --password <pw>  : legacy, on argv — kept for back-compat
+//   3. MATRON_PASSWORD  : env var (in the process environment, not argv)
+// Returns null when none is supplied; callers turn that into USAGE.
+async function resolvePassword(argv, deps) {
+  const env = deps.env ?? process.env
+  if (argv.includes('--password-stdin')) {
+    const read = deps.readStdin ?? readAllStdin
+    return (await read()).replace(/\r?\n$/, '')
+  }
+  const flagged = flag(argv, '--password')
+  if (flagged != null) return flagged
+  const envPw = env.MATRON_PASSWORD
+  return envPw != null && envPw !== '' ? envPw : null
 }
 
 // Mirrors the apps'/relay's server-URL stance (src/relay.js validateOffer,
@@ -58,14 +84,14 @@ export async function runAdmin(db, argv, deps = {}) {
   const [a, b] = argv
   if (a === 'user' && b === 'add') {
     const name = argv[2]
-    const pw = flag(argv, '--password')
+    const pw = await resolvePassword(argv, deps)
     if (!name || !pw) throw new Error(USAGE)
     const u = await createUser(db, name, pw)
     return `user ${name} created (id ${u.id})`
   }
   if (a === 'user' && b === 'passwd') {
     const name = argv[2]
-    const pw = flag(argv, '--password')
+    const pw = await resolvePassword(argv, deps)
     if (!name || !pw) throw new Error(USAGE)
     await setPassword(db, name, pw)
     return `password updated for ${name}`
