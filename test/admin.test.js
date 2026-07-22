@@ -31,6 +31,43 @@ test('admin CLI: user add, agent add, status', async () => {
   await assert.rejects(runAdmin(db, ['bogus']), /usage/i)
 })
 
+test('admin CLI: user add/passwd take the password off argv (--password-stdin, MATRON_PASSWORD)', async () => {
+  const db = openDb(':memory:')
+
+  // --password-stdin: the password arrives on stdin, never in argv
+  const addOut = await runAdmin(db, ['user', 'add', 'ann', '--password-stdin'],
+    { readStdin: async () => 'stdin-secret\n' })
+  assert.match(addOut, /user ann created/)
+  // the exact value logs in; the single trailing newline (from `echo`) was
+  // stripped, so it is NOT part of the stored password
+  assert.ok(await login(db, { username: 'ann', password: 'stdin-secret', deviceName: 'm' }))
+  assert.equal(await login(db, { username: 'ann', password: 'stdin-secret\n', deviceName: 'm2' }), null)
+
+  // MATRON_PASSWORD env fallback (deps.env keeps it out of the real process env)
+  const bobOut = await runAdmin(db, ['user', 'add', 'bob'], { env: { MATRON_PASSWORD: 'env-secret' } })
+  assert.match(bobOut, /user bob created/)
+  assert.ok(await login(db, { username: 'bob', password: 'env-secret', deviceName: 'm' }))
+
+  // user passwd via stdin rotates the password
+  const pwOut = await runAdmin(db, ['user', 'passwd', 'ann', '--password-stdin'],
+    { readStdin: async () => 'rotated\n' })
+  assert.match(pwOut, /password updated for ann/)
+  assert.ok(await login(db, { username: 'ann', password: 'rotated', deviceName: 'm3' }))
+
+  // precedence: --password-stdin wins over a --password flag on argv
+  const carolOut = await runAdmin(db, ['user', 'add', 'carol', '--password', 'FROM-ARGV', '--password-stdin'],
+    { readStdin: async () => 'FROM-STDIN' })
+  assert.match(carolOut, /user carol created/)
+  assert.ok(await login(db, { username: 'carol', password: 'FROM-STDIN', deviceName: 'm' }))
+  assert.equal(await login(db, { username: 'carol', password: 'FROM-ARGV', deviceName: 'm2' }), null)
+
+  // no password source at all → usage (unchanged behavior)
+  await assert.rejects(runAdmin(db, ['user', 'add', 'nopw']), /usage/i)
+  await assert.rejects(runAdmin(db, ['user', 'passwd', 'ann']), /usage/i)
+
+  db.close()
+})
+
 test('admin CLI: offload runs runOffload with --days (default 30), second run no-ops, bad --days rejected', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-offload-'))
   const dbPath = path.join(dir, 'cli.db')
