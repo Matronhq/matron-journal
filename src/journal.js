@@ -19,11 +19,12 @@ export function snippetOf(type, payload) {
   if ((type === 'image' || type === 'file') && p.caption) return String(p.caption).slice(0, 120)
   if (p.snippet) return String(p.snippet).slice(0, 120)
   if (type === 'tool_output' && p.command) return `$ ${String(p.command)}`.slice(0, 120)
-  // Matches the relay's fixed 'done'-category string (see relay.js
+  // Matches the relay's fixed 'done'-category alert (see relay.js
   // APS_ALERTS) — push.js's classify() only ever pushes a session_status
-  // event for a turn-finished transition (running -> waiting or -> done),
-  // so this reads right regardless of which of those two states it is.
-  if (type === 'session_status') return 'Session finished'
+  // event for a turn-finished transition (running -> waiting or -> done).
+  // "Turn", not "session": the session usually lives on after the turn
+  // ends, and calling it finished read wrong (Dan, 2026-08-02).
+  if (type === 'session_status') return 'Turn finished'
   return `[${type}]`
 }
 

@@ -25,7 +25,10 @@ const BODY_LIMIT = 1100
 
 const APS_ALERTS = {
   attention: { title: 'Matron', body: 'Your agent needs you' },
-  done: { title: 'Matron', body: 'Session finished' },
+  // "Turn", not "session": push.js classifies a 'done' push for every
+  // turn-finished transition (running -> waiting or -> done), and the
+  // session usually lives on after it (Dan, 2026-08-02).
+  done: { title: 'Matron', body: 'Your agent finished its turn' },
   activity: { title: 'Matron', body: 'New activity from your agent' },
 }
 

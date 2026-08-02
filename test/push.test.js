@@ -708,7 +708,7 @@ test('session_status pushes on the turn-finished TRANSITION, not the state alone
   assert.equal(stub.calls.length, 1)
   assert.equal(stub.calls[0].category, 'done')
   assert.equal(stub.calls[0].priority, 10)
-  assert.equal(stub.calls[0].payload.aps.alert.body, 'Session finished')
+  assert.equal(stub.calls[0].payload.aps.alert.body, 'Turn finished')
 
   // running -> done (crash/stop mid-work): also a turn ending — push.
   fire('done', 'running')
@@ -752,7 +752,7 @@ test('end-to-end wiring: convo_upsert threads the previous session state into th
   await new Promise((res) => setTimeout(res, 30))
   const doneCalls = stub.calls.filter((c) => c.category === 'done')
   assert.equal(doneCalls.length, 1, 'running -> waiting must push through the real convo_upsert path')
-  assert.equal(doneCalls[0].payload.aps.alert.body, 'Session finished')
+  assert.equal(doneCalls[0].payload.aps.alert.body, 'Turn finished')
 
   // waiting -> done: already-idle teardown, still exactly one.
   await upsert('done')
