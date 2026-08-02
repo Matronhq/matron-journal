@@ -242,9 +242,9 @@ test('snippetOf session_status reads as the turn-finished alert, matching the re
   // The only session_status events that ever reach a push body are
   // turn-finished ones (see push.js classify()), so the state itself
   // doesn't vary the wording.
-  assert.equal(snippetOf('session_status', { state: 'waiting' }), 'Session finished')
-  assert.equal(snippetOf('session_status', { state: 'done' }), 'Session finished')
-  assert.equal(snippetOf('session_status', null), 'Session finished')
+  assert.equal(snippetOf('session_status', { state: 'waiting' }), 'Turn finished')
+  assert.equal(snippetOf('session_status', { state: 'done' }), 'Turn finished')
+  assert.equal(snippetOf('session_status', null), 'Turn finished')
 })
 
 test('append with type session_status and a malformed payload throws a clean, descriptive error (not a raw DB crash)', async () => {
