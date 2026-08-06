@@ -88,7 +88,7 @@ export async function waitForDrain(ws, thresholdBytes, pollMs = 20) {
 }
 
 export function attachWs({
-  server, db, hub, pingMs = 20000, pushPipeline = noopPushPipeline,
+  server, db, hub, pingMs = 55000, pushPipeline = noopPushPipeline,
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
   revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES,
 }) {
@@ -98,7 +98,12 @@ export function attachWs({
   // cheap SELECT per inbound frame, not a fresh db.prepare() call each time.
   const deviceExistsStmt = db.prepare('SELECT 1 FROM devices WHERE id=?')
   const interval = setInterval(() => {
+    const now = Date.now()
     for (const ws of wss.clients) {
+      // Inbound traffic within the interval already proves the client is
+      // alive — skip the ping. Every heartbeat is a full radio wake on a
+      // phone, so an actively-chatting client shouldn't pay for both.
+      if (now - (ws._lastInbound || 0) < pingMs) { ws._alive = true; continue }
       if (ws._alive === false) { ws.terminate(); continue }
       ws._alive = false
       ws.ping()
@@ -148,6 +153,7 @@ export function attachWs({
     let conn = null
 
     ws.on('message', async (data) => {
+      ws._lastInbound = Date.now()
       let msg = null
       try { msg = JSON.parse(data) } catch { /* handled below */ }
       if (!msg || typeof msg !== 'object') {
