@@ -117,6 +117,22 @@ export function openDb(path) {
     db.exec('ALTER TABLE conversations ADD COLUMN parent_convo_id TEXT')
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_conversations_parent ON conversations(parent_convo_id)')
+  // How a session ENDED, as distinct from session_state's where-is-it-now
+  // (spec: Codex run visualization). A Codex child run finishes 'completed',
+  // 'interrupted' or 'failed' — all three land in session_state 'done', so the
+  // distinction needs its own column. NULL for every normal conversation and
+  // every row predating this column, which is what clients render as "no
+  // outcome to show".
+  //
+  // Deliberately NOT a CHECK constraint, unlike session_state. The vocabulary
+  // is the writing bridge's, not the journal's: a bridge that grows a fourth
+  // outcome must not start failing writes against an older server. Shape is
+  // validated at the ws boundary (non-empty bounded string) and clients
+  // already render an unrecognised value as "status unknown", so an unknown
+  // outcome degrades instead of breaking.
+  if (!convoCols.some((c) => c.name === 'session_outcome')) {
+    db.exec('ALTER TABLE conversations ADD COLUMN session_outcome TEXT')
+  }
   // Keeps the per-user quota SUM (see userBlobBytes) a cheap index scan rather
   // than a full-table read as the blob store grows.
   db.exec('CREATE INDEX IF NOT EXISTS idx_blobs_owner ON blobs(owner_user_id)')

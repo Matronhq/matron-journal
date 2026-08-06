@@ -44,6 +44,11 @@ const RPC_NAME_MAX_CHARS = 64 // method and error.code
 // RPC request ids. Convo ids are conventionally Claude session UUIDs (36
 // chars); this is a defensive upper bound, not a format assertion.
 const CONVO_ID_MAX_CHARS = 128
+// Cap for a session_outcome sent by a bridge. Shape-only, like the
+// parent_convo_id check: the outcome vocabulary belongs to the writing bridge
+// (today 'completed' | 'interrupted' | 'failed'), and the journal deliberately
+// does not enumerate it — see the session_outcome column comment in db.js.
+const SESSION_OUTCOME_MAX_CHARS = 32
 
 // Last status per (user, convo). In-memory only and bounded (oldest-written
 // evicted first): a lost entry just means the header stays blank until the
@@ -532,11 +537,22 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         )) {
           return fail('bad_request', 'bad parent_convo_id')
         }
+        // session_outcome is optional and, unlike session_state, is not
+        // enumerated here — only shape-checked. An omitted outcome leaves any
+        // previously recorded one untouched (COALESCE in upsertConversation).
+        if (msg.session_outcome != null && (
+          typeof msg.session_outcome !== 'string'
+          || msg.session_outcome.length === 0
+          || msg.session_outcome.length > SESSION_OUTCOME_MAX_CHARS
+        )) {
+          return fail('bad_request', 'bad session_outcome')
+        }
         const convo = upsertConversation(db, {
           id: msg.convo_id, ownerUserId: conn.userId,
           title: msg.title, sessionState: msg.session_state,
           agentDeviceId: conn.deviceId,
           parentConvoId: msg.parent_convo_id ?? null,
+          sessionOutcome: msg.session_outcome ?? null,
         })
         if (msg.session_state) {
           // prevSessionState is upsertConversation's read of the row BEFORE
@@ -547,7 +563,16 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
           appendAndFan({
             userId: conn.userId, convoId: msg.convo_id,
             sender: `agent:${conn.name}`, type: 'session_status',
-            payload: { state: msg.session_state },
+            // session_outcome rides the status event so a live client learns
+            // the terminal outcome without waiting for its next /snapshot.
+            // Read back from the stored row rather than the frame, so the
+            // event agrees with the snapshot even on a state-only upsert of a
+            // conversation that already resolved. The key is omitted entirely
+            // when there is no outcome, leaving every existing conversation's
+            // payload byte-identical to before.
+            payload: convo.session_outcome
+              ? { state: msg.session_state, session_outcome: convo.session_outcome }
+              : { state: msg.session_state },
             pushHint: { prevSessionState: convo.prevSessionState },
           })
         }
