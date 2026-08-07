@@ -665,6 +665,12 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (!target || target.user_id !== conn.userId || target.kind !== 'agent') return fail('not_found')
         const topic = sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS)
         const justification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
+        // The raw-string check above only catches a literally empty string —
+        // a payload of spaces/control chars passes it and THEN sanitises
+        // down to '', which would park/relay an invite with an empty
+        // justification and publish an empty card body. Re-check post-
+        // sanitisation with the same error the empty-string case gets.
+        if (!justification) return fail('bad_request', 'bad justification')
         if (isAllowed(db, conn.userId, conn.deviceId, msg.target_device_id)) {
           // User pre-approved this directed pair: the pre-consent flow,
           // verbatim — invite, immediate delivery attempt, undo+offline on a
@@ -724,6 +730,10 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (room.agent_device_id == null) return fail('conflict', 'room has no recorded owner to ask')
         if (room.agent_device_id === conn.deviceId) return fail('bad_request', 'cannot join own room')
         const justification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
+        // See agent_invite's matching check: the raw-string check above only
+        // catches a literally empty string, not whitespace/control chars
+        // that sanitise down to ''.
+        if (!justification) return fail('bad_request', 'bad justification')
         if (isAllowed(db, conn.userId, conn.deviceId, room.agent_device_id)) {
           // Same pre-consent flow, verbatim, PLUS the delivery stamp.
           const r = inviteParticipant(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId, initiatorDeviceId: conn.deviceId, justification })
@@ -834,15 +844,21 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
               kind: 'invite', event: 'left', room_id: msg.room_id, from_device_id: conn.deviceId,
             })
           }
-          // Pending rows the OTHER side initiated are join requests: that
-          // peer is blocked waiting for an answer this dissolve just made
-          // impossible, and the expiry sweep can no longer rescue it (the
-          // row is 'left', not 'invited'). Close the loop with the same
-          // synthetic-refusal frame the sweep sends — no from_device_id, so
-          // the initiator's existing expiry handling fires unchanged — only
-          // the reason differs ('left' vs 'expired'). Rows the owner itself
-          // initiated need nothing: the owner is the waiting side there, and
-          // it is the one leaving.
+          // Pending rows the OTHER side initiated are join requests — either
+          // already relayed ('invited') or still parked awaiting the user's
+          // consent ('awaiting_user', never delivered to any agent socket).
+          // Either way that peer is blocked waiting for an answer this
+          // dissolve just made impossible, and neither the expiry sweep nor
+          // the awaiting-TTL sweep can rescue it (the row is 'left', not
+          // 'invited'/'awaiting_user' anymore). Close the loop with the same
+          // synthetic-refusal frame both sweeps send — no from_device_id, so
+          // the initiator's existing expiry/timeout handling fires
+          // unchanged — only the reason differs ('left' vs 'expired'). Rows
+          // the owner itself initiated need nothing: for an 'invited' row
+          // the owner is the side waiting on the peer's answer, and for an
+          // 'awaiting_user' row the owner is the side waiting on the user's
+          // decision — either way it is the one leaving, so no notification
+          // is owed (and for the parked case the target never even knew).
           for (const row of pending) {
             if (row.initiator_device_id === conn.deviceId) continue
             notify(row.initiator_device_id, {

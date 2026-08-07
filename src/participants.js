@@ -168,37 +168,41 @@ export function undoInvite(db, convoId, agentDeviceId, prior) {
 
 // Owner-leave dissolution (ws.js agent_leave): the recorded owner has no
 // convo_agents row of its own, so an owner leaving means the whole room
-// winds down — every LIVE row (state 'joined' or 'invited') flips to
-// 'left'. Scoped to those two states on purpose: 'refused'/'expired' are
-// terminal outcomes, i.e. history, and rewriting them to 'left' would
-// destroy the record of a refusal (and make a later `already refused`
-// conflict read as `already left`).
+// winds down — every LIVE row (state 'joined', 'invited', or
+// 'awaiting_user') flips to 'left'. Scoped to those three states on
+// purpose: 'refused'/'denied'/'expired' are terminal outcomes, i.e.
+// history, and rewriting them to 'left' would destroy the record of a
+// refusal (and make a later `already refused` conflict read as `already
+// left`).
 //
 // Returns both halves of the notification duty, because the two are owed
 // DIFFERENT frames:
 //   - `joined`: device ids that were in the room, owed `event:'left'`.
-//   - `pending`: still-`invited` rows as {agent_device_id,
-//     initiator_device_id}. Whoever INITIATED such a row is blocked
-//     waiting for an answer that this dissolve has just made impossible
-//     (the expiry sweep can't rescue it either — its predicate is
-//     state='invited', which the flip has erased). ws.js turns each row
-//     whose initiator is not the leaving owner into a synthetic refusal.
+//   - `pending`: every still-`invited`/`awaiting_user` row as
+//     {agent_device_id, initiator_device_id}. Whoever INITIATED such a row
+//     is blocked waiting for an answer that this dissolve has just made
+//     impossible — a peer's answer for an 'invited' row, or the user's
+//     consent decision for a parked 'awaiting_user' row — and neither the
+//     expiry sweep nor the awaiting-TTL sweep can rescue it (their
+//     predicates are state='invited'/state='awaiting_user', which the flip
+//     has erased). ws.js turns each row whose initiator is not the leaving
+//     owner into a synthetic refusal.
 //
 // SELECT-then-UPDATE instead of a single RETURNING statement because
 // RETURNING reports post-update values, which can't tell a
-// previously-joined row from a previously-invited one; the two statements
-// can't interleave (better-sqlite3 is synchronous). Idempotent: a room
-// with nothing to flip returns empty lists.
+// previously-joined row from a previously-invited/parked one; the two
+// statements can't interleave (better-sqlite3 is synchronous). Idempotent:
+// a room with nothing to flip returns empty lists.
 export function leaveAllParticipants(db, convoId, now = Date.now()) {
   const live = db.prepare(
-    "SELECT agent_device_id, initiator_device_id, state FROM convo_agents WHERE convo_id=? AND state IN ('invited','joined')"
+    "SELECT agent_device_id, initiator_device_id, state FROM convo_agents WHERE convo_id=? AND state IN ('invited','joined','awaiting_user')"
   ).all(convoId)
   db.prepare(
-    "UPDATE convo_agents SET state='left', answered_at=? WHERE convo_id=? AND state IN ('invited','joined')"
+    "UPDATE convo_agents SET state='left', answered_at=? WHERE convo_id=? AND state IN ('invited','joined','awaiting_user')"
   ).run(now, convoId)
   return {
     joined: live.filter((r) => r.state === 'joined').map((r) => r.agent_device_id),
-    pending: live.filter((r) => r.state === 'invited')
+    pending: live.filter((r) => r.state !== 'joined')
       .map(({ agent_device_id, initiator_device_id }) => ({ agent_device_id, initiator_device_id })),
   }
 }

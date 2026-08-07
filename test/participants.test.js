@@ -94,6 +94,31 @@ test('leaveAllParticipants flips the live rows, spares terminal ones, and splits
   assert.deepEqual(leaveAllParticipants(d, 'empty'), { joined: [], pending: [] })
 })
 
+test('leaveAllParticipants also sweeps awaiting_user (parked) rows into pending, terminally', () => {
+  const d = db()
+  // 7 is a parked JOIN REQUEST — it initiated (and targets) its own row,
+  // same shape agent_join's park branch writes, so it is owed the same
+  // synthetic-answer treatment an 'invited' pending row gets.
+  parkInvite(d, { convoId: 'room', agentDeviceId: 7, initiatorDeviceId: 7, justification: 'x' })
+  // 8 is a parked INVITE — the owner (1) initiated it, so per the existing
+  // "the owner is the waiting side, and it is the one leaving" rule this
+  // row's initiator must still come back as pending (leaveAllParticipants
+  // itself does not filter by initiator — ws.js's notify loop does).
+  parkInvite(d, { convoId: 'room', agentDeviceId: 8, initiatorDeviceId: 1, justification: 'x' })
+
+  const result = leaveAllParticipants(d, 'room')
+  assert.deepEqual(new Set(result.pending), new Set([
+    { agent_device_id: 7, initiator_device_id: 7 },
+    { agent_device_id: 8, initiator_device_id: 1 },
+  ]))
+  assert.equal(result.pending.length, 2)
+  assert.deepEqual(result.joined, [])
+  assert.equal(getParticipant(d, 'room', 7).state, 'left', 'a parked row must go terminal, not linger awaiting_user')
+  assert.equal(getParticipant(d, 'room', 8).state, 'left')
+  // Idempotent, same as the invited/joined sweep above.
+  assert.deepEqual(leaveAllParticipants(d, 'room'), { joined: [], pending: [] })
+})
+
 test('hasParticipants is true for a convo with any row in any state', () => {
   const d = db()
   assert.equal(hasParticipants(d, 'room'), false, 'a convo nobody was ever drawn into is not a room')

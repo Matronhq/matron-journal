@@ -296,6 +296,37 @@ test('agent_join parks for user consent symmetrically: the room owner hears noth
   assert.equal(a.frames.length, 0, 'the room owner (join target) must not be relayed to while parked')
 })
 
+// --- Bugbot finding: whitespace-only justification must not pass validation.
+// The handlers validated msg.justification (the RAW string) for
+// non-emptiness, then ran it through sanitizePeerText afterward — so a
+// payload of spaces/control chars satisfied the raw check but sanitised
+// down to '', storing an empty justification and publishing an empty card
+// body. The fix validates the SANITISED value instead.
+
+test('agent_invite rejects a whitespace-only justification exactly like an empty one: nothing parked, no card published', async (t) => {
+  const { s, agB, client, a } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: '   \n\t  ' })
+  const err = await a.waitFor((f) => f.op === 'error' && f.ref === 'agent_invite')
+  assert.equal(err.code, 'bad_request')
+  assert.equal(err.detail, 'bad justification', 'same error shape as the empty-string case')
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId), null, 'nothing parked for a whitespace-only ask')
+
+  await new Promise((r) => setTimeout(r, 50))
+  assert.ok(!client.frames.some(isCard), 'no card published for a whitespace-only ask')
+})
+
+test('agent_join rejects a whitespace-only justification exactly like an empty one: nothing parked, no card published', async (t) => {
+  const { s, agB, client, b } = await roomFleet(t)
+  b.send({ op: 'agent_join', room_id: 'room', justification: '   \n\t  ' })
+  const err = await b.waitFor((f) => f.op === 'error' && f.ref === 'agent_join')
+  assert.equal(err.code, 'bad_request')
+  assert.equal(err.detail, 'bad justification', 'same error shape as the empty-string case')
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId), null, 'nothing parked for a whitespace-only ask')
+
+  await new Promise((r) => setTimeout(r, 50))
+  assert.ok(!client.frames.some(isCard), 'no card published for a whitespace-only ask')
+})
+
 // --- Task 8: delivery pump + hello hook + awaiting_user sweep --------------
 
 // Minimal fixture for the pump's own unit tests: a real db (schema +

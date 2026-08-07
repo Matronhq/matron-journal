@@ -220,6 +220,56 @@ test('owner leave answers a pending JOIN REQUEST instead of orphaning the reques
   assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'left')
 })
 
+test('owner leave also dissolves a PARKED (awaiting_user) join request: initiator gets the answer frame, the row goes terminal, and a stale answer 409s', async (t) => {
+  // Bugbot finding: leaveAllParticipants only swept 'invited'/'joined' rows,
+  // so a row parked for the user's consent (never delivered to any agent
+  // socket) survived a dissolved room — the card stayed live for a dead
+  // room and the requester waited out the full 24h park TTL instead of
+  // hearing the same synthetic 'left' answer an 'invited' row gets.
+  const { s, dan, agA, agB, a, b } = await fleet(t)
+  const agC = createAgent(s.db, dan.id, 'dev-c')
+  const c = await makeWsClient(s.base, { token: agC.token, cursor: null })
+  await c.waitFor((f) => f.op === 'hello_ok')
+  t.after(() => c.close())
+
+  // B: pre-approved (fleet() seeds the allowance both ways) join request —
+  // lands 'invited', delivered to the owner. Same shape as the test above.
+  b.send({ op: 'agent_join', room_id: 'room', justification: 'I have context on this bug' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'join_request')
+  await b.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+
+  // C: no allowance for this pair, so the join request parks for the
+  // user's consent instead of ever reaching A's socket.
+  c.send({ op: 'agent_join', room_id: 'room', justification: 'let me help too' })
+  await c.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  assert.equal(getParticipant(s.db, 'room', agC.deviceId).state, 'awaiting_user')
+
+  a.send({ op: 'agent_leave', room_id: 'room' })
+
+  const ansB = await b.waitFor((f) => f.kind === 'invite' && f.event === 'answer')
+  assert.equal(ansB.accept, false)
+  assert.equal(ansB.reason, 'left')
+  assert.equal(ansB.peer_device_id, agB.deviceId)
+
+  const ansC = await c.waitFor((f) => f.kind === 'invite' && f.event === 'answer')
+  assert.equal(ansC.accept, false)
+  assert.equal(ansC.reason, 'left')
+  assert.equal(ansC.peer_device_id, agC.deviceId)
+
+  assert.equal(getParticipant(s.db, 'room', agC.deviceId).state, 'left',
+    'the parked row must go terminal, not stay stuck awaiting_user until the 24h TTL')
+
+  // The now-dead card must not be answerable — a client trying to approve
+  // it hits the same 409 an already-answered row gets.
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const answerAttempt = await s.http('/agent-chat/answer', {
+    method: 'POST', token: login.json.token,
+    body: { room_id: 'room', target_device_id: agC.deviceId, decision: 'approve' },
+  })
+  assert.equal(answerAttempt.status, 409)
+  assert.deepEqual(answerAttempt.json, { error: 'conflict' })
+})
+
 test('a throwing notify neither undoes a committed dissolve nor strands the remaining peers', async (t) => {
   // The DB flip is committed before any frame goes out, so a send that
   // throws (a socket that died between the hub's lookup and the write) must
