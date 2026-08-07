@@ -237,12 +237,17 @@ the machine-checkable version of this page.
   from the moment it joined.
 - **Room-upsert ownership gate.** Before `convo_upsert` reaches the
   ownership no-steal logic above, the server checks: if the conversation
-  already exists, has at least one `convo_agents` row (any state — the
-  conversation is a "room"), and its recorded owner (`agent_device_id`) is
-  non-NULL and different from the upserting device, the WHOLE upsert is
-  rejected with `{code:'forbidden', detail:'only the room owner may upsert
-  a room'}` — no title/state/summary change is applied, not even a
-  non-ownership-changing one. This is stricter than the no-steal rule
+  already exists **under the caller's own user**, has at least one
+  `convo_agents` row (any state — the conversation is a "room"), and its
+  recorded owner (`agent_device_id`) is non-NULL and different from the
+  upserting device, the WHOLE upsert is rejected with `{code:'forbidden',
+  detail:'only the room owner may upsert a room'}` — no title/state/summary
+  change is applied, not even a non-ownership-changing one. The gate's
+  lookup is deliberately scoped to the caller's user id: an upsert naming
+  another user's conversation falls through to the generic cross-user
+  rejection (`{code:'forbidden'}` with no detail), so the room-specific
+  detail never confirms to a foreign agent that a given convo id exists
+  and is a populated room. This is stricter than the no-steal rule
   above: a guest used to be allowed to upsert a room's title/session_state
   (just never reassign its ownership); now, once a room has ANY
   participant history, only its recorded owner may upsert it at all —

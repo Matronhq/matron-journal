@@ -727,8 +727,12 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         // pre-existing last-writer-wins takeover (a re-paired bridge with a
         // new device id reclaiming its own sessions), and a conversation
         // with no recorded owner (legacy NULL rows) stays writable by
-        // anyone. See docs/protocol.md "Agent delivery scoping".
-        const existingRoom = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(msg.convo_id)
+        // anyone. See docs/protocol.md "Agent delivery scoping". Scoped to
+        // this user's own conversations: a foreign convo id must fall
+        // through to upsertConversation's generic not-authorized rejection,
+        // not this room-specific detail (which would tell another user's
+        // agent that the id exists and is a populated room).
+        const existingRoom = db.prepare('SELECT agent_device_id FROM conversations WHERE id=? AND owner_user_id=?').get(msg.convo_id, conn.userId)
         if (existingRoom && existingRoom.agent_device_id != null && existingRoom.agent_device_id !== conn.deviceId) {
           const hasParticipants = db.prepare('SELECT 1 FROM convo_agents WHERE convo_id=? LIMIT 1').get(msg.convo_id)
           if (hasParticipants) return fail('forbidden', 'only the room owner may upsert a room')

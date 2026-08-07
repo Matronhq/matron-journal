@@ -104,6 +104,29 @@ test('room-upsert gate: an uninvited stranger cannot upsert a room that has any 
   assert.equal(err2.code, 'forbidden')
 })
 
+test("room-upsert gate: another user's agent probing a room id gets the generic forbidden, not the room-specific detail", async (t) => {
+  const { s, dan, agA } = await fleet(t)
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: 'dev-x', initiatorDeviceId: agA.deviceId, justification: 'x' })
+  const eve = await createUser(s.db, 'eve', 'pw')
+  const agE = createAgent(s.db, eve.id, 'dev-e')
+  const e = await makeWsClient(s.base, { token: agE.token, cursor: null })
+  await e.waitFor((f) => f.op === 'hello_ok')
+  t.after(() => e.close())
+
+  // The room-specific detail must never cross the user boundary — it would
+  // confirm to eve that dan's convo id exists and is a populated room. The
+  // foreign upsert falls through to upsertConversation's generic rejection.
+  e.send({ op: 'convo_upsert', convo_id: 'room', title: 'probe', session_state: 'idle' })
+  const err = await e.waitFor((f) => f.op === 'error' && f.ref === 'convo_upsert')
+  assert.equal(err.code, 'forbidden')
+  assert.ok(!/room/.test(err.detail ?? ''), `detail must not leak room-ness, got: ${err.detail}`)
+
+  const row = s.db.prepare('SELECT owner_user_id, agent_device_id, title FROM conversations WHERE id=?').get('room')
+  assert.equal(row.owner_user_id, dan.id)
+  assert.equal(row.agent_device_id, agA.deviceId)
+  assert.equal(row.title, 'room')
+})
+
 test('room-upsert gate: a JOINED guest cannot upsert the room it joined either', async (t) => {
   const { s, agA, agB, a, b } = await fleet(t)
   inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x' })
