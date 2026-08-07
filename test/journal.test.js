@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { openDb } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { append, upsertConversation, snapshot, eventsAfter, messagesBefore, markRead, snippetOf } from '../src/journal.js'
+import { append, upsertConversation, snapshot, eventsAfter, messagesBefore, markRead, snippetOf, isClientOnlyEvent } from '../src/journal.js'
 import { inviteParticipant } from '../src/participants.js'
 
 async function setup() {
@@ -319,4 +319,17 @@ test('summary: set via upsert, kept when omitted, returned by snapshot', async (
   upsertConversation(db, { id: 's1', ownerUserId: dan.id, agentDeviceId: ag.deviceId, summary: 'fixed CI, now on tests' })
   const snap = snapshot(db, dan.id)
   assert.equal(snap.conversations.find((c) => c.id === 's1').summary, 'fixed CI, now on tests')
+})
+
+test('agent_chat permission_request is client-only; everything else is not', () => {
+  assert.equal(isClientOnlyEvent('permission_request', { kind: 'agent_chat' }), true)
+  assert.equal(isClientOnlyEvent('permission_request', { kind: 'tool_use' }), false)
+  assert.equal(isClientOnlyEvent('permission_request', null), false)
+  assert.equal(isClientOnlyEvent('text', { kind: 'agent_chat' }), false)
+})
+
+test('agent_chat card snippet is fixed — never the justification', () => {
+  const s = snippetOf('permission_request', { kind: 'agent_chat', justification: 'SECRET-DO-NOT-LEAK' })
+  assert.equal(s, '🤝 Agent chat request')
+  assert.ok(!s.includes('SECRET'))
 })
