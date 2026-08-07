@@ -1,7 +1,7 @@
 import { WebSocketServer } from 'ws'
 import { authToken, authorize, authorizeAgentWrite } from './auth.js'
 import { eventsAfter, append, markRead, upsertConversation, toEventShape } from './journal.js'
-import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, removeParticipant, getParticipant, expireInvites } from './participants.js'
+import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, undoInvite, getParticipant, expireInvites } from './participants.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -577,7 +577,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
           topic: msg.topic || '', justification: msg.justification,
         })
         if (!delivered) {
-          removeParticipant(db, msg.room_id, msg.target_device_id)
+          undoInvite(db, msg.room_id, msg.target_device_id, r.prior)
           return fail('offline')
         }
         conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: msg.target_device_id }))
@@ -602,7 +602,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
           justification: msg.justification,
         })
         if (!delivered) {
-          removeParticipant(db, msg.room_id, conn.deviceId)
+          undoInvite(db, msg.room_id, conn.deviceId, r.prior)
           return fail('offline')
         }
         conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: room.agent_device_id }))

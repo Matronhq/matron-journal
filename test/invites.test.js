@@ -168,6 +168,33 @@ test('agent_invite_ack/agent_invite_answer/agent_leave reject an unregistered ag
   assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'invited')
 })
 
+test('a refused row is restored (not erased) when a retry join fails because the owner is offline', async (t) => {
+  const { s, agA, agB, a, b } = await fleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'first ask' })
+  await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
+  b.send({ op: 'agent_invite_answer', room_id: 'room', accept: false, reason: 'not now' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'answer')
+  const refused = getParticipant(s.db, 'room', agB.deviceId)
+  assert.equal(refused.state, 'refused')
+  assert.equal(refused.justification, 'first ask')
+
+  // Take the owner offline so the retry's delivery fails.
+  a.close()
+  await new Promise((r) => setTimeout(r, 150))
+
+  b.send({ op: 'agent_join', room_id: 'room', justification: 'let me back in' })
+  const err = await b.waitFor((f) => f.op === 'error' && f.ref === 'agent_join')
+  assert.equal(err.code, 'offline')
+
+  // The failed retry must restore the PRIOR refused row exactly — not erase
+  // it (a bare delete would let a refused device wipe its own refusal
+  // history just by join-requesting while the owner happens to be offline).
+  const after = getParticipant(s.db, 'room', agB.deviceId)
+  assert.equal(after.state, 'refused')
+  assert.equal(after.justification, 'first ask', 'original refusal justification must survive, not the failed retry\'s')
+  assert.equal(after.initiator_device_id, agA.deviceId, 'original initiator (the owner\'s invite) must survive')
+})
+
 test('an unanswered invite expires and the initiator is told', async (t) => {
   const s = await startTestServer({ revocationSweepMs: 100, inviteTtlMs: 150 })
   t.after(() => s.close())

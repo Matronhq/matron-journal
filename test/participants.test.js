@@ -2,16 +2,16 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { openDb } from '../src/db.js'
 import {
-  inviteParticipant, answerInvite, leaveConvo, removeParticipant,
+  inviteParticipant, answerInvite, leaveConvo, removeParticipant, undoInvite,
   joinedAgentIds, getParticipant, isParticipant, expireInvites,
 } from '../src/participants.js'
 
 const db = () => openDb(':memory:')
 
-test('inviteParticipant creates a pending row', () => {
+test('inviteParticipant creates a pending row and reports no prior row', () => {
   const d = db()
   const r = inviteParticipant(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'help me' })
-  assert.deepEqual(r, { ok: true })
+  assert.deepEqual(r, { ok: true, prior: null })
   const row = getParticipant(d, 'room', 2)
   assert.equal(row.state, 'invited')
   assert.equal(row.initiator_device_id, 1)
@@ -19,15 +19,17 @@ test('inviteParticipant creates a pending row', () => {
   assert.equal(row.answered_at, null)
 })
 
-test('inviteParticipant refuses while invited or joined, renews after refused/left/expired', () => {
+test('inviteParticipant refuses while invited or joined, renews after refused/left/expired and reports the full prior row', () => {
   const d = db()
   inviteParticipant(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'x' })
   assert.deepEqual(inviteParticipant(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'y' }), { ok: false, state: 'invited' })
   answerInvite(d, { convoId: 'room', agentDeviceId: 2, accept: true })
   assert.deepEqual(inviteParticipant(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'y' }), { ok: false, state: 'joined' })
   leaveConvo(d, { convoId: 'room', agentDeviceId: 2 })
+  const leftRow = getParticipant(d, 'room', 2)
   const renewed = inviteParticipant(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 2, justification: 'again' })
-  assert.deepEqual(renewed, { ok: true })
+  assert.equal(renewed.ok, true)
+  assert.deepEqual(renewed.prior, { convo_id: 'room', agent_device_id: 2, ...leftRow })
   const row = getParticipant(d, 'room', 2)
   assert.equal(row.state, 'invited')
   assert.equal(row.initiator_device_id, 2)
@@ -75,6 +77,29 @@ test('isParticipant is true for any state, removeParticipant deletes the row', (
   removeParticipant(d, 'room', 2)
   assert.equal(isParticipant(d, 'room', 2), false)
   assert.equal(getParticipant(d, 'room', 2), null)
+})
+
+test('undoInvite restores the prior row exactly when one existed, else deletes like removeParticipant', () => {
+  const d = db()
+  // No prior row at all: undoInvite(..., null) deletes, same as a bare invite-then-remove.
+  inviteParticipant(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'x' })
+  undoInvite(d, 'room', 2, null)
+  assert.equal(getParticipant(d, 'room', 2), null)
+
+  // A renewed row: undoInvite must put back the exact prior state/fields,
+  // not just flip the state — a refused device must not lose its
+  // justification/initiator/timestamps by having a retry fail.
+  inviteParticipant(d, { convoId: 'room', agentDeviceId: 3, initiatorDeviceId: 1, justification: 'first' })
+  answerInvite(d, { convoId: 'room', agentDeviceId: 3, accept: false })
+  const priorRefused = getParticipant(d, 'room', 3)
+  const { prior } = inviteParticipant(d, { convoId: 'room', agentDeviceId: 3, initiatorDeviceId: 3, justification: 'retry' })
+  assert.equal(getParticipant(d, 'room', 3).state, 'invited', 'sanity: the renew took effect before undo')
+  undoInvite(d, 'room', 3, prior)
+  const restored = getParticipant(d, 'room', 3)
+  assert.deepEqual(restored, priorRefused)
+  assert.equal(restored.state, 'refused')
+  assert.equal(restored.justification, 'first')
+  assert.equal(restored.initiator_device_id, 1)
 })
 
 test('expireInvites flips only stale pending rows and returns them', () => {

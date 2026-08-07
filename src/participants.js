@@ -11,9 +11,13 @@
 // surfacing, not silently resetting).
 const RENEWABLE = new Set(['refused', 'left', 'expired'])
 
+// Returns `{ok:true, prior}` where `prior` is the full row as it stood
+// BEFORE this call (null if no row existed) — a caller whose delivery then
+// fails needs the WHOLE prior row, not just its state, to restore it exactly
+// rather than erasing it (see undoInvite below).
 export function inviteParticipant(db, { convoId, agentDeviceId, initiatorDeviceId, justification = '' }) {
   const existing = db.prepare(
-    'SELECT state FROM convo_agents WHERE convo_id=? AND agent_device_id=?'
+    'SELECT * FROM convo_agents WHERE convo_id=? AND agent_device_id=?'
   ).get(convoId, agentDeviceId)
   if (existing && !RENEWABLE.has(existing.state)) return { ok: false, state: existing.state }
   db.prepare(`
@@ -26,7 +30,7 @@ export function inviteParticipant(db, { convoId, agentDeviceId, initiatorDeviceI
       created_at=excluded.created_at,
       answered_at=NULL
   `).run(convoId, agentDeviceId, initiatorDeviceId, justification, Date.now())
-  return { ok: true }
+  return { ok: true, prior: existing ?? null }
 }
 
 export function answerInvite(db, { convoId, agentDeviceId, accept, now = Date.now() }) {
@@ -41,11 +45,35 @@ export function leaveConvo(db, { convoId, agentDeviceId, now = Date.now() }) {
   ).run(now, convoId, agentDeviceId).changes > 0
 }
 
-// Undo of a just-created invite whose delivery failed (the target had no
-// live socket when the request frame was sent) — the caller sees `offline`
-// and the table must not keep a pending row nobody was told about.
+// Unconditional delete — no restoration of any prior renewed row. Direct
+// callers (tests, admin-style cleanup) that want that ought to use
+// `isParticipant`/inspect the row themselves first; ws.js's own
+// offline-invite-undo path uses `undoInvite` below instead, specifically
+// because a bare delete here would erase a renewed row's prior history
+// (see undoInvite's doc comment).
 export function removeParticipant(db, convoId, agentDeviceId) {
   db.prepare('DELETE FROM convo_agents WHERE convo_id=? AND agent_device_id=?').run(convoId, agentDeviceId)
+}
+
+// Undo of an invite/join whose delivery failed (the target had no live
+// socket when the request frame was sent) — the caller sees `offline` and
+// the table must not keep a pending row nobody was told about. Unlike a bare
+// `removeParticipant` delete, this restores whatever `prior` row
+// `inviteParticipant` captured (a renewed `refused`/`left`/`expired` row)
+// rather than erasing it — otherwise a refused device could wipe its own
+// refusal history just by join-requesting while the room owner happens to
+// be offline. `prior: null` (inviteParticipant found no earlier row at all)
+// means the row it just inserted was wholly new — delete it, same as the
+// old behavior.
+export function undoInvite(db, convoId, agentDeviceId, prior) {
+  if (prior == null) {
+    removeParticipant(db, convoId, agentDeviceId)
+    return
+  }
+  db.prepare(`
+    UPDATE convo_agents SET state=?, initiator_device_id=?, justification=?, created_at=?, answered_at=?
+    WHERE convo_id=? AND agent_device_id=?
+  `).run(prior.state, prior.initiator_device_id, prior.justification, prior.created_at, prior.answered_at, convoId, agentDeviceId)
 }
 
 export function joinedAgentIds(db, convoId) {
