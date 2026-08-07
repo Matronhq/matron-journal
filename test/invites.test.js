@@ -42,6 +42,7 @@ test('full invite happy path: request → delivered → ack → answer(accept) �
   const ans = await a.waitFor((f) => f.kind === 'invite' && f.event === 'answer')
   assert.equal(ans.accept, true)
   assert.equal(ans.peer_device_id, agB.deviceId)
+  assert.equal(ans.from_device_id, agB.deviceId, 'the answering device is stamped on the live relay')
   assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'joined')
 })
 
@@ -75,6 +76,10 @@ test('join flow: peer asks, owner acks busy and accepts via peer_device_id', asy
   a.send({ op: 'agent_invite_answer', room_id: 'room', accept: true, peer_device_id: agB.deviceId })
   const ans = await b.waitFor((f) => f.kind === 'invite' && f.event === 'answer')
   assert.equal(ans.accept, true)
+  // In the join-request direction, from_device_id is the OWNER (who actually
+  // answered) — distinct from peer_device_id, which names the join-requester
+  // the row is about. This is how the join-requester learns who answered.
+  assert.equal(ans.from_device_id, agA.deviceId)
   assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'joined')
 })
 
@@ -215,6 +220,10 @@ test('an unanswered invite expires and the initiator is told', async (t) => {
   assert.equal(ans.accept, false)
   assert.equal(ans.reason, 'expired')
   assert.equal(ans.peer_device_id, agB.deviceId)
+  // Unlike the live agent_invite_answer relay, the sweep's synthetic expiry
+  // answer has no answering connection behind it, so it carries no
+  // from_device_id (documented difference — see docs/protocol.md).
+  assert.equal(ans.from_device_id, undefined)
   assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'expired')
   // A late answer from B is a clean conflict, not a resurrection.
   b.send({ op: 'agent_invite_answer', room_id: 'room', accept: true })

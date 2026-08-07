@@ -659,7 +659,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         }
         hub.sendToDevice(conn.userId, row.initiator_device_id, {
           kind: 'invite', event: 'answer', room_id: msg.room_id,
-          peer_device_id: rowDeviceId, accept: msg.accept,
+          peer_device_id: rowDeviceId, accept: msg.accept, from_device_id: conn.deviceId,
           ...(typeof msg.reason === 'string' && msg.reason ? { reason: msg.reason } : {}),
         })
         break

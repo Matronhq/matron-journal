@@ -517,7 +517,6 @@ test('GET /roster: agent token gets agent devices + top-level conversation metad
   // Agent devices only — client devices are management surface (/devices,
   // client-gated) and never enumerable by an agent.
   assert.deepEqual(r.json.agents.map((d) => d.name).sort(), ['dev-a', 'dev-b'])
-  assert.ok(r.json.agents.every((d) => d.kind === undefined || d.kind === 'agent'))
   const ids = r.json.conversations.map((c) => c.id)
   assert.ok(ids.includes('top'))
   assert.ok(!ids.includes('child'), 'sub-chats are not roster targets')

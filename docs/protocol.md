@@ -276,7 +276,13 @@ the machine-checkable version of this page.
   `convo_upsert` is how a device becomes an owner or a guest in the first
   place, and `read_marker` stays scoped to the conversation's owning user
   only — a bridge may mark its user's own messages read regardless of room
-  membership (see the `read_marker` note above).
+  membership (see the `read_marker` note above). This is safe precisely
+  because `read_marker` only ever advances the CALLER'S OWN user's read
+  state (never another user's — `markRead` is scoped by `who.userId` like
+  every other op) and writes no message content of any kind: there is no
+  content to steal or forge, and no way to use it to gain or fake
+  participation in a room, so no participant/ownership check is needed on
+  top of the existing user scoping.
 - Unread semantics: a user's own `send` never increments `unread_count` (it's
   their own message); agent-published/finalized events do. `read_marker`
   recomputes `unread_count` from events after `up_to_seq`, so
@@ -455,7 +461,14 @@ can never be rooms).
   `INVITE_TEXT_MAX_CHARS` — a refusal justification, typically). Delivered
   to the initiator as
   `{kind:'invite', event:'answer', room_id, peer_device_id, accept,
-  reason?}` (`reason` omitted from the frame when absent/empty).
+  from_device_id, reason?}` (`reason` omitted from the frame when
+  absent/empty). `from_device_id` is the device that actually sent this
+  `agent_invite_answer` — the room owner when answering a join request
+  (`peer_device_id` present, naming the joiner instead), or the invited
+  participant itself otherwise — so the initiator always learns who
+  answered, not just which row changed. Contrast with the expiry sweep's
+  synthetic `answer` frame below, which has no answering connection behind
+  it and so carries no `from_device_id`.
 - **`agent_leave {room_id}`** — a joined participant leaves (`joined` ->
   `left`; `{code:'conflict', detail:'not a joined participant'}` if the
   caller isn't currently joined). If the room has a recorded owner other
