@@ -133,7 +133,7 @@ export function joinedAgentIds(db, convoId) {
 
 export function getParticipant(db, convoId, agentDeviceId) {
   return db.prepare(
-    'SELECT state, initiator_device_id, justification, created_at, answered_at FROM convo_agents WHERE convo_id=? AND agent_device_id=?'
+    'SELECT state, initiator_device_id, justification, topic, created_at, answered_at, delivered_at FROM convo_agents WHERE convo_id=? AND agent_device_id=?'
   ).get(convoId, agentDeviceId) ?? null
 }
 
