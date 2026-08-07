@@ -150,6 +150,30 @@ test('undoInvite restores the prior row exactly when one existed, else deletes l
   assert.equal(restored.initiator_device_id, 1)
 })
 
+test('undoInvite restores topic (and delivered_at) from a denied parked prior row, not just state/justification/initiator', () => {
+  const d = db()
+  parkInvite(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'first ask', topic: 'budget review' })
+  answerParkedInvite(d, { convoId: 'room', agentDeviceId: 2, approve: false, now: 100 })
+  const priorDenied = getParticipant(d, 'room', 2)
+  assert.equal(priorDenied.state, 'denied')
+  assert.equal(priorDenied.topic, 'budget review', 'sanity: topic survives the deny')
+
+  // 'denied' is renewable — inviteParticipant's upsert resets topic to ''
+  // and delivered_at to NULL on any renew, same as any other renewed row.
+  const { prior } = inviteParticipant(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 2, justification: 'retry' })
+  assert.equal(getParticipant(d, 'room', 2).topic, '', 'sanity: the renew reset topic before undo')
+
+  // A failed retry's undo must put the WHOLE prior row back, including the
+  // fields the renew reset — not just state/justification/initiator, or the
+  // topic the user saw when they denied silently reverts to '' (history
+  // loss), contradicting undoInvite's own "restores prior exactly" docstring.
+  undoInvite(d, 'room', 2, prior)
+  const restored = getParticipant(d, 'room', 2)
+  assert.deepEqual(restored, priorDenied)
+  assert.equal(restored.topic, 'budget review')
+  assert.equal(restored.delivered_at, priorDenied.delivered_at)
+})
+
 test('expireInvites flips only stale pending rows and returns them', () => {
   const d = db()
   const now = Date.now()
@@ -186,7 +210,9 @@ test('awaiting_user is not renewable; denied is', () => {
   assert.deepEqual(parkInvite(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'y', topic: '' }),
     { ok: false, state: 'awaiting_user' })
   answerParkedInvite(d, { convoId: 'room', agentDeviceId: 2, approve: false })
-  assert.equal(getParticipant(d, 'room', 2).state, 'denied')
+  const denied = getParticipant(d, 'room', 2)
+  assert.equal(denied.state, 'denied')
+  assert.ok(denied.answered_at != null, 'a deny stamps answered_at like any other terminal answer')
   assert.equal(parkInvite(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'z', topic: '' }).ok, true)
 })
 
@@ -229,6 +255,29 @@ test('awaitingCount counts across convos by initiator', () => {
   parkInvite(d, { convoId: 'c', agentDeviceId: 4, initiatorDeviceId: 9, justification: 'x', topic: '' })
   assert.equal(awaitingCount(d, 1), 2)
   assert.equal(awaitingCount(d, 9), 1)
+})
+
+test('listAwaiting joins to the conversation title, scoped to the owning user only', () => {
+  const d = db()
+  d.prepare("INSERT INTO users(name, password_hash, created_at) VALUES('u','x',0)").run()
+  d.prepare("INSERT INTO users(name, password_hash, created_at) VALUES('other','x',0)").run()
+  const userId = d.prepare("SELECT id FROM users WHERE name='u'").get().id
+  const otherId = d.prepare("SELECT id FROM users WHERE name='other'").get().id
+  d.prepare(
+    'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, created_at) VALUES(?,?,?,?,?,?)'
+  ).run('room', userId, 'My Room', 'running', 1, 0)
+
+  parkInvite(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'x', topic: 'ci' })
+
+  const rows = listAwaiting(d, userId)
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].convo_id, 'room')
+  assert.equal(rows[0].agent_device_id, 2)
+  assert.equal(rows[0].title, 'My Room')
+  assert.equal(rows[0].topic, 'ci')
+  // Cross-user isolation — the pending endpoint scopes strictly to the
+  // conversation's owner, same as listAwaiting's WHERE clause.
+  assert.deepEqual(listAwaiting(d, otherId), [])
 })
 
 test('undeliveredInvites lists approved-but-undelivered rows joined to their conversation, and drops rows out after delivery', () => {

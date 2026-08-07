@@ -161,9 +161,9 @@ export function undoInvite(db, convoId, agentDeviceId, prior) {
     return
   }
   db.prepare(`
-    UPDATE convo_agents SET state=?, initiator_device_id=?, justification=?, created_at=?, answered_at=?
+    UPDATE convo_agents SET state=?, initiator_device_id=?, justification=?, topic=?, created_at=?, answered_at=?, delivered_at=?
     WHERE convo_id=? AND agent_device_id=?
-  `).run(prior.state, prior.initiator_device_id, prior.justification, prior.created_at, prior.answered_at, convoId, agentDeviceId)
+  `).run(prior.state, prior.initiator_device_id, prior.justification, prior.topic, prior.created_at, prior.answered_at, prior.delivered_at, convoId, agentDeviceId)
 }
 
 // Owner-leave dissolution (ws.js agent_leave): the recorded owner has no
