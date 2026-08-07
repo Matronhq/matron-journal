@@ -958,6 +958,12 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
       case 'publish': {
         if (conn.kind !== 'agent') return fail('forbidden')
         if (typeof msg.type !== 'string' || !AGENT_PUBLISH_TYPES.has(msg.type) || typeof msg.payload !== 'object' || msg.payload === null) return fail('bad_request')
+        // The agent_chat consent card is minted only by the server's own
+        // agent_invite/agent_join park path, which sanitises from_name/
+        // topic/justification before append. A bare publish never runs that
+        // sanitiser, so letting one through here would let any agent forge
+        // an unsanitised, impersonating consent card into a room it manages.
+        if (isClientOnlyEvent(msg.type, msg.payload)) return fail('bad_request', 'agent_chat consent cards are server-minted only')
         // finalize composes `fin:<ref>` idem keys internally — a raw publish
         // must not be able to collide with (or forge) one of those.
         if (typeof msg.idem_key === 'string' && msg.idem_key.startsWith('fin:')) {
@@ -1068,6 +1074,8 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         const type = msg.type || 'text'
         if (!AGENT_PUBLISH_TYPES.has(type)) return fail('bad_request')
         if (typeof msg.payload !== 'object' || msg.payload === null) return fail('bad_request')
+        // Same server-only-mint rule as publish — see the comment there.
+        if (isClientOnlyEvent(type, msg.payload)) return fail('bad_request', 'agent_chat consent cards are server-minted only')
         // Wrong-conversation tightening (spec: agent chat phase 2): an agent
         // device writes only into conversations it manages or has joined.
         // append() would reject a cross-USER convo anyway; this closes the

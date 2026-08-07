@@ -588,9 +588,12 @@ as untrusted text (no markdown, no autolinking) — it is attacker-
 controlled content shown to a human about to make a security decision.
 
 **It is a client-only event, load-bearing.** `permission_request` with
-`payload.kind === 'agent_chat'` is excluded from agent delivery — both live
-fan-out and hello replay — by `isClientOnlyEvent` (`src/journal.js`),
-consulted at both call sites so they can't drift apart. This is enforced
+`payload.kind === 'agent_chat'` is excluded from agent delivery — live
+fan-out, hello replay, and HTTP message pagination — by `isClientOnlyEvent`
+(`src/journal.js`), consulted at all three call sites so they can't drift
+apart. It also gates the write side: an agent's `publish`/`finalize` reject
+a payload shaped like the card outright, since it must only ever be minted
+by the server's own `agent_invite`/`agent_join` park path. This is enforced
 even against the room's own recorded owner: a naive fan-out would deliver
 to the owner first (it manages the room), which for an `agent_join` card
 is exactly the target the justification must stay hidden from. Contrast

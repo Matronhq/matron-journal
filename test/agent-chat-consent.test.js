@@ -71,20 +71,25 @@ async function roomFleet(t, { ownerName = 'dev-a', connectB = true } = {}) {
 
 const isCard = (f) => f.kind === 'journal' && f.type === 'permission_request' && f.payload?.kind === 'agent_chat'
 
-// Publishes the card via the existing generic `publish` op — permission_request
-// is already in ws.js's AGENT_PUBLISH_TYPES, so this drives a real trip through
-// appendAndFan/fanOut (the exact choke point Task 7's dedicated op will also
-// use), not a simulation of one.
+// Publishes a FORGED card via the generic `publish` op — permission_request
+// is in ws.js's AGENT_PUBLISH_TYPES, so before the ws.js guard this drove a
+// real trip through appendAndFan/fanOut. Now used only by the rejection
+// tests below (IMP-1): the card must be unforgeable via publish/finalize, so
+// it must be minted exclusively by the server's own agent_invite/agent_join
+// park path (exercised via roomFleet + `agent_invite` in the tests that
+// follow).
 function publishCard(agent) {
   agent.send({ op: 'publish', convo_id: 'room', type: 'permission_request', payload: { kind: 'agent_chat', justification: 'SECRET' } })
 }
 
-test('client-only agent-chat card: live fan-out reaches the client, never the owning agent', async (t) => {
-  const { agent, client } = await fleet(t)
-  // The publishing agent is also the room's recorded owner — exactly the
+test('client-only agent-chat card: live fan-out reaches the client, never the owning/requesting agent', async (t) => {
+  const { agA, agB, client, a, b } = await roomFleet(t)
+  // The requesting agent is also the room's recorded owner — exactly the
   // device broadcastJournal's default targets (owner + joined participants)
-  // would otherwise deliver to first.
-  publishCard(agent)
+  // would otherwise deliver to first. Drive the card through the real
+  // agent_invite park path (IMP-1: publish/finalize can no longer mint it).
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'SECRET' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
   const seen = await client.waitFor(isCard)
   assert.equal(seen.payload.justification, 'SECRET')
 
@@ -92,13 +97,15 @@ test('client-only agent-chat card: live fan-out reaches the client, never the ow
   // that delivers the client's copy, so there's no real race to wait out —
   // this is just a courtesy beat before asserting the negative.
   await new Promise((r) => setTimeout(r, 50))
-  assert.ok(!agent.frames.some(isCard), 'the agent that manages the room must not see the card live')
-  assert.ok(!JSON.stringify(agent.frames).includes('SECRET'), 'no trace of the justification text reached the agent live')
+  assert.ok(!a.frames.some(isCard), 'the agent that manages/requested the room must not see the card live')
+  assert.equal(b.frames.length, 0, 'the invite target must not see the card live either')
+  assert.ok(!JSON.stringify(a.frames).includes('SECRET'), 'no trace of the justification text reached the agent live')
 })
 
 test('client-only agent-chat card: hello replay from cursor 0 excludes it for the agent, includes it for the client', async (t) => {
-  const { s, agentDev, clientToken, agent, client } = await fleet(t)
-  publishCard(agent)
+  const { s, agA, agB, clientToken, a, client } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'SECRET' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
   await client.waitFor(isCard)
   // A benign follow-up event both devices are entitled to, appended after
   // the card — once it shows up in a fresh replay, the card (an earlier
@@ -106,9 +113,9 @@ test('client-only agent-chat card: hello replay from cursor 0 excludes it for th
   // loop, since eventsAfter delivers in seq order and each batch is sent
   // synchronously before the next is fetched.
   client.send({ op: 'send', convo_id: 'room', type: 'text', payload: { body: 'marker' } })
-  await agent.waitFor((f) => f.kind === 'journal' && f.type === 'text' && f.payload?.body === 'marker')
+  await a.waitFor((f) => f.kind === 'journal' && f.type === 'text' && f.payload?.body === 'marker')
 
-  const agentReplay = await makeWsClient(s.base, { token: agentDev.token, cursor: 0 })
+  const agentReplay = await makeWsClient(s.base, { token: agA.token, cursor: 0 })
   const clientReplay = await makeWsClient(s.base, { token: clientToken, cursor: 0 })
   t.after(() => { agentReplay.close(); clientReplay.close() })
   await agentReplay.waitFor((f) => f.kind === 'journal' && f.type === 'text' && f.payload?.body === 'marker')
@@ -120,11 +127,12 @@ test('client-only agent-chat card: hello replay from cursor 0 excludes it for th
 })
 
 test('client-only agent-chat card: HTTP GET /convo/:id/messages omits it for the agent, includes it for the client', async (t) => {
-  const { s, agentDev, clientToken, agent, client } = await fleet(t)
-  publishCard(agent)
+  const { s, agA, agB, clientToken, a, client } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'SECRET' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
   await client.waitFor(isCard)
 
-  const asAgent = await s.http('/convo/room/messages', { token: agentDev.token })
+  const asAgent = await s.http('/convo/room/messages', { token: agA.token })
   const asClient = await s.http('/convo/room/messages', { token: clientToken })
   assert.equal(asAgent.status, 200)
   assert.equal(asClient.status, 200)
@@ -133,6 +141,51 @@ test('client-only agent-chat card: HTTP GET /convo/:id/messages omits it for the
   assert.ok(asClient.json.events.some((e) => e.type === 'permission_request' && e.payload?.kind === 'agent_chat'),
     'the client-token page must include the card')
   assert.ok(!JSON.stringify(asAgent.json).includes('SECRET'), 'no trace of the justification text reached the agent via HTTP')
+})
+
+// --- IMP-1: the card is unforgeable via the generic agent-write ops --------
+//
+// permission_request is in AGENT_PUBLISH_TYPES (bridges legitimately publish
+// ordinary permission_request cards, e.g. tool-approval prompts), but a
+// payload shaped like the agent_chat consent card (`kind:'agent_chat'`) must
+// only ever be minted by the server's own agent_invite/agent_join park path,
+// which runs sanitizePeerText over from_name/topic/justification. A bare
+// publish/finalize never runs that sanitiser, so allowing it through would
+// let any agent forge an unsanitised, impersonating consent card (fake
+// from_device_id/from_name, control-char justification) straight into a
+// room it manages.
+
+test('agent publish of a forged agent_chat permission_request is rejected: error frame, nothing appended, no frame reaches anyone', async (t) => {
+  const { s, agent, client } = await fleet(t)
+  publishCard(agent)
+  const err = await agent.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'bad_request' && f.ref === 'publish')
+  assert.equal(err.detail, 'agent_chat consent cards are server-minted only')
+
+  await new Promise((r) => setTimeout(r, 50))
+  assert.ok(!agent.frames.some(isCard), 'no card reached the publishing agent')
+  assert.ok(!client.frames.some(isCard), 'no card reached the client either — nothing was appended at all')
+  assert.ok(!JSON.stringify(agent.frames).includes('SECRET'))
+  assert.ok(!JSON.stringify(client.frames).includes('SECRET'))
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM events WHERE convo_id='room' AND type='permission_request'").get().n, 0,
+    'the forged card must never be appended to the journal')
+})
+
+test('agent finalize of a forged agent_chat permission_request is rejected: error frame, nothing appended, no frame reaches anyone', async (t) => {
+  const { s, agent, client } = await fleet(t)
+  agent.send({
+    op: 'finalize', convo_id: 'room', message_ref: 'm1',
+    type: 'permission_request', payload: { kind: 'agent_chat', justification: 'SECRET' },
+  })
+  const err = await agent.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'bad_request' && f.ref === 'finalize')
+  assert.equal(err.detail, 'agent_chat consent cards are server-minted only')
+
+  await new Promise((r) => setTimeout(r, 50))
+  assert.ok(!agent.frames.some(isCard), 'no card reached the publishing agent')
+  assert.ok(!client.frames.some(isCard), 'no card reached the client either — nothing was appended at all')
+  assert.ok(!JSON.stringify(agent.frames).includes('SECRET'))
+  assert.ok(!JSON.stringify(client.frames).includes('SECRET'))
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM events WHERE convo_id='room' AND type='permission_request'").get().n, 0,
+    'the forged card must never be appended to the journal')
 })
 
 // --- Task 7: agent_invite/agent_join park for user consent -----------------
