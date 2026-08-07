@@ -167,3 +167,30 @@ test('agent_invite_ack/agent_invite_answer/agent_leave reject an unregistered ag
   // pending, untouched by the rejected ack/answer/leave attempts above.
   assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'invited')
 })
+
+test('an unanswered invite expires and the initiator is told', async (t) => {
+  const s = await startTestServer({ revocationSweepMs: 100, inviteTtlMs: 150 })
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const agA = createAgent(s.db, dan.id, 'dev-a')
+  const agB = createAgent(s.db, dan.id, 'dev-b')
+  const a = await makeWsClient(s.base, { token: agA.token, cursor: null })
+  const b = await makeWsClient(s.base, { token: agB.token, cursor: null })
+  await a.waitFor((f) => f.op === 'hello_ok')
+  await b.waitFor((f) => f.op === 'hello_ok')
+  t.after(() => { a.close(); b.close() })
+  a.send({ op: 'convo_upsert', convo_id: 'room', session_state: 'running' })
+  await a.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'x' })
+  await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
+  // B never answers; the sweep expires it.
+  const ans = await a.waitFor((f) => f.kind === 'invite' && f.event === 'answer', 3000)
+  assert.equal(ans.accept, false)
+  assert.equal(ans.reason, 'expired')
+  assert.equal(ans.peer_device_id, agB.deviceId)
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'expired')
+  // A late answer from B is a clean conflict, not a resurrection.
+  b.send({ op: 'agent_invite_answer', room_id: 'room', accept: true })
+  const err = await b.waitFor((f) => f.op === 'error' && f.ref === 'agent_invite_answer')
+  assert.equal(err.code, 'conflict')
+})

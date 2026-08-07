@@ -1,7 +1,7 @@
 import { WebSocketServer } from 'ws'
 import { authToken, authorize, authorizeAgentWrite } from './auth.js'
 import { eventsAfter, append, markRead, upsertConversation, toEventShape } from './journal.js'
-import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, removeParticipant, getParticipant } from './participants.js'
+import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, removeParticipant, getParticipant, expireInvites } from './participants.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -98,7 +98,7 @@ export async function waitForDrain(ws, thresholdBytes, pollMs = 20) {
 export function attachWs({
   server, db, hub, pingMs = 55000, pushPipeline = noopPushPipeline,
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
-  revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES,
+  revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES, inviteTtlMs = 1800000,
 }) {
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES })
   const statusCache = makeStatusCache()
@@ -131,6 +131,21 @@ export function attachWs({
     // must learn the stream is dead. Runs before the early-return below —
     // buffers expire even when no connection is registered.
     for (const ev of toolStreams.sweepIdle()) notifyStale(hub, ev)
+    // Invite expiry (spec: 30 min default, generous because busy is
+    // reported honestly via the ack). Piggybacks on this sweep timer, same
+    // as the tool-stream idle sweep above. The initiator (room owner for
+    // invites, the joiner for join requests) hears an expiry exactly like
+    // a refusal, with reason 'expired'; if it is offline right now it
+    // simply misses the frame — its next roster/answer attempt tells the
+    // same story (conflict / state=expired).
+    for (const row of expireInvites(db, inviteTtlMs)) {
+      const convo = db.prepare('SELECT owner_user_id FROM conversations WHERE id=?').get(row.convo_id)
+      if (!convo) continue
+      hub.sendToDevice(convo.owner_user_id, row.initiator_device_id, {
+        kind: 'invite', event: 'answer', room_id: row.convo_id,
+        peer_device_id: row.agent_device_id, accept: false, reason: 'expired',
+      })
+    }
     const conns = hub.allConns()
     if (conns.length === 0) return
     const ids = [...new Set(conns.map((c) => c.deviceId))]
