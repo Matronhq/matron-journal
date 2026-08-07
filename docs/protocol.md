@@ -429,7 +429,7 @@ can never be rooms).
 ### Expiry
 
 A pending `invited` row older than the invite TTL (`inviteTtlMs`, default 30
-minutes — `DEFAULT_INVITE_TTL_MS = 1800000`) is flipped to `expired` by the
+minutes — 1800000 ms, the `inviteTtlMs` parameter default in `attachWs`) is flipped to `expired` by the
 same periodic sweep that handles the tool-stream idle eviction and device
 revocation checks (see "Device revocation" below) — generous on purpose,
 because a busy responder is expected to report that honestly via
