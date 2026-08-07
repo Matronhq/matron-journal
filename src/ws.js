@@ -1,7 +1,7 @@
 import { WebSocketServer } from 'ws'
 import { authToken, authorize, authorizeAgentWrite } from './auth.js'
 import { eventsAfter, append, markRead, upsertConversation, toEventShape } from './journal.js'
-import { joinedAgentIds } from './participants.js'
+import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, removeParticipant, getParticipant } from './participants.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -45,6 +45,13 @@ const RPC_NAME_MAX_CHARS = 64 // method and error.code
 // RPC request ids. Convo ids are conventionally Claude session UUIDs (36
 // chars); this is a defensive upper bound, not a format assertion.
 const CONVO_ID_MAX_CHARS = 128
+
+// Invite lifecycle (spec: agent chat phase 2). Topic is a title fragment;
+// justification/reason are one-paragraph human text — capped so a row/frame
+// stays small, same defensive stance as ACTIVITY_DETAIL_MAX_CHARS.
+const INVITE_TOPIC_MAX_CHARS = 200
+const INVITE_TEXT_MAX_CHARS = 1000
+const SESSION_ACK_STATES = new Set(['idle', 'busy'])
 
 // Last status per (user, convo). In-memory only and bounded (oldest-written
 // evicted first): a lost entry just means the header stays blank until the
@@ -331,6 +338,16 @@ export function notifyStale(hub, entry) {
 export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0 }) {
   const fail = (code, detail) =>
     conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code, ref: msg.op, ...(detail ? { detail } : {}) }))
+  // Invite ops: validate a room id + load the row. Rooms are top-level
+  // conversations of this conn's user; children (sub-chats) are silenced
+  // conversations and can never be rooms.
+  const loadRoom = (roomId) => {
+    if (typeof roomId !== 'string' || !roomId || roomId.length > CONVO_ID_MAX_CHARS) return { err: ['bad_request', 'bad room_id'] }
+    const room = db.prepare('SELECT owner_user_id, agent_device_id, parent_convo_id FROM conversations WHERE id=?').get(roomId)
+    if (!room || room.owner_user_id !== conn.userId) return { err: ['not_found'] }
+    if (room.parent_convo_id != null) return { err: ['bad_request', 'child conversations cannot be rooms'] }
+    return { room }
+  }
   // Single choke point: every journal event becomes a WS frame AND (fire and
   // forget) a candidate push, right here — nowhere else calls
   // hub.broadcastJournal for a freshly-appended event. The push pipeline runs
@@ -508,6 +525,123 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
               : { error: { code: msg.error.code, ...(typeof msg.error.detail === 'string' ? { detail: msg.error.detail } : {}) } }),
           },
         })
+        break
+      }
+      case 'agent_invite': {
+        if (conn.kind !== 'agent') return fail('forbidden')
+        // Replies (delivered/ack/answer) are found by a hub scan of this
+        // device's sockets — mid-replay this socket is invisible there, so
+        // reject like agent_request does rather than lose the reply.
+        if (!conn.registered) return fail('not_ready')
+        const { room, err } = loadRoom(msg.room_id)
+        if (err) return fail(...err)
+        if (room.agent_device_id !== conn.deviceId) return fail('forbidden', 'only the room owner may invite')
+        if (!Number.isInteger(msg.target_device_id)) return fail('bad_request', 'bad target_device_id')
+        if (msg.target_device_id === conn.deviceId) return fail('bad_request', 'cannot invite self')
+        if (msg.topic != null && (typeof msg.topic !== 'string' || msg.topic.length > INVITE_TOPIC_MAX_CHARS)) return fail('bad_request', 'bad topic')
+        if (typeof msg.justification !== 'string' || !msg.justification || msg.justification.length > INVITE_TEXT_MAX_CHARS) return fail('bad_request', 'bad justification')
+        // Unknown id, another user's device, and a client device are
+        // indistinguishable — anti-enumeration, same stance as agent_request.
+        const target = db.prepare('SELECT user_id, kind FROM devices WHERE id=?').get(msg.target_device_id)
+        if (!target || target.user_id !== conn.userId || target.kind !== 'agent') return fail('not_found')
+        const r = inviteParticipant(db, {
+          convoId: msg.room_id, agentDeviceId: msg.target_device_id,
+          initiatorDeviceId: conn.deviceId, justification: msg.justification,
+        })
+        if (!r.ok) return fail('conflict', `already ${r.state}`)
+        // Single-socket delivery (sendRpcRequest): a request turn must not
+        // double-inject on a mid-reconnect bridge. false = offline — undo
+        // the row so no pending invite exists that nobody was told about,
+        // and the caller hears it immediately (spec: honest fast status).
+        const delivered = hub.sendRpcRequest(conn.userId, msg.target_device_id, {
+          kind: 'invite', event: 'request', room_id: msg.room_id,
+          from_device_id: conn.deviceId, from_name: conn.name,
+          topic: msg.topic || '', justification: msg.justification,
+        })
+        if (!delivered) {
+          removeParticipant(db, msg.room_id, msg.target_device_id)
+          return fail('offline')
+        }
+        conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: msg.target_device_id }))
+        break
+      }
+      case 'agent_join': {
+        if (conn.kind !== 'agent') return fail('forbidden')
+        if (!conn.registered) return fail('not_ready')
+        const { room, err } = loadRoom(msg.room_id)
+        if (err) return fail(...err)
+        if (typeof msg.justification !== 'string' || !msg.justification || msg.justification.length > INVITE_TEXT_MAX_CHARS) return fail('bad_request', 'bad justification')
+        if (room.agent_device_id == null) return fail('conflict', 'room has no recorded owner to ask')
+        if (room.agent_device_id === conn.deviceId) return fail('bad_request', 'cannot join own room')
+        const r = inviteParticipant(db, {
+          convoId: msg.room_id, agentDeviceId: conn.deviceId,
+          initiatorDeviceId: conn.deviceId, justification: msg.justification,
+        })
+        if (!r.ok) return fail('conflict', `already ${r.state}`)
+        const delivered = hub.sendRpcRequest(conn.userId, room.agent_device_id, {
+          kind: 'invite', event: 'join_request', room_id: msg.room_id,
+          from_device_id: conn.deviceId, from_name: conn.name,
+          justification: msg.justification,
+        })
+        if (!delivered) {
+          removeParticipant(db, msg.room_id, conn.deviceId)
+          return fail('offline')
+        }
+        conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: room.agent_device_id }))
+        break
+      }
+      case 'agent_invite_ack':
+      case 'agent_invite_answer': {
+        if (conn.kind !== 'agent') return fail('forbidden')
+        const { room, err } = loadRoom(msg.room_id)
+        if (err) return fail(...err)
+        // Direction rule: the row names the non-owner participant;
+        // initiator_device_id says who started it; the NON-initiator acks/
+        // answers. peer_device_id present = the owner acting on a join
+        // request; absent = the participant acting on an owner invite.
+        let rowDeviceId
+        if (msg.peer_device_id != null) {
+          if (!Number.isInteger(msg.peer_device_id)) return fail('bad_request', 'bad peer_device_id')
+          if (room.agent_device_id !== conn.deviceId) return fail('forbidden', 'only the room owner answers a join request')
+          rowDeviceId = msg.peer_device_id
+        } else {
+          rowDeviceId = conn.deviceId
+        }
+        const row = getParticipant(db, msg.room_id, rowDeviceId)
+        if (!row || row.state !== 'invited') return fail('conflict', 'no pending invite')
+        if (row.initiator_device_id === conn.deviceId) return fail('forbidden', 'the initiator cannot answer its own invite')
+        if (msg.op === 'agent_invite_ack') {
+          if (!SESSION_ACK_STATES.has(msg.session_state)) return fail('bad_request', 'bad session_state')
+          hub.sendToDevice(conn.userId, row.initiator_device_id, {
+            kind: 'invite', event: 'ack', room_id: msg.room_id,
+            from_device_id: conn.deviceId, session_state: msg.session_state,
+          })
+          break
+        }
+        if (typeof msg.accept !== 'boolean') return fail('bad_request', 'bad accept')
+        if (msg.reason != null && (typeof msg.reason !== 'string' || msg.reason.length > INVITE_TEXT_MAX_CHARS)) return fail('bad_request', 'bad reason')
+        if (!answerInvite(db, { convoId: msg.room_id, agentDeviceId: rowDeviceId, accept: msg.accept })) {
+          return fail('conflict', 'no pending invite')
+        }
+        hub.sendToDevice(conn.userId, row.initiator_device_id, {
+          kind: 'invite', event: 'answer', room_id: msg.room_id,
+          peer_device_id: rowDeviceId, accept: msg.accept,
+          ...(typeof msg.reason === 'string' && msg.reason ? { reason: msg.reason } : {}),
+        })
+        break
+      }
+      case 'agent_leave': {
+        if (conn.kind !== 'agent') return fail('forbidden')
+        const { room, err } = loadRoom(msg.room_id)
+        if (err) return fail(...err)
+        if (!leaveConvo(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId })) {
+          return fail('conflict', 'not a joined participant')
+        }
+        if (room.agent_device_id != null && room.agent_device_id !== conn.deviceId) {
+          hub.sendToDevice(conn.userId, room.agent_device_id, {
+            kind: 'invite', event: 'left', room_id: msg.room_id, from_device_id: conn.deviceId,
+          })
+        }
         break
       }
       case 'read_marker': {
