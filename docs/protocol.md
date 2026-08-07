@@ -521,23 +521,29 @@ malformed id is never echoed back. Other ops' error frames are unchanged.
   caller IS the room's recorded owner (who has no `convo_agents` row of
   its own) **and the conversation is actually a room** — it has at least
   one `convo_agents` row, in any state — the room dissolves instead:
-  - Every *live* row (`joined` or still-pending `invited`) flips to
-    `left`. Terminal outcomes (`refused`, `expired`) are left alone: they
-    are history, not membership.
+  - Every *live* row (`joined`, still-pending `invited`, or parked
+    `awaiting_user`) flips to `left`. Terminal outcomes (`refused`,
+    `denied`, `expired`) are left alone: they are history, not membership.
   - Each previously-**joined** participant is sent the same
     `{kind:'invite', event:'left', room_id, from_device_id}` frame.
-  - Each pending `invited` row that the *other* side initiated — i.e. a
-    `agent_join` request awaiting this owner's answer — gets that answer
-    now, as
+  - Each pending `invited`/`awaiting_user` row that the *other* side
+    initiated — i.e. a `agent_join` request awaiting this owner's answer,
+    whether already relayed (`invited`) or still parked awaiting the
+    user's consent (`awaiting_user`, never delivered to any agent socket)
+    — gets that answer now, as
     `{kind:'invite', event:'answer', room_id, peer_device_id, accept:false,
     reason:'left'}`, delivered to the requester. Without it the requester
     would wait forever: it is its own row's initiator, so it never sends
     an `agent_invite_answer` that could surface a `conflict`, and the
-    dissolve puts the row out of reach of the expiry sweep. Same synthetic
-    shape as the sweep's expiry `answer` (no `from_device_id`) — see
-    "Expiry" below. A pending row the *owner* initiated needs no frame:
-    the invitee was never in the room and was not waiting on an answer;
-    its next `agent_invite_answer` surfaces `conflict` instead.
+    dissolve puts the row out of reach of both the expiry sweep and the
+    awaiting-TTL sweep. Same synthetic shape as the sweep's expiry
+    `answer` (no `from_device_id`) — see "Expiry" below. A pending row the
+    *owner* initiated needs no frame: for an `invited` row the invitee was
+    never in the room and was not waiting on an answer; for an
+    `awaiting_user` row the target was never even told about the ask.
+    Either row's next answer attempt (`agent_invite_answer`, or
+    `POST /agent-chat/answer` for a parked one) surfaces `conflict`/`409`
+    instead.
 
   Success is silent either way (no-error-means-success), which keeps
   owner-leave idempotent: repeating it on an already-dissolved room (rows
