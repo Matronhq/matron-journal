@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { openDb } from '../src/db.js'
 import {
-  inviteParticipant, answerInvite, leaveConvo, removeParticipant, undoInvite,
+  inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, removeParticipant, undoInvite,
   joinedAgentIds, getParticipant, isParticipant, expireInvites,
 } from '../src/participants.js'
 
@@ -56,6 +56,27 @@ test('leaveConvo flips only a joined row', () => {
   answerInvite(d, { convoId: 'room', agentDeviceId: 2, accept: true })
   assert.equal(leaveConvo(d, { convoId: 'room', agentDeviceId: 2 }), true)
   assert.equal(getParticipant(d, 'room', 2).state, 'left')
+})
+
+test('leaveAllParticipants flips every non-left row of that convo and returns the previously-joined ids', () => {
+  const d = db()
+  inviteParticipant(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'x' })
+  answerInvite(d, { convoId: 'room', agentDeviceId: 2, accept: true })
+  inviteParticipant(d, { convoId: 'room', agentDeviceId: 3, initiatorDeviceId: 1, justification: 'x' }) // stays pending
+  inviteParticipant(d, { convoId: 'room', agentDeviceId: 4, initiatorDeviceId: 1, justification: 'x' })
+  answerInvite(d, { convoId: 'room', agentDeviceId: 4, accept: false }) // refused
+  inviteParticipant(d, { convoId: 'other', agentDeviceId: 5, initiatorDeviceId: 1, justification: 'x' })
+  answerInvite(d, { convoId: 'other', agentDeviceId: 5, accept: true })
+
+  assert.deepEqual(leaveAllParticipants(d, 'room'), [2], 'only the previously-joined id is owed a notification')
+  assert.equal(getParticipant(d, 'room', 2).state, 'left')
+  assert.equal(getParticipant(d, 'room', 3).state, 'left')
+  assert.equal(getParticipant(d, 'room', 4).state, 'left')
+  assert.equal(getParticipant(d, 'other', 5).state, 'joined', 'other convos untouched')
+  // Idempotent: a second dissolution finds nothing to flip or report.
+  assert.deepEqual(leaveAllParticipants(d, 'room'), [])
+  // And a convo with no rows at all is a clean no-op too.
+  assert.deepEqual(leaveAllParticipants(d, 'empty'), [])
 })
 
 test('joinedAgentIds returns only joined participants of that convo', () => {

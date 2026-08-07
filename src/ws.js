@@ -1,7 +1,7 @@
 import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { eventsAfter, append, markRead, upsertConversation, toEventShape } from './journal.js'
-import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, undoInvite, getParticipant, expireInvites } from './participants.js'
+import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, undoInvite, getParticipant, expireInvites } from './participants.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -696,6 +696,20 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (!conn.registered) return fail('not_ready')
         const { room, err } = loadRoom(msg.room_id)
         if (err) return fail(...err)
+        // Owner leave: the recorded owner has no convo_agents row, so
+        // leaveConvo can never represent it — the room dissolves instead.
+        // Every not-yet-left row flips to left and each previously-JOINED
+        // participant is told; success stays silent to the leaver (protocol
+        // convention — no error means success), which also makes a repeated
+        // owner-leave, or one on a participant-less room, idempotent.
+        if (room.agent_device_id === conn.deviceId) {
+          for (const deviceId of leaveAllParticipants(db, msg.room_id)) {
+            hub.sendToDevice(conn.userId, deviceId, {
+              kind: 'invite', event: 'left', room_id: msg.room_id, from_device_id: conn.deviceId,
+            })
+          }
+          break
+        }
         if (!leaveConvo(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId })) {
           return fail('conflict', 'not a joined participant')
         }

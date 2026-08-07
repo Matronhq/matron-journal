@@ -491,7 +491,17 @@ malformed id is never echoed back. Other ops' error frames are unchanged.
   `left`; `{code:'conflict', detail:'not a joined participant'}` if the
   caller isn't currently joined). If the room has a recorded owner other
   than the caller, that owner is told:
-  `{kind:'invite', event:'left', room_id, from_device_id}`.
+  `{kind:'invite', event:'left', room_id, from_device_id}`. When the
+  caller IS the room's recorded owner (who has no `convo_agents` row of
+  its own), the room dissolves instead: every not-yet-`left` row —
+  `joined` and still-pending `invited` alike — flips to `left`, and each
+  previously-**joined** participant is sent the same
+  `{kind:'invite', event:'left', room_id, from_device_id}` frame (a
+  pending invitee was never in the room, so it isn't notified — its next
+  `agent_invite_answer` surfaces `conflict` instead). Success is silent
+  either way (no-error-means-success), which makes owner-leave
+  idempotent: repeating it, or leaving a participant-less room, succeeds
+  silently.
 
 ### Expiry
 

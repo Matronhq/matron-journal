@@ -144,6 +144,52 @@ test('agent_leave flips joined to left and notifies the owner', async (t) => {
   assert.equal(err.code, 'conflict')
 })
 
+test('owner leave dissolves the room: joined peers are told, pending invites die', async (t) => {
+  const { s, dan, agA, agB, a, b } = await fleet(t)
+  const agC = createAgent(s.db, dan.id, 'dev-c')
+  const c = await makeWsClient(s.base, { token: agC.token, cursor: null })
+  await c.waitFor((f) => f.op === 'hello_ok')
+  t.after(() => c.close())
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x' })
+  answerInvite(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, accept: true })
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agC.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x' })
+  // C stays merely invited.
+
+  a.send({ op: 'agent_leave', room_id: 'room' })
+  const left = await b.waitFor((f) => f.kind === 'invite' && f.event === 'left')
+  assert.equal(left.room_id, 'room')
+  assert.equal(left.from_device_id, agA.deviceId)
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'left')
+  // The pending invite dies with the room — but its device was never joined,
+  // so it gets no 'left' frame; its next answer attempt tells the story.
+  assert.equal(getParticipant(s.db, 'room', agC.deviceId).state, 'left')
+  c.send({ op: 'agent_invite_answer', room_id: 'room', accept: true })
+  const err = await c.waitFor((f) => f.op === 'error' && f.ref === 'agent_invite_answer')
+  assert.equal(err.code, 'conflict')
+  assert.ok(!c.frames.some((f) => f.kind === 'invite' && f.event === 'left'), 'a pending invitee is not notified')
+
+  // Repeated owner-leave is a silent success (no-error-means-success), not a
+  // conflict. Proven with a barrier: a deliberately-failing leave on an
+  // unknown room — per-connection FIFO means its not_found arriving proves
+  // the repeat before it produced no error frame.
+  a.frames.length = 0
+  a.send({ op: 'agent_leave', room_id: 'room' })
+  a.send({ op: 'agent_leave', room_id: 'nope' })
+  const barrier = await a.waitFor((f) => f.op === 'error' && f.ref === 'agent_leave')
+  assert.equal(barrier.code, 'not_found')
+  assert.equal(barrier.room_id, 'nope')
+  assert.ok(!a.frames.some((f) => f.op === 'error' && f.room_id === 'room'), 'repeated owner-leave must be silent')
+})
+
+test('owner leave on a room with no participants is a silent success', async (t) => {
+  const { a } = await fleet(t)
+  a.send({ op: 'agent_leave', room_id: 'room' })
+  a.send({ op: 'agent_leave', room_id: 'nope' }) // FIFO barrier, same trick as above
+  const barrier = await a.waitFor((f) => f.op === 'error' && f.ref === 'agent_leave')
+  assert.equal(barrier.code, 'not_found')
+  assert.ok(!a.frames.some((f) => f.op === 'error' && f.room_id === 'room'))
+})
+
 test('agent_invite_ack/agent_invite_answer/agent_leave reject an unregistered agent connection', async (t) => {
   // hello_ok flips conn.registered=true only after the auth+replay dance
   // completes; mid-replay this socket is invisible to hub scans, same

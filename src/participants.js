@@ -76,6 +76,24 @@ export function undoInvite(db, convoId, agentDeviceId, prior) {
   `).run(prior.state, prior.initiator_device_id, prior.justification, prior.created_at, prior.answered_at, convoId, agentDeviceId)
 }
 
+// Owner-leave dissolution (ws.js agent_leave): the recorded owner has no
+// convo_agents row of its own, so an owner leaving means the whole room
+// winds down — every not-yet-left row (joined and still-pending alike)
+// flips to 'left'. Returns the device ids that were 'joined' beforehand,
+// the only ones owed a live 'left' notification (a pending invitee was
+// never in the room to begin with). SELECT-then-UPDATE instead of a single
+// RETURNING statement because RETURNING reports post-update values, which
+// can't tell a previously-joined row from a previously-invited one; the
+// two statements can't interleave (better-sqlite3 is synchronous).
+// Idempotent: a room with nothing to flip returns [].
+export function leaveAllParticipants(db, convoId, now = Date.now()) {
+  const joined = joinedAgentIds(db, convoId)
+  db.prepare(
+    "UPDATE convo_agents SET state='left', answered_at=? WHERE convo_id=? AND state<>'left'"
+  ).run(now, convoId)
+  return joined
+}
+
 export function joinedAgentIds(db, convoId) {
   return db.prepare(
     "SELECT agent_device_id FROM convo_agents WHERE convo_id=? AND state='joined'"
