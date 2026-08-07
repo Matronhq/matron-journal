@@ -5,7 +5,7 @@ import { createUser, createAgent } from '../src/auth.js'
 import { openDb } from '../src/db.js'
 import { upsertConversation } from '../src/journal.js'
 import { getParticipant, parkInvite, answerParkedInvite } from '../src/participants.js'
-import { addAllowance } from '../src/allowances.js'
+import { addAllowance, isAllowed } from '../src/allowances.js'
 import { deliverPendingInvites } from '../src/invite-delivery.js'
 
 // Harness pattern copied from the top of test/invites.test.js: one user, one
@@ -42,7 +42,7 @@ async function fleet(t) {
 // the invite target / join requester, depending on the test. `name` lets one
 // test give `agA` an attacker-shaped device name to prove the card sanitises
 // from_name too.
-async function roomFleet(t, { ownerName = 'dev-a' } = {}) {
+async function roomFleet(t, { ownerName = 'dev-a', connectB = true } = {}) {
   const s = await startTestServer()
   t.after(() => s.close())
   const dan = await createUser(s.db, 'dan', 'pw')
@@ -51,17 +51,20 @@ async function roomFleet(t, { ownerName = 'dev-a' } = {}) {
   const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
   const clientToken = login.json.token
   const a = await makeWsClient(s.base, { token: agA.token, cursor: null })
-  const b = await makeWsClient(s.base, { token: agB.token, cursor: null })
+  // connectB:false stands in for a target that is offline at the moment of
+  // approval — the HTTP answer-route tests need a device that genuinely has
+  // no live socket, not one that raced a close.
+  const b = connectB ? await makeWsClient(s.base, { token: agB.token, cursor: null }) : null
   const client = await makeWsClient(s.base, { token: clientToken, cursor: null })
   await a.waitFor((f) => f.op === 'hello_ok')
-  await b.waitFor((f) => f.op === 'hello_ok')
+  if (b) await b.waitFor((f) => f.op === 'hello_ok')
   await client.waitFor((f) => f.op === 'hello_ok')
-  t.after(() => { a.close(); b.close(); client.close() })
+  t.after(() => { a.close(); b?.close(); client.close() })
   a.send({ op: 'convo_upsert', convo_id: 'room', title: 'room', session_state: 'running' })
   await a.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
   await client.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
   a.frames.length = 0
-  b.frames.length = 0
+  if (b) b.frames.length = 0
   client.frames.length = 0
   return { s, dan, agA, agB, clientToken, a, b, client }
 }
@@ -393,4 +396,211 @@ test('sweep: a parked ask nobody answered for 24h expires and the requester hear
   assert.equal(ans.reason, 'refused', 'a user-side timeout must read exactly like a refusal — a peer must never learn "expired" means the human never even saw it')
   assert.equal(ans.peer_device_id, agB.deviceId)
   assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'expired')
+})
+
+// --- Task 9: client-gated HTTP /agent-chat/pending + /agent-chat/answer ---
+
+test('403: agent tokens are forbidden from both agent-chat HTTP routes, including answering a request addressed to itself', async (t) => {
+  const { s, agA, agB, a } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'need logs' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+
+  const pending = await s.http('/agent-chat/pending', { token: agA.token })
+  assert.equal(pending.status, 403)
+  assert.deepEqual(pending.json, { error: 'forbidden' })
+
+  const asOwner = await s.http('/agent-chat/answer', {
+    method: 'POST', token: agA.token,
+    body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'approve' },
+  })
+  assert.equal(asOwner.status, 403)
+
+  // The parked row's target IS agB — even so, agB's own agent token must not
+  // be able to answer a request addressed to itself. Only a client token may
+  // ever answer.
+  const asTarget = await s.http('/agent-chat/answer', {
+    method: 'POST', token: agB.token,
+    body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'approve' },
+  })
+  assert.equal(asTarget.status, 403)
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'awaiting_user', 'the 403s must not have mutated the row')
+})
+
+test('POST /agent-chat/answer: an unknown room is 404', async (t) => {
+  const { s, agB, clientToken } = await roomFleet(t)
+  const r = await s.http('/agent-chat/answer', {
+    method: 'POST', token: clientToken,
+    body: { room_id: 'does-not-exist', target_device_id: agB.deviceId, decision: 'approve' },
+  })
+  assert.equal(r.status, 404)
+  assert.deepEqual(r.json, { error: 'not_found' })
+})
+
+test('POST /agent-chat/answer: a room owned by another user is 404, not 403 (anti-enumeration parity)', async (t) => {
+  const { s, agB, clientToken } = await roomFleet(t)
+  await createUser(s.db, 'pat', 'pw')
+  const patLogin = await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'x' } })
+  const r = await s.http('/agent-chat/answer', {
+    method: 'POST', token: patLogin.json.token,
+    body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'approve' },
+  })
+  assert.equal(r.status, 404)
+  assert.deepEqual(r.json, { error: 'not_found' })
+})
+
+test('GET /agent-chat/pending lists a parked row with title+topic, and empties once it is answered', async (t) => {
+  const { s, agA, agB, clientToken, a } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci topic', justification: 'need logs' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+
+  const before = await s.http('/agent-chat/pending', { token: clientToken })
+  assert.equal(before.status, 200)
+  assert.equal(before.json.pending.length, 1)
+  const row = before.json.pending[0]
+  assert.equal(row.convo_id, 'room')
+  assert.equal(row.agent_device_id, agB.deviceId)
+  assert.equal(row.initiator_device_id, agA.deviceId)
+  assert.equal(row.topic, 'ci topic')
+  assert.equal(row.justification, 'need logs')
+  assert.equal(row.title, 'room')
+  assert.ok(row.created_at)
+
+  const ans = await s.http('/agent-chat/answer', {
+    method: 'POST', token: clientToken,
+    body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'deny' },
+  })
+  assert.equal(ans.status, 200)
+
+  const after = await s.http('/agent-chat/pending', { token: clientToken })
+  assert.deepEqual(after.json.pending, [])
+})
+
+test('POST /agent-chat/answer approve, target offline: row -> invited, {ok:true, delivered:false}', async (t) => {
+  const { s, agB, clientToken, a } = await roomFleet(t, { connectB: false })
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'need logs' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+
+  const r = await s.http('/agent-chat/answer', {
+    method: 'POST', token: clientToken,
+    body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'approve' },
+  })
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.json, { ok: true, delivered: false })
+  const row = getParticipant(s.db, 'room', agB.deviceId)
+  assert.equal(row.state, 'invited')
+  assert.equal(row.delivered_at, null, 'nobody has actually relayed the request yet')
+})
+
+test('POST /agent-chat/answer approve, target online: target receives the request frame, delivered:true', async (t) => {
+  const { s, agA, agB, clientToken, a, b } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'need logs' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+
+  const r = await s.http('/agent-chat/answer', {
+    method: 'POST', token: clientToken,
+    body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'approve' },
+  })
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.json, { ok: true, delivered: true })
+
+  const req = await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
+  assert.equal(req.room_id, 'room')
+  assert.equal(req.from_device_id, agA.deviceId)
+  assert.equal(req.from_name, 'dev-a')
+  assert.equal(req.topic, 'ci')
+  assert.equal(req.justification, 'need logs')
+  assert.ok(getParticipant(s.db, 'room', agB.deviceId).delivered_at != null)
+})
+
+test('POST /agent-chat/answer deny: row -> denied, requester gets an answer frame with reason "refused" (never "denied")', async (t) => {
+  const { s, agB, clientToken, a } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'need logs' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+
+  const r = await s.http('/agent-chat/answer', {
+    method: 'POST', token: clientToken,
+    body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'deny' },
+  })
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.json, { ok: true })
+
+  const ans = await a.waitFor((f) => f.kind === 'invite' && f.event === 'answer')
+  assert.equal(ans.accept, false)
+  assert.equal(ans.reason, 'refused')
+  assert.equal(ans.peer_device_id, agB.deviceId)
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'denied')
+})
+
+test('POST /agent-chat/answer on a non-awaiting row is 409', async (t) => {
+  const { s, agB, clientToken } = await roomFleet(t)
+  // No invite was ever parked for this pair — getParticipant returns null,
+  // so the row is not in state 'awaiting_user'.
+  const r = await s.http('/agent-chat/answer', {
+    method: 'POST', token: clientToken,
+    body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'approve' },
+  })
+  assert.equal(r.status, 409)
+  assert.deepEqual(r.json, { error: 'conflict' })
+})
+
+test('POST /agent-chat/answer: a bad decision value is 400', async (t) => {
+  const { s, agB, clientToken } = await roomFleet(t)
+  const r = await s.http('/agent-chat/answer', {
+    method: 'POST', token: clientToken,
+    body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'maybe' },
+  })
+  assert.equal(r.status, 400)
+  assert.deepEqual(r.json, { error: 'bad_request' })
+})
+
+test('POST /agent-chat/answer: a non-integer target_device_id is 400', async (t) => {
+  const { s, clientToken } = await roomFleet(t)
+  const r = await s.http('/agent-chat/answer', {
+    method: 'POST', token: clientToken,
+    body: { room_id: 'room', target_device_id: 'not-a-number', decision: 'approve' },
+  })
+  assert.equal(r.status, 400)
+  assert.deepEqual(r.json, { error: 'bad_request' })
+})
+
+test('always_allow:true on approve records the directed pair; a following agent_invite between them relays immediately', async (t) => {
+  const { s, agB, clientToken, a, b } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'need logs' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+
+  const r = await s.http('/agent-chat/answer', {
+    method: 'POST', token: clientToken,
+    body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'approve', always_allow: true },
+  })
+  assert.equal(r.status, 200)
+  await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
+
+  // A second room, second invite for the same directed pair: the allowance
+  // just recorded must bypass the park entirely (Task 7's allowance-bypass
+  // path), so no HTTP approval is needed this time.
+  a.send({ op: 'convo_upsert', convo_id: 'room2', title: 'room2', session_state: 'running' })
+  await a.waitFor((f) => f.kind === 'journal' && f.type === 'session_status' && f.convo_id === 'room2')
+  a.frames.length = 0
+  b.frames.length = 0
+
+  a.send({ op: 'agent_invite', room_id: 'room2', target_device_id: agB.deviceId, topic: 'ci2', justification: 'again' })
+  const req2 = await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
+  assert.equal(req2.room_id, 'room2')
+  assert.equal(getParticipant(s.db, 'room2', agB.deviceId).state, 'invited')
+  assert.ok(getParticipant(s.db, 'room2', agB.deviceId).delivered_at != null)
+})
+
+test('always_allow JOIN direction: approving a join request records (joiner -> room owner), never the reverse', async (t) => {
+  const { s, dan, agA, agB, clientToken, b } = await roomFleet(t)
+  b.send({ op: 'agent_join', room_id: 'room', justification: 'let me help with this bug' })
+  await b.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+
+  const r = await s.http('/agent-chat/answer', {
+    method: 'POST', token: clientToken,
+    body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'approve', always_allow: true },
+  })
+  assert.equal(r.status, 200)
+
+  assert.ok(isAllowed(s.db, dan.id, agB.deviceId, agA.deviceId), 'the pair recorded must be joiner -> room owner')
+  assert.ok(!isAllowed(s.db, dan.id, agA.deviceId, agB.deviceId), 'must not record the reverse direction')
 })
