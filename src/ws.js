@@ -1,5 +1,5 @@
 import { WebSocketServer } from 'ws'
-import { authToken, authorize } from './auth.js'
+import { authToken, authorize, authorizeAgentWrite } from './auth.js'
 import { eventsAfter, append, markRead, upsertConversation, toEventShape } from './journal.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
@@ -577,6 +577,13 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (typeof msg.idem_key === 'string' && msg.idem_key.startsWith('fin:')) {
           return fail('bad_request', 'idem_key prefix fin: is reserved')
         }
+        // Wrong-conversation tightening (spec: agent chat phase 2): an agent
+        // device writes only into conversations it manages or has joined.
+        // append() would reject a cross-USER convo anyway; this closes the
+        // same-user cross-DEVICE hole with an explicit error frame.
+        if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) {
+          return fail('forbidden', 'not a participant of this conversation')
+        }
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `agent:${conn.name}`, type: msg.type, payload: msg.payload,
@@ -593,7 +600,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         // but that only bounds the blast radius to the agent's own user; within
         // that user, a bridge could still spoof a live text overlay into a
         // conversation it does not own. Fail closed instead, uniformly.
-        if (!authorize(db, conn.userId, msg.convo_id)) return fail('forbidden')
+        if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) return fail('forbidden')
         // Overlay text is bounded by the 1 MiB WS frame cap and is never
         // retained (transient, latest-wins in the coalescer), so no separate
         // byte cap is needed — but reject a non-string text/replace_text rather
@@ -608,7 +615,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
       }
       case 'stream_append': {
         if (conn.kind !== 'agent') return fail('forbidden')
-        if (!authorize(db, conn.userId, msg.convo_id)) return fail('forbidden')
+        if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) return fail('forbidden')
         if (typeof msg.message_ref !== 'string' || !msg.message_ref) return fail('bad_request')
         if (typeof msg.chunk !== 'string' || !Number.isInteger(msg.offset) || msg.offset < 0) return fail('bad_request')
         const r = toolStreams.append({
@@ -639,7 +646,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         // (viewing-scoped, coalesced, never throws on a dead/slow socket).
         if (conn.kind !== 'agent') return fail('forbidden')
         if (!ACTIVITY_STATES.has(msg.state)) return fail('bad_request')
-        if (!authorize(db, conn.userId, msg.convo_id)) return fail('forbidden')
+        if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) return fail('forbidden')
         const detail = typeof msg.detail === 'string' ? msg.detail.slice(0, ACTIVITY_DETAIL_MAX_CHARS) : undefined
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id,
@@ -657,7 +664,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         // a server deploy.
         if (conn.kind !== 'agent') return fail('forbidden')
         if (typeof msg.status !== 'object' || msg.status === null) return fail('bad_request')
-        if (!authorize(db, conn.userId, msg.convo_id)) return fail('forbidden')
+        if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) return fail('forbidden')
         let encoded
         try { encoded = JSON.stringify(msg.status) } catch { return fail('bad_request') }
         if (Buffer.byteLength(encoded, 'utf8') > STATUS_MAX_BYTES) return fail('bad_request', 'status too large')
@@ -675,6 +682,13 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         const type = msg.type || 'text'
         if (!AGENT_PUBLISH_TYPES.has(type)) return fail('bad_request')
         if (typeof msg.payload !== 'object' || msg.payload === null) return fail('bad_request')
+        // Wrong-conversation tightening (spec: agent chat phase 2): an agent
+        // device writes only into conversations it manages or has joined.
+        // append() would reject a cross-USER convo anyway; this closes the
+        // same-user cross-DEVICE hole with an explicit error frame.
+        if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) {
+          return fail('forbidden', 'not a participant of this conversation')
+        }
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `agent:${conn.name}`, type, payload: msg.payload,
