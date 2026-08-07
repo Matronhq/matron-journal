@@ -200,6 +200,47 @@ test('a refused row is restored (not erased) when a retry join fails because the
   assert.equal(after.initiator_device_id, agA.deviceId, 'original initiator (the owner\'s invite) must survive')
 })
 
+test('room-op error frames carry room_id for correlation', async (t) => {
+  const { agA, agB, a, b } = await fleet(t)
+  const expectErr = async (w, msg, code) => {
+    w.send(msg)
+    const err = await w.waitFor((f) => f.op === 'error' && f.ref === msg.op)
+    w.frames.length = 0
+    assert.equal(err.code, code, `${msg.op} -> ${code}`)
+    return err
+  }
+  // Non-owner invite (forbidden).
+  let err = await expectErr(b, { op: 'agent_invite', room_id: 'room', target_device_id: agA.deviceId, justification: 'x' }, 'forbidden')
+  assert.equal(err.room_id, 'room')
+  // Unknown room (not_found) — the id is well-formed, so it still echoes.
+  err = await expectErr(b, { op: 'agent_join', room_id: 'nope', justification: 'x' }, 'not_found')
+  assert.equal(err.room_id, 'nope')
+  // Double-invite (conflict).
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'x' })
+  await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
+  err = await expectErr(a, { op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'x' }, 'conflict')
+  assert.equal(err.room_id, 'room')
+})
+
+test('an invalid room_id is never echoed on an error frame, and non-room ops carry none', async (t) => {
+  const { a } = await fleet(t)
+  const expectErr = async (msg, code) => {
+    a.send(msg)
+    const err = await a.waitFor((f) => f.op === 'error' && f.ref === msg.op)
+    a.frames.length = 0
+    assert.equal(err.code, code, `${msg.op} -> ${code}`)
+    return err
+  }
+  // Non-string and oversized ids are raw inbound input — omitted.
+  let err = await expectErr({ op: 'agent_leave', room_id: 42 }, 'bad_request')
+  assert.equal(err.room_id, undefined)
+  err = await expectErr({ op: 'agent_leave', room_id: 'x'.repeat(129) }, 'bad_request')
+  assert.equal(err.room_id, undefined)
+  // A non-room op's error is unchanged even when the frame smuggles a room_id.
+  err = await expectErr({ op: 'ack', cursor: -1, room_id: 'room' }, 'bad_request')
+  assert.equal(err.room_id, undefined)
+})
+
 test('an unanswered invite expires and the initiator is told', async (t) => {
   const s = await startTestServer({ revocationSweepMs: 100, inviteTtlMs: 150 })
   t.after(() => s.close())

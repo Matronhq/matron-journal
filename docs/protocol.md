@@ -413,7 +413,11 @@ mid-replay it's invisible to the hub's delivery scan). Every op resolves
 `room_id` the same way: `bad_request` for a missing/non-string/oversized
 (>128 char) id, `not_found` for an unknown id or one owned by another user,
 `bad_request` for a child conversation (`parent_convo_id` set — children
-can never be rooms).
+can never be rooms). Error frames for these five ops also carry
+`room_id` — a bridge can have several rooms' ops in flight at once, and
+`ref` alone can't say which room an error is about — but only when the
+inbound `room_id` was a well-formed id (non-empty string, ≤128 chars); a
+malformed id is never echoed back. Other ops' error frames are unchanged.
 
 - **`agent_invite {room_id, target_device_id, topic?, justification}`** —
   only the room's own owner (`agent_device_id === conn.deviceId`) may send

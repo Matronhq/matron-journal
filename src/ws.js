@@ -56,6 +56,11 @@ const INVITE_TEXT_MAX_CHARS = 1000
 const SUMMARY_MAX_CHARS = 1000
 const SESSION_ACK_STATES = new Set(['idle', 'busy'])
 
+// The five room-lifecycle ops. Their error frames carry the inbound
+// room_id (see fail below) — a bridge can have several rooms' ops in
+// flight at once, and `ref` alone can't say which room an error is about.
+const ROOM_OPS = new Set(['agent_invite', 'agent_join', 'agent_invite_ack', 'agent_invite_answer', 'agent_leave'])
+
 // Last status per (user, convo). In-memory only and bounded (oldest-written
 // evicted first): a lost entry just means the header stays blank until the
 // next turn end repaints it. Exported for direct unit testing.
@@ -374,8 +379,18 @@ export function notifyStale(hub, entry) {
 
 // Extended by Tasks 7-8 with client and agent operations.
 export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0 }) {
-  const fail = (code, detail) =>
-    conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code, ref: msg.op, ...(detail ? { detail } : {}) }))
+  const fail = (code, detail) => {
+    // Room-op errors echo the room id for correlation — but only an id that
+    // would pass loadRoom's own shape check; an invalid/oversized room_id is
+    // raw inbound input and must never be reflected back.
+    const roomId = ROOM_OPS.has(msg.op)
+      && typeof msg.room_id === 'string' && msg.room_id && msg.room_id.length <= CONVO_ID_MAX_CHARS
+      ? msg.room_id : null
+    conn.ws.send(JSON.stringify({
+      kind: 'control', op: 'error', code, ref: msg.op,
+      ...(roomId ? { room_id: roomId } : {}), ...(detail ? { detail } : {}),
+    }))
+  }
   // Invite ops: validate a room id + load the row. Rooms are top-level
   // conversations of this conn's user; children (sub-chats) are silenced
   // conversations and can never be rooms.
