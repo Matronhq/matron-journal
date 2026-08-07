@@ -701,6 +701,23 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (msg.summary != null && (typeof msg.summary !== 'string' || msg.summary.length > SUMMARY_MAX_CHARS)) {
           return fail('bad_request', 'bad summary')
         }
+        // Room-upsert ownership gate (fix: convo_upsert takeover bypass). A
+        // conversation with at least one convo_agents row (any state) is a
+        // "room" — once participants have been drawn into its lifecycle,
+        // ONLY the recorded owner may upsert it at all, joined guests and
+        // uninvited strangers alike (a guest upsert would otherwise flap
+        // session_state/title/summary the creator owns, or worse — with the
+        // old code — become the recorded owner itself and cut the real
+        // owner out of fan-out). A participant-less conversation keeps the
+        // pre-existing last-writer-wins takeover (a re-paired bridge with a
+        // new device id reclaiming its own sessions), and a conversation
+        // with no recorded owner (legacy NULL rows) stays writable by
+        // anyone. See docs/protocol.md "Agent delivery scoping".
+        const existingRoom = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(msg.convo_id)
+        if (existingRoom && existingRoom.agent_device_id != null && existingRoom.agent_device_id !== conn.deviceId) {
+          const hasParticipants = db.prepare('SELECT 1 FROM convo_agents WHERE convo_id=? LIMIT 1').get(msg.convo_id)
+          if (hasParticipants) return fail('forbidden', 'only the room owner may upsert a room')
+        }
         const convo = upsertConversation(db, {
           id: msg.convo_id, ownerUserId: conn.userId,
           title: msg.title, sessionState: msg.session_state,

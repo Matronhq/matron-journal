@@ -82,6 +82,49 @@ test('legacy NULL-owner convo still accepts any agent write', async (t) => {
   await b.waitFor((f) => f.kind === 'journal' && f.type === 'text' && f.payload.body === 'ok')
 })
 
+test('room-upsert gate: an uninvited stranger cannot upsert a room that has any participant history; ownership is unchanged; its publish stays forbidden', async (t) => {
+  const { s, dan, agA, agB, a, b } = await fleet(t)
+  // Give the room participant history via a THIRD device (never B), so this
+  // test isolates the "any convo_agents row at all" predicate from B's own
+  // membership state (that's the separate JOINED-guest test below).
+  const agC = createAgent(s.db, dan.id, 'dev-c')
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agC.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x' })
+
+  b.send({ op: 'convo_upsert', convo_id: 'room', title: 'stolen', session_state: 'idle' })
+  const err = await b.waitFor((f) => f.op === 'error' && f.ref === 'convo_upsert')
+  assert.equal(err.code, 'forbidden')
+
+  const row = s.db.prepare('SELECT agent_device_id, title, session_state FROM conversations WHERE id=?').get('room')
+  assert.equal(row.agent_device_id, agA.deviceId, 'ownership must not change')
+  assert.equal(row.title, 'room', 'title must not change')
+  assert.equal(row.session_state, 'running', 'session_state must not change')
+
+  b.send({ op: 'publish', convo_id: 'room', type: 'text', payload: { body: 'sneak' } })
+  const err2 = await b.waitFor((f) => f.op === 'error' && f.ref === 'publish')
+  assert.equal(err2.code, 'forbidden')
+})
+
+test('room-upsert gate: a JOINED guest cannot upsert the room it joined either', async (t) => {
+  const { s, agA, agB, a, b } = await fleet(t)
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x' })
+  answerInvite(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, accept: true })
+
+  b.send({ op: 'convo_upsert', convo_id: 'room', title: 'guest-set', session_state: 'idle' })
+  const err = await b.waitFor((f) => f.op === 'error' && f.ref === 'convo_upsert')
+  assert.equal(err.code, 'forbidden')
+
+  const row = s.db.prepare('SELECT agent_device_id, title, session_state FROM conversations WHERE id=?').get('room')
+  assert.equal(row.agent_device_id, agA.deviceId)
+  assert.equal(row.title, 'room')
+  assert.equal(row.session_state, 'running')
+})
+
+// A participant-less convo must still allow last-writer-wins takeover (a
+// re-paired bridge with a new device id reclaiming its own sessions) — this
+// is already covered end-to-end by agent-scoped-delivery.test.js's "a later
+// convo_upsert by another device takes over delivery" (convo 'sess-move' has
+// zero convo_agents rows throughout), so it is not duplicated here.
+
 test('convo_upsert rejects a non-string or oversize summary', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())

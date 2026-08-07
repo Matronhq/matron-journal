@@ -225,6 +225,32 @@ the machine-checkable version of this page.
   conversation for an agent connection, so a joined participant catching up
   after a disconnect sees the room's backlog too, not just live traffic
   from the moment it joined.
+- **Room-upsert ownership gate.** Before `convo_upsert` reaches the
+  ownership no-steal logic above, the server checks: if the conversation
+  already exists, has at least one `convo_agents` row (any state — the
+  conversation is a "room"), and its recorded owner (`agent_device_id`) is
+  non-NULL and different from the upserting device, the WHOLE upsert is
+  rejected with `{code:'forbidden', detail:'only the room owner may upsert
+  a room'}` — no title/state/summary change is applied, not even a
+  non-ownership-changing one. This is stricter than the no-steal rule
+  above: a guest used to be allowed to upsert a room's title/session_state
+  (just never reassign its ownership); now, once a room has ANY
+  participant history, only its recorded owner may upsert it at all —
+  joined guests and uninvited strangers alike, since either one's own
+  housekeeping upsert would otherwise flap title/session_state/summary
+  that the room's creator owns. A participant-less conversation (no
+  `convo_agents` rows at all) keeps the old last-writer-wins takeover
+  behavior — a re-paired bridge with a new device id can still reclaim its
+  own sessions — and a conversation with no recorded owner (legacy NULL)
+  stays writable by anyone. Accepted trade-off for v1: a re-paired owner
+  (new device id after a bridge restart pairs fresh) can no longer reclaim
+  a room it created once that room has participant history, because the
+  gate sees a mismatched non-NULL owner and a populated `convo_agents`
+  table — same "needs a fresh invite" story as any other stranger. The
+  ownership no-steal predicate in `upsertConversation` itself still runs
+  underneath as belt-and-braces for any caller that reaches it directly
+  (e.g. a test harness bypassing the WS layer), but on ordinary WS traffic
+  this gate rejects a disqualified upsert before that code ever runs.
 - Agent write authorization: `publish`, `finalize`, `stream`,
   `stream_append`, `activity`, and `status` all gate on the same rule
   (`authorizeAgentWrite`) — the agent device must be the conversation's
