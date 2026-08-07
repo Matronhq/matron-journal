@@ -343,7 +343,8 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
     // receive frames for conversations they own. Looked up per frame — the
     // convo row is already hot from append()'s own authorization read.
     const owner = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(frame.convo_id)
-    hub.broadcastJournal(conn.userId, frame, owner ? owner.agent_device_id : null)
+    const ownerId = owner ? owner.agent_device_id : null
+    hub.broadcastJournal(conn.userId, frame, ownerId == null ? null : new Set([ownerId]))
     try {
       pushPipeline.onAppend(conn.userId, frame, conn.deviceId, pushHint)
     } catch (err) {
