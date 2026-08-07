@@ -1,6 +1,7 @@
 import { WebSocketServer } from 'ws'
 import { authToken, authorize, authorizeAgentWrite } from './auth.js'
 import { eventsAfter, append, markRead, upsertConversation, toEventShape } from './journal.js'
+import { joinedAgentIds } from './participants.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -205,24 +206,27 @@ export function attachWs({
               return
             }
             let cursor = msg.cursor
-            // Agent connections replay only their own conversations' frames —
-            // the same ownership scoping hub.broadcastJournal applies to live
-            // traffic (NULL owner = legacy broadcast). Cached per convo for
-            // the duration of this replay; ownership changing mid-replay is
-            // indistinguishable from it changing right after and is harmless.
-            const ownerCache = who.kind === 'agent' ? new Map() : null
+            // Agent connections replay only frames for conversations they
+            // manage or have joined — the same scoping hub.broadcastJournal
+            // applies to live traffic (NULL owner = legacy broadcast).
+            // Decision cached per convo for the duration of this replay;
+            // membership changing mid-replay is indistinguishable from it
+            // changing right after and is harmless.
+            const decisionCache = who.kind === 'agent' ? new Map() : null
             const replaysTo = (convoId) => {
-              let owner = ownerCache.get(convoId)
-              if (owner === undefined) {
-                owner = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id ?? null
-                ownerCache.set(convoId, owner)
+              let d = decisionCache.get(convoId)
+              if (d === undefined) {
+                const owner = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id ?? null
+                d = owner == null || owner === who.deviceId
+                  || !!db.prepare("SELECT 1 FROM convo_agents WHERE convo_id=? AND agent_device_id=? AND state='joined'").get(convoId, who.deviceId)
+                decisionCache.set(convoId, d)
               }
-              return owner == null || owner === who.deviceId
+              return d
             }
             for (;;) {
               const batch = eventsAfter(db, who.userId, cursor, 500)
               for (const e of batch) {
-                if (ownerCache && !replaysTo(e.convo_id)) continue
+                if (decisionCache && !replaysTo(e.convo_id)) continue
                 ws.send(JSON.stringify(journalFrame(e)))
               }
               if (batch.length < 500) break
@@ -339,12 +343,13 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
   // push.js classify()) — it never touches the frame, so it can't leak onto
   // the wire or into the stored event payload.
   const fanOut = (frame, pushHint) => {
-    // Delivery scoping (see hub.broadcastJournal): agent connections only
-    // receive frames for conversations they own. Looked up per frame — the
-    // convo row is already hot from append()'s own authorization read.
-    const owner = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(frame.convo_id)
-    const ownerId = owner ? owner.agent_device_id : null
-    hub.broadcastJournal(conn.userId, frame, ownerId == null ? null : new Set([ownerId]))
+    // Delivery targets: recorded owner + joined participants (spec: agent
+    // chat phase 2 room fan-out). null owner = legacy broadcast. The convo
+    // row is already hot from append()'s own authorization read; the
+    // participant lookup is a primary-key-prefix seek on convo_agents.
+    const ownerId = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(frame.convo_id)?.agent_device_id ?? null
+    const targets = ownerId == null ? null : new Set([ownerId, ...joinedAgentIds(db, frame.convo_id)])
+    hub.broadcastJournal(conn.userId, frame, targets)
     try {
       pushPipeline.onAppend(conn.userId, frame, conn.deviceId, pushHint)
     } catch (err) {
