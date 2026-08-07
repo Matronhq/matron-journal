@@ -64,6 +64,16 @@ CREATE TABLE IF NOT EXISTS link_preapprovals(
   expires_at INTEGER NOT NULL,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS convo_agents(
+  convo_id TEXT NOT NULL,
+  agent_device_id INTEGER NOT NULL,
+  initiator_device_id INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('invited','joined','refused','left','expired')),
+  justification TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  answered_at INTEGER,
+  PRIMARY KEY(convo_id, agent_device_id)
+);
 `
 
 export function openDb(path) {
