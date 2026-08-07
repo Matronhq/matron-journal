@@ -127,6 +127,13 @@ export function openDb(path) {
     db.exec('ALTER TABLE conversations ADD COLUMN parent_convo_id TEXT')
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_conversations_parent ON conversations(parent_convo_id)')
+  // Rolling 2-3 sentence conversation summary, maintained by the owning
+  // bridge's title pass (spec: agent chat phase 2) — roster targeting
+  // metadata. Same don't-clobber discipline as title: only an upsert that
+  // carries it changes it.
+  if (!convoCols.some((c) => c.name === 'summary')) {
+    db.exec("ALTER TABLE conversations ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
+  }
   // Keeps the per-user quota SUM (see userBlobBytes) a cheap index scan rather
   // than a full-table read as the blob store grows.
   db.exec('CREATE INDEX IF NOT EXISTS idx_blobs_owner ON blobs(owner_user_id)')

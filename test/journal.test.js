@@ -305,3 +305,18 @@ test('a participant upsert never steals agent_device_id; a non-participant still
   upsertConversation(db, { id: 'room', ownerUserId: dan.id, sessionState: 'running', agentDeviceId: fresh.deviceId })
   assert.equal(db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get('room').agent_device_id, fresh.deviceId)
 })
+
+test('summary: set via upsert, kept when omitted, returned by snapshot', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const ag = createAgent(db, dan.id, 'dev-a')
+  upsertConversation(db, { id: 's1', ownerUserId: dan.id, title: 't', sessionState: 'running', agentDeviceId: ag.deviceId, summary: 'debugging CI' })
+  assert.equal(db.prepare('SELECT summary FROM conversations WHERE id=?').get('s1').summary, 'debugging CI')
+  // Don't-clobber: an upsert without summary keeps the stored one (July
+  // title-revert discipline).
+  upsertConversation(db, { id: 's1', ownerUserId: dan.id, sessionState: 'running', agentDeviceId: ag.deviceId })
+  assert.equal(db.prepare('SELECT summary FROM conversations WHERE id=?').get('s1').summary, 'debugging CI')
+  upsertConversation(db, { id: 's1', ownerUserId: dan.id, agentDeviceId: ag.deviceId, summary: 'fixed CI, now on tests' })
+  const snap = snapshot(db, dan.id)
+  assert.equal(snap.conversations.find((c) => c.id === 's1').summary, 'fixed CI, now on tests')
+})

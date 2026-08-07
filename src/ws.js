@@ -51,6 +51,9 @@ const CONVO_ID_MAX_CHARS = 128
 // stays small, same defensive stance as ACTIVITY_DETAIL_MAX_CHARS.
 const INVITE_TOPIC_MAX_CHARS = 200
 const INVITE_TEXT_MAX_CHARS = 1000
+// Cap for a convo_upsert's rolling summary (spec: agent chat phase 2) — same
+// defensive stance as the invite text caps above.
+const SUMMARY_MAX_CHARS = 1000
 const SESSION_ACK_STATES = new Set(['idle', 'busy'])
 
 // Last status per (user, convo). In-memory only and bounded (oldest-written
@@ -695,11 +698,15 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         )) {
           return fail('bad_request', 'bad parent_convo_id')
         }
+        if (msg.summary != null && (typeof msg.summary !== 'string' || msg.summary.length > SUMMARY_MAX_CHARS)) {
+          return fail('bad_request', 'bad summary')
+        }
         const convo = upsertConversation(db, {
           id: msg.convo_id, ownerUserId: conn.userId,
           title: msg.title, sessionState: msg.session_state,
           agentDeviceId: conn.deviceId,
           parentConvoId: msg.parent_convo_id ?? null,
+          summary: msg.summary ?? null,
         })
         if (msg.session_state) {
           // prevSessionState is upsertConversation's read of the row BEFORE

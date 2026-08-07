@@ -81,3 +81,20 @@ test('legacy NULL-owner convo still accepts any agent write', async (t) => {
   b.send({ op: 'publish', convo_id: 'legacy', type: 'text', payload: { body: 'ok' } })
   await b.waitFor((f) => f.kind === 'journal' && f.type === 'text' && f.payload.body === 'ok')
 })
+
+test('convo_upsert rejects a non-string or oversize summary', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const agA = createAgent(s.db, dan.id, 'dev-a')
+  const ag = await makeWsClient(s.base, { token: agA.token, cursor: null })
+  await ag.waitFor((f) => f.op === 'hello_ok')
+  t.after(() => ag.close())
+  ag.send({ op: 'convo_upsert', convo_id: 'v1', session_state: 'running', summary: 42 })
+  let err = await ag.waitFor((f) => f.op === 'error' && f.ref === 'convo_upsert')
+  assert.equal(err.code, 'bad_request')
+  ag.frames.length = 0
+  ag.send({ op: 'convo_upsert', convo_id: 'v1', session_state: 'running', summary: 'x'.repeat(1001) })
+  err = await ag.waitFor((f) => f.op === 'error' && f.ref === 'convo_upsert')
+  assert.equal(err.code, 'bad_request')
+})
