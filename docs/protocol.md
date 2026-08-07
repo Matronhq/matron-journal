@@ -160,7 +160,10 @@ the machine-checkable version of this page.
 ## WebSocket
 
 - `WS /ws`: first frame `{op:'hello', token, cursor}` (cursor null = live-only).
-  Server: `hello_ok {seq}`, then journal frames `> cursor`, then live.
+  Server: `hello_ok {seq, device_id, name}`, then journal frames `> cursor`,
+  then live. `device_id`/`name` are the authenticated device's own identity —
+  bridges use them for agent-chat rooms (own-echo guard, roster
+  self-exclusion, room titles).
   If the replay gap (`head_seq - cursor`) exceeds `MATRON_MAX_REPLAY`
   (default 50000), the server sends `{kind:'control', op:'snapshot_required'}`
   instead of replaying and closes the socket with code `4009` — the client
@@ -179,6 +182,12 @@ the machine-checkable version of this page.
   `up_to_seq: null` resolves server-side to the conversation's current
   `last_seq` at processing time, so a fire-and-forget publisher never needs
   to learn the seq it was assigned; explicit integers keep working as before.
+- Live journal frames (fan-out at append time) carry `sender_device_id` —
+  the numeric device id of the connection that produced the event. Device
+  names have no unique constraint, so this is the only exact own-echo test
+  a bridge has in a shared room. Deliberately live-only: absent from hello
+  replay frames and never stored in the event row, so consumers must fall
+  back to sender-name matching for replayed history.
 - Publishes and sends are at-least-once: a caller that doesn't get a
   confirmation should retry with the same `idem_key`/`local_id`. A deduped
   retry gets NO dedicated confirmation frame — convergence is observed via
@@ -410,7 +419,11 @@ mid-replay it's invisible to the hub's delivery scan). Every op resolves
 `room_id` the same way: `bad_request` for a missing/non-string/oversized
 (>128 char) id, `not_found` for an unknown id or one owned by another user,
 `bad_request` for a child conversation (`parent_convo_id` set — children
-can never be rooms).
+can never be rooms). Error frames for these five ops also carry
+`room_id` — a bridge can have several rooms' ops in flight at once, and
+`ref` alone can't say which room an error is about — but only when the
+inbound `room_id` was a well-formed id (non-empty string, ≤128 chars); a
+malformed id is never echoed back. Other ops' error frames are unchanged.
 
 - **`agent_invite {room_id, target_device_id, topic?, justification}`** —
   only the room's own owner (`agent_device_id === conn.deviceId`) may send
@@ -478,7 +491,35 @@ can never be rooms).
   `left`; `{code:'conflict', detail:'not a joined participant'}` if the
   caller isn't currently joined). If the room has a recorded owner other
   than the caller, that owner is told:
-  `{kind:'invite', event:'left', room_id, from_device_id}`.
+  `{kind:'invite', event:'left', room_id, from_device_id}`. When the
+  caller IS the room's recorded owner (who has no `convo_agents` row of
+  its own) **and the conversation is actually a room** — it has at least
+  one `convo_agents` row, in any state — the room dissolves instead:
+  - Every *live* row (`joined` or still-pending `invited`) flips to
+    `left`. Terminal outcomes (`refused`, `expired`) are left alone: they
+    are history, not membership.
+  - Each previously-**joined** participant is sent the same
+    `{kind:'invite', event:'left', room_id, from_device_id}` frame.
+  - Each pending `invited` row that the *other* side initiated — i.e. a
+    `agent_join` request awaiting this owner's answer — gets that answer
+    now, as
+    `{kind:'invite', event:'answer', room_id, peer_device_id, accept:false,
+    reason:'left'}`, delivered to the requester. Without it the requester
+    would wait forever: it is its own row's initiator, so it never sends
+    an `agent_invite_answer` that could surface a `conflict`, and the
+    dissolve puts the row out of reach of the expiry sweep. Same synthetic
+    shape as the sweep's expiry `answer` (no `from_device_id`) — see
+    "Expiry" below. A pending row the *owner* initiated needs no frame:
+    the invitee was never in the room and was not waiting on an answer;
+    its next `agent_invite_answer` surfaces `conflict` instead.
+
+  Success is silent either way (no-error-means-success), which keeps
+  owner-leave idempotent: repeating it on an already-dissolved room (rows
+  exist, all `left`) succeeds silently again. A conversation with **no**
+  `convo_agents` rows at all is not a room — `convo_upsert` stamps the
+  creating device as `agent_device_id` on every agent-created
+  conversation, so this case is just an ordinary solo convo — and leaving
+  it is the usual `{code:'conflict', detail:'not a joined participant'}`.
 
 ### Expiry
 
@@ -495,6 +536,14 @@ it simply misses the frame, same as any other invite frame (see "Delivery"
 below) — its next roster read or invite/join attempt tells the same story
 (`state:'expired'` via a fresh, renewed invite). An expired row is
 renewable, same as `refused`/`left`.
+
+Owner-dissolve produces the same synthetic frame with `reason:'left'`
+instead (see `agent_leave` above): a pending join request that the room's
+dissolution has made unanswerable is closed the same way an expired one
+is, because the waiting initiator is in the same position either way. Both
+frames omit `from_device_id` — there is no answering connection behind
+them — so an initiator can handle the pair identically and read `reason`
+only to log *why*.
 
 ### Delivery
 

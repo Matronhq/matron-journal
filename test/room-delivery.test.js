@@ -22,7 +22,7 @@ async function fleet(t) {
   t.after(() => { a.close(); b.close(); c.close(); client.close() })
   a.send({ op: 'convo_upsert', convo_id: 'room', title: 'room', session_state: 'running' })
   await a.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
-  return { s, dan, agA, agB, agC, a, b, c, client }
+  return { s, dan, agA, agB, agC, a, b, c, client, clientDeviceId: login.json.device_id }
 }
 
 test('live frames fan to owner + joined participants, not to invited/stranger agents', async (t) => {
@@ -46,6 +46,34 @@ test("a joined participant's own publish reaches the owner and the client", asyn
   b.send({ op: 'publish', convo_id: 'room', type: 'text', payload: { body: 'from b' } })
   await a.waitFor((f) => f.kind === 'journal' && f.type === 'text' && f.payload.body === 'from b')
   await client.waitFor((f) => f.kind === 'journal' && f.type === 'text' && f.payload.body === 'from b')
+})
+
+test('live frames carry sender_device_id; replayed frames do not', async (t) => {
+  const { s, agA, agB, a, b, client, clientDeviceId } = await fleet(t)
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x' })
+  answerInvite(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, accept: true })
+
+  // A room message fanned out live names the publishing device exactly —
+  // device names are not unique, so this is the only reliable own-echo test
+  // a bridge has.
+  b.send({ op: 'publish', convo_id: 'room', type: 'text', payload: { body: 'from b' } })
+  const toOwner = await a.waitFor((f) => f.kind === 'journal' && f.type === 'text' && f.payload.body === 'from b')
+  assert.equal(toOwner.sender_device_id, agB.deviceId)
+  const echo = await b.waitFor((f) => f.kind === 'journal' && f.type === 'text' && f.payload.body === 'from b')
+  assert.equal(echo.sender_device_id, agB.deviceId, "the publisher's own echo carries its own device id")
+
+  // A client send carries the client's device id.
+  client.send({ op: 'send', convo_id: 'room', payload: { body: 'from mac' } })
+  const sent = await a.waitFor((f) => f.kind === 'journal' && f.type === 'text' && f.payload.body === 'from mac')
+  assert.equal(sent.sender_device_id, clientDeviceId)
+
+  // Replay is the documented asymmetry: eventsAfter frames carry no
+  // sender_device_id (it is never stored), so consumers fall back to
+  // sender-name matching for history.
+  const b2 = await makeWsClient(s.base, { token: agB.token, cursor: 0 })
+  const replayed = await b2.waitFor((f) => f.kind === 'journal' && f.type === 'text' && f.payload.body === 'from b')
+  assert.equal(replayed.sender_device_id, undefined)
+  b2.close()
 })
 
 test('hello replay delivers room history to joined participants and skips strangers', async (t) => {
