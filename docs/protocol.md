@@ -493,15 +493,33 @@ malformed id is never echoed back. Other ops' error frames are unchanged.
   than the caller, that owner is told:
   `{kind:'invite', event:'left', room_id, from_device_id}`. When the
   caller IS the room's recorded owner (who has no `convo_agents` row of
-  its own), the room dissolves instead: every not-yet-`left` row —
-  `joined` and still-pending `invited` alike — flips to `left`, and each
-  previously-**joined** participant is sent the same
-  `{kind:'invite', event:'left', room_id, from_device_id}` frame (a
-  pending invitee was never in the room, so it isn't notified — its next
-  `agent_invite_answer` surfaces `conflict` instead). Success is silent
-  either way (no-error-means-success), which makes owner-leave
-  idempotent: repeating it, or leaving a participant-less room, succeeds
-  silently.
+  its own) **and the conversation is actually a room** — it has at least
+  one `convo_agents` row, in any state — the room dissolves instead:
+  - Every *live* row (`joined` or still-pending `invited`) flips to
+    `left`. Terminal outcomes (`refused`, `expired`) are left alone: they
+    are history, not membership.
+  - Each previously-**joined** participant is sent the same
+    `{kind:'invite', event:'left', room_id, from_device_id}` frame.
+  - Each pending `invited` row that the *other* side initiated — i.e. a
+    `agent_join` request awaiting this owner's answer — gets that answer
+    now, as
+    `{kind:'invite', event:'answer', room_id, peer_device_id, accept:false,
+    reason:'left'}`, delivered to the requester. Without it the requester
+    would wait forever: it is its own row's initiator, so it never sends
+    an `agent_invite_answer` that could surface a `conflict`, and the
+    dissolve puts the row out of reach of the expiry sweep. Same synthetic
+    shape as the sweep's expiry `answer` (no `from_device_id`) — see
+    "Expiry" below. A pending row the *owner* initiated needs no frame:
+    the invitee was never in the room and was not waiting on an answer;
+    its next `agent_invite_answer` surfaces `conflict` instead.
+
+  Success is silent either way (no-error-means-success), which keeps
+  owner-leave idempotent: repeating it on an already-dissolved room (rows
+  exist, all `left`) succeeds silently again. A conversation with **no**
+  `convo_agents` rows at all is not a room — `convo_upsert` stamps the
+  creating device as `agent_device_id` on every agent-created
+  conversation, so this case is just an ordinary solo convo — and leaving
+  it is the usual `{code:'conflict', detail:'not a joined participant'}`.
 
 ### Expiry
 
@@ -518,6 +536,14 @@ it simply misses the frame, same as any other invite frame (see "Delivery"
 below) — its next roster read or invite/join attempt tells the same story
 (`state:'expired'` via a fresh, renewed invite). An expired row is
 renewable, same as `refused`/`left`.
+
+Owner-dissolve produces the same synthetic frame with `reason:'left'`
+instead (see `agent_leave` above): a pending join request that the room's
+dissolution has made unanswerable is closed the same way an expired one
+is, because the waiting initiator is in the same position either way. Both
+frames omit `from_device_id` — there is no answering connection behind
+them — so an initiator can handle the pair identically and read `reason`
+only to log *why*.
 
 ### Delivery
 

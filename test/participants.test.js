@@ -2,8 +2,8 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { openDb } from '../src/db.js'
 import {
-  inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, removeParticipant, undoInvite,
-  joinedAgentIds, getParticipant, isParticipant, expireInvites,
+  inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants,
+  removeParticipant, undoInvite, joinedAgentIds, getParticipant, isParticipant, expireInvites,
 } from '../src/participants.js'
 
 const db = () => openDb(':memory:')
@@ -58,25 +58,49 @@ test('leaveConvo flips only a joined row', () => {
   assert.equal(getParticipant(d, 'room', 2).state, 'left')
 })
 
-test('leaveAllParticipants flips every non-left row of that convo and returns the previously-joined ids', () => {
+test('leaveAllParticipants flips the live rows, spares terminal ones, and splits joined from pending', () => {
   const d = db()
+  const now = Date.now()
   inviteParticipant(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'x' })
   answerInvite(d, { convoId: 'room', agentDeviceId: 2, accept: true })
-  inviteParticipant(d, { convoId: 'room', agentDeviceId: 3, initiatorDeviceId: 1, justification: 'x' }) // stays pending
+  // 3 is a pending JOIN REQUEST — it initiated its own row, so it is the
+  // side waiting for an answer.
+  inviteParticipant(d, { convoId: 'room', agentDeviceId: 3, initiatorDeviceId: 3, justification: 'x' })
   inviteParticipant(d, { convoId: 'room', agentDeviceId: 4, initiatorDeviceId: 1, justification: 'x' })
-  answerInvite(d, { convoId: 'room', agentDeviceId: 4, accept: false }) // refused
+  answerInvite(d, { convoId: 'room', agentDeviceId: 4, accept: false }) // refused — terminal
+  inviteParticipant(d, { convoId: 'room', agentDeviceId: 6, initiatorDeviceId: 1, justification: 'x' })
+  d.prepare('UPDATE convo_agents SET created_at=? WHERE convo_id=? AND agent_device_id=?').run(now - 10000, 'room', 6)
+  expireInvites(d, 5000, now) // 6 only — every other pending row is fresh
   inviteParticipant(d, { convoId: 'other', agentDeviceId: 5, initiatorDeviceId: 1, justification: 'x' })
   answerInvite(d, { convoId: 'other', agentDeviceId: 5, accept: true })
 
-  assert.deepEqual(leaveAllParticipants(d, 'room'), [2], 'only the previously-joined id is owed a notification')
+  assert.deepEqual(leaveAllParticipants(d, 'room'), {
+    joined: [2],
+    pending: [{ agent_device_id: 3, initiator_device_id: 3 }],
+  }, 'joined ids are owed a left frame; pending rows carry the initiator owed an answer')
   assert.equal(getParticipant(d, 'room', 2).state, 'left')
   assert.equal(getParticipant(d, 'room', 3).state, 'left')
-  assert.equal(getParticipant(d, 'room', 4).state, 'left')
+  // Terminal outcomes are history: a dissolve must not rewrite them, or a
+  // refusal record turns into an indistinguishable 'left'.
+  assert.equal(getParticipant(d, 'room', 4).state, 'refused', 'a refusal survives the dissolve')
+  assert.equal(getParticipant(d, 'room', 6).state, 'expired', 'an expiry survives the dissolve')
   assert.equal(getParticipant(d, 'other', 5).state, 'joined', 'other convos untouched')
   // Idempotent: a second dissolution finds nothing to flip or report.
-  assert.deepEqual(leaveAllParticipants(d, 'room'), [])
+  assert.deepEqual(leaveAllParticipants(d, 'room'), { joined: [], pending: [] })
   // And a convo with no rows at all is a clean no-op too.
-  assert.deepEqual(leaveAllParticipants(d, 'empty'), [])
+  assert.deepEqual(leaveAllParticipants(d, 'empty'), { joined: [], pending: [] })
+})
+
+test('hasParticipants is true for a convo with any row in any state', () => {
+  const d = db()
+  assert.equal(hasParticipants(d, 'room'), false, 'a convo nobody was ever drawn into is not a room')
+  inviteParticipant(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'x' })
+  assert.equal(hasParticipants(d, 'room'), true)
+  answerInvite(d, { convoId: 'room', agentDeviceId: 2, accept: false })
+  assert.equal(hasParticipants(d, 'room'), true, 'a refused row still makes it a room')
+  leaveAllParticipants(d, 'room')
+  assert.equal(hasParticipants(d, 'room'), true, 'a dissolved room stays a room — that is what keeps re-leaving idempotent')
+  assert.equal(hasParticipants(d, 'other'), false)
 })
 
 test('joinedAgentIds returns only joined participants of that convo', () => {

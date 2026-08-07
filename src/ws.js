@@ -1,7 +1,7 @@
 import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { eventsAfter, append, markRead, upsertConversation, toEventShape } from './journal.js'
-import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, undoInvite, getParticipant, expireInvites } from './participants.js'
+import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, undoInvite, getParticipant, expireInvites } from './participants.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -60,6 +60,23 @@ const SESSION_ACK_STATES = new Set(['idle', 'busy'])
 // room_id (see fail below) — a bridge can have several rooms' ops in
 // flight at once, and `ref` alone can't say which room an error is about.
 const ROOM_OPS = new Set(['agent_invite', 'agent_join', 'agent_invite_ack', 'agent_invite_answer', 'agent_leave'])
+
+// The room_id echo, as a spreadable fragment ({} when there's nothing safe
+// to echo). Module-level rather than a closure inside handleOp's `fail`
+// because the OUTERMOST backstop — the internal-error frame sent when
+// something unexpected escapes handleOp entirely — needs the identical
+// predicate, and that frame is emitted from the socket's message handler,
+// where `fail` doesn't exist. An 'internal' error is exactly the case a
+// bridge can least afford to leave uncorrelated. Only echoes an id that
+// would pass loadRoom's own shape check; an invalid/oversized room_id is
+// raw inbound input and must never be reflected back. `msg` may be
+// absent/unparsed at the backstop, hence the null guard.
+function roomIdEcho(msg) {
+  const roomId = msg && ROOM_OPS.has(msg.op)
+    && typeof msg.room_id === 'string' && msg.room_id && msg.room_id.length <= CONVO_ID_MAX_CHARS
+    ? msg.room_id : null
+  return roomId ? { room_id: roomId } : {}
+}
 
 // Last status per (user, convo). In-memory only and bounded (oldest-written
 // evicted first): a lost entry just means the header stays blank until the
@@ -349,7 +366,7 @@ export function attachWs({
         if (!conn || !conn.registered) {
           ws.close()
         } else {
-          ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'internal', ref: msg && msg.op }))
+          ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'internal', ref: msg && msg.op, ...roomIdEcho(msg) }))
         }
       }
     })
@@ -380,15 +397,9 @@ export function notifyStale(hub, entry) {
 // Extended by Tasks 7-8 with client and agent operations.
 export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0 }) {
   const fail = (code, detail) => {
-    // Room-op errors echo the room id for correlation — but only an id that
-    // would pass loadRoom's own shape check; an invalid/oversized room_id is
-    // raw inbound input and must never be reflected back.
-    const roomId = ROOM_OPS.has(msg.op)
-      && typeof msg.room_id === 'string' && msg.room_id && msg.room_id.length <= CONVO_ID_MAX_CHARS
-      ? msg.room_id : null
     conn.ws.send(JSON.stringify({
       kind: 'control', op: 'error', code, ref: msg.op,
-      ...(roomId ? { room_id: roomId } : {}), ...(detail ? { detail } : {}),
+      ...roomIdEcho(msg), ...(detail ? { detail } : {}),
     }))
   }
   // Invite ops: validate a room id + load the row. Rooms are top-level
@@ -696,16 +707,52 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (!conn.registered) return fail('not_ready')
         const { room, err } = loadRoom(msg.room_id)
         if (err) return fail(...err)
+        // Best-effort notification: by the time these run the DB flip is
+        // already committed, so a throwing send (a socket that died between
+        // the hub's lookup and the write) must not surface as {code:
+        // 'internal'} — the caller would retry a leave that has already
+        // happened, the retry would no-op, and the peers not yet reached
+        // would never be told. Swallow and log, same stance as fanOut's
+        // push-pipeline guard.
+        const notify = (deviceId, frame) => {
+          try {
+            hub.sendToDevice(conn.userId, deviceId, frame)
+          } catch (sendErr) {
+            console.error('agent_leave notify failed (the leave itself already committed)', sendErr)
+          }
+        }
         // Owner leave: the recorded owner has no convo_agents row, so
         // leaveConvo can never represent it — the room dissolves instead.
-        // Every not-yet-left row flips to left and each previously-JOINED
-        // participant is told; success stays silent to the leaver (protocol
-        // convention — no error means success), which also makes a repeated
-        // owner-leave, or one on a participant-less room, idempotent.
-        if (room.agent_device_id === conn.deviceId) {
-          for (const deviceId of leaveAllParticipants(db, msg.room_id)) {
-            hub.sendToDevice(conn.userId, deviceId, {
+        // Gated on the convo actually being a ROOM (any convo_agents row,
+        // any state): convo_upsert stamps agent_device_id on every
+        // agent-created conversation, so without this a plain solo convo
+        // that never had a participant would take the dissolve branch and
+        // answer a bogus agent_leave with silent success instead of the
+        // historical `not a joined participant` conflict below. State-
+        // agnostic, so an already-dissolved room (all rows 'left') still
+        // takes this branch and stays idempotent.
+        if (room.agent_device_id === conn.deviceId && hasParticipants(db, msg.room_id)) {
+          const { joined, pending } = leaveAllParticipants(db, msg.room_id)
+          // Everyone who was actually in the room hears the owner leave.
+          for (const deviceId of joined) {
+            notify(deviceId, {
               kind: 'invite', event: 'left', room_id: msg.room_id, from_device_id: conn.deviceId,
+            })
+          }
+          // Pending rows the OTHER side initiated are join requests: that
+          // peer is blocked waiting for an answer this dissolve just made
+          // impossible, and the expiry sweep can no longer rescue it (the
+          // row is 'left', not 'invited'). Close the loop with the same
+          // synthetic-refusal frame the sweep sends — no from_device_id, so
+          // the initiator's existing expiry handling fires unchanged — only
+          // the reason differs ('left' vs 'expired'). Rows the owner itself
+          // initiated need nothing: the owner is the waiting side there, and
+          // it is the one leaving.
+          for (const row of pending) {
+            if (row.initiator_device_id === conn.deviceId) continue
+            notify(row.initiator_device_id, {
+              kind: 'invite', event: 'answer', room_id: msg.room_id,
+              peer_device_id: row.agent_device_id, accept: false, reason: 'left',
             })
           }
           break
@@ -713,8 +760,12 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (!leaveConvo(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId })) {
           return fail('conflict', 'not a joined participant')
         }
-        if (room.agent_device_id != null && room.agent_device_id !== conn.deviceId) {
-          hub.sendToDevice(conn.userId, room.agent_device_id, {
+        // A participant left: tell the room's recorded owner, if there is
+        // one. (No need to exclude the caller — a caller that IS the owner
+        // has no convo_agents row to have been 'joined' in, so leaveConvo
+        // above would have failed it into the conflict.)
+        if (room.agent_device_id != null) {
+          notify(room.agent_device_id, {
             kind: 'invite', event: 'left', room_id: msg.room_id, from_device_id: conn.deviceId,
           })
         }
@@ -775,8 +826,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         // agent that the id exists and is a populated room).
         const existingRoom = db.prepare('SELECT agent_device_id FROM conversations WHERE id=? AND owner_user_id=?').get(msg.convo_id, conn.userId)
         if (existingRoom && existingRoom.agent_device_id != null && existingRoom.agent_device_id !== conn.deviceId) {
-          const hasParticipants = db.prepare('SELECT 1 FROM convo_agents WHERE convo_id=? LIMIT 1').get(msg.convo_id)
-          if (hasParticipants) return fail('forbidden', 'only the room owner may upsert a room')
+          if (hasParticipants(db, msg.convo_id)) return fail('forbidden', 'only the room owner may upsert a room')
         }
         const convo = upsertConversation(db, {
           id: msg.convo_id, ownerUserId: conn.userId,
