@@ -419,6 +419,13 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
     // participant lookup is a primary-key-prefix seek on convo_agents.
     const ownerId = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(frame.convo_id)?.agent_device_id ?? null
     const targets = ownerId == null ? null : new Set([ownerId, ...joinedAgentIds(db, frame.convo_id)])
+    // Live frames carry the producing connection's device id: device names
+    // have no unique constraint, so a bridge in a shared room can't reliably
+    // tell its own echoes apart by sender name alone. Deliberately LIVE-only
+    // — absent from hello replay (journalFrame over eventsAfter) and never
+    // stored in the event row, so consumers must fall back to sender-name
+    // matching for replayed history.
+    frame.sender_device_id = conn.deviceId
     hub.broadcastJournal(conn.userId, frame, targets)
     try {
       pushPipeline.onAppend(conn.userId, frame, conn.deviceId, pushHint)

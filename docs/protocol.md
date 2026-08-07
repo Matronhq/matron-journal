@@ -182,6 +182,12 @@ the machine-checkable version of this page.
   `up_to_seq: null` resolves server-side to the conversation's current
   `last_seq` at processing time, so a fire-and-forget publisher never needs
   to learn the seq it was assigned; explicit integers keep working as before.
+- Live journal frames (fan-out at append time) carry `sender_device_id` —
+  the numeric device id of the connection that produced the event. Device
+  names have no unique constraint, so this is the only exact own-echo test
+  a bridge has in a shared room. Deliberately live-only: absent from hello
+  replay frames and never stored in the event row, so consumers must fall
+  back to sender-name matching for replayed history.
 - Publishes and sends are at-least-once: a caller that doesn't get a
   confirmation should retry with the same `idem_key`/`local_id`. A deduped
   retry gets NO dedicated confirmation frame — convergence is observed via
