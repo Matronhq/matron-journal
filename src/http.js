@@ -1,7 +1,7 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { login, authToken, changePassword, revokeOwnedDevice, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
-import { snapshot, messagesBefore, toEventShape } from './journal.js'
+import { snapshot, messagesBefore, toEventShape, isClientOnlyEvent } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs } from './db.js'
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
@@ -427,8 +427,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           return json(res, 404, { error: 'not_found' })
         }
         try {
-          const events = messagesBefore(db, who.userId, convoId, { beforeSeq, limit }).map(toEventShape)
-          return json(res, 200, { events })
+          let events = messagesBefore(db, who.userId, convoId, { beforeSeq, limit })
+          // Client-only events (the agent-chat approval card) never reach an
+          // agent device by any read path — this is the HTTP-pagination half
+          // of the guarantee ws.js's fanOut and hello replay also enforce.
+          if (who.kind !== 'client') events = events.filter((e) => !isClientOnlyEvent(e.type, e.payload))
+          return json(res, 200, { events: events.map(toEventShape) })
         } catch (e) {
           // Unauthorized and missing are indistinguishable: both 404, same
           // body as GET /media/:id's unknown-id response — never 403 (that

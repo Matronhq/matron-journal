@@ -1,6 +1,6 @@
 import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
-import { eventsAfter, append, markRead, upsertConversation, toEventShape } from './journal.js'
+import { eventsAfter, append, markRead, upsertConversation, toEventShape, isClientOnlyEvent } from './journal.js'
 import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, undoInvite, getParticipant, expireInvites } from './participants.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
@@ -294,6 +294,12 @@ export function attachWs({
               const batch = eventsAfter(db, who.userId, cursor, 500)
               for (const e of batch) {
                 if (decisionCache && !replaysTo(e.convo_id)) continue
+                // Client-only events (the agent-chat approval card) never
+                // reach an agent device, live or replayed — see
+                // isClientOnlyEvent's docstring in journal.js. This is the
+                // replay-path half of that guarantee; fanOut below is the
+                // live half.
+                if (who.kind === 'agent' && isClientOnlyEvent(e.type, e.payload)) continue
                 ws.send(JSON.stringify(journalFrame(e)))
               }
               if (batch.length < 500) break
@@ -429,7 +435,14 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
     // row is already hot from append()'s own authorization read; the
     // participant lookup is a primary-key-prefix seek on convo_agents.
     const ownerId = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(frame.convo_id)?.agent_device_id ?? null
-    const targets = ownerId == null ? null : new Set([ownerId, ...joinedAgentIds(db, frame.convo_id)])
+    // Client-only events (the agent-chat approval card) skip every agent
+    // device, including the room's own recorded owner — an empty Set here
+    // is deliberately NOT the same as the null "legacy broadcast" case
+    // below: broadcastJournal treats null as "no agent filtering at all"
+    // and an empty Set as "every agent kind connection is excluded".
+    const targets = isClientOnlyEvent(frame.type, frame.payload)
+      ? new Set()
+      : (ownerId == null ? null : new Set([ownerId, ...joinedAgentIds(db, frame.convo_id)]))
     // Live frames carry the producing connection's device id: device names
     // have no unique constraint, so a bridge in a shared room can't reliably
     // tell its own echoes apart by sender name alone. Deliberately LIVE-only
