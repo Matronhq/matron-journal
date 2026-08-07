@@ -388,20 +388,35 @@ A **room** is not a new entity — it's an ordinary top-level conversation
 (never a child; see "Child conversations" above) whose owner
 (`agent_device_id`) has drawn other agent devices of the same user into its
 lifecycle via the `convo_agents` table (spec: 2026-08-06 agent-to-agent chat
-design, Phase 2). A `convo_agents` row is a **grant**, one per
-`(convo_id, agent_device_id)`, that moves through a small state machine:
+design, Phase 2; consent gating: 2026-08-07 agent chat consent design). A
+`convo_agents` row is a **grant**, one per `(convo_id, agent_device_id)`,
+that moves through a small state machine:
 
-    invited -> joined | refused | expired
+    awaiting_user -> invited -> joined
+         │              │      └─refuse──> refused
+         │              └─ttl──────────> expired
+         ├─deny────> denied
+         └─ttl─────> expired
     joined  -> left
 
-`invited` is the only pending state; `joined` is the only state that confers
-delivery and write rights (see "Agent write authorization" and "Agent
-delivery scoping" above). A row left in `refused`, `left`, or `expired` is
-**renewable** — a fresh `agent_invite`/`agent_join` may reuse the same
-`(convo_id, agent_device_id)` pair and resets it to `invited`; a row already
-`invited` or `joined` is not — inviting/joining over one of those returns
-`{code:'conflict', detail:'already <state>'}` instead of silently resetting
-it (a double-invite is treated as a caller bug worth surfacing, not a no-op).
+`awaiting_user` and `invited` are the two pending states.
+`awaiting_user` means the request is parked awaiting the **user's**
+decision (see "Consent gating" below) — it is where every `agent_invite`/
+`agent_join` lands by default. `invited` means the user has decided (or the
+directed pair was already always-allowed, skipping the park step
+entirely) and the target agent has yet to answer. `joined` is the only
+state that confers delivery and write rights (see "Agent write
+authorization" and "Agent delivery scoping" above). A row left in
+`refused`, `denied`, `left`, or `expired` is **renewable** — a fresh
+`agent_invite`/`agent_join` may reuse the same `(convo_id, agent_device_id)`
+pair and resets it to `awaiting_user` (or `invited`, on the allowance-
+bypass path); a row already `awaiting_user`, `invited`, or `joined` is not
+— inviting/joining over one of those returns `{code:'conflict',
+detail:'already <state>'}` instead of silently resetting it (a
+double-invite is a caller bug worth surfacing, not a no-op; the same
+non-renewability keeps a still-pending `awaiting_user` ask from becoming a
+re-request loop against the user's attention — see the per-requester cap
+below).
 
 Every row also records `initiator_device_id` — whichever side asked (the
 room owner sending an invite, or the would-be participant sending a join
@@ -433,29 +448,40 @@ malformed id is never echoed back. Other ops' error frames are unchanged.
   device — anti-enumeration, same stance as `agent_request`; `bad_request`
   for inviting self). `topic` is optional (≤200 chars,
   `INVITE_TOPIC_MAX_CHARS`), `justification` is required (1-1000 chars,
-  `INVITE_TEXT_MAX_CHARS`). Creates/renews an `invited` row. Delivery is
-  single-socket (`hub.sendRpcRequest`, same rule as Agent RPC — the most
-  recently registered live connection of the target device, so a
-  mid-reconnect bridge can't double-receive): no live registered connection
-  on the target means `{code:'offline'}`, and the just-created row is
-  deleted (`removeParticipant`) so no pending invite is left that nobody was
-  told about. On success the caller gets
-  `{kind:'invite', event:'delivered', room_id, target_device_id}` and the
-  target gets
-  `{kind:'invite', event:'request', room_id, from_device_id, from_name,
-  topic, justification}`.
+  `INVITE_TEXT_MAX_CHARS`). What happens next depends on whether the user
+  has already always-allowed this directed pair, `initiator_device_id ->
+  target_device_id` (see "Consent gating" below):
+  - **Allowance bypass** — creates/renews an `invited` row and attempts
+    delivery immediately. Delivery is single-socket (`hub.sendRpcRequest`,
+    same rule as Agent RPC — the most recently registered live connection
+    of the target device, so a mid-reconnect bridge can't double-receive):
+    no live registered connection on the target means `{code:'offline'}`,
+    and the just-created row is deleted (`removeParticipant`) so no
+    pending invite is left that nobody was told about. On success the
+    caller gets `{kind:'invite', event:'delivered', room_id,
+    target_device_id}` and the target gets `{kind:'invite',
+    event:'request', room_id, from_device_id, from_name, topic,
+    justification}`.
+  - **No standing allowance (the default)** — creates/renews an
+    `awaiting_user` row instead. The target agent is sent **nothing**; the
+    justification never leaves the journal until the user approves it. The
+    caller still gets `{kind:'invite', event:'delivered', room_id,
+    target_device_id}` — see "Consent gating" below for what `delivered`
+    means in this case.
 - **`agent_join {room_id, justification}`** — the reverse direction: an
   agent asks to join a room it doesn't own. The room must have a recorded
   owner (`{code:'conflict', detail:'room has no recorded owner to ask'}`
   otherwise) and the caller can't be that owner
-  (`{code:'bad_request', detail:'cannot join own room'}`). Creates/renews an
-  `invited` row with the caller as both the participant and the initiator.
-  Same single-socket delivery and `offline` handling as `agent_invite`,
-  targeted at the room's owner device. On success the caller gets
-  `{kind:'invite', event:'delivered', room_id, target_device_id:<owner>}`
-  and the owner gets
-  `{kind:'invite', event:'join_request', room_id, from_device_id, from_name,
-  justification}`.
+  (`{code:'bad_request', detail:'cannot join own room'}`). Same
+  allowance-bypass-vs-park branch as `agent_invite`, with the caller as
+  both the participant and the initiator and the room's owner device as
+  the target: on the bypass path it creates/renews an `invited` row with
+  the same single-socket delivery and `offline` handling, and on success
+  the caller gets `{kind:'invite', event:'delivered', room_id,
+  target_device_id:<owner>}` and the owner gets `{kind:'invite',
+  event:'join_request', room_id, from_device_id, from_name,
+  justification}`; with no standing allowance it parks an `awaiting_user`
+  row instead, same as `agent_invite`.
 - **`agent_invite_ack {room_id, peer_device_id?, session_state}`** — a
   non-committal status ping while an invite/join is still pending
   (`invited`), sent by whichever side did NOT initiate. `session_state` must
@@ -521,21 +547,205 @@ malformed id is never echoed back. Other ops' error frames are unchanged.
   conversation, so this case is just an ordinary solo convo — and leaving
   it is the usual `{code:'conflict', detail:'not a joined participant'}`.
 
+### Consent gating (`awaiting_user`)
+
+(spec: `docs/superpowers/specs/2026-08-07-agent-chat-consent-design.md`.)
+The default outcome of `agent_invite`/`agent_join` — whenever the directed
+pair has no standing allowance — is a park, not a relay: the request lands
+in `awaiting_user` and the target agent is told nothing. The requester's
+`justification` (an attacker-controlled string if the requesting agent has
+been prompt-injected) never reaches a sibling agent's context; it reaches a
+human first.
+
+**The card.** Parking appends a `permission_request` event to the **room
+conversation** — not the requester's or the target's own session
+conversation; the room is where the chat will actually happen if approved,
+and it is what the push notification below deep-links the user to.
+Payload:
+
+```json
+{
+  "kind": "agent_chat",
+  "request": "invite" | "join",
+  "room_id": "…",
+  "from_device_id": 7,
+  "from_name": "…",
+  "target_device_id": 12,
+  "topic": "…",
+  "justification": "…"
+}
+```
+
+sent with `sender: "agent:<name>"`, same sender convention as any other
+agent-authored event. `from_name`, `topic`, and `justification` are all
+remote-agent-controlled text and are run through the journal's own
+sanitiser before storage/publish — control characters (including `\n`)
+become spaces, collapsed, trimmed to `INVITE_TOPIC_MAX_CHARS`/
+`INVITE_TEXT_MAX_CHARS` — the same treatment the bridge already applies to
+peer text it renders in its own voice, now applied journal-side because the
+journal is the one publishing this event. Apps must render `justification`
+as untrusted text (no markdown, no autolinking) — it is attacker-
+controlled content shown to a human about to make a security decision.
+
+**It is a client-only event, load-bearing.** `permission_request` with
+`payload.kind === 'agent_chat'` is excluded from agent delivery — both live
+fan-out and hello replay — by `isClientOnlyEvent` (`src/journal.js`),
+consulted at both call sites so they can't drift apart. This is enforced
+even against the room's own recorded owner: a naive fan-out would deliver
+to the owner first (it manages the room), which for an `agent_join` card
+is exactly the target the justification must stay hidden from. Contrast
+with the `kind:'invite'` frames in "Delivery" below, which are a different,
+unrelated mechanism (ephemeral, WS-only, agent-to-agent) that the card
+plays no part in.
+
+**Reading and answering the card.** Two client-gated (`who.kind !== 'client'`
+→ `403`) HTTP endpoints, since only a human may decide:
+
+- **`GET /agent-chat/pending`** → `{pending: [...]}`, one entry per
+  `awaiting_user` row owned by the caller's user:
+  `{convo_id, agent_device_id, initiator_device_id, justification, topic,
+  created_at, title}` (`title` is the room's). A durable inbox for a client
+  that missed the live card or wants to review every outstanding ask at
+  once.
+- **`POST /agent-chat/answer`** `{room_id, target_device_id, decision:
+  "approve"|"deny", always_allow?}` — `room_id`/`target_device_id` must
+  resolve to a **row belonging to the caller's own user**
+  (`conversations.owner_user_id`); an unknown room and one owned by another
+  user are indistinguishable (`404 {error:'not_found'}`, never `403` — same
+  anti-enumeration stance as `GET /convo/:id/messages`). The row must be
+  `state='awaiting_user'` or the call is `409 {error:'conflict'}` (already
+  answered, or never parked).
+  - **`deny`** flips the row to `denied` and, if the initiator is
+    reachable, sends it `{kind:'invite', event:'answer', room_id,
+    peer_device_id: target_device_id, accept:false, reason:'refused'}` —
+    `reason` is **`'refused'`, never `'denied'`**. A requesting agent must
+    never be able to tell "the human said no" from "the peer said no";
+    collapsing the two into one wire string is what keeps that true (the
+    distinct `denied` DB state exists for the user's own audit trail, not
+    for the requester).
+  - **`approve`** flips the row to `invited`. If `always_allow: true`, it
+    also records a directed allowance pair — see "Allowance bypass"
+    below for the JOIN-direction rule that decides which two device ids
+    get paired. It then calls the delivery pump (see below) scoped to
+    this row's own recipient, and the response is `{ok:true, delivered}`
+    where `delivered` is read back off the just-answered row's own
+    `delivered_at` (not a pump-wide "something got sent" flag) — `true`
+    if the target happened to be connected right now, `false` if delivery
+    is still owed.
+
+**`delivered` widens.** Both the old allowance-bypass path and the new
+park-then-approve path ack the *requester* with the same
+`{kind:'invite', event:'delivered', room_id, target_device_id}` frame — on
+the park path, at parking time, before the human has even seen the card.
+`delivered` no longer means "the target's socket got the frame"; it means
+"accepted into the system". The bridge's `agent_chat_start` tool copy
+already tolerates this (a `pending` result is documented as normal and not
+to be polled), so no wire-shape change was needed, only a wider meaning for
+one that already existed.
+
+**Delivery pump.** Approval alone cannot deliver — the room's target agent
+may be offline, and an approval made through `matron-admin` (a separate CLI
+process, not the running server) never touches the hub at all. A single
+function, `deliverPendingInvites(db, hub, {deviceId?})` (`src/invite-
+delivery.js`), owns delivery for every `state='invited' AND delivered_at IS
+NULL` row, and is called from three places: `POST /agent-chat/answer`
+(scoped to the just-answered row's recipient, for the fast path), an
+agent's `hello` registration (scoped to that device, catching up whatever
+was approved while it was offline), and the periodic sweep timer (unscoped
+catch-all — covers `matron-admin`-approved rows, and any row whose target
+was already connected at approval time so no hello would ever fire for
+it). `markDelivered`'s `delivered_at IS NULL` predicate makes the pump
+idempotent — a hello racing the sweep can double-*call* the pump but not
+double-*deliver* — and `matron-admin agent-chat approve` says as much in
+its own output, since the CLI itself has no path to the hub whatsoever and
+the delivery genuinely happens later, out of its hands.
+
+**Allowance bypass.** `agent_chat_allowances(user_id, from_device_id,
+target_device_id)` — directed pairs a user has already approved once and
+chosen to trust going forward ("always allow this agent to chat to that
+agent"), checked by `isAllowed` before every park decision. A pair is
+recorded from the approval card (`always_allow: true` on `POST
+/agent-chat/answer`) or from `matron-admin agent-chat approve ...
+--always-allow`, and removed via `matron-admin agent-chat allowances
+<username> --revoke <from_id>:<to_id>` (there is no app UI for this yet —
+see below). **JOIN direction rule:** an `agent_join` row self-targets
+(`agent_device_id` names the joiner, who is also `initiator_device_id`), so
+the pair worth remembering is `(initiator_device_id -> room's recorded
+owner)`, not `(initiator_device_id -> itself)`; an `agent_invite` row's
+initiator and target are already the two distinct devices, so the pair is
+`(initiator_device_id -> target_device_id)` as given.
+
+**Cap.** Outstanding `awaiting_user` rows per *requesting* device are
+capped at `MAX_AWAITING_PER_REQUESTER` (3); over the cap, `agent_invite`/
+`agent_join` fail `{code:'conflict', detail:'too many requests awaiting
+user approval'}` rather than queuing indefinitely against the user's
+attention.
+
+**`matron-admin agent-chat` — the v1 approval surface.** Until the apps
+grow the card UI (Approve/Deny/always-allow wired to `POST
+/agent-chat/answer`), an operator drives approvals from the CLI, writing
+the DB directly:
+
+```
+matron-admin agent-chat pending <username>
+matron-admin agent-chat approve <username> <room_id> <device_id> [--always-allow]
+matron-admin agent-chat deny <username> <room_id> <device_id>
+matron-admin agent-chat allowances <username> [--revoke <from_id>:<to_id>]
+```
+
+`pending` lists one line per `awaiting_user` row for that user (room id,
+target device id/name, topic, justification, relative age).
+`approve`/`deny` re-run the same room-ownership check `POST
+/agent-chat/answer` does (`conversations.owner_user_id` must match the
+named user) before touching the row — this is not skippable just because
+the CLI is a trusted operator surface; taking a username is precisely what
+makes the check meaningful. Because this CLI cannot reach the running
+server's hub, its output says so plainly both ways: an approval is relayed
+by the sweep-tick pump (or that agent's next hello), not by this command,
+within one sweep interval; a denial cannot push an answer frame to the
+requester at all — its waiter simply times out to pending, and the state
+change is only visible on its next attempt.
+
 ### Expiry
+
+Two independent TTLs, on two different clocks, because they answer two
+different questions — "has the *target agent* gone quiet?" versus "has the
+*user* gone quiet?" — and the two must not be conflated (see "What the
+requester learns" below).
 
 A pending `invited` row older than the invite TTL (`inviteTtlMs`, default 30
 minutes — 1800000 ms, the `inviteTtlMs` parameter default in `attachWs`) is flipped to `expired` by the
 same periodic sweep that handles the tool-stream idle eviction and device
 revocation checks (see "Device revocation" below) — generous on purpose,
 because a busy responder is expected to report that honestly via
-`agent_invite_ack` rather than race the clock. The initiator hears an
-expiry exactly like an explicit refusal:
+`agent_invite_ack` rather than race the clock. This TTL clocks from
+`delivered_at`, **not** `created_at` — the 30-minute window is a window for
+the target to *answer*, so it must not start ticking before the target has
+actually seen the ask; a row that is `invited` but still undelivered
+(target offline, or approved-but-not-yet-pumped) is exempt and can never
+expire out from under a target that hasn't heard the ask yet. The initiator
+hears an expiry exactly like an explicit refusal:
 `{kind:'invite', event:'answer', room_id, peer_device_id:<agent_device_id>,
 accept:false, reason:'expired'}`. If the initiator is offline at sweep time
 it simply misses the frame, same as any other invite frame (see "Delivery"
 below) — its next roster read or invite/join attempt tells the same story
 (`state:'expired'` via a fresh, renewed invite). An expired row is
 renewable, same as `refused`/`left`.
+
+A parked `awaiting_user` row — the user, not the target agent, hasn't
+answered — has its own, much longer TTL: `AWAITING_USER_TTL_MS`, 24 hours,
+clocked from `created_at` (there is no delivery to wait for; the card was
+already published the moment the row was parked). Generous on purpose: an
+ask that arrives while the user is asleep must survive the night. The same
+sweep flips it to `expired` and notifies the initiator — but, unlike the
+`invited`-TTL case above, with `reason:'refused'`, **not** `'expired'`: a
+user who never looked at the card and a user who looked and said no must
+read identically to the requester (see "What the requester learns" in the
+consent design spec). `denied` (an explicit `POST /agent-chat/answer
+{decision:'deny'}` or `matron-admin agent-chat deny`) uses the same
+`reason:'refused'` wire string for the same reason — three different DB
+facts (`denied`, `refused`, this TTL's `expired`), one indistinguishable
+story on the wire.
 
 Owner-dissolve produces the same synthetic frame with `reason:'left'`
 instead (see `agent_leave` above): a pending join request that the room's

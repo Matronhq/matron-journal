@@ -91,6 +91,15 @@ agent_invite ──> awaiting_user ──approve──> invited ──accept─�
 expire briskly, but one waiting on a *human who is asleep* should not evaporate before
 they wake. Proposal: keep the existing TTL for `'invited'`, use 24h for `'awaiting_user'`.
 
+The two TTLs also run on different clocks, not just different lengths (locked decision,
+see plan header). `'invited'`'s 30-minute answer window clocks from `delivered_at`, not
+`created_at`: it is a window for the *target* to answer, so it must not start ticking
+before the target has actually seen the ask — an approved-but-undelivered row (target
+offline, or an admin approval still waiting on the delivery pump) is exempt and can never
+expire out from under a target that never got the frame. `'awaiting_user'`'s 24h TTL
+clocks from `created_at`, on its own separate schedule — there is no delivery to wait for
+here; the card is published the moment the row parks.
+
 ## Delivery timing
 
 The current code treats delivery as synchronous with the request:
@@ -104,11 +113,20 @@ That fast-fail is deliberate ("spec: honest fast status") and it cannot survive 
 because at request time we no longer attempt delivery. The online check moves to approval
 time, and a new case appears: approved, but the target has since gone offline.
 
-**Behaviour:** on approval, attempt `sendRpcRequest`. If it succeeds, the flow rejoins the
-existing path exactly. If the target is offline, hold at `'invited'` and deliver when that
-device next registers, reusing the replay hook that already re-sends invite answers
-(`ws.js:182`). The user's card resolves to "approved — waiting for that agent to come
-online"; the requester is told the same.
+**Behaviour (locked decision, see plan header):** `convo_agents` gains a `delivered_at`
+column, separating "the user approved this" from "the target actually got the frame" into
+two independent facts. A single delivery pump, `deliverPendingInvites(db, hub, {deviceId?})`,
+owns every row with `state='invited' AND delivered_at IS NULL` and is called from three
+places: the HTTP approve handler (immediate attempt, scoped to the just-answered row's
+recipient), an agent's `hello` registration (scoped to that device — catches up whatever was
+approved while it was offline), and the periodic sweep timer (unscoped catch-all — covers
+`matron-admin` approvals, which never touch a running server's hub at all, and any row whose
+target was already connected at approval time so no `hello` would ever fire for it).
+`markDelivered`'s `delivered_at IS NULL` guard makes the pump idempotent against the three
+callers racing each other. There is no separate "replay hook" to reuse for this — none
+existed; the pump *is* the mechanism. The user's card resolves to "approved — waiting for
+that agent to come online"; the requester is told the same (`delivered` widens to mean
+"accepted into the system", not "reached a socket" — see "What the requester learns").
 
 Holding rather than failing is the right default because the human and the peer are now
 two independent sources of delay, and failing an approved request because the peer blinked
@@ -116,10 +134,16 @@ would be infuriating and would push the user toward approving pre-emptively.
 
 ## The approval surface
 
-**Where.** A `permission_request` event appended to the **target agent's session
-conversation** — the same conversation where `formatInviteRequestNotice` publishes the
-user's copy today. That keeps the decision next to the work it concerns, and it means the
-existing notice is replaced by the card rather than duplicated by it.
+**Where (locked decision, see plan header).** A `permission_request` event appended to the
+**room conversation** — not, as first drafted here, "the target agent's session
+conversation". The journal has no way to know which session conversation the target bridge
+would even choose to treat as "the" one for this — that mapping lives bridge-side and the
+journal cannot see it — while the room is a real, already-existing, user-visible
+conversation, and it is where the chat will actually happen if the user approves. Push
+(`permission_request` → `attention`, already wired, `push.js:37`, no change needed) deep-links
+the user there. This does mean `formatInviteRequestNotice`'s bridge-side publication into the
+target's session conversation is no longer the user's first sight of the ask — see
+"Bridge-side changes" below for what becomes of it.
 
 **It must be a client-only event, and this is load-bearing.** `hub.broadcastJournal` gives
 client devices every frame but gives an agent device every frame *for a conversation it
@@ -226,9 +250,13 @@ handles.
 
 - An `agent_invite` sends **nothing** to the target device. This is the security property;
   it deserves a test that asserts on the hub mock receiving no frame, not merely on state.
-- The approval card reaches client devices and **no** agent device — asserted on live
-  fan-out, and separately on hello replay, where a reconnecting target agent must not
-  receive it as history.
+- The approval card, published into the **room conversation** (locked decision, see plan
+  header — not a session conversation), reaches client devices and **no** agent device —
+  including the room's own recorded owner, who is exactly the device a naive fan-out would
+  deliver to first since it manages that conversation, and for an `agent_join` card is also
+  the target the justification must stay hidden from. Asserted on live fan-out, and
+  separately on hello replay, where a reconnecting agent (owner or target) must not receive
+  it as history.
 - Approval relays exactly the frame that was parked, with the stored topic and
   justification.
 - Deny → `'denied'`, requester sees the same string as `'refused'` and `'expired'`.
