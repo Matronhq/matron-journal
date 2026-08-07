@@ -1,7 +1,9 @@
 import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { eventsAfter, append, markRead, upsertConversation, toEventShape, isClientOnlyEvent } from './journal.js'
-import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, undoInvite, getParticipant, expireInvites } from './participants.js'
+import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, undoInvite, getParticipant, expireInvites, parkInvite, awaitingCount, markDelivered } from './participants.js'
+import { isAllowed } from './allowances.js'
+import { sanitizePeerText } from './peer-text.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -51,6 +53,16 @@ const CONVO_ID_MAX_CHARS = 128
 // stays small, same defensive stance as ACTIVITY_DETAIL_MAX_CHARS.
 const INVITE_TOPIC_MAX_CHARS = 200
 const INVITE_TEXT_MAX_CHARS = 1000
+// Consent-gate constants (spec: agent chat consent). AWAITING_USER_TTL_MS is
+// the 24h clock the sweep (Task 8) will use to expire a parked ask nobody
+// ever answered — declared here, alongside the other invite lifecycle
+// constants, even though nothing reads it yet. MAX_AWAITING_PER_REQUESTER
+// caps how many asks a single device can have parked at once, across every
+// room, so one chatty agent can't flood the user's attention queue.
+// PEER_NAME_CAP bounds the sanitised from_name embedded in a consent card.
+const AWAITING_USER_TTL_MS = 24 * 3600_000
+const MAX_AWAITING_PER_REQUESTER = 3
+const PEER_NAME_CAP = 80
 // Cap for a convo_upsert's rolling summary (spec: agent chat phase 2) — same
 // defensive stance as the invite text caps above.
 const SUMMARY_MAX_CHARS = 1000
@@ -628,24 +640,55 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         // indistinguishable — anti-enumeration, same stance as agent_request.
         const target = db.prepare('SELECT user_id, kind FROM devices WHERE id=?').get(msg.target_device_id)
         if (!target || target.user_id !== conn.userId || target.kind !== 'agent') return fail('not_found')
-        const r = inviteParticipant(db, {
-          convoId: msg.room_id, agentDeviceId: msg.target_device_id,
-          initiatorDeviceId: conn.deviceId, justification: msg.justification,
-        })
-        if (!r.ok) return fail('conflict', `already ${r.state}`)
-        // Single-socket delivery (sendRpcRequest): a request turn must not
-        // double-inject on a mid-reconnect bridge. false = offline — undo
-        // the row so no pending invite exists that nobody was told about,
-        // and the caller hears it immediately (spec: honest fast status).
-        const delivered = hub.sendRpcRequest(conn.userId, msg.target_device_id, {
-          kind: 'invite', event: 'request', room_id: msg.room_id,
-          from_device_id: conn.deviceId, from_name: conn.name,
-          topic: msg.topic || '', justification: msg.justification,
-        })
-        if (!delivered) {
-          undoInvite(db, msg.room_id, msg.target_device_id, r.prior)
-          return fail('offline')
+        const topic = sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS)
+        const justification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
+        if (isAllowed(db, conn.userId, conn.deviceId, msg.target_device_id)) {
+          // User pre-approved this directed pair: the pre-consent flow,
+          // verbatim — invite, immediate delivery attempt, undo+offline on a
+          // dead socket, PLUS the delivery stamp the old flow never wrote.
+          const r = inviteParticipant(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id, initiatorDeviceId: conn.deviceId, justification })
+          if (!r.ok) return fail('conflict', `already ${r.state}`)
+          // Single-socket delivery (sendRpcRequest): a request turn must not
+          // double-inject on a mid-reconnect bridge. false = offline — undo
+          // the row so no pending invite exists that nobody was told about,
+          // and the caller hears it immediately (spec: honest fast status).
+          const delivered = hub.sendRpcRequest(conn.userId, msg.target_device_id, {
+            kind: 'invite', event: 'request', room_id: msg.room_id,
+            from_device_id: conn.deviceId, from_name: conn.name, topic, justification,
+          })
+          if (!delivered) {
+            undoInvite(db, msg.room_id, msg.target_device_id, r.prior)
+            return fail('offline')
+          }
+          markDelivered(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id })
+          conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: msg.target_device_id }))
+          break
         }
+        // No standing allowance for this directed pair: park for the user's
+        // consent instead of ever reaching the target's socket. Capped per
+        // requester device so one chatty agent can't flood the user's
+        // attention queue with asks.
+        if (awaitingCount(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
+          return fail('conflict', 'too many requests awaiting user approval')
+        }
+        const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id, initiatorDeviceId: conn.deviceId, justification, topic })
+        if (!r.ok) return fail('conflict', `already ${r.state}`)
+        // Client-only card (isClientOnlyEvent in journal.js): appendAndFan's
+        // own fan-out already excludes every agent device, including the
+        // room's recorded owner, so this never reaches an agent socket.
+        appendAndFan({
+          userId: conn.userId, convoId: msg.room_id, sender: conn.name, type: 'permission_request',
+          payload: {
+            kind: 'agent_chat', request: 'invite', room_id: msg.room_id,
+            from_device_id: conn.deviceId, from_name: sanitizePeerText(conn.name, PEER_NAME_CAP),
+            target_device_id: msg.target_device_id, topic, justification,
+          },
+        })
+        // Same ack as a relayed request: to the bridge, delivered means
+        // "accepted into the system" — its tool copy already says pending is
+        // normal and the answer arrives as a later turn. A distinct 'parked'
+        // event would let a requester distinguish gated targets from
+        // ungated ones.
         conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: msg.target_device_id }))
         break
       }
@@ -657,20 +700,36 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (typeof msg.justification !== 'string' || !msg.justification || msg.justification.length > INVITE_TEXT_MAX_CHARS) return fail('bad_request', 'bad justification')
         if (room.agent_device_id == null) return fail('conflict', 'room has no recorded owner to ask')
         if (room.agent_device_id === conn.deviceId) return fail('bad_request', 'cannot join own room')
-        const r = inviteParticipant(db, {
-          convoId: msg.room_id, agentDeviceId: conn.deviceId,
-          initiatorDeviceId: conn.deviceId, justification: msg.justification,
-        })
-        if (!r.ok) return fail('conflict', `already ${r.state}`)
-        const delivered = hub.sendRpcRequest(conn.userId, room.agent_device_id, {
-          kind: 'invite', event: 'join_request', room_id: msg.room_id,
-          from_device_id: conn.deviceId, from_name: conn.name,
-          justification: msg.justification,
-        })
-        if (!delivered) {
-          undoInvite(db, msg.room_id, conn.deviceId, r.prior)
-          return fail('offline')
+        const justification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
+        if (isAllowed(db, conn.userId, conn.deviceId, room.agent_device_id)) {
+          // Same pre-consent flow, verbatim, PLUS the delivery stamp.
+          const r = inviteParticipant(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId, initiatorDeviceId: conn.deviceId, justification })
+          if (!r.ok) return fail('conflict', `already ${r.state}`)
+          const delivered = hub.sendRpcRequest(conn.userId, room.agent_device_id, {
+            kind: 'invite', event: 'join_request', room_id: msg.room_id,
+            from_device_id: conn.deviceId, from_name: conn.name, justification,
+          })
+          if (!delivered) {
+            undoInvite(db, msg.room_id, conn.deviceId, r.prior)
+            return fail('offline')
+          }
+          markDelivered(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId })
+          conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: room.agent_device_id }))
+          break
         }
+        if (awaitingCount(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
+          return fail('conflict', 'too many requests awaiting user approval')
+        }
+        const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId, initiatorDeviceId: conn.deviceId, justification, topic: '' })
+        if (!r.ok) return fail('conflict', `already ${r.state}`)
+        appendAndFan({
+          userId: conn.userId, convoId: msg.room_id, sender: conn.name, type: 'permission_request',
+          payload: {
+            kind: 'agent_chat', request: 'join', room_id: msg.room_id,
+            from_device_id: conn.deviceId, from_name: sanitizePeerText(conn.name, PEER_NAME_CAP),
+            target_device_id: room.agent_device_id, topic: '', justification,
+          },
+        })
         conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: room.agent_device_id }))
         break
       }

@@ -3,14 +3,25 @@ import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { getParticipant, inviteParticipant, answerInvite, markDelivered } from '../src/participants.js'
+import { addAllowance } from '../src/allowances.js'
 import { handleOp } from '../src/ws.js'
 
+// Task 7 made `agent_invite`/`agent_join` park for user consent by default —
+// no relay to the target at all unless a standing allowance covers the
+// directed pair (see src/allowances.js, test/agent-chat-consent.test.js).
+// This file's job is the OLDER contract: once a pair IS allowed, the relay
+// (busy ack, refuse, accept, offline undo) behaves exactly as it did before
+// consent-gating existed. So `fleet` seeds a bidirectional allowance up
+// front — both directions, since the join-flow test below has B ask A —
+// putting every test in this file on the relay path, same as pre-Task-7.
 async function fleet(t) {
   const s = await startTestServer()
   t.after(() => s.close())
   const dan = await createUser(s.db, 'dan', 'pw')
   const agA = createAgent(s.db, dan.id, 'dev-a')
   const agB = createAgent(s.db, dan.id, 'dev-b')
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: agB.deviceId })
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: agB.deviceId, targetDeviceId: agA.deviceId })
   const a = await makeWsClient(s.base, { token: agA.token, cursor: null })
   const b = await makeWsClient(s.base, { token: agB.token, cursor: null })
   await a.waitFor((f) => f.op === 'hello_ok')
@@ -122,8 +133,12 @@ test('validation and authorization failures', async (t) => {
 })
 
 test('inviting an offline device fails with offline and leaves no row', async (t) => {
-  const { s, dan, a } = await fleet(t)
+  const { s, dan, agA, a } = await fleet(t)
   const ghost = createAgent(s.db, dan.id, 'dev-ghost') // never connects
+  // Relay-path coverage: an unallowed pair would park instead of ever
+  // touching liveness, which is a different test (see
+  // agent-chat-consent.test.js's MAX_AWAITING/park scenarios).
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: ghost.deviceId })
   a.send({ op: 'agent_invite', room_id: 'room', target_device_id: ghost.deviceId, justification: 'x' })
   const err = await a.waitFor((f) => f.op === 'error' && f.ref === 'agent_invite')
   assert.equal(err.code, 'offline')
@@ -396,6 +411,8 @@ test('an unanswered invite expires and the initiator is told', async (t) => {
   const dan = await createUser(s.db, 'dan', 'pw')
   const agA = createAgent(s.db, dan.id, 'dev-a')
   const agB = createAgent(s.db, dan.id, 'dev-b')
+  // Relay-path coverage (Task 7 parks an unallowed pair instead).
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: agB.deviceId })
   const a = await makeWsClient(s.base, { token: agA.token, cursor: null })
   const b = await makeWsClient(s.base, { token: agB.token, cursor: null })
   await a.waitFor((f) => f.op === 'hello_ok')
@@ -406,10 +423,11 @@ test('an unanswered invite expires and the initiator is told', async (t) => {
   a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'x' })
   await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
   // New contract: the 30-minute (here, 150ms) answer clock starts at
-  // delivered_at, not created_at (Task 4). ws.js's current agent_invite
-  // handler relays immediately but doesn't yet stamp delivery (that wiring
-  // is Task 7) — stamp it directly here so the sweep has a delivered row to
-  // clock, matching what B's receipt of the request frame above attests.
+  // delivered_at, not created_at (Task 4). The allowance-path relay above
+  // now stamps delivery itself (Task 7's markDelivered call) — this
+  // redundant direct stamp only guards against a future path that stops
+  // doing so on its own; markDelivered's delivered_at-IS-NULL guard makes it
+  // a harmless no-op here.
   markDelivered(s.db, { convoId: 'room', agentDeviceId: agB.deviceId })
   // B never answers; the sweep expires it.
   const ans = await a.waitFor((f) => f.kind === 'invite' && f.event === 'answer', 3000)

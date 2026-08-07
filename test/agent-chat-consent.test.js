@@ -2,6 +2,8 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
+import { getParticipant } from '../src/participants.js'
+import { addAllowance } from '../src/allowances.js'
 
 // Harness pattern copied from the top of test/invites.test.js: one user, one
 // client device, one agent device — both connected, both hello_ok'd, and a
@@ -28,6 +30,37 @@ async function fleet(t) {
   agent.frames.length = 0
   client.frames.length = 0
   return { s, dan, agentDev, clientToken, agent, client }
+}
+
+// A second fleet shape for Task 7's room-op tests: TWO agent devices (a room
+// owner and an invite/join counterpart) plus a client, mirroring
+// test/invites.test.js's `fleet` but with the client connection this file's
+// scenarios need to observe the consent card. `agA` owns 'room'; `agB` is
+// the invite target / join requester, depending on the test. `name` lets one
+// test give `agA` an attacker-shaped device name to prove the card sanitises
+// from_name too.
+async function roomFleet(t, { ownerName = 'dev-a' } = {}) {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const agA = createAgent(s.db, dan.id, ownerName)
+  const agB = createAgent(s.db, dan.id, 'dev-b')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const clientToken = login.json.token
+  const a = await makeWsClient(s.base, { token: agA.token, cursor: null })
+  const b = await makeWsClient(s.base, { token: agB.token, cursor: null })
+  const client = await makeWsClient(s.base, { token: clientToken, cursor: null })
+  await a.waitFor((f) => f.op === 'hello_ok')
+  await b.waitFor((f) => f.op === 'hello_ok')
+  await client.waitFor((f) => f.op === 'hello_ok')
+  t.after(() => { a.close(); b.close(); client.close() })
+  a.send({ op: 'convo_upsert', convo_id: 'room', title: 'room', session_state: 'running' })
+  await a.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
+  a.frames.length = 0
+  b.frames.length = 0
+  client.frames.length = 0
+  return { s, dan, agA, agB, clientToken, a, b, client }
 }
 
 const isCard = (f) => f.kind === 'journal' && f.type === 'permission_request' && f.payload?.kind === 'agent_chat'
@@ -94,4 +127,107 @@ test('client-only agent-chat card: HTTP GET /convo/:id/messages omits it for the
   assert.ok(asClient.json.events.some((e) => e.type === 'permission_request' && e.payload?.kind === 'agent_chat'),
     'the client-token page must include the card')
   assert.ok(!JSON.stringify(asAgent.json).includes('SECRET'), 'no trace of the justification text reached the agent via HTTP')
+})
+
+// --- Task 7: agent_invite/agent_join park for user consent -----------------
+
+test('agent_invite parks: the target hears nothing, the requester gets the same delivered ack, and the client sees a permission_request card', async (t) => {
+  const { agA, agB, client, a, b } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'need your logs' })
+
+  const ack = await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.target_device_id === agB.deviceId)
+  assert.ok(ack, 'the requester gets the bridge-compat delivered ack even though nothing was relayed')
+
+  const card = await client.waitFor((f) => f.kind === 'journal' && f.type === 'permission_request' && f.payload?.kind === 'agent_chat')
+  assert.equal(card.payload.request, 'invite')
+  assert.equal(card.payload.room_id, 'room')
+  assert.equal(card.payload.from_device_id, agA.deviceId)
+  assert.equal(card.payload.from_name, 'dev-a')
+  assert.equal(card.payload.target_device_id, agB.deviceId)
+  assert.equal(card.payload.topic, 'ci')
+  assert.equal(card.payload.justification, 'need your logs')
+
+  // The live frame is delivered synchronously inside the same handleOp call
+  // that delivers the client's copy, so this is a courtesy settle beat, not
+  // a real race — the security property under test is zero frames, ever.
+  await new Promise((r) => setTimeout(r, 100))
+  assert.equal(b.frames.length, 0, 'the invite target must never be relayed to while parked')
+  assert.ok(!a.frames.some((f) => f.kind === 'journal' && f.type === 'permission_request'),
+    'the requesting agent (also the room owner) must not see the card live either — client-only means no agent, not just not-the-target')
+})
+
+test('a parked invite lands the row in awaiting_user with the topic stored, never delivered_at', async (t) => {
+  const { s, agB, a } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci topic', justification: 'x' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  const row = getParticipant(s.db, 'room', agB.deviceId)
+  assert.equal(row.state, 'awaiting_user')
+  assert.equal(row.topic, 'ci topic')
+  assert.equal(row.justification, 'x')
+  assert.equal(row.delivered_at, null)
+})
+
+test('the card sanitises attacker-controlled from_name, topic, and justification', async (t) => {
+  const { agB, client, a } = await roomFleet(t, { ownerName: 'evil\nname' })
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'evil\ntopic', justification: 'evil\njust' })
+  const card = await client.waitFor((f) => f.kind === 'journal' && f.type === 'permission_request' && f.payload?.kind === 'agent_chat')
+  assert.equal(card.payload.from_name, 'evil name')
+  assert.equal(card.payload.topic, 'evil topic')
+  assert.equal(card.payload.justification, 'evil just')
+})
+
+test('a 4th outstanding request from one requester device is rejected before parking, not queued', async (t) => {
+  const { agB, a } = await roomFleet(t)
+  const rooms = ['room', 'room2', 'room3', 'room4']
+  for (const r of rooms.slice(1)) {
+    a.send({ op: 'convo_upsert', convo_id: r, title: r, session_state: 'running' })
+    await a.waitFor((f) => f.kind === 'journal' && f.type === 'session_status' && f.convo_id === r)
+  }
+  for (const r of rooms.slice(0, 3)) {
+    a.send({ op: 'agent_invite', room_id: r, target_device_id: agB.deviceId, justification: 'ask' })
+    await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.room_id === r)
+  }
+  a.send({ op: 'agent_invite', room_id: rooms[3], target_device_id: agB.deviceId, justification: 'ask 4' })
+  const err = await a.waitFor((f) => f.op === 'error' && f.ref === 'agent_invite')
+  assert.equal(err.code, 'conflict')
+  assert.equal(err.room_id, rooms[3])
+})
+
+test('an allowed pair bypasses the park entirely: immediate relay, invited+delivered row, no card', async (t) => {
+  const { s, dan, agA, agB, a, b, client } = await roomFleet(t)
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: agB.deviceId })
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'need logs' })
+
+  const req = await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
+  assert.equal(req.room_id, 'room')
+  assert.equal(req.from_name, 'dev-a')
+  assert.equal(req.topic, 'ci')
+  assert.equal(req.justification, 'need logs')
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.target_device_id === agB.deviceId)
+
+  const row = getParticipant(s.db, 'room', agB.deviceId)
+  assert.equal(row.state, 'invited')
+  assert.ok(row.delivered_at != null, 'the allowance path stamps delivery, unlike the old pre-Task-7 flow')
+
+  await new Promise((r) => setTimeout(r, 100))
+  assert.ok(!client.frames.some((f) => f.kind === 'journal' && f.type === 'permission_request'),
+    'no consent card is published when a standing allowance covers the pair')
+})
+
+test('agent_join parks for user consent symmetrically: the room owner hears nothing, the requester gets delivered, and the card requests join', async (t) => {
+  const { agA, agB, client, a, b } = await roomFleet(t)
+  b.send({ op: 'agent_join', room_id: 'room', justification: 'let me help with this bug' })
+
+  await b.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.target_device_id === agA.deviceId)
+
+  const card = await client.waitFor((f) => f.kind === 'journal' && f.type === 'permission_request' && f.payload?.kind === 'agent_chat')
+  assert.equal(card.payload.request, 'join')
+  assert.equal(card.payload.room_id, 'room')
+  assert.equal(card.payload.from_device_id, agB.deviceId)
+  assert.equal(card.payload.from_name, 'dev-b')
+  assert.equal(card.payload.target_device_id, agA.deviceId)
+  assert.equal(card.payload.justification, 'let me help with this bug')
+
+  await new Promise((r) => setTimeout(r, 100))
+  assert.equal(a.frames.length, 0, 'the room owner (join target) must not be relayed to while parked')
 })
