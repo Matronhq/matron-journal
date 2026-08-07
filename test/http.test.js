@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
+import { inviteParticipant, answerInvite } from '../src/participants.js'
 
 test('login → snapshot → pagination over HTTP', async (t) => {
   const s = await startTestServer()
@@ -74,6 +75,45 @@ test('GET /convo/:id/messages validates limit, before_seq, and percent-encoding'
   const badEncoding = await fetch(s.base + '/convo/%zz/messages', { headers: { authorization: `Bearer ${token}` } })
   assert.equal(badEncoding.status, 400)
   assert.deepEqual(await badEncoding.json(), { error: 'bad_request' })
+})
+
+test('GET /convo/:id/messages: agent tokens are gated by authorizeAgentWrite (owner/joined only), never a bare same-user check; client tokens are unchanged', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const owner = createAgent(s.db, dan.id, 'owner')
+  const stranger = createAgent(s.db, dan.id, 'stranger')
+  const guest = createAgent(s.db, dan.id, 'guest')
+  upsertConversation(s.db, { id: 'room', ownerUserId: dan.id, title: 'room', sessionState: 'running', agentDeviceId: owner.deviceId })
+  append(s.db, { userId: dan.id, convoId: 'room', sender: 'agent:owner', type: 'text', payload: { body: 'hi' } })
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+
+  // A same-user agent that is neither the owner nor a joined participant is
+  // rejected — this is the whole point of the fix: pre-fix, any agent token
+  // of the user could read any other agent's conversation transcript.
+  const foreign = await s.http('/convo/room/messages', { token: stranger.token })
+  assert.equal(foreign.status, 404)
+  assert.deepEqual(foreign.json, { error: 'not_found' })
+
+  // The recorded owner reads fine.
+  const ownerRes = await s.http('/convo/room/messages', { token: owner.token })
+  assert.equal(ownerRes.status, 200)
+  assert.equal(ownerRes.json.events.length, 1)
+  assert.equal(ownerRes.json.events[0].payload.body, 'hi')
+
+  // A joined participant reads fine too (this is what agent_chat_read's
+  // "allowed for joined agents" needs).
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: guest.deviceId, initiatorDeviceId: owner.deviceId, justification: 'x' })
+  answerInvite(s.db, { convoId: 'room', agentDeviceId: guest.deviceId, accept: true })
+  const guestRes = await s.http('/convo/room/messages', { token: guest.token })
+  assert.equal(guestRes.status, 200)
+  assert.equal(guestRes.json.events.length, 1)
+
+  // A client token of the same user is unaffected — still just user-scoped
+  // ownership, same as before this fix.
+  const clientRes = await s.http('/convo/room/messages', { token: login.json.token })
+  assert.equal(clientRes.status, 200)
+  assert.equal(clientRes.json.events.length, 1)
 })
 
 test('POST /login and /push/register reject a non-object JSON body (null, array, bare primitive) with 400, not 500', async (t) => {

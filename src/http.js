@@ -1,6 +1,6 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
-import { login, authToken, changePassword, revokeOwnedDevice, createAgent, createClientDevice } from './auth.js'
+import { login, authToken, changePassword, revokeOwnedDevice, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, toEventShape } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs } from './db.js'
 import { receiveBlob } from './media.js'
@@ -414,6 +414,18 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const rawLimit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : 50
         if (!Number.isInteger(rawLimit) || rawLimit < 1) return json(res, 400, { error: 'bad_request' })
         const limit = Math.min(rawLimit, 200)
+        // Agent tokens get roster metadata only in v1 (spec: 2026-08-06
+        // agent-to-agent chat design, "Reads" — "no cross-agent transcript
+        // reads in v1"). messagesBefore's own gate below is user-scoped
+        // (authorize()), so any agent device of the user could otherwise
+        // read any other agent's conversation transcript, room or not.
+        // Tighten to the same owner/joined-participant/legacy-NULL rule
+        // every other agent write path already uses. Client tokens are
+        // unchanged (still just user-scoped ownership). Same 404 shape as
+        // every other not-authorized/missing case here — never 403.
+        if (who.kind === 'agent' && !authorizeAgentWrite(db, who.userId, who.deviceId, convoId)) {
+          return json(res, 404, { error: 'not_found' })
+        }
         try {
           const events = messagesBefore(db, who.userId, convoId, { beforeSeq, limit }).map(toEventShape)
           return json(res, 200, { events })

@@ -18,7 +18,17 @@ the machine-checkable version of this page.
 - `GET /convo/:id/messages?before_seq&limit` (Bearer) -> `{events}`. `limit`
   is clamped to 1..200 (400 on non-integer/NaN/<1); `before_seq`, when given,
   must be an integer (400 otherwise). Owner-only; missing or not-owned are
-  indistinguishable, both 404 `{error:'not_found'}` (never 403).
+  indistinguishable, both 404 `{error:'not_found'}` (never 403). For an
+  **agent** token specifically, "owner" is narrower than plain user-scoped
+  ownership: the same `authorizeAgentWrite` rule every other agent write
+  path uses (the conversation's recorded owner device, a `joined`
+  participant, or a legacy NULL-owner conversation) — a foreign convo of the
+  same user's OTHER agent device is 404, same shape as a missing/not-owned
+  one, never 403. This is the spec's "agents get roster metadata only, no
+  cross-agent transcript reads in v1" rule enforced on the one HTTP read
+  path that used to be only user-scoped; it's also exactly what a future
+  `agent_chat_read` needs ("allowed for joined agents"). Client tokens are
+  unaffected — still plain user-scoped ownership.
 - `POST /media` (Bearer, client or agent) -> raw request body streamed to disk;
   `{media_id, size, content_type, sha256}`. Content-Type header captured
   (default `application/octet-stream`). 400 `{error:'empty'}` on a zero-byte
