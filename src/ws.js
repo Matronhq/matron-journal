@@ -1,9 +1,10 @@
 import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { eventsAfter, append, markRead, upsertConversation, toEventShape, isClientOnlyEvent } from './journal.js'
-import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, undoInvite, getParticipant, expireInvites, parkInvite, awaitingCount, markDelivered } from './participants.js'
+import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, undoInvite, getParticipant, expireInvites, parkInvite, awaitingCount, markDelivered, expireAwaiting } from './participants.js'
 import { isAllowed } from './allowances.js'
 import { sanitizePeerText } from './peer-text.js'
+import { deliverPendingInvites } from './invite-delivery.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -54,9 +55,8 @@ const CONVO_ID_MAX_CHARS = 128
 const INVITE_TOPIC_MAX_CHARS = 200
 const INVITE_TEXT_MAX_CHARS = 1000
 // Consent-gate constants (spec: agent chat consent). AWAITING_USER_TTL_MS is
-// the 24h clock the sweep (Task 8) will use to expire a parked ask nobody
-// ever answered — declared here, alongside the other invite lifecycle
-// constants, even though nothing reads it yet. MAX_AWAITING_PER_REQUESTER
+// the 24h clock the sweep uses (see the sweep timer's expireAwaiting loop)
+// to expire a parked ask nobody ever answered. MAX_AWAITING_PER_REQUESTER
 // caps how many asks a single device can have parked at once, across every
 // room, so one chatty agent can't flood the user's attention queue.
 // PEER_NAME_CAP bounds the sanitised from_name embedded in a consent card.
@@ -193,6 +193,24 @@ export function attachWs({
         hub.sendToDevice(convo.owner_user_id, row.initiator_device_id, {
           kind: 'invite', event: 'answer', room_id: row.convo_id,
           peer_device_id: row.agent_device_id, accept: false, reason: 'expired',
+        })
+      }
+      // Catch-all delivery attempt (spec: single pump, three callers) — an
+      // admin-approved or HTTP-approved row whose target was already
+      // connected by the time it got approved has no hello to catch it;
+      // this sweep tick is what finally gets it there.
+      deliverPendingInvites(db, hub)
+      // awaiting_user TTL (24h, AWAITING_USER_TTL_MS): a parked ask the user
+      // never answered at all. Told to the requester as reason: 'refused',
+      // NEVER 'expired' — a user-side timeout that never even reached a
+      // decision must be indistinguishable from a deliberate no, or a peer
+      // could infer "the user hasn't looked yet" and keep re-asking.
+      for (const row of expireAwaiting(db, AWAITING_USER_TTL_MS)) {
+        const convo = ownerLookup.get(row.convo_id)
+        if (!convo) continue
+        hub.sendToDevice(convo.owner_user_id, row.initiator_device_id, {
+          kind: 'invite', event: 'answer', room_id: row.convo_id,
+          peer_device_id: row.agent_device_id, accept: false, reason: 'refused',
         })
       }
       const conns = hub.allConns()
@@ -356,6 +374,11 @@ export function attachWs({
           if (conn.closed) return
           hub.register(conn)
           conn.registered = true
+          // Catch-up delivery for THIS device only (spec: single pump, three
+          // callers) — an invite approved while this agent was offline sits
+          // undelivered until it next connects; this is that moment. Scoped
+          // to agent connections: a client device is never a recipient row.
+          if (who.kind === 'agent') deliverPendingInvites(db, hub, { deviceId: conn.deviceId })
           return
         }
         // Spec §8 close-on-next-frame: revocation is just deleting the

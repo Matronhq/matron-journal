@@ -2,8 +2,11 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { getParticipant } from '../src/participants.js'
+import { openDb } from '../src/db.js'
+import { upsertConversation } from '../src/journal.js'
+import { getParticipant, parkInvite, answerParkedInvite } from '../src/participants.js'
 import { addAllowance } from '../src/allowances.js'
+import { deliverPendingInvites } from '../src/invite-delivery.js'
 
 // Harness pattern copied from the top of test/invites.test.js: one user, one
 // client device, one agent device — both connected, both hello_ok'd, and a
@@ -235,4 +238,159 @@ test('agent_join parks for user consent symmetrically: the room owner hears noth
 
   await new Promise((r) => setTimeout(r, 100))
   assert.equal(a.frames.length, 0, 'the room owner (join target) must not be relayed to while parked')
+})
+
+// --- Task 8: delivery pump + hello hook + awaiting_user sweep --------------
+
+// Minimal fixture for the pump's own unit tests: a real db (schema +
+// foreign_keys enforced, so undeliveredInvites' join to conversations has
+// something to join against) but no sockets at all — the stub hub below
+// stands in for hub.js entirely.
+async function pumpFleet() {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const agA = createAgent(db, dan.id, 'dev-a') // room owner / invite initiator
+  const agB = createAgent(db, dan.id, 'dev-b') // invite target / joiner
+  upsertConversation(db, {
+    id: 'room', ownerUserId: dan.id, title: 'room', sessionState: 'running',
+    agentDeviceId: agA.deviceId, parentConvoId: null, summary: null,
+  })
+  return { db, dan, agA, agB }
+}
+
+// Exact shape the brief specifies: records every attempted send (so a test
+// can tell an offline attempt from no attempt at all) and reports success
+// per the `online` set, same as hub.sendRpcRequest's single-socket contract.
+function stubHub(onlineDeviceIds = []) {
+  const calls = []
+  const online = new Set(onlineDeviceIds)
+  return { calls, sendRpcRequest: (u, d, f) => { calls.push([u, d, f]); return online.has(d) } }
+}
+
+test('deliverPendingInvites: an offline recipient is attempted but never stamped delivered', async () => {
+  const { db, agA, agB } = await pumpFleet()
+  parkInvite(db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, justification: 'need logs', topic: 'ci' })
+  assert.ok(answerParkedInvite(db, { convoId: 'room', agentDeviceId: agB.deviceId, approve: true }))
+  const hub = stubHub([]) // agB is not online
+  const sent = deliverPendingInvites(db, hub)
+  assert.equal(sent, 0)
+  assert.equal(hub.calls.length, 1, 'the pump must still try — that attempt is how it learns the target is offline')
+  assert.equal(getParticipant(db, 'room', agB.deviceId).delivered_at, null, 'an offline recipient must not be stamped delivered')
+})
+
+test('deliverPendingInvites: an online recipient gets the exact request frame and is stamped, exactly once', async () => {
+  const { db, dan, agA, agB } = await pumpFleet()
+  parkInvite(db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, justification: 'need logs', topic: 'ci' })
+  answerParkedInvite(db, { convoId: 'room', agentDeviceId: agB.deviceId, approve: true })
+  const hub = stubHub([agB.deviceId])
+
+  const sent = deliverPendingInvites(db, hub)
+  assert.equal(sent, 1)
+  assert.equal(hub.calls.length, 1)
+  const [userId, deviceId, frame] = hub.calls[0]
+  assert.equal(userId, dan.id)
+  assert.equal(deviceId, agB.deviceId)
+  assert.deepEqual(frame, {
+    kind: 'invite', event: 'request', room_id: 'room',
+    from_device_id: agA.deviceId, from_name: 'dev-a', topic: 'ci', justification: 'need logs',
+  })
+  assert.ok(getParticipant(db, 'room', agB.deviceId).delivered_at != null)
+
+  // Exactly-once: a second pump call must find nothing left undelivered.
+  const sentAgain = deliverPendingInvites(db, hub)
+  assert.equal(sentAgain, 0)
+  assert.equal(hub.calls.length, 1, 'no second attempt against an already-delivered row')
+})
+
+test('deliverPendingInvites: a join-direction row routes to room_agent_device_id, not agent_device_id', async () => {
+  const { db, dan, agA, agB } = await pumpFleet()
+  // agB is both the row's agent_device_id AND its initiator — the join-request
+  // shape (see undeliveredInvites' doc comment in participants.js). The
+  // recipient must be agA (the room's recorded owner), not agB itself.
+  parkInvite(db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agB.deviceId, justification: 'let me help', topic: '' })
+  answerParkedInvite(db, { convoId: 'room', agentDeviceId: agB.deviceId, approve: true })
+  const hub = stubHub([agA.deviceId])
+
+  const sent = deliverPendingInvites(db, hub)
+  assert.equal(sent, 1)
+  assert.equal(hub.calls.length, 1)
+  const [userId, deviceId, frame] = hub.calls[0]
+  assert.equal(userId, dan.id)
+  assert.equal(deviceId, agA.deviceId, 'a join request must be routed to the room owner, not back to the joiner')
+  assert.deepEqual(frame, {
+    kind: 'invite', event: 'join_request', room_id: 'room',
+    from_device_id: agB.deviceId, from_name: 'dev-b', justification: 'let me help',
+  })
+  assert.ok(getParticipant(db, 'room', agB.deviceId).delivered_at != null)
+})
+
+test('hello hook: an invite approved while the target was offline is delivered the moment it connects; a later reconnect gets nothing', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const agA = createAgent(s.db, dan.id, 'dev-a')
+  const agB = createAgent(s.db, dan.id, 'dev-b') // stays offline through the park+approve
+  const a = await makeWsClient(s.base, { token: agA.token, cursor: null })
+  await a.waitFor((f) => f.op === 'hello_ok')
+  t.after(() => a.close())
+  a.send({ op: 'convo_upsert', convo_id: 'room', title: 'room', session_state: 'running' })
+  await a.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
+
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'need logs' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'awaiting_user')
+
+  // Approve directly — standing in for the HTTP consent endpoint (a separate
+  // task): the pump must not care WHO approved, only that the row is now
+  // 'invited' and undelivered.
+  assert.ok(answerParkedInvite(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, approve: true }))
+
+  const b = await makeWsClient(s.base, { token: agB.token, cursor: null })
+  await b.waitFor((f) => f.op === 'hello_ok')
+  t.after(() => b.close())
+  const req = await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
+  assert.equal(req.room_id, 'room')
+  assert.equal(req.from_device_id, agA.deviceId)
+  assert.equal(req.from_name, 'dev-a')
+  assert.equal(req.topic, 'ci')
+  assert.equal(req.justification, 'need logs')
+  assert.ok(getParticipant(s.db, 'room', agB.deviceId).delivered_at != null)
+
+  // A second reconnect of the same device must receive nothing further —
+  // the row is already stamped delivered.
+  b.close()
+  await new Promise((r) => setTimeout(r, 50))
+  const b2 = await makeWsClient(s.base, { token: agB.token, cursor: null })
+  await b2.waitFor((f) => f.op === 'hello_ok')
+  t.after(() => b2.close())
+  await new Promise((r) => setTimeout(r, 100))
+  assert.ok(!b2.frames.some((f) => f.kind === 'invite' && f.event === 'request'), 'a reconnect after delivery must receive nothing')
+})
+
+test('sweep: a parked ask nobody answered for 24h expires and the requester hears reason "refused", never "expired"', async (t) => {
+  const s = await startTestServer({ revocationSweepMs: 100 })
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const agA = createAgent(s.db, dan.id, 'dev-a')
+  const agB = createAgent(s.db, dan.id, 'dev-b')
+  const a = await makeWsClient(s.base, { token: agA.token, cursor: null })
+  await a.waitFor((f) => f.op === 'hello_ok')
+  t.after(() => a.close())
+  a.send({ op: 'convo_upsert', convo_id: 'room', title: 'room', session_state: 'running' })
+  await a.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
+
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'x' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'awaiting_user')
+
+  // Force the park 25h stale — past the fixed 24h AWAITING_USER_TTL_MS —
+  // same raw-UPDATE mechanism test/invites.test.js uses for expireInvites.
+  s.db.prepare("UPDATE convo_agents SET created_at=? WHERE convo_id='room' AND agent_device_id=?")
+    .run(Date.now() - 25 * 3600_000, agB.deviceId)
+
+  const ans = await a.waitFor((f) => f.kind === 'invite' && f.event === 'answer', 3000)
+  assert.equal(ans.accept, false)
+  assert.equal(ans.reason, 'refused', 'a user-side timeout must read exactly like a refusal — a peer must never learn "expired" means the human never even saw it')
+  assert.equal(ans.peer_device_id, agB.deviceId)
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'expired')
 })
