@@ -1,5 +1,5 @@
 import { WebSocketServer } from 'ws'
-import { authToken, authorize, authorizeAgentWrite } from './auth.js'
+import { authToken, authorizeAgentWrite } from './auth.js'
 import { eventsAfter, append, markRead, upsertConversation, toEventShape } from './journal.js'
 import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, undoInvite, getParticipant, expireInvites } from './participants.js'
 
@@ -791,7 +791,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
       case 'stream': {
         if (conn.kind !== 'agent') return fail('forbidden')
         // Ownership check, matching every other agent write path (activity/
-        // status/stream_append all call authorize()). Previously omitted here
+        // status/stream_append all call authorizeAgentWrite()). Previously omitted here
         // on the theory that sendEphemeral's own user-scoping made it inert —
         // but that only bounds the blast radius to the agent's own user; within
         // that user, a bridge could still spoof a live text overlay into a
