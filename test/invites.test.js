@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { getParticipant, inviteParticipant, answerInvite } from '../src/participants.js'
+import { handleOp } from '../src/ws.js'
 
 async function fleet(t) {
   const s = await startTestServer()
@@ -136,4 +137,33 @@ test('agent_leave flips joined to left and notifies the owner', async (t) => {
   b.send({ op: 'agent_leave', room_id: 'room' })
   const err = await b.waitFor((f) => f.op === 'error' && f.ref === 'agent_leave')
   assert.equal(err.code, 'conflict')
+})
+
+test('agent_invite_ack/agent_invite_answer/agent_leave reject an unregistered agent connection', async (t) => {
+  // hello_ok flips conn.registered=true only after the auth+replay dance
+  // completes; mid-replay this socket is invisible to hub scans, same
+  // reasoning as agent_invite/agent_join's existing gate (see loadRoom's
+  // comment). Simulate that pre-registration window directly via handleOp,
+  // since a real ws.hello() races the registration flag closed too fast to
+  // observe from a public-interface test.
+  const { s, dan, agA, agB } = await fleet(t)
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x' })
+  const frames = []
+  const unregistered = {
+    ws: { send: (str) => frames.push(JSON.parse(str)) },
+    userId: dan.id, deviceId: agB.deviceId, kind: 'agent', name: 'dev-b', registered: false,
+  }
+  for (const msg of [
+    { op: 'agent_invite_ack', room_id: 'room', session_state: 'idle' },
+    { op: 'agent_invite_answer', room_id: 'room', accept: true },
+    { op: 'agent_leave', room_id: 'room' },
+  ]) {
+    frames.length = 0
+    handleOp({ db: s.db, hub: s.hub, conn: unregistered, msg })
+    assert.equal(frames.length, 1, `${msg.op} should reply with exactly one frame`)
+    assert.equal(frames[0].code, 'not_ready', `${msg.op} -> not_ready`)
+  }
+  // The gate short-circuits before any state mutation: the invite is still
+  // pending, untouched by the rejected ack/answer/leave attempts above.
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'invited')
 })

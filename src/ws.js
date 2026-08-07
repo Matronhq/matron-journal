@@ -593,6 +593,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
       case 'agent_invite_ack':
       case 'agent_invite_answer': {
         if (conn.kind !== 'agent') return fail('forbidden')
+        if (!conn.registered) return fail('not_ready')
         const { room, err } = loadRoom(msg.room_id)
         if (err) return fail(...err)
         // Direction rule: the row names the non-owner participant;
@@ -632,6 +633,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
       }
       case 'agent_leave': {
         if (conn.kind !== 'agent') return fail('forbidden')
+        if (!conn.registered) return fail('not_ready')
         const { room, err } = loadRoom(msg.room_id)
         if (err) return fail(...err)
         if (!leaveConvo(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId })) {
