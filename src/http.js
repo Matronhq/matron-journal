@@ -353,18 +353,27 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           return json(res, 200, { ok: true })
         }
         answerParkedInvite(db, { convoId: room_id, agentDeviceId: target_device_id, approve: true })
+        // Join requests self-target (row.initiator_device_id ===
+        // target_device_id, the joiner) — the recipient of THIS row's relay
+        // (and, below, the directed-pair target) is the room owner, not the
+        // joiner itself.
+        const isJoin = row.initiator_device_id === target_device_id
         if (always_allow === true) {
-          // Join requests self-target (row.initiator_device_id ===
-          // target_device_id, the joiner) — the directed pair to remember is
-          // joiner -> room owner, not joiner -> joiner.
-          const isJoin = row.initiator_device_id === target_device_id
           addAllowance(db, {
             userId: who.userId,
             fromDeviceId: row.initiator_device_id,
             targetDeviceId: isJoin ? room.agent_device_id : target_device_id,
           })
         }
-        const delivered = deliverPendingInvites(db, hub) > 0
+        // Scoped to this row's own recipient: the unscoped pump sweeps every
+        // undelivered row system-wide, so an unrelated row's successful
+        // delivery could otherwise make `sent > 0` true while THIS row's
+        // target is still offline. Even scoped, `sent` could reflect a
+        // different row addressed to the same recipient device — so the
+        // response flag is read back off the answered row itself, which is
+        // exact.
+        deliverPendingInvites(db, hub, { deviceId: isJoin ? room.agent_device_id : target_device_id })
+        const delivered = getParticipant(db, room_id, target_device_id)?.delivered_at != null
         return json(res, 200, { ok: true, delivered })
       }
       const dm = url.pathname.match(/^\/devices\/(\d+)\/revoke$/)

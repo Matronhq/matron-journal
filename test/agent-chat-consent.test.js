@@ -512,6 +512,39 @@ test('POST /agent-chat/answer approve, target online: target receives the reques
   assert.ok(getParticipant(s.db, 'room', agB.deviceId).delivered_at != null)
 })
 
+test('delivered flag is scoped to the answered row: an unrelated ONLINE recipient must not make an OFFLINE target read delivered:true', async (t) => {
+  const { s, dan, agA, agB, clientToken, a } = await roomFleet(t, { connectB: false })
+  // The row we are about to answer: agB, offline throughout this test.
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'need logs' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+
+  // An UNRELATED already-approved, undelivered row for a third device that
+  // IS online — planted directly via the participants API (bypassing the
+  // park flow) so it sits in exactly the state the pump sweeps: state
+  // 'invited', delivered_at NULL. Before the fix, the unscoped pump call
+  // inside POST /agent-chat/answer would deliver THIS row too (agC is
+  // online) and report sent>0, making the response wrongly claim the
+  // just-approved (still offline) agB row was delivered.
+  const agC = createAgent(s.db, dan.id, 'dev-c')
+  const c = await makeWsClient(s.base, { token: agC.token, cursor: null })
+  await c.waitFor((f) => f.op === 'hello_ok')
+  t.after(() => c.close())
+  parkInvite(s.db, { convoId: 'room', agentDeviceId: agC.deviceId, initiatorDeviceId: agA.deviceId, justification: 'unrelated', topic: '' })
+  assert.ok(answerParkedInvite(s.db, { convoId: 'room', agentDeviceId: agC.deviceId, approve: true }))
+  assert.equal(getParticipant(s.db, 'room', agC.deviceId).delivered_at, null)
+
+  const r = await s.http('/agent-chat/answer', {
+    method: 'POST', token: clientToken,
+    body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'approve' },
+  })
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.json, { ok: true, delivered: false }, 'agB is offline — an unrelated online agC row must never leak into this response')
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId).delivered_at, null)
+  // The pump call this request triggers must be scoped to agB's own
+  // recipient only — agC's unrelated row is left exactly as it was.
+  assert.equal(getParticipant(s.db, 'room', agC.deviceId).delivered_at, null, 'the scoped pump call must not touch an unrelated recipient\'s row')
+})
+
 test('POST /agent-chat/answer deny: row -> denied, requester gets an answer frame with reason "refused" (never "denied")', async (t) => {
   const { s, agB, clientToken, a } = await roomFleet(t)
   a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'need logs' })
