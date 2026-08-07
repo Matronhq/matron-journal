@@ -146,6 +146,7 @@ test('agent_invite parks: the target hears nothing, the requester gets the same 
   assert.equal(card.payload.target_device_id, agB.deviceId)
   assert.equal(card.payload.topic, 'ci')
   assert.equal(card.payload.justification, 'need your logs')
+  assert.equal(card.sender, 'agent:dev-a', 'every agent-authored append carries the agent: prefix (docs/protocol.md)')
 
   // The live frame is delivered synchronously inside the same handleOp call
   // that delivers the client's copy, so this is a courtesy settle beat, not
@@ -177,7 +178,7 @@ test('the card sanitises attacker-controlled from_name, topic, and justification
 })
 
 test('a 4th outstanding request from one requester device is rejected before parking, not queued', async (t) => {
-  const { agB, a } = await roomFleet(t)
+  const { s, agB, a } = await roomFleet(t)
   const rooms = ['room', 'room2', 'room3', 'room4']
   for (const r of rooms.slice(1)) {
     a.send({ op: 'convo_upsert', convo_id: r, title: r, session_state: 'running' })
@@ -191,6 +192,9 @@ test('a 4th outstanding request from one requester device is rejected before par
   const err = await a.waitFor((f) => f.op === 'error' && f.ref === 'agent_invite')
   assert.equal(err.code, 'conflict')
   assert.equal(err.room_id, rooms[3])
+  // The cap check runs before parkInvite is ever called — the rejected 4th
+  // ask must leave no trace in convo_agents for that room+device.
+  assert.equal(getParticipant(s.db, rooms[3], agB.deviceId), null)
 })
 
 test('an allowed pair bypasses the park entirely: immediate relay, invited+delivered row, no card', async (t) => {
@@ -227,6 +231,7 @@ test('agent_join parks for user consent symmetrically: the room owner hears noth
   assert.equal(card.payload.from_name, 'dev-b')
   assert.equal(card.payload.target_device_id, agA.deviceId)
   assert.equal(card.payload.justification, 'let me help with this bug')
+  assert.equal(card.sender, 'agent:dev-b', 'every agent-authored append carries the agent: prefix (docs/protocol.md)')
 
   await new Promise((r) => setTimeout(r, 100))
   assert.equal(a.frames.length, 0, 'the room owner (join target) must not be relayed to while parked')

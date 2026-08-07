@@ -677,7 +677,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         // own fan-out already excludes every agent device, including the
         // room's recorded owner, so this never reaches an agent socket.
         appendAndFan({
-          userId: conn.userId, convoId: msg.room_id, sender: conn.name, type: 'permission_request',
+          userId: conn.userId, convoId: msg.room_id, sender: `agent:${conn.name}`, type: 'permission_request',
           payload: {
             kind: 'agent_chat', request: 'invite', room_id: msg.room_id,
             from_device_id: conn.deviceId, from_name: sanitizePeerText(conn.name, PEER_NAME_CAP),
@@ -723,7 +723,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId, initiatorDeviceId: conn.deviceId, justification, topic: '' })
         if (!r.ok) return fail('conflict', `already ${r.state}`)
         appendAndFan({
-          userId: conn.userId, convoId: msg.room_id, sender: conn.name, type: 'permission_request',
+          userId: conn.userId, convoId: msg.room_id, sender: `agent:${conn.name}`, type: 'permission_request',
           payload: {
             kind: 'agent_chat', request: 'join', room_id: msg.room_id,
             from_device_id: conn.deviceId, from_name: sanitizePeerText(conn.name, PEER_NAME_CAP),
