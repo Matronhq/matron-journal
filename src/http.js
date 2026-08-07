@@ -295,6 +295,27 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         }))
         return json(res, 200, { devices })
       }
+      if (req.method === 'GET' && url.pathname === '/roster') {
+        // Targeting surface for agent chat (spec: phase 2 roster) — unlike
+        // /devices (management, client-gated) this is deliberately open to
+        // agent tokens, and deliberately NARROWER: agent devices only
+        // (an agent still has no business enumerating its user's client
+        // devices), no cursor/lag/push_prefs, and only top-level
+        // conversations (children are silenced sub-chats, never chat
+        // targets). Same owner_user_id scoping as every other read.
+        const live = new Set(hub.connsOf(who.userId).filter((c) => c.ws.readyState === 1).map((c) => c.deviceId))
+        const agents = db.prepare(
+          "SELECT id AS device_id, name, created_at, last_seen_at FROM devices WHERE user_id=? AND kind='agent' ORDER BY id"
+        ).all(who.userId).map((d) => ({ ...d, connected: live.has(d.device_id) }))
+        const conversations = db.prepare(
+          `SELECT id, title, session_state, last_seq, summary, agent_device_id, created_at,
+                  (SELECT ts FROM events e WHERE e.convo_id = conversations.id
+                   ORDER BY e.seq DESC LIMIT 1) AS last_ts
+           FROM conversations WHERE owner_user_id=? AND parent_convo_id IS NULL
+           ORDER BY last_seq DESC`
+        ).all(who.userId)
+        return json(res, 200, { agents, conversations })
+      }
       const dm = url.pathname.match(/^\/devices\/(\d+)\/revoke$/)
       if (req.method === 'POST' && dm) {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })

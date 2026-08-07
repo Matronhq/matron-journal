@@ -458,3 +458,42 @@ test('PUT /push/prefs validation: unknown fields, non-boolean values, agent devi
   const agent = createAgent(s.db, login.json.user_id, 'bridge')
   assert.equal((await s.http('/push/prefs', { method: 'PUT', token: agent.token, body: { attention: false } })).status, 403)
 })
+
+test('GET /roster: agent token gets agent devices + top-level conversation metadata', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const eve = await createUser(s.db, 'eve', 'pw')
+  const agA = createAgent(s.db, dan.id, 'dev-a')
+  const agB = createAgent(s.db, dan.id, 'dev-b')
+  createAgent(s.db, eve.id, 'dev-eve')
+  await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  upsertConversation(s.db, { id: 'top', ownerUserId: dan.id, title: 'work', sessionState: 'running', agentDeviceId: agA.deviceId, summary: 'fixing CI' })
+  upsertConversation(s.db, { id: 'child', ownerUserId: dan.id, title: 'sub', sessionState: 'running', agentDeviceId: agA.deviceId, parentConvoId: 'top' })
+  upsertConversation(s.db, { id: 'evetop', ownerUserId: eve.id, title: 'secret', sessionState: 'running' })
+
+  const r = await s.http('/roster', { token: agB.token })
+  assert.equal(r.status, 200)
+  // Agent devices only — client devices are management surface (/devices,
+  // client-gated) and never enumerable by an agent.
+  assert.deepEqual(r.json.agents.map((d) => d.name).sort(), ['dev-a', 'dev-b'])
+  assert.ok(r.json.agents.every((d) => d.kind === undefined || d.kind === 'agent'))
+  const ids = r.json.conversations.map((c) => c.id)
+  assert.ok(ids.includes('top'))
+  assert.ok(!ids.includes('child'), 'sub-chats are not roster targets')
+  assert.ok(!ids.includes('evetop'), 'other users invisible')
+  const top = r.json.conversations.find((c) => c.id === 'top')
+  assert.equal(top.summary, 'fixing CI')
+  assert.equal(top.agent_device_id, agA.deviceId)
+})
+
+test('GET /roster works for client tokens too and requires auth', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'dan', 'pw')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const ok = await s.http('/roster', { token: login.json.token })
+  assert.equal(ok.status, 200)
+  const anon = await s.http('/roster')
+  assert.equal(anon.status, 401)
+})
