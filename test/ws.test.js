@@ -26,6 +26,29 @@ test('hello replays from cursor, then streams live appends', async (t) => {
   c.close()
 })
 
+test('hello_ok carries the authenticated device identity (id + name)', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const bridge = createAgent(s.db, dan.id, 'dev-2')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+
+  const agent = await makeWsClient(s.base, { token: bridge.token, cursor: null })
+  const aHello = await agent.waitFor((f) => f.op === 'hello_ok')
+  assert.ok(Number.isInteger(aHello.device_id), `agent hello_ok device_id must be an integer, got ${JSON.stringify(aHello.device_id)}`)
+  assert.equal(aHello.device_id, bridge.deviceId)
+  assert.equal(aHello.name, 'dev-2')
+
+  const client = await makeWsClient(s.base, { token: login.json.token, cursor: null })
+  const cHello = await client.waitFor((f) => f.op === 'hello_ok')
+  assert.ok(Number.isInteger(cHello.device_id), `client hello_ok device_id must be an integer, got ${JSON.stringify(cHello.device_id)}`)
+  assert.equal(cHello.device_id, login.json.device_id)
+  assert.equal(cHello.name, 'mac')
+
+  agent.close()
+  client.close()
+})
+
 test('bad token gets error control frame', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())

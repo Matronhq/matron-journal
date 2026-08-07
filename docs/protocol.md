@@ -160,7 +160,10 @@ the machine-checkable version of this page.
 ## WebSocket
 
 - `WS /ws`: first frame `{op:'hello', token, cursor}` (cursor null = live-only).
-  Server: `hello_ok {seq}`, then journal frames `> cursor`, then live.
+  Server: `hello_ok {seq, device_id, name}`, then journal frames `> cursor`,
+  then live. `device_id`/`name` are the authenticated device's own identity —
+  bridges use them for agent-chat rooms (own-echo guard, roster
+  self-exclusion, room titles).
   If the replay gap (`head_seq - cursor`) exceeds `MATRON_MAX_REPLAY`
   (default 50000), the server sends `{kind:'control', op:'snapshot_required'}`
   instead of replaying and closes the socket with code `4009` — the client

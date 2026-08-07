@@ -234,7 +234,12 @@ export function attachWs({
           conn.username = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId).name
           const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(who.userId)
           const headSeq = head ? head.seq : 0
-          ws.send(JSON.stringify({ kind: 'control', op: 'hello_ok', seq: headSeq }))
+          // device_id/name: the connection's own identity, echoed back so the
+          // peer knows who it authenticated as — bridges need it for agent-chat
+          // rooms (own-echo guard, roster self-exclusion, room titles); the
+          // token is otherwise opaque to them. Reuses the row authToken already
+          // resolved (`who`) — no extra lookup.
+          ws.send(JSON.stringify({ kind: 'control', op: 'hello_ok', seq: headSeq, device_id: who.deviceId, name: who.name }))
           if (msg.cursor != null) {
             // snapshot_required valve (spec §6): a gap this large is not worth
             // replaying — tell the client to wipe, GET /snapshot, and reconnect
