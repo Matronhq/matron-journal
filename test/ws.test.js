@@ -443,6 +443,32 @@ test('revocation sweep: a silently-listening revoked device is closed (error fra
   mac.close()
 })
 
+test("sweep tick catches a DB error instead of throwing (uncaught exception on an unref'd timer would kill the process)", async (t) => {
+  const s = await startTestServer({ revocationSweepMs: 60 })
+  t.after(() => s.close())
+
+  const logged = []
+  const originalConsoleError = console.error
+  console.error = (...args) => { logged.push(args) }
+  t.after(() => { console.error = originalConsoleError })
+
+  // Shutdown-race / SQLITE_BUSY stand-in: closing the db makes every query
+  // inside the sweep body (expireInvites, the per-row owner lookup, the
+  // revocation scan) throw "database connection is not open". Before this
+  // fix that exception was uncaught on the sweep's setInterval callback —
+  // fatal to the whole process, since the timer is unref'd and nothing else
+  // observes it. This test simply running to its assertion (instead of
+  // crashing the whole `node --test` run) is half the proof; the explicit
+  // log check below is the other half.
+  s.db.close()
+  await new Promise((r) => setTimeout(r, 200))
+
+  assert.ok(
+    logged.some(([label]) => label === 'sweep failed'),
+    'the sweep must catch and log a DB error inside its body, not throw'
+  )
+})
+
 test('a socket that closes mid-replay is never left registered in the hub', async (t) => {
   // replayBackpressureBytes: -1 parks the replay loop in waitForDrain at the
   // first batch boundary indefinitely (bufferedAmount >= 0 is always > -1)

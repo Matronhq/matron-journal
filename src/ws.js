@@ -129,38 +129,53 @@ export function attachWs({
   // next-frame or ≤ one sweep interval (60s default), whichever comes
   // first. unref'd — never keeps the process alive on its own.
   const sweep = setInterval(() => {
-    // Tool-stream idle sweep piggybacks on this timer: a bridge that died
-    // mid-command never finalizes, so its buffer must expire and any viewer
-    // must learn the stream is dead. Runs before the early-return below —
-    // buffers expire even when no connection is registered.
-    for (const ev of toolStreams.sweepIdle()) notifyStale(hub, ev)
-    // Invite expiry (spec: 30 min default, generous because busy is
-    // reported honestly via the ack). Piggybacks on this sweep timer, same
-    // as the tool-stream idle sweep above. The initiator (room owner for
-    // invites, the joiner for join requests) hears an expiry exactly like
-    // a refusal, with reason 'expired'; if it is offline right now it
-    // simply misses the frame — its next roster/answer attempt tells the
-    // same story (conflict / state=expired).
-    for (const row of expireInvites(db, inviteTtlMs)) {
-      const convo = db.prepare('SELECT owner_user_id FROM conversations WHERE id=?').get(row.convo_id)
-      if (!convo) continue
-      hub.sendToDevice(convo.owner_user_id, row.initiator_device_id, {
-        kind: 'invite', event: 'answer', room_id: row.convo_id,
-        peer_device_id: row.agent_device_id, accept: false, reason: 'expired',
-      })
-    }
-    const conns = hub.allConns()
-    if (conns.length === 0) return
-    const ids = [...new Set(conns.map((c) => c.deviceId))]
-    const existing = new Set(
-      db.prepare(`SELECT id FROM devices WHERE id IN (${ids.map(() => '?').join(',')})`)
-        .all(...ids).map((r) => r.id)
-    )
-    for (const c of conns) {
-      if (existing.has(c.deviceId)) continue
-      if (c.ws.readyState !== 1) continue // already closing; its 'close' handler unregisters it
-      c.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
-      c.ws.close(4001)
+    // Whole-body guard: this callback now does DB work (expireInvites below
+    // plus a per-expired-row lookup) ahead of the connection-count
+    // early-return, so any SQLite error here (a shutdown race, SQLITE_BUSY)
+    // must not become an uncaught exception on the process's timer thread —
+    // that would kill the whole server. A reproduced suite flake ("database
+    // connection is not open" surfacing well after a test's server had
+    // closed) traced to exactly this gap. Fail loud, not fatal.
+    try {
+      // Tool-stream idle sweep piggybacks on this timer: a bridge that died
+      // mid-command never finalizes, so its buffer must expire and any viewer
+      // must learn the stream is dead. Runs before the early-return below —
+      // buffers expire even when no connection is registered.
+      for (const ev of toolStreams.sweepIdle()) notifyStale(hub, ev)
+      // Invite expiry (spec: 30 min default, generous because busy is
+      // reported honestly via the ack). Piggybacks on this sweep timer, same
+      // as the tool-stream idle sweep above. The initiator (room owner for
+      // invites, the joiner for join requests) hears an expiry exactly like
+      // a refusal, with reason 'expired'; if it is offline right now it
+      // simply misses the frame — its next roster/answer attempt tells the
+      // same story (conflict / state=expired). Statement prepared once per
+      // tick, not once per expired row — expiry is rare but a busy sweep
+      // tick could still carry several rows.
+      const expired = expireInvites(db, inviteTtlMs)
+      const ownerLookup = db.prepare('SELECT owner_user_id FROM conversations WHERE id=?')
+      for (const row of expired) {
+        const convo = ownerLookup.get(row.convo_id)
+        if (!convo) continue
+        hub.sendToDevice(convo.owner_user_id, row.initiator_device_id, {
+          kind: 'invite', event: 'answer', room_id: row.convo_id,
+          peer_device_id: row.agent_device_id, accept: false, reason: 'expired',
+        })
+      }
+      const conns = hub.allConns()
+      if (conns.length === 0) return
+      const ids = [...new Set(conns.map((c) => c.deviceId))]
+      const existing = new Set(
+        db.prepare(`SELECT id FROM devices WHERE id IN (${ids.map(() => '?').join(',')})`)
+          .all(...ids).map((r) => r.id)
+      )
+      for (const c of conns) {
+        if (existing.has(c.deviceId)) continue
+        if (c.ws.readyState !== 1) continue // already closing; its 'close' handler unregisters it
+        c.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
+        c.ws.close(4001)
+      }
+    } catch (err) {
+      console.error('sweep failed', err)
     }
   }, revocationSweepMs)
   sweep.unref()
