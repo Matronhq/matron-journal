@@ -8,29 +8,119 @@
 
 // Renewable states: an old outcome must not block a fresh invite, but a
 // pending or accepted row must (double-invite is a caller bug worth
-// surfacing, not silently resetting).
-const RENEWABLE = new Set(['refused', 'left', 'expired'])
+// surfacing, not silently resetting). 'denied' is renewable for the same
+// reason 'refused' is — a user's past no must not permanently bar a
+// legitimate later ask. 'awaiting_user' is deliberately NOT renewable: a
+// pending ask that could simply be renewed is a re-request loop against the
+// user's attention, not a fresh ask (see parkInvite/answerParkedInvite).
+const RENEWABLE = new Set(['refused', 'denied', 'left', 'expired'])
+
+// Shared upsert behind inviteParticipant/parkInvite: same renew-or-reject
+// gate, same conflict target, differing only in which state (and topic) the
+// row lands in. `delivered_at` is always reset to NULL here — a renewed row
+// is a brand new ask, not a continuation of whatever was or wasn't delivered
+// before.
+function upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state, justification, topic }) {
+  const existing = db.prepare(
+    'SELECT * FROM convo_agents WHERE convo_id=? AND agent_device_id=?'
+  ).get(convoId, agentDeviceId)
+  if (existing && !RENEWABLE.has(existing.state)) return { ok: false, state: existing.state }
+  db.prepare(`
+    INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, justification, topic, created_at, answered_at, delivered_at)
+    VALUES(?,?,?,?,?,?,?,NULL,NULL)
+    ON CONFLICT(convo_id, agent_device_id) DO UPDATE SET
+      initiator_device_id=excluded.initiator_device_id,
+      state=excluded.state,
+      justification=excluded.justification,
+      topic=excluded.topic,
+      created_at=excluded.created_at,
+      answered_at=NULL,
+      delivered_at=NULL
+  `).run(convoId, agentDeviceId, initiatorDeviceId, state, justification, topic, Date.now())
+  return { ok: true, prior: existing ?? null }
+}
 
 // Returns `{ok:true, prior}` where `prior` is the full row as it stood
 // BEFORE this call (null if no row existed) — a caller whose delivery then
 // fails needs the WHOLE prior row, not just its state, to restore it exactly
 // rather than erasing it (see undoInvite below).
 export function inviteParticipant(db, { convoId, agentDeviceId, initiatorDeviceId, justification = '' }) {
-  const existing = db.prepare(
-    'SELECT * FROM convo_agents WHERE convo_id=? AND agent_device_id=?'
-  ).get(convoId, agentDeviceId)
-  if (existing && !RENEWABLE.has(existing.state)) return { ok: false, state: existing.state }
-  db.prepare(`
-    INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, justification, created_at, answered_at)
-    VALUES(?,?,?,'invited',?,?,NULL)
-    ON CONFLICT(convo_id, agent_device_id) DO UPDATE SET
-      initiator_device_id=excluded.initiator_device_id,
-      state='invited',
-      justification=excluded.justification,
-      created_at=excluded.created_at,
-      answered_at=NULL
-  `).run(convoId, agentDeviceId, initiatorDeviceId, justification, Date.now())
-  return { ok: true, prior: existing ?? null }
+  return upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state: 'invited', justification, topic: '' })
+}
+
+// Parks a request awaiting the user's consent — same renew/conflict
+// semantics as inviteParticipant, but the row lands in 'awaiting_user'
+// (never delivered to the target) and carries the topic the user will see
+// on the approval card. See answerParkedInvite for how a park resolves.
+export function parkInvite(db, { convoId, agentDeviceId, initiatorDeviceId, justification = '', topic = '' }) {
+  return upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state: 'awaiting_user', justification, topic })
+}
+
+// Resolves a parked row per the user's decision. Approve restarts
+// created_at (the 30-minute answer-from-target clock has not started yet —
+// delivered_at stays NULL until markDelivered fires) and clears answered_at
+// so the row reads as freshly pending, not previously answered. Deny is
+// terminal and stamps answered_at, same shape as answerInvite's refusal.
+// Scoped to state='awaiting_user' so answering twice, or answering a row
+// that was never parked, is a no-op false rather than a silent state stomp.
+export function answerParkedInvite(db, { convoId, agentDeviceId, approve, now = Date.now() }) {
+  const r = approve
+    ? db.prepare("UPDATE convo_agents SET state='invited', created_at=?, answered_at=NULL WHERE convo_id=? AND agent_device_id=? AND state='awaiting_user'").run(now, convoId, agentDeviceId)
+    : db.prepare("UPDATE convo_agents SET state='denied', answered_at=? WHERE convo_id=? AND agent_device_id=? AND state='awaiting_user'").run(now, convoId, agentDeviceId)
+  return r.changes === 1
+}
+
+// Stamps actual relay to the recipient — called by whichever of the pump's
+// three callers (HTTP approve, agent hello, sweep timer) actually got the
+// frame onto a live socket. The delivered_at IS NULL guard makes repeat
+// calls (a hello racing the sweep) a no-op rather than clobbering an earlier
+// stamp, and scoping to state='invited' keeps a row that has since moved on
+// (left/expired) from being stamped after the fact.
+export function markDelivered(db, { convoId, agentDeviceId, now = Date.now() }) {
+  return db.prepare("UPDATE convo_agents SET delivered_at=? WHERE convo_id=? AND agent_device_id=? AND state='invited' AND delivered_at IS NULL")
+    .run(now, convoId, agentDeviceId).changes === 1
+}
+
+// Every approved invite the delivery pump still owes a relay to. Joined to
+// conversations for the two facts the pump needs but convo_agents doesn't
+// carry: which user owns the room (to scope the hub lookup) and which
+// device manages it (the recipient for a self-initiated JOIN REQUEST row,
+// where agent_device_id names the joiner, not the target — see
+// deliverPendingInvites in invite-delivery.js for the routing logic this
+// feeds).
+export function undeliveredInvites(db) {
+  return db.prepare(`
+    SELECT ca.convo_id, ca.agent_device_id, ca.initiator_device_id, ca.justification, ca.topic,
+           c.owner_user_id, c.agent_device_id AS room_agent_device_id
+    FROM convo_agents ca JOIN conversations c ON c.id = ca.convo_id
+    WHERE ca.state='invited' AND ca.delivered_at IS NULL
+  `).all()
+}
+
+// Outstanding parked asks for one requester, across every room — the cap
+// that keeps a single device from flooding the user's attention with asks
+// (MAX_AWAITING_PER_REQUESTER in ws.js).
+export function awaitingCount(db, initiatorDeviceId) {
+  return db.prepare("SELECT COUNT(*) c FROM convo_agents WHERE state='awaiting_user' AND initiator_device_id=?").get(initiatorDeviceId).c
+}
+
+// Every row awaiting this user's decision, joined to conversations for the
+// title the pending endpoint/CLI displays alongside the ask.
+export function listAwaiting(db, userId) {
+  return db.prepare(`
+    SELECT ca.convo_id, ca.agent_device_id, ca.initiator_device_id, ca.justification, ca.topic, ca.created_at, c.title
+    FROM convo_agents ca JOIN conversations c ON c.id = ca.convo_id
+    WHERE ca.state='awaiting_user' AND c.owner_user_id=? ORDER BY ca.created_at
+  `).all(userId)
+}
+
+// Sweep half of the 24h awaiting_user TTL, mirroring expireInvites below:
+// flip stale parked rows and report them so the caller can tell the
+// requester its ask timed out. RETURNING keeps flip-and-report atomic.
+export function expireAwaiting(db, ttlMs, now = Date.now()) {
+  return db.prepare(
+    "UPDATE convo_agents SET state='expired', answered_at=? WHERE state='awaiting_user' AND created_at<=? RETURNING convo_id, agent_device_id, initiator_device_id"
+  ).all(now, now - ttlMs)
 }
 
 export function answerInvite(db, { convoId, agentDeviceId, accept, now = Date.now() }) {
@@ -146,9 +236,14 @@ export function isParticipant(db, convoId, agentDeviceId) {
 // Sweep half of invite expiry (ws.js owns the timer and the caller
 // notification): flip stale pending rows and report them. RETURNING keeps
 // flip-and-report atomic — no separate SELECT that a concurrent answer
-// could race.
+// could race. Clocked by delivered_at, not created_at: the 30-minute
+// answer window is a window for the TARGET to answer, so it must not start
+// ticking before the target has actually seen the ask — an
+// approved-but-undelivered row (target offline, or an admin-approved park
+// still waiting on the pump) is exempt (delivered_at IS NULL) so it can
+// never expire out from under an offline target.
 export function expireInvites(db, ttlMs, now = Date.now()) {
   return db.prepare(
-    "UPDATE convo_agents SET state='expired', answered_at=? WHERE state='invited' AND created_at<=? RETURNING convo_id, agent_device_id, initiator_device_id"
+    "UPDATE convo_agents SET state='expired', answered_at=? WHERE state='invited' AND delivered_at IS NOT NULL AND delivered_at<=? RETURNING convo_id, agent_device_id, initiator_device_id"
   ).all(now, now - ttlMs)
 }

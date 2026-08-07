@@ -4,6 +4,8 @@ import { openDb } from '../src/db.js'
 import {
   inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants,
   removeParticipant, undoInvite, joinedAgentIds, getParticipant, isParticipant, expireInvites,
+  parkInvite, answerParkedInvite, markDelivered, undeliveredInvites, awaitingCount,
+  listAwaiting, expireAwaiting,
 } from '../src/participants.js'
 
 const db = () => openDb(':memory:')
@@ -69,7 +71,8 @@ test('leaveAllParticipants flips the live rows, spares terminal ones, and splits
   inviteParticipant(d, { convoId: 'room', agentDeviceId: 4, initiatorDeviceId: 1, justification: 'x' })
   answerInvite(d, { convoId: 'room', agentDeviceId: 4, accept: false }) // refused — terminal
   inviteParticipant(d, { convoId: 'room', agentDeviceId: 6, initiatorDeviceId: 1, justification: 'x' })
-  d.prepare('UPDATE convo_agents SET created_at=? WHERE convo_id=? AND agent_device_id=?').run(now - 10000, 'room', 6)
+  // New contract: expireInvites clocks off delivered_at, not created_at.
+  markDelivered(d, { convoId: 'room', agentDeviceId: 6, now: now - 10000 })
   expireInvites(d, 5000, now) // 6 only — every other pending row is fresh
   inviteParticipant(d, { convoId: 'other', agentDeviceId: 5, initiatorDeviceId: 1, justification: 'x' })
   answerInvite(d, { convoId: 'other', agentDeviceId: 5, accept: true })
@@ -151,8 +154,11 @@ test('expireInvites flips only stale pending rows and returns them', () => {
   const d = db()
   const now = Date.now()
   inviteParticipant(d, { convoId: 'stale', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'x' })
-  d.prepare('UPDATE convo_agents SET created_at=? WHERE convo_id=?').run(now - 10000, 'stale')
+  // New contract: the 30-minute answer clock starts at delivered_at, not
+  // created_at — stamp delivery, then backdate it to simulate staleness.
+  markDelivered(d, { convoId: 'stale', agentDeviceId: 2, now: now - 10000 })
   inviteParticipant(d, { convoId: 'fresh', agentDeviceId: 3, initiatorDeviceId: 1, justification: 'x' })
+  markDelivered(d, { convoId: 'fresh', agentDeviceId: 3, now })
   inviteParticipant(d, { convoId: 'done', agentDeviceId: 4, initiatorDeviceId: 1, justification: 'x' })
   answerInvite(d, { convoId: 'done', agentDeviceId: 4, accept: true })
   const expired = expireInvites(d, 5000, now)
@@ -162,4 +168,99 @@ test('expireInvites flips only stale pending rows and returns them', () => {
   assert.equal(getParticipant(d, 'done', 4).state, 'joined')
   // Second sweep finds nothing.
   assert.deepEqual(expireInvites(d, 5000, now), [])
+})
+
+test('parkInvite creates awaiting_user with topic, no delivery stamp', () => {
+  const d = db()
+  const r = parkInvite(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'help', topic: 'ci' })
+  assert.deepEqual(r, { ok: true, prior: null })
+  const row = getParticipant(d, 'room', 2)
+  assert.equal(row.state, 'awaiting_user')
+  assert.equal(row.topic, 'ci')
+  assert.equal(row.delivered_at, null)
+})
+
+test('awaiting_user is not renewable; denied is', () => {
+  const d = db()
+  parkInvite(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'x', topic: '' })
+  assert.deepEqual(parkInvite(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'y', topic: '' }),
+    { ok: false, state: 'awaiting_user' })
+  answerParkedInvite(d, { convoId: 'room', agentDeviceId: 2, approve: false })
+  assert.equal(getParticipant(d, 'room', 2).state, 'denied')
+  assert.equal(parkInvite(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'z', topic: '' }).ok, true)
+})
+
+test('approve flips to invited and restarts created_at; deny stamps answered_at', () => {
+  const d = db()
+  parkInvite(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'x', topic: '' })
+  assert.equal(answerParkedInvite(d, { convoId: 'room', agentDeviceId: 2, approve: true, now: 999 }), true)
+  const row = getParticipant(d, 'room', 2)
+  assert.equal(row.state, 'invited')
+  assert.equal(row.created_at, 999)
+  assert.equal(row.delivered_at, null)
+  // answering a non-parked row is a no-op
+  assert.equal(answerParkedInvite(d, { convoId: 'room', agentDeviceId: 2, approve: false }), false)
+})
+
+test('expireInvites only reaps DELIVERED invited rows, clocked by delivered_at', () => {
+  const d = db()
+  parkInvite(d, { convoId: 'a', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'x', topic: '' })
+  answerParkedInvite(d, { convoId: 'a', agentDeviceId: 2, approve: true, now: 0 })
+  // undelivered and ancient: must survive
+  assert.deepEqual(expireInvites(d, 1000, 1_000_000), [])
+  markDelivered(d, { convoId: 'a', agentDeviceId: 2, now: 1_000_000 })
+  assert.deepEqual(expireInvites(d, 1000, 1_000_500), [])            // inside window
+  assert.equal(expireInvites(d, 1000, 1_002_000).length, 1)          // past window from delivered_at
+})
+
+test('expireAwaiting reaps parked rows by created_at', () => {
+  const d = db()
+  parkInvite(d, { convoId: 'a', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'x', topic: '' })
+  assert.deepEqual(expireAwaiting(d, 24 * 3600_000, Date.now()), [])
+  const rows = expireAwaiting(d, 0, Date.now() + 1)
+  assert.equal(rows.length, 1)
+  assert.equal(getParticipant(d, 'a', 2).state, 'expired')
+})
+
+test('awaitingCount counts across convos by initiator', () => {
+  const d = db()
+  parkInvite(d, { convoId: 'a', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'x', topic: '' })
+  parkInvite(d, { convoId: 'b', agentDeviceId: 3, initiatorDeviceId: 1, justification: 'x', topic: '' })
+  parkInvite(d, { convoId: 'c', agentDeviceId: 4, initiatorDeviceId: 9, justification: 'x', topic: '' })
+  assert.equal(awaitingCount(d, 1), 2)
+  assert.equal(awaitingCount(d, 9), 1)
+})
+
+test('undeliveredInvites lists approved-but-undelivered rows joined to their conversation, and drops rows out after delivery', () => {
+  const d = db()
+  // Seed a conversations row the way the FK (owner_user_id REFERENCES
+  // users(id)) requires — raw INSERT, same style as db.test.js's user seed.
+  d.prepare("INSERT INTO users(name, password_hash, created_at) VALUES('u','x',0)").run()
+  const userId = d.prepare("SELECT id FROM users WHERE name='u'").get().id
+  d.prepare(
+    'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, created_at) VALUES(?,?,?,?,?,?)'
+  ).run('room', userId, 'room', 'running', 1, 0)
+
+  // Owner-invite: the room's owning device (1) invites device 2.
+  parkInvite(d, { convoId: 'room', agentDeviceId: 2, initiatorDeviceId: 1, justification: 'owner asks', topic: 't1' })
+  answerParkedInvite(d, { convoId: 'room', agentDeviceId: 2, approve: true, now: 1 })
+  // Self-initiated join request: device 3 is its own row's initiator.
+  parkInvite(d, { convoId: 'room', agentDeviceId: 3, initiatorDeviceId: 3, justification: 'let me in', topic: 't2' })
+  answerParkedInvite(d, { convoId: 'room', agentDeviceId: 3, approve: true, now: 1 })
+
+  const rows = undeliveredInvites(d)
+  assert.equal(rows.length, 2)
+  const ownerInvite = rows.find((r) => r.agent_device_id === 2)
+  const joinRequest = rows.find((r) => r.agent_device_id === 3)
+  assert.equal(ownerInvite.owner_user_id, userId)
+  assert.equal(ownerInvite.room_agent_device_id, 1)
+  assert.equal(ownerInvite.initiator_device_id, 1)
+  assert.equal(joinRequest.owner_user_id, userId)
+  assert.equal(joinRequest.room_agent_device_id, 1)
+  assert.equal(joinRequest.initiator_device_id, 3, 'self-initiated: initiator === agent_device_id')
+
+  markDelivered(d, { convoId: 'room', agentDeviceId: 2, now: 2 })
+  assert.deepEqual(undeliveredInvites(d).map((r) => r.agent_device_id), [3])
+  markDelivered(d, { convoId: 'room', agentDeviceId: 3, now: 2 })
+  assert.deepEqual(undeliveredInvites(d), [])
 })
