@@ -1,8 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { openDb } from '../src/db.js'
-import { createUser } from '../src/auth.js'
+import { createUser, createAgent } from '../src/auth.js'
 import { append, upsertConversation, snapshot, eventsAfter, messagesBefore, markRead, snippetOf } from '../src/journal.js'
+import { inviteParticipant } from '../src/participants.js'
 
 async function setup() {
   const db = openDb(':memory:')
@@ -285,4 +286,22 @@ test('snippetOf tool_output falls back to `$ command` when snippet is absent', (
   const s = snippetOf('tool_output', { command: long })
   assert.equal(s.length, 120)
   assert.ok(s.startsWith('$ x'))
+})
+
+test('a participant upsert never steals agent_device_id; a non-participant still takes over', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const owner = createAgent(db, dan.id, 'dev-a')
+  const guest = createAgent(db, dan.id, 'dev-b')
+  const fresh = createAgent(db, dan.id, 'dev-c')
+  upsertConversation(db, { id: 'room', ownerUserId: dan.id, title: 'room', sessionState: 'running', agentDeviceId: owner.deviceId })
+  // Guest is a participant in ANY state (invited is enough — being invited
+  // makes you categorically a guest).
+  inviteParticipant(db, { convoId: 'room', agentDeviceId: guest.deviceId, initiatorDeviceId: owner.deviceId, justification: 'x' })
+  upsertConversation(db, { id: 'room', ownerUserId: dan.id, sessionState: 'running', agentDeviceId: guest.deviceId })
+  assert.equal(db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get('room').agent_device_id, owner.deviceId)
+  // A device with no participant row keeps the last-writer-wins takeover
+  // (bridge re-pair reclaiming its own sessions under a new device id).
+  upsertConversation(db, { id: 'room', ownerUserId: dan.id, sessionState: 'running', agentDeviceId: fresh.deviceId })
+  assert.equal(db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get('room').agent_device_id, fresh.deviceId)
 })

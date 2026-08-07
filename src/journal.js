@@ -55,9 +55,22 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     // deliberately never written on the update path, so a later upsert that
     // omits it does not clear it and one carrying a different value does not
     // change it (child linkage is a fixed structural fact of the conversation).
+
+    // Ownership no-steal (spec: agent chat phase 2, the "last-writer-wins
+    // ownership flap" fix): a device that appears in convo_agents for this
+    // conversation — any state — is categorically a guest; its upsert keeps
+    // title/state fresh but never reassigns delivery ownership. A device
+    // with NO participant row keeps the takeover behavior (a re-paired
+    // bridge gets a new device id and must be able to reclaim its own
+    // sessions).
+    const guest = agentDeviceId != null
+      && existing.agent_device_id != null
+      && existing.agent_device_id !== agentDeviceId
+      && !!db.prepare('SELECT 1 FROM convo_agents WHERE convo_id=? AND agent_device_id=?').get(id, agentDeviceId)
+
     db.prepare(
       'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id) WHERE id=?'
-    ).run(title ?? null, sessionState ?? null, agentDeviceId ?? null, id)
+    ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), id)
   } else {
     const initialTitle = title || ''
     db.prepare(
