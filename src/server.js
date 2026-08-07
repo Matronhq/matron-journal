@@ -218,7 +218,7 @@ function warnIfBindTrustsSpoofableIp(bind) {
 
 export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
-  retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, walCheckpointIntervalMs, toolStreamOpts,
+  retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
   toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
@@ -276,6 +276,7 @@ export function startServer({
     pingMs: resolveNumericEnv('MATRON_WS_PING_MS', process.env.MATRON_WS_PING_MS, 55000),
     rpcMaxBytes: resolveNumericEnv('MATRON_RPC_MAX_BYTES', process.env.MATRON_RPC_MAX_BYTES, 16384),
     ...(revocationSweepMs !== undefined ? { revocationSweepMs } : {}),
+    ...(inviteTtlMs !== undefined ? { inviteTtlMs } : {}),
   })
   let retentionInterval = null
   let walCheckpointInterval = null

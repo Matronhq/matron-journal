@@ -108,6 +108,22 @@ export function authorize(db, userId, convoId) {
   return !!row && row.owner_user_id === userId
 }
 
+// Agent write gate (spec: agent chat phase 2, the wrong-conversation
+// tightening). An agent device may write into a conversation iff it is the
+// recorded managing device (conversations.agent_device_id), a joined
+// participant (convo_agents), or the conversation predates ownership
+// recording (agent_device_id IS NULL — legacy broadcast rows). User scoping
+// comes first, same as authorize(). Inline SQL rather than importing
+// participants.js — auth.js stays dependency-free below argon2/crypto.
+export function authorizeAgentWrite(db, userId, deviceId, convoId) {
+  const row = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(convoId)
+  if (!row || row.owner_user_id !== userId) return false
+  if (row.agent_device_id == null || row.agent_device_id === deviceId) return true
+  return !!db.prepare(
+    "SELECT 1 FROM convo_agents WHERE convo_id=? AND agent_device_id=? AND state='joined'"
+  ).get(convoId, deviceId)
+}
+
 // Per-username failed-login lockout with exponential backoff (spec §8). Complements
 // the per-IP limiter: an attacker rotating IPs is still locked out of the username.
 // Flip side: anyone who knows a username can keep its real owner locked out for the

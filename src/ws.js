@@ -1,6 +1,7 @@
 import { WebSocketServer } from 'ws'
-import { authToken, authorize } from './auth.js'
+import { authToken, authorizeAgentWrite } from './auth.js'
 import { eventsAfter, append, markRead, upsertConversation, toEventShape } from './journal.js'
+import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, undoInvite, getParticipant, expireInvites } from './participants.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -44,6 +45,16 @@ const RPC_NAME_MAX_CHARS = 64 // method and error.code
 // RPC request ids. Convo ids are conventionally Claude session UUIDs (36
 // chars); this is a defensive upper bound, not a format assertion.
 const CONVO_ID_MAX_CHARS = 128
+
+// Invite lifecycle (spec: agent chat phase 2). Topic is a title fragment;
+// justification/reason are one-paragraph human text — capped so a row/frame
+// stays small, same defensive stance as ACTIVITY_DETAIL_MAX_CHARS.
+const INVITE_TOPIC_MAX_CHARS = 200
+const INVITE_TEXT_MAX_CHARS = 1000
+// Cap for a convo_upsert's rolling summary (spec: agent chat phase 2) — same
+// defensive stance as the invite text caps above.
+const SUMMARY_MAX_CHARS = 1000
+const SESSION_ACK_STATES = new Set(['idle', 'busy'])
 
 // Last status per (user, convo). In-memory only and bounded (oldest-written
 // evicted first): a lost entry just means the header stays blank until the
@@ -90,7 +101,7 @@ export async function waitForDrain(ws, thresholdBytes, pollMs = 20) {
 export function attachWs({
   server, db, hub, pingMs = 55000, pushPipeline = noopPushPipeline,
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
-  revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES,
+  revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES, inviteTtlMs = 1800000,
 }) {
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES })
   const statusCache = makeStatusCache()
@@ -118,23 +129,53 @@ export function attachWs({
   // next-frame or ≤ one sweep interval (60s default), whichever comes
   // first. unref'd — never keeps the process alive on its own.
   const sweep = setInterval(() => {
-    // Tool-stream idle sweep piggybacks on this timer: a bridge that died
-    // mid-command never finalizes, so its buffer must expire and any viewer
-    // must learn the stream is dead. Runs before the early-return below —
-    // buffers expire even when no connection is registered.
-    for (const ev of toolStreams.sweepIdle()) notifyStale(hub, ev)
-    const conns = hub.allConns()
-    if (conns.length === 0) return
-    const ids = [...new Set(conns.map((c) => c.deviceId))]
-    const existing = new Set(
-      db.prepare(`SELECT id FROM devices WHERE id IN (${ids.map(() => '?').join(',')})`)
-        .all(...ids).map((r) => r.id)
-    )
-    for (const c of conns) {
-      if (existing.has(c.deviceId)) continue
-      if (c.ws.readyState !== 1) continue // already closing; its 'close' handler unregisters it
-      c.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
-      c.ws.close(4001)
+    // Whole-body guard: this callback now does DB work (expireInvites below
+    // plus a per-expired-row lookup) ahead of the connection-count
+    // early-return, so any SQLite error here (a shutdown race, SQLITE_BUSY)
+    // must not become an uncaught exception on the process's timer thread —
+    // that would kill the whole server. A reproduced suite flake ("database
+    // connection is not open" surfacing well after a test's server had
+    // closed) traced to exactly this gap. Fail loud, not fatal.
+    try {
+      // Tool-stream idle sweep piggybacks on this timer: a bridge that died
+      // mid-command never finalizes, so its buffer must expire and any viewer
+      // must learn the stream is dead. Runs before the early-return below —
+      // buffers expire even when no connection is registered.
+      for (const ev of toolStreams.sweepIdle()) notifyStale(hub, ev)
+      // Invite expiry (spec: 30 min default, generous because busy is
+      // reported honestly via the ack). Piggybacks on this sweep timer, same
+      // as the tool-stream idle sweep above. The initiator (room owner for
+      // invites, the joiner for join requests) hears an expiry exactly like
+      // a refusal, with reason 'expired'; if it is offline right now it
+      // simply misses the frame — its next roster/answer attempt tells the
+      // same story (conflict / state=expired). Statement prepared once per
+      // tick, not once per expired row — expiry is rare but a busy sweep
+      // tick could still carry several rows.
+      const expired = expireInvites(db, inviteTtlMs)
+      const ownerLookup = db.prepare('SELECT owner_user_id FROM conversations WHERE id=?')
+      for (const row of expired) {
+        const convo = ownerLookup.get(row.convo_id)
+        if (!convo) continue
+        hub.sendToDevice(convo.owner_user_id, row.initiator_device_id, {
+          kind: 'invite', event: 'answer', room_id: row.convo_id,
+          peer_device_id: row.agent_device_id, accept: false, reason: 'expired',
+        })
+      }
+      const conns = hub.allConns()
+      if (conns.length === 0) return
+      const ids = [...new Set(conns.map((c) => c.deviceId))]
+      const existing = new Set(
+        db.prepare(`SELECT id FROM devices WHERE id IN (${ids.map(() => '?').join(',')})`)
+          .all(...ids).map((r) => r.id)
+      )
+      for (const c of conns) {
+        if (existing.has(c.deviceId)) continue
+        if (c.ws.readyState !== 1) continue // already closing; its 'close' handler unregisters it
+        c.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
+        c.ws.close(4001)
+      }
+    } catch (err) {
+      console.error('sweep failed', err)
     }
   }, revocationSweepMs)
   sweep.unref()
@@ -205,24 +246,27 @@ export function attachWs({
               return
             }
             let cursor = msg.cursor
-            // Agent connections replay only their own conversations' frames —
-            // the same ownership scoping hub.broadcastJournal applies to live
-            // traffic (NULL owner = legacy broadcast). Cached per convo for
-            // the duration of this replay; ownership changing mid-replay is
-            // indistinguishable from it changing right after and is harmless.
-            const ownerCache = who.kind === 'agent' ? new Map() : null
+            // Agent connections replay only frames for conversations they
+            // manage or have joined — the same scoping hub.broadcastJournal
+            // applies to live traffic (NULL owner = legacy broadcast).
+            // Decision cached per convo for the duration of this replay;
+            // membership changing mid-replay is indistinguishable from it
+            // changing right after and is harmless.
+            const decisionCache = who.kind === 'agent' ? new Map() : null
             const replaysTo = (convoId) => {
-              let owner = ownerCache.get(convoId)
-              if (owner === undefined) {
-                owner = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id ?? null
-                ownerCache.set(convoId, owner)
+              let d = decisionCache.get(convoId)
+              if (d === undefined) {
+                const owner = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id ?? null
+                d = owner == null || owner === who.deviceId
+                  || !!db.prepare("SELECT 1 FROM convo_agents WHERE convo_id=? AND agent_device_id=? AND state='joined'").get(convoId, who.deviceId)
+                decisionCache.set(convoId, d)
               }
-              return owner == null || owner === who.deviceId
+              return d
             }
             for (;;) {
               const batch = eventsAfter(db, who.userId, cursor, 500)
               for (const e of batch) {
-                if (ownerCache && !replaysTo(e.convo_id)) continue
+                if (decisionCache && !replaysTo(e.convo_id)) continue
                 ws.send(JSON.stringify(journalFrame(e)))
               }
               if (batch.length < 500) break
@@ -327,6 +371,16 @@ export function notifyStale(hub, entry) {
 export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0 }) {
   const fail = (code, detail) =>
     conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code, ref: msg.op, ...(detail ? { detail } : {}) }))
+  // Invite ops: validate a room id + load the row. Rooms are top-level
+  // conversations of this conn's user; children (sub-chats) are silenced
+  // conversations and can never be rooms.
+  const loadRoom = (roomId) => {
+    if (typeof roomId !== 'string' || !roomId || roomId.length > CONVO_ID_MAX_CHARS) return { err: ['bad_request', 'bad room_id'] }
+    const room = db.prepare('SELECT owner_user_id, agent_device_id, parent_convo_id FROM conversations WHERE id=?').get(roomId)
+    if (!room || room.owner_user_id !== conn.userId) return { err: ['not_found'] }
+    if (room.parent_convo_id != null) return { err: ['bad_request', 'child conversations cannot be rooms'] }
+    return { room }
+  }
   // Single choke point: every journal event becomes a WS frame AND (fire and
   // forget) a candidate push, right here — nowhere else calls
   // hub.broadcastJournal for a freshly-appended event. The push pipeline runs
@@ -339,11 +393,13 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
   // push.js classify()) — it never touches the frame, so it can't leak onto
   // the wire or into the stored event payload.
   const fanOut = (frame, pushHint) => {
-    // Delivery scoping (see hub.broadcastJournal): agent connections only
-    // receive frames for conversations they own. Looked up per frame — the
-    // convo row is already hot from append()'s own authorization read.
-    const owner = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(frame.convo_id)
-    hub.broadcastJournal(conn.userId, frame, owner ? owner.agent_device_id : null)
+    // Delivery targets: recorded owner + joined participants (spec: agent
+    // chat phase 2 room fan-out). null owner = legacy broadcast. The convo
+    // row is already hot from append()'s own authorization read; the
+    // participant lookup is a primary-key-prefix seek on convo_agents.
+    const ownerId = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(frame.convo_id)?.agent_device_id ?? null
+    const targets = ownerId == null ? null : new Set([ownerId, ...joinedAgentIds(db, frame.convo_id)])
+    hub.broadcastJournal(conn.userId, frame, targets)
     try {
       pushPipeline.onAppend(conn.userId, frame, conn.deviceId, pushHint)
     } catch (err) {
@@ -504,6 +560,125 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         })
         break
       }
+      case 'agent_invite': {
+        if (conn.kind !== 'agent') return fail('forbidden')
+        // Replies (delivered/ack/answer) are found by a hub scan of this
+        // device's sockets — mid-replay this socket is invisible there, so
+        // reject like agent_request does rather than lose the reply.
+        if (!conn.registered) return fail('not_ready')
+        const { room, err } = loadRoom(msg.room_id)
+        if (err) return fail(...err)
+        if (room.agent_device_id !== conn.deviceId) return fail('forbidden', 'only the room owner may invite')
+        if (!Number.isInteger(msg.target_device_id)) return fail('bad_request', 'bad target_device_id')
+        if (msg.target_device_id === conn.deviceId) return fail('bad_request', 'cannot invite self')
+        if (msg.topic != null && (typeof msg.topic !== 'string' || msg.topic.length > INVITE_TOPIC_MAX_CHARS)) return fail('bad_request', 'bad topic')
+        if (typeof msg.justification !== 'string' || !msg.justification || msg.justification.length > INVITE_TEXT_MAX_CHARS) return fail('bad_request', 'bad justification')
+        // Unknown id, another user's device, and a client device are
+        // indistinguishable — anti-enumeration, same stance as agent_request.
+        const target = db.prepare('SELECT user_id, kind FROM devices WHERE id=?').get(msg.target_device_id)
+        if (!target || target.user_id !== conn.userId || target.kind !== 'agent') return fail('not_found')
+        const r = inviteParticipant(db, {
+          convoId: msg.room_id, agentDeviceId: msg.target_device_id,
+          initiatorDeviceId: conn.deviceId, justification: msg.justification,
+        })
+        if (!r.ok) return fail('conflict', `already ${r.state}`)
+        // Single-socket delivery (sendRpcRequest): a request turn must not
+        // double-inject on a mid-reconnect bridge. false = offline — undo
+        // the row so no pending invite exists that nobody was told about,
+        // and the caller hears it immediately (spec: honest fast status).
+        const delivered = hub.sendRpcRequest(conn.userId, msg.target_device_id, {
+          kind: 'invite', event: 'request', room_id: msg.room_id,
+          from_device_id: conn.deviceId, from_name: conn.name,
+          topic: msg.topic || '', justification: msg.justification,
+        })
+        if (!delivered) {
+          undoInvite(db, msg.room_id, msg.target_device_id, r.prior)
+          return fail('offline')
+        }
+        conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: msg.target_device_id }))
+        break
+      }
+      case 'agent_join': {
+        if (conn.kind !== 'agent') return fail('forbidden')
+        if (!conn.registered) return fail('not_ready')
+        const { room, err } = loadRoom(msg.room_id)
+        if (err) return fail(...err)
+        if (typeof msg.justification !== 'string' || !msg.justification || msg.justification.length > INVITE_TEXT_MAX_CHARS) return fail('bad_request', 'bad justification')
+        if (room.agent_device_id == null) return fail('conflict', 'room has no recorded owner to ask')
+        if (room.agent_device_id === conn.deviceId) return fail('bad_request', 'cannot join own room')
+        const r = inviteParticipant(db, {
+          convoId: msg.room_id, agentDeviceId: conn.deviceId,
+          initiatorDeviceId: conn.deviceId, justification: msg.justification,
+        })
+        if (!r.ok) return fail('conflict', `already ${r.state}`)
+        const delivered = hub.sendRpcRequest(conn.userId, room.agent_device_id, {
+          kind: 'invite', event: 'join_request', room_id: msg.room_id,
+          from_device_id: conn.deviceId, from_name: conn.name,
+          justification: msg.justification,
+        })
+        if (!delivered) {
+          undoInvite(db, msg.room_id, conn.deviceId, r.prior)
+          return fail('offline')
+        }
+        conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: room.agent_device_id }))
+        break
+      }
+      case 'agent_invite_ack':
+      case 'agent_invite_answer': {
+        if (conn.kind !== 'agent') return fail('forbidden')
+        if (!conn.registered) return fail('not_ready')
+        const { room, err } = loadRoom(msg.room_id)
+        if (err) return fail(...err)
+        // Direction rule: the row names the non-owner participant;
+        // initiator_device_id says who started it; the NON-initiator acks/
+        // answers. peer_device_id present = the owner acting on a join
+        // request; absent = the participant acting on an owner invite.
+        let rowDeviceId
+        if (msg.peer_device_id != null) {
+          if (!Number.isInteger(msg.peer_device_id)) return fail('bad_request', 'bad peer_device_id')
+          if (room.agent_device_id !== conn.deviceId) return fail('forbidden', 'only the room owner answers a join request')
+          rowDeviceId = msg.peer_device_id
+        } else {
+          rowDeviceId = conn.deviceId
+        }
+        const row = getParticipant(db, msg.room_id, rowDeviceId)
+        if (!row || row.state !== 'invited') return fail('conflict', 'no pending invite')
+        if (row.initiator_device_id === conn.deviceId) return fail('forbidden', 'the initiator cannot answer its own invite')
+        if (msg.op === 'agent_invite_ack') {
+          if (!SESSION_ACK_STATES.has(msg.session_state)) return fail('bad_request', 'bad session_state')
+          hub.sendToDevice(conn.userId, row.initiator_device_id, {
+            kind: 'invite', event: 'ack', room_id: msg.room_id,
+            from_device_id: conn.deviceId, session_state: msg.session_state,
+          })
+          break
+        }
+        if (typeof msg.accept !== 'boolean') return fail('bad_request', 'bad accept')
+        if (msg.reason != null && (typeof msg.reason !== 'string' || msg.reason.length > INVITE_TEXT_MAX_CHARS)) return fail('bad_request', 'bad reason')
+        if (!answerInvite(db, { convoId: msg.room_id, agentDeviceId: rowDeviceId, accept: msg.accept })) {
+          return fail('conflict', 'no pending invite')
+        }
+        hub.sendToDevice(conn.userId, row.initiator_device_id, {
+          kind: 'invite', event: 'answer', room_id: msg.room_id,
+          peer_device_id: rowDeviceId, accept: msg.accept, from_device_id: conn.deviceId,
+          ...(typeof msg.reason === 'string' && msg.reason ? { reason: msg.reason } : {}),
+        })
+        break
+      }
+      case 'agent_leave': {
+        if (conn.kind !== 'agent') return fail('forbidden')
+        if (!conn.registered) return fail('not_ready')
+        const { room, err } = loadRoom(msg.room_id)
+        if (err) return fail(...err)
+        if (!leaveConvo(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId })) {
+          return fail('conflict', 'not a joined participant')
+        }
+        if (room.agent_device_id != null && room.agent_device_id !== conn.deviceId) {
+          hub.sendToDevice(conn.userId, room.agent_device_id, {
+            kind: 'invite', event: 'left', room_id: msg.room_id, from_device_id: conn.deviceId,
+          })
+        }
+        break
+      }
       case 'read_marker': {
         // null means "resolve server-side to the conversation head" (see
         // markRead); anything else must be a genuine non-negative seq.
@@ -538,11 +713,36 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         )) {
           return fail('bad_request', 'bad parent_convo_id')
         }
+        if (msg.summary != null && (typeof msg.summary !== 'string' || msg.summary.length > SUMMARY_MAX_CHARS)) {
+          return fail('bad_request', 'bad summary')
+        }
+        // Room-upsert ownership gate (fix: convo_upsert takeover bypass). A
+        // conversation with at least one convo_agents row (any state) is a
+        // "room" — once participants have been drawn into its lifecycle,
+        // ONLY the recorded owner may upsert it at all, joined guests and
+        // uninvited strangers alike (a guest upsert would otherwise flap
+        // session_state/title/summary the creator owns, or worse — with the
+        // old code — become the recorded owner itself and cut the real
+        // owner out of fan-out). A participant-less conversation keeps the
+        // pre-existing last-writer-wins takeover (a re-paired bridge with a
+        // new device id reclaiming its own sessions), and a conversation
+        // with no recorded owner (legacy NULL rows) stays writable by
+        // anyone. See docs/protocol.md "Agent delivery scoping". Scoped to
+        // this user's own conversations: a foreign convo id must fall
+        // through to upsertConversation's generic not-authorized rejection,
+        // not this room-specific detail (which would tell another user's
+        // agent that the id exists and is a populated room).
+        const existingRoom = db.prepare('SELECT agent_device_id FROM conversations WHERE id=? AND owner_user_id=?').get(msg.convo_id, conn.userId)
+        if (existingRoom && existingRoom.agent_device_id != null && existingRoom.agent_device_id !== conn.deviceId) {
+          const hasParticipants = db.prepare('SELECT 1 FROM convo_agents WHERE convo_id=? LIMIT 1').get(msg.convo_id)
+          if (hasParticipants) return fail('forbidden', 'only the room owner may upsert a room')
+        }
         const convo = upsertConversation(db, {
           id: msg.convo_id, ownerUserId: conn.userId,
           title: msg.title, sessionState: msg.session_state,
           agentDeviceId: conn.deviceId,
           parentConvoId: msg.parent_convo_id ?? null,
+          summary: msg.summary ?? null,
         })
         if (msg.session_state) {
           // prevSessionState is upsertConversation's read of the row BEFORE
@@ -577,6 +777,13 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (typeof msg.idem_key === 'string' && msg.idem_key.startsWith('fin:')) {
           return fail('bad_request', 'idem_key prefix fin: is reserved')
         }
+        // Wrong-conversation tightening (spec: agent chat phase 2): an agent
+        // device writes only into conversations it manages or has joined.
+        // append() would reject a cross-USER convo anyway; this closes the
+        // same-user cross-DEVICE hole with an explicit error frame.
+        if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) {
+          return fail('forbidden', 'not a participant of this conversation')
+        }
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `agent:${conn.name}`, type: msg.type, payload: msg.payload,
@@ -588,12 +795,12 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
       case 'stream': {
         if (conn.kind !== 'agent') return fail('forbidden')
         // Ownership check, matching every other agent write path (activity/
-        // status/stream_append all call authorize()). Previously omitted here
+        // status/stream_append all call authorizeAgentWrite()). Previously omitted here
         // on the theory that sendEphemeral's own user-scoping made it inert —
         // but that only bounds the blast radius to the agent's own user; within
         // that user, a bridge could still spoof a live text overlay into a
         // conversation it does not own. Fail closed instead, uniformly.
-        if (!authorize(db, conn.userId, msg.convo_id)) return fail('forbidden')
+        if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) return fail('forbidden')
         // Overlay text is bounded by the 1 MiB WS frame cap and is never
         // retained (transient, latest-wins in the coalescer), so no separate
         // byte cap is needed — but reject a non-string text/replace_text rather
@@ -608,7 +815,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
       }
       case 'stream_append': {
         if (conn.kind !== 'agent') return fail('forbidden')
-        if (!authorize(db, conn.userId, msg.convo_id)) return fail('forbidden')
+        if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) return fail('forbidden')
         if (typeof msg.message_ref !== 'string' || !msg.message_ref) return fail('bad_request')
         if (typeof msg.chunk !== 'string' || !Number.isInteger(msg.offset) || msg.offset < 0) return fail('bad_request')
         const r = toolStreams.append({
@@ -639,7 +846,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         // (viewing-scoped, coalesced, never throws on a dead/slow socket).
         if (conn.kind !== 'agent') return fail('forbidden')
         if (!ACTIVITY_STATES.has(msg.state)) return fail('bad_request')
-        if (!authorize(db, conn.userId, msg.convo_id)) return fail('forbidden')
+        if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) return fail('forbidden')
         const detail = typeof msg.detail === 'string' ? msg.detail.slice(0, ACTIVITY_DETAIL_MAX_CHARS) : undefined
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id,
@@ -657,7 +864,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         // a server deploy.
         if (conn.kind !== 'agent') return fail('forbidden')
         if (typeof msg.status !== 'object' || msg.status === null) return fail('bad_request')
-        if (!authorize(db, conn.userId, msg.convo_id)) return fail('forbidden')
+        if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) return fail('forbidden')
         let encoded
         try { encoded = JSON.stringify(msg.status) } catch { return fail('bad_request') }
         if (Buffer.byteLength(encoded, 'utf8') > STATUS_MAX_BYTES) return fail('bad_request', 'status too large')
@@ -675,6 +882,13 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         const type = msg.type || 'text'
         if (!AGENT_PUBLISH_TYPES.has(type)) return fail('bad_request')
         if (typeof msg.payload !== 'object' || msg.payload === null) return fail('bad_request')
+        // Wrong-conversation tightening (spec: agent chat phase 2): an agent
+        // device writes only into conversations it manages or has joined.
+        // append() would reject a cross-USER convo anyway; this closes the
+        // same-user cross-DEVICE hole with an explicit error frame.
+        if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) {
+          return fail('forbidden', 'not a participant of this conversation')
+        }
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `agent:${conn.name}`, type, payload: msg.payload,

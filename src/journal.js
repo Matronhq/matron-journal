@@ -41,7 +41,7 @@ export function snippetOf(type, payload) {
 // (undefined for a brand-new convo). Purely an in-memory hint for the push
 // pipeline's turn-finished detection (see push.js classify()) — never
 // stored or broadcast, so it carries no wire/protocol weight.
-export function upsertConversation(db, { id, ownerUserId, title, sessionState, agentDeviceId, parentConvoId }) {
+export function upsertConversation(db, { id, ownerUserId, title, sessionState, agentDeviceId, parentConvoId, summary }) {
   const existing = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
   const prevSessionState = existing ? existing.session_state : undefined
   let metaChanged = false
@@ -55,14 +55,27 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     // deliberately never written on the update path, so a later upsert that
     // omits it does not clear it and one carrying a different value does not
     // change it (child linkage is a fixed structural fact of the conversation).
+
+    // Ownership no-steal (spec: agent chat phase 2, the "last-writer-wins
+    // ownership flap" fix): a device that appears in convo_agents for this
+    // conversation — any state — is categorically a guest; its upsert keeps
+    // title/state fresh but never reassigns delivery ownership. A device
+    // with NO participant row keeps the takeover behavior (a re-paired
+    // bridge gets a new device id and must be able to reclaim its own
+    // sessions).
+    const guest = agentDeviceId != null
+      && existing.agent_device_id != null
+      && existing.agent_device_id !== agentDeviceId
+      && !!db.prepare('SELECT 1 FROM convo_agents WHERE convo_id=? AND agent_device_id=?').get(id, agentDeviceId)
+
     db.prepare(
-      'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id) WHERE id=?'
-    ).run(title ?? null, sessionState ?? null, agentDeviceId ?? null, id)
+      'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id), summary=COALESCE(?, summary) WHERE id=?'
+    ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), summary ?? null, id)
   } else {
     const initialTitle = title || ''
     db.prepare(
-      'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, created_at) VALUES(?,?,?,?,?,?,?)'
-    ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, Date.now())
+      'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, summary, created_at) VALUES(?,?,?,?,?,?,?,?)'
+    ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, summary || '', Date.now())
     if (initialTitle || parentConvoId) metaChanged = true
   }
   const convo = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
@@ -138,7 +151,7 @@ export function snapshot(db, userId) {
   // events (just created, or history pruned by retention) — clients fall
   // back to created_at. The (convo_id, seq) index makes the subquery a seek.
   const conversations = db.prepare(
-    `SELECT id, title, session_state, last_seq, unread_count, snippet, parent_convo_id, created_at,
+    `SELECT id, title, session_state, last_seq, unread_count, snippet, parent_convo_id, summary, created_at,
             (SELECT ts FROM events e WHERE e.convo_id = conversations.id
              ORDER BY e.seq DESC LIMIT 1) AS last_ts
      FROM conversations WHERE owner_user_id=? ORDER BY last_seq DESC`
