@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { getParticipant, inviteParticipant, answerInvite } from '../src/participants.js'
+import { getParticipant, inviteParticipant, answerInvite, markDelivered } from '../src/participants.js'
 import { handleOp } from '../src/ws.js'
 
 async function fleet(t) {
@@ -405,6 +405,12 @@ test('an unanswered invite expires and the initiator is told', async (t) => {
   await a.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
   a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'x' })
   await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
+  // New contract: the 30-minute (here, 150ms) answer clock starts at
+  // delivered_at, not created_at (Task 4). ws.js's current agent_invite
+  // handler relays immediately but doesn't yet stamp delivery (that wiring
+  // is Task 7) — stamp it directly here so the sweep has a delivered row to
+  // clock, matching what B's receipt of the request frame above attests.
+  markDelivered(s.db, { convoId: 'room', agentDeviceId: agB.deviceId })
   // B never answers; the sweep expires it.
   const ans = await a.waitFor((f) => f.kind === 'invite' && f.event === 'answer', 3000)
   assert.equal(ans.accept, false)
