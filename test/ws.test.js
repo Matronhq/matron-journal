@@ -207,10 +207,9 @@ test('client send into a child (sub-chat) convo is rejected and appends nothing;
   t.after(() => s.close())
   const dan = await createUser(s.db, 'dan', 'pw')
   // A normal parent convo and a child sub-chat (parent_convo_id set): the child
-  // mirrors a subagent transcript for durability and is read-only to clients per
-  // the sub-chat contract (loop #453). The composer is hidden client-side, but an
-  // old tab or a direct WS caller can still emit op:send here — the server is the
-  // authoritative guard.
+  // mirrors a subagent transcript for durability and is read-only to clients.
+  // The composer is hidden client-side, but an old tab or a direct WS caller can
+  // still emit op:send here — the server is the authoritative guard.
   upsertConversation(s.db, { id: 'parent', ownerUserId: dan.id })
   upsertConversation(s.db, { id: 'child', ownerUserId: dan.id, parentConvoId: 'parent' })
   const l = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
@@ -227,6 +226,30 @@ test('client send into a child (sub-chat) convo is rejected and appends nothing;
   const f = await c.waitFor((x) => x.kind === 'journal' && x.type === 'text' && x.convo_id === 'parent')
   assert.equal(f.payload.body, 'allowed')
   assert.equal(f.sender, 'user:dan')
+  c.close()
+})
+
+test('client prompt_reply into a child (sub-chat) convo is rejected and appends nothing', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  // Same read-only sub-chat contract as op:send — prompt_reply is the other
+  // client-write path, so a direct WS caller must not be able to inject a reply
+  // into a read-only child transcript either.
+  upsertConversation(s.db, { id: 'parent', ownerUserId: dan.id })
+  upsertConversation(s.db, { id: 'child', ownerUserId: dan.id, parentConvoId: 'parent' })
+  const l = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const c = await makeWsClient(s.base, { token: l.json.token, cursor: 0 })
+  await c.waitFor((f) => f.op === 'hello_ok')
+
+  c.send({ op: 'prompt_reply', convo_id: 'child', target_seq: 1, choice: 'yes' })
+  await c.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'forbidden' && f.ref === 'prompt_reply')
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM events WHERE convo_id='child'").get().n, 0)
+
+  // the parent (non-child) convo still accepts a prompt_reply
+  c.send({ op: 'prompt_reply', convo_id: 'parent', target_seq: 1, choice: 'yes' })
+  const f = await c.waitFor((x) => x.kind === 'journal' && x.type === 'prompt_reply' && x.convo_id === 'parent')
+  assert.equal(f.payload.choice, 'yes')
   c.close()
 })
 
