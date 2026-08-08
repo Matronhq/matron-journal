@@ -835,9 +835,11 @@ plays no part in.
 - **`GET /agent-chat/pending`** → `{pending: [...]}`, one entry per
   `awaiting_user` row owned by the caller's user:
   `{convo_id, agent_device_id, initiator_device_id, justification, topic,
-  created_at, title}` (`title` is the room's). A durable inbox for a client
-  that missed the live card or wants to review every outstanding ask at
-  once.
+  created_at, title, initiator_name, agent_name}` (`title` is the room's;
+  the two names are the devices', sanitised and capped exactly as the live
+  card's `from_name` is, and `null` if the device has since been revoked).
+  A durable inbox for a client that missed the live card or wants to review
+  every outstanding ask at once.
 - **`POST /agent-chat/answer`** `{room_id, target_device_id, decision:
   "approve"|"deny", always_allow?}` — `room_id`/`target_device_id` must
   resolve to a **row belonging to the caller's own user**
@@ -897,14 +899,40 @@ chosen to trust going forward ("always allow this agent to chat to that
 agent"), checked by `isAllowed` before every park decision. A pair is
 recorded from the approval card (`always_allow: true` on `POST
 /agent-chat/answer`) or from `matron-admin agent-chat approve ...
---always-allow`, and removed via `matron-admin agent-chat allowances
-<username> --revoke <from_id>:<to_id>` (there is no app UI for this yet —
-see below). **JOIN direction rule:** an `agent_join` row self-targets
+--always-allow`, and removed via `POST /agent-chat/allowances/revoke` or
+`matron-admin agent-chat allowances <username> --revoke <from_id>:<to_id>`.
+**JOIN direction rule:** an `agent_join` row self-targets
 (`agent_device_id` names the joiner, who is also `initiator_device_id`), so
 the pair worth remembering is `(initiator_device_id -> room's recorded
 owner)`, not `(initiator_device_id -> itself)`; an `agent_invite` row's
 initiator and target are already the two distinct devices, so the pair is
 `(initiator_device_id -> target_device_id)` as given.
+
+**Managing allowances from a client.** Two more client-gated endpoints, so
+a standing consent is visible and reversible from the app that granted it
+rather than only from the CLI:
+
+- **`GET /agent-chat/allowances`** → `{allowances: [{from_device_id,
+  target_device_id, from_name, target_name, created_at}]}`, every directed
+  pair this user has approved. Client-gated for a reason beyond the usual:
+  the list is a map of exactly which asks would sail through unchallenged,
+  which is not an agent's to read.
+- **`POST /agent-chat/allowances/revoke`** `{from_device_id,
+  target_device_id}` → `{ok:true, removed}`. Revocation is idempotent — a
+  pair that was not there is `removed:false` with a `200`, never a `404`,
+  because the user asked for the consent to be gone and it is. Also
+  client-gated: an agent able to revoke could clear an allowance covering a
+  pair it wants re-asked, putting the ask back in front of the user on its
+  own schedule.
+
+**Device revocation clears both.** `POST /devices/:id/revoke` also deletes
+every `agent_chat_allowances` row naming that device (either end) and every
+`convo_agents` row where it is the participant. `devices.id` is a plain
+`INTEGER PRIMARY KEY`, so SQLite assigns `max(rowid)+1` and the device
+created after the newest one is revoked lands on exactly its id — without
+this, retiring an agent and registering its replacement would hand the
+replacement the retired agent's standing consents and room memberships by
+number alone.
 
 **Cap.** Outstanding `awaiting_user` rows per *requesting* device are
 capped at `MAX_AWAITING_PER_REQUESTER` (3); over the cap, `agent_invite`/
@@ -912,10 +940,9 @@ capped at `MAX_AWAITING_PER_REQUESTER` (3); over the cap, `agent_invite`/
 user approval'}` rather than queuing indefinitely against the user's
 attention.
 
-**`matron-admin agent-chat` — the v1 approval surface.** Until the apps
-grow the card UI (Approve/Deny/always-allow wired to `POST
-/agent-chat/answer`), an operator drives approvals from the CLI, writing
-the DB directly:
+**`matron-admin agent-chat` — the operator approval surface.** The same
+decisions from the CLI, writing the DB directly — for an operator without
+a client device to hand, or a user whose apps predate the card UI:
 
 ```
 matron-admin agent-chat pending <username>

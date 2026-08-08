@@ -106,13 +106,33 @@ export function awaitingCount(db, initiatorDeviceId) {
 }
 
 // Every row awaiting this user's decision, joined to conversations for the
-// title the pending endpoint/CLI displays alongside the ask.
+// title the pending endpoint/CLI displays alongside the ask, and to devices
+// for the two names the ask is ABOUT. The live consent card carries
+// `from_name` in its payload; a client reading this durable inbox instead
+// (it was offline when the card was minted) gets the same fact here rather
+// than having to reconstruct it from the room title. LEFT JOIN so a row
+// whose device was revoked mid-ask still lists, with a null name.
 export function listAwaiting(db, userId) {
   return db.prepare(`
-    SELECT ca.convo_id, ca.agent_device_id, ca.initiator_device_id, ca.justification, ca.topic, ca.created_at, c.title
+    SELECT ca.convo_id, ca.agent_device_id, ca.initiator_device_id, ca.justification, ca.topic, ca.created_at, c.title,
+           di.name AS initiator_name, dt.name AS agent_name
     FROM convo_agents ca JOIN conversations c ON c.id = ca.convo_id
+    LEFT JOIN devices di ON di.id = ca.initiator_device_id AND di.user_id = c.owner_user_id
+    LEFT JOIN devices dt ON dt.id = ca.agent_device_id AND dt.user_id = c.owner_user_id
     WHERE ca.state='awaiting_user' AND c.owner_user_id=? ORDER BY ca.created_at
   `).all(userId)
+}
+
+// Every participation row naming this device, across the user's rooms.
+// Called when a device is revoked, for the same reason
+// forgetDeviceAllowances is: device ids are reused after a delete, and a
+// leftover state='joined' row would hand a brand new agent write access to
+// an old room (authorizeAgentWrite) purely by inheriting its number.
+export function forgetDeviceParticipation(db, userId, deviceId) {
+  return db.prepare(`
+    DELETE FROM convo_agents WHERE agent_device_id=?
+      AND convo_id IN (SELECT id FROM conversations WHERE owner_user_id=?)
+  `).run(deviceId, userId).changes
 }
 
 // Sweep half of the 24h awaiting_user TTL, mirroring expireInvites below:
