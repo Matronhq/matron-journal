@@ -167,9 +167,11 @@ an implicit AND over literal terms, and reject anything that still fails to pars
 An `around_seq` mode on the existing endpoint, returning `limit/2` events either side.
 Mutually exclusive with `before_seq`; supplying both is a 400.
 
-Reuses the endpoint's existing authorisation unchanged — including its deliberate
-404-not-403 for an unauthorised conversation, so a caller cannot probe which conversations
-exist.
+For a client, reuses the endpoint's existing authorisation unchanged — including its
+deliberate 404-not-403 for an unauthorised conversation, so a caller cannot probe which
+conversations exist. For an agent, authorisation resolves per the two-regime rule in
+"Locked decisions" below: `before_seq` keeps the Phase-2 gate, `around_seq` opens the
+conversation but filters the response to `indexableBody`-visible events.
 
 ## Bridge tools
 
@@ -225,7 +227,39 @@ until it has backfilled everything locally, but it is not this spec).
 
 ## Open questions
 
-1. **Diffs in the index?** Included above, because "what did we change to fix X" is a real
-   question. But a diff is code, not prose, and a committed `.env` would land in the index
-   verbatim. Dropping them is a one-line change to `indexableBody`.
+1. ~~**Diffs in the index?**~~ **Resolved: included.** See "Locked decisions" below (decision
+   2) — "what did we change to fix X" is a real question, and dropping them later is a
+   one-line change to `indexableBody` if it turns out to leak too much.
 2. **Whether phase 3 waits for a later App Store cycle** or ships with the rest.
+
+## Locked decisions (2026-08-08 planning)
+
+Made while turning this spec into an implementation plan
+(`docs/superpowers/plans/2026-08-08-agent-journal-search.md`); folded back in here so the
+spec and the shipped behaviour don't drift apart.
+
+1. **Agent context access resolves into two regimes, not one.** This spec's API section
+   originally said `around_seq` "reuses the endpoint's existing authorisation unchanged" —
+   but the endpoint also carries the Phase-2 agent gate (`authorizeAgentWrite`) that 404s
+   any conversation an agent doesn't manage or hasn't joined, which would make context reads
+   impossible for exactly the hits `/search` returns. Resolution: in `around_seq` mode, an
+   agent may read a conversation it doesn't manage, but the response is filtered to events
+   where `indexableBody(type, payload)` is non-null (text + diff prose — exactly the indexed
+   set, one shared rule with the index feed and the backfill). An agent's `around_seq` on a
+   conversation it DOES manage, and everything a client does in either mode, is unchanged.
+   `before_seq` mode keeps the tightened Phase-2 gate exactly as it is today.
+2. **Diffs stay in the index** (resolves open question 1). "What did we change to fix X" is
+   a real question worth answering. Dropping diffs later, if the leak risk proves worse than
+   the retrieval value, is a one-line change to `indexableBody`.
+3. **Backfill cursor is a one-row table, not a checkpoint file or a full re-scan.**
+   Resumability is `INSERT OR IGNORE` (never `OR REPLACE`) plus a one-row
+   `search_backfill_state` table storing the last scanned `events.rowid` — a restart resumes
+   where it left off, and a completed backfill costs one row read per boot rather than a full
+   table scan. Any event appended after the schema exists is indexed by the live path, so the
+   cursor can never miss a row.
+4. **`/search` is open to both device kinds**, not user-scoped-to-agents-only as an earlier
+   reading of this spec might imply. Clients may use it later; the agent-visibility/privacy
+   plan is where agent-caller-specific filtering gets layered on top, not this one.
+5. **Snippet highlight markers are `**`…`**`** (markdown bold) — both the bridge's agent
+   surfaces and the apps already render markdown, so no new rendering convention is needed
+   on either side.

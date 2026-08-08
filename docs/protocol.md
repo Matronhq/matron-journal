@@ -29,6 +29,45 @@ the machine-checkable version of this page.
   path that used to be only user-scoped; it's also exactly what a future
   `agent_chat_read` needs ("allowed for joined agents"). Client tokens are
   unaffected — still plain user-scoped ownership.
+- `GET /convo/:id/messages?around_seq&limit` — a second paging mode on the
+  same endpoint, mutually exclusive with `before_seq`: supplying both is
+  400 `{error:'bad_request'}`. `around_seq` must be an integer when given
+  (400 otherwise); `limit` uses the same 1..200 clamp as `before_seq`.
+  Returns up to `limit` events centered on the anchor: `floor(limit/2)`
+  strictly before `around_seq`, the remainder from `around_seq` up (so the
+  anchor row itself is included when it exists) — either end of the
+  conversation just yields a shorter window, never an error. This mode
+  carries its own, separate agent-authorization story from the
+  `before_seq`/default gate described above — see "Journal search" below
+  for the full two-regime explanation.
+- `GET /search?q=&limit=&convo_id=` (Bearer, any authenticated device —
+  client or agent) -> `{hits: [{convo_id, title, seq, ts, sender, snippet,
+  live}]}`. Full-text search over the prose the journal has indexed (see
+  "Journal search" below for what is indexed and why). `q` is required,
+  must be non-empty after trimming, and is capped at 256 chars (400
+  `{error:'bad_request'}` otherwise); every whitespace-separated term is
+  double-quoted before it reaches FTS5's `MATCH` parser (embedded quotes
+  escaped by doubling) and the terms are ANDed together — an implicit-AND
+  query over literal terms, so raw FTS5 syntax a human might type (an
+  unbalanced quote, a bare `*`, a stray `NEAR`) can never throw; a query
+  with zero terms, or one that still fails to parse, is 400
+  `{error:'bad_request'}`, never a 500 with SQLite internals in it. `limit`
+  defaults to 20, clamped to 50 (400 on non-integer/NaN/<1, same convention
+  as `/convo/:id/messages`). `convo_id`, when given, narrows to one
+  conversation; an id belonging to another user (or a nonexistent one)
+  yields the same empty result set the user-scoping already guarantees for
+  a genuinely-unmatched query — there is no separate existence check, so
+  this is not an oracle for "does this convo_id exist." Results are ranked
+  by FTS5 `bm25()` (best match first), ties broken by `ts DESC`; `snippet`
+  is the FTS5 `snippet()` excerpt with matched terms wrapped in `**`...`**`
+  (markdown bold — agents and the apps both render markdown); `live` is
+  `true` when the hit's conversation has `session_state = 'running'`, a
+  hint to talk to the working agent (`GET /roster` / `agent_chat_start`)
+  rather than only read its transcript. Scoped to the caller's own user
+  (`search_messages.user_id`) regardless of device kind — open to both
+  agents (the feature's primary audience) and clients; the agent-
+  visibility/privacy plan layers additional agent-caller filtering on top
+  later.
 - `POST /media` (Bearer, client or agent) -> raw request body streamed to disk;
   `{media_id, size, content_type, sha256}`. Content-Type header captured
   (default `application/octet-stream`). 400 `{error:'empty'}` on a zero-byte
@@ -156,6 +195,102 @@ the machine-checkable version of this page.
   unknown/expired/other-device.
 - `POST /link/deny {link_code}` (Bearer, same binding as approve) ->
   `{status:'denied'}`. 404 for unknown/expired/other-device/already-resolved.
+
+## Journal search
+
+(spec: `docs/superpowers/specs/2026-08-07-agent-journal-search-design.md`.)
+A prose-only full-text index over the journal, serving `GET /search` and
+the `around_seq` context mode on `GET /convo/:id/messages` (both above) —
+the feature that lets an agent look up "what happened with X" across a
+user's whole history instead of only the roster metadata a foreign
+conversation otherwise exposes.
+
+### What is indexed
+
+Two event types: `text` (`payload.body`) and `diff` (`payload.diff`,
+falling back to `payload.snippet` when `diff` is empty/absent). Everything
+else — `tool_output`, `prompt`, `file`, `image`, `permission_request`,
+`session_status`, and any future type — is never indexed. Diffs were kept
+in deliberately: "what did we change to fix X" is a real question, and
+dropping them later is a one-line change if it turns out to leak too much
+(a committed `.env` diff would land in the index verbatim).
+
+One function, `indexableBody(type, payload)` (`src/search.js`), is the
+single source of truth for this rule. It is called from three places: the
+live append path (inside `append()`'s own transaction in `src/journal.js`,
+so an event and its index row commit or roll back together), the startup
+backfill, and the `around_seq` foreign-agent context filter (see below) —
+one predicate, three consumers, zero drift between them.
+
+`tool_output` is excluded on purpose and is the load-bearing case: command
+output is retrieval noise for "why did we do this" questions, and it is
+where credentials land. Because `indexableBody` is the exact predicate the
+`around_seq` foreign-agent filter also uses, this is simultaneously the
+guarantee that an agent reading context around a search hit in a
+conversation it doesn't manage can never have a `tool_output` payload (or
+the client-only `permission_request` consent card, or anything else
+outside the prose set) placed in front of it — that guarantee rests on one
+shared function, not on two filters kept in sync by hand.
+
+### Index invariants
+
+- **Append-only, insert-trigger-only.** `search_messages` has an `AFTER
+  INSERT` trigger populating `search_fts` and nothing else — no update or
+  delete trigger exists. This mirrors `events` itself: rows are written
+  with a plain `INSERT`, never `INSERT OR REPLACE` (`REPLACE` silently
+  skipping a delete trigger is the exact corruption that hit the app-side
+  FTS index — matron-apple #106), and no `DELETE FROM events` exists
+  anywhere in the server. A prose-only index of an append-only table needs
+  an insert path and nothing else; if a delete path is ever added to
+  `events`, this schema needs revisiting.
+- **Retention never touches indexed rows.** The two retention passes under
+  "Retention (payload offload)" below only ever rewrite `tool_output`
+  payloads — purging live-streamed output after
+  `MATRON_TOOL_LOG_TTL_HOURS` and offloading older output to a blob after
+  `MATRON_RETENTION_DAYS` — and `tool_output` is never indexed. Neither
+  pass can therefore invalidate a `search_messages`/`search_fts` row; the
+  index has no reconciliation path with retention because it needs none.
+- **Backfill is resumable and self-healing.** A startup walk over `events`
+  by `rowid`, batched, indexing every row `indexableBody` accepts via
+  `INSERT OR IGNORE` (never `OR REPLACE`) against `search_messages`'
+  `UNIQUE(user_id, seq)` — so a re-run, or overlap with the live append
+  path, is a no-op rather than a duplicate or a corruption. Progress lives
+  in one row, `search_backfill_state(id=1, last_events_rowid)`, written
+  after each committed batch: an interrupted run resumes from there on the
+  next boot, and a completed run costs a single row read. `/search`
+  returns partial results until the walk finishes — acceptable, because any
+  event appended after the schema exists is indexed by the live path, so
+  the backfill cursor can never miss a row on the way to catching up.
+
+### Agent context access: two regimes
+
+`GET /convo/:id/messages` now has two distinct authorization stories for
+an agent token, selected by which query parameter is present:
+
+- **`before_seq` (or neither param)** keeps the Phase-2 gate described
+  above unchanged: an agent reads a conversation's full transcript (every
+  event type, unfiltered) only for one it manages or has `joined`
+  (`authorizeAgentWrite`) — a conversation outside that set stays 404,
+  exactly as before this feature existed.
+- **`around_seq`** is the search-context surface, and deliberately looser:
+  an agent MAY read a conversation outside that set — that is the point,
+  since a `/search` hit can be anywhere in the user's history — but the
+  response is filtered to events where `indexableBody(type, payload)` is
+  non-null, i.e. exactly the set the index can see (`text` + `diff`
+  prose). `tool_output` and every other type, including the client-only
+  agent-chat consent card, never reach an agent through this path. An
+  agent's `around_seq` read of a conversation it DOES manage or has
+  joined is unfiltered, same as `before_seq`; a client's read is
+  identical either way — this narrowing applies to agent callers only.
+
+  This resolves what would otherwise be a contradiction with the design
+  spec's original wording, "reuses the endpoint's existing authorisation
+  unchanged": that holds for a client, but for an agent it means the
+  Phase-2 gate is specifically bypassed in `around_seq` mode, with the
+  `indexableBody` filter substituted in as the narrower replacement. Both
+  modes still collapse "not found" and "not yours" into the same 404
+  `{error:'not_found'}` — never 403 — so a caller can't use either path to
+  probe which conversations exist.
 
 ## WebSocket
 
