@@ -78,11 +78,24 @@ test('append: tool_output and other non-prose types never reach the index', () =
   db.close()
 })
 
-test('append: a failed append indexes nothing (transactionality)', () => {
+test('append: a failing search insert rolls back the whole append (same transaction, fails loudly)', () => {
   const db = openDb(':memory:')
-  seedUserAndConvo(db)
-  assert.throws(() => append(db, { userId: 1, convoId: 'nope', sender: 'user:dan', type: 'text', payload: { body: 'ghost' } }))
-  assert.equal(db.prepare('SELECT COUNT(*) n FROM search_messages').get().n, 0)
+  const { userId, convoId } = seedUserAndConvo(db)
+  // First append to establish seq=1
+  append(db, { userId, convoId, sender: 'user:dan', type: 'text', payload: { body: 'first msg' } })
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM events').get().n, 1)
+  assert.equal(db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId).seq, 1)
+  // Pre-insert search_messages row with (user_id, seq=2) to trigger UNIQUE constraint
+  // when the next append() tries to insert its search row
+  db.prepare('INSERT INTO search_messages(user_id, convo_id, seq, ts, sender, body) VALUES(?,?,?,?,?,?)')
+    .run(userId, convoId, 2, Date.now(), 'user:dan', 'blocking')
+  // Second append with text (indexable) will try to INSERT into search_messages
+  // with the same seq=2, violating the UNIQUE(user_id, seq) constraint
+  assert.throws(() => append(db, { userId, convoId, sender: 'user:dan', type: 'text', payload: { body: 'second msg' } }))
+  // Verify the events table still has only the first row (append rollback)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM events').get().n, 1)
+  // Verify user_seq was rolled back from 2 back to 1
+  assert.equal(db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId).seq, 1)
   db.close()
 })
 
