@@ -5,6 +5,7 @@ import { openDb, isPrivateDevice, pinDevicePrivate, unpinDevicePrivate, applyBri
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import { addAllowance } from '../src/allowances.js'
+import { getParticipant, answerParkedInvite } from '../src/participants.js'
 import { startTestServer, makeWsClient } from './helpers.js'
 
 async function dbWithAgent() {
@@ -291,11 +292,52 @@ test('the drawn-in flow: once ghost invites kit and kit accepts, kit can answer 
   ghostWs.send({ op: 'agent_invite', room_id: 'ghost-room', target_device_id: kit.deviceId, justification: 'need your eyes' })
   const req = await kitWs.waitFor((f) => f.kind === 'invite' && f.event === 'request')
   assert.equal(req.room_id, 'ghost-room')
+  // Pin the exemption's actual precondition (fix-round-2 finding): this
+  // row must be delivered_at-set, not merely "any row exists" — that is
+  // exactly what distinguishes it from the parked/denied rows the gate
+  // must still block (see the isKnownParticipant test below).
+  assert.ok(getParticipant(s.db, 'ghost-room', kit.deviceId).delivered_at != null, 'sanity: this is a delivered row, the case the gate must exempt')
   kitWs.send({ op: 'agent_invite_answer', room_id: 'ghost-room', accept: true })
   await ghostWs.waitFor((f) => f.kind === 'invite' && f.event === 'answer')
   kitWs.send({ op: 'agent_leave', room_id: 'ghost-room' })
   await ghostWs.waitFor((f) => f.kind === 'invite' && f.event === 'left')
   assert.equal(kitWs.frames.filter((f) => f.op === 'error').length, 0,
     'kit — drawn into ghost\'s private room by an accepted invite — never hit the room-privacy not_found gate')
+  kitWs.close(); ghostWs.close(); await s.close()
+})
+
+test('agent_leave/agent_join: a merely parked (awaiting_user) or denied row does NOT exempt the gate — not_found byte-identical to an unknown room', async () => {
+  const { s, kit, ghostWs, kitWs } = await chatPrivacyFixture()
+  // No standing allowance: this invite parks for the user's consent
+  // instead of ever reaching kit's socket (see appendAndFan's comment in
+  // ws.js — a parked card is client-only, no agent device gets it).
+  ghostWs.send({ op: 'agent_invite', room_id: 'ghost-room', target_device_id: kit.deviceId, justification: 'park me' })
+  await ghostWs.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  await new Promise((r) => setTimeout(r, 50))
+  assert.ok(!kitWs.frames.some((f) => f.kind === 'invite' && f.event === 'request'), 'sanity: parked, never delivered to kit')
+  assert.equal(getParticipant(s.db, 'ghost-room', kit.deviceId).state, 'awaiting_user')
+  assert.equal(getParticipant(s.db, 'ghost-room', kit.deviceId).delivered_at, null)
+
+  const stripRoomId = ({ room_id, ...rest }) => rest
+  const probe = async (op, extra = {}) => {
+    kitWs.send({ op, room_id: 'ghost-room', ...extra })
+    const priv = await kitWs.waitFor((f) => f.op === 'error' && f.ref === op)
+    kitWs.send({ op, room_id: 'no-such-room', ...extra })
+    const unknown = await kitWs.waitFor((f) => f.op === 'error' && f.ref === op && f !== priv)
+    assert.equal(priv.code, 'not_found', `${op} on the parked/denied private room`)
+    assert.equal(unknown.code, 'not_found', `${op} on an unknown room`)
+    assert.deepEqual(stripRoomId(priv), stripRoomId(unknown), `${op} frames identical modulo room_id`)
+  }
+  // awaiting_user: never delivered — probe/existence must still be hidden.
+  await probe('agent_leave')
+  await probe('agent_join', { justification: 'curious' })
+
+  // Drive the same row to 'denied' (the user explicitly refused) and
+  // confirm the gate still blocks — denied means the target was never told.
+  assert.ok(answerParkedInvite(s.db, { convoId: 'ghost-room', agentDeviceId: kit.deviceId, approve: false }))
+  assert.equal(getParticipant(s.db, 'ghost-room', kit.deviceId).state, 'denied')
+  await probe('agent_leave')
+  await probe('agent_join', { justification: 'curious again' })
+
   kitWs.close(); ghostWs.close(); await s.close()
 })

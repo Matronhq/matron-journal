@@ -2,7 +2,7 @@ import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { applyBridgePrivate, isPrivateDevice } from './db.js'
 import { eventsAfter, append, markRead, upsertConversation, toEventShape, isClientOnlyEvent } from './journal.js'
-import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, undoInvite, getParticipant, isParticipant, expireInvites, parkInvite, awaitingCount, markDelivered, expireAwaiting } from './participants.js'
+import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, undoInvite, getParticipant, isKnownParticipant, expireInvites, parkInvite, awaitingCount, markDelivered, expireAwaiting } from './participants.js'
 import { isAllowed } from './allowances.js'
 import { sanitizePeerText } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
@@ -475,13 +475,16 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
     // right below) would otherwise answer differently for a private-owned
     // room than for an unknown one — an existence oracle one caller-
     // controlled field away. Must run before ALL of those, including the
-    // child-convo check. The exemption is `isParticipant` on ANY state (a
-    // parked ask, a pending invite, or a joined row): once a caller has
-    // been drawn into this room's lifecycle it must keep answering
-    // invite/answer/leave ops for that caller, or a private owner's own
-    // invitee could never act on it again.
+    // child-convo check. The exemption is `isKnownParticipant`, NOT plain
+    // isParticipant — a row the caller only knows about because THEY
+    // legitimately initiated it, or that was actually delivered to them, or
+    // where they're joined. A merely parked ('awaiting_user', never
+    // relayed) or denied (never told) row must not exempt the gate — either
+    // would leak a private room's existence to an agent the user never
+    // approved or explicitly refused. See isKnownParticipant's doc comment
+    // for the 'expired' ambiguity this also resolves.
     if (room.agent_device_id != null && isPrivateDevice(db, room.agent_device_id)
-      && !isPrivateDevice(db, conn.deviceId) && !isParticipant(db, roomId, conn.deviceId)) {
+      && !isPrivateDevice(db, conn.deviceId) && !isKnownParticipant(db, roomId, conn.deviceId)) {
       return { err: ['not_found'] }
     }
     if (room.parent_convo_id != null) return { err: ['bad_request', 'child conversations cannot be rooms'] }

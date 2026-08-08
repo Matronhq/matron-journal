@@ -237,6 +237,29 @@ export function isParticipant(db, convoId, agentDeviceId) {
   ).get(convoId, agentDeviceId)
 }
 
+// Room-privacy gate exemption (ws.js loadRoom) — deliberately narrower than
+// isParticipant's "any row, any state". A convo_agents row only proves a
+// caller legitimately already knows a private-owned room exists if the
+// caller initiated the row themselves (a join request they sent — they
+// already targeted this room's id), it was actually delivered to them
+// (delivered_at set), or they're joined. An 'awaiting_user' row (parked for
+// the user's consent, never relayed to the target's socket) and a 'denied'
+// one (the user's refusal, never told to the target either) must NOT exempt
+// an ordinary caller merely probing — either would leak a private room's
+// existence to exactly the agent the user never approved or explicitly
+// refused. 'expired' is ambiguous by which sweep produced it — expired from
+// 'invited' (expireInvites) requires delivered_at IS NOT NULL, so it stays
+// exempt; expired from 'awaiting_user' (expireAwaiting) never had
+// delivered_at set, so it doesn't. delivered_at alone discriminates both
+// cases correctly without inspecting how the row got to 'expired'.
+export function isKnownParticipant(db, convoId, agentDeviceId) {
+  const row = db.prepare(
+    'SELECT initiator_device_id, state, delivered_at FROM convo_agents WHERE convo_id=? AND agent_device_id=?'
+  ).get(convoId, agentDeviceId)
+  if (!row) return false
+  return row.initiator_device_id === agentDeviceId || row.delivered_at != null || row.state === 'joined'
+}
+
 // Sweep half of invite expiry (ws.js owns the timer and the caller
 // notification): flip stale pending rows and report them. RETURNING keeps
 // flip-and-report atomic — no separate SELECT that a concurrent answer
