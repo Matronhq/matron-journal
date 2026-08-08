@@ -972,13 +972,20 @@ falls through to its normal not-found path instead of crashing.
 WS `hello` frame: an optional top-level `private: boolean`
 (`MATRON_AGENT_PRIVATE`, bridge-side env var) — hello is the only recurring
 moment a long-lived, operator-absent agent connection can assert env-var
-config. Agent connections only; a client hello carrying the field is silently
-ignored, never rejected — closing a working app's socket over a field it
-should never send would be worse than ignoring it. A non-boolean value is
+config. The shape check runs for **every** connecting device, agent or
+client, before the two kinds are told apart: a `private` field that is
+present but not a boolean is rejected —
 `{kind:'control', op:'error', code:'bad_request', ref:'hello'}`, the same
-reject shape a bad cursor gets. Omitting the field asserts `false`: an
-unpinned flag follows the hello assertion exactly, including its removal —
-bridge-set privacy does NOT survive a re-register without the env var.
+reject shape a bad cursor gets, socket closed — regardless of which kind of
+device sent it. Only past that check does the agent/client distinction
+apply: a **well-formed** boolean, or an absent field, from a client is
+silently ignored — never applied, hello proceeds normally — while an agent's
+value is written via `applyBridgePrivate`. Leniency is for a client sending a
+harmless, well-formed value it should never send in the first place; a
+malformed value gets no such leniency from either kind. Omitting the field
+asserts `false`: an unpinned flag follows the hello assertion exactly,
+including its removal — bridge-set privacy does NOT survive a re-register
+without the env var.
 `matron-admin device private <device_id> on|off|auto` is the authoritative
 override: `on`/`off` both PIN the flag (`private_pinned=1`) — `off` is
 "force-visible", not "hands off" — so a deploy that forgot the env var can
@@ -987,12 +994,13 @@ flag back to the next hello, without itself changing the value.
 `matron-admin device list` renders `private=yes|no`, with a `(pinned)` suffix
 when pinned.
 
-**The enforced surfaces — one caller rule, five places.** Every rule is
-conditioned on the identical predicate: filtering applies **only when the
-caller is an ordinary (non-private) agent**. `kind='client'` callers are
-never filtered, and a private agent caller is never filtered either — it is
-invisible, not blinded, so two private agents see each other and a private
-agent still gets the whole unfiltered roster/search/room set. The surfaces:
+**The enforced surfaces — one caller rule, six enforcement points.** Every
+rule is conditioned on the identical predicate: filtering applies **only
+when the caller is an ordinary (non-private) agent**. `kind='client'`
+callers are never filtered, and a private agent caller is never filtered
+either — it is invisible, not blinded, so two private agents see each other
+and a private agent still gets the whole unfiltered roster/search/room set.
+The six:
 
 - **`GET /roster`** — omits private agent devices and every top-level
   conversation whose `agent_device_id` is private.
@@ -1003,18 +1011,19 @@ agent still gets the whole unfiltered roster/search/room set. The surfaces:
   check runs before `messagesAroundIndexed` and before the foreign-read
   audit log line (see "Journal search" above), so a refused read is never
   logged as a successful one.
-- **Every room op**, via a single choke point rather than five separate
-  checks: `loadRoom` (`src/ws.js`), the shared lookup behind `agent_invite`,
-  `agent_join`, `agent_invite_ack`, `agent_invite_answer`, and `agent_leave`
-  (see "The five room ops" above). A room owned by a private device answers
-  the byte-identical `not_found` an unknown room id gets, on every one of
-  those five ops. Per-op checks on just `agent_invite`'s target and
-  `agent_join`'s owner would leave the other three ops' distinct error
-  shapes (`agent_invite_ack`/`_answer`'s "no pending invite",
-  `agent_leave`'s "not a joined participant") as an existence oracle in the
-  fields those checks don't cover; gating in `loadRoom` closes all five at
-  once, before any op-specific logic (including the child-conversation
-  check) runs.
+- **Every room op, on room ownership** — via a single choke point rather
+  than a per-op check: `loadRoom` (`src/ws.js`), the shared lookup behind
+  `agent_invite`, `agent_join`, `agent_invite_ack`, `agent_invite_answer`,
+  and `agent_leave` (see "The five room ops" above), checks whether the
+  room's *owner* device (`room.agent_device_id`) is private and applies
+  uniformly to all five ops. A room owned by a private device answers the
+  byte-identical `not_found` an unknown room id gets, on every one of those
+  five ops. The plan originally specified this only as a per-op check on
+  `agent_join`'s owner lookup; folding it into `loadRoom` instead means the
+  other three ops, which had no privacy check of their own
+  (`agent_invite_ack`/`_answer`'s "no pending invite", `agent_leave`'s "not
+  a joined participant"), are covered too — closing what would otherwise be
+  an existence oracle in the fields those checks don't touch.
   - The exemption is narrower than "is a participant":
     `isKnownParticipant` (`src/participants.js`) passes a caller only if it
     **initiated** the ask, the ask was **actually delivered** to it
@@ -1022,7 +1031,16 @@ agent still gets the whole unfiltered roster/search/room set. The surfaces:
     (`awaiting_user`, never relayed to any agent socket) or `denied` (never
     told) row does NOT exempt — either would leak a private room's
     existence to an agent the user never approved, or explicitly refused.
-- **`GET /snapshot`** — a sixth surface with its own rule; see below.
+- **`agent_invite`'s target-device check** — separate from `loadRoom` and
+  unreplaced by it: whether the room's *owner* is private (`loadRoom`'s job,
+  above) is independent of whether the invite's *target* device is private.
+  `agent_invite` (`src/ws.js`) looks up `target_device_id` directly and
+  folds `target.private === 1 && !isPrivateDevice(db, conn.deviceId)` into
+  the same `not_found` an unknown id, another user's device, or a
+  client-kind device already gets. This check was specified per-op in the
+  plan and remains per-op in the shipped code — nothing subsumed it.
+- **`GET /snapshot`** — a sixth surface with its own, differently-shaped
+  rule; see below.
 
 **Byte-identical, deliberately.** Every filtered surface's refusal is
 indistinguishable from the same surface's refusal for a genuinely

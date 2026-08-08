@@ -160,19 +160,23 @@ Called out in the implementation plan's header
 
 Where the shipped implementation departs from the plan above, and why:
 
-- **The chat-surface gate moved into `loadRoom`.** The plan's Task 5 specified two
-  separate checks — `agent_invite`'s target lookup and `agent_join`'s owner check.
-  Execution found that left the other three room ops (`agent_invite_ack`,
-  `agent_invite_answer`, `agent_leave`) with distinct error shapes for a private-owned
-  room versus a nonexistent one (e.g. "no pending invite" vs `not_found`) — an existence
-  oracle in the fields those per-op checks didn't cover. The fix moved the gate into
-  `loadRoom` (`src/ws.js`), the shared lookup behind all five room ops, so a
-  private-owned room answers the byte-identical `not_found` an unknown room id gets on
-  every op from one choke point. The exemption is `isKnownParticipant`
-  (`src/participants.js`), narrower than plain participant lookup: it passes only a
-  caller that initiated the ask, actually had it delivered, or is `joined` — a merely
-  parked (`awaiting_user`) or `denied` row does not exempt, since either would leak the
-  room's existence to an agent the user never approved or explicitly refused.
+- **`agent_join`'s owner check moved into `loadRoom`; `agent_invite`'s target check did
+  not.** The plan's Task 5 specified two separate per-op checks — `agent_invite`'s
+  target-device lookup and `agent_join`'s room-owner lookup. Execution subsumed only the
+  second of those into `loadRoom` (`src/ws.js`), the shared lookup behind all five room
+  ops: gating on `room.agent_device_id`'s privacy there, rather than in `agent_join`
+  alone, closes what would otherwise have been distinct error shapes for a private-owned
+  room versus a nonexistent one on the other three ops (`agent_invite_ack`,
+  `agent_invite_answer`, `agent_leave` — e.g. "no pending invite" vs `not_found`), which
+  had no privacy check of their own — an existence oracle in the fields those per-op
+  checks didn't cover. `agent_invite`'s target-device check is a *different* check (is
+  the invite's target private, independent of whether the room's owner is) and remains
+  exactly where the plan put it, per-op inside `agent_invite`, unreplaced. The `loadRoom`
+  exemption is `isKnownParticipant` (`src/participants.js`), narrower than plain
+  participant lookup: it passes only a caller that initiated the ask, actually had it
+  delivered, or is `joined` — a merely parked (`awaiting_user`) or `denied` row does not
+  exempt, since either would leak the room's existence to an agent the user never
+  approved or explicitly refused.
 - **A Task 8 (`/snapshot`) was added by the search branch's final security review**,
   outside this plan's original four-surface scope. `GET /snapshot` predates this feature
   and needed its own two rules layered on top: `snippet` omitted for every agent caller
