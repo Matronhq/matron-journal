@@ -416,3 +416,47 @@ test('around_seq: a private agent reads foreign context like any other agent sur
   assert.equal(r.status, 200)
   await s.close()
 })
+
+// /snapshot: two independent rules (spec: agent visibility & privacy, task
+// 8). Credential rule — snippet must never reach ANY agent device, because
+// snippetOf() can surface tool_output text (where credentials land); /roster
+// already omits snippet for exactly this reason. Privacy rule — mirrors
+// roster's ordinary-agent conversation filter so /snapshot can't be used as
+// an end-run around it.
+test('snapshot: an agent caller never sees a tool_output-derived snippet, even for its own conversation', async () => {
+  const { s, kit, clientToken, userId } = await privacyFixture()
+  append(s.db, {
+    userId, convoId: 'open-work', sender: 'agent:kit', type: 'tool_output',
+    payload: { snippet: 'SECRET=hunter2' },
+  })
+  const agentRead = await s.http('/snapshot', { token: kit.token })
+  assert.equal(agentRead.status, 200)
+  assert.ok(!JSON.stringify(agentRead.json).includes('SECRET'), 'no credential text anywhere in an agent snapshot')
+  const clientRead = await s.http('/snapshot', { token: clientToken })
+  const clientConvo = clientRead.json.conversations.find((c) => c.id === 'open-work')
+  assert.equal(clientConvo.snippet, 'SECRET=hunter2', 'clients keep snippets unchanged')
+  await s.close()
+})
+
+test('snapshot: an ordinary agent does not see a private-owned conversation', async () => {
+  const { s, kit } = await privacyFixture()
+  const r = await s.http('/snapshot', { token: kit.token })
+  assert.equal(r.status, 200)
+  const ids = r.json.conversations.map((c) => c.id)
+  assert.ok(!ids.includes('ghost-work'), 'private-owned conversation absent')
+  assert.ok(ids.includes('open-work'))
+  assert.ok(ids.includes('legacy'), 'NULL-owner conversations stay visible')
+  await s.close()
+})
+
+test('snapshot: a client and a private agent (ghost) see all three conversations', async () => {
+  const { s, clientToken, ghost } = await privacyFixture()
+  for (const token of [clientToken, ghost.token]) {
+    const r = await s.http('/snapshot', { token })
+    const ids = r.json.conversations.map((c) => c.id)
+    assert.ok(ids.includes('open-work'))
+    assert.ok(ids.includes('ghost-work'))
+    assert.ok(ids.includes('legacy'))
+  }
+  await s.close()
+})

@@ -242,7 +242,17 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       if (req.method === 'GET' && url.pathname === '/snapshot') {
-        return json(res, 200, snapshot(db, who.userId))
+        // Two independent rules layered on top of the client shape (spec:
+        // agent visibility & privacy, task 8):
+        //   - snippet omitted for EVERY agent caller, private or not — it can
+        //     carry tool_output text (credentials), same reason /roster omits
+        //     it. A managing agent losing its own convo's snippet is
+        //     acceptable: no agent consumer of /snapshot exists.
+        //   - private-owned conversations excluded for a FILTERED (ordinary)
+        //     agent only — same one-caller-rule predicate as /roster and
+        //     /search, so /snapshot can't be used as an end-run around them.
+        const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
+        return json(res, 200, snapshot(db, who.userId, { omitSnippet: who.kind === 'agent', excludePrivateOwned: filtered }))
       }
       if (req.method === 'GET' && url.pathname === '/metrics') {
         // Any valid device (client or agent) — no admin-only concept in v1.
