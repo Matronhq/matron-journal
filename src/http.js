@@ -257,7 +257,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       if (req.method === 'GET' && url.pathname === '/metrics') {
         // Any valid device (client or agent) — no admin-only concept in v1.
         // Scoping (no cross-user leakage) is enforced inside buildMetrics.
-        return json(res, 200, buildMetrics(db, { hub, pushPipeline, dbPath, userId: who.userId }))
+        // Privacy filter (spec: agent visibility & privacy): same
+        // one-caller-rule predicate as /roster and /search — an ORDINARY
+        // agent caller's device list omits private devices; a client or a
+        // private agent caller sees the full list, unchanged.
+        const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
+        return json(res, 200, buildMetrics(db, { hub, pushPipeline, dbPath, userId: who.userId, excludePrivateDevices: filtered }))
       }
       if (req.method === 'POST' && url.pathname === '/push/register') {
         // Only client devices carry push tokens — agents run on the dev box

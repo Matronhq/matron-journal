@@ -929,6 +929,27 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (msg.up_to_seq != null && (!Number.isInteger(msg.up_to_seq) || msg.up_to_seq < 0)) {
           return fail('bad_request')
         }
+        // Privacy gate (spec: agent visibility & privacy, final-review
+        // finding): read_marker has no membership check at all, so an
+        // ORDINARY agent could otherwise both mark-read into a private
+        // room it has no standing in (fanning a read_marker event out into
+        // it) AND use the distinct forbidden-vs-success outcome as an
+        // existence oracle for the private device's rooms. Same exemption
+        // as loadRoom's gate: a private caller, or an ordinary caller that
+        // is a known participant (isKnownParticipant — initiated, actually
+        // delivered, or joined), passes unfiltered. Must run BEFORE
+        // markRead so a refused mark never appends an event or fans out.
+        // The unknown-id path below throws inside markRead and lands in
+        // this same fail('forbidden') via the outer catch — reusing it
+        // here keeps the two paths byte-identical, not just similarly
+        // shaped.
+        if (conn.kind === 'agent' && !isPrivateDevice(db, conn.deviceId)) {
+          const room = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(msg.convo_id)
+          if (room && room.owner_user_id === conn.userId && room.agent_device_id != null
+            && isPrivateDevice(db, room.agent_device_id) && !isKnownParticipant(db, msg.convo_id, conn.deviceId)) {
+            return fail('forbidden')
+          }
+        }
         // Both kinds may advance the read marker: a client marking read for
         // itself, or an agent (bridge) marking read on behalf of its user —
         // e.g. after mirroring the user's own message into the journal, so
@@ -979,6 +1000,23 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         const existingRoom = db.prepare('SELECT agent_device_id FROM conversations WHERE id=? AND owner_user_id=?').get(msg.convo_id, conn.userId)
         if (existingRoom && existingRoom.agent_device_id != null && existingRoom.agent_device_id !== conn.deviceId) {
           if (hasParticipants(db, msg.convo_id)) return fail('forbidden', 'only the room owner may upsert a room')
+          // Private-owner takeover guard (spec: agent visibility & privacy,
+          // final-review finding). A participant-less conversation normally
+          // keeps the old last-writer-wins takeover (a re-paired bridge with
+          // a new device id reclaiming its own sessions) — but when the
+          // EXISTING owner is a private device, an ordinary caller must not
+          // be able to silently reassign ownership of a conversation it has
+          // no standing to touch. Reuses the exact same forbidden shape the
+          // populated-room gate above already returns: that oracle class
+          // (forbidden for something you can't touch, vs. a fresh id simply
+          // creating) is an accepted trade-off there and is not a new one
+          // here. A private caller is exempt (invisible, not blinded, same
+          // rule as every other surface); the caller being the current
+          // owner can't reach this branch at all (the outer condition above
+          // already requires agent_device_id !== conn.deviceId).
+          if (isPrivateDevice(db, existingRoom.agent_device_id) && !isPrivateDevice(db, conn.deviceId)) {
+            return fail('forbidden', 'only the room owner may upsert a room')
+          }
         }
         const convo = upsertConversation(db, {
           id: msg.convo_id, ownerUserId: conn.userId,

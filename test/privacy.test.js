@@ -179,6 +179,29 @@ test('roster: privacy is per-user — another user roster is unaffected either w
   await s.close()
 })
 
+test('metrics: an ordinary agent\'s device list omits private devices; a client sees everything', async () => {
+  const { s, clientToken, kit, ghost, wraith } = await privacyFixture()
+  const agentView = await s.http('/metrics', { token: kit.token })
+  assert.equal(agentView.status, 200)
+  const agentIds = agentView.json.user.devices.map((d) => d.device_id)
+  assert.ok(agentIds.includes(kit.deviceId), 'the caller itself stays listed')
+  assert.ok(!agentIds.includes(ghost.deviceId), 'private device omitted from an ordinary agent\'s metrics')
+  assert.ok(!agentIds.includes(wraith.deviceId), 'private device omitted from an ordinary agent\'s metrics')
+  const clientView = await s.http('/metrics', { token: clientToken })
+  const clientIds = clientView.json.user.devices.map((d) => d.device_id)
+  assert.ok(clientIds.includes(ghost.deviceId), 'client metrics unchanged')
+  assert.ok(clientIds.includes(wraith.deviceId), 'client metrics unchanged')
+  await s.close()
+})
+
+test('metrics: a private agent (ghost) sees the whole device list too — invisible, not blinded', async () => {
+  const { s, ghost, wraith } = await privacyFixture()
+  const r = await s.http('/metrics', { token: ghost.token })
+  const ids = r.json.user.devices.map((d) => d.device_id)
+  assert.ok(ids.includes(wraith.deviceId))
+  await s.close()
+})
+
 // Extends privacyFixture with live sockets for kit (ordinary) and ghost
 // (private), and a room each manages.
 async function chatPrivacyFixture() {
@@ -342,6 +365,62 @@ test('agent_leave/agent_join: a merely parked (awaiting_user) or denied row does
   kitWs.close(); ghostWs.close(); await s.close()
 })
 
+test('read_marker: an ordinary agent marking a private-owned conversation gets the byte-identical forbidden an unknown convo_id gets; no event lands', async () => {
+  const { s, kitWs } = await chatPrivacyFixture()
+  const eventsBefore = s.db.prepare("SELECT COUNT(*) c FROM events WHERE convo_id='ghost-work'").get().c
+  kitWs.send({ op: 'read_marker', convo_id: 'ghost-work' })
+  const priv = await kitWs.waitFor((f) => f.op === 'error' && f.ref === 'read_marker')
+  kitWs.send({ op: 'read_marker', convo_id: 'no-such-convo' })
+  const unknown = await kitWs.waitFor((f) => f.op === 'error' && f.ref === 'read_marker' && f !== priv)
+  assert.equal(priv.code, 'forbidden')
+  assert.deepEqual(priv, unknown, 'byte-identical to the unknown-convo rejection — existence never confirmed')
+  const eventsAfter = s.db.prepare("SELECT COUNT(*) c FROM events WHERE convo_id='ghost-work'").get().c
+  assert.equal(eventsAfter, eventsBefore, 'no read_marker event landed in the private room')
+  kitWs.close(); await s.close()
+})
+
+test('read_marker: a client can still mark a private-owned conversation read', async () => {
+  const { s, clientToken } = await chatPrivacyFixture()
+  const clientWs = await makeWsClient(s.base, { token: clientToken, cursor: 0 })
+  await clientWs.waitFor((f) => f.op === 'hello_ok')
+  clientWs.send({ op: 'read_marker', convo_id: 'ghost-work' })
+  const frame = await clientWs.waitFor((f) => f.kind === 'journal' && f.type === 'read_marker')
+  assert.equal(frame.convo_id, 'ghost-work')
+  clientWs.close(); await s.close()
+})
+
+test('convo_upsert: an ordinary agent cannot take over a private-owned, participant-less conversation', async () => {
+  const { s, kitWs, ghost } = await chatPrivacyFixture()
+  const before = s.db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get('ghost-work')
+  assert.equal(before.agent_device_id, ghost.deviceId)
+  kitWs.send({ op: 'convo_upsert', convo_id: 'ghost-work', title: 'stolen', session_state: 'running' })
+  const err = await kitWs.waitFor((f) => f.op === 'error' && f.ref === 'convo_upsert')
+  assert.equal(err.code, 'forbidden')
+  const after = s.db.prepare('SELECT agent_device_id, title FROM conversations WHERE id=?').get('ghost-work')
+  assert.equal(after.agent_device_id, ghost.deviceId, 'ownership unchanged')
+  assert.notEqual(after.title, 'stolen')
+  kitWs.close(); await s.close()
+})
+
+test('convo_upsert: a private agent (ghost) can still upsert its own participant-less conversation', async () => {
+  const { s, ghostWs, ghost } = await chatPrivacyFixture()
+  ghostWs.send({ op: 'convo_upsert', convo_id: 'ghost-work', title: 'still mine', session_state: 'running' })
+  await new Promise((r) => setTimeout(r, 50))
+  const after = s.db.prepare('SELECT agent_device_id, title FROM conversations WHERE id=?').get('ghost-work')
+  assert.equal(after.agent_device_id, ghost.deviceId)
+  assert.equal(after.title, 'still mine')
+  await s.close()
+})
+
+test('convo_upsert: an ordinary agent can still upsert a brand new conversation id', async () => {
+  const { s, kitWs } = await chatPrivacyFixture()
+  kitWs.send({ op: 'convo_upsert', convo_id: 'kit-fresh', title: 'fresh', session_state: 'running' })
+  await new Promise((r) => setTimeout(r, 50))
+  const row = s.db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get('kit-fresh')
+  assert.ok(row, 'a new id is unaffected by the private-owner guard')
+  kitWs.close(); await s.close()
+})
+
 // Extends privacyFixture with an indexed prose message in each of the two
 // title-owned conversations, so search hits and around_seq context reads
 // have something real to find.
@@ -458,5 +537,7 @@ test('snapshot: a client and a private agent (ghost) see all three conversations
     assert.ok(ids.includes('ghost-work'))
     assert.ok(ids.includes('legacy'))
   }
+  const ghostSnapshot = await s.http('/snapshot', { token: ghost.token })
+  assert.ok(ghostSnapshot.json.conversations.every((c) => c.snippet === null), 'a private agent still never gets a snippet')
   await s.close()
 })
