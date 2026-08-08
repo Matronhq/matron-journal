@@ -37,6 +37,51 @@ export function indexableBody(type, payload) {
 //     synchronous, and a multi-GB history must not starve the server's
 //     sockets while it indexes. Search returns partial results until the
 //     walk finishes — acceptable and self-healing (spec).
+// Human input → FTS5 MATCH string. Raw MATCH syntax throws on things people
+// actually type (an unbalanced quote, a bare *, a stray NEAR) — so every
+// whitespace-separated term is double-quoted (FTS5 escapes an embedded " by
+// doubling it), giving an implicit AND over literal terms. Returns null for
+// input with no terms; the route maps that to 400.
+export function ftsQueryFor(raw) {
+  const terms = String(raw).split(/\s+/).filter(Boolean)
+  if (terms.length === 0) return null
+  return terms.map((t) => `"${t.replace(/"/g, '""')}"`).join(' ')
+}
+
+// Ranked, user-scoped search (spec: GET /search). bm25() ascending is
+// best-first; ts DESC breaks ties toward recency. `live` is derived from the
+// conversation's session_state so the caller can prefer talking to a working
+// agent over reading its transcript. The try/catch is belt-and-braces: after
+// quoting, a parse failure should be unreachable, but a SQLite error must
+// surface as badQuery (→ 400), never a 500 with internals in it.
+export function searchMessages(db, userId, { query, limit = 20, convoId = null } = {}) {
+  const match = ftsQueryFor(query)
+  if (match == null) return { badQuery: true }
+  const sql = `
+    SELECT sm.convo_id, c.title, sm.seq, sm.ts, sm.sender, c.session_state,
+           snippet(search_fts, 0, '**', '**', '…', 12) AS snippet
+    FROM search_fts
+    JOIN search_messages sm ON sm.rowid = search_fts.rowid
+    JOIN conversations c ON c.id = sm.convo_id
+    WHERE search_fts MATCH ? AND sm.user_id = ?${convoId != null ? ' AND sm.convo_id = ?' : ''}
+    ORDER BY bm25(search_fts), sm.ts DESC
+    LIMIT ?`
+  let rows
+  try {
+    rows = convoId != null
+      ? db.prepare(sql).all(match, userId, convoId, limit)
+      : db.prepare(sql).all(match, userId, limit)
+  } catch {
+    return { badQuery: true }
+  }
+  return {
+    hits: rows.map((r) => ({
+      convo_id: r.convo_id, title: r.title, seq: r.seq, ts: r.ts, sender: r.sender,
+      snippet: r.snippet, live: r.session_state === 'running',
+    })),
+  }
+}
+
 export async function backfillSearchIndex(db, { batchSize = 1000, log = () => {}, shouldStop = () => false } = {}) {
   const state = db.prepare('SELECT last_events_rowid FROM search_backfill_state WHERE id=1').get()
   let cursor = state ? state.last_events_rowid : 0

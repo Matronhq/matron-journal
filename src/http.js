@@ -8,6 +8,7 @@ import { buildMetrics } from './metrics.js'
 import { listAwaiting, answerParkedInvite, getParticipant } from './participants.js'
 import { addAllowance } from './allowances.js'
 import { deliverPendingInvites } from './invite-delivery.js'
+import { searchMessages } from './search.js'
 
 const json = (res, status, obj) => {
   if (res.writableEnded || res.destroyed) return
@@ -375,6 +376,23 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         deliverPendingInvites(db, hub, { deviceId: isJoin ? room.agent_device_id : target_device_id })
         const delivered = getParticipant(db, room_id, target_device_id)?.delivered_at != null
         return json(res, 200, { ok: true, delivered })
+      }
+      if (req.method === 'GET' && url.pathname === '/search') {
+        // User-scoped full-text search (spec: agent journal search). Open to
+        // both device kinds: agents are the design's audience, clients may
+        // ride it later; scoping is by the authenticated user either way.
+        const q = url.searchParams.get('q')
+        if (typeof q !== 'string' || !q.trim() || q.length > 256) return json(res, 400, { error: 'bad_request' })
+        const rawLimit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : 20
+        if (!Number.isInteger(rawLimit) || rawLimit < 1) return json(res, 400, { error: 'bad_request' })
+        const limit = Math.min(rawLimit, 50)
+        // convo_id narrows results; an id the user can't see yields the same
+        // empty set an unmatched query does (user scoping already guarantees
+        // it) — no existence oracle, nothing extra to check.
+        const convoId = url.searchParams.get('convo_id')
+        const r = searchMessages(db, who.userId, { query: q, limit, convoId })
+        if (r.badQuery) return json(res, 400, { error: 'bad_request' })
+        return json(res, 200, { hits: r.hits })
       }
       const dm = url.pathname.match(/^\/devices\/(\d+)\/revoke$/)
       if (req.method === 'POST' && dm) {
