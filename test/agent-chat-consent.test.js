@@ -288,7 +288,11 @@ test('agent_join parks for user consent symmetrically: the room owner hears noth
   assert.equal(card.payload.room_id, 'room')
   assert.equal(card.payload.from_device_id, agB.deviceId)
   assert.equal(card.payload.from_name, 'dev-b')
-  assert.equal(card.payload.target_device_id, agA.deviceId)
+  // A join self-targets: the parked row is keyed on the JOINER, so the card's
+  // target_device_id — the field a client feeds back to /agent-chat/answer —
+  // is agB, not the room owner. The `invite/delivered` ack above is the frame
+  // that names the owner (who got asked), and it still does.
+  assert.equal(card.payload.target_device_id, agB.deviceId)
   assert.equal(card.payload.justification, 'let me help with this bug')
   assert.equal(card.sender, 'agent:dev-b', 'every agent-authored append carries the agent: prefix (docs/protocol.md)')
 
@@ -627,6 +631,30 @@ test('delivered flag is scoped to the answered row: an unrelated ONLINE recipien
   // The pump call this request triggers must be scoped to agB's own
   // recipient only — agC's unrelated row is left exactly as it was.
   assert.equal(getParticipant(s.db, 'room', agC.deviceId).delivered_at, null, 'the scoped pump call must not touch an unrelated recipient\'s row')
+})
+
+// --- Bugbot finding: the join card must be answerable using its own fields.
+// The card carried the room owner in target_device_id while the parked row is
+// keyed on the joiner, so a client that echoed the field back got a 409 and
+// the ask could never be approved from the card alone.
+
+test('a join card is answerable using the card\'s own target_device_id: the ask unparks and reaches the room owner', async (t) => {
+  const { s, agA, agB, clientToken, a, b, client } = await roomFleet(t)
+  b.send({ op: 'agent_join', room_id: 'room', justification: 'let me help with this bug' })
+  const card = await client.waitFor(isCard)
+  assert.notEqual(card.payload.target_device_id, agA.deviceId, 'the owner is not the row this card asks about')
+
+  // Exactly what a client UI does: read the card, POST its fields back.
+  const r = await s.http('/agent-chat/answer', {
+    method: 'POST', token: clientToken,
+    body: { room_id: card.payload.room_id, target_device_id: card.payload.target_device_id, decision: 'approve' },
+  })
+  assert.equal(r.status, 200, 'echoing the card back must resolve the row it describes, not 409')
+  // Approving a park unparks it to 'invited' and relays onward — for a join,
+  // to the room owner, who still gets the final say.
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'invited')
+  const relay = await a.waitFor((f) => f.kind === 'invite' && f.event === 'join_request')
+  assert.equal(relay.from_device_id, agB.deviceId, 'the owner is asked about the joiner, not about itself')
 })
 
 test('POST /agent-chat/answer deny: row -> denied, requester gets an answer frame with reason "refused" (never "denied")', async (t) => {
