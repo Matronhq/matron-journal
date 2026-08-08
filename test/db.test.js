@@ -104,6 +104,50 @@ test('openDb adds parent_convo_id (+ its index) to a pre-existing conversations 
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
+test('openDb adds session_outcome to a pre-existing conversations table in place', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-outcome-migration-'))
+  const dbPath = path.join(dir, 'pre-migration.db')
+
+  const raw = new Database(dbPath)
+  raw.exec(`
+    CREATE TABLE conversations(
+      id TEXT PRIMARY KEY,
+      owner_user_id INTEGER NOT NULL,
+      title TEXT NOT NULL DEFAULT '',
+      session_state TEXT NOT NULL DEFAULT 'running',
+      last_seq INTEGER NOT NULL DEFAULT 0,
+      unread_count INTEGER NOT NULL DEFAULT 0,
+      snippet TEXT NOT NULL DEFAULT '',
+      created_at INTEGER NOT NULL
+    );
+  `)
+  raw.prepare(
+    "INSERT INTO conversations(id, owner_user_id, title, created_at) VALUES('c1',1,'legacy',0)"
+  ).run()
+  raw.close()
+
+  const db = openDb(dbPath)
+  const cols = db.prepare('PRAGMA table_info(conversations)').all().map((c) => c.name)
+  assert.ok(cols.includes('session_outcome'), 'session_outcome column missing after migration')
+  // Pre-existing row survives untouched, with session_outcome now NULL —
+  // which is exactly what "this conversation has no outcome" means.
+  const row = db.prepare("SELECT title, session_outcome FROM conversations WHERE id='c1'").get()
+  assert.equal(row.title, 'legacy')
+  assert.equal(row.session_outcome, null)
+  // No CHECK constraint: the outcome vocabulary belongs to the writing bridge,
+  // so a value this server has never heard of must still be storable.
+  db.prepare("UPDATE conversations SET session_outcome='some-future-outcome' WHERE id='c1'").run()
+  assert.equal(
+    db.prepare("SELECT session_outcome FROM conversations WHERE id='c1'").get().session_outcome,
+    'some-future-outcome'
+  )
+  db.close()
+
+  // Re-opening (already migrated) is a no-op, not an error.
+  assert.doesNotThrow(() => openDb(dbPath).close())
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
 // WAL mitigation, openDb half (docs/wal-checkpoint-profile.md): the WAL file
 // truncates back to <=4MiB on reset for every opener, but the inline
 // auto-checkpoint must stay at SQLite's stock default here — only the server

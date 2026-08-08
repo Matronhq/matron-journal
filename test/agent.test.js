@@ -164,6 +164,95 @@ test('convo_upsert rejects a malformed parent_convo_id with bad_request, connect
   agent.close()
 })
 
+test('convo_upsert accepts session_outcome: session_status payload and snapshot carry it; it is mutable and sticky', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const ag = createAgent(s.db, dan.id, 'dev-2')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
+  const client = await makeWsClient(s.base, { token: login.json.token, cursor: 0 })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+  await client.waitFor((f) => f.op === 'hello_ok')
+
+  // A running child carries no outcome yet: the key is absent from the payload,
+  // so an existing client's session_status frame is unchanged.
+  agent.send({ op: 'convo_upsert', convo_id: 'codex-1', title: 'review run', parent_convo_id: 'parent-1', session_state: 'running' })
+  const running = await client.waitFor((f) => f.kind === 'journal' && f.convo_id === 'codex-1' && f.type === 'session_status')
+  assert.equal(running.payload.state, 'running')
+  assert.ok(!('session_outcome' in running.payload))
+
+  // Terminal upsert: the outcome rides the same session_status event.
+  agent.send({ op: 'convo_upsert', convo_id: 'codex-1', session_state: 'done', session_outcome: 'completed' })
+  const done = await client.waitFor((f) => f.kind === 'journal' && f.convo_id === 'codex-1' && f.type === 'session_status' && f.payload.state === 'done')
+  assert.equal(done.payload.session_outcome, 'completed')
+  assert.equal(s.db.prepare("SELECT session_outcome FROM conversations WHERE id='codex-1'").get().session_outcome, 'completed')
+
+  // Sticky: a later upsert that omits the outcome must not clear it, and the
+  // status event still reports it (read back from the row, not the frame).
+  agent.send({ op: 'convo_upsert', convo_id: 'codex-1', session_state: 'archived' })
+  const archived = await client.waitFor((f) => f.kind === 'journal' && f.convo_id === 'codex-1' && f.type === 'session_status' && f.payload.state === 'archived')
+  assert.equal(archived.payload.session_outcome, 'completed')
+  assert.equal(s.db.prepare("SELECT session_outcome FROM conversations WHERE id='codex-1'").get().session_outcome, 'completed')
+
+  // Mutable, unlike parent_convo_id: a re-emit with a different outcome wins.
+  agent.send({ op: 'convo_upsert', convo_id: 'codex-1', session_state: 'done', session_outcome: 'failed' })
+  await client.waitFor((f) => f.kind === 'journal' && f.convo_id === 'codex-1' && f.type === 'session_status' && f.payload.session_outcome === 'failed')
+  assert.equal(s.db.prepare("SELECT session_outcome FROM conversations WHERE id='codex-1'").get().session_outcome, 'failed')
+
+  // A plain conversation reads null, so clients can tell "no outcome" from any value.
+  agent.send({ op: 'convo_upsert', convo_id: 'plain-1', title: 'normal', session_state: 'running' })
+  await client.waitFor((f) => f.kind === 'journal' && f.convo_id === 'plain-1' && f.type === 'session_status')
+
+  const snap = await s.http('/snapshot', { token: login.json.token })
+  assert.equal(snap.json.conversations.find((c) => c.id === 'codex-1').session_outcome, 'failed')
+  assert.equal(snap.json.conversations.find((c) => c.id === 'plain-1').session_outcome, null)
+
+  agent.close(); client.close()
+})
+
+test('convo_upsert stores an unenumerated session_outcome verbatim so a newer bridge is not rejected', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const ag = createAgent(s.db, dan.id, 'dev-2')
+  const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+
+  // The journal does not own the outcome vocabulary. A value it has never
+  // heard of is stored as-is, not rejected — clients render an unknown outcome
+  // as "status unknown" rather than breaking.
+  agent.send({ op: 'convo_upsert', convo_id: 'codex-new', session_state: 'done', session_outcome: 'timed-out' })
+  const ev = await agent.waitFor((f) => f.kind === 'journal' && f.convo_id === 'codex-new' && f.type === 'session_status')
+  assert.equal(ev.payload.session_outcome, 'timed-out')
+  assert.equal(s.db.prepare("SELECT session_outcome FROM conversations WHERE id='codex-new'").get().session_outcome, 'timed-out')
+  assert.equal(agent.ws.readyState, 1)
+  agent.close()
+})
+
+test('convo_upsert rejects a malformed session_outcome with bad_request, connection survives', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const ag = createAgent(s.db, dan.id, 'dev-2')
+  const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+
+  for (const bad of [42, '', 'x'.repeat(33), {}, []]) {
+    agent.send({ op: 'convo_upsert', convo_id: `bad-${Math.random()}`, session_outcome: bad })
+    await agent.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'bad_request' && f.ref === 'convo_upsert')
+  }
+  assert.equal(agent.ws.readyState, 1)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM conversations').get().n, 0)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM events').get().n, 0)
+
+  // An explicit null is the same as omitting it (normal convo, no outcome).
+  agent.send({ op: 'convo_upsert', convo_id: 'ok-2', session_state: 'running', session_outcome: null })
+  await agent.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
+  assert.equal(s.db.prepare("SELECT session_outcome FROM conversations WHERE id='ok-2'").get().session_outcome, null)
+  agent.close()
+})
+
 test('agent publish with a fin:-prefixed idem_key is rejected, nothing lands', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())
