@@ -4,6 +4,7 @@ import WebSocket from 'ws'
 import { openDb, isPrivateDevice, pinDevicePrivate, unpinDevicePrivate, applyBridgePrivate } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
+import { addAllowance } from '../src/allowances.js'
 import { startTestServer, makeWsClient } from './helpers.js'
 
 async function dbWithAgent() {
@@ -228,4 +229,73 @@ test('a private agent can invite another private agent (the boundary is with ord
   const ack = await ghostWs.waitFor((f) => (f.kind === 'invite' && f.event === 'delivered') || f.op === 'error')
   assert.equal(ack.event, 'delivered')
   ghostWs.close(); await s.close()
+})
+
+// Fix-round findings: the privacy gate must live in loadRoom itself, ahead
+// of every other check any room op makes — otherwise a caller-controlled
+// field (a blank justification, an accept flag, an unrelated arg) picks
+// which of two DIFFERENT rejections comes back, and that difference alone
+// confirms a private room exists. room_id necessarily differs between the
+// "real private room" and "no such room" probes in every test below, so
+// deepEqual compares the frames with room_id stripped.
+const stripRoomId = ({ room_id, ...rest }) => rest
+
+test('agent_join: a blank justification does not flip the answer — the room-privacy not_found wins before the justification check ever runs', async () => {
+  const { s, kitWs } = await chatPrivacyFixture()
+  kitWs.send({ op: 'agent_join', room_id: 'ghost-room', justification: '' })
+  const priv = await kitWs.waitFor((f) => f.op === 'error' && f.ref === 'agent_join')
+  kitWs.send({ op: 'agent_join', room_id: 'no-such-room', justification: '' })
+  const unknown = await kitWs.waitFor((f) => f.op === 'error' && f.ref === 'agent_join' && f !== priv)
+  assert.equal(priv.code, 'not_found')
+  assert.equal(unknown.code, 'not_found')
+  assert.deepEqual(stripRoomId(priv), stripRoomId(unknown), 'a malformed justification never distinguishes a private room from an unknown one')
+  kitWs.close(); await s.close()
+})
+
+test('per-op existence oracle: agent_invite, agent_invite_answer, and agent_leave all answer a private-owned room exactly like an unknown one', async () => {
+  const { s, kitWs, ghost } = await chatPrivacyFixture()
+  const probe = async (frame) => {
+    kitWs.send({ ...frame, room_id: 'ghost-room' })
+    const priv = await kitWs.waitFor((f) => f.op === 'error' && f.ref === frame.op)
+    kitWs.send({ ...frame, room_id: 'no-such-room' })
+    const unknown = await kitWs.waitFor((f) => f.op === 'error' && f.ref === frame.op && f !== priv)
+    assert.equal(priv.code, 'not_found', `${frame.op} on the private-owned room`)
+    assert.equal(unknown.code, 'not_found', `${frame.op} on an unknown room`)
+    assert.deepEqual(stripRoomId(priv), stripRoomId(unknown), `${frame.op} frames identical modulo room_id`)
+  }
+  await probe({ op: 'agent_invite', target_device_id: ghost.deviceId, justification: 'probe' })
+  await probe({ op: 'agent_invite_answer', accept: true })
+  await probe({ op: 'agent_leave' })
+  kitWs.close(); await s.close()
+})
+
+test('agent_join: a private caller (wraith) passes the room-privacy gate on another private device (ghost)\'s room', async () => {
+  const { s, wraith } = await chatPrivacyFixture()
+  const wraithWs = await makeWsClient(s.base, { token: wraith.token, cursor: 0 })
+  await wraithWs.waitFor((f) => f.op === 'hello_ok')
+  wraithWs.send({ op: 'agent_join', room_id: 'ghost-room', justification: 'wraith joining ghost' })
+  const ack = await wraithWs.waitFor((f) => (f.kind === 'invite' && f.event === 'delivered') || f.op === 'error')
+  assert.notEqual(ack.code, 'not_found', 'a private caller is invisible, not blinded — the gate never fires for it')
+  assert.equal(ack.event, 'delivered', 'normal park-for-consent flow runs, same as any other valid join request')
+  wraithWs.close(); await s.close()
+})
+
+test('the drawn-in flow: once ghost invites kit and kit accepts, kit can answer and later leave — no step is rejected not_found', async () => {
+  const { s, userId, ghost, kit, ghostWs, kitWs } = await chatPrivacyFixture()
+  // Standing allowance bypasses the park-for-consent step so the invite
+  // relays straight to kit's own socket and reaches 'invited' — this is
+  // the real state machine's route to a drawn-in participant, not a DB
+  // shortcut (see test/agent-chat-consent.test.js: "an allowed pair
+  // bypasses the park entirely").
+  addAllowance(s.db, { userId, fromDeviceId: ghost.deviceId, targetDeviceId: kit.deviceId })
+  ghostWs.send({ op: 'agent_invite', room_id: 'ghost-room', target_device_id: kit.deviceId, justification: 'need your eyes' })
+  const req = await kitWs.waitFor((f) => f.kind === 'invite' && f.event === 'request')
+  assert.equal(req.room_id, 'ghost-room')
+  kitWs.send({ op: 'agent_invite_answer', room_id: 'ghost-room', accept: true })
+  await ghostWs.waitFor((f) => f.kind === 'invite' && f.event === 'answer')
+  kitWs.send({ op: 'agent_leave', room_id: 'ghost-room' })
+  await ghostWs.waitFor((f) => f.kind === 'invite' && f.event === 'left')
+  assert.equal(kitWs.frames.filter((f) => f.op === 'error').length, 0,
+    'kit — drawn into ghost\'s private room by an accepted invite — never hit the room-privacy not_found gate')
+  kitWs.close(); ghostWs.close(); await s.close()
 })

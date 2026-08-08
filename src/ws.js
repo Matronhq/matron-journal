@@ -2,7 +2,7 @@ import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { applyBridgePrivate, isPrivateDevice } from './db.js'
 import { eventsAfter, append, markRead, upsertConversation, toEventShape, isClientOnlyEvent } from './journal.js'
-import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, undoInvite, getParticipant, expireInvites, parkInvite, awaitingCount, markDelivered, expireAwaiting } from './participants.js'
+import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, undoInvite, getParticipant, isParticipant, expireInvites, parkInvite, awaitingCount, markDelivered, expireAwaiting } from './participants.js'
 import { isAllowed } from './allowances.js'
 import { sanitizePeerText } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
@@ -466,6 +466,24 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
     if (typeof roomId !== 'string' || !roomId || roomId.length > CONVO_ID_MAX_CHARS) return { err: ['bad_request', 'bad room_id'] }
     const room = db.prepare('SELECT owner_user_id, agent_device_id, parent_convo_id FROM conversations WHERE id=?').get(roomId)
     if (!room || room.owner_user_id !== conn.userId) return { err: ['not_found'] }
+    // Privacy gate — single choke point (spec: agent visibility & privacy).
+    // A room owned by a private device does not exist for an ordinary
+    // caller with no standing footing in it: every other loadRoom-gated op
+    // (agent_invite's "only the owner may invite", agent_join's owner-null/
+    // self checks, agent_invite_ack/_answer's "no pending invite",
+    // agent_leave's "not a joined participant", and the child-convo check
+    // right below) would otherwise answer differently for a private-owned
+    // room than for an unknown one — an existence oracle one caller-
+    // controlled field away. Must run before ALL of those, including the
+    // child-convo check. The exemption is `isParticipant` on ANY state (a
+    // parked ask, a pending invite, or a joined row): once a caller has
+    // been drawn into this room's lifecycle it must keep answering
+    // invite/answer/leave ops for that caller, or a private owner's own
+    // invitee could never act on it again.
+    if (room.agent_device_id != null && isPrivateDevice(db, room.agent_device_id)
+      && !isPrivateDevice(db, conn.deviceId) && !isParticipant(db, roomId, conn.deviceId)) {
+      return { err: ['not_found'] }
+    }
     if (room.parent_convo_id != null) return { err: ['bad_request', 'child conversations cannot be rooms'] }
     return { room }
   }
@@ -749,9 +767,6 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (typeof msg.justification !== 'string' || !msg.justification || msg.justification.length > INVITE_TEXT_MAX_CHARS) return fail('bad_request', 'bad justification')
         if (room.agent_device_id == null) return fail('conflict', 'room has no recorded owner to ask')
         if (room.agent_device_id === conn.deviceId) return fail('bad_request', 'cannot join own room')
-        // A room owned by a private device does not exist for an ordinary
-        // agent — same not_found loadRoom gives an unknown room id.
-        if (isPrivateDevice(db, room.agent_device_id) && !isPrivateDevice(db, conn.deviceId)) return fail('not_found')
         const justification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
         // See agent_invite's matching check: the raw-string check above only
         // catches a literally empty string, not whitespace/control chars
