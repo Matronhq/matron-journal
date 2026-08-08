@@ -44,6 +44,7 @@ test('indexableBody: tolerates malformed payloads', () => {
 import { openDb } from '../src/db.js'
 import { append, upsertConversation } from '../src/journal.js'
 import { runExpireLogs, runOffload } from '../src/retention.js'
+import { createAgent } from '../src/auth.js'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -283,5 +284,96 @@ test('GET /search: porter stemming finds morphological variants', async () => {
   append(s.db, { userId: user_id, convoId: 'c', sender: 'user:dan', type: 'text', payload: { body: 'we dropped the sqlcipher plan' } })
   const r = await s.http('/search?q=dropping', { token })
   assert.equal(r.json.hits.length, 1)
+  await s.close()
+})
+
+// Fixture: dan with a client token, two agent devices (kit manages 'work',
+// rex manages nothing), prose + tool_output events in 'work'.
+async function contextFixture() {
+  const s = await startTestServer()
+  await createUser(s.db, 'dan', 'password-123')
+  const { token: clientToken, user_id: userId } = (await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'password-123' } })).json
+  const kit = createAgent(s.db, userId, 'kit')
+  const rex = createAgent(s.db, userId, 'rex')
+  upsertConversation(s.db, { id: 'work', ownerUserId: userId, title: 'Work', sessionState: 'running', agentDeviceId: kit.deviceId })
+  const seqs = []
+  const put = (type, payload) => {
+    const r = append(s.db, { userId, convoId: 'work', sender: 'agent:kit', type, payload })
+    seqs.push(r.seq)
+    return r.seq
+  }
+  put('text', { body: 'first message' })
+  put('tool_output', { command: 'env', snippet: 'SECRET=hunter2' })
+  const anchor = put('text', { body: 'the decision happened here' })
+  put('diff', { diff: '+the change itself' })
+  put('text', { body: 'aftermath' })
+  return { s, clientToken, userId, kit, rex, anchor, seqs }
+}
+
+test('around_seq: client gets the window either side, ascending, anchored', async () => {
+  const { s, clientToken, anchor } = await contextFixture()
+  const r = await s.http(`/convo/work/messages?around_seq=${anchor}&limit=4`, { token: clientToken })
+  assert.equal(r.status, 200)
+  const seqs = r.json.events.map((e) => e.seq)
+  assert.deepEqual([...seqs].sort((a, b) => a - b), seqs, 'ascending')
+  assert.ok(r.json.events.some((e) => e.seq === anchor), 'anchor row included')
+  assert.ok(r.json.events.length <= 4)
+  assert.ok(r.json.events.some((e) => e.seq < anchor) && r.json.events.some((e) => e.seq > anchor), 'both sides present')
+  await s.close()
+})
+
+test('around_seq: at either end of a conversation returns short, not an error', async () => {
+  const { s, clientToken, seqs } = await contextFixture()
+  const first = await s.http(`/convo/work/messages?around_seq=${seqs[0]}&limit=10`, { token: clientToken })
+  assert.equal(first.status, 200)
+  assert.equal(first.json.events.length, 5)
+  const last = await s.http(`/convo/work/messages?around_seq=${seqs[seqs.length - 1] + 100}&limit=10`, { token: clientToken })
+  assert.equal(last.status, 200)
+  assert.ok(last.json.events.length > 0)
+  await s.close()
+})
+
+test('around_seq: before_seq and around_seq together → 400', async () => {
+  const { s, clientToken, anchor } = await contextFixture()
+  const r = await s.http(`/convo/work/messages?around_seq=${anchor}&before_seq=${anchor}`, { token: clientToken })
+  assert.equal(r.status, 400)
+  await s.close()
+})
+
+test('around_seq: a foreign agent sees ONLY what the index can see — the tool_output leak test', async () => {
+  const { s, rex, anchor } = await contextFixture()
+  const r = await s.http(`/convo/work/messages?around_seq=${anchor}&limit=10`, { token: rex.token })
+  assert.equal(r.status, 200, 'foreign agent CAN read context around a hit — that is the feature')
+  assert.ok(r.json.events.length >= 3)
+  const raw = JSON.stringify(r.json)
+  assert.ok(!raw.includes('SECRET'), 'tool_output never reaches a foreign agent')
+  assert.ok(r.json.events.every((e) => ['text', 'diff'].includes(e.type)))
+  await s.close()
+})
+
+test('around_seq: the managing agent still sees its own conversation unfiltered', async () => {
+  const { s, kit, anchor } = await contextFixture()
+  const r = await s.http(`/convo/work/messages?around_seq=${anchor}&limit=10`, { token: kit.token })
+  assert.equal(r.status, 200)
+  assert.ok(r.json.events.some((e) => e.type === 'tool_output'), 'own-conversation reads are unchanged')
+  await s.close()
+})
+
+test('around_seq: before_seq keeps the existing agent gate — foreign agent still 404s', async () => {
+  const { s, rex } = await contextFixture()
+  const r = await s.http('/convo/work/messages?limit=10', { token: rex.token })
+  assert.equal(r.status, 404)
+  await s.close()
+})
+
+test('around_seq: cross-user is 404, indistinguishable from missing', async () => {
+  const { s, anchor } = await contextFixture()
+  await createUser(s.db, 'mallory', 'password-123')
+  const m = (await s.http('/login', { method: 'POST', body: { username: 'mallory', password: 'password-123' } })).json
+  const r = await s.http(`/convo/work/messages?around_seq=${anchor}`, { token: m.token })
+  assert.equal(r.status, 404)
+  const missing = await s.http(`/convo/no-such/messages?around_seq=${anchor}`, { token: m.token })
+  assert.equal(missing.status, 404)
+  assert.deepEqual(r.json, missing.json)
   await s.close()
 })

@@ -198,6 +198,24 @@ export function messagesBefore(db, userId, convoId, { beforeSeq = null, limit = 
   return rows.reverse().map(parseRow)
 }
 
+// Context window for a search hit (spec: agent journal search, around_seq).
+// floor(limit/2) rows strictly before the anchor, the remainder from the
+// anchor up — so the anchor row itself is included when it exists, and
+// either end of the conversation just yields a short window, never an
+// error. Ascending order, same authorize() gate as messagesBefore.
+export function messagesAround(db, userId, convoId, { aroundSeq, limit = 30 } = {}) {
+  if (!authorize(db, userId, convoId)) throw new Error('not authorized')
+  const before = Math.floor(limit / 2)
+  const after = limit - before
+  const rows = [
+    ...db.prepare('SELECT * FROM events WHERE convo_id=? AND seq<? ORDER BY seq DESC LIMIT ?')
+      .all(convoId, aroundSeq, before).reverse(),
+    ...db.prepare('SELECT * FROM events WHERE convo_id=? AND seq>=? ORDER BY seq LIMIT ?')
+      .all(convoId, aroundSeq, after),
+  ]
+  return rows.map(parseRow)
+}
+
 // `sender` defaults to the caller's own `user:<name>` identity (the original
 // client-only behavior) but callers may pass an explicit identity string —
 // ws.js does, so an agent connection marking read on behalf of its user gets

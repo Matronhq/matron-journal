@@ -1,14 +1,14 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { login, authToken, changePassword, revokeOwnedDevice, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
-import { snapshot, messagesBefore, toEventShape, isClientOnlyEvent } from './journal.js'
+import { snapshot, messagesBefore, messagesAround, toEventShape, isClientOnlyEvent } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs } from './db.js'
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
 import { listAwaiting, answerParkedInvite, getParticipant } from './participants.js'
 import { addAllowance } from './allowances.js'
 import { deliverPendingInvites } from './invite-delivery.js'
-import { searchMessages } from './search.js'
+import { searchMessages, indexableBody } from './search.js'
 
 const json = (res, status, obj) => {
   if (res.writableEnded || res.destroyed) return
@@ -489,27 +489,45 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           beforeSeq = Number(url.searchParams.get('before_seq'))
           if (!Number.isInteger(beforeSeq)) return json(res, 400, { error: 'bad_request' })
         }
+        let aroundSeq = null
+        if (url.searchParams.has('around_seq')) {
+          aroundSeq = Number(url.searchParams.get('around_seq'))
+          if (!Number.isInteger(aroundSeq)) return json(res, 400, { error: 'bad_request' })
+        }
+        // The two paging modes are mutually exclusive by design — a request
+        // carrying both has a confused caller, and picking one silently
+        // would hide the bug.
+        if (aroundSeq != null && beforeSeq != null) return json(res, 400, { error: 'bad_request' })
         const rawLimit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : 50
         if (!Number.isInteger(rawLimit) || rawLimit < 1) return json(res, 400, { error: 'bad_request' })
         const limit = Math.min(rawLimit, 200)
-        // Agent tokens get roster metadata only in v1 (spec: 2026-08-06
-        // agent-to-agent chat design, "Reads" — "no cross-agent transcript
-        // reads in v1"). messagesBefore's own gate below is user-scoped
-        // (authorize()), so any agent device of the user could otherwise
-        // read any other agent's conversation transcript, room or not.
-        // Tighten to the same owner/joined-participant/legacy-NULL rule
-        // every other agent write path already uses. Client tokens are
-        // unchanged (still just user-scoped ownership). Same 404 shape as
-        // every other not-authorized/missing case here — never 403.
-        if (who.kind === 'agent' && !authorizeAgentWrite(db, who.userId, who.deviceId, convoId)) {
+        // Two agent read regimes (locked decision, search spec fold-in):
+        //  - before_seq (and default) paging keeps the Phase-2 gate: an agent
+        //    reads full transcripts only for conversations it manages or has
+        //    joined (authorizeAgentWrite) — 404 otherwise, same as ever.
+        //  - around_seq on a conversation OUTSIDE that set is the search
+        //    context surface: allowed (it is the feature /search exists to
+        //    serve), but filtered to exactly what the index can see
+        //    (indexableBody non-null: text + diff prose). tool_output — the
+        //    credential surface — and every other type never appear, which
+        //    also covers the client-only consent card (indexableBody is null
+        //    for permission_request).
+        const agentForeign = who.kind === 'agent' && !authorizeAgentWrite(db, who.userId, who.deviceId, convoId)
+        if (agentForeign && aroundSeq == null) {
           return json(res, 404, { error: 'not_found' })
         }
         try {
-          let events = messagesBefore(db, who.userId, convoId, { beforeSeq, limit })
-          // Client-only events (the agent-chat approval card) never reach an
-          // agent device by any read path — this is the HTTP-pagination half
-          // of the guarantee ws.js's fanOut and hello replay also enforce.
-          if (who.kind !== 'client') events = events.filter((e) => !isClientOnlyEvent(e.type, e.payload))
+          let events = aroundSeq != null
+            ? messagesAround(db, who.userId, convoId, { aroundSeq, limit })
+            : messagesBefore(db, who.userId, convoId, { beforeSeq, limit })
+          if (agentForeign) {
+            events = events.filter((e) => indexableBody(e.type, e.payload) != null)
+          } else if (who.kind !== 'client') {
+            // Client-only events (the agent-chat approval card) never reach an
+            // agent device by any read path — this is the HTTP-pagination half
+            // of the guarantee ws.js's fanOut and hello replay also enforce.
+            events = events.filter((e) => !isClientOnlyEvent(e.type, e.payload))
+          }
           return json(res, 200, { events: events.map(toEventShape) })
         } catch (e) {
           // Unauthorized and missing are indistinguishable: both 404, same
