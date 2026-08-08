@@ -2,7 +2,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { login, authToken, changePassword, revokeOwnedDevice, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent } from './journal.js'
-import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs } from './db.js'
+import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice } from './db.js'
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
 import { listAwaiting, answerParkedInvite, getParticipant } from './participants.js'
@@ -308,14 +308,23 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // conversations (children are silenced sub-chats, never chat
         // targets). Same owner_user_id scoping as every other read.
         const live = new Set(hub.connsOf(who.userId).filter((c) => c.ws.readyState === 1).map((c) => c.deviceId))
+        // Privacy filter (spec: agent visibility & privacy): applies only to
+        // an ORDINARY agent caller. Clients always see everything; a private
+        // agent is invisible, not blinded (one-directional, deliberately) —
+        // which also resolves "can two private agents see each other" as yes.
+        const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
         const agents = db.prepare(
-          "SELECT id AS device_id, name, created_at, last_seen_at FROM devices WHERE user_id=? AND kind='agent' ORDER BY id"
+          `SELECT id AS device_id, name, created_at, last_seen_at FROM devices
+           WHERE user_id=? AND kind='agent'${filtered ? ' AND private=0' : ''} ORDER BY id`
         ).all(who.userId).map((d) => ({ ...d, connected: live.has(d.device_id) }))
         const conversations = db.prepare(
           `SELECT id, title, session_state, last_seq, summary, agent_device_id, created_at,
                   (SELECT ts FROM events e WHERE e.convo_id = conversations.id
                    ORDER BY e.seq DESC LIMIT 1) AS last_ts
-           FROM conversations WHERE owner_user_id=? AND parent_convo_id IS NULL
+           FROM conversations WHERE owner_user_id=? AND parent_convo_id IS NULL${filtered
+             ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
+                    SELECT 1 FROM devices d WHERE d.id=conversations.agent_device_id AND d.private=1))`
+             : ''}
            ORDER BY last_seq DESC`
         ).all(who.userId)
         return json(res, 200, { agents, conversations })

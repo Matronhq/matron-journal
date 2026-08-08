@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import WebSocket from 'ws'
 import { openDb, isPrivateDevice, pinDevicePrivate, unpinDevicePrivate, applyBridgePrivate } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
+import { upsertConversation } from '../src/journal.js'
 import { startTestServer } from './helpers.js'
 
 async function dbWithAgent() {
@@ -112,5 +113,66 @@ test('hello: a client sending private is ignored; a non-boolean is rejected', as
   ok.ws?.close()
   const bad = await helloRaw(s.base, { op: 'hello', token: clientToken, private: 'yes' })
   assert.ok(bad.frames.some((f) => f.op === 'error' && f.code === 'bad_request' && f.ref === 'hello'))
+  await s.close()
+})
+
+// Fixture: dan with a client, an ordinary agent (kit), and two private
+// agents (ghost, wraith). ghost manages a conversation.
+async function privacyFixture() {
+  const s = await startTestServer()
+  await createUser(s.db, 'dan', 'password-123')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'password-123' } })
+  const userId = login.json.user_id
+  const clientToken = login.json.token
+  const kit = createAgent(s.db, userId, 'kit')
+  const ghost = createAgent(s.db, userId, 'ghost')
+  const wraith = createAgent(s.db, userId, 'wraith')
+  pinDevicePrivate(s.db, ghost.deviceId, true)
+  pinDevicePrivate(s.db, wraith.deviceId, true)
+  upsertConversation(s.db, { id: 'open-work', ownerUserId: userId, title: 'Open work', sessionState: 'running', agentDeviceId: kit.deviceId })
+  upsertConversation(s.db, { id: 'ghost-work', ownerUserId: userId, title: 'Ghost work', sessionState: 'running', agentDeviceId: ghost.deviceId })
+  upsertConversation(s.db, { id: 'legacy', ownerUserId: userId, title: 'Legacy', sessionState: 'done' }) // agent_device_id NULL
+  return { s, userId, clientToken, kit, ghost, wraith }
+}
+
+test('roster: an ordinary agent cannot see private devices or their conversations', async () => {
+  const { s, kit, ghost } = await privacyFixture()
+  const r = await s.http('/roster', { token: kit.token })
+  assert.equal(r.status, 200)
+  const ids = r.json.agents.map((a) => a.device_id)
+  assert.ok(ids.includes(kit.deviceId))
+  assert.ok(!ids.includes(ghost.deviceId), 'private device absent')
+  const convos = r.json.conversations.map((c) => c.id)
+  assert.ok(convos.includes('open-work'))
+  assert.ok(convos.includes('legacy'), 'NULL-owner conversations stay visible')
+  assert.ok(!convos.includes('ghost-work'), 'private-owned conversation absent — the summaries are the point')
+  await s.close()
+})
+
+test('roster: a client sees everything, unchanged', async () => {
+  const { s, clientToken, ghost } = await privacyFixture()
+  const r = await s.http('/roster', { token: clientToken })
+  assert.ok(r.json.agents.some((a) => a.device_id === ghost.deviceId))
+  assert.ok(r.json.conversations.some((c) => c.id === 'ghost-work'))
+  await s.close()
+})
+
+test('roster: a private agent sees the whole roster — including another private agent', async () => {
+  const { s, ghost, wraith } = await privacyFixture()
+  const r = await s.http('/roster', { token: ghost.token })
+  assert.ok(r.json.agents.some((a) => a.device_id === wraith.deviceId), 'two private agents see each other')
+  assert.ok(r.json.conversations.some((c) => c.id === 'ghost-work'))
+  await s.close()
+})
+
+test('roster: privacy is per-user — another user roster is unaffected either way', async () => {
+  const { s, ghost } = await privacyFixture()
+  await createUser(s.db, 'eve', 'password-123')
+  const eve = (await s.http('/login', { method: 'POST', body: { username: 'eve', password: 'password-123' } })).json
+  const eveAgent = createAgent(s.db, eve.user_id, 'evebot')
+  const r = await s.http('/roster', { token: eveAgent.token })
+  // dan's devices — private or not — were never visible to eve's agents and stay that way
+  assert.ok(!r.json.agents.some((a) => a.device_id === ghost.deviceId))
+  assert.deepEqual(r.json.conversations, [])
   await s.close()
 })
