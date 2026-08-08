@@ -38,3 +38,66 @@ test('indexableBody: tolerates malformed payloads', () => {
   assert.equal(indexableBody('text', 'bare string'), null)
   assert.equal(indexableBody('diff', 7), null)
 })
+
+import { openDb } from '../src/db.js'
+import { append, upsertConversation } from '../src/journal.js'
+import { runExpireLogs, runOffload } from '../src/retention.js'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+
+function seedUserAndConvo(db, { userId = 1, convoId = 'c1' } = {}) {
+  db.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(?, ?, 'x', 0)")
+    .run(userId, `u${userId}`)
+  upsertConversation(db, { id: convoId, ownerUserId: userId, title: 'T', sessionState: 'running' })
+  return { userId, convoId }
+}
+
+const ftsCount = (db, term) =>
+  db.prepare('SELECT COUNT(*) n FROM search_fts WHERE search_fts MATCH ?').get(`"${term}"`).n
+
+test('append: text and diff events are indexed in the same transaction', () => {
+  const db = openDb(':memory:')
+  const { userId, convoId } = seedUserAndConvo(db)
+  append(db, { userId, convoId, sender: 'user:dan', type: 'text', payload: { body: 'sqlcipher attempt deferred' } })
+  append(db, { userId, convoId, sender: 'agent:kit', type: 'diff', payload: { diff: '+used xchacha instead' } })
+  assert.equal(ftsCount(db, 'sqlcipher'), 1)
+  assert.equal(ftsCount(db, 'xchacha'), 1)
+  const row = db.prepare('SELECT * FROM search_messages WHERE user_id=? ORDER BY seq').get(userId)
+  assert.equal(row.convo_id, convoId)
+  assert.equal(row.sender, 'user:dan')
+  db.close()
+})
+
+test('append: tool_output and other non-prose types never reach the index', () => {
+  const db = openDb(':memory:')
+  const { userId, convoId } = seedUserAndConvo(db)
+  append(db, { userId, convoId, sender: 'agent:kit', type: 'tool_output', payload: { command: 'env', snippet: 'SECRET=hunter2' } })
+  append(db, { userId, convoId, sender: 'agent:kit', type: 'session_status', payload: { state: 'waiting' } })
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM search_messages').get().n, 0)
+  db.close()
+})
+
+test('append: a failed append indexes nothing (transactionality)', () => {
+  const db = openDb(':memory:')
+  seedUserAndConvo(db)
+  assert.throws(() => append(db, { userId: 1, convoId: 'nope', sender: 'user:dan', type: 'text', payload: { body: 'ghost' } }))
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM search_messages').get().n, 0)
+  db.close()
+})
+
+test('retention rewriting tool_output leaves the index untouched', () => {
+  const db = openDb(':memory:')
+  const { userId, convoId } = seedUserAndConvo(db)
+  const mediaDir = fs.mkdtempSync(path.join(os.tmpdir(), 'search-retention-'))
+  append(db, { userId, convoId, sender: 'user:dan', type: 'text', payload: { body: 'the only indexed row' } })
+  append(db, { userId, convoId, sender: 'agent:kit', type: 'tool_output', payload: { command: 'ls', snippet: 'out', live_log: true } })
+  append(db, { userId, convoId, sender: 'agent:kit', type: 'tool_output', payload: { command: 'ls', snippet: 'old out' } })
+  // Age both tool_output rows past every retention window
+  db.prepare("UPDATE events SET ts=1 WHERE type='tool_output'").run()
+  runExpireLogs(db, { hours: 24, mediaDir })
+  runOffload(db, { days: 30, mediaDir })
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM search_messages').get().n, 1)
+  assert.equal(ftsCount(db, 'indexed'), 1)
+  db.close()
+})

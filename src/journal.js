@@ -1,4 +1,5 @@
 import { authorize } from './auth.js'
+import { indexableBody } from './search.js'
 
 export const MESSAGE_TYPES = [
   'text', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image',
@@ -118,6 +119,17 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
     db.prepare(
       'INSERT INTO events(user_id, seq, convo_id, ts, sender, type, payload, blob_ref, idem_key) VALUES(?,?,?,?,?,?,?,?,?)'
     ).run(userId, seq, convoId, ts, sender, type, payloadJson, blobRef, idemKey)
+    // Search index feed (spec: agent journal search) — same transaction as
+    // the event row, so the index can never hold a row the journal doesn't
+    // (or vice versa). Plain INSERT, never OR REPLACE/OR IGNORE: a duplicate
+    // (user_id, seq) is impossible for a freshly-minted seq, and failing
+    // loudly beats silently corrupting the external-content FTS pair.
+    const searchBody = indexableBody(type, payload)
+    if (searchBody != null) {
+      db.prepare(
+        'INSERT INTO search_messages(user_id, convo_id, seq, ts, sender, body) VALUES(?,?,?,?,?,?)'
+      ).run(userId, convoId, seq, ts, sender, searchBody)
+    }
     if (type === 'session_status') {
       // Guard against a malformed agent payload (null/undefined/non-object,
       // or an object with no string `state`) reaching the DB as a raw
