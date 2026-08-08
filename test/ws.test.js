@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
-import { waitForDrain } from '../src/ws.js'
+import { waitForDrain, shouldSkipPing } from '../src/ws.js'
 
 test('hello replays from cursor, then streams live appends', async (t) => {
   const s = await startTestServer()
@@ -331,6 +331,29 @@ test('waitForDrain gives up once the socket is no longer open, rather than hangi
   const t0 = Date.now()
   await waitForDrain(fakeWs, 1000, 5)
   assert.ok(Date.now() - t0 < 500, 'must not hang forever waiting on a dead socket')
+})
+
+test('shouldSkipPing skips the heartbeat for a client that chatted recently and is drained', () => {
+  const now = 1_000_000
+  const fakeWs = { bufferedAmount: 0, _lastInbound: now - 1000 }
+  assert.equal(shouldSkipPing(fakeWs, now, 55000), true)
+})
+
+test('shouldSkipPing pings a client that has gone quiet', () => {
+  const now = 1_000_000
+  assert.equal(shouldSkipPing({ bufferedAmount: 0, _lastInbound: now - 60000 }, now, 55000), false)
+  // A socket that has never sent an inbound frame must be pinged, not skipped.
+  assert.equal(shouldSkipPing({ bufferedAmount: 0 }, now, 55000), false)
+})
+
+test('shouldSkipPing pings a chatty client that is not draining, so the replay stall bound still applies', () => {
+  // The replay-backpressure case: the peer keeps sending cheap inbound ops
+  // while never reading, so `_lastInbound` is always fresh. Skipping here
+  // would let it renew its own liveness forever and park the replay loop in
+  // waitForDrain past the documented ~2×pingMs bound.
+  const now = 1_000_000
+  const fakeWs = { bufferedAmount: 4 * 1024 * 1024, _lastInbound: now - 10 }
+  assert.equal(shouldSkipPing(fakeWs, now, 55000), false)
 })
 
 test('replay backpressure wait-loop is wired into a real connection: even at a tiny threshold, replay stays complete and in order', async (t) => {
