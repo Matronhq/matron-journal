@@ -149,8 +149,10 @@ export function openDb(path) {
   // Per-device agent-visibility flag (spec: agent visibility & privacy).
   // `private=1` = invisible and unreachable to OTHER agent devices — not to
   // the user's own client devices, which see everything unchanged. Enforced
-  // at four surfaces: GET /roster, GET /search, around_seq context reads,
-  // and agent_invite/agent_join targeting. `private_pinned=1` records that
+  // at: GET /roster, GET /search, around_seq context reads, room ops (via
+  // loadRoom) and invite targeting, GET /snapshot, and GET /metrics — see
+  // docs/protocol.md "Device privacy" for the full enumeration.
+  // `private_pinned=1` records that
   // matron-admin owns the flag: the bridge's per-hello assertion is ignored
   // while pinned, so a deploy that forgot MATRON_AGENT_PRIVATE can never
   // silently unmark a machine (admin wins — spec precedence decision).

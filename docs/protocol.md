@@ -125,7 +125,10 @@ the machine-checkable version of this page.
   (per-user head seq, per-device kind/cursor/lag/last_seen_at, total events,
   DB file size) directly from the SQLite file — connected-socket count and
   APNs counters only exist in a running server's memory, so those are
-  `/metrics`-only.
+  `/metrics`-only. `user.devices` additionally omits private devices for a
+  filtered (ordinary, non-private) agent caller — same one-caller-rule
+  predicate as `/roster`/`/search`; see "Device privacy" below. A client or
+  a private agent caller sees every device, unchanged.
 - `GET /devices` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`) -> `{devices: [{device_id, kind, name, created_at,
   cursor, lag, last_seen_at, is_self, connected, push_prefs}]}`. The
@@ -994,13 +997,13 @@ flag back to the next hello, without itself changing the value.
 `matron-admin device list` renders `private=yes|no`, with a `(pinned)` suffix
 when pinned.
 
-**The enforced surfaces — one caller rule, six enforcement points.** Every
+**The enforced surfaces — one caller rule, seven enforcement points.** Every
 rule is conditioned on the identical predicate: filtering applies **only
 when the caller is an ordinary (non-private) agent**. `kind='client'`
 callers are never filtered, and a private agent caller is never filtered
 either — it is invisible, not blinded, so two private agents see each other
 and a private agent still gets the whole unfiltered roster/search/room set.
-The six:
+The seven:
 
 - **`GET /roster`** — omits private agent devices and every top-level
   conversation whose `agent_device_id` is private.
@@ -1041,6 +1044,11 @@ The six:
   plan and remains per-op in the shipped code — nothing subsumed it.
 - **`GET /snapshot`** — a sixth surface with its own, differently-shaped
   rule; see below.
+- **`GET /metrics`** — the `user.devices` list (`buildMetrics`,
+  `src/metrics.js`) omits private devices for a filtered ordinary-agent
+  caller, via an `excludePrivateDevices` option computed with the same
+  predicate at the HTTP layer; a client or a private agent caller gets the
+  unfiltered list, byte-identical to today.
 
 **Byte-identical, deliberately.** Every filtered surface's refusal is
 indistinguishable from the same surface's refusal for a genuinely
@@ -1077,6 +1085,30 @@ client shape, not the single roster/search/room predicate above:
   the compromised device, this feature bought nothing); the only flag it can
   touch is its own, and unmarking itself only makes it more visible, which
   harms nobody but itself.
+- **Revocation re-exposes.** `matron-admin device revoke` (see "Device
+  revocation" below) deletes the device row outright — there is no
+  soft-delete or tombstone. A private device's conversations still carry its
+  now-dangling `agent_device_id`, so every enforcement point above (whose
+  private check is `isPrivateDevice`, a live lookup against the `devices`
+  table) sees no row, answers `false`, and stops excluding them: a
+  decommissioned private agent's whole history becomes visible and
+  searchable again to ordinary agents the moment it's revoked. Privacy here
+  is a visibility flag on a live device, not a retention policy on its past
+  conversations; if a decommissioned device's history needs to stay hidden,
+  that needs a distinct fail-closed mechanism (e.g. an owner id that
+  survives its device row) — not implemented in v1.
+- **A drawn-in ordinary agent keeps the access it was granted, not the
+  discoverability.** Once an ordinary agent is `joined` into a private
+  device's room (invited and accepted, or joined via `agent_join`), it reads
+  and writes that room over the ordinary journal/WS paths exactly like any
+  other room it's a participant in — `authorizeAgentWrite`, hello replay,
+  and paging never re-check privacy once a caller has standing. But that
+  room still never appears in the participant's own `GET /roster`,
+  `GET /snapshot`, or `GET /search` — those three stay scoped to the
+  one-caller predicate above regardless of the caller's actual room
+  memberships. The asymmetry is deliberate: discovery closes (you can't find
+  what you weren't told about), granted access does not (once told, you keep
+  reading it the normal way).
 
 ## Device revocation
 
