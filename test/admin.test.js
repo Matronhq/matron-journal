@@ -608,3 +608,37 @@ test('link-code --png: unwritable path fails before minting (unreachable port ne
   )
   db.close()
 })
+
+test('device private: on pins private, off pins visible, auto releases the pin', async () => {
+  const db = openDb(':memory:')
+  const u = await createUser(db, 'dan', 'pw')
+  const a = createAgent(db, u.id, 'kit')
+  const out = await runAdmin(db, ['device', 'private', String(a.deviceId), 'on'])
+  assert.match(out, /private/)
+  assert.deepEqual(db.prepare('SELECT private, private_pinned FROM devices WHERE id=?').get(a.deviceId), { private: 1, private_pinned: 1 })
+  await runAdmin(db, ['device', 'private', String(a.deviceId), 'off'])
+  assert.deepEqual(db.prepare('SELECT private, private_pinned FROM devices WHERE id=?').get(a.deviceId), { private: 0, private_pinned: 1 })
+  const auto = await runAdmin(db, ['device', 'private', String(a.deviceId), 'auto'])
+  assert.match(auto, /bridge|hello|env/i, 'output explains the flag now follows the bridge')
+  assert.equal(db.prepare('SELECT private_pinned FROM devices WHERE id=?').get(a.deviceId).private_pinned, 0)
+  db.close()
+})
+
+test('device private: unknown device and bad mode are refused', async () => {
+  const db = openDb(':memory:')
+  await assert.rejects(() => runAdmin(db, ['device', 'private', '999', 'on']), /no such device/)
+  const u = await createUser(db, 'dan', 'pw')
+  const a = createAgent(db, u.id, 'kit')
+  await assert.rejects(() => runAdmin(db, ['device', 'private', String(a.deviceId), 'maybe']), /usage/i)
+  db.close()
+})
+
+test('device list: shows the private flag and its pin state', async () => {
+  const db = openDb(':memory:')
+  const u = await createUser(db, 'dan', 'pw')
+  const a = createAgent(db, u.id, 'kit')
+  await runAdmin(db, ['device', 'private', String(a.deviceId), 'on'])
+  const out = await runAdmin(db, ['device', 'list', 'dan'])
+  assert.match(out, /private=yes \(pinned\)/)
+  db.close()
+})
