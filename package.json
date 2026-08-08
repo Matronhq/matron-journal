@@ -1,6 +1,7 @@
 {
   "name": "matron-journal",
   "version": "0.1.0",
+  "license": "AGPL-3.0-only",
   "type": "module",
   "bin": {
     "matron-admin": "bin/matron-admin.js",
