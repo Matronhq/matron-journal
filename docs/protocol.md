@@ -14,7 +14,11 @@ the machine-checkable version of this page.
   a successful login (429 `locked_out` with `retry_after` seconds + `Retry-After` header).
 - `GET /snapshot` (Bearer) -> `{conversations, seq}`. Each conversation row
   carries `parent_convo_id` (`null` for a normal conversation; set for a
-  subagent child — see "Child conversations").
+  subagent child — see "Child conversations"). Every agent caller — private
+  or not — gets `snippet` omitted from every row (it can carry `tool_output`
+  text, a credential surface); an ordinary (non-private) agent additionally
+  has private-owned conversations excluded entirely — see "Device privacy"
+  below.
 - `GET /convo/:id/messages?before_seq&limit` (Bearer) -> `{events}`. `limit`
   is clamped to 1..200 (400 on non-integer/NaN/<1); `before_seq`, when given,
   must be an integer (400 otherwise). Owner-only; missing or not-owned are
@@ -65,9 +69,9 @@ the machine-checkable version of this page.
   hint to talk to the working agent (`GET /roster` / `agent_chat_start`)
   rather than only read its transcript. Scoped to the caller's own user
   (`search_messages.user_id`) regardless of device kind — open to both
-  agents (the feature's primary audience) and clients; the agent-
-  visibility/privacy plan layers additional agent-caller filtering on top
-  later.
+  agents (the feature's primary audience) and clients; an ordinary
+  (non-private) agent caller additionally has hits from private-owned
+  conversations excluded — see "Device privacy" below.
 - `POST /media` (Bearer, client or agent) -> raw request body streamed to disk;
   `{media_id, size, content_type, sha256}`. Content-Type header captured
   (default `application/octet-stream`). 400 `{error:'empty'}` on a zero-byte
@@ -941,6 +945,120 @@ scoping" above) now reach not just the recorded owner but every currently-
 `joined` participant too — that's the durable side of room membership (the
 room's actual conversation content), distinct from this section's ephemeral
 invite-lifecycle relay.
+
+## Device privacy
+
+(spec: `docs/superpowers/specs/2026-08-07-agent-visibility-privacy-design.md`.)
+A per-device flag that makes an agent device — and what it manages — invisible
+and unreachable to *other agent devices*, while the user's own client apps see
+everything unchanged. Consent (see "Agent chat rooms" above) stops a rogue
+agent injecting text into a sibling's context; it does not stop it *watching*,
+and once a room is approved a compromised participant can work on it freely
+and indefinitely. For a device with materially more authority than its
+siblings, unreachable is a stronger property than approved, because
+unreachable has no first-contact hole at all.
+
+**The flag pair.** `devices.private` (`INTEGER NOT NULL DEFAULT 0`) is the
+value; `devices.private_pinned` (`INTEGER NOT NULL DEFAULT 0`) records who
+owns it. `private=1` means invisible/unreachable to other agents — not to the
+user: `kind='client'` connections are never filtered by any rule below, and
+`GET /devices` (already client-only, see above) is untouched by this feature
+entirely. `isPrivateDevice(db, deviceId)` (`src/db.js`) is the single read
+helper every enforcement point calls; it answers `false` for an unknown/
+deleted id rather than throwing, so a caller checking a dangling reference
+falls through to its normal not-found path instead of crashing.
+
+**Setting it: hello, then the pin.** The bridge asserts its own flag on every
+WS `hello` frame: an optional top-level `private: boolean`
+(`MATRON_AGENT_PRIVATE`, bridge-side env var) — hello is the only recurring
+moment a long-lived, operator-absent agent connection can assert env-var
+config. Agent connections only; a client hello carrying the field is silently
+ignored, never rejected — closing a working app's socket over a field it
+should never send would be worse than ignoring it. A non-boolean value is
+`{kind:'control', op:'error', code:'bad_request', ref:'hello'}`, the same
+reject shape a bad cursor gets. Omitting the field asserts `false`: an
+unpinned flag follows the hello assertion exactly, including its removal —
+bridge-set privacy does NOT survive a re-register without the env var.
+`matron-admin device private <device_id> on|off|auto` is the authoritative
+override: `on`/`off` both PIN the flag (`private_pinned=1`) — `off` is
+"force-visible", not "hands off" — so a deploy that forgot the env var can
+never silently unmark a pinned machine; `auto` releases the pin and hands the
+flag back to the next hello, without itself changing the value.
+`matron-admin device list` renders `private=yes|no`, with a `(pinned)` suffix
+when pinned.
+
+**The enforced surfaces — one caller rule, five places.** Every rule is
+conditioned on the identical predicate: filtering applies **only when the
+caller is an ordinary (non-private) agent**. `kind='client'` callers are
+never filtered, and a private agent caller is never filtered either — it is
+invisible, not blinded, so two private agents see each other and a private
+agent still gets the whole unfiltered roster/search/room set. The surfaces:
+
+- **`GET /roster`** — omits private agent devices and every top-level
+  conversation whose `agent_device_id` is private.
+- **`GET /search`** — `searchMessages`'s `excludePrivateOwned` option
+  (`src/search.js`) excludes hits from private-owned conversations.
+- **The `around_seq` context mode** of `GET /convo/:id/messages` — a
+  private-owned conversation 404s for a foreign ordinary-agent read. The
+  check runs before `messagesAroundIndexed` and before the foreign-read
+  audit log line (see "Journal search" above), so a refused read is never
+  logged as a successful one.
+- **Every room op**, via a single choke point rather than five separate
+  checks: `loadRoom` (`src/ws.js`), the shared lookup behind `agent_invite`,
+  `agent_join`, `agent_invite_ack`, `agent_invite_answer`, and `agent_leave`
+  (see "The five room ops" above). A room owned by a private device answers
+  the byte-identical `not_found` an unknown room id gets, on every one of
+  those five ops. Per-op checks on just `agent_invite`'s target and
+  `agent_join`'s owner would leave the other three ops' distinct error
+  shapes (`agent_invite_ack`/`_answer`'s "no pending invite",
+  `agent_leave`'s "not a joined participant") as an existence oracle in the
+  fields those checks don't cover; gating in `loadRoom` closes all five at
+  once, before any op-specific logic (including the child-conversation
+  check) runs.
+  - The exemption is narrower than "is a participant":
+    `isKnownParticipant` (`src/participants.js`) passes a caller only if it
+    **initiated** the ask, the ask was **actually delivered** to it
+    (`delivered_at IS NOT NULL`), or it is **`joined`**. A merely parked
+    (`awaiting_user`, never relayed to any agent socket) or `denied` (never
+    told) row does NOT exempt — either would leak a private room's
+    existence to an agent the user never approved, or explicitly refused.
+- **`GET /snapshot`** — a sixth surface with its own rule; see below.
+
+**Byte-identical, deliberately.** Every filtered surface's refusal is
+indistinguishable from the same surface's refusal for a genuinely
+nonexistent target: `not_found` for room ops (matching an unknown room or
+device id, another user's device, or a client-kind device), `404
+{error:'not_found'}` for `around_seq` (matching a missing conversation). A
+distinct "that's private" error would itself confirm existence — the thing
+being hidden.
+
+**`/snapshot`'s two independent rules (added by security review during
+implementation, alongside the four surfaces above).** `GET /snapshot`
+predates this feature and answers to its own pair of rules layered on the
+client shape, not the single roster/search/room predicate above:
+
+- **`snippet` is omitted for every agent caller, private or not** —
+  unconditional, because the risk is credential leakage (a snippet can carry
+  `tool_output` text), not visibility. A managing agent losing its own
+  conversation's snippet in this one summary payload is an accepted cost; no
+  agent consumer of `/snapshot`'s snippet exists.
+- **Private-owned conversations are excluded for a filtered (ordinary) agent
+  only** — the same one-caller predicate as `/roster` and `/search`, so
+  `/snapshot` can't be used as an end-run around either.
+
+**What this does not do.**
+
+- **Visibility, not privilege.** Every device is still the same journal user
+  with the same rights; privacy is not a permission boundary between an
+  agent and its own box, and does not prevent it doing damage there.
+- **No retroactive hiding.** Text a private agent already wrote into
+  another agent's conversation stays visible there — the flag changes what's
+  discoverable going forward, not the historical record.
+- **A compromised private agent gains nothing from the flag.** It already
+  sees everything (the asymmetry runs the other way — if the private one is
+  the compromised device, this feature bought nothing); the only flag it can
+  touch is its own, and unmarking itself only makes it more visible, which
+  harms nobody but itself.
 
 ## Device revocation
 
