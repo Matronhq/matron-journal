@@ -399,7 +399,11 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // empty set an unmatched query does (user scoping already guarantees
         // it) — no existence oracle, nothing extra to check.
         const convoId = url.searchParams.get('convo_id') || null
-        const r = searchMessages(db, who.userId, { query: q, limit, convoId })
+        // Privacy filter (spec: agent visibility & privacy): same
+        // one-caller-rule predicate the roster uses — applies only to an
+        // ORDINARY agent caller, never to clients or private agents.
+        const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
+        const r = searchMessages(db, who.userId, { query: q, limit, convoId, excludePrivateOwned: filtered })
         if (r.badQuery) return json(res, 400, { error: 'bad_request' })
         return json(res, 200, { hits: r.hits })
       }
@@ -532,6 +536,16 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         try {
           let events
           if (agentForeign && aroundSeq != null) {
+            // Privacy gate (spec: agent visibility & privacy): a conversation
+            // owned by a private device does not exist for an ordinary
+            // agent's context reads — same 404 as missing/unauthorized, and
+            // it must fire before the audit log line below so a refused read
+            // is never logged as a successful foreign read. A private caller
+            // bypasses this, same one-directional rule as everywhere else.
+            const owner = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id
+            if (owner != null && isPrivateDevice(db, owner) && !isPrivateDevice(db, who.deviceId)) {
+              return json(res, 404, { error: 'not_found' })
+            }
             // Window over the indexed (prose) set directly, not over every
             // event with a post-hoc filter — in a tool_output-heavy convo,
             // filtering after windowing can starve a small limit down to a

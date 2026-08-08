@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import WebSocket from 'ws'
 import { openDb, isPrivateDevice, pinDevicePrivate, unpinDevicePrivate, applyBridgePrivate } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { upsertConversation } from '../src/journal.js'
+import { upsertConversation, append } from '../src/journal.js'
 import { addAllowance } from '../src/allowances.js'
 import { getParticipant, answerParkedInvite } from '../src/participants.js'
 import { startTestServer, makeWsClient } from './helpers.js'
@@ -340,4 +340,51 @@ test('agent_leave/agent_join: a merely parked (awaiting_user) or denied row does
   await probe('agent_join', { justification: 'curious again' })
 
   kitWs.close(); ghostWs.close(); await s.close()
+})
+
+// Extends privacyFixture with an indexed prose message in each of the two
+// title-owned conversations, so search hits and around_seq context reads
+// have something real to find.
+async function searchPrivacyFixture() {
+  const fx = await privacyFixture()
+  append(fx.s.db, { userId: fx.userId, convoId: 'open-work', sender: 'agent:kit', type: 'text', payload: { body: 'heliotrope in the open' } })
+  append(fx.s.db, { userId: fx.userId, convoId: 'ghost-work', sender: 'agent:ghost', type: 'text', payload: { body: 'heliotrope behind the veil' } })
+  return fx
+}
+
+test('search: an ordinary agent gets no hits from private-owned conversations', async () => {
+  const { s, kit } = await searchPrivacyFixture()
+  const r = await s.http('/search?q=heliotrope', { token: kit.token })
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.json.hits.map((h) => h.convo_id), ['open-work'])
+  await s.close()
+})
+
+test('search: clients and private agents see hits from everywhere', async () => {
+  const { s, clientToken, ghost } = await searchPrivacyFixture()
+  for (const token of [clientToken, ghost.token]) {
+    const r = await s.http('/search?q=heliotrope', { token })
+    assert.equal(r.json.hits.length, 2, 'both conversations hit')
+  }
+  await s.close()
+})
+
+test('around_seq: a private-owned conversation is 404 for an ordinary agent, normal for a client', async () => {
+  const { s, kit, clientToken, userId } = await searchPrivacyFixture()
+  const anchor = s.db.prepare("SELECT seq FROM events WHERE convo_id='ghost-work' ORDER BY seq DESC LIMIT 1").get().seq
+  const agentRead = await s.http(`/convo/ghost-work/messages?around_seq=${anchor}`, { token: kit.token })
+  assert.equal(agentRead.status, 404)
+  const missing = await s.http(`/convo/never-existed/messages?around_seq=${anchor}`, { token: kit.token })
+  assert.deepEqual(agentRead.json, missing.json, 'indistinguishable from a missing conversation')
+  const clientRead = await s.http(`/convo/ghost-work/messages?around_seq=${anchor}`, { token: clientToken })
+  assert.equal(clientRead.status, 200)
+  await s.close()
+})
+
+test('around_seq: a private agent reads foreign context like any other agent surface allows', async () => {
+  const { s, ghost } = await searchPrivacyFixture()
+  const anchor = s.db.prepare("SELECT seq FROM events WHERE convo_id='open-work' ORDER BY seq DESC LIMIT 1").get().seq
+  const r = await s.http(`/convo/open-work/messages?around_seq=${anchor}`, { token: ghost.token })
+  assert.equal(r.status, 200)
+  await s.close()
 })
