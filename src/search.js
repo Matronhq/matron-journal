@@ -23,20 +23,6 @@ export function indexableBody(type, payload) {
   return null
 }
 
-// Startup backfill (spec: agent journal search, "Backfill"). Walks `events`
-// by rowid in batches, indexing every row indexableBody accepts. Three
-// safety properties, each load-bearing:
-//   - INSERT OR IGNORE on UNIQUE(user_id, seq) — never OR REPLACE (the
-//     external-content corruption trap, matron-apple #106) — so overlap
-//     with the live append path or a re-run is a no-op, not a duplicate.
-//   - The cursor row (search_backfill_state) advances per committed batch,
-//     so an interrupted run resumes where it stopped and a completed one
-//     costs a single row read at next boot. Rows appended after the schema
-//     exists are indexed live by append(), so the cursor can never miss.
-//   - One batch per event-loop turn (the await below): better-sqlite3 is
-//     synchronous, and a multi-GB history must not starve the server's
-//     sockets while it indexes. Search returns partial results until the
-//     walk finishes — acceptable and self-healing (spec).
 // Human input → FTS5 MATCH string. Raw MATCH syntax throws on things people
 // actually type (an unbalanced quote, a bare *, a stray NEAR) — so every
 // whitespace-separated term is double-quoted (FTS5 escapes an embedded " by
@@ -71,7 +57,8 @@ export function searchMessages(db, userId, { query, limit = 20, convoId = null }
     rows = convoId != null
       ? db.prepare(sql).all(match, userId, convoId, limit)
       : db.prepare(sql).all(match, userId, limit)
-  } catch {
+  } catch (err) {
+    console.error('search query failed', err)
     return { badQuery: true }
   }
   return {
@@ -82,6 +69,20 @@ export function searchMessages(db, userId, { query, limit = 20, convoId = null }
   }
 }
 
+// Startup backfill (spec: agent journal search, "Backfill"). Walks `events`
+// by rowid in batches, indexing every row indexableBody accepts. Three
+// safety properties, each load-bearing:
+//   - INSERT OR IGNORE on UNIQUE(user_id, seq) — never OR REPLACE (the
+//     external-content corruption trap, matron-apple #106) — so overlap
+//     with the live append path or a re-run is a no-op, not a duplicate.
+//   - The cursor row (search_backfill_state) advances per committed batch,
+//     so an interrupted run resumes where it stopped and a completed one
+//     costs a single row read at next boot. Rows appended after the schema
+//     exists are indexed live by append(), so the cursor can never miss.
+//   - One batch per event-loop turn (the await below): better-sqlite3 is
+//     synchronous, and a multi-GB history must not starve the server's
+//     sockets while it indexes. Search returns partial results until the
+//     walk finishes — acceptable and self-healing (spec).
 export async function backfillSearchIndex(db, { batchSize = 1000, log = () => {}, shouldStop = () => false } = {}) {
   const state = db.prepare('SELECT last_events_rowid FROM search_backfill_state WHERE id=1').get()
   let cursor = state ? state.last_events_rowid : 0
@@ -89,8 +90,16 @@ export async function backfillSearchIndex(db, { batchSize = 1000, log = () => {}
     'INSERT INTO search_backfill_state(id, last_events_rowid) VALUES(1, ?) ' +
     'ON CONFLICT(id) DO UPDATE SET last_events_rowid=excluded.last_events_rowid'
   )
-  const selectBatch = db.prepare(
-    'SELECT rowid, user_id, convo_id, seq, ts, sender, type, payload FROM events WHERE rowid>? ORDER BY rowid LIMIT ?'
+  // Batch rowids are selected index-only first (no payload column touched):
+  // most history is tool_output, which indexableBody always rejects, so
+  // reading and JSON.parse-ing its payload is pure waste at backfill scale.
+  // The second query re-fetches only the rows whose type can ever index.
+  const selectBatchIds = db.prepare(
+    'SELECT rowid FROM events WHERE rowid>? ORDER BY rowid LIMIT ?'
+  )
+  const selectIndexable = db.prepare(
+    `SELECT rowid, user_id, convo_id, seq, ts, sender, type, payload FROM events
+     WHERE rowid>? AND rowid<=? AND type IN ('text','diff') ORDER BY rowid`
   )
   const insert = db.prepare(
     'INSERT OR IGNORE INTO search_messages(user_id, convo_id, seq, ts, sender, body) VALUES(?,?,?,?,?,?)'
@@ -99,21 +108,25 @@ export async function backfillSearchIndex(db, { batchSize = 1000, log = () => {}
   let indexed = 0
   for (;;) {
     if (shouldStop()) break
-    const rows = selectBatch.all(cursor, batchSize)
-    if (rows.length === 0) break
+    const ids = selectBatchIds.all(cursor, batchSize)
+    if (ids.length === 0) break
+    const floor = cursor
+    const ceiling = ids[ids.length - 1].rowid
     db.transaction(() => {
+      const rows = selectIndexable.all(floor, ceiling)
       for (const row of rows) {
         let payload
         try { payload = JSON.parse(row.payload) } catch { payload = null }
         const body = indexableBody(row.type, payload)
         if (body != null) indexed += insert.run(row.user_id, row.convo_id, row.seq, row.ts, row.sender, body).changes
       }
-      cursor = rows[rows.length - 1].rowid
+      cursor = ceiling
       saveCursor.run(cursor)
     })()
-    scanned += rows.length
+    scanned += ids.length
     log(`search backfill: scanned ${scanned} events, indexed ${indexed}`)
     await new Promise((r) => setImmediate(r))
   }
+  log(`search backfill complete: scanned ${scanned}, indexed ${indexed}`)
   return { scanned, indexed }
 }

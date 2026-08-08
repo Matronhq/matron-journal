@@ -377,3 +377,77 @@ test('around_seq: cross-user is 404, indistinguishable from missing', async () =
   assert.deepEqual(r.json, missing.json)
   await s.close()
 })
+
+test('around_seq: an AGENT token minted for a different user gets the same 404 as a missing convo (no cross-user oracle)', async () => {
+  const { s, anchor } = await contextFixture()
+  await createUser(s.db, 'mallory', 'password-123')
+  const mallory = (await s.http('/login', { method: 'POST', body: { username: 'mallory', password: 'password-123' } })).json
+  const spy = createAgent(s.db, mallory.user_id, 'spy')
+  const r = await s.http(`/convo/work/messages?around_seq=${anchor}`, { token: spy.token })
+  assert.equal(r.status, 404)
+  const missing = await s.http(`/convo/no-such/messages?around_seq=${anchor}`, { token: spy.token })
+  assert.equal(missing.status, 404)
+  assert.deepEqual(r.json, missing.json)
+  await s.close()
+})
+
+test('around_seq: a non-integer value → 400', async () => {
+  const { s, clientToken } = await contextFixture()
+  const r = await s.http('/convo/work/messages?around_seq=abc', { token: clientToken })
+  assert.equal(r.status, 400)
+  await s.close()
+})
+
+// Fixture for the foreign-agent windowing tests: 40 text events interleaved
+// 2-for-1 with 20 tool_output events (60 events total), so a window that
+// merely filtered post-hoc would starve badly. textSeqs[19] sits with 19
+// prose events before it and 21 after — enough to fill both a limit=10 and
+// a clamped limit=30 window from either side.
+async function heavyForeignFixture() {
+  const s = await startTestServer()
+  await createUser(s.db, 'dan', 'password-123')
+  const { user_id: userId } = (await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'password-123' } })).json
+  const kit = createAgent(s.db, userId, 'kit')
+  const rex = createAgent(s.db, userId, 'rex')
+  upsertConversation(s.db, { id: 'heavy', ownerUserId: userId, title: 'Heavy', sessionState: 'running', agentDeviceId: kit.deviceId })
+  const textSeqs = []
+  for (let i = 0; i < 20; i++) {
+    for (let j = 0; j < 2; j++) {
+      const r = append(s.db, { userId, convoId: 'heavy', sender: 'agent:kit', type: 'text', payload: { body: `prose ${i}-${j}` } })
+      textSeqs.push(r.seq)
+    }
+    append(s.db, { userId, convoId: 'heavy', sender: 'agent:kit', type: 'tool_output', payload: { command: 'env', snippet: 'SECRET=hunter2' } })
+  }
+  return { s, userId, rex, textSeqs, anchor: textSeqs[19] }
+}
+
+test('around_seq: a foreign agent gets a FULL window of prose from a tool_output-heavy conversation (pins the indexed-window fix)', async () => {
+  const { s, rex, anchor } = await heavyForeignFixture()
+  const r = await s.http(`/convo/heavy/messages?around_seq=${anchor}&limit=10`, { token: rex.token })
+  assert.equal(r.status, 200)
+  assert.equal(r.json.events.length, 10, 'the window is full, not starved by interleaved tool_output')
+  assert.ok(r.json.events.every((e) => e.type === 'text'), 'no tool_output leaks into the window')
+  await s.close()
+})
+
+test('around_seq: a foreign agent read is clamped to 30 even when more prose exists and a bigger limit is requested', async () => {
+  const { s, rex, anchor } = await heavyForeignFixture()
+  const r = await s.http(`/convo/heavy/messages?around_seq=${anchor}&limit=100`, { token: rex.token })
+  assert.equal(r.status, 200)
+  assert.ok(r.json.events.length <= 30, `expected <=30 events, got ${r.json.events.length}`)
+  await s.close()
+})
+
+test('GET /search: empty convo_id is treated as no filter, not a literal-empty-string filter', async () => {
+  const s = await startTestServer()
+  await createUser(s.db, 'dan', 'password-123')
+  const { token, user_id } = (await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'password-123' } })).json
+  upsertConversation(s.db, { id: 'c1', ownerUserId: user_id, title: 'One', sessionState: 'done' })
+  upsertConversation(s.db, { id: 'c2', ownerUserId: user_id, title: 'Two', sessionState: 'done' })
+  append(s.db, { userId: user_id, convoId: 'c1', sender: 'user:dan', type: 'text', payload: { body: 'shared keyword' } })
+  append(s.db, { userId: user_id, convoId: 'c2', sender: 'user:dan', type: 'text', payload: { body: 'shared keyword' } })
+  const r = await s.http('/search?q=shared&convo_id=', { token })
+  assert.equal(r.status, 200)
+  assert.equal(r.json.hits.length, 2, 'an empty convo_id must not filter results down to zero')
+  await s.close()
+})

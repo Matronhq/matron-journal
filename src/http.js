@@ -1,7 +1,7 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { login, authToken, changePassword, revokeOwnedDevice, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
-import { snapshot, messagesBefore, messagesAround, toEventShape, isClientOnlyEvent } from './journal.js'
+import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs } from './db.js'
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
@@ -389,7 +389,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // convo_id narrows results; an id the user can't see yields the same
         // empty set an unmatched query does (user scoping already guarantees
         // it) — no existence oracle, nothing extra to check.
-        const convoId = url.searchParams.get('convo_id')
+        const convoId = url.searchParams.get('convo_id') || null
         const r = searchMessages(db, who.userId, { query: q, limit, convoId })
         if (r.badQuery) return json(res, 400, { error: 'bad_request' })
         return json(res, 200, { hits: r.hits })
@@ -507,20 +507,41 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         //    joined (authorizeAgentWrite) — 404 otherwise, same as ever.
         //  - around_seq on a conversation OUTSIDE that set is the search
         //    context surface: allowed (it is the feature /search exists to
-        //    serve), but filtered to exactly what the index can see
-        //    (indexableBody non-null: text + diff prose). tool_output — the
-        //    credential surface — and every other type never appear, which
-        //    also covers the client-only consent card (indexableBody is null
-        //    for permission_request).
+        //    serve), but windowed over exactly what the index can see
+        //    (search_messages: text + diff prose) rather than over every
+        //    event with a post-hoc filter, so a limited window is never
+        //    starved down to a few rows by interleaved tool_output. The
+        //    limit is clamped to 30 (a search-hit-orientation read, not bulk
+        //    extraction) and every read is logged server-side. tool_output —
+        //    the credential surface — and every other type never appear,
+        //    which also covers the client-only consent card (indexableBody
+        //    is null for permission_request).
         const agentForeign = who.kind === 'agent' && !authorizeAgentWrite(db, who.userId, who.deviceId, convoId)
         if (agentForeign && aroundSeq == null) {
           return json(res, 404, { error: 'not_found' })
         }
         try {
-          let events = aroundSeq != null
-            ? messagesAround(db, who.userId, convoId, { aroundSeq, limit })
-            : messagesBefore(db, who.userId, convoId, { beforeSeq, limit })
+          let events
+          if (agentForeign && aroundSeq != null) {
+            // Window over the indexed (prose) set directly, not over every
+            // event with a post-hoc filter — in a tool_output-heavy convo,
+            // filtering after windowing can starve a small limit down to a
+            // couple of rows before the caller ever sees them (final
+            // review). The limit is also clamped: a foreign agent's context
+            // read is meant to orient around one search hit, not extract a
+            // conversation wholesale.
+            const clampedLimit = Math.min(limit, 30)
+            events = messagesAroundIndexed(db, who.userId, convoId, { aroundSeq, limit: clampedLimit })
+            console.log(`journal: foreign-agent context read convo=${convoId} device=${who.deviceId} anchor=${aroundSeq}`)
+          } else if (aroundSeq != null) {
+            events = messagesAround(db, who.userId, convoId, { aroundSeq, limit })
+          } else {
+            events = messagesBefore(db, who.userId, convoId, { beforeSeq, limit })
+          }
           if (agentForeign) {
+            // Belt-and-braces against drift between the index and the rule:
+            // messagesAroundIndexed already returns only indexable rows, so
+            // this should be a no-op in practice.
             events = events.filter((e) => indexableBody(e.type, e.payload) != null)
           } else if (who.kind !== 'client') {
             // Client-only events (the agent-chat approval card) never reach an

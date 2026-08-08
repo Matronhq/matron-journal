@@ -216,6 +216,33 @@ export function messagesAround(db, userId, convoId, { aroundSeq, limit = 30 } = 
   return rows.map(parseRow)
 }
 
+// Same window shape as messagesAround, but the seq set is picked FROM
+// search_messages — exactly the indexable (prose) set, indexed by
+// (convo_id, seq) — instead of windowing over every event and filtering
+// after. In a tool_output-heavy conversation, windowing over ALL events
+// first can starve a small limit down to a couple of prose rows before the
+// caller ever gets to filter; picking the window from the already-indexed
+// set means every row returned is one the caller can see. The seqs found
+// are then re-fetched from `events` (search_messages doesn't carry the full
+// payload) and mapped through the same parseRow as every other reader.
+export function messagesAroundIndexed(db, userId, convoId, { aroundSeq, limit = 30 } = {}) {
+  if (!authorize(db, userId, convoId)) throw new Error('not authorized')
+  const before = Math.floor(limit / 2)
+  const after = limit - before
+  const seqs = [
+    ...db.prepare('SELECT seq FROM search_messages WHERE convo_id=? AND seq<? ORDER BY seq DESC LIMIT ?')
+      .all(convoId, aroundSeq, before).map((r) => r.seq).reverse(),
+    ...db.prepare('SELECT seq FROM search_messages WHERE convo_id=? AND seq>=? ORDER BY seq LIMIT ?')
+      .all(convoId, aroundSeq, after).map((r) => r.seq),
+  ]
+  if (seqs.length === 0) return []
+  const placeholders = seqs.map(() => '?').join(',')
+  const rows = db.prepare(
+    `SELECT * FROM events WHERE convo_id=? AND seq IN (${placeholders}) ORDER BY seq`
+  ).all(convoId, ...seqs)
+  return rows.map(parseRow)
+}
+
 // `sender` defaults to the caller's own `user:<name>` identity (the original
 // client-only behavior) but callers may pass an explicit identity string —
 // ws.js does, so an agent connection marking read on behalf of its user gets

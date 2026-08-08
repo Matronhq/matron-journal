@@ -275,22 +275,43 @@ an agent token, selected by which query parameter is present:
 - **`around_seq`** is the search-context surface, and deliberately looser:
   an agent MAY read a conversation outside that set — that is the point,
   since a `/search` hit can be anywhere in the user's history — but the
-  response is filtered to events where `indexableBody(type, payload)` is
-  non-null, i.e. exactly the set the index can see (`text` + `diff`
+  response is limited to the set the index can see (`text` + `diff`
   prose). `tool_output` and every other type, including the client-only
   agent-chat consent card, never reach an agent through this path. An
   agent's `around_seq` read of a conversation it DOES manage or has
   joined is unfiltered, same as `before_seq`; a client's read is
   identical either way — this narrowing applies to agent callers only.
 
+  For a foreign read specifically, the seq window itself is computed FROM
+  `search_messages` — the indexed prose set, not `events` — rather than
+  windowed over every event and filtered afterward. In a `tool_output`-heavy
+  conversation (the common case: an agent's own tool calls dwarf its prose),
+  windowing over everything first and filtering after can starve a small
+  `limit` down to a couple of visible rows even though plenty of prose
+  exists further out; picking the window from the already-indexed set means
+  a requested window is a full window of visible events whenever that much
+  prose exists. `indexableBody` is still applied to the result as
+  belt-and-braces against drift between the index and the rule, so it stays
+  the single predicate all three consumers (live append, backfill, this
+  filter) ultimately answer to — it should just never have anything left to
+  filter in practice now.
+
+  Two more restrictions apply only to this foreign-read path: `limit` is
+  clamped to 30 regardless of what the caller requests (a context read is
+  meant to orient around one search hit, not extract a conversation
+  wholesale — the client and managing-agent paths keep the normal 1..200
+  clamp), and every foreign context read is logged server-side
+  (`journal: foreign-agent context read convo=… device=… anchor=…`) so the
+  exposure this feature grants is observable, not silent.
+
   This resolves what would otherwise be a contradiction with the design
   spec's original wording, "reuses the endpoint's existing authorisation
   unchanged": that holds for a client, but for an agent it means the
   Phase-2 gate is specifically bypassed in `around_seq` mode, with the
-  `indexableBody` filter substituted in as the narrower replacement. Both
-  modes still collapse "not found" and "not yours" into the same 404
-  `{error:'not_found'}` — never 403 — so a caller can't use either path to
-  probe which conversations exist.
+  indexed-window-plus-`indexableBody` filter substituted in as the narrower
+  replacement. Both modes still collapse "not found" and "not yours" into
+  the same 404 `{error:'not_found'}` — never 403 — so a caller can't use
+  either path to probe which conversations exist.
 
 ## WebSocket
 
