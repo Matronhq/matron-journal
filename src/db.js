@@ -146,6 +146,20 @@ export function openDb(path) {
   if (!deviceCols.some((c) => c.name === 'push_prefs')) {
     db.exec('ALTER TABLE devices ADD COLUMN push_prefs TEXT')
   }
+  // Per-device agent-visibility flag (spec: agent visibility & privacy).
+  // `private=1` = invisible and unreachable to OTHER agent devices — not to
+  // the user's own client devices, which see everything unchanged. Enforced
+  // at four surfaces: GET /roster, GET /search, around_seq context reads,
+  // and agent_invite/agent_join targeting. `private_pinned=1` records that
+  // matron-admin owns the flag: the bridge's per-hello assertion is ignored
+  // while pinned, so a deploy that forgot MATRON_AGENT_PRIVATE can never
+  // silently unmark a machine (admin wins — spec precedence decision).
+  if (!deviceCols.some((c) => c.name === 'private')) {
+    db.exec('ALTER TABLE devices ADD COLUMN private INTEGER NOT NULL DEFAULT 0')
+  }
+  if (!deviceCols.some((c) => c.name === 'private_pinned')) {
+    db.exec('ALTER TABLE devices ADD COLUMN private_pinned INTEGER NOT NULL DEFAULT 0')
+  }
   // Which agent device manages this conversation — recorded by convo_upsert,
   // read by the delivery scoping in ws.js/hub.js. NULL (every row predating
   // this column, or a convo whose bridge hasn't re-upserted yet) means
@@ -299,4 +313,31 @@ export function listDevices(db, userId) {
   return db.prepare(
     'SELECT id AS device_id, kind, name, created_at, cursor, last_seen_at, push_prefs FROM devices WHERE user_id=? ORDER BY id'
   ).all(userId).map((d) => ({ ...d, lag: headSeq - d.cursor, push_prefs: parsePushPrefs(d.push_prefs) }))
+}
+
+// The privacy flag, read side. False for unknown ids: a caller checking a
+// dangling/deleted device must fall through to the normal not_found path,
+// not crash.
+export function isPrivateDevice(db, deviceId) {
+  return !!db.prepare('SELECT 1 FROM devices WHERE id=? AND private=1').get(deviceId)
+}
+
+// matron-admin's write: sets the value AND takes ownership (pin). Both
+// directions pin — `off` is "force-visible", not "hands off".
+export function pinDevicePrivate(db, deviceId, value) {
+  db.prepare('UPDATE devices SET private=?, private_pinned=1 WHERE id=?').run(value ? 1 : 0, deviceId)
+}
+
+// Hands the flag back to the bridge's hello assertion. Deliberately does not
+// touch the value — the next hello does.
+export function unpinDevicePrivate(db, deviceId) {
+  db.prepare('UPDATE devices SET private_pinned=0 WHERE id=?').run(deviceId)
+}
+
+// The bridge's per-hello assertion (MATRON_AGENT_PRIVATE on the bridge
+// side). A no-op while pinned. Hello-without-the-field asserts false — a
+// bridge-set flag does NOT survive a re-register without the env var; an
+// admin-set one does (the pin).
+export function applyBridgePrivate(db, deviceId, value) {
+  db.prepare('UPDATE devices SET private=? WHERE id=? AND private_pinned=0').run(value ? 1 : 0, deviceId)
 }
