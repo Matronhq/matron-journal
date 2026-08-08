@@ -1,5 +1,6 @@
 import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
+import { applyBridgePrivate } from './db.js'
 import { eventsAfter, append, markRead, upsertConversation, toEventShape, isClientOnlyEvent } from './journal.js'
 import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, undoInvite, getParticipant, expireInvites, parkInvite, awaitingCount, markDelivered, expireAwaiting } from './participants.js'
 import { isAllowed } from './allowances.js'
@@ -276,6 +277,21 @@ export function attachWs({
             ws.close()
             return
           }
+          // Optional bridge assertion of its own visibility flag (spec:
+          // agent visibility & privacy — MATRON_AGENT_PRIVATE, bridge-side).
+          // Same reject shape as a bad cursor: a malformed hello dies here.
+          if (msg.private !== undefined && typeof msg.private !== 'boolean') {
+            ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'bad_request', ref: 'hello' }))
+            ws.close()
+            return
+          }
+          // Agents only — a client has no visibility flag to assert, and
+          // silently ignoring it beats closing a working app's socket over a
+          // field it should never send. Applied BEFORE replay/registration so
+          // every read this connection triggers already sees the new state.
+          // Absent field = asserts visible: an unpinned flag follows the env
+          // var exactly, including its removal (admin pin is the override).
+          if (who.kind === 'agent') applyBridgePrivate(db, who.deviceId, msg.private === true)
           // conn is assigned here, before replay/registration complete below. If another
           // message arrives while the replay loop is yielded (see setImmediate below),
           // it will be dispatched to handleOp before hub.register(conn) runs. That's safe
