@@ -83,6 +83,38 @@ CREATE TABLE IF NOT EXISTS agent_chat_allowances(
   created_at INTEGER NOT NULL,
   PRIMARY KEY(user_id, from_device_id, target_device_id)
 );
+-- Search index (spec: agent journal search). Deliberately INSERT-trigger
+-- only: \`events\` is append-only — plain INSERT in journal.js append(), no
+-- DELETE anywhere, and retention only rewrites tool_output payloads, which
+-- indexableBody never indexes — so no update/delete trigger can ever be
+-- needed. If a delete/update path is ever added to \`events\`, this schema
+-- must be revisited (external-content FTS corrupts when content rows change
+-- without the matching fts delete — matron-apple #106). Never INSERT OR
+-- REPLACE into search_messages for the same reason.
+CREATE TABLE IF NOT EXISTS search_messages(
+  rowid     INTEGER PRIMARY KEY,
+  user_id   INTEGER NOT NULL,
+  convo_id  TEXT NOT NULL,
+  seq       INTEGER NOT NULL,
+  ts        INTEGER NOT NULL,
+  sender    TEXT NOT NULL,
+  body      TEXT NOT NULL,
+  UNIQUE(user_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_search_messages_convo ON search_messages(convo_id, seq);
+CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
+  body,
+  content='search_messages',
+  content_rowid='rowid',
+  tokenize='porter unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS search_messages_ai AFTER INSERT ON search_messages BEGIN
+  INSERT INTO search_fts(rowid, body) VALUES (new.rowid, new.body);
+END;
+CREATE TABLE IF NOT EXISTS search_backfill_state(
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  last_events_rowid INTEGER NOT NULL
+);
 `
 
 export function openDb(path) {
