@@ -15,6 +15,7 @@ import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
 import { runOffload, runExpireLogs } from './retention.js'
+import { backfillSearchIndex } from './search.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
@@ -280,10 +281,18 @@ export function startServer({
   })
   let retentionInterval = null
   let walCheckpointInterval = null
+  let closing = false
   return new Promise((resolve) => {
     server.listen(port, bind, () => {
       retentionInterval = scheduleRetention(db, { mediaDir: resolvedMediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
+      // Fire-and-forget: search serves partial results until this finishes
+      // (self-healing — spec). shouldStop lets close() end the walk cleanly
+      // instead of racing a closed DB handle.
+      const searchBackfill = backfillSearchIndex(db, {
+        log: (l) => console.log(l),
+        shouldStop: () => closing,
+      }).catch((err) => { console.error('search backfill failed', err) })
       resolve({
         port: server.address().port,
         db,
@@ -292,14 +301,16 @@ export function startServer({
         toolStreams,
         pushPipeline,
         preapproveKey: resolvedPreapproveKey,
+        searchBackfill,
         close: () => new Promise((r) => {
+          closing = true
           if (retentionInterval) clearInterval(retentionInterval)
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
           wss.close()
           for (const c of wss.clients) c.terminate()
           pushPipeline.close()
           if (ownsApnsClient) resolvedApnsClient.close()
-          server.close(() => { db.close(); r() })
+          server.close(() => { searchBackfill.then(() => { db.close(); r() }) })
         }),
       })
     })

@@ -1,7 +1,7 @@
 // test/search.test.js
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { indexableBody } from '../src/search.js'
+import { indexableBody, backfillSearchIndex } from '../src/search.js'
 
 test('indexableBody: text events index their body', () => {
   assert.equal(indexableBody('text', { body: 'why did we drop SQLCipher' }), 'why did we drop SQLCipher')
@@ -113,4 +113,72 @@ test('retention rewriting tool_output leaves the index untouched', () => {
   assert.equal(db.prepare('SELECT COUNT(*) n FROM search_messages').get().n, 1)
   assert.equal(ftsCount(db, 'indexed'), 1)
   db.close()
+})
+
+// Simulates a pre-search DB: rows written straight into `events`, bypassing
+// append() and therefore the live index feed — exactly what history looks
+// like when the schema first arrives.
+function insertRawEvent(db, { userId, convoId, seq, type, payload, sender = 'user:dan' }) {
+  db.prepare('INSERT INTO user_seq(user_id, seq) VALUES(?, ?) ON CONFLICT(user_id) DO UPDATE SET seq=MAX(seq, excluded.seq)').run(userId, seq)
+  db.prepare(
+    'INSERT INTO events(user_id, seq, convo_id, ts, sender, type, payload) VALUES(?,?,?,?,?,?,?)'
+  ).run(userId, seq, convoId, seq, sender, type, JSON.stringify(payload))
+}
+
+test('backfill: indexes historical prose, skips everything else, and reports progress', async () => {
+  const db = openDb(':memory:')
+  seedUserAndConvo(db)
+  insertRawEvent(db, { userId: 1, convoId: 'c1', seq: 1, type: 'text', payload: { body: 'ancient decision' } })
+  insertRawEvent(db, { userId: 1, convoId: 'c1', seq: 2, type: 'tool_output', payload: { snippet: 'SECRET=hunter2' } })
+  insertRawEvent(db, { userId: 1, convoId: 'c1', seq: 3, type: 'diff', payload: { diff: '+ancient change' } })
+  const lines = []
+  const r = await backfillSearchIndex(db, { batchSize: 2, log: (l) => lines.push(l) })
+  assert.equal(r.scanned, 3)
+  assert.equal(r.indexed, 2)
+  assert.ok(lines.length >= 1, 'progress is logged')
+  assert.equal(ftsCount(db, 'ancient'), 2)
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM search_messages WHERE body LIKE '%SECRET%'").get().n, 0)
+  db.close()
+})
+
+test('backfill: running twice changes nothing (idempotent)', async () => {
+  const db = openDb(':memory:')
+  seedUserAndConvo(db)
+  insertRawEvent(db, { userId: 1, convoId: 'c1', seq: 1, type: 'text', payload: { body: 'once only' } })
+  await backfillSearchIndex(db)
+  const r2 = await backfillSearchIndex(db)
+  assert.equal(r2.indexed, 0)
+  assert.equal(ftsCount(db, 'once'), 1)
+  db.close()
+})
+
+test('backfill: interrupt and re-run reaches the same state (resumable)', async () => {
+  const db = openDb(':memory:')
+  seedUserAndConvo(db)
+  for (let i = 1; i <= 10; i++) insertRawEvent(db, { userId: 1, convoId: 'c1', seq: i, type: 'text', payload: { body: `note ${i}` } })
+  let batches = 0
+  const r1 = await backfillSearchIndex(db, { batchSize: 3, shouldStop: () => ++batches > 1 })
+  assert.ok(r1.scanned < 10, 'stopped early')
+  const r2 = await backfillSearchIndex(db, { batchSize: 3 })
+  assert.equal(r1.scanned + r2.scanned, 10, 'resume starts where the interrupt left off, no re-scan')
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM search_messages').get().n, 10)
+  db.close()
+})
+
+test('backfill: rows the live path already indexed are not duplicated', async () => {
+  const db = openDb(':memory:')
+  const { userId, convoId } = seedUserAndConvo(db)
+  append(db, { userId, convoId, sender: 'user:dan', type: 'text', payload: { body: 'live row' } })
+  const r = await backfillSearchIndex(db)
+  assert.equal(r.indexed, 0)
+  assert.equal(ftsCount(db, 'live'), 1)
+  db.close()
+})
+
+test('startServer kicks off the backfill and exposes its promise', async () => {
+  const { startTestServer } = await import('./helpers.js')
+  const s = await startTestServer()
+  assert.ok(s.searchBackfill instanceof Promise)
+  await s.searchBackfill
+  await s.close()
 })
