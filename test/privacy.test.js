@@ -369,12 +369,40 @@ test('search: clients and private agents see hits from everywhere', async () => 
   await s.close()
 })
 
+// The most direct existence probe: narrowing the search to the private-owned
+// convo_id directly, instead of relying on it being absent from an unscoped
+// hit list. Also the only test that exercises the 4-bind SQL variant
+// (match, userId, convoId, limit) with excludePrivateOwned active — a future
+// edit that moves the predicate relative to the convoId ternary would break
+// silently without this.
+test('search: convo_id-narrowed search on a private-owned conversation returns empty, not an error', async () => {
+  const { s, kit } = await searchPrivacyFixture()
+  const r = await s.http('/search?q=heliotrope&convo_id=ghost-work', { token: kit.token })
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.json.hits, [])
+  await s.close()
+})
+
+// The roster pins NULL-owner (legacy) conversations as always-visible to an
+// ordinary agent (see "roster: an ordinary agent cannot see private devices
+// or their conversations" above) — search must agree, since excludePrivateOwned
+// is a self-contained SQL predicate independent of the roster's.
+test('search: an ordinary agent still gets hits from a NULL-owner (legacy) conversation', async () => {
+  const { s, kit, userId } = await searchPrivacyFixture()
+  append(s.db, { userId, convoId: 'legacy', sender: 'agent:kit', type: 'text', payload: { body: 'heliotrope in the archive' } })
+  const r = await s.http('/search?q=heliotrope', { token: kit.token })
+  assert.equal(r.status, 200)
+  assert.ok(r.json.hits.some((h) => h.convo_id === 'legacy'), 'NULL-owner conversation is never private-owned')
+  await s.close()
+})
+
 test('around_seq: a private-owned conversation is 404 for an ordinary agent, normal for a client', async () => {
   const { s, kit, clientToken, userId } = await searchPrivacyFixture()
   const anchor = s.db.prepare("SELECT seq FROM events WHERE convo_id='ghost-work' ORDER BY seq DESC LIMIT 1").get().seq
   const agentRead = await s.http(`/convo/ghost-work/messages?around_seq=${anchor}`, { token: kit.token })
   assert.equal(agentRead.status, 404)
   const missing = await s.http(`/convo/never-existed/messages?around_seq=${anchor}`, { token: kit.token })
+  assert.equal(missing.status, 404)
   assert.deepEqual(agentRead.json, missing.json, 'indistinguishable from a missing conversation')
   const clientRead = await s.http(`/convo/ghost-work/messages?around_seq=${anchor}`, { token: clientToken })
   assert.equal(clientRead.status, 200)
