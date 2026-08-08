@@ -637,7 +637,7 @@ can never be rooms). Error frames for these five ops also carry
 inbound `room_id` was a well-formed id (non-empty string, ≤128 chars); a
 malformed id is never echoed back. Other ops' error frames are unchanged.
 
-- **`agent_invite {room_id, target_device_id, topic?, justification}`** —
+- **`agent_invite {room_id, target_device_id, target_convo_id?, topic?, justification}`** —
   only the room's own owner (`agent_device_id === conn.deviceId`) may send
   it (`forbidden` — "only the room owner may invite" — otherwise);
   `target_device_id` must be a different agent device of the same user
@@ -645,7 +645,23 @@ malformed id is never echoed back. Other ops' error frames are unchanged.
   device — anti-enumeration, same stance as `agent_request`; `bad_request`
   for inviting self). `topic` is optional (≤200 chars,
   `INVITE_TOPIC_MAX_CHARS`), `justification` is required (1-1000 chars,
-  `INVITE_TEXT_MAX_CHARS`). What happens next depends on whether the user
+  `INVITE_TEXT_MAX_CHARS`).
+
+  `target_convo_id` is optional and names **which of the target device's
+  conversations** the ask is for. A caller picks a conversation off
+  `/roster`, but the invite otherwise resolves down to that conversation's
+  owning device — and a receiving bridge running several sessions then
+  cannot tell which was meant. Where it is absent (a pre-3.5 caller) the
+  receiver falls back to a guess; where it is present it is **authorisation,
+  not a hint**: it must be a top-level conversation of this user that
+  `target_device_id` actually owns, else `not_found` — the same code the
+  unknown-device case gets, so a caller cannot probe for conversations it
+  can't see. Persisted on the `convo_agents` row (so it survives a park for
+  consent) and relayed verbatim on the `request` frame; **omitted, never
+  null**, when the caller sent none, so a receiver can tell "not addressed"
+  from "addressed to nothing".
+
+  What happens next depends on whether the user
   has already always-allowed this directed pair, `initiator_device_id ->
   target_device_id` (see "Consent gating" below):
   - **Allowance bypass** — creates/renews an `invited` row and attempts
@@ -658,7 +674,7 @@ malformed id is never echoed back. Other ops' error frames are unchanged.
     caller gets `{kind:'invite', event:'delivered', room_id,
     target_device_id}` and the target gets `{kind:'invite',
     event:'request', room_id, from_device_id, from_name, topic,
-    justification}`.
+    justification, target_convo_id?}`.
   - **No standing allowance (the default)** — creates/renews an
     `awaiting_user` row instead. The target agent is sent **nothing**; the
     justification never leaves the journal until the user approves it. The

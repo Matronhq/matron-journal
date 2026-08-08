@@ -24,7 +24,13 @@ export function deliverPendingInvites(db, hub, { deviceId = null } = {}) {
           from_device_id: row.initiator_device_id, from_name: from?.name ?? '', justification: row.justification }
       : { kind: 'invite', event: 'request', room_id: row.convo_id,
           from_device_id: row.initiator_device_id, from_name: from?.name ?? '',
-          topic: row.topic, justification: row.justification }
+          topic: row.topic, justification: row.justification,
+          // Which of the recipient's OWN conversations this ask was aimed at
+          // — the receiving bridge binds the room to that session instead of
+          // guessing at its most recently active one. Omitted (never null)
+          // for a pre-3.5 requester that stored no target, so the receiver
+          // can tell "not addressed" from "addressed to nothing".
+          ...(row.target_convo_id ? { target_convo_id: row.target_convo_id } : {}) }
     if (hub.sendRpcRequest(row.owner_user_id, recipient, frame)) {
       markDelivered(db, { convoId: row.convo_id, agentDeviceId: row.agent_device_id })
       sent += 1

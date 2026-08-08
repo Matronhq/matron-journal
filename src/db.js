@@ -236,6 +236,22 @@ export function openDb(path) {
       ALTER TABLE convo_agents_new RENAME TO convo_agents;
     `)
   }
+  // Which of the target device's conversations the requester actually meant
+  // (spec: agent chat phase 3.5). An agent picks a CONVERSATION off /roster,
+  // but the invite used to resolve down to that conversation's owning DEVICE
+  // and drop the convo id — so a receiving bridge running several sessions
+  // could not tell which was meant, guessed at the most recently active one,
+  // and landed a stranger's chat request in an unrelated conversation.
+  // NULL = a pre-3.5 requester that never sent one; the receiver falls back
+  // to its old guess for those, so the column is additive in both directions.
+  //
+  // Deliberately AFTER the CHECK-constraint rebuild above: that path recreates
+  // the table from a fixed definition, so an ALTER placed before it would be
+  // dropped on exactly the databases that take both migrations.
+  const convoAgentCols = db.prepare('PRAGMA table_info(convo_agents)').all()
+  if (!convoAgentCols.some((c) => c.name === 'target_convo_id')) {
+    db.exec('ALTER TABLE convo_agents ADD COLUMN target_convo_id TEXT')
+  }
   return db
 }
 

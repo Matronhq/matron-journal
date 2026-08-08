@@ -709,6 +709,27 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         const target = db.prepare('SELECT user_id, kind, private FROM devices WHERE id=?').get(msg.target_device_id)
         if (!target || target.user_id !== conn.userId || target.kind !== 'agent'
           || (target.private === 1 && !isPrivateDevice(db, conn.deviceId))) return fail('not_found')
+        // Which of the target's conversations this ask is FOR (spec: agent
+        // chat phase 3.5). Optional — a pre-3.5 bridge sends none — but when
+        // present it is authorisation, not a hint: the requester may only
+        // address a top-level conversation that the target device actually
+        // owns. Without this check a caller could name any convo id and the
+        // receiving bridge would bind the room to that session, which is a
+        // write into a conversation the requester was never invited to.
+        // Every failure is the same 'not_found' the unknown-device case
+        // gets: distinguishing "no such convo" from "not that device's"
+        // would confirm the existence of conversations the caller cannot see.
+        let targetConvoId = null
+        if (msg.target_convo_id != null) {
+          if (typeof msg.target_convo_id !== 'string' || !msg.target_convo_id) return fail('bad_request', 'bad target_convo_id')
+          const targetConvo = db.prepare(
+            'SELECT owner_user_id, agent_device_id, parent_convo_id FROM conversations WHERE id=?'
+          ).get(msg.target_convo_id)
+          if (!targetConvo || targetConvo.owner_user_id !== conn.userId
+            || targetConvo.agent_device_id !== msg.target_device_id
+            || targetConvo.parent_convo_id != null) return fail('not_found')
+          targetConvoId = msg.target_convo_id
+        }
         const topic = sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS)
         const justification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
         // The raw-string check above only catches a literally empty string —
@@ -721,7 +742,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
           // User pre-approved this directed pair: the pre-consent flow,
           // verbatim — invite, immediate delivery attempt, undo+offline on a
           // dead socket, PLUS the delivery stamp the old flow never wrote.
-          const r = inviteParticipant(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id, initiatorDeviceId: conn.deviceId, justification })
+          const r = inviteParticipant(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id, initiatorDeviceId: conn.deviceId, justification, targetConvoId })
           if (!r.ok) return fail('conflict', `already ${r.state}`)
           // Single-socket delivery (sendRpcRequest): a request turn must not
           // double-inject on a mid-reconnect bridge. false = offline — undo
@@ -730,6 +751,9 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
           const delivered = hub.sendRpcRequest(conn.userId, msg.target_device_id, {
             kind: 'invite', event: 'request', room_id: msg.room_id,
             from_device_id: conn.deviceId, from_name: conn.name, topic, justification,
+            // Omitted, never null, when the requester sent none — see the
+            // matching shape in invite-delivery.js.
+            ...(targetConvoId ? { target_convo_id: targetConvoId } : {}),
           })
           if (!delivered) {
             undoInvite(db, msg.room_id, msg.target_device_id, r.prior)
@@ -746,7 +770,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (awaitingCount(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
           return fail('conflict', 'too many requests awaiting user approval')
         }
-        const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id, initiatorDeviceId: conn.deviceId, justification, topic })
+        const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id, initiatorDeviceId: conn.deviceId, justification, topic, targetConvoId })
         if (!r.ok) return fail('conflict', `already ${r.state}`)
         // Client-only card (isClientOnlyEvent in journal.js): appendAndFan's
         // own fan-out already excludes every agent device, including the
