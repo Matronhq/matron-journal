@@ -4,11 +4,13 @@ import os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import qrcode from 'qrcode-terminal'
 import QRCode from 'qrcode'
-import { openDb } from '../src/db.js'
+import { openDb, pinDevicePrivate, unpinDevicePrivate } from '../src/db.js'
 import { createUser, setPassword, createAgent, revokeDevice } from '../src/auth.js'
 import { resolveMediaDir } from '../src/media.js'
 import { resolvePreapproveKeyPath } from '../src/preapprove-key.js'
 import { runOffload, runExpireLogs } from '../src/retention.js'
+import { listAwaiting, answerParkedInvite } from '../src/participants.js'
+import { addAllowance, removeAllowance, listAllowances } from '../src/allowances.js'
 
 const USAGE = `usage:
   matron-admin user add <name> --password <pw>
@@ -16,9 +18,14 @@ const USAGE = `usage:
   matron-admin agent add <username> <agent-name>
   matron-admin device list <username>
   matron-admin device revoke <device_id>
+  matron-admin device private <device_id> on|off|auto
   matron-admin link-code <username> --server-url <url> [--port <n>] [--expires <30m|24h>] [--png <path>]
   matron-admin offload [--days N]
   matron-admin expire-logs [--hours N]
+  matron-admin agent-chat pending <username>
+  matron-admin agent-chat approve <username> <room_id> <device_id> [--always-allow]
+  matron-admin agent-chat deny <username> <room_id> <device_id>
+  matron-admin agent-chat allowances <username> [--revoke <from_id>:<to_id>]
   matron-admin status`
 
 function flag(argv, name) {
@@ -53,6 +60,41 @@ function formatExpiry(expiresInSeconds) {
   return mins >= 120 ? `expires in ${Math.round(mins / 60)} hours` : `expires in ${mins} minutes`
 }
 
+// "asked 3m ago" / "asked 2h ago" / "asked 5d ago" for `agent-chat pending` —
+// coarse on purpose, this is an operator glance, not an audit timestamp
+// (created_at is printed in full by `agent-chat allowances`, which is the
+// audit-shaped one of the two).
+function formatAge(createdAt, now = Date.now()) {
+  const mins = Math.floor(Math.max(0, now - createdAt) / 60000)
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins}m ago`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours}h ago`
+  return `${Math.floor(hours / 24)}d ago`
+}
+
+function requireUser(db, username) {
+  const user = db.prepare('SELECT id FROM users WHERE name=?').get(username)
+  if (!user) throw new Error(`no such user: ${username}`)
+  return user
+}
+
+// The ownership check every agent-chat answer must pass before touching a
+// row: this CLI takes a username precisely so a parked ask cannot be
+// approved/denied against the wrong user's room just because the operator
+// (or a scripting mistake) named the wrong room/device id. Joins
+// conversations for owner_user_id (the check itself) and agent_device_id
+// (the room's recorded owner, needed for the --always-allow JOIN direction
+// rule below) in one query.
+function loadAwaitingRow(db, roomId, deviceId) {
+  return db.prepare(`
+    SELECT ca.convo_id, ca.agent_device_id, ca.initiator_device_id, ca.state,
+           c.owner_user_id, c.agent_device_id AS room_agent_device_id
+    FROM convo_agents ca JOIN conversations c ON c.id = ca.convo_id
+    WHERE ca.convo_id=? AND ca.agent_device_id=?
+  `).get(roomId, deviceId)
+}
+
 export async function runAdmin(db, argv, deps = {}) {
   const renderPng = deps.renderPng ?? ((uri) => QRCode.toBuffer(uri, { type: 'png', scale: 8 }))
   const [a, b] = argv
@@ -83,9 +125,12 @@ export async function runAdmin(db, argv, deps = {}) {
     if (!username) throw new Error(USAGE)
     const user = db.prepare('SELECT id FROM users WHERE name=?').get(username)
     if (!user) throw new Error(`no such user: ${username}`)
-    const devices = db.prepare('SELECT id, kind, name, cursor, last_seen_at FROM devices WHERE user_id=? ORDER BY id').all(user.id)
+    const devices = db.prepare('SELECT id, kind, name, cursor, last_seen_at, private, private_pinned FROM devices WHERE user_id=? ORDER BY id').all(user.id)
     if (devices.length === 0) return `no devices for ${username}`
-    return devices.map((d) => `${d.id} kind=${d.kind} name=${d.name} cursor=${d.cursor} last_seen_at=${d.last_seen_at ?? 'never'}`).join('\n')
+    return devices.map((d) =>
+      `${d.id} kind=${d.kind} name=${d.name} cursor=${d.cursor} last_seen_at=${d.last_seen_at ?? 'never'}` +
+      ` private=${d.private ? 'yes' : 'no'}${d.private_pinned ? ' (pinned)' : ''}`
+    ).join('\n')
   }
   // Spec §8: "Revocation: delete the device/agent row; its socket is closed
   // on next frame." This just deletes the row — WS enforcement (the
@@ -98,6 +143,23 @@ export async function runAdmin(db, argv, deps = {}) {
     if (!existing) throw new Error(`no such device: ${deviceId}`)
     revokeDevice(db, deviceId)
     return `device ${deviceId} revoked`
+  }
+  // Visibility flag override (spec: agent visibility & privacy). on/off PIN
+  // the flag — the bridge's per-hello MATRON_AGENT_PRIVATE assertion is
+  // ignored until `auto` releases it. This is what makes admin authoritative:
+  // a deploy that forgot the env var cannot unmark a pinned machine.
+  if (a === 'device' && b === 'private') {
+    const deviceId = Number(argv[2])
+    const mode = argv[3]
+    if (!Number.isInteger(deviceId) || !['on', 'off', 'auto'].includes(mode)) throw new Error(USAGE)
+    const existing = db.prepare('SELECT id FROM devices WHERE id=?').get(deviceId)
+    if (!existing) throw new Error(`no such device: ${deviceId}`)
+    if (mode === 'auto') {
+      unpinDevicePrivate(db, deviceId)
+      return `device ${deviceId} privacy unpinned — the flag now follows the bridge's hello assertion (MATRON_AGENT_PRIVATE) from its next connect`
+    }
+    pinDevicePrivate(db, deviceId, mode === 'on')
+    return `device ${deviceId} pinned private=${mode} — the bridge's hello assertion is ignored until 'auto' releases it`
   }
   if (a === 'link-code') {
     const username = argv[1]
@@ -269,6 +331,96 @@ export async function runAdmin(db, argv, deps = {}) {
     const mediaDir = resolveMediaDir(db.name)
     const r = runExpireLogs(db, { hours, mediaDir })
     return `purged ${r.expired} live_log payload(s) older than ${hours}h`
+  }
+  // v1 approval surface for agent-chat consent (spec: 2026-08-07 agent chat
+  // consent) — until the apps grow the permission_request card UI, an
+  // operator drives approve/deny from here. This CLI writes the DB
+  // directly and has no connection to the running server's hub, which
+  // shapes both the approve and deny paths below: approve cannot deliver
+  // the invite itself (the journal server's sweep-tick pump — or that
+  // agent's next hello — does it, within one sweep interval), and deny
+  // cannot push an answer frame to the requester at all (its waiter simply
+  // times out to pending; the row's state tells the story on any later
+  // attempt). Both facts are said in the command's own output so the
+  // operator isn't left wondering why nothing happened immediately.
+  if (a === 'agent-chat' && b === 'pending') {
+    const username = argv[2]
+    if (!username) throw new Error(USAGE)
+    const user = requireUser(db, username)
+    const rows = listAwaiting(db, user.id)
+    if (rows.length === 0) return `no agent-chat requests awaiting approval for ${username}`
+    return rows.map((r) => {
+      const dev = db.prepare('SELECT name FROM devices WHERE id=?').get(r.agent_device_id)
+      return `room ${r.convo_id} ("${r.title}")  device ${r.agent_device_id} (${dev?.name ?? '?'})` +
+        `  topic: ${r.topic || '(none)'}  justification: ${r.justification}  asked ${formatAge(r.created_at)}`
+    }).join('\n')
+  }
+  if (a === 'agent-chat' && b === 'approve') {
+    const [, , username, roomId, deviceIdRaw] = argv
+    const alwaysAllow = argv.includes('--always-allow')
+    if (!username || !roomId || !deviceIdRaw) throw new Error(USAGE)
+    const deviceId = Number(deviceIdRaw)
+    if (!Number.isInteger(deviceId)) throw new Error(USAGE)
+    const user = requireUser(db, username)
+    const row = loadAwaitingRow(db, roomId, deviceId)
+    // Unknown row and a row belonging to another user's room are treated
+    // identically — this check must never be skipped just because the CLI
+    // is a trusted operator surface; taking a username is precisely what
+    // makes the check meaningful.
+    if (!row || row.owner_user_id !== user.id) {
+      throw new Error(`no agent-chat request for ${username} in room ${roomId} for device ${deviceId}`)
+    }
+    if (!answerParkedInvite(db, { convoId: roomId, agentDeviceId: deviceId, approve: true })) {
+      throw new Error(`room ${roomId} device ${deviceId} is not awaiting approval (already answered, or never parked)`)
+    }
+    // JOIN direction rule: a join request's row self-targets (the row's
+    // agent_device_id IS the initiator — the joiner), so the pair to
+    // remember is (initiator -> the room's recorded owner), not
+    // (initiator -> itself). An invite's row has a distinct initiator (the
+    // room owner) and target, so the pair is (initiator -> target) as-is.
+    const isJoin = row.initiator_device_id === deviceId
+    const allowTarget = isJoin ? row.room_agent_device_id : deviceId
+    if (alwaysAllow) {
+      addAllowance(db, { userId: user.id, fromDeviceId: row.initiator_device_id, targetDeviceId: allowTarget })
+    }
+    return [
+      `approved: room ${roomId} device ${deviceId} is now invited (asked by device ${row.initiator_device_id}).`,
+      alwaysAllow ? `always-allow recorded: device ${row.initiator_device_id} -> device ${allowTarget} (no future approval needed for this pair).` : null,
+      "this CLI cannot reach the running server's hub — the invite is delivered by the journal's sweep-tick pump, within one sweep interval, or sooner if that agent connects/hellos in the meantime.",
+    ].filter(Boolean).join('\n')
+  }
+  if (a === 'agent-chat' && b === 'deny') {
+    const [, , username, roomId, deviceIdRaw] = argv
+    if (!username || !roomId || !deviceIdRaw) throw new Error(USAGE)
+    const deviceId = Number(deviceIdRaw)
+    if (!Number.isInteger(deviceId)) throw new Error(USAGE)
+    const user = requireUser(db, username)
+    const row = loadAwaitingRow(db, roomId, deviceId)
+    if (!row || row.owner_user_id !== user.id) {
+      throw new Error(`no agent-chat request for ${username} in room ${roomId} for device ${deviceId}`)
+    }
+    if (!answerParkedInvite(db, { convoId: roomId, agentDeviceId: deviceId, approve: false })) {
+      throw new Error(`room ${roomId} device ${deviceId} is not awaiting approval (already answered, or never parked)`)
+    }
+    return [
+      `denied: room ${roomId} device ${deviceId} is now denied.`,
+      `this CLI cannot push an answer frame to device ${row.initiator_device_id} — it has no connection to the running server's hub — so that agent's wait simply times out to pending; its next attempt will read as declined, same as a peer refusal.`,
+    ].join('\n')
+  }
+  if (a === 'agent-chat' && b === 'allowances') {
+    const username = argv[2]
+    if (!username) throw new Error(USAGE)
+    const user = requireUser(db, username)
+    const revokeFlag = flag(argv, '--revoke')
+    if (revokeFlag != null) {
+      const m = /^(\d+):(\d+)$/.exec(revokeFlag)
+      if (!m) throw new Error(`${USAGE}\n\n--revoke needs <from_id>:<to_id>`)
+      const removed = removeAllowance(db, { userId: user.id, fromDeviceId: Number(m[1]), targetDeviceId: Number(m[2]) })
+      return removed ? `allowance ${m[1]} -> ${m[2]} revoked for ${username}` : `no such allowance ${m[1]} -> ${m[2]} for ${username}`
+    }
+    const rows = listAllowances(db, user.id)
+    if (rows.length === 0) return `no always-allow pairs for ${username}`
+    return rows.map((r) => `${r.from_device_id} -> ${r.target_device_id} (since ${new Date(r.created_at).toISOString()})`).join('\n')
   }
   if (a === 'status') {
     // DB-derived stats only (this reads the SQLite file directly, no

@@ -1,10 +1,14 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
-import { login, authToken, changePassword, revokeOwnedDevice, createAgent, createClientDevice } from './auth.js'
-import { snapshot, messagesBefore, toEventShape } from './journal.js'
-import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs } from './db.js'
+import { login, authToken, changePassword, revokeOwnedDevice, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
+import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent } from './journal.js'
+import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice } from './db.js'
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
+import { listAwaiting, answerParkedInvite, getParticipant } from './participants.js'
+import { addAllowance } from './allowances.js'
+import { deliverPendingInvites } from './invite-delivery.js'
+import { searchMessages, indexableBody } from './search.js'
 
 const json = (res, status, obj) => {
   if (res.writableEnded || res.destroyed) return
@@ -238,12 +242,27 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       if (req.method === 'GET' && url.pathname === '/snapshot') {
-        return json(res, 200, snapshot(db, who.userId))
+        // Two independent rules layered on top of the client shape (spec:
+        // agent visibility & privacy, task 8):
+        //   - snippet omitted for EVERY agent caller, private or not — it can
+        //     carry tool_output text (credentials), same reason /roster omits
+        //     it. A managing agent losing its own convo's snippet is
+        //     acceptable: no agent consumer of /snapshot exists.
+        //   - private-owned conversations excluded for a FILTERED (ordinary)
+        //     agent only — same one-caller-rule predicate as /roster and
+        //     /search, so /snapshot can't be used as an end-run around them.
+        const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
+        return json(res, 200, snapshot(db, who.userId, { omitSnippet: who.kind === 'agent', excludePrivateOwned: filtered }))
       }
       if (req.method === 'GET' && url.pathname === '/metrics') {
         // Any valid device (client or agent) — no admin-only concept in v1.
         // Scoping (no cross-user leakage) is enforced inside buildMetrics.
-        return json(res, 200, buildMetrics(db, { hub, pushPipeline, dbPath, userId: who.userId }))
+        // Privacy filter (spec: agent visibility & privacy): same
+        // one-caller-rule predicate as /roster and /search — an ORDINARY
+        // agent caller's device list omits private devices; a client or a
+        // private agent caller sees the full list, unchanged.
+        const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
+        return json(res, 200, buildMetrics(db, { hub, pushPipeline, dbPath, userId: who.userId, excludePrivateDevices: filtered }))
       }
       if (req.method === 'POST' && url.pathname === '/push/register') {
         // Only client devices carry push tokens — agents run on the dev box
@@ -294,6 +313,114 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           ...d, is_self: d.device_id === who.deviceId, connected: live.has(d.device_id),
         }))
         return json(res, 200, { devices })
+      }
+      if (req.method === 'GET' && url.pathname === '/roster') {
+        // Targeting surface for agent chat (spec: phase 2 roster) — unlike
+        // /devices (management, client-gated) this is deliberately open to
+        // agent tokens, and deliberately NARROWER: agent devices only
+        // (an agent still has no business enumerating its user's client
+        // devices), no cursor/lag/push_prefs, and only top-level
+        // conversations (children are silenced sub-chats, never chat
+        // targets). Same owner_user_id scoping as every other read.
+        const live = new Set(hub.connsOf(who.userId).filter((c) => c.ws.readyState === 1).map((c) => c.deviceId))
+        // Privacy filter (spec: agent visibility & privacy): applies only to
+        // an ORDINARY agent caller. Clients always see everything; a private
+        // agent is invisible, not blinded (one-directional, deliberately) —
+        // which also resolves "can two private agents see each other" as yes.
+        const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
+        const agents = db.prepare(
+          `SELECT id AS device_id, name, created_at, last_seen_at FROM devices
+           WHERE user_id=? AND kind='agent'${filtered ? ' AND private=0' : ''} ORDER BY id`
+        ).all(who.userId).map((d) => ({ ...d, connected: live.has(d.device_id) }))
+        const conversations = db.prepare(
+          `SELECT id, title, session_state, last_seq, summary, agent_device_id, created_at,
+                  (SELECT ts FROM events e WHERE e.convo_id = conversations.id
+                   ORDER BY e.seq DESC LIMIT 1) AS last_ts
+           FROM conversations WHERE owner_user_id=? AND parent_convo_id IS NULL${filtered
+             ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
+                    SELECT 1 FROM devices d WHERE d.id=conversations.agent_device_id AND d.private=1))`
+             : ''}
+           ORDER BY last_seq DESC`
+        ).all(who.userId)
+        return json(res, 200, { agents, conversations })
+      }
+      if (req.method === 'GET' && url.pathname === '/agent-chat/pending') {
+        // The consent-card surface for clients that missed the live card (or
+        // want a durable inbox of asks) — client-gated like every other
+        // decision-making endpoint here; an agent has no business reading
+        // its own or another agent's pending asks over HTTP.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        return json(res, 200, { pending: listAwaiting(db, who.userId) })
+      }
+      if (req.method === 'POST' && url.pathname === '/agent-chat/answer') {
+        // Client-gated: an agent must never answer a consent ask, including
+        // one addressed to itself — the whole point of parking is that only
+        // the human decides.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const body = await readBody(req)
+        const { room_id, target_device_id, decision, always_allow } = body
+        if (decision !== 'approve' && decision !== 'deny') return json(res, 400, { error: 'bad_request' })
+        if (typeof room_id !== 'string' || !Number.isInteger(target_device_id)) return json(res, 400, { error: 'bad_request' })
+        const room = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(room_id)
+        // Unknown room and a room owned by someone else are indistinguishable
+        // (404, never 403) — same anti-enumeration stance as
+        // GET /convo/:id/messages.
+        if (!room || room.owner_user_id !== who.userId) return json(res, 404, { error: 'not_found' })
+        const row = getParticipant(db, room_id, target_device_id)
+        if (!row || row.state !== 'awaiting_user') return json(res, 409, { error: 'conflict' })
+        if (decision === 'deny') {
+          answerParkedInvite(db, { convoId: room_id, agentDeviceId: target_device_id, approve: false })
+          // Indistinguishable from a peer refusal — reason 'refused', never
+          // 'denied' (a requester must never learn the human said no).
+          hub.sendToDevice(who.userId, row.initiator_device_id, {
+            kind: 'invite', event: 'answer', room_id, peer_device_id: target_device_id, accept: false, reason: 'refused',
+          })
+          return json(res, 200, { ok: true })
+        }
+        answerParkedInvite(db, { convoId: room_id, agentDeviceId: target_device_id, approve: true })
+        // Join requests self-target (row.initiator_device_id ===
+        // target_device_id, the joiner) — the recipient of THIS row's relay
+        // (and, below, the directed-pair target) is the room owner, not the
+        // joiner itself.
+        const isJoin = row.initiator_device_id === target_device_id
+        if (always_allow === true) {
+          addAllowance(db, {
+            userId: who.userId,
+            fromDeviceId: row.initiator_device_id,
+            targetDeviceId: isJoin ? room.agent_device_id : target_device_id,
+          })
+        }
+        // Scoped to this row's own recipient: the unscoped pump sweeps every
+        // undelivered row system-wide, so an unrelated row's successful
+        // delivery could otherwise make `sent > 0` true while THIS row's
+        // target is still offline. Even scoped, `sent` could reflect a
+        // different row addressed to the same recipient device — so the
+        // response flag is read back off the answered row itself, which is
+        // exact.
+        deliverPendingInvites(db, hub, { deviceId: isJoin ? room.agent_device_id : target_device_id })
+        const delivered = getParticipant(db, room_id, target_device_id)?.delivered_at != null
+        return json(res, 200, { ok: true, delivered })
+      }
+      if (req.method === 'GET' && url.pathname === '/search') {
+        // User-scoped full-text search (spec: agent journal search). Open to
+        // both device kinds: agents are the design's audience, clients may
+        // ride it later; scoping is by the authenticated user either way.
+        const q = url.searchParams.get('q')
+        if (typeof q !== 'string' || !q.trim() || q.length > 256) return json(res, 400, { error: 'bad_request' })
+        const rawLimit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : 20
+        if (!Number.isInteger(rawLimit) || rawLimit < 1) return json(res, 400, { error: 'bad_request' })
+        const limit = Math.min(rawLimit, 50)
+        // convo_id narrows results; an id the user can't see yields the same
+        // empty set an unmatched query does (user scoping already guarantees
+        // it) — no existence oracle, nothing extra to check.
+        const convoId = url.searchParams.get('convo_id') || null
+        // Privacy filter (spec: agent visibility & privacy): same
+        // one-caller-rule predicate the roster uses — applies only to an
+        // ORDINARY agent caller, never to clients or private agents.
+        const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
+        const r = searchMessages(db, who.userId, { query: q, limit, convoId, excludePrivateOwned: filtered })
+        if (r.badQuery) return json(res, 400, { error: 'bad_request' })
+        return json(res, 200, { hits: r.hits })
       }
       const dm = url.pathname.match(/^\/devices\/(\d+)\/revoke$/)
       if (req.method === 'POST' && dm) {
@@ -390,12 +517,77 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           beforeSeq = Number(url.searchParams.get('before_seq'))
           if (!Number.isInteger(beforeSeq)) return json(res, 400, { error: 'bad_request' })
         }
+        let aroundSeq = null
+        if (url.searchParams.has('around_seq')) {
+          aroundSeq = Number(url.searchParams.get('around_seq'))
+          if (!Number.isInteger(aroundSeq)) return json(res, 400, { error: 'bad_request' })
+        }
+        // The two paging modes are mutually exclusive by design — a request
+        // carrying both has a confused caller, and picking one silently
+        // would hide the bug.
+        if (aroundSeq != null && beforeSeq != null) return json(res, 400, { error: 'bad_request' })
         const rawLimit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : 50
         if (!Number.isInteger(rawLimit) || rawLimit < 1) return json(res, 400, { error: 'bad_request' })
         const limit = Math.min(rawLimit, 200)
+        // Two agent read regimes (locked decision, search spec fold-in):
+        //  - before_seq (and default) paging keeps the Phase-2 gate: an agent
+        //    reads full transcripts only for conversations it manages or has
+        //    joined (authorizeAgentWrite) — 404 otherwise, same as ever.
+        //  - around_seq on a conversation OUTSIDE that set is the search
+        //    context surface: allowed (it is the feature /search exists to
+        //    serve), but windowed over exactly what the index can see
+        //    (search_messages: text + diff prose) rather than over every
+        //    event with a post-hoc filter, so a limited window is never
+        //    starved down to a few rows by interleaved tool_output. The
+        //    limit is clamped to 30 (a search-hit-orientation read, not bulk
+        //    extraction) and every read is logged server-side. tool_output —
+        //    the credential surface — and every other type never appear,
+        //    which also covers the client-only consent card (indexableBody
+        //    is null for permission_request).
+        const agentForeign = who.kind === 'agent' && !authorizeAgentWrite(db, who.userId, who.deviceId, convoId)
+        if (agentForeign && aroundSeq == null) {
+          return json(res, 404, { error: 'not_found' })
+        }
         try {
-          const events = messagesBefore(db, who.userId, convoId, { beforeSeq, limit }).map(toEventShape)
-          return json(res, 200, { events })
+          let events
+          if (agentForeign && aroundSeq != null) {
+            // Privacy gate (spec: agent visibility & privacy): a conversation
+            // owned by a private device does not exist for an ordinary
+            // agent's context reads — same 404 as missing/unauthorized, and
+            // it must fire before the audit log line below so a refused read
+            // is never logged as a successful foreign read. A private caller
+            // bypasses this, same one-directional rule as everywhere else.
+            const owner = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id
+            if (owner != null && isPrivateDevice(db, owner) && !isPrivateDevice(db, who.deviceId)) {
+              return json(res, 404, { error: 'not_found' })
+            }
+            // Window over the indexed (prose) set directly, not over every
+            // event with a post-hoc filter — in a tool_output-heavy convo,
+            // filtering after windowing can starve a small limit down to a
+            // couple of rows before the caller ever sees them (final
+            // review). The limit is also clamped: a foreign agent's context
+            // read is meant to orient around one search hit, not extract a
+            // conversation wholesale.
+            const clampedLimit = Math.min(limit, 30)
+            events = messagesAroundIndexed(db, who.userId, convoId, { aroundSeq, limit: clampedLimit })
+            console.log(`journal: foreign-agent context read convo=${convoId} device=${who.deviceId} anchor=${aroundSeq}`)
+          } else if (aroundSeq != null) {
+            events = messagesAround(db, who.userId, convoId, { aroundSeq, limit })
+          } else {
+            events = messagesBefore(db, who.userId, convoId, { beforeSeq, limit })
+          }
+          if (agentForeign) {
+            // Belt-and-braces against drift between the index and the rule:
+            // messagesAroundIndexed already returns only indexable rows, so
+            // this should be a no-op in practice.
+            events = events.filter((e) => indexableBody(e.type, e.payload) != null)
+          } else if (who.kind !== 'client') {
+            // Client-only events (the agent-chat approval card) never reach an
+            // agent device by any read path — this is the HTTP-pagination half
+            // of the guarantee ws.js's fanOut and hello replay also enforce.
+            events = events.filter((e) => !isClientOnlyEvent(e.type, e.payload))
+          }
+          return json(res, 200, { events: events.map(toEventShape) })
         } catch (e) {
           // Unauthorized and missing are indistinguishable: both 404, same
           // body as GET /media/:id's unknown-id response — never 403 (that

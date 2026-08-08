@@ -64,6 +64,57 @@ CREATE TABLE IF NOT EXISTS link_preapprovals(
   expires_at INTEGER NOT NULL,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS convo_agents(
+  convo_id TEXT NOT NULL,
+  agent_device_id INTEGER NOT NULL,
+  initiator_device_id INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('awaiting_user','invited','joined','refused','denied','left','expired')),
+  justification TEXT NOT NULL DEFAULT '',
+  topic TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  answered_at INTEGER,
+  delivered_at INTEGER,
+  PRIMARY KEY(convo_id, agent_device_id)
+);
+CREATE TABLE IF NOT EXISTS agent_chat_allowances(
+  user_id INTEGER NOT NULL,
+  from_device_id INTEGER NOT NULL,
+  target_device_id INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(user_id, from_device_id, target_device_id)
+);
+-- Search index (spec: agent journal search). Deliberately INSERT-trigger
+-- only: \`events\` is append-only — plain INSERT in journal.js append(), no
+-- DELETE anywhere, and retention only rewrites tool_output payloads, which
+-- indexableBody never indexes — so no update/delete trigger can ever be
+-- needed. If a delete/update path is ever added to \`events\`, this schema
+-- must be revisited (external-content FTS corrupts when content rows change
+-- without the matching fts delete — matron-apple #106). Never INSERT OR
+-- REPLACE into search_messages for the same reason.
+CREATE TABLE IF NOT EXISTS search_messages(
+  rowid     INTEGER PRIMARY KEY,
+  user_id   INTEGER NOT NULL,
+  convo_id  TEXT NOT NULL,
+  seq       INTEGER NOT NULL,
+  ts        INTEGER NOT NULL,
+  sender    TEXT NOT NULL,
+  body      TEXT NOT NULL,
+  UNIQUE(user_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_search_messages_convo ON search_messages(convo_id, seq);
+CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
+  body,
+  content='search_messages',
+  content_rowid='rowid',
+  tokenize='porter unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS search_messages_ai AFTER INSERT ON search_messages BEGIN
+  INSERT INTO search_fts(rowid, body) VALUES (new.rowid, new.body);
+END;
+CREATE TABLE IF NOT EXISTS search_backfill_state(
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  last_events_rowid INTEGER NOT NULL
+);
 `
 
 export function openDb(path) {
@@ -94,6 +145,23 @@ export function openDb(path) {
   // apns_env above.
   if (!deviceCols.some((c) => c.name === 'push_prefs')) {
     db.exec('ALTER TABLE devices ADD COLUMN push_prefs TEXT')
+  }
+  // Per-device agent-visibility flag (spec: agent visibility & privacy).
+  // `private=1` = invisible and unreachable to OTHER agent devices — not to
+  // the user's own client devices, which see everything unchanged. Enforced
+  // at: GET /roster, GET /search, around_seq context reads, room ops (via
+  // loadRoom) and invite targeting, read_marker, convo_upsert's
+  // private-owner takeover guard, GET /snapshot, and GET /metrics — see
+  // docs/protocol.md "Device privacy" for the full enumeration.
+  // `private_pinned=1` records that
+  // matron-admin owns the flag: the bridge's per-hello assertion is ignored
+  // while pinned, so a deploy that forgot MATRON_AGENT_PRIVATE can never
+  // silently unmark a machine (admin wins — spec precedence decision).
+  if (!deviceCols.some((c) => c.name === 'private')) {
+    db.exec('ALTER TABLE devices ADD COLUMN private INTEGER NOT NULL DEFAULT 0')
+  }
+  if (!deviceCols.some((c) => c.name === 'private_pinned')) {
+    db.exec('ALTER TABLE devices ADD COLUMN private_pinned INTEGER NOT NULL DEFAULT 0')
   }
   // Which agent device manages this conversation — recorded by convo_upsert,
   // read by the delivery scoping in ws.js/hub.js. NULL (every row predating
@@ -133,9 +201,41 @@ export function openDb(path) {
   if (!convoCols.some((c) => c.name === 'session_outcome')) {
     db.exec('ALTER TABLE conversations ADD COLUMN session_outcome TEXT')
   }
+  // Rolling 2-3 sentence conversation summary, maintained by the owning
+  // bridge's title pass (spec: agent chat phase 2) — roster targeting
+  // metadata. Same don't-clobber discipline as title: only an upsert that
+  // carries it changes it.
+  if (!convoCols.some((c) => c.name === 'summary')) {
+    db.exec("ALTER TABLE conversations ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
+  }
   // Keeps the per-user quota SUM (see userBlobBytes) a cheap index scan rather
   // than a full-table read as the blob store grows.
   db.exec('CREATE INDEX IF NOT EXISTS idx_blobs_owner ON blobs(owner_user_id)')
+  // SQLite cannot ALTER a CHECK constraint, so convo_agents needs a rebuild to
+  // add consent states (awaiting_user, denied) and new columns (topic, delivered_at).
+  // delivered_at = created_at is correct for pre-consent flow (rows were delivered
+  // at creation or the row was deleted and recreated).
+  const caDef = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='convo_agents'").get()
+  if (caDef && !caDef.sql.includes('awaiting_user')) {
+    db.exec(`
+      CREATE TABLE convo_agents_new(
+        convo_id TEXT NOT NULL,
+        agent_device_id INTEGER NOT NULL,
+        initiator_device_id INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('awaiting_user','invited','joined','refused','denied','left','expired')),
+        justification TEXT NOT NULL DEFAULT '',
+        topic TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        answered_at INTEGER,
+        delivered_at INTEGER,
+        PRIMARY KEY(convo_id, agent_device_id)
+      );
+      INSERT INTO convo_agents_new(convo_id, agent_device_id, initiator_device_id, state, justification, created_at, answered_at, delivered_at)
+        SELECT convo_id, agent_device_id, initiator_device_id, state, justification, created_at, answered_at, created_at FROM convo_agents;
+      DROP TABLE convo_agents;
+      ALTER TABLE convo_agents_new RENAME TO convo_agents;
+    `)
+  }
   return db
 }
 
@@ -232,4 +332,31 @@ export function listDevices(db, userId) {
   return db.prepare(
     'SELECT id AS device_id, kind, name, created_at, cursor, last_seen_at, push_prefs FROM devices WHERE user_id=? ORDER BY id'
   ).all(userId).map((d) => ({ ...d, lag: headSeq - d.cursor, push_prefs: parsePushPrefs(d.push_prefs) }))
+}
+
+// The privacy flag, read side. False for unknown ids: a caller checking a
+// dangling/deleted device must fall through to the normal not_found path,
+// not crash.
+export function isPrivateDevice(db, deviceId) {
+  return !!db.prepare('SELECT 1 FROM devices WHERE id=? AND private=1').get(deviceId)
+}
+
+// matron-admin's write: sets the value AND takes ownership (pin). Both
+// directions pin — `off` is "force-visible", not "hands off".
+export function pinDevicePrivate(db, deviceId, value) {
+  db.prepare('UPDATE devices SET private=?, private_pinned=1 WHERE id=?').run(value ? 1 : 0, deviceId)
+}
+
+// Hands the flag back to the bridge's hello assertion. Deliberately does not
+// touch the value — the next hello does.
+export function unpinDevicePrivate(db, deviceId) {
+  db.prepare('UPDATE devices SET private_pinned=0 WHERE id=?').run(deviceId)
+}
+
+// The bridge's per-hello assertion (MATRON_AGENT_PRIVATE on the bridge
+// side). A no-op while pinned. Hello-without-the-field asserts false — a
+// bridge-set flag does NOT survive a re-register without the env var; an
+// admin-set one does (the pin).
+export function applyBridgePrivate(db, deviceId, value) {
+  db.prepare('UPDATE devices SET private=? WHERE id=? AND private_pinned=0').run(value ? 1 : 0, deviceId)
 }

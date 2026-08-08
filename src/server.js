@@ -15,6 +15,7 @@ import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
 import { runOffload, runExpireLogs } from './retention.js'
+import { backfillSearchIndex } from './search.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
@@ -218,7 +219,7 @@ function warnIfBindTrustsSpoofableIp(bind) {
 
 export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
-  retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, walCheckpointIntervalMs, toolStreamOpts,
+  retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
   toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
@@ -271,15 +272,27 @@ export function startServer({
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
+    // 55s: under the common 60s proxy idle-timeout defaults, and a 2.75x
+    // cut in heartbeat radio wakes for idle phone clients vs the old 20s.
+    pingMs: resolveNumericEnv('MATRON_WS_PING_MS', process.env.MATRON_WS_PING_MS, 55000),
     rpcMaxBytes: resolveNumericEnv('MATRON_RPC_MAX_BYTES', process.env.MATRON_RPC_MAX_BYTES, 16384),
     ...(revocationSweepMs !== undefined ? { revocationSweepMs } : {}),
+    ...(inviteTtlMs !== undefined ? { inviteTtlMs } : {}),
   })
   let retentionInterval = null
   let walCheckpointInterval = null
+  let closing = false
   return new Promise((resolve) => {
     server.listen(port, bind, () => {
       retentionInterval = scheduleRetention(db, { mediaDir: resolvedMediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
+      // Fire-and-forget: search serves partial results until this finishes
+      // (self-healing — spec). shouldStop lets close() end the walk cleanly
+      // instead of racing a closed DB handle.
+      const searchBackfill = backfillSearchIndex(db, {
+        log: (l) => console.log(l),
+        shouldStop: () => closing,
+      }).catch((err) => { console.error('search backfill failed', err) })
       resolve({
         port: server.address().port,
         db,
@@ -288,14 +301,16 @@ export function startServer({
         toolStreams,
         pushPipeline,
         preapproveKey: resolvedPreapproveKey,
+        searchBackfill,
         close: () => new Promise((r) => {
+          closing = true
           if (retentionInterval) clearInterval(retentionInterval)
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
           wss.close()
           for (const c of wss.clients) c.terminate()
           pushPipeline.close()
           if (ownsApnsClient) resolvedApnsClient.close()
-          server.close(() => { db.close(); r() })
+          server.close(() => { searchBackfill.then(() => { db.close(); r() }) })
         }),
       })
     })

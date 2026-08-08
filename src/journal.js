@@ -1,14 +1,27 @@
 import { authorize } from './auth.js'
+import { indexableBody } from './search.js'
 
 export const MESSAGE_TYPES = [
   'text', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image',
 ]
+
+// Events that must never reach an agent device, live or replayed. The
+// agent-chat approval card carries a peer agent's justification — the whole
+// consent design exists to keep that text away from agents until the user
+// approves, and the target agent MANAGES the room conversation the card sits
+// in, so the default fan-out would hand it straight over. One predicate,
+// consumed by ws.js fanOut, ws.js hello replay, and http.js message reads —
+// inlining the check at each site is how they drift apart.
+export function isClientOnlyEvent(type, payload) {
+  return type === 'permission_request' && !!payload && typeof payload === 'object' && payload.kind === 'agent_chat'
+}
 
 export function snippetOf(type, payload) {
   // Tolerate whatever an agent hands us — null/undefined/a bare string or
   // number — rather than crashing on `payload.body` etc. A malformed
   // payload just yields an empty/placeholder snippet, never a thrown error.
   const p = payload && typeof payload === 'object' ? payload : {}
+  if (isClientOnlyEvent(type, payload)) return '🤝 Agent chat request'
   if (type === 'text') return String(p.body || '').slice(0, 120)
   if (type === 'prompt') return `? ${String(p.question || '').slice(0, 110)}`
   if (type === 'permission_request') return `permission: ${String(p.description || '').slice(0, 100)}`
@@ -41,7 +54,7 @@ export function snippetOf(type, payload) {
 // (undefined for a brand-new convo). Purely an in-memory hint for the push
 // pipeline's turn-finished detection (see push.js classify()) — never
 // stored or broadcast, so it carries no wire/protocol weight.
-export function upsertConversation(db, { id, ownerUserId, title, sessionState, agentDeviceId, parentConvoId, sessionOutcome }) {
+export function upsertConversation(db, { id, ownerUserId, title, sessionState, agentDeviceId, parentConvoId, sessionOutcome, summary }) {
   const existing = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
   const prevSessionState = existing ? existing.session_state : undefined
   let metaChanged = false
@@ -60,14 +73,27 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     // COALESCE-last-write-wins rule as session_state, so a bridge re-emitting
     // outcomes after a reconnect is idempotent and an upsert that omits it
     // leaves the recorded outcome alone.
+
+    // Ownership no-steal (spec: agent chat phase 2, the "last-writer-wins
+    // ownership flap" fix): a device that appears in convo_agents for this
+    // conversation — any state — is categorically a guest; its upsert keeps
+    // title/state fresh but never reassigns delivery ownership. A device
+    // with NO participant row keeps the takeover behavior (a re-paired
+    // bridge gets a new device id and must be able to reclaim its own
+    // sessions).
+    const guest = agentDeviceId != null
+      && existing.agent_device_id != null
+      && existing.agent_device_id !== agentDeviceId
+      && !!db.prepare('SELECT 1 FROM convo_agents WHERE convo_id=? AND agent_device_id=?').get(id, agentDeviceId)
+
     db.prepare(
-      'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id), session_outcome=COALESCE(?, session_outcome) WHERE id=?'
-    ).run(title ?? null, sessionState ?? null, agentDeviceId ?? null, sessionOutcome ?? null, id)
+      'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id), session_outcome=COALESCE(?, session_outcome), summary=COALESCE(?, summary) WHERE id=?'
+    ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), sessionOutcome ?? null, summary ?? null, id)
   } else {
     const initialTitle = title || ''
     db.prepare(
-      'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, created_at) VALUES(?,?,?,?,?,?,?,?)'
-    ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, Date.now())
+      'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, created_at) VALUES(?,?,?,?,?,?,?,?,?)'
+    ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', Date.now())
     if (initialTitle || parentConvoId) metaChanged = true
   }
   const convo = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
@@ -98,6 +124,17 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
     db.prepare(
       'INSERT INTO events(user_id, seq, convo_id, ts, sender, type, payload, blob_ref, idem_key) VALUES(?,?,?,?,?,?,?,?,?)'
     ).run(userId, seq, convoId, ts, sender, type, payloadJson, blobRef, idemKey)
+    // Search index feed (spec: agent journal search) — same transaction as
+    // the event row, so the index can never hold a row the journal doesn't
+    // (or vice versa). Plain INSERT, never OR REPLACE/OR IGNORE: a duplicate
+    // (user_id, seq) is impossible for a freshly-minted seq, and failing
+    // loudly beats silently corrupting the external-content FTS pair.
+    const searchBody = indexableBody(type, payload)
+    if (searchBody != null) {
+      db.prepare(
+        'INSERT INTO search_messages(user_id, convo_id, seq, ts, sender, body) VALUES(?,?,?,?,?,?)'
+      ).run(userId, convoId, seq, ts, sender, searchBody)
+    }
     if (type === 'session_status') {
       // Guard against a malformed agent payload (null/undefined/non-object,
       // or an object with no string `state`) reaching the DB as a raw
@@ -135,7 +172,18 @@ const parseRow = (r) => ({ ...r, payload: JSON.parse(r.payload) })
 export const toEventShape = ({ seq, convo_id, ts, sender, type, payload }) =>
   ({ seq, convo_id, ts, sender, type, payload })
 
-export function snapshot(db, userId) {
+// `opts` (spec: agent visibility & privacy, task 8) — both default off, so
+// the one existing call site (http.js /snapshot) is the only caller that
+// opts in and every other hypothetical caller keeps the original shape:
+//   - omitSnippet: never hand back the `snippet` column. snippetOf() can
+//     surface tool_output text (where credentials land — see its `p.snippet`
+//     branch), so this must apply to EVERY agent caller, not just filtered
+//     ones. Mirrors /roster's deliberate snippet omission (same reason).
+//   - excludePrivateOwned: same predicate shape as the roster's conversations
+//     query — a private device's conversations are dropped unless
+//     agent_device_id is NULL (never private-owned). Only for the "ordinary
+//     agent" caller; clients and private agents pass this false.
+export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned = false } = {}) {
   // last_ts: timestamp of the conversation's newest event, so a client can
   // show a correct "last activity" time from a snapshot alone. Without it,
   // a client refreshing via /snapshot after missing frames advanced the
@@ -143,10 +191,16 @@ export function snapshot(db, userId) {
   // events (just created, or history pruned by retention) — clients fall
   // back to created_at. The (convo_id, seq) index makes the subquery a seek.
   const conversations = db.prepare(
-    `SELECT id, title, session_state, session_outcome, last_seq, unread_count, snippet, parent_convo_id, created_at,
+    `SELECT id, title, session_state, session_outcome, last_seq, unread_count,
+            ${omitSnippet ? 'NULL' : 'snippet'} AS snippet,
+            parent_convo_id, summary, created_at,
             (SELECT ts FROM events e WHERE e.convo_id = conversations.id
              ORDER BY e.seq DESC LIMIT 1) AS last_ts
-     FROM conversations WHERE owner_user_id=? ORDER BY last_seq DESC`
+     FROM conversations WHERE owner_user_id=?${excludePrivateOwned
+       ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
+              SELECT 1 FROM devices d WHERE d.id=conversations.agent_device_id AND d.private=1))`
+       : ''}
+     ORDER BY last_seq DESC`
   ).all(userId)
   const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)
   return { conversations, seq: head ? head.seq : 0 }
@@ -164,6 +218,51 @@ export function messagesBefore(db, userId, convoId, { beforeSeq = null, limit = 
     ? db.prepare('SELECT * FROM events WHERE convo_id=? ORDER BY seq DESC LIMIT ?').all(convoId, limit)
     : db.prepare('SELECT * FROM events WHERE convo_id=? AND seq<? ORDER BY seq DESC LIMIT ?').all(convoId, beforeSeq, limit)
   return rows.reverse().map(parseRow)
+}
+
+// Context window for a search hit (spec: agent journal search, around_seq).
+// floor(limit/2) rows strictly before the anchor, the remainder from the
+// anchor up — so the anchor row itself is included when it exists, and
+// either end of the conversation just yields a short window, never an
+// error. Ascending order, same authorize() gate as messagesBefore.
+export function messagesAround(db, userId, convoId, { aroundSeq, limit = 30 } = {}) {
+  if (!authorize(db, userId, convoId)) throw new Error('not authorized')
+  const before = Math.floor(limit / 2)
+  const after = limit - before
+  const rows = [
+    ...db.prepare('SELECT * FROM events WHERE convo_id=? AND seq<? ORDER BY seq DESC LIMIT ?')
+      .all(convoId, aroundSeq, before).reverse(),
+    ...db.prepare('SELECT * FROM events WHERE convo_id=? AND seq>=? ORDER BY seq LIMIT ?')
+      .all(convoId, aroundSeq, after),
+  ]
+  return rows.map(parseRow)
+}
+
+// Same window shape as messagesAround, but the seq set is picked FROM
+// search_messages — exactly the indexable (prose) set, indexed by
+// (convo_id, seq) — instead of windowing over every event and filtering
+// after. In a tool_output-heavy conversation, windowing over ALL events
+// first can starve a small limit down to a couple of prose rows before the
+// caller ever gets to filter; picking the window from the already-indexed
+// set means every row returned is one the caller can see. The seqs found
+// are then re-fetched from `events` (search_messages doesn't carry the full
+// payload) and mapped through the same parseRow as every other reader.
+export function messagesAroundIndexed(db, userId, convoId, { aroundSeq, limit = 30 } = {}) {
+  if (!authorize(db, userId, convoId)) throw new Error('not authorized')
+  const before = Math.floor(limit / 2)
+  const after = limit - before
+  const seqs = [
+    ...db.prepare('SELECT seq FROM search_messages WHERE convo_id=? AND seq<? ORDER BY seq DESC LIMIT ?')
+      .all(convoId, aroundSeq, before).map((r) => r.seq).reverse(),
+    ...db.prepare('SELECT seq FROM search_messages WHERE convo_id=? AND seq>=? ORDER BY seq LIMIT ?')
+      .all(convoId, aroundSeq, after).map((r) => r.seq),
+  ]
+  if (seqs.length === 0) return []
+  const placeholders = seqs.map(() => '?').join(',')
+  const rows = db.prepare(
+    `SELECT * FROM events WHERE convo_id=? AND seq IN (${placeholders}) ORDER BY seq`
+  ).all(convoId, ...seqs)
+  return rows.map(parseRow)
 }
 
 // `sender` defaults to the caller's own `user:<name>` identity (the original
