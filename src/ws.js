@@ -138,6 +138,25 @@ export async function waitForDrain(ws, thresholdBytes, pollMs = 20) {
   }
 }
 
+// Heartbeat skip rule, exported standalone so the two conditions are unit-
+// testable without a real socket (same reason as waitForDrain above).
+//
+// Inbound traffic within the interval proves the peer is alive, so an
+// actively-chatting client shouldn't also pay for a ping — every heartbeat
+// is a full radio wake on a phone.
+//
+// It proves nothing about the peer *reading*, though, which is why the skip
+// also requires an empty outgoing queue. A client that keeps sending small
+// frames (an `activity` op costs it nothing) while never draining what we
+// send would otherwise renew its own liveness forever, and the replay loop's
+// ~2×pingMs stall bound — see the VERIFIED note at its waitForDrain call —
+// would never fire, leaving the loop parked with a full backpressure buffer.
+// A pong is the only evidence the outbound direction is moving, so a
+// backlogged socket is always pinged.
+export function shouldSkipPing(ws, now, pingMs) {
+  return ws.bufferedAmount === 0 && now - (ws._lastInbound || 0) < pingMs
+}
+
 export function attachWs({
   server, db, hub, pingMs = 55000, pushPipeline = noopPushPipeline,
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
@@ -151,10 +170,7 @@ export function attachWs({
   const interval = setInterval(() => {
     const now = Date.now()
     for (const ws of wss.clients) {
-      // Inbound traffic within the interval already proves the client is
-      // alive — skip the ping. Every heartbeat is a full radio wake on a
-      // phone, so an actively-chatting client shouldn't pay for both.
-      if (now - (ws._lastInbound || 0) < pingMs) { ws._alive = true; continue }
+      if (shouldSkipPing(ws, now, pingMs)) { ws._alive = true; continue }
       if (ws._alive === false) { ws.terminate(); continue }
       ws._alive = false
       ws.ping()
@@ -372,6 +388,9 @@ export function attachWs({
               // poll, this loop's `conn.closed` check (a few lines down) returns shortly
               // after, and the replay never has to be resumed. No separate bounded-stall
               // timer or test needed here — it would just be re-testing the heartbeat.
+              // The heartbeat's inbound-traffic skip does NOT weaken this: `shouldSkipPing`
+              // refuses to skip while anything is queued outbound, which is exactly the
+              // state a socket parked here is in.
               await waitForDrain(ws, replayBackpressureBytes)
               // Yield between batches only — a large backlog must not block the event
               // loop (and starve other connections' pings) while replaying.
@@ -830,7 +849,17 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
           payload: {
             kind: 'agent_chat', request: 'join', room_id: msg.room_id,
             from_device_id: conn.deviceId, from_name: sanitizePeerText(conn.name, PEER_NAME_CAP),
-            target_device_id: room.agent_device_id, topic: '', justification,
+            // The row this card asks about is keyed on the JOINER (parkInvite
+            // above passes agentDeviceId: conn.deviceId), and that is exactly
+            // what POST /agent-chat/answer looks up. A join self-targets, so
+            // this equals from_device_id — the answer endpoint relies on that
+            // (`isJoin = row.initiator_device_id === target_device_id`).
+            // Sending the room owner here instead would make a client that
+            // echoes the card's own field back get a 409: no such row.
+            // Not to be confused with the ephemeral `invite/delivered` ack
+            // below, whose target_device_id IS the owner — that frame reports
+            // who was asked, not which row is pending.
+            target_device_id: conn.deviceId, topic: '', justification,
           },
         })
         conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: room.agent_device_id }))

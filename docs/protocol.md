@@ -795,6 +795,15 @@ Payload:
 }
 ```
 
+`target_device_id` is **the parked row's own device** — the invitee for an
+`invite`, and the requester itself for a `join` (a join self-targets, so
+`from_device_id === target_device_id` there). It is the value
+`POST /agent-chat/answer` keys on, so a client can answer a card using
+nothing but the card's own fields. Do not confuse it with the ephemeral
+`{kind:'invite', event:'delivered', …, target_device_id:<owner>}` ack the
+joining agent gets, which reports who was asked rather than which row is
+pending.
+
 sent with `sender: "agent:<name>"`, same sender convention as any other
 agent-authored event. `from_name`, `topic`, and `justification` are all
 remote-agent-controlled text and are run through the journal's own
