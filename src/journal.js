@@ -4,11 +4,23 @@ export const MESSAGE_TYPES = [
   'text', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image',
 ]
 
+// Events that must never reach an agent device, live or replayed. The
+// agent-chat approval card carries a peer agent's justification — the whole
+// consent design exists to keep that text away from agents until the user
+// approves, and the target agent MANAGES the room conversation the card sits
+// in, so the default fan-out would hand it straight over. One predicate,
+// consumed by ws.js fanOut, ws.js hello replay, and http.js message reads —
+// inlining the check at each site is how they drift apart.
+export function isClientOnlyEvent(type, payload) {
+  return type === 'permission_request' && !!payload && typeof payload === 'object' && payload.kind === 'agent_chat'
+}
+
 export function snippetOf(type, payload) {
   // Tolerate whatever an agent hands us — null/undefined/a bare string or
   // number — rather than crashing on `payload.body` etc. A malformed
   // payload just yields an empty/placeholder snippet, never a thrown error.
   const p = payload && typeof payload === 'object' ? payload : {}
+  if (isClientOnlyEvent(type, payload)) return '🤝 Agent chat request'
   if (type === 'text') return String(p.body || '').slice(0, 120)
   if (type === 'prompt') return `? ${String(p.question || '').slice(0, 110)}`
   if (type === 'permission_request') return `permission: ${String(p.description || '').slice(0, 100)}`

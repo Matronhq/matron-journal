@@ -68,11 +68,20 @@ CREATE TABLE IF NOT EXISTS convo_agents(
   convo_id TEXT NOT NULL,
   agent_device_id INTEGER NOT NULL,
   initiator_device_id INTEGER NOT NULL,
-  state TEXT NOT NULL CHECK(state IN ('invited','joined','refused','left','expired')),
+  state TEXT NOT NULL CHECK(state IN ('awaiting_user','invited','joined','refused','denied','left','expired')),
   justification TEXT NOT NULL DEFAULT '',
+  topic TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   answered_at INTEGER,
+  delivered_at INTEGER,
   PRIMARY KEY(convo_id, agent_device_id)
+);
+CREATE TABLE IF NOT EXISTS agent_chat_allowances(
+  user_id INTEGER NOT NULL,
+  from_device_id INTEGER NOT NULL,
+  target_device_id INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(user_id, from_device_id, target_device_id)
 );
 `
 
@@ -137,6 +146,31 @@ export function openDb(path) {
   // Keeps the per-user quota SUM (see userBlobBytes) a cheap index scan rather
   // than a full-table read as the blob store grows.
   db.exec('CREATE INDEX IF NOT EXISTS idx_blobs_owner ON blobs(owner_user_id)')
+  // SQLite cannot ALTER a CHECK constraint, so convo_agents needs a rebuild to
+  // add consent states (awaiting_user, denied) and new columns (topic, delivered_at).
+  // delivered_at = created_at is correct for pre-consent flow (rows were delivered
+  // at creation or the row was deleted and recreated).
+  const caDef = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='convo_agents'").get()
+  if (caDef && !caDef.sql.includes('awaiting_user')) {
+    db.exec(`
+      CREATE TABLE convo_agents_new(
+        convo_id TEXT NOT NULL,
+        agent_device_id INTEGER NOT NULL,
+        initiator_device_id INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('awaiting_user','invited','joined','refused','denied','left','expired')),
+        justification TEXT NOT NULL DEFAULT '',
+        topic TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        answered_at INTEGER,
+        delivered_at INTEGER,
+        PRIMARY KEY(convo_id, agent_device_id)
+      );
+      INSERT INTO convo_agents_new(convo_id, agent_device_id, initiator_device_id, state, justification, created_at, answered_at, delivered_at)
+        SELECT convo_id, agent_device_id, initiator_device_id, state, justification, created_at, answered_at, created_at FROM convo_agents;
+      DROP TABLE convo_agents;
+      ALTER TABLE convo_agents_new RENAME TO convo_agents;
+    `)
+  }
   return db
 }
 

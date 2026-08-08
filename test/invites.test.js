@@ -2,15 +2,26 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { getParticipant, inviteParticipant, answerInvite } from '../src/participants.js'
+import { getParticipant, inviteParticipant, answerInvite, markDelivered } from '../src/participants.js'
+import { addAllowance } from '../src/allowances.js'
 import { handleOp } from '../src/ws.js'
 
+// Task 7 made `agent_invite`/`agent_join` park for user consent by default —
+// no relay to the target at all unless a standing allowance covers the
+// directed pair (see src/allowances.js, test/agent-chat-consent.test.js).
+// This file's job is the OLDER contract: once a pair IS allowed, the relay
+// (busy ack, refuse, accept, offline undo) behaves exactly as it did before
+// consent-gating existed. So `fleet` seeds a bidirectional allowance up
+// front — both directions, since the join-flow test below has B ask A —
+// putting every test in this file on the relay path, same as pre-Task-7.
 async function fleet(t) {
   const s = await startTestServer()
   t.after(() => s.close())
   const dan = await createUser(s.db, 'dan', 'pw')
   const agA = createAgent(s.db, dan.id, 'dev-a')
   const agB = createAgent(s.db, dan.id, 'dev-b')
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: agB.deviceId })
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: agB.deviceId, targetDeviceId: agA.deviceId })
   const a = await makeWsClient(s.base, { token: agA.token, cursor: null })
   const b = await makeWsClient(s.base, { token: agB.token, cursor: null })
   await a.waitFor((f) => f.op === 'hello_ok')
@@ -122,8 +133,12 @@ test('validation and authorization failures', async (t) => {
 })
 
 test('inviting an offline device fails with offline and leaves no row', async (t) => {
-  const { s, dan, a } = await fleet(t)
+  const { s, dan, agA, a } = await fleet(t)
   const ghost = createAgent(s.db, dan.id, 'dev-ghost') // never connects
+  // Relay-path coverage: an unallowed pair would park instead of ever
+  // touching liveness, which is a different test (see
+  // agent-chat-consent.test.js's MAX_AWAITING/park scenarios).
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: ghost.deviceId })
   a.send({ op: 'agent_invite', room_id: 'room', target_device_id: ghost.deviceId, justification: 'x' })
   const err = await a.waitFor((f) => f.op === 'error' && f.ref === 'agent_invite')
   assert.equal(err.code, 'offline')
@@ -203,6 +218,56 @@ test('owner leave answers a pending JOIN REQUEST instead of orphaning the reques
   // expiry handling fires unchanged, only the reason differs.
   assert.equal(ans.from_device_id, undefined)
   assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'left')
+})
+
+test('owner leave also dissolves a PARKED (awaiting_user) join request: initiator gets the answer frame, the row goes terminal, and a stale answer 409s', async (t) => {
+  // Bugbot finding: leaveAllParticipants only swept 'invited'/'joined' rows,
+  // so a row parked for the user's consent (never delivered to any agent
+  // socket) survived a dissolved room — the card stayed live for a dead
+  // room and the requester waited out the full 24h park TTL instead of
+  // hearing the same synthetic 'left' answer an 'invited' row gets.
+  const { s, dan, agA, agB, a, b } = await fleet(t)
+  const agC = createAgent(s.db, dan.id, 'dev-c')
+  const c = await makeWsClient(s.base, { token: agC.token, cursor: null })
+  await c.waitFor((f) => f.op === 'hello_ok')
+  t.after(() => c.close())
+
+  // B: pre-approved (fleet() seeds the allowance both ways) join request —
+  // lands 'invited', delivered to the owner. Same shape as the test above.
+  b.send({ op: 'agent_join', room_id: 'room', justification: 'I have context on this bug' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'join_request')
+  await b.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+
+  // C: no allowance for this pair, so the join request parks for the
+  // user's consent instead of ever reaching A's socket.
+  c.send({ op: 'agent_join', room_id: 'room', justification: 'let me help too' })
+  await c.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  assert.equal(getParticipant(s.db, 'room', agC.deviceId).state, 'awaiting_user')
+
+  a.send({ op: 'agent_leave', room_id: 'room' })
+
+  const ansB = await b.waitFor((f) => f.kind === 'invite' && f.event === 'answer')
+  assert.equal(ansB.accept, false)
+  assert.equal(ansB.reason, 'left')
+  assert.equal(ansB.peer_device_id, agB.deviceId)
+
+  const ansC = await c.waitFor((f) => f.kind === 'invite' && f.event === 'answer')
+  assert.equal(ansC.accept, false)
+  assert.equal(ansC.reason, 'left')
+  assert.equal(ansC.peer_device_id, agC.deviceId)
+
+  assert.equal(getParticipant(s.db, 'room', agC.deviceId).state, 'left',
+    'the parked row must go terminal, not stay stuck awaiting_user until the 24h TTL')
+
+  // The now-dead card must not be answerable — a client trying to approve
+  // it hits the same 409 an already-answered row gets.
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const answerAttempt = await s.http('/agent-chat/answer', {
+    method: 'POST', token: login.json.token,
+    body: { room_id: 'room', target_device_id: agC.deviceId, decision: 'approve' },
+  })
+  assert.equal(answerAttempt.status, 409)
+  assert.deepEqual(answerAttempt.json, { error: 'conflict' })
 })
 
 test('a throwing notify neither undoes a committed dissolve nor strands the remaining peers', async (t) => {
@@ -396,6 +461,8 @@ test('an unanswered invite expires and the initiator is told', async (t) => {
   const dan = await createUser(s.db, 'dan', 'pw')
   const agA = createAgent(s.db, dan.id, 'dev-a')
   const agB = createAgent(s.db, dan.id, 'dev-b')
+  // Relay-path coverage (Task 7 parks an unallowed pair instead).
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: agB.deviceId })
   const a = await makeWsClient(s.base, { token: agA.token, cursor: null })
   const b = await makeWsClient(s.base, { token: agB.token, cursor: null })
   await a.waitFor((f) => f.op === 'hello_ok')
@@ -405,6 +472,13 @@ test('an unanswered invite expires and the initiator is told', async (t) => {
   await a.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
   a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'x' })
   await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
+  // New contract: the 30-minute (here, 150ms) answer clock starts at
+  // delivered_at, not created_at (Task 4). The allowance-path relay above
+  // now stamps delivery itself (Task 7's markDelivered call) — this
+  // redundant direct stamp only guards against a future path that stops
+  // doing so on its own; markDelivered's delivered_at-IS-NULL guard makes it
+  // a harmless no-op here.
+  markDelivered(s.db, { convoId: 'room', agentDeviceId: agB.deviceId })
   // B never answers; the sweep expires it.
   const ans = await a.waitFor((f) => f.kind === 'invite' && f.event === 'answer', 3000)
   assert.equal(ans.accept, false)

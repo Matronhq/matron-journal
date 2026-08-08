@@ -11,6 +11,8 @@ import { upsertConversation, append } from '../src/journal.js'
 import { resolveMediaDir, writeBlobSync } from '../src/media.js'
 import { runAdmin, parseExpiresSeconds } from '../bin/matron-admin.js'
 import { startTestServer } from './helpers.js'
+import { parkInvite, getParticipant } from '../src/participants.js'
+import { listAllowances } from '../src/allowances.js'
 
 test('admin CLI: user add, agent add, status', async () => {
   const db = openDb(':memory:')
@@ -156,6 +158,149 @@ test('admin CLI: device list and device revoke', async () => {
   const noneOut = await runAdmin(db, ['device', 'list', 'lonely'])
   assert.match(noneOut, /no devices/i)
 
+  db.close()
+})
+
+test('admin CLI: agent-chat pending/approve prints room+topic and the sweep-delivery note, --always-allow records the directed pair', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const owner = createAgent(db, dan.id, 'owner-agent') // room owner, and the invite's initiator
+  const target = createAgent(db, dan.id, 'target-agent') // the invited device
+  upsertConversation(db, { id: 'room1', ownerUserId: dan.id, title: 'Ops Room', agentDeviceId: owner.deviceId })
+  parkInvite(db, {
+    convoId: 'room1', agentDeviceId: target.deviceId, initiatorDeviceId: owner.deviceId,
+    justification: 'need a hand', topic: 'deploy',
+  })
+
+  const pendingOut = await runAdmin(db, ['agent-chat', 'pending', 'dan'])
+  assert.match(pendingOut, /room1/)
+  assert.match(pendingOut, /topic: deploy/)
+  assert.match(pendingOut, /need a hand/)
+  assert.match(pendingOut, new RegExp(`device ${target.deviceId} \\(target-agent\\)`))
+
+  const approveOut = await runAdmin(db, ['agent-chat', 'approve', 'dan', 'room1', String(target.deviceId), '--always-allow'])
+  assert.match(approveOut, /invited/)
+  // Both facts the CLI cannot make happen itself must be said, per the brief.
+  assert.match(approveOut, /sweep/i)
+  assert.match(approveOut, /hub/i)
+
+  const row = getParticipant(db, 'room1', target.deviceId)
+  assert.equal(row.state, 'invited')
+  assert.equal(row.delivered_at, null) // delivery is the pump's job, not this command's
+
+  const pairs = listAllowances(db, dan.id)
+  assert.equal(pairs.length, 1)
+  assert.equal(pairs[0].from_device_id, owner.deviceId)
+  assert.equal(pairs[0].target_device_id, target.deviceId)
+
+  db.close()
+})
+
+test('admin CLI: agent-chat approve honours the JOIN direction rule (self-targeting row -> pair to the room owner)', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const owner = createAgent(db, dan.id, 'owner-agent')
+  const joiner = createAgent(db, dan.id, 'joiner-agent')
+  upsertConversation(db, { id: 'room1', ownerUserId: dan.id, title: 'Ops Room', agentDeviceId: owner.deviceId })
+  // A join request's row self-targets: agent_device_id === initiator_device_id (the joiner).
+  parkInvite(db, {
+    convoId: 'room1', agentDeviceId: joiner.deviceId, initiatorDeviceId: joiner.deviceId,
+    justification: 'let me in', topic: '',
+  })
+
+  await runAdmin(db, ['agent-chat', 'approve', 'dan', 'room1', String(joiner.deviceId), '--always-allow'])
+
+  const pairs = listAllowances(db, dan.id)
+  assert.equal(pairs.length, 1)
+  assert.equal(pairs[0].from_device_id, joiner.deviceId)
+  assert.equal(pairs[0].target_device_id, owner.deviceId) // the room's recorded owner, not the joiner itself
+
+  db.close()
+})
+
+test('admin CLI: agent-chat deny flips to denied and says the requester cannot be told directly', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const owner = createAgent(db, dan.id, 'owner-agent')
+  const target = createAgent(db, dan.id, 'target-agent')
+  upsertConversation(db, { id: 'room1', ownerUserId: dan.id, title: 'Ops Room', agentDeviceId: owner.deviceId })
+  parkInvite(db, {
+    convoId: 'room1', agentDeviceId: target.deviceId, initiatorDeviceId: owner.deviceId,
+    justification: 'need a hand', topic: 'deploy',
+  })
+
+  const denyOut = await runAdmin(db, ['agent-chat', 'deny', 'dan', 'room1', String(target.deviceId)])
+  assert.match(denyOut, /denied/)
+  assert.match(denyOut, /times out to pending/)
+
+  const row = getParticipant(db, 'room1', target.deviceId)
+  assert.equal(row.state, 'denied')
+
+  db.close()
+})
+
+test('admin CLI: agent-chat approve/deny reject a row that belongs to another user\'s room', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const eve = await createUser(db, 'eve', 'pw')
+  const owner = createAgent(db, dan.id, 'owner-agent')
+  const target = createAgent(db, dan.id, 'target-agent')
+  upsertConversation(db, { id: 'room1', ownerUserId: dan.id, title: 'Ops Room', agentDeviceId: owner.deviceId })
+  parkInvite(db, {
+    convoId: 'room1', agentDeviceId: target.deviceId, initiatorDeviceId: owner.deviceId,
+    justification: 'need a hand', topic: 'deploy',
+  })
+
+  await assert.rejects(runAdmin(db, ['agent-chat', 'approve', 'eve', 'room1', String(target.deviceId)]), /no agent-chat request/)
+  await assert.rejects(runAdmin(db, ['agent-chat', 'deny', 'eve', 'room1', String(target.deviceId)]), /no agent-chat request/)
+  // untouched by the rejected attempts
+  assert.equal(getParticipant(db, 'room1', target.deviceId).state, 'awaiting_user')
+
+  db.close()
+})
+
+test('admin CLI: agent-chat allowances lists pairs and --revoke <from>:<to> removes one', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const owner = createAgent(db, dan.id, 'owner-agent')
+  const target = createAgent(db, dan.id, 'target-agent')
+  upsertConversation(db, { id: 'room1', ownerUserId: dan.id, title: 'Ops Room', agentDeviceId: owner.deviceId })
+  parkInvite(db, {
+    convoId: 'room1', agentDeviceId: target.deviceId, initiatorDeviceId: owner.deviceId,
+    justification: 'need a hand', topic: 'deploy',
+  })
+  await runAdmin(db, ['agent-chat', 'approve', 'dan', 'room1', String(target.deviceId), '--always-allow'])
+
+  const listOut = await runAdmin(db, ['agent-chat', 'allowances', 'dan'])
+  assert.match(listOut, new RegExp(`${owner.deviceId} -> ${target.deviceId}`))
+
+  const revokeOut = await runAdmin(db, ['agent-chat', 'allowances', 'dan', '--revoke', `${owner.deviceId}:${target.deviceId}`])
+  assert.match(revokeOut, /revoked/)
+  assert.equal(listAllowances(db, dan.id).length, 0)
+
+  const revokeAgainOut = await runAdmin(db, ['agent-chat', 'allowances', 'dan', '--revoke', `${owner.deviceId}:${target.deviceId}`])
+  assert.match(revokeAgainOut, /no such allowance/)
+
+  const emptyOut = await runAdmin(db, ['agent-chat', 'allowances', 'dan'])
+  assert.match(emptyOut, /no always-allow pairs/)
+
+  db.close()
+})
+
+test('admin CLI: agent-chat pending/approve/deny/allowances with an unknown username exits non-zero', async () => {
+  const db = openDb(':memory:')
+  await assert.rejects(runAdmin(db, ['agent-chat', 'pending', 'ghost']), /no such user: ghost/)
+  await assert.rejects(runAdmin(db, ['agent-chat', 'approve', 'ghost', 'room1', '2']), /no such user: ghost/)
+  await assert.rejects(runAdmin(db, ['agent-chat', 'deny', 'ghost', 'room1', '2']), /no such user: ghost/)
+  await assert.rejects(runAdmin(db, ['agent-chat', 'allowances', 'ghost']), /no such user: ghost/)
+  db.close()
+})
+
+test('admin CLI: agent-chat pending says so when nothing is awaiting', async () => {
+  const db = openDb(':memory:')
+  await createUser(db, 'dan', 'pw')
+  const out = await runAdmin(db, ['agent-chat', 'pending', 'dan'])
+  assert.match(out, /no agent-chat requests awaiting approval/)
   db.close()
 })
 

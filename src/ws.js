@@ -1,7 +1,10 @@
 import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
-import { eventsAfter, append, markRead, upsertConversation, toEventShape } from './journal.js'
-import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, undoInvite, getParticipant, expireInvites } from './participants.js'
+import { eventsAfter, append, markRead, upsertConversation, toEventShape, isClientOnlyEvent } from './journal.js'
+import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, undoInvite, getParticipant, expireInvites, parkInvite, awaitingCount, markDelivered, expireAwaiting } from './participants.js'
+import { isAllowed } from './allowances.js'
+import { sanitizePeerText } from './peer-text.js'
+import { deliverPendingInvites } from './invite-delivery.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -51,6 +54,15 @@ const CONVO_ID_MAX_CHARS = 128
 // stays small, same defensive stance as ACTIVITY_DETAIL_MAX_CHARS.
 const INVITE_TOPIC_MAX_CHARS = 200
 const INVITE_TEXT_MAX_CHARS = 1000
+// Consent-gate constants (spec: agent chat consent). AWAITING_USER_TTL_MS is
+// the 24h clock the sweep uses (see the sweep timer's expireAwaiting loop)
+// to expire a parked ask nobody ever answered. MAX_AWAITING_PER_REQUESTER
+// caps how many asks a single device can have parked at once, across every
+// room, so one chatty agent can't flood the user's attention queue.
+// PEER_NAME_CAP bounds the sanitised from_name embedded in a consent card.
+const AWAITING_USER_TTL_MS = 24 * 3600_000
+const MAX_AWAITING_PER_REQUESTER = 3
+const PEER_NAME_CAP = 80
 // Cap for a convo_upsert's rolling summary (spec: agent chat phase 2) — same
 // defensive stance as the invite text caps above.
 const SUMMARY_MAX_CHARS = 1000
@@ -183,6 +195,24 @@ export function attachWs({
           peer_device_id: row.agent_device_id, accept: false, reason: 'expired',
         })
       }
+      // Catch-all delivery attempt (spec: single pump, three callers) — an
+      // admin-approved or HTTP-approved row whose target was already
+      // connected by the time it got approved has no hello to catch it;
+      // this sweep tick is what finally gets it there.
+      deliverPendingInvites(db, hub)
+      // awaiting_user TTL (24h, AWAITING_USER_TTL_MS): a parked ask the user
+      // never answered at all. Told to the requester as reason: 'refused',
+      // NEVER 'expired' — a user-side timeout that never even reached a
+      // decision must be indistinguishable from a deliberate no, or a peer
+      // could infer "the user hasn't looked yet" and keep re-asking.
+      for (const row of expireAwaiting(db, AWAITING_USER_TTL_MS)) {
+        const convo = ownerLookup.get(row.convo_id)
+        if (!convo) continue
+        hub.sendToDevice(convo.owner_user_id, row.initiator_device_id, {
+          kind: 'invite', event: 'answer', room_id: row.convo_id,
+          peer_device_id: row.agent_device_id, accept: false, reason: 'refused',
+        })
+      }
       const conns = hub.allConns()
       if (conns.length === 0) return
       const ids = [...new Set(conns.map((c) => c.deviceId))]
@@ -294,6 +324,12 @@ export function attachWs({
               const batch = eventsAfter(db, who.userId, cursor, 500)
               for (const e of batch) {
                 if (decisionCache && !replaysTo(e.convo_id)) continue
+                // Client-only events (the agent-chat approval card) never
+                // reach an agent device, live or replayed — see
+                // isClientOnlyEvent's docstring in journal.js. This is the
+                // replay-path half of that guarantee; fanOut below is the
+                // live half.
+                if (who.kind === 'agent' && isClientOnlyEvent(e.type, e.payload)) continue
                 ws.send(JSON.stringify(journalFrame(e)))
               }
               if (batch.length < 500) break
@@ -338,6 +374,11 @@ export function attachWs({
           if (conn.closed) return
           hub.register(conn)
           conn.registered = true
+          // Catch-up delivery for THIS device only (spec: single pump, three
+          // callers) — an invite approved while this agent was offline sits
+          // undelivered until it next connects; this is that moment. Scoped
+          // to agent connections: a client device is never a recipient row.
+          if (who.kind === 'agent') deliverPendingInvites(db, hub, { deviceId: conn.deviceId })
           return
         }
         // Spec §8 close-on-next-frame: revocation is just deleting the
@@ -429,7 +470,14 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
     // row is already hot from append()'s own authorization read; the
     // participant lookup is a primary-key-prefix seek on convo_agents.
     const ownerId = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(frame.convo_id)?.agent_device_id ?? null
-    const targets = ownerId == null ? null : new Set([ownerId, ...joinedAgentIds(db, frame.convo_id)])
+    // Client-only events (the agent-chat approval card) skip every agent
+    // device, including the room's own recorded owner — an empty Set here
+    // is deliberately NOT the same as the null "legacy broadcast" case
+    // below: broadcastJournal treats null as "no agent filtering at all"
+    // and an empty Set as "every agent kind connection is excluded".
+    const targets = isClientOnlyEvent(frame.type, frame.payload)
+      ? new Set()
+      : (ownerId == null ? null : new Set([ownerId, ...joinedAgentIds(db, frame.convo_id)]))
     // Live frames carry the producing connection's device id: device names
     // have no unique constraint, so a bridge in a shared room can't reliably
     // tell its own echoes apart by sender name alone. Deliberately LIVE-only
@@ -615,24 +663,61 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         // indistinguishable — anti-enumeration, same stance as agent_request.
         const target = db.prepare('SELECT user_id, kind FROM devices WHERE id=?').get(msg.target_device_id)
         if (!target || target.user_id !== conn.userId || target.kind !== 'agent') return fail('not_found')
-        const r = inviteParticipant(db, {
-          convoId: msg.room_id, agentDeviceId: msg.target_device_id,
-          initiatorDeviceId: conn.deviceId, justification: msg.justification,
-        })
-        if (!r.ok) return fail('conflict', `already ${r.state}`)
-        // Single-socket delivery (sendRpcRequest): a request turn must not
-        // double-inject on a mid-reconnect bridge. false = offline — undo
-        // the row so no pending invite exists that nobody was told about,
-        // and the caller hears it immediately (spec: honest fast status).
-        const delivered = hub.sendRpcRequest(conn.userId, msg.target_device_id, {
-          kind: 'invite', event: 'request', room_id: msg.room_id,
-          from_device_id: conn.deviceId, from_name: conn.name,
-          topic: msg.topic || '', justification: msg.justification,
-        })
-        if (!delivered) {
-          undoInvite(db, msg.room_id, msg.target_device_id, r.prior)
-          return fail('offline')
+        const topic = sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS)
+        const justification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
+        // The raw-string check above only catches a literally empty string —
+        // a payload of spaces/control chars passes it and THEN sanitises
+        // down to '', which would park/relay an invite with an empty
+        // justification and publish an empty card body. Re-check post-
+        // sanitisation with the same error the empty-string case gets.
+        if (!justification) return fail('bad_request', 'bad justification')
+        if (isAllowed(db, conn.userId, conn.deviceId, msg.target_device_id)) {
+          // User pre-approved this directed pair: the pre-consent flow,
+          // verbatim — invite, immediate delivery attempt, undo+offline on a
+          // dead socket, PLUS the delivery stamp the old flow never wrote.
+          const r = inviteParticipant(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id, initiatorDeviceId: conn.deviceId, justification })
+          if (!r.ok) return fail('conflict', `already ${r.state}`)
+          // Single-socket delivery (sendRpcRequest): a request turn must not
+          // double-inject on a mid-reconnect bridge. false = offline — undo
+          // the row so no pending invite exists that nobody was told about,
+          // and the caller hears it immediately (spec: honest fast status).
+          const delivered = hub.sendRpcRequest(conn.userId, msg.target_device_id, {
+            kind: 'invite', event: 'request', room_id: msg.room_id,
+            from_device_id: conn.deviceId, from_name: conn.name, topic, justification,
+          })
+          if (!delivered) {
+            undoInvite(db, msg.room_id, msg.target_device_id, r.prior)
+            return fail('offline')
+          }
+          markDelivered(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id })
+          conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: msg.target_device_id }))
+          break
         }
+        // No standing allowance for this directed pair: park for the user's
+        // consent instead of ever reaching the target's socket. Capped per
+        // requester device so one chatty agent can't flood the user's
+        // attention queue with asks.
+        if (awaitingCount(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
+          return fail('conflict', 'too many requests awaiting user approval')
+        }
+        const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id, initiatorDeviceId: conn.deviceId, justification, topic })
+        if (!r.ok) return fail('conflict', `already ${r.state}`)
+        // Client-only card (isClientOnlyEvent in journal.js): appendAndFan's
+        // own fan-out already excludes every agent device, including the
+        // room's recorded owner, so this never reaches an agent socket.
+        appendAndFan({
+          userId: conn.userId, convoId: msg.room_id, sender: `agent:${conn.name}`, type: 'permission_request',
+          payload: {
+            kind: 'agent_chat', request: 'invite', room_id: msg.room_id,
+            from_device_id: conn.deviceId, from_name: sanitizePeerText(conn.name, PEER_NAME_CAP),
+            target_device_id: msg.target_device_id, topic, justification,
+          },
+        })
+        // Same ack as a relayed request: to the bridge, delivered means
+        // "accepted into the system" — its tool copy already says pending is
+        // normal and the answer arrives as a later turn. A distinct 'parked'
+        // event would let a requester distinguish gated targets from
+        // ungated ones.
         conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: msg.target_device_id }))
         break
       }
@@ -644,20 +729,40 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (typeof msg.justification !== 'string' || !msg.justification || msg.justification.length > INVITE_TEXT_MAX_CHARS) return fail('bad_request', 'bad justification')
         if (room.agent_device_id == null) return fail('conflict', 'room has no recorded owner to ask')
         if (room.agent_device_id === conn.deviceId) return fail('bad_request', 'cannot join own room')
-        const r = inviteParticipant(db, {
-          convoId: msg.room_id, agentDeviceId: conn.deviceId,
-          initiatorDeviceId: conn.deviceId, justification: msg.justification,
-        })
-        if (!r.ok) return fail('conflict', `already ${r.state}`)
-        const delivered = hub.sendRpcRequest(conn.userId, room.agent_device_id, {
-          kind: 'invite', event: 'join_request', room_id: msg.room_id,
-          from_device_id: conn.deviceId, from_name: conn.name,
-          justification: msg.justification,
-        })
-        if (!delivered) {
-          undoInvite(db, msg.room_id, conn.deviceId, r.prior)
-          return fail('offline')
+        const justification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
+        // See agent_invite's matching check: the raw-string check above only
+        // catches a literally empty string, not whitespace/control chars
+        // that sanitise down to ''.
+        if (!justification) return fail('bad_request', 'bad justification')
+        if (isAllowed(db, conn.userId, conn.deviceId, room.agent_device_id)) {
+          // Same pre-consent flow, verbatim, PLUS the delivery stamp.
+          const r = inviteParticipant(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId, initiatorDeviceId: conn.deviceId, justification })
+          if (!r.ok) return fail('conflict', `already ${r.state}`)
+          const delivered = hub.sendRpcRequest(conn.userId, room.agent_device_id, {
+            kind: 'invite', event: 'join_request', room_id: msg.room_id,
+            from_device_id: conn.deviceId, from_name: conn.name, justification,
+          })
+          if (!delivered) {
+            undoInvite(db, msg.room_id, conn.deviceId, r.prior)
+            return fail('offline')
+          }
+          markDelivered(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId })
+          conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: room.agent_device_id }))
+          break
         }
+        if (awaitingCount(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
+          return fail('conflict', 'too many requests awaiting user approval')
+        }
+        const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId, initiatorDeviceId: conn.deviceId, justification, topic: '' })
+        if (!r.ok) return fail('conflict', `already ${r.state}`)
+        appendAndFan({
+          userId: conn.userId, convoId: msg.room_id, sender: `agent:${conn.name}`, type: 'permission_request',
+          payload: {
+            kind: 'agent_chat', request: 'join', room_id: msg.room_id,
+            from_device_id: conn.deviceId, from_name: sanitizePeerText(conn.name, PEER_NAME_CAP),
+            target_device_id: room.agent_device_id, topic: '', justification,
+          },
+        })
         conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: room.agent_device_id }))
         break
       }
@@ -739,15 +844,21 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
               kind: 'invite', event: 'left', room_id: msg.room_id, from_device_id: conn.deviceId,
             })
           }
-          // Pending rows the OTHER side initiated are join requests: that
-          // peer is blocked waiting for an answer this dissolve just made
-          // impossible, and the expiry sweep can no longer rescue it (the
-          // row is 'left', not 'invited'). Close the loop with the same
-          // synthetic-refusal frame the sweep sends — no from_device_id, so
-          // the initiator's existing expiry handling fires unchanged — only
-          // the reason differs ('left' vs 'expired'). Rows the owner itself
-          // initiated need nothing: the owner is the waiting side there, and
-          // it is the one leaving.
+          // Pending rows the OTHER side initiated are join requests — either
+          // already relayed ('invited') or still parked awaiting the user's
+          // consent ('awaiting_user', never delivered to any agent socket).
+          // Either way that peer is blocked waiting for an answer this
+          // dissolve just made impossible, and neither the expiry sweep nor
+          // the awaiting-TTL sweep can rescue it (the row is 'left', not
+          // 'invited'/'awaiting_user' anymore). Close the loop with the same
+          // synthetic-refusal frame both sweeps send — no from_device_id, so
+          // the initiator's existing expiry/timeout handling fires
+          // unchanged — only the reason differs ('left' vs 'expired'). Rows
+          // the owner itself initiated need nothing: for an 'invited' row
+          // the owner is the side waiting on the peer's answer, and for an
+          // 'awaiting_user' row the owner is the side waiting on the user's
+          // decision — either way it is the one leaving, so no notification
+          // is owed (and for the parked case the target never even knew).
           for (const row of pending) {
             if (row.initiator_device_id === conn.deviceId) continue
             notify(row.initiator_device_id, {
@@ -863,6 +974,12 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
       case 'publish': {
         if (conn.kind !== 'agent') return fail('forbidden')
         if (typeof msg.type !== 'string' || !AGENT_PUBLISH_TYPES.has(msg.type) || typeof msg.payload !== 'object' || msg.payload === null) return fail('bad_request')
+        // The agent_chat consent card is minted only by the server's own
+        // agent_invite/agent_join park path, which sanitises from_name/
+        // topic/justification before append. A bare publish never runs that
+        // sanitiser, so letting one through here would let any agent forge
+        // an unsanitised, impersonating consent card into a room it manages.
+        if (isClientOnlyEvent(msg.type, msg.payload)) return fail('bad_request', 'agent_chat consent cards are server-minted only')
         // finalize composes `fin:<ref>` idem keys internally — a raw publish
         // must not be able to collide with (or forge) one of those.
         if (typeof msg.idem_key === 'string' && msg.idem_key.startsWith('fin:')) {
@@ -973,6 +1090,8 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         const type = msg.type || 'text'
         if (!AGENT_PUBLISH_TYPES.has(type)) return fail('bad_request')
         if (typeof msg.payload !== 'object' || msg.payload === null) return fail('bad_request')
+        // Same server-only-mint rule as publish — see the comment there.
+        if (isClientOnlyEvent(type, msg.payload)) return fail('bad_request', 'agent_chat consent cards are server-minted only')
         // Wrong-conversation tightening (spec: agent chat phase 2): an agent
         // device writes only into conversations it manages or has joined.
         // append() would reject a cross-USER convo anyway; this closes the

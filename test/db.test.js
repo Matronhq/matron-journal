@@ -170,3 +170,43 @@ test('clientDevicesForPush and listDevices expose push_prefs', async () => {
   const roster = listDevices(db, dan.id)
   assert.deepEqual(roster[0].push_prefs, { attention: false, done: true, activity: false })
 })
+
+test('convo_agents accepts the consent states and columns', () => {
+  const db = openDb(':memory:')
+  db.prepare(`INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, justification, topic, created_at, delivered_at)
+             VALUES('r', 2, 1, 'awaiting_user', 'j', 't', 5, NULL)`).run()
+  db.prepare("UPDATE convo_agents SET state='denied' WHERE convo_id='r'").run()
+  assert.equal(db.prepare("SELECT state FROM convo_agents WHERE convo_id='r'").get().state, 'denied')
+  assert.throws(() => db.prepare("UPDATE convo_agents SET state='bogus' WHERE convo_id='r'").run())
+})
+
+test('old-schema convo_agents is rebuilt in place, rows preserved, delivered_at backfilled', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-convo-agents-migration-'))
+  const dbPath = path.join(dir, 'pre-migration.db')
+
+  const raw = new Database(dbPath)
+  raw.exec(`CREATE TABLE convo_agents(
+    convo_id TEXT NOT NULL, agent_device_id INTEGER NOT NULL, initiator_device_id INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('invited','joined','refused','left','expired')),
+    justification TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, answered_at INTEGER,
+    PRIMARY KEY(convo_id, agent_device_id));
+    INSERT INTO convo_agents VALUES('r', 2, 1, 'joined', 'why', 111, 222);`)
+  raw.close()
+
+  const db = openDb(dbPath)
+  const row = db.prepare("SELECT * FROM convo_agents WHERE convo_id='r'").get()
+  assert.equal(row.state, 'joined')
+  assert.equal(row.justification, 'why')
+  assert.equal(row.topic, '')
+  assert.equal(row.delivered_at, 111)
+  db.close()
+
+  assert.doesNotThrow(() => openDb(dbPath).close())
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('agent_chat_allowances table exists with its composite key', () => {
+  const db = openDb(':memory:')
+  db.prepare('INSERT INTO agent_chat_allowances(user_id, from_device_id, target_device_id, created_at) VALUES(1,2,3,4)').run()
+  assert.throws(() => db.prepare('INSERT INTO agent_chat_allowances(user_id, from_device_id, target_device_id, created_at) VALUES(1,2,3,5)').run())
+})

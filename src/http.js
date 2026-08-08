@@ -1,10 +1,13 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { login, authToken, changePassword, revokeOwnedDevice, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
-import { snapshot, messagesBefore, toEventShape } from './journal.js'
+import { snapshot, messagesBefore, toEventShape, isClientOnlyEvent } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs } from './db.js'
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
+import { listAwaiting, answerParkedInvite, getParticipant } from './participants.js'
+import { addAllowance } from './allowances.js'
+import { deliverPendingInvites } from './invite-delivery.js'
 
 const json = (res, status, obj) => {
   if (res.writableEnded || res.destroyed) return
@@ -316,6 +319,63 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         ).all(who.userId)
         return json(res, 200, { agents, conversations })
       }
+      if (req.method === 'GET' && url.pathname === '/agent-chat/pending') {
+        // The consent-card surface for clients that missed the live card (or
+        // want a durable inbox of asks) — client-gated like every other
+        // decision-making endpoint here; an agent has no business reading
+        // its own or another agent's pending asks over HTTP.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        return json(res, 200, { pending: listAwaiting(db, who.userId) })
+      }
+      if (req.method === 'POST' && url.pathname === '/agent-chat/answer') {
+        // Client-gated: an agent must never answer a consent ask, including
+        // one addressed to itself — the whole point of parking is that only
+        // the human decides.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const body = await readBody(req)
+        const { room_id, target_device_id, decision, always_allow } = body
+        if (decision !== 'approve' && decision !== 'deny') return json(res, 400, { error: 'bad_request' })
+        if (typeof room_id !== 'string' || !Number.isInteger(target_device_id)) return json(res, 400, { error: 'bad_request' })
+        const room = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(room_id)
+        // Unknown room and a room owned by someone else are indistinguishable
+        // (404, never 403) — same anti-enumeration stance as
+        // GET /convo/:id/messages.
+        if (!room || room.owner_user_id !== who.userId) return json(res, 404, { error: 'not_found' })
+        const row = getParticipant(db, room_id, target_device_id)
+        if (!row || row.state !== 'awaiting_user') return json(res, 409, { error: 'conflict' })
+        if (decision === 'deny') {
+          answerParkedInvite(db, { convoId: room_id, agentDeviceId: target_device_id, approve: false })
+          // Indistinguishable from a peer refusal — reason 'refused', never
+          // 'denied' (a requester must never learn the human said no).
+          hub.sendToDevice(who.userId, row.initiator_device_id, {
+            kind: 'invite', event: 'answer', room_id, peer_device_id: target_device_id, accept: false, reason: 'refused',
+          })
+          return json(res, 200, { ok: true })
+        }
+        answerParkedInvite(db, { convoId: room_id, agentDeviceId: target_device_id, approve: true })
+        // Join requests self-target (row.initiator_device_id ===
+        // target_device_id, the joiner) — the recipient of THIS row's relay
+        // (and, below, the directed-pair target) is the room owner, not the
+        // joiner itself.
+        const isJoin = row.initiator_device_id === target_device_id
+        if (always_allow === true) {
+          addAllowance(db, {
+            userId: who.userId,
+            fromDeviceId: row.initiator_device_id,
+            targetDeviceId: isJoin ? room.agent_device_id : target_device_id,
+          })
+        }
+        // Scoped to this row's own recipient: the unscoped pump sweeps every
+        // undelivered row system-wide, so an unrelated row's successful
+        // delivery could otherwise make `sent > 0` true while THIS row's
+        // target is still offline. Even scoped, `sent` could reflect a
+        // different row addressed to the same recipient device — so the
+        // response flag is read back off the answered row itself, which is
+        // exact.
+        deliverPendingInvites(db, hub, { deviceId: isJoin ? room.agent_device_id : target_device_id })
+        const delivered = getParticipant(db, room_id, target_device_id)?.delivered_at != null
+        return json(res, 200, { ok: true, delivered })
+      }
       const dm = url.pathname.match(/^\/devices\/(\d+)\/revoke$/)
       if (req.method === 'POST' && dm) {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
@@ -427,8 +487,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           return json(res, 404, { error: 'not_found' })
         }
         try {
-          const events = messagesBefore(db, who.userId, convoId, { beforeSeq, limit }).map(toEventShape)
-          return json(res, 200, { events })
+          let events = messagesBefore(db, who.userId, convoId, { beforeSeq, limit })
+          // Client-only events (the agent-chat approval card) never reach an
+          // agent device by any read path — this is the HTTP-pagination half
+          // of the guarantee ws.js's fanOut and hello replay also enforce.
+          if (who.kind !== 'client') events = events.filter((e) => !isClientOnlyEvent(e.type, e.payload))
+          return json(res, 200, { events: events.map(toEventShape) })
         } catch (e) {
           // Unauthorized and missing are indistinguishable: both 404, same
           // body as GET /media/:id's unknown-id response — never 403 (that
