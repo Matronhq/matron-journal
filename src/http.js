@@ -11,6 +11,12 @@ import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
 
+// A device name on its way to a client: same sieve and cap the live consent
+// card's `from_name` gets. NULL stays null rather than collapsing to '' —
+// "this device is gone" and "this device is named the empty string" are
+// different facts, and the apps render the id instead for the former.
+const deviceName = (raw) => (raw == null ? null : sanitizePeerText(raw, PEER_NAME_CAP))
+
 const json = (res, status, obj) => {
   if (res.writableEnded || res.destroyed) return
   res.writeHead(status, { 'content-type': 'application/json' })
@@ -357,8 +363,8 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // journal's own voice.
         const pending = listAwaiting(db, who.userId).map((r) => ({
           ...r,
-          initiator_name: sanitizePeerText(r.initiator_name, PEER_NAME_CAP),
-          agent_name: sanitizePeerText(r.agent_name, PEER_NAME_CAP),
+          initiator_name: deviceName(r.initiator_name),
+          agent_name: deviceName(r.agent_name),
         }))
         return json(res, 200, { pending })
       }
@@ -370,8 +376,8 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
         const allowances = listAllowances(db, who.userId).map((r) => ({
           ...r,
-          from_name: sanitizePeerText(r.from_name, PEER_NAME_CAP),
-          target_name: sanitizePeerText(r.target_name, PEER_NAME_CAP),
+          from_name: deviceName(r.from_name),
+          target_name: deviceName(r.target_name),
         }))
         return json(res, 200, { allowances })
       }

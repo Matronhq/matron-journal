@@ -878,3 +878,18 @@ test('revoking a device clears its allowances and room membership, so a reused i
   assert.ok(!isAllowed(s.db, dan.id, agA.deviceId, fresh.deviceId))
   assert.equal(getParticipant(s.db, 'room', fresh.deviceId), null)
 })
+
+test('a revoked device leaves a null name, never an empty string', async (t) => {
+  const { s, dan, agA, clientToken } = await roomFleet(t)
+  const doomed = createAgent(s.db, dan.id, 'dev-doomed')
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: doomed.deviceId })
+  // Delete the device row directly: the /revoke route now clears its
+  // allowances too, and this test is about the SHAPE a dangling row serves.
+  s.db.prepare('DELETE FROM devices WHERE id=?').run(doomed.deviceId)
+
+  const r = await s.http('/agent-chat/allowances', { token: clientToken })
+  assert.equal(r.status, 200)
+  const row = r.json.allowances.find((a) => a.target_device_id === doomed.deviceId)
+  assert.equal(row.target_name, null, 'null, not "" — protocol.md documents null and the apps show the id instead')
+  assert.equal(row.from_name, 'dev-a')
+})
