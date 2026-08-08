@@ -150,7 +150,8 @@ export function openDb(path) {
   // `private=1` = invisible and unreachable to OTHER agent devices — not to
   // the user's own client devices, which see everything unchanged. Enforced
   // at: GET /roster, GET /search, around_seq context reads, room ops (via
-  // loadRoom) and invite targeting, GET /snapshot, and GET /metrics — see
+  // loadRoom) and invite targeting, read_marker, convo_upsert's
+  // private-owner takeover guard, GET /snapshot, and GET /metrics — see
   // docs/protocol.md "Device privacy" for the full enumeration.
   // `private_pinned=1` records that
   // matron-admin owns the flag: the bridge's per-hello assertion is ignored
