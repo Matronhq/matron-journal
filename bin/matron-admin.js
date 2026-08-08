@@ -4,7 +4,7 @@ import os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import qrcode from 'qrcode-terminal'
 import QRCode from 'qrcode'
-import { openDb } from '../src/db.js'
+import { openDb, pinDevicePrivate, unpinDevicePrivate } from '../src/db.js'
 import { createUser, setPassword, createAgent, revokeDevice } from '../src/auth.js'
 import { resolveMediaDir } from '../src/media.js'
 import { resolvePreapproveKeyPath } from '../src/preapprove-key.js'
@@ -18,6 +18,7 @@ const USAGE = `usage:
   matron-admin agent add <username> <agent-name>
   matron-admin device list <username>
   matron-admin device revoke <device_id>
+  matron-admin device private <device_id> on|off|auto
   matron-admin link-code <username> --server-url <url> [--port <n>] [--expires <30m|24h>] [--png <path>]
   matron-admin offload [--days N]
   matron-admin expire-logs [--hours N]
@@ -124,9 +125,12 @@ export async function runAdmin(db, argv, deps = {}) {
     if (!username) throw new Error(USAGE)
     const user = db.prepare('SELECT id FROM users WHERE name=?').get(username)
     if (!user) throw new Error(`no such user: ${username}`)
-    const devices = db.prepare('SELECT id, kind, name, cursor, last_seen_at FROM devices WHERE user_id=? ORDER BY id').all(user.id)
+    const devices = db.prepare('SELECT id, kind, name, cursor, last_seen_at, private, private_pinned FROM devices WHERE user_id=? ORDER BY id').all(user.id)
     if (devices.length === 0) return `no devices for ${username}`
-    return devices.map((d) => `${d.id} kind=${d.kind} name=${d.name} cursor=${d.cursor} last_seen_at=${d.last_seen_at ?? 'never'}`).join('\n')
+    return devices.map((d) =>
+      `${d.id} kind=${d.kind} name=${d.name} cursor=${d.cursor} last_seen_at=${d.last_seen_at ?? 'never'}` +
+      ` private=${d.private ? 'yes' : 'no'}${d.private_pinned ? ' (pinned)' : ''}`
+    ).join('\n')
   }
   // Spec §8: "Revocation: delete the device/agent row; its socket is closed
   // on next frame." This just deletes the row — WS enforcement (the
@@ -139,6 +143,23 @@ export async function runAdmin(db, argv, deps = {}) {
     if (!existing) throw new Error(`no such device: ${deviceId}`)
     revokeDevice(db, deviceId)
     return `device ${deviceId} revoked`
+  }
+  // Visibility flag override (spec: agent visibility & privacy). on/off PIN
+  // the flag — the bridge's per-hello MATRON_AGENT_PRIVATE assertion is
+  // ignored until `auto` releases it. This is what makes admin authoritative:
+  // a deploy that forgot the env var cannot unmark a pinned machine.
+  if (a === 'device' && b === 'private') {
+    const deviceId = Number(argv[2])
+    const mode = argv[3]
+    if (!Number.isInteger(deviceId) || !['on', 'off', 'auto'].includes(mode)) throw new Error(USAGE)
+    const existing = db.prepare('SELECT id FROM devices WHERE id=?').get(deviceId)
+    if (!existing) throw new Error(`no such device: ${deviceId}`)
+    if (mode === 'auto') {
+      unpinDevicePrivate(db, deviceId)
+      return `device ${deviceId} privacy unpinned — the flag now follows the bridge's hello assertion (MATRON_AGENT_PRIVATE) from its next connect`
+    }
+    pinDevicePrivate(db, deviceId, mode === 'on')
+    return `device ${deviceId} pinned private=${mode} — the bridge's hello assertion is ignored until 'auto' releases it`
   }
   if (a === 'link-code') {
     const username = argv[1]

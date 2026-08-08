@@ -1,7 +1,8 @@
 import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
+import { applyBridgePrivate, isPrivateDevice } from './db.js'
 import { eventsAfter, append, markRead, upsertConversation, toEventShape, isClientOnlyEvent } from './journal.js'
-import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, undoInvite, getParticipant, expireInvites, parkInvite, awaitingCount, markDelivered, expireAwaiting } from './participants.js'
+import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, undoInvite, getParticipant, isKnownParticipant, expireInvites, parkInvite, awaitingCount, markDelivered, expireAwaiting } from './participants.js'
 import { isAllowed } from './allowances.js'
 import { sanitizePeerText } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
@@ -276,6 +277,21 @@ export function attachWs({
             ws.close()
             return
           }
+          // Optional bridge assertion of its own visibility flag (spec:
+          // agent visibility & privacy — MATRON_AGENT_PRIVATE, bridge-side).
+          // Same reject shape as a bad cursor: a malformed hello dies here.
+          if (msg.private !== undefined && typeof msg.private !== 'boolean') {
+            ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'bad_request', ref: 'hello' }))
+            ws.close()
+            return
+          }
+          // Agents only — a client has no visibility flag to assert, and
+          // silently ignoring it beats closing a working app's socket over a
+          // field it should never send. Applied BEFORE replay/registration so
+          // every read this connection triggers already sees the new state.
+          // Absent field = asserts visible: an unpinned flag follows the env
+          // var exactly, including its removal (admin pin is the override).
+          if (who.kind === 'agent') applyBridgePrivate(db, who.deviceId, msg.private === true)
           // conn is assigned here, before replay/registration complete below. If another
           // message arrives while the replay loop is yielded (see setImmediate below),
           // it will be dispatched to handleOp before hub.register(conn) runs. That's safe
@@ -450,6 +466,27 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
     if (typeof roomId !== 'string' || !roomId || roomId.length > CONVO_ID_MAX_CHARS) return { err: ['bad_request', 'bad room_id'] }
     const room = db.prepare('SELECT owner_user_id, agent_device_id, parent_convo_id FROM conversations WHERE id=?').get(roomId)
     if (!room || room.owner_user_id !== conn.userId) return { err: ['not_found'] }
+    // Privacy gate — single choke point (spec: agent visibility & privacy).
+    // A room owned by a private device does not exist for an ordinary
+    // caller with no standing footing in it: every other loadRoom-gated op
+    // (agent_invite's "only the owner may invite", agent_join's owner-null/
+    // self checks, agent_invite_ack/_answer's "no pending invite",
+    // agent_leave's "not a joined participant", and the child-convo check
+    // right below) would otherwise answer differently for a private-owned
+    // room than for an unknown one — an existence oracle one caller-
+    // controlled field away. Must run before ALL of those, including the
+    // child-convo check. The exemption is `isKnownParticipant`, NOT plain
+    // isParticipant — a row the caller only knows about because THEY
+    // legitimately initiated it, or that was actually delivered to them, or
+    // where they're joined. A merely parked ('awaiting_user', never
+    // relayed) or denied (never told) row must not exempt the gate — either
+    // would leak a private room's existence to an agent the user never
+    // approved or explicitly refused. See isKnownParticipant's doc comment
+    // for the 'expired' ambiguity this also resolves.
+    if (room.agent_device_id != null && isPrivateDevice(db, room.agent_device_id)
+      && !isPrivateDevice(db, conn.deviceId) && !isKnownParticipant(db, roomId, conn.deviceId)) {
+      return { err: ['not_found'] }
+    }
     if (room.parent_convo_id != null) return { err: ['bad_request', 'child conversations cannot be rooms'] }
     return { room }
   }
@@ -659,10 +696,14 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (msg.target_device_id === conn.deviceId) return fail('bad_request', 'cannot invite self')
         if (msg.topic != null && (typeof msg.topic !== 'string' || msg.topic.length > INVITE_TOPIC_MAX_CHARS)) return fail('bad_request', 'bad topic')
         if (typeof msg.justification !== 'string' || !msg.justification || msg.justification.length > INVITE_TEXT_MAX_CHARS) return fail('bad_request', 'bad justification')
-        // Unknown id, another user's device, and a client device are
-        // indistinguishable — anti-enumeration, same stance as agent_request.
-        const target = db.prepare('SELECT user_id, kind FROM devices WHERE id=?').get(msg.target_device_id)
-        if (!target || target.user_id !== conn.userId || target.kind !== 'agent') return fail('not_found')
+        // Unknown id, another user's device, a client device — and now a
+        // private device seen by an ORDINARY agent — are indistinguishable
+        // (spec: agent visibility & privacy; a distinct error would confirm
+        // the existence being hidden). A private CALLER passes: invisible,
+        // not blinded.
+        const target = db.prepare('SELECT user_id, kind, private FROM devices WHERE id=?').get(msg.target_device_id)
+        if (!target || target.user_id !== conn.userId || target.kind !== 'agent'
+          || (target.private === 1 && !isPrivateDevice(db, conn.deviceId))) return fail('not_found')
         const topic = sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS)
         const justification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
         // The raw-string check above only catches a literally empty string —
@@ -888,6 +929,27 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (msg.up_to_seq != null && (!Number.isInteger(msg.up_to_seq) || msg.up_to_seq < 0)) {
           return fail('bad_request')
         }
+        // Privacy gate (spec: agent visibility & privacy, final-review
+        // finding): read_marker has no membership check at all, so an
+        // ORDINARY agent could otherwise both mark-read into a private
+        // room it has no standing in (fanning a read_marker event out into
+        // it) AND use the distinct forbidden-vs-success outcome as an
+        // existence oracle for the private device's rooms. Same exemption
+        // as loadRoom's gate: a private caller, or an ordinary caller that
+        // is a known participant (isKnownParticipant — initiated, actually
+        // delivered, or joined), passes unfiltered. Must run BEFORE
+        // markRead so a refused mark never appends an event or fans out.
+        // The unknown-id path below throws inside markRead and lands in
+        // this same fail('forbidden') via the outer catch — reusing it
+        // here keeps the two paths byte-identical, not just similarly
+        // shaped.
+        if (conn.kind === 'agent' && !isPrivateDevice(db, conn.deviceId)) {
+          const room = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(msg.convo_id)
+          if (room && room.owner_user_id === conn.userId && room.agent_device_id != null
+            && isPrivateDevice(db, room.agent_device_id) && !isKnownParticipant(db, msg.convo_id, conn.deviceId)) {
+            return fail('forbidden')
+          }
+        }
         // Both kinds may advance the read marker: a client marking read for
         // itself, or an agent (bridge) marking read on behalf of its user —
         // e.g. after mirroring the user's own message into the journal, so
@@ -938,6 +1000,23 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         const existingRoom = db.prepare('SELECT agent_device_id FROM conversations WHERE id=? AND owner_user_id=?').get(msg.convo_id, conn.userId)
         if (existingRoom && existingRoom.agent_device_id != null && existingRoom.agent_device_id !== conn.deviceId) {
           if (hasParticipants(db, msg.convo_id)) return fail('forbidden', 'only the room owner may upsert a room')
+          // Private-owner takeover guard (spec: agent visibility & privacy,
+          // final-review finding). A participant-less conversation normally
+          // keeps the old last-writer-wins takeover (a re-paired bridge with
+          // a new device id reclaiming its own sessions) — but when the
+          // EXISTING owner is a private device, an ordinary caller must not
+          // be able to silently reassign ownership of a conversation it has
+          // no standing to touch. Reuses the exact same forbidden shape the
+          // populated-room gate above already returns: that oracle class
+          // (forbidden for something you can't touch, vs. a fresh id simply
+          // creating) is an accepted trade-off there and is not a new one
+          // here. A private caller is exempt (invisible, not blinded, same
+          // rule as every other surface); the caller being the current
+          // owner can't reach this branch at all (the outer condition above
+          // already requires agent_device_id !== conn.deviceId).
+          if (isPrivateDevice(db, existingRoom.agent_device_id) && !isPrivateDevice(db, conn.deviceId)) {
+            return fail('forbidden', 'only the room owner may upsert a room')
+          }
         }
         const convo = upsertConversation(db, {
           id: msg.convo_id, ownerUserId: conn.userId,

@@ -116,9 +116,71 @@ Stated plainly, so the flag is not over-trusted:
 1. **Precedence.** If `matron-admin` marks a device private and it later registers with
    `MATRON_AGENT_PRIVATE` unset, does it stay private? Proposal: yes, admin wins — an
    explicit server-side decision should not be undone by a deploy that forgot an env var.
+   **Resolved:** yes, admin wins, via the pin (`private_pinned`) — see "Locked decisions"
+   below.
 2. **Per-conversation privacy** as well as per-device — "this chat is not searchable by
    agents", independent of which machine owns it. Plausibly useful, not specified here; it
    would want its own flag on `conversations` and the same three-surface treatment.
+   **Deferred** — out of scope for this implementation; unchanged from the proposal above.
 3. **Whether a private agent should be excluded from the roster it receives** — i.e. can
    two private agents see each other? Proposal: yes, they can. Private is about the
-   boundary with ordinary agents.
+   boundary with ordinary agents. **Resolved:** yes, uniformly — private callers bypass
+   all filtering, at every surface, not just the roster — see "Locked decisions" below.
+
+## Locked decisions (2026-08-08 planning)
+
+Called out in the implementation plan's header
+(`docs/superpowers/plans/2026-08-08-agent-visibility-privacy.md`) for Dan:
+
+1. **The bridge presents its flag on every WS hello** — an optional boolean `private`
+   field on the hello frame, applied for agent connections only, ignored for clients.
+   Rationale: agents are minted at `/pair/claim` (a one-shot poll with no operator
+   present) and long-lived after that; hello is the only recurring moment the bridge can
+   assert env-var config without re-pairing. The bridge-side change (read
+   `MATRON_AGENT_PRIVATE`, send the field) is a separate matron-bridge task.
+2. **Pin semantics.** `private_pinned=1` means matron-admin owns the flag and hello
+   assertions are ignored. `matron-admin device private <id> on|off` sets value + pin;
+   `auto` clears the pin (the value stays until the next hello asserts). An unpinned flag
+   follows the hello assertion exactly — including hello-without-the-field, which asserts
+   `false` (spec test: bridge-set privacy does NOT survive a re-register without the env
+   var; admin-set does).
+3. **Open question 1 (precedence): resolved as proposed — admin wins** (that is what the
+   pin is).
+4. **Open question 3 (can two private agents see each other): resolved as proposed —
+   yes.** Implemented as: the privacy filter applies only when the caller is a
+   non-private agent, at every surface uniformly (roster, search, context, chat). The
+   spec's "can start chats with non-private agents" sentence is superseded by this — a
+   private agent can also invite another private agent; "private is about the boundary
+   with ordinary agents".
+5. **Open question 2 (per-conversation privacy): out of scope**, unchanged.
+6. **`GET /devices` is untouched** — it is already client-only (`src/http.js`), so a
+   private device correctly remains visible there to the user.
+
+## Implementation deltas (2026-08-08 execution)
+
+Where the shipped implementation departs from the plan above, and why:
+
+- **`agent_join`'s owner check moved into `loadRoom`; `agent_invite`'s target check did
+  not.** The plan's Task 5 specified two separate per-op checks — `agent_invite`'s
+  target-device lookup and `agent_join`'s room-owner lookup. Execution subsumed only the
+  second of those into `loadRoom` (`src/ws.js`), the shared lookup behind all five room
+  ops: gating on `room.agent_device_id`'s privacy there, rather than in `agent_join`
+  alone, closes what would otherwise have been distinct error shapes for a private-owned
+  room versus a nonexistent one on the other three ops (`agent_invite_ack`,
+  `agent_invite_answer`, `agent_leave` — e.g. "no pending invite" vs `not_found`), which
+  had no privacy check of their own — an existence oracle in the fields those per-op
+  checks didn't cover. `agent_invite`'s target-device check is a *different* check (is
+  the invite's target private, independent of whether the room's owner is) and remains
+  exactly where the plan put it, per-op inside `agent_invite`, unreplaced. The `loadRoom`
+  exemption is `isKnownParticipant` (`src/participants.js`), narrower than plain
+  participant lookup: it passes only a caller that initiated the ask, actually had it
+  delivered, or is `joined` — a merely parked (`awaiting_user`) or `denied` row does not
+  exempt, since either would leak the room's existence to an agent the user never
+  approved or explicitly refused.
+- **A Task 8 (`/snapshot`) was added by the search branch's final security review**,
+  outside this plan's original four-surface scope. `GET /snapshot` predates this feature
+  and needed its own two rules layered on top: `snippet` omitted for every agent caller
+  (private or not — a credential-leakage concern, since a snippet can carry `tool_output`
+  text), and private-owned conversations excluded for a filtered (ordinary) agent caller
+  only, matching the `/roster`/`/search` predicate so `/snapshot` can't be used as an
+  end-run around either.

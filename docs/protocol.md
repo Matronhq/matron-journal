@@ -14,7 +14,11 @@ the machine-checkable version of this page.
   a successful login (429 `locked_out` with `retry_after` seconds + `Retry-After` header).
 - `GET /snapshot` (Bearer) -> `{conversations, seq}`. Each conversation row
   carries `parent_convo_id` (`null` for a normal conversation; set for a
-  subagent child — see "Child conversations").
+  subagent child — see "Child conversations"). Every agent caller — private
+  or not — gets `snippet` omitted from every row (it can carry `tool_output`
+  text, a credential surface); an ordinary (non-private) agent additionally
+  has private-owned conversations excluded entirely — see "Device privacy"
+  below.
 - `GET /convo/:id/messages?before_seq&limit` (Bearer) -> `{events}`. `limit`
   is clamped to 1..200 (400 on non-integer/NaN/<1); `before_seq`, when given,
   must be an integer (400 otherwise). Owner-only; missing or not-owned are
@@ -65,9 +69,9 @@ the machine-checkable version of this page.
   hint to talk to the working agent (`GET /roster` / `agent_chat_start`)
   rather than only read its transcript. Scoped to the caller's own user
   (`search_messages.user_id`) regardless of device kind — open to both
-  agents (the feature's primary audience) and clients; the agent-
-  visibility/privacy plan layers additional agent-caller filtering on top
-  later.
+  agents (the feature's primary audience) and clients; an ordinary
+  (non-private) agent caller additionally has hits from private-owned
+  conversations excluded — see "Device privacy" below.
 - `POST /media` (Bearer, client or agent) -> raw request body streamed to disk;
   `{media_id, size, content_type, sha256}`. Content-Type header captured
   (default `application/octet-stream`). 400 `{error:'empty'}` on a zero-byte
@@ -121,7 +125,10 @@ the machine-checkable version of this page.
   (per-user head seq, per-device kind/cursor/lag/last_seen_at, total events,
   DB file size) directly from the SQLite file — connected-socket count and
   APNs counters only exist in a running server's memory, so those are
-  `/metrics`-only.
+  `/metrics`-only. `user.devices` additionally omits private devices for a
+  filtered (ordinary, non-private) agent caller — same one-caller-rule
+  predicate as `/roster`/`/search`; see "Device privacy" below. A client or
+  a private agent caller sees every device, unchanged.
 - `GET /devices` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`) -> `{devices: [{device_id, kind, name, created_at,
   cursor, lag, last_seen_at, is_self, connected, push_prefs}]}`. The
@@ -421,7 +428,9 @@ an agent token, selected by which query parameter is present:
   that the room's creator owns. A participant-less conversation (no
   `convo_agents` rows at all) keeps the old last-writer-wins takeover
   behavior — a re-paired bridge with a new device id can still reclaim its
-  own sessions — and a conversation with no recorded owner (legacy NULL)
+  own sessions — **except when the recorded owner is a private device**
+  (see "Device privacy" below): there, an ordinary caller's takeover is
+  refused instead, and a conversation with no recorded owner (legacy NULL)
   stays writable by anyone. Accepted trade-off for v1: a re-paired owner
   (new device id after a bridge restart pairs fresh) can no longer reclaim
   a room it created once that room has participant history, because the
@@ -431,6 +440,29 @@ an agent token, selected by which query parameter is present:
   underneath as belt-and-braces for any caller that reaches it directly
   (e.g. a test harness bypassing the WS layer), but on ordinary WS traffic
   this gate rejects a disqualified upsert before that code ever runs.
+
+  **Operational trap: re-pairing a private bridge onto a fresh device id.**
+  The private-owner guard checks the NEW connection's own `private` flag,
+  not any memory of the old device — so whether a re-paired bridge can
+  reclaim its own participant-less conversations depends entirely on how
+  its new device id acquires privacy, and the two paths behave very
+  differently:
+  - **`MATRON_AGENT_PRIVATE` (bridge-side env var) self-heals.** The bridge
+    asserts `private` on every `hello`, and `hello` always completes before
+    any op (including `convo_upsert`) is processed on that connection — so
+    if the env var travels with the re-pair, the fresh device is marked
+    private before its first upsert ever reaches the guard, and reclaiming
+    its old sessions just works, no operator action needed.
+  - **An admin PIN on the OLD device id does not transfer.** `matron-admin
+    device private <id> on` pins one specific `devices` row; a re-pair
+    mints a brand-new row that starts unpinned and `private=0` by default
+    (see the schema default above). If the operator relied on the pin
+    rather than the env var, the new device is *ordinary* the moment it
+    connects: its `convo_upsert`s on the old private-owned conversations
+    return `forbidden`, ownership never transfers, and that history is
+    effectively read-only to the new device until an operator either runs
+    `matron-admin device private <new_id> on` or ensures the env var is set
+    so the next re-pair self-heals instead.
 - Agent write authorization: `publish`, `finalize`, `stream`,
   `stream_append`, `activity`, and `status` all gate on the same rule
   (`authorizeAgentWrite`) — the agent device must be the conversation's
@@ -442,17 +474,26 @@ an agent token, selected by which query parameter is present:
   accepted / has since left / has expired — fails closed as
   `{kind:'control', op:'error', code:'forbidden', ref:<op>}` (`publish`/
   `finalize` add `detail:'not a participant of this conversation'`).
-  `convo_upsert` and `read_marker` are deliberately NOT gated by this rule:
-  `convo_upsert` is how a device becomes an owner or a guest in the first
-  place, and `read_marker` stays scoped to the conversation's owning user
-  only — a bridge may mark its user's own messages read regardless of room
-  membership (see the `read_marker` note above). This is safe precisely
-  because `read_marker` only ever advances the CALLER'S OWN user's read
-  state (never another user's — `markRead` is scoped by `who.userId` like
-  every other op) and writes no message content of any kind: there is no
-  content to steal or forge, and no way to use it to gain or fake
-  participation in a room, so no participant/ownership check is needed on
-  top of the existing user scoping.
+  `convo_upsert` and `read_marker` are deliberately NOT gated by this rule
+  (`authorizeAgentWrite`'s owner-or-joined-participant test) — but each has
+  its own, narrower gate instead, not a free pass:
+  - `convo_upsert` is how a device becomes an owner or a guest in the first
+    place, so it can't require the very standing it's used to establish —
+    but it is not ungated: see "Room-upsert ownership gate" above for the
+    populated-room case and "Device privacy" below for the private-owner
+    takeover guard layered on top of it for a participant-less room.
+  - `read_marker` stays scoped to the conversation's owning user only — a
+    bridge may mark its user's own messages read without being `joined` —
+    but as of "Device privacy" below, an ORDINARY agent caller marking a
+    conversation whose recorded owner is a private device, that the caller
+    is not a known participant of (`isKnownParticipant`), gets the same
+    `forbidden` its own unknown-convo-id path already returns. This is safe
+    precisely because `read_marker` only ever advances the CALLER'S OWN
+    user's read state (never another user's — `markRead` is scoped by
+    `who.userId` like every other op) and writes no message content of any
+    kind: there is no content to steal or forge, and no way to use it to
+    gain or fake participation in a room — the privacy gate exists to close
+    an *existence-oracle* and *unwanted-write* hole, not a content-leak one.
 - Unread semantics: a user's own `send` never increments `unread_count` (it's
   their own message); agent-published/finalized events do. `read_marker`
   recomputes `unread_count` from events after `up_to_seq`, so
@@ -941,6 +982,218 @@ scoping" above) now reach not just the recorded owner but every currently-
 `joined` participant too — that's the durable side of room membership (the
 room's actual conversation content), distinct from this section's ephemeral
 invite-lifecycle relay.
+
+## Device privacy
+
+(spec: `docs/superpowers/specs/2026-08-07-agent-visibility-privacy-design.md`.)
+A per-device flag that makes an agent device — and what it manages — invisible
+and unreachable to *other agent devices*, while the user's own client apps see
+everything unchanged. Consent (see "Agent chat rooms" above) stops a rogue
+agent injecting text into a sibling's context; it does not stop it *watching*,
+and once a room is approved a compromised participant can work on it freely
+and indefinitely. For a device with materially more authority than its
+siblings, unreachable is a stronger property than approved, because
+unreachable has no first-contact hole at all.
+
+**The flag pair.** `devices.private` (`INTEGER NOT NULL DEFAULT 0`) is the
+value; `devices.private_pinned` (`INTEGER NOT NULL DEFAULT 0`) records who
+owns it. `private=1` means invisible/unreachable to other agents — not to the
+user: `kind='client'` connections are never filtered by any rule below, and
+`GET /devices` (already client-only, see above) is untouched by this feature
+entirely. `isPrivateDevice(db, deviceId)` (`src/db.js`) is the single read
+helper every enforcement point calls; it answers `false` for an unknown/
+deleted id rather than throwing, so a caller checking a dangling reference
+falls through to its normal not-found path instead of crashing.
+
+**Setting it: hello, then the pin.** The bridge asserts its own flag on every
+WS `hello` frame: an optional top-level `private: boolean`
+(`MATRON_AGENT_PRIVATE`, bridge-side env var) — hello is the only recurring
+moment a long-lived, operator-absent agent connection can assert env-var
+config. The shape check runs for **every** connecting device, agent or
+client, before the two kinds are told apart: a `private` field that is
+present but not a boolean is rejected —
+`{kind:'control', op:'error', code:'bad_request', ref:'hello'}`, the same
+reject shape a bad cursor gets, socket closed — regardless of which kind of
+device sent it. Only past that check does the agent/client distinction
+apply: a **well-formed** boolean, or an absent field, from a client is
+silently ignored — never applied, hello proceeds normally — while an agent's
+value is written via `applyBridgePrivate`. Leniency is for a client sending a
+harmless, well-formed value it should never send in the first place; a
+malformed value gets no such leniency from either kind. Omitting the field
+asserts `false`: an unpinned flag follows the hello assertion exactly,
+including its removal — bridge-set privacy does NOT survive a re-register
+without the env var.
+`matron-admin device private <device_id> on|off|auto` is the authoritative
+override: `on`/`off` both PIN the flag (`private_pinned=1`) — `off` is
+"force-visible", not "hands off" — so a deploy that forgot the env var can
+never silently unmark a pinned machine; `auto` releases the pin and hands the
+flag back to the next hello, without itself changing the value.
+`matron-admin device list` renders `private=yes|no`, with a `(pinned)` suffix
+when pinned.
+
+**The enforced surfaces — one caller rule, nine enforcement points.** Every
+rule is conditioned on the identical predicate: filtering applies **only
+when the caller is an ordinary (non-private) agent**. `kind='client'`
+callers are never filtered, and a private agent caller is never filtered
+either — it is invisible, not blinded, so two private agents see each other
+and a private agent still gets the whole unfiltered roster/search/room set.
+The nine:
+
+- **`GET /roster`** — omits private agent devices and every top-level
+  conversation whose `agent_device_id` is private.
+- **`GET /search`** — `searchMessages`'s `excludePrivateOwned` option
+  (`src/search.js`) excludes hits from private-owned conversations.
+- **The `around_seq` context mode** of `GET /convo/:id/messages` — a
+  private-owned conversation 404s for a foreign ordinary-agent read. The
+  check runs before `messagesAroundIndexed` and before the foreign-read
+  audit log line (see "Journal search" above), so a refused read is never
+  logged as a successful one.
+- **Every room op, on room ownership** — via a single choke point rather
+  than a per-op check: `loadRoom` (`src/ws.js`), the shared lookup behind
+  `agent_invite`, `agent_join`, `agent_invite_ack`, `agent_invite_answer`,
+  and `agent_leave` (see "The five room ops" above), checks whether the
+  room's *owner* device (`room.agent_device_id`) is private and applies
+  uniformly to all five ops. A room owned by a private device answers the
+  byte-identical `not_found` an unknown room id gets, on every one of those
+  five ops. The plan originally specified this only as a per-op check on
+  `agent_join`'s owner lookup; folding it into `loadRoom` instead means the
+  other three ops, which had no privacy check of their own
+  (`agent_invite_ack`/`_answer`'s "no pending invite", `agent_leave`'s "not
+  a joined participant"), are covered too — closing what would otherwise be
+  an existence oracle in the fields those checks don't touch.
+  - The exemption is narrower than "is a participant":
+    `isKnownParticipant` (`src/participants.js`) passes a caller only if it
+    **initiated** the ask, the ask was **actually delivered** to it
+    (`delivered_at IS NOT NULL`), or it is **`joined`**. A merely parked
+    (`awaiting_user`, never relayed to any agent socket) or `denied` (never
+    told) row does NOT exempt — either would leak a private room's
+    existence to an agent the user never approved, or explicitly refused.
+- **`agent_invite`'s target-device check** — separate from `loadRoom` and
+  unreplaced by it: whether the room's *owner* is private (`loadRoom`'s job,
+  above) is independent of whether the invite's *target* device is private.
+  `agent_invite` (`src/ws.js`) looks up `target_device_id` directly and
+  folds `target.private === 1 && !isPrivateDevice(db, conn.deviceId)` into
+  the same `not_found` an unknown id, another user's device, or a
+  client-kind device already gets. This check was specified per-op in the
+  plan and remains per-op in the shipped code — nothing subsumed it.
+- **`read_marker`** — an ordinary agent caller marking a conversation whose
+  recorded owner is a private device, and that the caller is not a known
+  participant of (`isKnownParticipant`, same exemption `loadRoom` uses),
+  gets the same `forbidden` its own unknown-`convo_id` path already returns
+  (`markRead`'s `not authorized` throw, caught by `handleOp`'s outer
+  catch) — byte-identical, not merely same-shaped, because `read_marker`
+  isn't one of the five room ops `roomIdEcho` attaches `room_id` to, so
+  neither rejection carries one. The gate runs before `markRead`, so a
+  refused mark never appends a `read_marker` event or fans one out. See
+  "Agent write authorization" above for why `read_marker` isn't gated by
+  `authorizeAgentWrite` itself.
+- **`convo_upsert`'s private-owner takeover guard** — extends the
+  pre-existing "Room-upsert ownership gate" (above) to the
+  participant-less case it deliberately left open: when the existing
+  conversation's recorded owner is a private device and the upserting
+  caller is an ordinary agent, the whole upsert is refused with the
+  identical `forbidden` shape the populated-room gate already returns,
+  instead of the old last-writer-wins takeover. See "Room-upsert ownership
+  gate" above for the full mechanics and the re-pairing operational trap
+  this creates. Unlike every other surface in this list, this one is a
+  **new, accepted** existence oracle rather than a byte-identical
+  rejection — see "Byte-identical, deliberately" below.
+- **`GET /snapshot`** — a differently-shaped rule of its own; see below.
+- **`GET /metrics`** — the `user.devices` list (`buildMetrics`,
+  `src/metrics.js`) omits private devices for a filtered ordinary-agent
+  caller, via an `excludePrivateDevices` option computed with the same
+  predicate at the HTTP layer; a client or a private agent caller gets the
+  unfiltered list, byte-identical to today.
+
+**Byte-identical, deliberately — with one accepted exception.** Every
+filtered surface's refusal is indistinguishable from the same surface's
+refusal for a genuinely nonexistent target: `not_found` for room ops
+(matching an unknown room or device id, another user's device, or a
+client-kind device), `404 {error:'not_found'}` for `around_seq` (matching a
+missing conversation), and the same `forbidden` for `read_marker` (matching
+its own unknown-`convo_id` rejection — see above). A distinct "that's
+private" error would itself confirm existence — the thing being hidden.
+
+The one deliberate exception is `convo_upsert`'s private-owner takeover
+guard (above): refusing an upsert on an existing private-owned,
+participant-less conversation id IS distinguishable from an upsert on a
+fresh id, which simply creates it — a caller who already knows or guesses
+an id can learn "something private-owned already exists here" in a way it
+could not learn from a truly-unused id. This mirrors an oracle already
+accepted one gate up: the populated-room case (any `convo_agents` history)
+answers a caller-visible `forbidden` for a private-owned room, distinguishable
+from ordinary creation, for exactly the same structural reason — a
+conversation that already exists behaves differently from one that
+doesn't, and hiding *that* difference would mean either silently rejecting
+every fresh `convo_upsert` too (breaking normal room creation) or silently
+allowing the private-owner takeover this guard exists to close. Extending
+an already-accepted oracle class to the participant-less case was judged
+preferable to inventing a second, differently-shaped one.
+
+**`/snapshot`'s two independent rules (added by security review during
+implementation, alongside the other enforcement points above).**
+`GET /snapshot` predates this feature and answers to its own pair of rules
+layered on the client shape, not the single roster/search/room predicate
+above:
+
+- **`snippet` is omitted for every agent caller, private or not** —
+  unconditional, because the risk is credential leakage (a snippet can carry
+  `tool_output` text), not visibility. A managing agent losing its own
+  conversation's snippet in this one summary payload is an accepted cost; no
+  agent consumer of `/snapshot`'s snippet exists.
+- **Private-owned conversations are excluded for a filtered (ordinary) agent
+  only** — the same one-caller predicate as `/roster` and `/search`, so
+  `/snapshot` can't be used as an end-run around either.
+
+**What this does not do.**
+
+- **Visibility, not privilege.** Every device is still the same journal user
+  with the same rights; privacy is not a permission boundary between an
+  agent and its own box, and does not prevent it doing damage there.
+- **No retroactive hiding.** Text a private agent already wrote into
+  another agent's conversation stays visible there — the flag changes what's
+  discoverable going forward, not the historical record.
+- **A compromised private agent gains nothing from the flag.** It already
+  sees everything (the asymmetry runs the other way — if the private one is
+  the compromised device, this feature bought nothing); the only flag it can
+  touch is its own, and unmarking itself only makes it more visible, which
+  harms nobody but itself.
+- **Revocation re-exposes.** `matron-admin device revoke` (see "Device
+  revocation" below) deletes the device row outright — there is no
+  soft-delete or tombstone. A private device's conversations still carry its
+  now-dangling `agent_device_id`, so every enforcement point above (whose
+  private check is `isPrivateDevice`, a live lookup against the `devices`
+  table) sees no row, answers `false`, and stops excluding them: a
+  decommissioned private agent's whole history becomes visible and
+  searchable again to ordinary agents the moment it's revoked. Privacy here
+  is a visibility flag on a live device, not a retention policy on its past
+  conversations; if a decommissioned device's history needs to stay hidden,
+  that needs a distinct fail-closed mechanism (e.g. an owner id that
+  survives its device row) — not implemented in v1.
+- **`/metrics`'s global aggregates still count private devices.**
+  `sockets_connected`, `journal_row_count`, and `db_file_size_bytes` are
+  whole-user (or whole-server) aggregates computed before the per-device
+  `user.devices` filtering above — a private agent's own live socket, its
+  journal rows, and its share of the DB file size are folded into these
+  numbers for every caller on the account, including an ordinary agent
+  whose own `user.devices` list just had that same device filtered out. No
+  id or name ever leaks through them (they're bare counts), but an
+  attentive ordinary-agent caller can still infer "something else is active
+  on this account" from population-level movement it can't attribute to
+  any device. Only the per-device list — the part that could name one — is
+  filtered.
+- **A drawn-in ordinary agent keeps the access it was granted, not the
+  discoverability.** Once an ordinary agent is `joined` into a private
+  device's room (invited and accepted, or joined via `agent_join`), it reads
+  and writes that room over the ordinary journal/WS paths exactly like any
+  other room it's a participant in — `authorizeAgentWrite`, hello replay,
+  and paging never re-check privacy once a caller has standing. But that
+  room still never appears in the participant's own `GET /roster`,
+  `GET /snapshot`, or `GET /search` — those three stay scoped to the
+  one-caller predicate above regardless of the caller's actual room
+  memberships. The asymmetry is deliberate: discovery closes (you can't find
+  what you weren't told about), granted access does not (once told, you keep
+  reading it the normal way).
 
 ## Device revocation
 

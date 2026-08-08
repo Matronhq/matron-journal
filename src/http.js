@@ -2,7 +2,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { login, authToken, changePassword, revokeOwnedDevice, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent } from './journal.js'
-import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs } from './db.js'
+import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice } from './db.js'
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
 import { listAwaiting, answerParkedInvite, getParticipant } from './participants.js'
@@ -242,12 +242,27 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       if (req.method === 'GET' && url.pathname === '/snapshot') {
-        return json(res, 200, snapshot(db, who.userId))
+        // Two independent rules layered on top of the client shape (spec:
+        // agent visibility & privacy, task 8):
+        //   - snippet omitted for EVERY agent caller, private or not — it can
+        //     carry tool_output text (credentials), same reason /roster omits
+        //     it. A managing agent losing its own convo's snippet is
+        //     acceptable: no agent consumer of /snapshot exists.
+        //   - private-owned conversations excluded for a FILTERED (ordinary)
+        //     agent only — same one-caller-rule predicate as /roster and
+        //     /search, so /snapshot can't be used as an end-run around them.
+        const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
+        return json(res, 200, snapshot(db, who.userId, { omitSnippet: who.kind === 'agent', excludePrivateOwned: filtered }))
       }
       if (req.method === 'GET' && url.pathname === '/metrics') {
         // Any valid device (client or agent) — no admin-only concept in v1.
         // Scoping (no cross-user leakage) is enforced inside buildMetrics.
-        return json(res, 200, buildMetrics(db, { hub, pushPipeline, dbPath, userId: who.userId }))
+        // Privacy filter (spec: agent visibility & privacy): same
+        // one-caller-rule predicate as /roster and /search — an ORDINARY
+        // agent caller's device list omits private devices; a client or a
+        // private agent caller sees the full list, unchanged.
+        const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
+        return json(res, 200, buildMetrics(db, { hub, pushPipeline, dbPath, userId: who.userId, excludePrivateDevices: filtered }))
       }
       if (req.method === 'POST' && url.pathname === '/push/register') {
         // Only client devices carry push tokens — agents run on the dev box
@@ -308,14 +323,23 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // conversations (children are silenced sub-chats, never chat
         // targets). Same owner_user_id scoping as every other read.
         const live = new Set(hub.connsOf(who.userId).filter((c) => c.ws.readyState === 1).map((c) => c.deviceId))
+        // Privacy filter (spec: agent visibility & privacy): applies only to
+        // an ORDINARY agent caller. Clients always see everything; a private
+        // agent is invisible, not blinded (one-directional, deliberately) —
+        // which also resolves "can two private agents see each other" as yes.
+        const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
         const agents = db.prepare(
-          "SELECT id AS device_id, name, created_at, last_seen_at FROM devices WHERE user_id=? AND kind='agent' ORDER BY id"
+          `SELECT id AS device_id, name, created_at, last_seen_at FROM devices
+           WHERE user_id=? AND kind='agent'${filtered ? ' AND private=0' : ''} ORDER BY id`
         ).all(who.userId).map((d) => ({ ...d, connected: live.has(d.device_id) }))
         const conversations = db.prepare(
           `SELECT id, title, session_state, last_seq, summary, agent_device_id, created_at,
                   (SELECT ts FROM events e WHERE e.convo_id = conversations.id
                    ORDER BY e.seq DESC LIMIT 1) AS last_ts
-           FROM conversations WHERE owner_user_id=? AND parent_convo_id IS NULL
+           FROM conversations WHERE owner_user_id=? AND parent_convo_id IS NULL${filtered
+             ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
+                    SELECT 1 FROM devices d WHERE d.id=conversations.agent_device_id AND d.private=1))`
+             : ''}
            ORDER BY last_seq DESC`
         ).all(who.userId)
         return json(res, 200, { agents, conversations })
@@ -390,7 +414,11 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // empty set an unmatched query does (user scoping already guarantees
         // it) — no existence oracle, nothing extra to check.
         const convoId = url.searchParams.get('convo_id') || null
-        const r = searchMessages(db, who.userId, { query: q, limit, convoId })
+        // Privacy filter (spec: agent visibility & privacy): same
+        // one-caller-rule predicate the roster uses — applies only to an
+        // ORDINARY agent caller, never to clients or private agents.
+        const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
+        const r = searchMessages(db, who.userId, { query: q, limit, convoId, excludePrivateOwned: filtered })
         if (r.badQuery) return json(res, 400, { error: 'bad_request' })
         return json(res, 200, { hits: r.hits })
       }
@@ -523,6 +551,16 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         try {
           let events
           if (agentForeign && aroundSeq != null) {
+            // Privacy gate (spec: agent visibility & privacy): a conversation
+            // owned by a private device does not exist for an ordinary
+            // agent's context reads — same 404 as missing/unauthorized, and
+            // it must fire before the audit log line below so a refused read
+            // is never logged as a successful foreign read. A private caller
+            // bypasses this, same one-directional rule as everywhere else.
+            const owner = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id
+            if (owner != null && isPrivateDevice(db, owner) && !isPrivateDevice(db, who.deviceId)) {
+              return json(res, 404, { error: 'not_found' })
+            }
             // Window over the indexed (prose) set directly, not over every
             // event with a post-hoc filter — in a tool_output-heavy convo,
             // filtering after windowing can starve a small limit down to a

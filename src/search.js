@@ -40,7 +40,10 @@ export function ftsQueryFor(raw) {
 // agent over reading its transcript. The try/catch is belt-and-braces: after
 // quoting, a parse failure should be unreachable, but a SQLite error must
 // surface as badQuery (→ 400), never a 500 with internals in it.
-export function searchMessages(db, userId, { query, limit = 20, convoId = null } = {}) {
+// excludePrivateOwned (spec: agent visibility & privacy): hits from
+// conversations owned by a private device vanish for ordinary agent
+// callers. NULL-owner (legacy) conversations are never private-owned.
+export function searchMessages(db, userId, { query, limit = 20, convoId = null, excludePrivateOwned = false } = {}) {
   const match = ftsQueryFor(query)
   if (match == null) return { badQuery: true }
   const sql = `
@@ -50,6 +53,10 @@ export function searchMessages(db, userId, { query, limit = 20, convoId = null }
     JOIN search_messages sm ON sm.rowid = search_fts.rowid
     JOIN conversations c ON c.id = sm.convo_id
     WHERE search_fts MATCH ? AND sm.user_id = ?${convoId != null ? ' AND sm.convo_id = ?' : ''}
+    ${excludePrivateOwned
+      ? `AND (c.agent_device_id IS NULL OR NOT EXISTS(
+            SELECT 1 FROM devices d WHERE d.id=c.agent_device_id AND d.private=1))`
+      : ''}
     ORDER BY bm25(search_fts), sm.ts DESC
     LIMIT ?`
   let rows

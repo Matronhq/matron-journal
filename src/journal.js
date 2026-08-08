@@ -167,7 +167,18 @@ const parseRow = (r) => ({ ...r, payload: JSON.parse(r.payload) })
 export const toEventShape = ({ seq, convo_id, ts, sender, type, payload }) =>
   ({ seq, convo_id, ts, sender, type, payload })
 
-export function snapshot(db, userId) {
+// `opts` (spec: agent visibility & privacy, task 8) — both default off, so
+// the one existing call site (http.js /snapshot) is the only caller that
+// opts in and every other hypothetical caller keeps the original shape:
+//   - omitSnippet: never hand back the `snippet` column. snippetOf() can
+//     surface tool_output text (where credentials land — see its `p.snippet`
+//     branch), so this must apply to EVERY agent caller, not just filtered
+//     ones. Mirrors /roster's deliberate snippet omission (same reason).
+//   - excludePrivateOwned: same predicate shape as the roster's conversations
+//     query — a private device's conversations are dropped unless
+//     agent_device_id is NULL (never private-owned). Only for the "ordinary
+//     agent" caller; clients and private agents pass this false.
+export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned = false } = {}) {
   // last_ts: timestamp of the conversation's newest event, so a client can
   // show a correct "last activity" time from a snapshot alone. Without it,
   // a client refreshing via /snapshot after missing frames advanced the
@@ -175,10 +186,15 @@ export function snapshot(db, userId) {
   // events (just created, or history pruned by retention) — clients fall
   // back to created_at. The (convo_id, seq) index makes the subquery a seek.
   const conversations = db.prepare(
-    `SELECT id, title, session_state, last_seq, unread_count, snippet, parent_convo_id, summary, created_at,
+    `SELECT id, title, session_state, last_seq, unread_count, ${omitSnippet ? 'NULL' : 'snippet'} AS snippet,
+            parent_convo_id, summary, created_at,
             (SELECT ts FROM events e WHERE e.convo_id = conversations.id
              ORDER BY e.seq DESC LIMIT 1) AS last_ts
-     FROM conversations WHERE owner_user_id=? ORDER BY last_seq DESC`
+     FROM conversations WHERE owner_user_id=?${excludePrivateOwned
+       ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
+              SELECT 1 FROM devices d WHERE d.id=conversations.agent_device_id AND d.private=1))`
+       : ''}
+     ORDER BY last_seq DESC`
   ).all(userId)
   const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)
   return { conversations, seq: head ? head.seq : 0 }
