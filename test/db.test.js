@@ -210,3 +210,29 @@ test('agent_chat_allowances table exists with its composite key', () => {
   db.prepare('INSERT INTO agent_chat_allowances(user_id, from_device_id, target_device_id, created_at) VALUES(1,2,3,4)').run()
   assert.throws(() => db.prepare('INSERT INTO agent_chat_allowances(user_id, from_device_id, target_device_id, created_at) VALUES(1,2,3,5)').run())
 })
+
+test('search schema: tables, insert trigger, and NOTHING else', () => {
+  const db = openDb(':memory:')
+  // content table + fts + backfill state all exist
+  db.prepare("INSERT INTO search_messages(user_id, convo_id, seq, ts, sender, body) VALUES(1,'c1',1,1,'user:dan','hello sqlite search')").run()
+  const hit = db.prepare("SELECT rowid FROM search_fts WHERE search_fts MATCH 'sqlite'").get()
+  assert.ok(hit, 'insert trigger populates the FTS index')
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM search_backfill_state').get().n, 0)
+  // The append-only invariant, pinned: exactly ONE trigger (after-insert) on
+  // search_messages — a future update/delete trigger means someone added a
+  // mutation path to events and must revisit the whole design.
+  const triggers = db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='search_messages'"
+  ).all()
+  assert.deepEqual(triggers.map((t) => t.name), ['search_messages_ai'])
+  db.close()
+})
+
+test('search schema: UNIQUE(user_id, seq) makes re-inserts with OR IGNORE no-ops', () => {
+  const db = openDb(':memory:')
+  const ins = db.prepare("INSERT OR IGNORE INTO search_messages(user_id, convo_id, seq, ts, sender, body) VALUES(1,'c1',1,1,'user:dan','hello')")
+  assert.equal(ins.run().changes, 1)
+  assert.equal(ins.run().changes, 0)
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM search_fts WHERE search_fts MATCH 'hello'").get().n, 1)
+  db.close()
+})

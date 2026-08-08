@@ -1,4 +1,5 @@
 import { authorize } from './auth.js'
+import { indexableBody } from './search.js'
 
 export const MESSAGE_TYPES = [
   'text', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image',
@@ -118,6 +119,17 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
     db.prepare(
       'INSERT INTO events(user_id, seq, convo_id, ts, sender, type, payload, blob_ref, idem_key) VALUES(?,?,?,?,?,?,?,?,?)'
     ).run(userId, seq, convoId, ts, sender, type, payloadJson, blobRef, idemKey)
+    // Search index feed (spec: agent journal search) — same transaction as
+    // the event row, so the index can never hold a row the journal doesn't
+    // (or vice versa). Plain INSERT, never OR REPLACE/OR IGNORE: a duplicate
+    // (user_id, seq) is impossible for a freshly-minted seq, and failing
+    // loudly beats silently corrupting the external-content FTS pair.
+    const searchBody = indexableBody(type, payload)
+    if (searchBody != null) {
+      db.prepare(
+        'INSERT INTO search_messages(user_id, convo_id, seq, ts, sender, body) VALUES(?,?,?,?,?,?)'
+      ).run(userId, convoId, seq, ts, sender, searchBody)
+    }
     if (type === 'session_status') {
       // Guard against a malformed agent payload (null/undefined/non-object,
       // or an object with no string `state`) reaching the DB as a raw
@@ -184,6 +196,51 @@ export function messagesBefore(db, userId, convoId, { beforeSeq = null, limit = 
     ? db.prepare('SELECT * FROM events WHERE convo_id=? ORDER BY seq DESC LIMIT ?').all(convoId, limit)
     : db.prepare('SELECT * FROM events WHERE convo_id=? AND seq<? ORDER BY seq DESC LIMIT ?').all(convoId, beforeSeq, limit)
   return rows.reverse().map(parseRow)
+}
+
+// Context window for a search hit (spec: agent journal search, around_seq).
+// floor(limit/2) rows strictly before the anchor, the remainder from the
+// anchor up — so the anchor row itself is included when it exists, and
+// either end of the conversation just yields a short window, never an
+// error. Ascending order, same authorize() gate as messagesBefore.
+export function messagesAround(db, userId, convoId, { aroundSeq, limit = 30 } = {}) {
+  if (!authorize(db, userId, convoId)) throw new Error('not authorized')
+  const before = Math.floor(limit / 2)
+  const after = limit - before
+  const rows = [
+    ...db.prepare('SELECT * FROM events WHERE convo_id=? AND seq<? ORDER BY seq DESC LIMIT ?')
+      .all(convoId, aroundSeq, before).reverse(),
+    ...db.prepare('SELECT * FROM events WHERE convo_id=? AND seq>=? ORDER BY seq LIMIT ?')
+      .all(convoId, aroundSeq, after),
+  ]
+  return rows.map(parseRow)
+}
+
+// Same window shape as messagesAround, but the seq set is picked FROM
+// search_messages — exactly the indexable (prose) set, indexed by
+// (convo_id, seq) — instead of windowing over every event and filtering
+// after. In a tool_output-heavy conversation, windowing over ALL events
+// first can starve a small limit down to a couple of prose rows before the
+// caller ever gets to filter; picking the window from the already-indexed
+// set means every row returned is one the caller can see. The seqs found
+// are then re-fetched from `events` (search_messages doesn't carry the full
+// payload) and mapped through the same parseRow as every other reader.
+export function messagesAroundIndexed(db, userId, convoId, { aroundSeq, limit = 30 } = {}) {
+  if (!authorize(db, userId, convoId)) throw new Error('not authorized')
+  const before = Math.floor(limit / 2)
+  const after = limit - before
+  const seqs = [
+    ...db.prepare('SELECT seq FROM search_messages WHERE convo_id=? AND seq<? ORDER BY seq DESC LIMIT ?')
+      .all(convoId, aroundSeq, before).map((r) => r.seq).reverse(),
+    ...db.prepare('SELECT seq FROM search_messages WHERE convo_id=? AND seq>=? ORDER BY seq LIMIT ?')
+      .all(convoId, aroundSeq, after).map((r) => r.seq),
+  ]
+  if (seqs.length === 0) return []
+  const placeholders = seqs.map(() => '?').join(',')
+  const rows = db.prepare(
+    `SELECT * FROM events WHERE convo_id=? AND seq IN (${placeholders}) ORDER BY seq`
+  ).all(convoId, ...seqs)
+  return rows.map(parseRow)
 }
 
 // `sender` defaults to the caller's own `user:<name>` identity (the original
