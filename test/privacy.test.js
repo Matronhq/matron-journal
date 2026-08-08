@@ -4,7 +4,7 @@ import WebSocket from 'ws'
 import { openDb, isPrivateDevice, pinDevicePrivate, unpinDevicePrivate, applyBridgePrivate } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
-import { startTestServer } from './helpers.js'
+import { startTestServer, makeWsClient } from './helpers.js'
 
 async function dbWithAgent() {
   const db = openDb(':memory:')
@@ -175,4 +175,57 @@ test('roster: privacy is per-user — another user roster is unaffected either w
   assert.ok(!r.json.agents.some((a) => a.device_id === ghost.deviceId))
   assert.deepEqual(r.json.conversations, [])
   await s.close()
+})
+
+// Extends privacyFixture with live sockets for kit (ordinary) and ghost
+// (private), and a room each manages.
+async function chatPrivacyFixture() {
+  const fx = await privacyFixture()
+  const kitWs = await makeWsClient(fx.s.base, { token: fx.kit.token, cursor: 0 })
+  await kitWs.waitFor((f) => f.op === 'hello_ok')
+  const ghostWs = await makeWsClient(fx.s.base, { token: fx.ghost.token, cursor: 0 })
+  await ghostWs.waitFor((f) => f.op === 'hello_ok')
+  kitWs.send({ op: 'convo_upsert', convo_id: 'kit-room', title: 'Kit room', session_state: 'running' })
+  ghostWs.send({ op: 'convo_upsert', convo_id: 'ghost-room', title: 'Ghost room', session_state: 'running' })
+  await new Promise((r) => setTimeout(r, 100))
+  return { ...fx, kitWs, ghostWs }
+}
+
+test('agent_invite: a private target answers not_found, byte-identical to an unknown id', async () => {
+  const { s, kitWs, ghost } = await chatPrivacyFixture()
+  kitWs.send({ op: 'agent_invite', room_id: 'kit-room', target_device_id: ghost.deviceId, justification: 'let me in' })
+  const priv = await kitWs.waitFor((f) => f.op === 'error' && f.ref === 'agent_invite')
+  kitWs.send({ op: 'agent_invite', room_id: 'kit-room', target_device_id: 999999, justification: 'let me in' })
+  const unknown = await kitWs.waitFor((f) => f.op === 'error' && f.ref === 'agent_invite' && f !== priv)
+  assert.equal(priv.code, 'not_found')
+  const strip = ({ ...f }) => f
+  assert.deepEqual(strip(priv), strip(unknown), 'frames identical — existence never confirmed')
+  kitWs.close(); await s.close()
+})
+
+test('agent_join: a private-owned room answers not_found like a room that does not exist', async () => {
+  const { s, kitWs } = await chatPrivacyFixture()
+  kitWs.send({ op: 'agent_join', room_id: 'ghost-room', justification: 'curious' })
+  const priv = await kitWs.waitFor((f) => f.op === 'error' && f.ref === 'agent_join')
+  kitWs.send({ op: 'agent_join', room_id: 'no-such-room', justification: 'curious' })
+  const unknown = await kitWs.waitFor((f) => f.op === 'error' && f.ref === 'agent_join' && f.room_id === 'no-such-room')
+  assert.equal(priv.code, 'not_found')
+  assert.equal(unknown.code, 'not_found')
+  kitWs.close(); await s.close()
+})
+
+test('a private agent keeps full outbound capability: it can invite an ordinary agent', async () => {
+  const { s, ghostWs, kit } = await chatPrivacyFixture()
+  ghostWs.send({ op: 'agent_invite', room_id: 'ghost-room', target_device_id: kit.deviceId, justification: 'need your eyes' })
+  const ack = await ghostWs.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  assert.equal(ack.room_id, 'ghost-room')
+  ghostWs.close(); await s.close()
+})
+
+test('a private agent can invite another private agent (the boundary is with ordinary agents)', async () => {
+  const { s, ghostWs, wraith } = await chatPrivacyFixture()
+  ghostWs.send({ op: 'agent_invite', room_id: 'ghost-room', target_device_id: wraith.deviceId, justification: 'ghost to wraith' })
+  const ack = await ghostWs.waitFor((f) => (f.kind === 'invite' && f.event === 'delivered') || f.op === 'error')
+  assert.equal(ack.event, 'delivered')
+  ghostWs.close(); await s.close()
 })

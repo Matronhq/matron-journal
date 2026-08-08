@@ -1,6 +1,6 @@
 import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
-import { applyBridgePrivate } from './db.js'
+import { applyBridgePrivate, isPrivateDevice } from './db.js'
 import { eventsAfter, append, markRead, upsertConversation, toEventShape, isClientOnlyEvent } from './journal.js'
 import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, undoInvite, getParticipant, expireInvites, parkInvite, awaitingCount, markDelivered, expireAwaiting } from './participants.js'
 import { isAllowed } from './allowances.js'
@@ -675,10 +675,14 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (msg.target_device_id === conn.deviceId) return fail('bad_request', 'cannot invite self')
         if (msg.topic != null && (typeof msg.topic !== 'string' || msg.topic.length > INVITE_TOPIC_MAX_CHARS)) return fail('bad_request', 'bad topic')
         if (typeof msg.justification !== 'string' || !msg.justification || msg.justification.length > INVITE_TEXT_MAX_CHARS) return fail('bad_request', 'bad justification')
-        // Unknown id, another user's device, and a client device are
-        // indistinguishable — anti-enumeration, same stance as agent_request.
-        const target = db.prepare('SELECT user_id, kind FROM devices WHERE id=?').get(msg.target_device_id)
-        if (!target || target.user_id !== conn.userId || target.kind !== 'agent') return fail('not_found')
+        // Unknown id, another user's device, a client device — and now a
+        // private device seen by an ORDINARY agent — are indistinguishable
+        // (spec: agent visibility & privacy; a distinct error would confirm
+        // the existence being hidden). A private CALLER passes: invisible,
+        // not blinded.
+        const target = db.prepare('SELECT user_id, kind, private FROM devices WHERE id=?').get(msg.target_device_id)
+        if (!target || target.user_id !== conn.userId || target.kind !== 'agent'
+          || (target.private === 1 && !isPrivateDevice(db, conn.deviceId))) return fail('not_found')
         const topic = sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS)
         const justification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
         // The raw-string check above only catches a literally empty string —
@@ -745,6 +749,9 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         if (typeof msg.justification !== 'string' || !msg.justification || msg.justification.length > INVITE_TEXT_MAX_CHARS) return fail('bad_request', 'bad justification')
         if (room.agent_device_id == null) return fail('conflict', 'room has no recorded owner to ask')
         if (room.agent_device_id === conn.deviceId) return fail('bad_request', 'cannot join own room')
+        // A room owned by a private device does not exist for an ordinary
+        // agent — same not_found loadRoom gives an unknown room id.
+        if (isPrivateDevice(db, room.agent_device_id) && !isPrivateDevice(db, conn.deviceId)) return fail('not_found')
         const justification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
         // See agent_invite's matching check: the raw-string check above only
         // catches a literally empty string, not whitespace/control chars
