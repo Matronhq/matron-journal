@@ -637,7 +637,7 @@ can never be rooms). Error frames for these five ops also carry
 inbound `room_id` was a well-formed id (non-empty string, ≤128 chars); a
 malformed id is never echoed back. Other ops' error frames are unchanged.
 
-- **`agent_invite {room_id, target_device_id, target_convo_id?, topic?, justification}`** —
+- **`agent_invite {room_id, target_device_id, target_convo_id?, from_convo_id?, topic?, justification}`** —
   only the room's own owner (`agent_device_id === conn.deviceId`) may send
   it (`forbidden` — "only the room owner may invite" — otherwise);
   `target_device_id` must be a different agent device of the same user
@@ -660,6 +660,14 @@ malformed id is never echoed back. Other ops' error frames are unchanged.
   consent) and relayed verbatim on the `request` frame; **omitted, never
   null**, when the caller sent none, so a receiver can tell "not addressed"
   from "addressed to nothing".
+
+  `from_convo_id` is its mirror image: optional, and naming **which of the
+  requester's own conversations** is doing the asking, so the consent card
+  can say who is asking rather than just which device. Validated the same
+  way and for the same reason — a top-level conversation this connection's
+  own device owns, else `not_found`. It is display-only: unlike
+  `target_convo_id` it is not persisted or relayed, only resolved to a title
+  for the card.
 
   What happens next depends on whether the user
   has already always-allowed this directed pair, `initiator_device_id ->
@@ -791,9 +799,39 @@ Payload:
   "from_name": "…",
   "target_device_id": 12,
   "topic": "…",
-  "justification": "…"
+  "justification": "…",
+  "from_convo_id": "…",
+  "from_convo_title": "…",
+  "to_name": "…",
+  "to_convo_id": "…",
+  "to_convo_title": "…"
 }
 ```
+
+The last five are **display-only** and exist so the card can state who is
+asking whom. `to_name` is the device on the far end — the invitee for an
+`invite`, the room's **owner** for a `join` — and is always populated. The
+two id/title pairs identify the two sessions, and are `""` when the
+requesting bridge named no conversation (`from_convo_id` / `target_convo_id`
+omitted), so a client must treat a blank as "not stated" rather than
+rendering an empty quote. Note `to_name` deliberately does not track
+`target_device_id` on a join: the field below names the row to answer, while
+`to_name` names who is being asked.
+
+Both id and title are sent because neither alone identifies a session to a
+user. Bridges seed a session title with a `"<box>:<first two of the convo
+id>"` prefix, which is what the conversation list displays — but a room's
+title has no prefix, a retitle can drop one, and two sessions can share
+wording. Clients should render the short id from the **id** and, so the
+same characters do not appear twice, leave the title alone when it already
+carries that prefix. A title is a snapshot taken when the ask was made: the
+card is an immutable event, so a later retitle does not rewrite it.
+
+`from_convo_id` is authorisation, not decoration, exactly as
+`target_convo_id` is: the requester may only name a top-level conversation
+its own device owns, else `not_found`. A title is shown to the user as the
+asker's identity, so an unchecked one would let a requester borrow another
+session's name to be trusted by.
 
 `target_device_id` is **the parked row's own device** — the invitee for an
 `invite`, and the requester itself for a `join` (a join self-targets, so

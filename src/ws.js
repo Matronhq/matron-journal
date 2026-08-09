@@ -60,6 +60,12 @@ const SESSION_OUTCOME_MAX_CHARS = 32
 // stays small, same defensive stance as ACTIVITY_DETAIL_MAX_CHARS.
 const INVITE_TOPIC_MAX_CHARS = 200
 const INVITE_TEXT_MAX_CHARS = 1000
+// Conversation titles quoted on a consent card to say WHICH session is
+// asking and which is being asked (spec: agent chat request naming). Titles
+// are agent-written, so they are peer text like from_name and get the same
+// sanitising; the cap is tighter than a topic's because these are rendered
+// as identity on one line, not as body copy.
+const CARD_TITLE_MAX_CHARS = 120
 // Consent-gate constants (spec: agent chat consent). AWAITING_USER_TTL_MS is
 // the 24h clock the sweep uses (see the sweep timer's expireAwaiting loop)
 // to expire a parked ask nobody ever answered. MAX_AWAITING_PER_REQUESTER
@@ -725,7 +731,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         // (spec: agent visibility & privacy; a distinct error would confirm
         // the existence being hidden). A private CALLER passes: invisible,
         // not blinded.
-        const target = db.prepare('SELECT user_id, kind, private FROM devices WHERE id=?').get(msg.target_device_id)
+        const target = db.prepare('SELECT user_id, kind, private, name FROM devices WHERE id=?').get(msg.target_device_id)
         if (!target || target.user_id !== conn.userId || target.kind !== 'agent'
           || (target.private === 1 && !isPrivateDevice(db, conn.deviceId))) return fail('not_found')
         // Which of the target's conversations this ask is FOR (spec: agent
@@ -739,15 +745,36 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         // gets: distinguishing "no such convo" from "not that device's"
         // would confirm the existence of conversations the caller cannot see.
         let targetConvoId = null
+        let toConvoTitle = ''
         if (msg.target_convo_id != null) {
           if (typeof msg.target_convo_id !== 'string' || !msg.target_convo_id) return fail('bad_request', 'bad target_convo_id')
           const targetConvo = db.prepare(
-            'SELECT owner_user_id, agent_device_id, parent_convo_id FROM conversations WHERE id=?'
+            'SELECT owner_user_id, agent_device_id, parent_convo_id, title FROM conversations WHERE id=?'
           ).get(msg.target_convo_id)
           if (!targetConvo || targetConvo.owner_user_id !== conn.userId
             || targetConvo.agent_device_id !== msg.target_device_id
             || targetConvo.parent_convo_id != null) return fail('not_found')
           targetConvoId = msg.target_convo_id
+          toConvoTitle = sanitizePeerText(targetConvo.title, CARD_TITLE_MAX_CHARS)
+        }
+        // Which of the REQUESTER's own conversations is doing the asking
+        // (spec: agent chat request naming). Same authorisation shape as
+        // target_convo_id above, and for the same reason turned around: a
+        // title is presented to the user as the asker's identity, so a
+        // requester naming a conversation it does not own would be
+        // borrowing someone else's name to be trusted by. Optional — a
+        // bridge that predates this field sends none and the card simply
+        // says less.
+        let fromConvoTitle = ''
+        if (msg.from_convo_id != null) {
+          if (typeof msg.from_convo_id !== 'string' || !msg.from_convo_id) return fail('bad_request', 'bad from_convo_id')
+          const fromConvo = db.prepare(
+            'SELECT owner_user_id, agent_device_id, parent_convo_id, title FROM conversations WHERE id=?'
+          ).get(msg.from_convo_id)
+          if (!fromConvo || fromConvo.owner_user_id !== conn.userId
+            || fromConvo.agent_device_id !== conn.deviceId
+            || fromConvo.parent_convo_id != null) return fail('not_found')
+          fromConvoTitle = sanitizePeerText(fromConvo.title, CARD_TITLE_MAX_CHARS)
         }
         const topic = sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS)
         const justification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
@@ -800,6 +827,24 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
             kind: 'agent_chat', request: 'invite', room_id: msg.room_id,
             from_device_id: conn.deviceId, from_name: sanitizePeerText(conn.name, PEER_NAME_CAP),
             target_device_id: msg.target_device_id, topic, justification,
+            // Display-only identity, alongside the routing ids above: who is
+            // asking, and who they want to talk to. Without these a client
+            // holds two opaque device ids and can only say "another agent",
+            // which is not something a user can consent to. to_name is
+            // always resolvable here; the two titles are blank when the
+            // bridge named no conversation.
+            // The ids travel alongside the titles because a title is
+            // mutable, agent-written, and not guaranteed to identify
+            // anything: bridges seed session titles with a "<box>:<first two
+            // of the id>" prefix, but a room's title has none, a retitle can
+            // drop one, and two sessions can end up with the same words. The
+            // id is the stable handle a client renders the short form from —
+            // and the one it would need to deep-link to the conversation.
+            from_convo_id: msg.from_convo_id ?? '',
+            from_convo_title: fromConvoTitle,
+            to_name: sanitizePeerText(target.name, PEER_NAME_CAP),
+            to_convo_id: targetConvoId ?? '',
+            to_convo_title: toConvoTitle,
           },
         })
         // Same ack as a relayed request: to the bridge, delivered means
@@ -823,6 +868,11 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         // catches a literally empty string, not whitespace/control chars
         // that sanitise down to ''.
         if (!justification) return fail('bad_request', 'bad justification')
+        // Room ownership was established above, so this row exists; `?.name`
+        // only guards the device being deleted between the two statements,
+        // in which case the card degrades to a nameless owner rather than
+        // throwing inside the op handler.
+        const ownerName = db.prepare('SELECT name FROM devices WHERE id=?').get(room.agent_device_id)?.name ?? ''
         if (isAllowed(db, conn.userId, conn.deviceId, room.agent_device_id)) {
           // Same pre-consent flow, verbatim, PLUS the delivery stamp.
           const r = inviteParticipant(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId, initiatorDeviceId: conn.deviceId, justification })
@@ -860,6 +910,15 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
             // below, whose target_device_id IS the owner — that frame reports
             // who was asked, not which row is pending.
             target_device_id: conn.deviceId, topic: '', justification,
+            // Display-only, mirroring the invite card. Note this deliberately
+            // does NOT follow target_device_id: that field names the row to
+            // answer (the joiner, self-targeted), whereas the user needs to
+            // read who is being asked to let them in — the room's owner.
+            from_convo_id: '',
+            from_convo_title: '',
+            to_name: sanitizePeerText(ownerName, PEER_NAME_CAP),
+            to_convo_id: '',
+            to_convo_title: '',
           },
         })
         conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: room.agent_device_id }))
