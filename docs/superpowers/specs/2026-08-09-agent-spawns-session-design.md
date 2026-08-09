@@ -159,6 +159,25 @@ agent_session_start({ device_id, workdir, task, topic? })
   (`oneLine`/`peerField`) before reaching the card — this text comes from an
   agent, and a newline in it must not forge a second line on a consent card.
 
+### Ask the user where, first
+
+The tool description instructs the calling agent, unconditionally:
+
+> If the user has not already said which box and directory the work should
+> happen in, ask them before calling this. They usually have a preference,
+> and the consent card can only be approved or declined — it cannot be
+> corrected.
+
+This is not a fallback for when the user is present; it is the normal path.
+A spawn cannot proceed without the user's tap regardless, so an agent that
+guesses saves nothing — it just moves the same wait to after the request,
+where a wrong guess costs a decline and a retry instead of one question.
+
+Consequently the card stays a plain approve/decline, and a decline stays a
+bare `declined` with no reason: the only thing a reason could usefully
+correct — the box or the directory — has already been agreed before the
+card exists.
+
 ### What the child wakes up to
 
 The **target bridge** composes the opening turn, not the parent — so a
