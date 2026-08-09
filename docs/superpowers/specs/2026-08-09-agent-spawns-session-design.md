@@ -82,12 +82,21 @@ with a timeout. Once it exists, folder discovery rides it for free.
 3. **Consent.** The journal publishes the card into the parent's own
    conversation, naming the parent session, the target box, the resolved
    workdir and the task text. One tap.
-4. **On approve.** The journal creates the room convo, records both agents
+4. **On approve.** The tap first *claims* the row: `UPDATE … SET
+   state='approved' … WHERE id=? AND state='awaiting_user'`, and a zero
+   row-count answers 409 and stops. Everything after this is expensive and
+   externally visible — a room, a live agent on another box — so nothing
+   starts until exactly one caller has won the claim. Two taps from two
+   devices therefore spawn once, which is what the failure table below
+   promises. The winner then creates the room convo, records both agents
    as `joined` (no second invite — approving the spawn approved the pair),
-   then issues `start` to the target bridge with `{workdir, prompt,
+   and issues `start` to the target bridge with `{workdir, prompt,
    room_id}`. The target bridge spawns, joins the room, and seeds the
-   child's first turn. The journal writes `child_convo_id` onto the row and
-   tells the parent, which surfaces as a turn.
+   child's first turn. The journal moves the row to `started`, writes
+   `room_id` and `child_convo_id` onto it, and tells the parent, which
+   surfaces as a turn. `approved` is thus the window in which a spawn is
+   authorised but not yet live — the state a journal restart mid-`start`
+   finds the row in, and the one the broker timeout resolves to `failed`.
 5. **On refuse / timeout / failure.** The row moves to `denied` / `expired` /
    `failed`; the parent hears exactly one outcome either way. A spawn that
    fails after approval closes the room with the epitaph line
@@ -123,10 +132,16 @@ consent path's history stays readable.
   no. Here there is no peer to hide behind; the parent must be told
   something, and inventing a box-side failure would send the agent off
   diagnosing a network problem that does not exist.
-- **A cap on outstanding asks per agent.** `convo_agents` already counts
-  pending asks per initiator (`countPendingByInitiator`); spawn requests
-  reuse it. Every-time consent makes the user's attention the throttle, and
-  a looping agent must not be able to stack forty cards against it.
+- **A cap on outstanding asks per agent.** Every-time consent makes the
+  user's attention the throttle, and a looping agent must not be able to
+  stack forty cards against it. The cap counts **both** tables: pending
+  spawn rows live in `agent_spawn_requests`, so reusing `convo_agents`'
+  `countPendingByInitiator` unchanged would leave spawn cards uncapped
+  while chat invites stayed capped — and an agent that has exhausted its
+  chat-invite budget could still spawn freely. One `countPendingAsks(db,
+  fromDeviceId)` sums `awaiting_user` rows across both, and both surfaces
+  check it against one shared limit. What the user is being protected from
+  is cards, not any one table's cards.
 
 **No depth cap.** A child may itself spawn a grandchild; every link costs
 the user a tap, which is a better throttle than a number, and the second
@@ -174,9 +189,14 @@ guesses saves nothing — it just moves the same wait to after the request,
 where a wrong guess costs a decline and a retry instead of one question.
 
 Consequently the card stays a plain approve/decline, and a decline stays a
-bare `declined` with no reason: the only thing a reason could usefully
-correct — the box or the directory — has already been agreed before the
-card exists.
+bare `declined` with no reason. The box and the directory — the two fields
+a reason could usefully correct — have already been agreed before the card
+exists. The `task` has not: it is agent-authored, it is executed verbatim,
+and the user may well decline precisely because it is wrong. That is
+accepted rather than solved. The parent is in an open conversation with
+the user, so the correction arrives there, in the user's own words, and
+the parent asks again — which is a better channel for "not like that" than
+any structured reason code, and keeps the card itself a single tap.
 
 ### What the child wakes up to
 
@@ -287,8 +307,11 @@ Every request resolves exactly once, and the parent is told exactly once.
 
 - **Journal:** state machine transitions; op authorization in both
   directions (agent-only ops reject clients, the answer endpoint rejects
-  agents); broker timeout; expiry sweep; the pending-ask cap; the
-  anti-enumeration 404s.
+  agents); broker timeout; expiry sweep; the anti-enumeration 404s. Two
+  cases earn named tests: the pending-ask cap counted across *both* tables
+  (spawn rows alone, chat rows alone, and a mix that trips the limit only
+  when summed), and a second approve on a claimed row answering 409 without
+  creating a second room.
 - **Bridge:** handler-factory unit tests (the `agent-chat.test.js` pattern),
   plus source-inspection pins in `index.js` for wiring that cannot be
   imported in-process.
