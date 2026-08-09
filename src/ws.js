@@ -833,8 +833,17 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
             // which is not something a user can consent to. to_name is
             // always resolvable here; the two titles are blank when the
             // bridge named no conversation.
+            // The ids travel alongside the titles because a title is
+            // mutable, agent-written, and not guaranteed to identify
+            // anything: bridges seed session titles with a "<box>:<first two
+            // of the id>" prefix, but a room's title has none, a retitle can
+            // drop one, and two sessions can end up with the same words. The
+            // id is the stable handle a client renders the short form from —
+            // and the one it would need to deep-link to the conversation.
+            from_convo_id: msg.from_convo_id ?? '',
             from_convo_title: fromConvoTitle,
             to_name: sanitizePeerText(target.name, PEER_NAME_CAP),
+            to_convo_id: targetConvoId ?? '',
             to_convo_title: toConvoTitle,
           },
         })
@@ -905,8 +914,10 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
             // does NOT follow target_device_id: that field names the row to
             // answer (the joiner, self-targeted), whereas the user needs to
             // read who is being asked to let them in — the room's owner.
+            from_convo_id: '',
             from_convo_title: '',
             to_name: sanitizePeerText(ownerName, PEER_NAME_CAP),
+            to_convo_id: '',
             to_convo_title: '',
           },
         })

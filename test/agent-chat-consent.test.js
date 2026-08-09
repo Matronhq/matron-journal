@@ -917,8 +917,10 @@ test('invite card names both ends: requesting session, target device, target ses
 
   const card = await client.waitFor(isCard)
   assert.equal(card.payload.from_name, 'dev-a')
+  assert.equal(card.payload.from_convo_id, 'mine')
   assert.equal(card.payload.from_convo_title, 'Syncing bridge services')
   assert.equal(card.payload.to_name, 'dev-b')
+  assert.equal(card.payload.to_convo_id, 'work')
   assert.equal(card.payload.to_convo_title, 'text carry and fitting parity')
   // The routing field keeps its existing meaning; the names are additive.
   assert.equal(card.payload.target_device_id, agB.deviceId)
@@ -933,7 +935,9 @@ test('invite card from a pre-3.5 bridge: names what it can, omits what it was no
   // The target device is always resolvable from target_device_id, so the
   // card never degrades to "another agent" even against an old bridge.
   assert.equal(card.payload.to_name, 'dev-b')
+  assert.equal(card.payload.to_convo_id, '')
   assert.equal(card.payload.to_convo_title, '')
+  assert.equal(card.payload.from_convo_id, '')
   assert.equal(card.payload.from_convo_title, '')
 })
 
