@@ -24,7 +24,13 @@ It is a prerequisite for `docs/superpowers/specs/2026-08-09-agent-spawns-session
 
 ## Compatibility note for the reviewer
 
-Shipped App Store builds (Apple 1.0.3, Android v0.1.5) contain an allowances screen that calls `GET /agent-chat/allowances`. After Task 3 that screen gets a 404 and shows its error state until those apps are updated. This is accepted: the screen can only ever have listed rows that no longer exist. The apps' own removal is a separate PR per platform, tracked outside this plan.
+Shipped App Store builds (Apple 1.0.3, Android v0.1.5) contain an allowances screen that calls `GET /agent-chat/allowances`. After Task 3 that screen gets a 404 and shows its error state until those apps are updated. This is accepted: the screen can only ever have listed rows that no longer exist.
+
+That screen is not the only break, and not the important one. The live consent card itself carries an "always allow" toggle on both shipped platforms — `MatronShared/Sources/DesignSystem/AgentChatRequestCard.swift:102` (iOS/Mac) and `app/src/main/java/chat/matron/android/designsystem/AgentChatRequestCard.kt:116` (Android). Both clients send the field only when that toggle is on: `if alwaysAllow, decision == .approve { body["always_allow"] = true }` (`JournalAPI.swift:503`) and `if (alwaysAllow && decision == AgentChatDecision.APPROVE) put("always_allow", true)` (`JournalApi.kt:408`). Both default the toggle to off, so an ordinary approval from shipped Apple 1.0.3 / Android v0.1.5 never sets the field and keeps working unchanged. But a user who flips the toggle and taps Approve now gets `400 {error:'bad_request'}` from `POST /agent-chat/answer` (per the global constraint above) and **cannot approve the request at all** — a broken primary action, not a broken settings screen. It fails closed, which is correct, but it is a real regression for any user who has that toggle on, until the app is updated.
+
+Consequence: this journal change must land after, or alongside, the per-platform app PRs that remove the toggle. Do not deploy this journal change first and leave shipped apps carrying a live "always allow" switch that 400s.
+
+**Deploy note — mid-upgrade window.** `DROP TABLE IF EXISTS agent_chat_allowances` runs on every `openDb`. If a new-code process (a new `matron-admin` CLI invocation, or a new server) opens the live database while an old server process is still running, the table vanishes under the old process and its `isAllowed` prepared statement throws `no such table`, surfacing as `{code:'internal'}` on every `agent_invite` until the old process restarts. This is transient, restart-scoped, and fails closed, so it does not change the code — but it does mean: **stop the service before running any new-code CLI against the database**, and deploy the new server binary as a restart, not a rolling window where old and new processes share the database.
 
 ## File Structure
 

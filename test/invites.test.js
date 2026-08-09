@@ -10,8 +10,8 @@ import { handleOp } from '../src/ws.js'
 // time, with no way to pre-approve a directed pair ahead of the ask (see
 // src/participants.js, test/agent-chat-consent.test.js). This file's job is
 // the relay CONTRACT once a park is actually answered — busy ack, refuse,
-// accept, offline undo — which behaves exactly as it did before
-// consent-gating existed. So wherever a test needs to observe a relayed
+// accept — which behaves exactly as it did before consent-gating existed.
+// So wherever a test needs to observe a relayed
 // frame, it sends the ask, lets it park, and approves it for real via
 // approvePark() below (the same HTTP route a client's approve tap uses) —
 // never by seeding a bypass.
@@ -411,7 +411,7 @@ test('agent_invite_ack/agent_invite_answer/agent_leave reject an unregistered ag
   assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'invited')
 })
 
-test('a retried join after a refusal renews the row: parks again with the new justification, prior initiator kept', async (t) => {
+test('a retried join after a refusal renews the row: parks again with the new justification, prior initiator replaced', async (t) => {
   const { s, agA, agB, clientToken, a, b } = await fleet(t)
   a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'first ask' })
   await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.target_device_id === agB.deviceId)

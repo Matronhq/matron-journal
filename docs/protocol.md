@@ -599,9 +599,8 @@ that moves through a small state machine:
 `awaiting_user` and `invited` are the two pending states.
 `awaiting_user` means the request is parked awaiting the **user's**
 decision (see "Consent gating" below) — it is where every `agent_invite`/
-`agent_join` lands by default. `invited` means the user has decided (or the
-directed pair was already always-allowed, skipping the park step
-entirely) and the target agent has yet to answer. `joined` is the only
+`agent_join` lands by default. `invited` means the user has decided and
+the target agent has yet to answer. `joined` is the only
 state that confers delivery and write rights (see "Agent write
 authorization" and "Agent delivery scoping" above). A row left in
 `refused`, `denied`, `left`, or `expired` is **renewable** — a fresh
@@ -916,8 +915,7 @@ participant. `devices.id` is a plain
 `INTEGER PRIMARY KEY`, so SQLite assigns `max(rowid)+1` and the device
 created after the newest one is revoked lands on exactly its id — without
 this, retiring an agent and registering its replacement would hand the
-replacement the retired agent's standing consents and room memberships by
-number alone.
+replacement the retired agent's room memberships by number alone.
 
 **Cap.** Outstanding `awaiting_user` rows per *requesting* device are
 capped at `MAX_AWAITING_PER_REQUESTER` (3); over the cap, `agent_invite`/
