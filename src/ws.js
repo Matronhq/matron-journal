@@ -4,7 +4,7 @@ import { applyBridgePrivate, isPrivateDevice } from './db.js'
 import { eventsAfter, append, markRead, upsertConversation, toEventShape, isClientOnlyEvent } from './journal.js'
 import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, undoInvite, getParticipant, isKnownParticipant, expireInvites, parkInvite, awaitingCount, markDelivered, expireAwaiting } from './participants.js'
 import { isAllowed } from './allowances.js'
-import { sanitizePeerText } from './peer-text.js'
+import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
@@ -65,10 +65,10 @@ const INVITE_TEXT_MAX_CHARS = 1000
 // to expire a parked ask nobody ever answered. MAX_AWAITING_PER_REQUESTER
 // caps how many asks a single device can have parked at once, across every
 // room, so one chatty agent can't flood the user's attention queue.
-// PEER_NAME_CAP bounds the sanitised from_name embedded in a consent card.
+// (PEER_NAME_CAP, which bounds the sanitised from_name embedded in a consent
+// card, now lives in peer-text.js — http.js applies the same cap.)
 const AWAITING_USER_TTL_MS = 24 * 3600_000
 const MAX_AWAITING_PER_REQUESTER = 3
-const PEER_NAME_CAP = 80
 // Cap for a convo_upsert's rolling summary (spec: agent chat phase 2) — same
 // defensive stance as the invite text caps above.
 const SUMMARY_MAX_CHARS = 1000

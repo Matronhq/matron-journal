@@ -5,10 +5,17 @@ import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEven
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice } from './db.js'
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
-import { listAwaiting, answerParkedInvite, getParticipant } from './participants.js'
-import { addAllowance } from './allowances.js'
+import { listAwaiting, answerParkedInvite, getParticipant, forgetDeviceParticipation } from './participants.js'
+import { addAllowance, removeAllowance, listAllowances, forgetDeviceAllowances } from './allowances.js'
+import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
+
+// A device name on its way to a client: same sieve and cap the live consent
+// card's `from_name` gets. NULL stays null rather than collapsing to '' —
+// "this device is gone" and "this device is named the empty string" are
+// different facts, and the apps render the id instead for the former.
+const deviceName = (raw) => (raw == null ? null : sanitizePeerText(raw, PEER_NAME_CAP))
 
 const json = (res, status, obj) => {
   if (res.writableEnded || res.destroyed) return
@@ -350,7 +357,47 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // decision-making endpoint here; an agent has no business reading
         // its own or another agent's pending asks over HTTP.
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
-        return json(res, 200, { pending: listAwaiting(db, who.userId) })
+        // Device names go out through the same sieve the live card's
+        // `from_name` does: they land in a card in the user's app, and a
+        // newline in a device name is line forgery there just as it is in the
+        // journal's own voice.
+        const pending = listAwaiting(db, who.userId).map((r) => ({
+          ...r,
+          initiator_name: deviceName(r.initiator_name),
+          agent_name: deviceName(r.agent_name),
+        }))
+        return json(res, 200, { pending })
+      }
+      if (req.method === 'GET' && url.pathname === '/agent-chat/allowances') {
+        // The standing consents the user has granted ("always allow A → B"),
+        // so an app can show and revoke them. Client-gated: an agent must not
+        // be able to read which pairs the user has pre-approved — that is a
+        // map of what it could get away with asking for.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const allowances = listAllowances(db, who.userId).map((r) => ({
+          ...r,
+          from_name: deviceName(r.from_name),
+          target_name: deviceName(r.target_name),
+        }))
+        return json(res, 200, { allowances })
+      }
+      if (req.method === 'POST' && url.pathname === '/agent-chat/allowances/revoke') {
+        // Withdrawing a standing consent. Client-gated for the obvious reason
+        // and one less obvious: an agent able to revoke could clear an
+        // allowance covering a pair it wants re-asked, putting the ask back
+        // in front of the user on its own schedule.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const { from_device_id, target_device_id } = await readBody(req)
+        if (!Number.isInteger(from_device_id) || !Number.isInteger(target_device_id)) {
+          return json(res, 400, { error: 'bad_request' })
+        }
+        // `removed:false` for an allowance that was not there is a 200, not a
+        // 404: revocation is idempotent, and the user asking for a consent to
+        // be gone got what they asked for either way.
+        const removed = removeAllowance(db, {
+          userId: who.userId, fromDeviceId: from_device_id, targetDeviceId: target_device_id,
+        })
+        return json(res, 200, { ok: true, removed })
       }
       if (req.method === 'POST' && url.pathname === '/agent-chat/answer') {
         // Client-gated: an agent must never answer a consent ask, including
@@ -428,7 +475,15 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // Deleting the row IS the revocation (docs/protocol.md "Device
         // revocation"): HTTP 401s on the next call, WS closes next-frame or
         // via the ≤60s sweep. Not-owned and nonexistent are indistinguishable.
-        if (!revokeOwnedDevice(db, who.userId, Number(dm[1]))) return json(res, 404, { error: 'not_found' })
+        const revokedId = Number(dm[1])
+        if (!revokeOwnedDevice(db, who.userId, revokedId)) return json(res, 404, { error: 'not_found' })
+        // `devices.id` is a plain INTEGER PRIMARY KEY, so SQLite hands the
+        // highest deleted rowid to the next device created. Anything keyed on
+        // a device id therefore has to be cleared with the device, or a brand
+        // new agent inherits the revoked one's standing consent (allowances)
+        // and room membership (convo_agents) purely by number.
+        forgetDeviceAllowances(db, who.userId, revokedId)
+        forgetDeviceParticipation(db, who.userId, revokedId)
         return json(res, 200, { ok: true })
       }
       if (req.method === 'POST' && url.pathname === '/pair/approve') {

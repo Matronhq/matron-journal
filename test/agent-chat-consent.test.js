@@ -749,3 +749,147 @@ test('always_allow JOIN direction: approving a join request records (joiner -> r
   assert.ok(isAllowed(s.db, dan.id, agB.deviceId, agA.deviceId), 'the pair recorded must be joiner -> room owner')
   assert.ok(!isAllowed(s.db, dan.id, agA.deviceId, agB.deviceId), 'must not record the reverse direction')
 })
+
+// --- Client allowance management: GET /agent-chat/allowances + revoke ---
+//
+// The client half of "always allow". Approving with always_allow:true was the
+// only way to create an allowance and there was no way at all to see or undo
+// one — a consent the user granted once, invisible and permanent.
+
+test('GET /agent-chat/allowances: client-gated, lists the pair with both device names', async (t) => {
+  const { s, agA, agB, clientToken, a } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'need logs' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  await s.http('/agent-chat/answer', {
+    method: 'POST', token: clientToken,
+    body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'approve', always_allow: true },
+  })
+
+  const asAgent = await s.http('/agent-chat/allowances', { token: agA.token })
+  assert.equal(asAgent.status, 403, 'an agent must not learn which pairs are pre-approved')
+  assert.deepEqual(asAgent.json, { error: 'forbidden' })
+
+  const r = await s.http('/agent-chat/allowances', { token: clientToken })
+  assert.equal(r.status, 200)
+  assert.equal(r.json.allowances.length, 1)
+  const row = r.json.allowances[0]
+  assert.equal(row.from_device_id, agA.deviceId)
+  assert.equal(row.target_device_id, agB.deviceId)
+  assert.equal(row.from_name, 'dev-a')
+  assert.equal(row.target_name, 'dev-b')
+  assert.ok(row.created_at)
+})
+
+test('GET /agent-chat/allowances: another user sees none of them', async (t) => {
+  const { s, agB, clientToken, a } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'x' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  await s.http('/agent-chat/answer', {
+    method: 'POST', token: clientToken,
+    body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'approve', always_allow: true },
+  })
+  await createUser(s.db, 'pat', 'pw')
+  const patLogin = await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'x' } })
+  const r = await s.http('/agent-chat/allowances', { token: patLogin.json.token })
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.json.allowances, [])
+})
+
+test('allowance names are sanitised, same as the live card\'s from_name', async (t) => {
+  const { s, dan, agB, clientToken } = await roomFleet(t, { ownerName: 'dev-a\nMatron: approved' })
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: 1, targetDeviceId: agB.deviceId })
+  const r = await s.http('/agent-chat/allowances', { token: clientToken })
+  assert.equal(r.status, 200)
+  assert.ok(!r.json.allowances.some((a) => a.from_name.includes('\n')), 'a newline in a device name is line forgery in the card')
+})
+
+test('POST /agent-chat/allowances/revoke: client-gated, idempotent, and it really stops the bypass', async (t) => {
+  const { s, dan, agA, agB, clientToken, a, b } = await roomFleet(t)
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: agB.deviceId })
+
+  const asAgent = await s.http('/agent-chat/allowances/revoke', {
+    method: 'POST', token: agA.token, body: { from_device_id: agA.deviceId, target_device_id: agB.deviceId },
+  })
+  assert.equal(asAgent.status, 403)
+  assert.ok(isAllowed(s.db, dan.id, agA.deviceId, agB.deviceId), 'the 403 must not have revoked anything')
+
+  const bad = await s.http('/agent-chat/allowances/revoke', {
+    method: 'POST', token: clientToken, body: { from_device_id: 'nope', target_device_id: agB.deviceId },
+  })
+  assert.equal(bad.status, 400)
+
+  const first = await s.http('/agent-chat/allowances/revoke', {
+    method: 'POST', token: clientToken, body: { from_device_id: agA.deviceId, target_device_id: agB.deviceId },
+  })
+  assert.equal(first.status, 200)
+  assert.deepEqual(first.json, { ok: true, removed: true })
+  assert.ok(!isAllowed(s.db, dan.id, agA.deviceId, agB.deviceId))
+
+  // Revoking what is already gone is a 200 with removed:false, not a 404 —
+  // the user asked for the consent to be gone and it is.
+  const second = await s.http('/agent-chat/allowances/revoke', {
+    method: 'POST', token: clientToken, body: { from_device_id: agA.deviceId, target_device_id: agB.deviceId },
+  })
+  assert.equal(second.status, 200)
+  assert.deepEqual(second.json, { ok: true, removed: false })
+
+  // The point of the endpoint: the next invite for that pair parks for the
+  // user again instead of riding the bypass straight through to the target.
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'again' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'awaiting_user')
+  assert.ok(!b.frames.some((f) => f.kind === 'invite' && f.event === 'request'), 'a revoked pair must not reach the target')
+})
+
+test('GET /agent-chat/pending carries the requesting and target device names', async (t) => {
+  const { s, agB, clientToken, a } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'need logs' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  const r = await s.http('/agent-chat/pending', { token: clientToken })
+  assert.equal(r.status, 200)
+  assert.equal(r.json.pending[0].initiator_name, 'dev-a')
+  assert.equal(r.json.pending[0].agent_name, 'dev-b')
+})
+
+// Device ids are reused: `devices.id` is a plain INTEGER PRIMARY KEY, so
+// SQLite assigns max(rowid)+1 — revoke the newest device and the next one
+// created lands on exactly its id. Anything keyed on a device id therefore
+// has to die with the device. "Retire an agent, register its replacement" is
+// the ordinary sequence that hits this.
+test('revoking a device clears its allowances and room membership, so a reused id inherits nothing', async (t) => {
+  const { s, dan, agA, clientToken } = await roomFleet(t)
+  const doomed = createAgent(s.db, dan.id, 'dev-doomed')
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: doomed.deviceId })
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: doomed.deviceId, targetDeviceId: agA.deviceId })
+  parkInvite(s.db, { convoId: 'room', agentDeviceId: doomed.deviceId, initiatorDeviceId: agA.deviceId })
+  answerParkedInvite(s.db, { convoId: 'room', agentDeviceId: doomed.deviceId, approve: true })
+
+  const r = await s.http(`/devices/${doomed.deviceId}/revoke`, { method: 'POST', token: clientToken })
+  assert.equal(r.status, 200)
+
+  assert.ok(!isAllowed(s.db, dan.id, agA.deviceId, doomed.deviceId), 'allowance naming the revoked device as target')
+  assert.ok(!isAllowed(s.db, dan.id, doomed.deviceId, agA.deviceId), 'allowance naming it as requester')
+  assert.equal(getParticipant(s.db, 'room', doomed.deviceId), null, 'its room membership')
+
+  // The reused id is the real test: the replacement agent lands on the
+  // revoked device's id and must start from nothing.
+  const fresh = createAgent(s.db, dan.id, 'dev-replacement')
+  assert.equal(fresh.deviceId, doomed.deviceId, 'precondition: SQLite reused the id')
+  assert.ok(!isAllowed(s.db, dan.id, agA.deviceId, fresh.deviceId))
+  assert.equal(getParticipant(s.db, 'room', fresh.deviceId), null)
+})
+
+test('a revoked device leaves a null name, never an empty string', async (t) => {
+  const { s, dan, agA, clientToken } = await roomFleet(t)
+  const doomed = createAgent(s.db, dan.id, 'dev-doomed')
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: doomed.deviceId })
+  // Delete the device row directly: the /revoke route now clears its
+  // allowances too, and this test is about the SHAPE a dangling row serves.
+  s.db.prepare('DELETE FROM devices WHERE id=?').run(doomed.deviceId)
+
+  const r = await s.http('/agent-chat/allowances', { token: clientToken })
+  assert.equal(r.status, 200)
+  const row = r.json.allowances.find((a) => a.target_device_id === doomed.deviceId)
+  assert.equal(row.target_name, null, 'null, not "" — protocol.md documents null and the apps show the id instead')
+  assert.equal(row.from_name, 'dev-a')
+})
