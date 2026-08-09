@@ -4,7 +4,6 @@ import WebSocket from 'ws'
 import { openDb, isPrivateDevice, pinDevicePrivate, unpinDevicePrivate, applyBridgePrivate } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
-import { addAllowance } from '../src/allowances.js'
 import { getParticipant, answerParkedInvite } from '../src/participants.js'
 import { startTestServer, makeWsClient } from './helpers.js'
 
@@ -216,6 +215,19 @@ async function chatPrivacyFixture() {
   return { ...fx, kitWs, ghostWs }
 }
 
+// Approves a parked ask via the same HTTP route a client's approve tap
+// takes — Task 1 removed the standing-allowance fast path that used to let
+// a test seed immediate relay directly; this is the real state machine's
+// route to a drawn-in participant, not a DB shortcut.
+async function approvePark(s, clientToken, roomId, participantDeviceId) {
+  const r = await s.http('/agent-chat/answer', {
+    method: 'POST', token: clientToken,
+    body: { room_id: roomId, target_device_id: participantDeviceId, decision: 'approve' },
+  })
+  assert.equal(r.status, 200, 'approving the park must succeed')
+  return r.json
+}
+
 test('agent_invite: a private target answers not_found, byte-identical to an unknown id', async () => {
   const { s, kitWs, ghost } = await chatPrivacyFixture()
   kitWs.send({ op: 'agent_invite', room_id: 'kit-room', target_device_id: ghost.deviceId, justification: 'let me in' })
@@ -305,14 +317,13 @@ test('agent_join: a private caller (wraith) passes the room-privacy gate on anot
 })
 
 test('the drawn-in flow: once ghost invites kit and kit accepts, kit can answer and later leave — no step is rejected not_found', async () => {
-  const { s, userId, ghost, kit, ghostWs, kitWs } = await chatPrivacyFixture()
-  // Standing allowance bypasses the park-for-consent step so the invite
-  // relays straight to kit's own socket and reaches 'invited' — this is
-  // the real state machine's route to a drawn-in participant, not a DB
-  // shortcut (see test/agent-chat-consent.test.js: "an allowed pair
-  // bypasses the park entirely").
-  addAllowance(s.db, { userId, fromDeviceId: ghost.deviceId, targetDeviceId: kit.deviceId })
+  const { s, clientToken, ghost, kit, ghostWs, kitWs } = await chatPrivacyFixture()
   ghostWs.send({ op: 'agent_invite', room_id: 'ghost-room', target_device_id: kit.deviceId, justification: 'need your eyes' })
+  await ghostWs.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.target_device_id === kit.deviceId)
+  // Every ask parks for the user's consent now (Task 1 removed the
+  // standing-allowance fast path) — approve it for real, the state
+  // machine's own route to a drawn-in participant.
+  await approvePark(s, clientToken, 'ghost-room', kit.deviceId)
   const req = await kitWs.waitFor((f) => f.kind === 'invite' && f.event === 'request')
   assert.equal(req.room_id, 'ghost-room')
   // Pin the exemption's actual precondition (fix-round-2 finding): this

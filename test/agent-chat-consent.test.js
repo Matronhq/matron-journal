@@ -256,27 +256,6 @@ test('a 4th outstanding request from one requester device is rejected before par
   assert.equal(getParticipant(s.db, rooms[3], agB.deviceId), null)
 })
 
-test('an allowed pair bypasses the park entirely: immediate relay, invited+delivered row, no card', async (t) => {
-  const { s, dan, agA, agB, a, b, client } = await roomFleet(t)
-  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: agB.deviceId })
-  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'need logs' })
-
-  const req = await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
-  assert.equal(req.room_id, 'room')
-  assert.equal(req.from_name, 'dev-a')
-  assert.equal(req.topic, 'ci')
-  assert.equal(req.justification, 'need logs')
-  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.target_device_id === agB.deviceId)
-
-  const row = getParticipant(s.db, 'room', agB.deviceId)
-  assert.equal(row.state, 'invited')
-  assert.ok(row.delivered_at != null, 'the allowance path stamps delivery, unlike the old pre-Task-7 flow')
-
-  await new Promise((r) => setTimeout(r, 100))
-  assert.ok(!client.frames.some((f) => f.kind === 'journal' && f.type === 'permission_request'),
-    'no consent card is published when a standing allowance covers the pair')
-})
-
 test('agent_join parks for user consent symmetrically: the room owner hears nothing, the requester gets delivered, and the card requests join', async (t) => {
   const { agA, agB, client, a, b } = await roomFleet(t)
   b.send({ op: 'agent_join', room_id: 'room', justification: 'let me help with this bug' })
@@ -708,48 +687,6 @@ test('POST /agent-chat/answer: a non-integer target_device_id is 400', async (t)
   assert.deepEqual(r.json, { error: 'bad_request' })
 })
 
-test('always_allow:true on approve records the directed pair; a following agent_invite between them relays immediately', async (t) => {
-  const { s, agB, clientToken, a, b } = await roomFleet(t)
-  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'need logs' })
-  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
-
-  const r = await s.http('/agent-chat/answer', {
-    method: 'POST', token: clientToken,
-    body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'approve', always_allow: true },
-  })
-  assert.equal(r.status, 200)
-  await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
-
-  // A second room, second invite for the same directed pair: the allowance
-  // just recorded must bypass the park entirely (Task 7's allowance-bypass
-  // path), so no HTTP approval is needed this time.
-  a.send({ op: 'convo_upsert', convo_id: 'room2', title: 'room2', session_state: 'running' })
-  await a.waitFor((f) => f.kind === 'journal' && f.type === 'session_status' && f.convo_id === 'room2')
-  a.frames.length = 0
-  b.frames.length = 0
-
-  a.send({ op: 'agent_invite', room_id: 'room2', target_device_id: agB.deviceId, topic: 'ci2', justification: 'again' })
-  const req2 = await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
-  assert.equal(req2.room_id, 'room2')
-  assert.equal(getParticipant(s.db, 'room2', agB.deviceId).state, 'invited')
-  assert.ok(getParticipant(s.db, 'room2', agB.deviceId).delivered_at != null)
-})
-
-test('always_allow JOIN direction: approving a join request records (joiner -> room owner), never the reverse', async (t) => {
-  const { s, dan, agA, agB, clientToken, b } = await roomFleet(t)
-  b.send({ op: 'agent_join', room_id: 'room', justification: 'let me help with this bug' })
-  await b.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
-
-  const r = await s.http('/agent-chat/answer', {
-    method: 'POST', token: clientToken,
-    body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'approve', always_allow: true },
-  })
-  assert.equal(r.status, 200)
-
-  assert.ok(isAllowed(s.db, dan.id, agB.deviceId, agA.deviceId), 'the pair recorded must be joiner -> room owner')
-  assert.ok(!isAllowed(s.db, dan.id, agA.deviceId, agB.deviceId), 'must not record the reverse direction')
-})
-
 // --- Client allowance management: GET /agent-chat/allowances + revoke ---
 //
 // The client half of "always allow". Approving with always_allow:true was the
@@ -982,4 +919,66 @@ test('join card names the room owner it is asking to be let in by', async (t) =>
   assert.equal(card.payload.request, 'join')
   assert.equal(card.payload.from_name, 'dev-b')
   assert.equal(card.payload.to_name, 'dev-a', 'the owner being asked, not the joiner')
+})
+
+// --- Task 1: every invite parks — the pre-approval gate is gone -----------
+
+test('a pre-existing allowance no longer relays: the invite parks and the user still gets a card', async (t) => {
+  const { s, dan, agA, agB, client, a } = await roomFleet(t)
+  // The row the old fast path keyed on. Seeded directly rather than via
+  // always_allow:true so this test survives Task 2 deleting that field.
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: agB.deviceId })
+
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'work together', topic: 'x' })
+
+  const card = await client.waitFor((f) => f.kind === 'journal' && f.type === 'permission_request')
+  assert.equal(card.payload.request, 'invite')
+  assert.equal(card.payload.target_device_id, agB.deviceId)
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'awaiting_user')
+})
+
+test('a pre-existing allowance does not deliver to the target socket', async (t) => {
+  const { s, dan, agA, agB, b, a } = await roomFleet(t)
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: agB.deviceId })
+  b.frames.length = 0
+
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'work together', topic: 'x' })
+  // Give any erroneous relay a chance to arrive before asserting absence.
+  await a.waitFor((f) => f.kind === 'invite' || f.op === 'error' || f.kind === 'journal')
+
+  assert.equal(b.frames.filter((f) => f.kind === 'invite' && f.event === 'request').length, 0)
+})
+
+// agent_join carries its own isAllowed fast-path check in ws.js — a second
+// call site sharing the same import the brief has us delete, not called out
+// in the brief's Files list (which names only the agent_invite branch at the
+// old line 822) but broken by that deletion all the same: `isAllowed` would
+// go undefined at the join call site the moment the import goes, and the
+// plan's own Goal line ("every agent-chat invite and join asks the user,
+// every time") and the parent task's framing ("ws.js stops consulting
+// isAllowed") both cover it. Removed alongside the invite branch; pinned
+// here the same way.
+test('a pre-existing allowance no longer relays a join: the request parks and the user still gets a card', async (t) => {
+  const { s, dan, agA, agB, client, b } = await roomFleet(t)
+  // Direction matches the old join fast path: isAllowed(joiner, owner).
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: agB.deviceId, targetDeviceId: agA.deviceId })
+
+  b.send({ op: 'agent_join', room_id: 'room', justification: 'let me help' })
+
+  const card = await client.waitFor((f) => f.kind === 'journal' && f.type === 'permission_request')
+  assert.equal(card.payload.request, 'join')
+  assert.equal(card.payload.target_device_id, agB.deviceId)
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'awaiting_user')
+})
+
+test('a pre-existing allowance does not deliver a join request to the room owner socket', async (t) => {
+  const { s, dan, agA, agB, a, b } = await roomFleet(t)
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: agB.deviceId, targetDeviceId: agA.deviceId })
+  a.frames.length = 0
+
+  b.send({ op: 'agent_join', room_id: 'room', justification: 'let me help' })
+  // Give any erroneous relay a chance to arrive before asserting absence.
+  await b.waitFor((f) => f.kind === 'invite' || f.op === 'error' || f.kind === 'journal')
+
+  assert.equal(a.frames.filter((f) => f.kind === 'invite' && f.event === 'join_request').length, 0)
 })

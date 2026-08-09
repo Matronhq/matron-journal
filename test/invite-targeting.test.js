@@ -3,7 +3,6 @@ import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { getParticipant, parkInvite, answerParkedInvite } from '../src/participants.js'
-import { addAllowance } from '../src/allowances.js'
 import { deliverPendingInvites } from '../src/invite-delivery.js'
 
 // `target_convo_id` on agent_invite (spec: agent chat phase 3.5).
@@ -18,16 +17,19 @@ import { deliverPendingInvites } from '../src/invite-delivery.js'
 // Two halves are tested here: the journal RELAYS the target, and the journal
 // REFUSES to relay one the requester has no business naming.
 
-// Two agent devices under one user, each owning a conversation of its own,
-// with a standing allowance so invites take the immediate-relay path rather
-// than parking for consent (that path gets its own test below).
+// Two agent devices under one user, each owning a conversation of its own.
+// Tests that need to observe a relayed request frame approve the park for
+// real via approvePark() below (the same HTTP route a client's approve tap
+// uses) — Task 1 removed the standing-allowance fast path this fleet() used
+// to pre-seed for immediate relay.
 async function fleet(t) {
   const s = await startTestServer()
   t.after(() => s.close())
   const dan = await createUser(s.db, 'dan', 'pw')
   const agA = createAgent(s.db, dan.id, 'dev-a')
   const agB = createAgent(s.db, dan.id, 'dev-b')
-  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: agB.deviceId })
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const clientToken = login.json.token
   const a = await makeWsClient(s.base, { token: agA.token, cursor: null })
   const b = await makeWsClient(s.base, { token: agB.token, cursor: null })
   await a.waitFor((f) => f.op === 'hello_ok')
@@ -39,27 +41,42 @@ async function fleet(t) {
   await a.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
   b.send({ op: 'convo_upsert', convo_id: 'b-work', title: 'B at work', session_state: 'running' })
   await b.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
-  return { s, dan, agA, agB, a, b }
+  return { s, dan, agA, agB, clientToken, a, b }
+}
+
+// Approves a parked ask via the same HTTP route a client's approve tap
+// takes — the only way left to reach a relayed request frame now that every
+// ask parks (Task 1 removed the standing-allowance bypass).
+async function approvePark(s, clientToken, roomId, participantDeviceId) {
+  const r = await s.http('/agent-chat/answer', {
+    method: 'POST', token: clientToken,
+    body: { room_id: roomId, target_device_id: participantDeviceId, decision: 'approve' },
+  })
+  assert.equal(r.status, 200, 'approving the park must succeed')
+  return r.json
 }
 
 test('a valid target_convo_id rides along to the target on the relay path', async (t) => {
-  const { agB, a, b } = await fleet(t)
+  const { s, agB, clientToken, a, b } = await fleet(t)
   a.send({
     op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId,
     target_convo_id: 'b-work', justification: 'need your logs',
   })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.target_device_id === agB.deviceId)
+  await approvePark(s, clientToken, 'room', agB.deviceId)
   const req = await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
   assert.equal(req.target_convo_id, 'b-work',
     'without this the receiving bridge has nothing to aim at but a guess')
-  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.target_device_id === agB.deviceId)
 })
 
 test('an invite with no target_convo_id omits the field entirely', async (t) => {
-  const { agB, a, b } = await fleet(t)
+  const { s, agB, clientToken, a, b } = await fleet(t)
   // A pre-3.5 bridge sends none. The field must be ABSENT, not null: the
   // receiver distinguishes "not addressed" (fall back, suppress the user's
   // copy) from "addressed", and a null would read as the latter.
   a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'x' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.target_device_id === agB.deviceId)
+  await approvePark(s, clientToken, 'room', agB.deviceId)
   const req = await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
   assert.ok(!('target_convo_id' in req), 'absent, not null')
 })
