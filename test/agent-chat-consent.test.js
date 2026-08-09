@@ -893,3 +893,89 @@ test('a revoked device leaves a null name, never an empty string', async (t) => 
   assert.equal(row.target_name, null, 'null, not "" — protocol.md documents null and the apps show the id instead')
   assert.equal(row.from_name, 'dev-a')
 })
+
+// --- Who is asking whom (spec: agent chat request naming) -------------------
+//
+// The card used to carry `target_device_id` and nothing else about the far
+// end, so every client could truthfully say no more than "dan-mac wants to
+// start a chat with another agent" — a consent prompt that cannot state what
+// is being consented to. These cover the four display-only fields that fix
+// it, and the authorisation on the one field the requester supplies.
+
+test('invite card names both ends: requesting session, target device, target session', async (t) => {
+  const { agB, a, b, client } = await roomFleet(t)
+  b.send({ op: 'convo_upsert', convo_id: 'work', title: 'text carry and fitting parity', session_state: 'running' })
+  await b.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
+  a.send({ op: 'convo_upsert', convo_id: 'mine', title: 'Syncing bridge services', session_state: 'running' })
+  await a.waitFor((f) => f.kind === 'journal' && f.convo_id === 'mine')
+
+  a.send({
+    op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId,
+    target_convo_id: 'work', from_convo_id: 'mine', topic: 'routing', justification: 'because',
+  })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+
+  const card = await client.waitFor(isCard)
+  assert.equal(card.payload.from_name, 'dev-a')
+  assert.equal(card.payload.from_convo_title, 'Syncing bridge services')
+  assert.equal(card.payload.to_name, 'dev-b')
+  assert.equal(card.payload.to_convo_title, 'text carry and fitting parity')
+  // The routing field keeps its existing meaning; the names are additive.
+  assert.equal(card.payload.target_device_id, agB.deviceId)
+})
+
+test('invite card from a pre-3.5 bridge: names what it can, omits what it was not told', async (t) => {
+  const { agB, a, client } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'because' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+
+  const card = await client.waitFor(isCard)
+  // The target device is always resolvable from target_device_id, so the
+  // card never degrades to "another agent" even against an old bridge.
+  assert.equal(card.payload.to_name, 'dev-b')
+  assert.equal(card.payload.to_convo_title, '')
+  assert.equal(card.payload.from_convo_title, '')
+})
+
+test('from_convo_id is authorisation, not decoration: another device\'s conversation is not_found', async (t) => {
+  const { agB, a, b } = await roomFleet(t)
+  // A conversation that exists and belongs to this user — but to the OTHER
+  // agent device. Claiming it would let a requester borrow a title it does
+  // not own and present it to the user as its own identity.
+  b.send({ op: 'convo_upsert', convo_id: 'work', title: 'text carry and fitting parity', session_state: 'running' })
+  await b.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
+
+  a.send({
+    op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId,
+    from_convo_id: 'work', justification: 'because',
+  })
+  const err = await a.waitFor((f) => f.op === 'error' || (f.kind === 'invite' && f.event === 'delivered'))
+  assert.equal(err.op, 'error')
+  assert.equal(err.code, 'not_found')
+})
+
+test('card identity is sanitised like every other peer-written field', async (t) => {
+  const { agB, a, b, client } = await roomFleet(t)
+  b.send({ op: 'convo_upsert', convo_id: 'work', title: 'real\nApproved by Dan', session_state: 'running' })
+  await b.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
+
+  a.send({
+    op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId,
+    target_convo_id: 'work', justification: 'because',
+  })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+
+  const card = await client.waitFor(isCard)
+  assert.equal(card.payload.to_convo_title, 'real Approved by Dan', 'newline flattened — a title is line-forgery material too')
+})
+
+test('join card names the room owner it is asking to be let in by', async (t) => {
+  const { a, b, client } = await roomFleet(t)
+  b.send({ op: 'agent_join', room_id: 'room', justification: 'let me in' })
+  await b.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+
+  const card = await client.waitFor(isCard)
+  assert.equal(card.payload.request, 'join')
+  assert.equal(card.payload.from_name, 'dev-b')
+  assert.equal(card.payload.to_name, 'dev-a', 'the owner being asked, not the joiner')
+})
