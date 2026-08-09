@@ -163,6 +163,20 @@ export function openDb(path) {
   if (!deviceCols.some((c) => c.name === 'private_pinned')) {
     db.exec('ALTER TABLE devices ADD COLUMN private_pinned INTEGER NOT NULL DEFAULT 0')
   }
+  // An APNs token names a physical app install, so at most one device row may
+  // hold it. Re-pairing creates a NEW device row, and until setApnsRegistration
+  // learned to claim the token, every superseded row kept it: on dev-2 one Mac
+  // token was spread across 18 rows, so a single event fanned out as 18 sends
+  // to the same device and APNs 429'd all but one (~9,300 rate_limited in a
+  // day). Collapse the historical duplicates, newest row wins — it is the live
+  // registration, the older ones are dead re-pairs. Runs before the unique
+  // index below, which is what keeps the invariant true from here on.
+  db.exec(`
+    UPDATE devices SET apns_token=NULL, apns_env=NULL
+     WHERE apns_token IS NOT NULL
+       AND id < (SELECT MAX(d2.id) FROM devices d2 WHERE d2.apns_token = devices.apns_token)
+  `)
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_apns_token ON devices(apns_token) WHERE apns_token IS NOT NULL')
   // Which agent device manages this conversation — recorded by convo_upsert,
   // read by the delivery scoping in ws.js/hub.js. NULL (every row predating
   // this column, or a convo whose bridge hasn't re-upserted yet) means
@@ -277,7 +291,20 @@ export function userBlobBytes(db, userId) {
 // `apnsToken: null` unregisters (both columns cleared together — a token
 // without a known environment is unsendable, so they're always set/cleared
 // as a pair).
+//
+// Registering CLAIMS the token: any other row still holding it is cleared
+// first, across users as well as within one. A token names a physical app
+// install, and re-pairing mints a fresh device row rather than reusing the
+// old one, so without this every re-pair left another row pointing at the
+// same device — the push pipeline then sent one event N times to it and APNs
+// 429'd the surplus. The cross-user case is a privacy rule as much as a
+// rate-limit one: a device handed to someone else must stop receiving its
+// previous owner's notifications. Unregistering scavenges nothing — it
+// touches only the caller's own row.
 export function setApnsRegistration(db, deviceId, { apnsToken, apnsEnv }) {
+  if (apnsToken != null) {
+    db.prepare('UPDATE devices SET apns_token=NULL, apns_env=NULL WHERE apns_token=? AND id<>?').run(apnsToken, deviceId)
+  }
   db.prepare('UPDATE devices SET apns_token=?, apns_env=? WHERE id=?').run(apnsToken, apnsEnv, deviceId)
 }
 

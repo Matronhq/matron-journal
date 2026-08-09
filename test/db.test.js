@@ -280,3 +280,102 @@ test('search schema: UNIQUE(user_id, seq) makes re-inserts with OR IGNORE no-ops
   assert.equal(db.prepare("SELECT COUNT(*) n FROM search_fts WHERE search_fts MATCH 'hello'").get().n, 1)
   db.close()
 })
+
+// An APNs token identifies a physical app install, so at most ONE device row
+// may hold it. The bug this pins: every re-pair of the Mac app created a fresh
+// device row and left the old rows holding the same live token, so one push
+// fanned out to 18 rows — 18 sends to one device, 17 of them 429 rate_limited
+// by APNs.
+test('registering an APNs token clears it from every other device row', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const mk = (hash) => db.prepare(
+    "INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(?,'client','mac',?,0)"
+  ).run(dan.id, hash).lastInsertRowid
+
+  const old = mk('h-old')
+  const fresh = mk('h-fresh')
+  setApnsRegistration(db, old, { apnsToken: 'mac-token', apnsEnv: 'sandbox' })
+  setApnsRegistration(db, fresh, { apnsToken: 'mac-token', apnsEnv: 'sandbox' })
+
+  const rows = clientDevicesForPush(db, dan.id)
+  assert.deepEqual(rows.map((r) => r.id), [fresh], 'only the newest registration keeps the token')
+  const stale = db.prepare('SELECT apns_token, apns_env FROM devices WHERE id=?').get(old)
+  assert.equal(stale.apns_token, null)
+  assert.equal(stale.apns_env, null, 'token and env are always cleared as a pair')
+  db.close()
+})
+
+// Cross-user, because a re-paired device that now belongs to someone else must
+// stop receiving the previous owner's notifications — the same exclusivity
+// rule, with a privacy consequence rather than a rate-limit one.
+test('registering an APNs token claims it from another user_id device row', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const sam = await createUser(db, 'sam', 'pw')
+  const danMac = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(?,'client','mac','h-dan',0)").run(dan.id).lastInsertRowid
+  const samMac = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(?,'client','mac','h-sam',0)").run(sam.id).lastInsertRowid
+
+  setApnsRegistration(db, danMac, { apnsToken: 'shared-hardware', apnsEnv: 'prod' })
+  setApnsRegistration(db, samMac, { apnsToken: 'shared-hardware', apnsEnv: 'prod' })
+
+  assert.equal(clientDevicesForPush(db, dan.id).length, 0, 'the previous owner keeps no claim on the token')
+  assert.deepEqual(clientDevicesForPush(db, sam.id).map((r) => r.id), [samMac])
+  db.close()
+})
+
+// Unregistering must not scavenge: `apnsToken: null` clears only the caller's
+// own row, and can never null out a token some other row legitimately holds.
+test('unregistering clears only the calling device row', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const phone = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(?,'client','phone','h-p',0)").run(dan.id).lastInsertRowid
+  const mac = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(?,'client','mac','h-m',0)").run(dan.id).lastInsertRowid
+  setApnsRegistration(db, phone, { apnsToken: 'phone-token', apnsEnv: 'prod' })
+  setApnsRegistration(db, mac, { apnsToken: 'mac-token', apnsEnv: 'prod' })
+
+  setApnsRegistration(db, mac, { apnsToken: null, apnsEnv: null })
+
+  assert.deepEqual(clientDevicesForPush(db, dan.id).map((r) => r.id), [phone])
+  db.close()
+})
+
+// The live dev-2 DB already carries 18 rows sharing one token; the fix above
+// only stops NEW duplicates, so openDb collapses the existing ones on start.
+test('openDb collapses duplicate APNs tokens, keeping the newest device row', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-apns-dedupe-'))
+  const dbPath = path.join(dir, 'dupes.db')
+
+  // Seeded through a raw handle, because openDb is exactly what refuses to
+  // hold duplicates: the pre-fix schema had no unique index to violate.
+  const raw = new Database(dbPath)
+  raw.exec(`
+    CREATE TABLE devices(
+      id INTEGER PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      cursor INTEGER NOT NULL DEFAULT 0,
+      apns_token TEXT,
+      created_at INTEGER NOT NULL,
+      last_seen_at INTEGER
+    );
+  `)
+  const ins = raw.prepare(
+    "INSERT INTO devices(id, user_id, kind, name, token_hash, apns_token, created_at) VALUES(?,1,'client','mac',?,?,0)"
+  )
+  for (const [id, hash] of [[1, 'h1'], [2, 'h2'], [3, 'h3']]) ins.run(id, hash, 'mac-token')
+  // A different token on a fourth row is untouched by the collapse.
+  ins.run(4, 'h4', 'phone-token')
+  raw.close()
+
+  const db = openDb(dbPath)
+  assert.deepEqual(
+    db.prepare('SELECT id FROM devices WHERE apns_token IS NOT NULL ORDER BY id').all().map((r) => r.id),
+    [3, 4]
+  )
+  assert.equal(db.prepare('SELECT apns_env FROM devices WHERE id=1').get().apns_env, null)
+  db.close()
+  fs.rmSync(dir, { recursive: true, force: true })
+})
