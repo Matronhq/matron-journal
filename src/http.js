@@ -6,7 +6,7 @@ import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, s
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
 import { listAwaiting, answerParkedInvite, getParticipant, forgetDeviceParticipation } from './participants.js'
-import { removeAllowance, listAllowances, forgetDeviceAllowances } from './allowances.js'
+import { forgetDeviceAllowances } from './allowances.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
@@ -367,37 +367,6 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           agent_name: deviceName(r.agent_name),
         }))
         return json(res, 200, { pending })
-      }
-      if (req.method === 'GET' && url.pathname === '/agent-chat/allowances') {
-        // The standing consents the user has granted ("always allow A → B"),
-        // so an app can show and revoke them. Client-gated: an agent must not
-        // be able to read which pairs the user has pre-approved — that is a
-        // map of what it could get away with asking for.
-        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
-        const allowances = listAllowances(db, who.userId).map((r) => ({
-          ...r,
-          from_name: deviceName(r.from_name),
-          target_name: deviceName(r.target_name),
-        }))
-        return json(res, 200, { allowances })
-      }
-      if (req.method === 'POST' && url.pathname === '/agent-chat/allowances/revoke') {
-        // Withdrawing a standing consent. Client-gated for the obvious reason
-        // and one less obvious: an agent able to revoke could clear an
-        // allowance covering a pair it wants re-asked, putting the ask back
-        // in front of the user on its own schedule.
-        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
-        const { from_device_id, target_device_id } = await readBody(req)
-        if (!Number.isInteger(from_device_id) || !Number.isInteger(target_device_id)) {
-          return json(res, 400, { error: 'bad_request' })
-        }
-        // `removed:false` for an allowance that was not there is a 200, not a
-        // 404: revocation is idempotent, and the user asking for a consent to
-        // be gone got what they asked for either way.
-        const removed = removeAllowance(db, {
-          userId: who.userId, fromDeviceId: from_device_id, targetDeviceId: target_device_id,
-        })
-        return json(res, 200, { ok: true, removed })
       }
       if (req.method === 'POST' && url.pathname === '/agent-chat/answer') {
         // Client-gated: an agent must never answer a consent ask, including
