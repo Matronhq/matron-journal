@@ -5,7 +5,6 @@ import { createUser, createAgent } from '../src/auth.js'
 import { openDb } from '../src/db.js'
 import { upsertConversation } from '../src/journal.js'
 import { getParticipant, parkInvite, answerParkedInvite } from '../src/participants.js'
-import { addAllowance, isAllowed } from '../src/allowances.js'
 import { deliverPendingInvites } from '../src/invite-delivery.js'
 
 // Harness pattern copied from the top of test/invites.test.js: one user, one
@@ -755,26 +754,21 @@ test('a device gone from under a parked ask leaves a null name in /agent-chat/pe
 // created lands on exactly its id. Anything keyed on a device id therefore
 // has to die with the device. "Retire an agent, register its replacement" is
 // the ordinary sequence that hits this.
-test('revoking a device clears its allowances and room membership, so a reused id inherits nothing', async (t) => {
+test('revoking a device clears its room membership, so a reused id inherits nothing', async (t) => {
   const { s, dan, agA, clientToken } = await roomFleet(t)
   const doomed = createAgent(s.db, dan.id, 'dev-doomed')
-  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: doomed.deviceId })
-  addAllowance(s.db, { userId: dan.id, fromDeviceId: doomed.deviceId, targetDeviceId: agA.deviceId })
   parkInvite(s.db, { convoId: 'room', agentDeviceId: doomed.deviceId, initiatorDeviceId: agA.deviceId })
   answerParkedInvite(s.db, { convoId: 'room', agentDeviceId: doomed.deviceId, approve: true })
 
   const r = await s.http(`/devices/${doomed.deviceId}/revoke`, { method: 'POST', token: clientToken })
   assert.equal(r.status, 200)
 
-  assert.ok(!isAllowed(s.db, dan.id, agA.deviceId, doomed.deviceId), 'allowance naming the revoked device as target')
-  assert.ok(!isAllowed(s.db, dan.id, doomed.deviceId, agA.deviceId), 'allowance naming it as requester')
   assert.equal(getParticipant(s.db, 'room', doomed.deviceId), null, 'its room membership')
 
   // The reused id is the real test: the replacement agent lands on the
   // revoked device's id and must start from nothing.
   const fresh = createAgent(s.db, dan.id, 'dev-replacement')
   assert.equal(fresh.deviceId, doomed.deviceId, 'precondition: SQLite reused the id')
-  assert.ok(!isAllowed(s.db, dan.id, agA.deviceId, fresh.deviceId))
   assert.equal(getParticipant(s.db, 'room', fresh.deviceId), null)
 })
 
@@ -868,64 +862,3 @@ test('join card names the room owner it is asking to be let in by', async (t) =>
   assert.equal(card.payload.to_name, 'dev-a', 'the owner being asked, not the joiner')
 })
 
-// --- Task 1: every invite parks — the pre-approval gate is gone -----------
-
-test('a pre-existing allowance no longer relays: the invite parks and the user still gets a card', async (t) => {
-  const { s, dan, agA, agB, client, a } = await roomFleet(t)
-  // The row the old fast path keyed on. Seeded directly rather than via
-  // always_allow:true so this test survives Task 2 deleting that field.
-  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: agB.deviceId })
-
-  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'work together', topic: 'x' })
-
-  const card = await client.waitFor((f) => f.kind === 'journal' && f.type === 'permission_request')
-  assert.equal(card.payload.request, 'invite')
-  assert.equal(card.payload.target_device_id, agB.deviceId)
-  assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'awaiting_user')
-})
-
-test('a pre-existing allowance does not deliver to the target socket', async (t) => {
-  const { s, dan, agA, agB, b, a } = await roomFleet(t)
-  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: agB.deviceId })
-  b.frames.length = 0
-
-  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'work together', topic: 'x' })
-  // Give any erroneous relay a chance to arrive before asserting absence.
-  await a.waitFor((f) => f.kind === 'invite' || f.op === 'error' || f.kind === 'journal')
-
-  assert.equal(b.frames.filter((f) => f.kind === 'invite' && f.event === 'request').length, 0)
-})
-
-// agent_join carries its own isAllowed fast-path check in ws.js — a second
-// call site sharing the same import the brief has us delete, not called out
-// in the brief's Files list (which names only the agent_invite branch at the
-// old line 822) but broken by that deletion all the same: `isAllowed` would
-// go undefined at the join call site the moment the import goes, and the
-// plan's own Goal line ("every agent-chat invite and join asks the user,
-// every time") and the parent task's framing ("ws.js stops consulting
-// isAllowed") both cover it. Removed alongside the invite branch; pinned
-// here the same way.
-test('a pre-existing allowance no longer relays a join: the request parks and the user still gets a card', async (t) => {
-  const { s, dan, agA, agB, client, b } = await roomFleet(t)
-  // Direction matches the old join fast path: isAllowed(joiner, owner).
-  addAllowance(s.db, { userId: dan.id, fromDeviceId: agB.deviceId, targetDeviceId: agA.deviceId })
-
-  b.send({ op: 'agent_join', room_id: 'room', justification: 'let me help' })
-
-  const card = await client.waitFor((f) => f.kind === 'journal' && f.type === 'permission_request')
-  assert.equal(card.payload.request, 'join')
-  assert.equal(card.payload.target_device_id, agB.deviceId)
-  assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'awaiting_user')
-})
-
-test('a pre-existing allowance does not deliver a join request to the room owner socket', async (t) => {
-  const { s, dan, agA, agB, a, b } = await roomFleet(t)
-  addAllowance(s.db, { userId: dan.id, fromDeviceId: agB.deviceId, targetDeviceId: agA.deviceId })
-  a.frames.length = 0
-
-  b.send({ op: 'agent_join', room_id: 'room', justification: 'let me help' })
-  // Give any erroneous relay a chance to arrive before asserting absence.
-  await b.waitFor((f) => f.kind === 'invite' || f.op === 'error' || f.kind === 'journal')
-
-  assert.equal(a.frames.filter((f) => f.kind === 'invite' && f.event === 'join_request').length, 0)
-})

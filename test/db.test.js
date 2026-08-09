@@ -249,10 +249,27 @@ test('old-schema convo_agents is rebuilt in place, rows preserved, delivered_at 
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('agent_chat_allowances table exists with its composite key', () => {
+test('openDb: agent_chat_allowances is gone from a fresh database', () => {
   const db = openDb(':memory:')
-  db.prepare('INSERT INTO agent_chat_allowances(user_id, from_device_id, target_device_id, created_at) VALUES(1,2,3,4)').run()
-  assert.throws(() => db.prepare('INSERT INTO agent_chat_allowances(user_id, from_device_id, target_device_id, created_at) VALUES(1,2,3,5)').run())
+  const t = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='agent_chat_allowances'").get()
+  assert.equal(t, undefined)
+})
+
+test('openDb: an existing agent_chat_allowances table is dropped on migrate', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-allow-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'm.db')
+  const raw = new Database(dbPath)
+  raw.exec(`CREATE TABLE agent_chat_allowances(
+    user_id INTEGER NOT NULL, from_device_id INTEGER NOT NULL,
+    target_device_id INTEGER NOT NULL, created_at INTEGER NOT NULL,
+    PRIMARY KEY(user_id, from_device_id, target_device_id))`)
+  raw.prepare('INSERT INTO agent_chat_allowances VALUES(1,2,3,0)').run()
+  raw.close()
+
+  const db = openDb(dbPath)
+  const found = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='agent_chat_allowances'").get()
+  assert.equal(found, undefined, 'the migration must drop the table, standing consent and all')
 })
 
 test('search schema: tables, insert trigger, and NOTHING else', () => {

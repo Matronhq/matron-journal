@@ -76,13 +76,6 @@ CREATE TABLE IF NOT EXISTS convo_agents(
   delivered_at INTEGER,
   PRIMARY KEY(convo_id, agent_device_id)
 );
-CREATE TABLE IF NOT EXISTS agent_chat_allowances(
-  user_id INTEGER NOT NULL,
-  from_device_id INTEGER NOT NULL,
-  target_device_id INTEGER NOT NULL,
-  created_at INTEGER NOT NULL,
-  PRIMARY KEY(user_id, from_device_id, target_device_id)
-);
 -- Search index (spec: agent journal search). Deliberately INSERT-trigger
 -- only: \`events\` is append-only — plain INSERT in journal.js append(), no
 -- DELETE anywhere, and retention only rewrites tool_output payloads, which
@@ -266,6 +259,11 @@ export function openDb(path) {
   if (!convoAgentCols.some((c) => c.name === 'target_convo_id')) {
     db.exec('ALTER TABLE convo_agents ADD COLUMN target_convo_id TEXT')
   }
+  // Standing agent-chat consent ("always allow A -> B") is gone: every ask
+  // parks for the user now. Dropped rather than left in place, because a
+  // table of grants that nothing consults still reads like a live security
+  // control to the next person who finds it.
+  db.exec('DROP TABLE IF EXISTS agent_chat_allowances')
   return db
 }
 

@@ -124,9 +124,8 @@ export function listAwaiting(db, userId) {
 }
 
 // Every participation row naming this device, across the user's rooms.
-// Called when a device is revoked, for the same reason
-// forgetDeviceAllowances is: device ids are reused after a delete, and a
-// leftover state='joined' row would hand a brand new agent write access to
+// Called when a device is revoked: device ids are reused after a delete, and
+// a leftover state='joined' row would hand a brand new agent write access to
 // an old room (authorizeAgentWrite) purely by inheriting its number.
 export function forgetDeviceParticipation(db, userId, deviceId) {
   return db.prepare(`

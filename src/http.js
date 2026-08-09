@@ -6,7 +6,6 @@ import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, s
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
 import { listAwaiting, answerParkedInvite, getParticipant, forgetDeviceParticipation } from './participants.js'
-import { forgetDeviceAllowances } from './allowances.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
@@ -447,9 +446,8 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // `devices.id` is a plain INTEGER PRIMARY KEY, so SQLite hands the
         // highest deleted rowid to the next device created. Anything keyed on
         // a device id therefore has to be cleared with the device, or a brand
-        // new agent inherits the revoked one's standing consent (allowances)
-        // and room membership (convo_agents) purely by number.
-        forgetDeviceAllowances(db, who.userId, revokedId)
+        // new agent inherits the revoked one's room membership (convo_agents)
+        // purely by number.
         forgetDeviceParticipation(db, who.userId, revokedId)
         return json(res, 200, { ok: true })
       }
