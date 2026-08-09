@@ -10,7 +10,7 @@ import { resolveMediaDir } from '../src/media.js'
 import { resolvePreapproveKeyPath } from '../src/preapprove-key.js'
 import { runOffload, runExpireLogs } from '../src/retention.js'
 import { listAwaiting, answerParkedInvite } from '../src/participants.js'
-import { addAllowance, removeAllowance, listAllowances } from '../src/allowances.js'
+import { addAllowance } from '../src/allowances.js'
 
 const USAGE = `usage:
   matron-admin user add <name> (--password <pw> | --password-stdin | env MATRON_PASSWORD)
@@ -25,7 +25,6 @@ const USAGE = `usage:
   matron-admin agent-chat pending <username>
   matron-admin agent-chat approve <username> <room_id> <device_id> [--always-allow]
   matron-admin agent-chat deny <username> <room_id> <device_id>
-  matron-admin agent-chat allowances <username> [--revoke <from_id>:<to_id>]
   matron-admin status`
 
 function flag(argv, name) {
@@ -87,9 +86,7 @@ function formatExpiry(expiresInSeconds) {
 }
 
 // "asked 3m ago" / "asked 2h ago" / "asked 5d ago" for `agent-chat pending` —
-// coarse on purpose, this is an operator glance, not an audit timestamp
-// (created_at is printed in full by `agent-chat allowances`, which is the
-// audit-shaped one of the two).
+// coarse on purpose, this is an operator glance, not an audit timestamp.
 function formatAge(createdAt, now = Date.now()) {
   const mins = Math.floor(Math.max(0, now - createdAt) / 60000)
   if (mins < 1) return 'just now'
@@ -432,21 +429,6 @@ export async function runAdmin(db, argv, deps = {}) {
       `denied: room ${roomId} device ${deviceId} is now denied.`,
       `this CLI cannot push an answer frame to device ${row.initiator_device_id} — it has no connection to the running server's hub — so that agent's wait simply times out to pending; its next attempt will read as declined, same as a peer refusal.`,
     ].join('\n')
-  }
-  if (a === 'agent-chat' && b === 'allowances') {
-    const username = argv[2]
-    if (!username) throw new Error(USAGE)
-    const user = requireUser(db, username)
-    const revokeFlag = flag(argv, '--revoke')
-    if (revokeFlag != null) {
-      const m = /^(\d+):(\d+)$/.exec(revokeFlag)
-      if (!m) throw new Error(`${USAGE}\n\n--revoke needs <from_id>:<to_id>`)
-      const removed = removeAllowance(db, { userId: user.id, fromDeviceId: Number(m[1]), targetDeviceId: Number(m[2]) })
-      return removed ? `allowance ${m[1]} -> ${m[2]} revoked for ${username}` : `no such allowance ${m[1]} -> ${m[2]} for ${username}`
-    }
-    const rows = listAllowances(db, user.id)
-    if (rows.length === 0) return `no always-allow pairs for ${username}`
-    return rows.map((r) => `${r.from_device_id} -> ${r.target_device_id} (since ${new Date(r.created_at).toISOString()})`).join('\n')
   }
   if (a === 'status') {
     // DB-derived stats only (this reads the SQLite file directly, no

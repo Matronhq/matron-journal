@@ -296,40 +296,17 @@ test('admin CLI: agent-chat approve/deny reject a row that belongs to another us
   db.close()
 })
 
-test('admin CLI: agent-chat allowances lists pairs and --revoke <from>:<to> removes one', async () => {
+test('admin CLI: the agent-chat allowances subcommand is gone', async () => {
   const db = openDb(':memory:')
-  const dan = await createUser(db, 'dan', 'pw')
-  const owner = createAgent(db, dan.id, 'owner-agent')
-  const target = createAgent(db, dan.id, 'target-agent')
-  upsertConversation(db, { id: 'room1', ownerUserId: dan.id, title: 'Ops Room', agentDeviceId: owner.deviceId })
-  parkInvite(db, {
-    convoId: 'room1', agentDeviceId: target.deviceId, initiatorDeviceId: owner.deviceId,
-    justification: 'need a hand', topic: 'deploy',
-  })
-  await runAdmin(db, ['agent-chat', 'approve', 'dan', 'room1', String(target.deviceId), '--always-allow'])
-
-  const listOut = await runAdmin(db, ['agent-chat', 'allowances', 'dan'])
-  assert.match(listOut, new RegExp(`${owner.deviceId} -> ${target.deviceId}`))
-
-  const revokeOut = await runAdmin(db, ['agent-chat', 'allowances', 'dan', '--revoke', `${owner.deviceId}:${target.deviceId}`])
-  assert.match(revokeOut, /revoked/)
-  assert.equal(listAllowances(db, dan.id).length, 0)
-
-  const revokeAgainOut = await runAdmin(db, ['agent-chat', 'allowances', 'dan', '--revoke', `${owner.deviceId}:${target.deviceId}`])
-  assert.match(revokeAgainOut, /no such allowance/)
-
-  const emptyOut = await runAdmin(db, ['agent-chat', 'allowances', 'dan'])
-  assert.match(emptyOut, /no always-allow pairs/)
-
-  db.close()
+  await createUser(db, 'dan', 'pw')
+  await assert.rejects(runAdmin(db, ['agent-chat', 'allowances', 'dan']))
 })
 
-test('admin CLI: agent-chat pending/approve/deny/allowances with an unknown username exits non-zero', async () => {
+test('admin CLI: agent-chat pending/approve/deny with an unknown username exits non-zero', async () => {
   const db = openDb(':memory:')
   await assert.rejects(runAdmin(db, ['agent-chat', 'pending', 'ghost']), /no such user: ghost/)
   await assert.rejects(runAdmin(db, ['agent-chat', 'approve', 'ghost', 'room1', '2']), /no such user: ghost/)
   await assert.rejects(runAdmin(db, ['agent-chat', 'deny', 'ghost', 'room1', '2']), /no such user: ghost/)
-  await assert.rejects(runAdmin(db, ['agent-chat', 'allowances', 'ghost']), /no such user: ghost/)
   db.close()
 })
 
