@@ -501,8 +501,9 @@ an agent token, selected by which query parameter is present:
   never counted toward unread: `convo_meta` (a rename), `summary` (TOC metadata),
   and `edit` (not new activity).
 - `summary` events: agent-publishable message kind carrying `{toc, detail, model}`
-  (strings, toc ≤ 2000 chars, detail ≤ 1000 chars, model ≤ 100 chars; excess
-  is trimmed, not rejected). TOC summaries are derived metadata: journal-synced
+  (payload is opaque to the server — no field-level validation or size caps
+  enforced; the server only checks the payload is a non-null object; any
+  truncation is bridge-side). TOC summaries are derived metadata: journal-synced
   (fans out and replays to all devices), never FTS-indexed, never increment
   `unread_count`, and never trigger APNs push (journal-sync-only, like
   `convo_meta` — clients learn them from the replay, not from notifications).
