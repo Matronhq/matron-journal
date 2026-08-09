@@ -6,7 +6,7 @@ import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, s
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
 import { listAwaiting, answerParkedInvite, getParticipant, forgetDeviceParticipation } from './participants.js'
-import { addAllowance, removeAllowance, listAllowances, forgetDeviceAllowances } from './allowances.js'
+import { removeAllowance, listAllowances, forgetDeviceAllowances } from './allowances.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
@@ -405,9 +405,14 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // the human decides.
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
         const body = await readBody(req)
-        const { room_id, target_device_id, decision, always_allow } = body
+        const { room_id, target_device_id, decision } = body
         if (decision !== 'approve' && decision !== 'deny') return json(res, 400, { error: 'bad_request' })
         if (typeof room_id !== 'string' || !Number.isInteger(target_device_id)) return json(res, 400, { error: 'bad_request' })
+        // `always_allow` was the standing-consent grant. It is gone, and a
+        // body still carrying it is rejected rather than ignored: a caller
+        // that believes it granted standing consent which does not exist is
+        // worse off than one told plainly that the field is not accepted.
+        if ('always_allow' in body) return json(res, 400, { error: 'bad_request' })
         const room = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(room_id)
         // Unknown room and a room owned by someone else are indistinguishable
         // (404, never 403) — same anti-enumeration stance as
@@ -430,13 +435,6 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // (and, below, the directed-pair target) is the room owner, not the
         // joiner itself.
         const isJoin = row.initiator_device_id === target_device_id
-        if (always_allow === true) {
-          addAllowance(db, {
-            userId: who.userId,
-            fromDeviceId: row.initiator_device_id,
-            targetDeviceId: isJoin ? room.agent_device_id : target_device_id,
-          })
-        }
         // Scoped to this row's own recipient: the unscoped pump sweeps every
         // undelivered row system-wide, so an unrelated row's successful
         // delivery could otherwise make `sent > 0` true while THIS row's

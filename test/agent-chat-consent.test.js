@@ -687,6 +687,23 @@ test('POST /agent-chat/answer: a non-integer target_device_id is 400', async (t)
   assert.deepEqual(r.json, { error: 'bad_request' })
 })
 
+test('POST /agent-chat/answer rejects always_allow rather than ignoring it', async (t) => {
+  const { s, agA, agB, clientToken, a } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'j', topic: 'x' })
+  await new Promise((r) => setTimeout(r, 50))
+
+  for (const value of [true, false]) {
+    const r = await s.http('/agent-chat/answer', {
+      method: 'POST', token: clientToken,
+      body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'approve', always_allow: value },
+    })
+    assert.equal(r.status, 400, `always_allow:${value} must be rejected, never ignored`)
+    assert.equal(r.json.error, 'bad_request')
+  }
+  // The rejected calls must not have answered the row either.
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'awaiting_user')
+})
+
 // --- Client allowance management: GET /agent-chat/allowances + revoke ---
 //
 // The client half of "always allow". Approving with always_allow:true was the
@@ -694,13 +711,16 @@ test('POST /agent-chat/answer: a non-integer target_device_id is 400', async (t)
 // one — a consent the user granted once, invisible and permanent.
 
 test('GET /agent-chat/allowances: client-gated, lists the pair with both device names', async (t) => {
-  const { s, agA, agB, clientToken, a } = await roomFleet(t)
+  const { s, dan, agA, agB, clientToken, a } = await roomFleet(t)
   a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'need logs' })
   await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
   await s.http('/agent-chat/answer', {
     method: 'POST', token: clientToken,
-    body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'approve', always_allow: true },
+    body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'approve' },
   })
+  // always_allow is gone from the answer endpoint (Task 2) — seed the
+  // allowance directly, the way every other allowance test in this file does.
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: agB.deviceId })
 
   const asAgent = await s.http('/agent-chat/allowances', { token: agA.token })
   assert.equal(asAgent.status, 403, 'an agent must not learn which pairs are pre-approved')
@@ -718,13 +738,16 @@ test('GET /agent-chat/allowances: client-gated, lists the pair with both device 
 })
 
 test('GET /agent-chat/allowances: another user sees none of them', async (t) => {
-  const { s, agB, clientToken, a } = await roomFleet(t)
+  const { s, dan, agA, agB, clientToken, a } = await roomFleet(t)
   a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'x' })
   await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
   await s.http('/agent-chat/answer', {
     method: 'POST', token: clientToken,
-    body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'approve', always_allow: true },
+    body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'approve' },
   })
+  // always_allow is gone from the answer endpoint (Task 2) — seed the
+  // allowance directly, the way every other allowance test in this file does.
+  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: agB.deviceId })
   await createUser(s.db, 'pat', 'pw')
   const patLogin = await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'x' } })
   const r = await s.http('/agent-chat/allowances', { token: patLogin.json.token })
