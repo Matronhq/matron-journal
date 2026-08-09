@@ -606,8 +606,8 @@ state that confers delivery and write rights (see "Agent write
 authorization" and "Agent delivery scoping" above). A row left in
 `refused`, `denied`, `left`, or `expired` is **renewable** — a fresh
 `agent_invite`/`agent_join` may reuse the same `(convo_id, agent_device_id)`
-pair and resets it to `awaiting_user` (or `invited`, on the allowance-
-bypass path); a row already `awaiting_user`, `invited`, or `joined` is not
+pair and resets it to `awaiting_user`; a row already `awaiting_user`,
+`invited`, or `joined` is not
 — inviting/joining over one of those returns `{code:'conflict',
 detail:'already <state>'}` instead of silently resetting it (a
 double-invite is a caller bug worth surfacing, not a no-op; the same
@@ -669,40 +669,21 @@ malformed id is never echoed back. Other ops' error frames are unchanged.
   `target_convo_id` it is not persisted or relayed, only resolved to a title
   for the card.
 
-  What happens next depends on whether the user
-  has already always-allowed this directed pair, `initiator_device_id ->
-  target_device_id` (see "Consent gating" below):
-  - **Allowance bypass** — creates/renews an `invited` row and attempts
-    delivery immediately. Delivery is single-socket (`hub.sendRpcRequest`,
-    same rule as Agent RPC — the most recently registered live connection
-    of the target device, so a mid-reconnect bridge can't double-receive):
-    no live registered connection on the target means `{code:'offline'}`,
-    and the just-created row is deleted (`removeParticipant`) so no
-    pending invite is left that nobody was told about. On success the
-    caller gets `{kind:'invite', event:'delivered', room_id,
-    target_device_id}` and the target gets `{kind:'invite',
-    event:'request', room_id, from_device_id, from_name, topic,
-    justification, target_convo_id?}`.
-  - **No standing allowance (the default)** — creates/renews an
-    `awaiting_user` row instead. The target agent is sent **nothing**; the
-    justification never leaves the journal until the user approves it. The
-    caller still gets `{kind:'invite', event:'delivered', room_id,
-    target_device_id}` — see "Consent gating" below for what `delivered`
-    means in this case.
+  Every ask parks: it creates/renews an `awaiting_user` row and the target
+  agent is sent **nothing** — the justification never leaves the journal
+  until the user approves it (see "Consent gating" below). The caller still
+  gets `{kind:'invite', event:'delivered', room_id, target_device_id}`
+  immediately — see "Consent gating" below for what `delivered` means here.
 - **`agent_join {room_id, justification}`** — the reverse direction: an
   agent asks to join a room it doesn't own. The room must have a recorded
   owner (`{code:'conflict', detail:'room has no recorded owner to ask'}`
   otherwise) and the caller can't be that owner
-  (`{code:'bad_request', detail:'cannot join own room'}`). Same
-  allowance-bypass-vs-park branch as `agent_invite`, with the caller as
-  both the participant and the initiator and the room's owner device as
-  the target: on the bypass path it creates/renews an `invited` row with
-  the same single-socket delivery and `offline` handling, and on success
-  the caller gets `{kind:'invite', event:'delivered', room_id,
-  target_device_id:<owner>}` and the owner gets `{kind:'invite',
-  event:'join_request', room_id, from_device_id, from_name,
-  justification}`; with no standing allowance it parks an `awaiting_user`
-  row instead, same as `agent_invite`.
+  (`{code:'bad_request', detail:'cannot join own room'}`). Same park as
+  `agent_invite`, with the caller as both the participant and the
+  initiator and the room's owner device as the target: it creates/renews
+  an `awaiting_user` row, and the caller gets `{kind:'invite',
+  event:'delivered', room_id, target_device_id:<owner>}` while the owner
+  is sent nothing until the user answers.
 - **`agent_invite_ack {room_id, peer_device_id?, session_state}`** — a
   non-committal status ping while an invite/join is still pending
   (`invited`), sent by whichever side did NOT initiate. `session_state` must
@@ -777,9 +758,9 @@ malformed id is never echoed back. Other ops' error frames are unchanged.
 ### Consent gating (`awaiting_user`)
 
 (spec: `docs/superpowers/specs/2026-08-07-agent-chat-consent-design.md`.)
-The default outcome of `agent_invite`/`agent_join` — whenever the directed
-pair has no standing allowance — is a park, not a relay: the request lands
-in `awaiting_user` and the target agent is told nothing. The requester's
+Every `agent_invite`/`agent_join` is a park, not a relay: the request lands
+in `awaiting_user` and the target agent is told nothing, every time — there
+is no way to pre-approve a directed pair. The requester's
 `justification` (an attacker-controlled string if the requesting agent has
 been prompt-injected) never reaches a sibling agent's context; it reaches a
 human first.
@@ -879,13 +860,17 @@ plays no part in.
   A durable inbox for a client that missed the live card or wants to review
   every outstanding ask at once.
 - **`POST /agent-chat/answer`** `{room_id, target_device_id, decision:
-  "approve"|"deny", always_allow?}` — `room_id`/`target_device_id` must
+  "approve"|"deny"}` — `room_id`/`target_device_id` must
   resolve to a **row belonging to the caller's own user**
   (`conversations.owner_user_id`); an unknown room and one owned by another
   user are indistinguishable (`404 {error:'not_found'}`, never `403` — same
   anti-enumeration stance as `GET /convo/:id/messages`). The row must be
   `state='awaiting_user'` or the call is `409 {error:'conflict'}` (already
-  answered, or never parked).
+  answered, or never parked). A body carrying `always_allow` at all — any
+  value — is `400 {error:'bad_request'}`, not silently ignored: there is no
+  standing-consent grant left for it to mean, and a caller that believed it
+  had granted one would be worse off than a caller told plainly the field
+  is not accepted.
   - **`deny`** flips the row to `denied` and, if the initiator is
     reachable, sends it `{kind:'invite', event:'answer', room_id,
     peer_device_id: target_device_id, accept:false, reason:'refused'}` —
@@ -894,25 +879,19 @@ plays no part in.
     collapsing the two into one wire string is what keeps that true (the
     distinct `denied` DB state exists for the user's own audit trail, not
     for the requester).
-  - **`approve`** flips the row to `invited`. If `always_allow: true`, it
-    also records a directed allowance pair — see "Allowance bypass"
-    below for the JOIN-direction rule that decides which two device ids
-    get paired. It then calls the delivery pump (see below) scoped to
-    this row's own recipient, and the response is `{ok:true, delivered}`
-    where `delivered` is read back off the just-answered row's own
-    `delivered_at` (not a pump-wide "something got sent" flag) — `true`
-    if the target happened to be connected right now, `false` if delivery
-    is still owed.
+  - **`approve`** flips the row to `invited`, then calls the delivery pump
+    (see below) scoped to this row's own recipient, and the response is
+    `{ok:true, delivered}` where `delivered` is read back off the
+    just-answered row's own `delivered_at` (not a pump-wide "something got
+    sent" flag) — `true` if the target happened to be connected right now,
+    `false` if delivery is still owed.
 
-**`delivered` widens.** Both the old allowance-bypass path and the new
-park-then-approve path ack the *requester* with the same
-`{kind:'invite', event:'delivered', room_id, target_device_id}` frame — on
-the park path, at parking time, before the human has even seen the card.
-`delivered` no longer means "the target's socket got the frame"; it means
-"accepted into the system". The bridge's `agent_chat_start` tool copy
-already tolerates this (a `pending` result is documented as normal and not
-to be polled), so no wire-shape change was needed, only a wider meaning for
-one that already existed.
+**`delivered` widens.** The requester's `{kind:'invite', event:'delivered',
+room_id, target_device_id}` frame arrives at parking time — before the
+human has even seen the card, let alone approved it. `delivered` does not
+mean "the target's socket got the frame"; it means "accepted into the
+system". The bridge's `agent_chat_start` tool copy already tolerates this
+(a `pending` result is documented as normal and not to be polled).
 
 **Delivery pump.** Approval alone cannot deliver — the room's target agent
 may be offline, and an approval made through `matron-admin` (a separate CLI
@@ -931,41 +910,9 @@ double-*deliver* — and `matron-admin agent-chat approve` says as much in
 its own output, since the CLI itself has no path to the hub whatsoever and
 the delivery genuinely happens later, out of its hands.
 
-**Allowance bypass.** `agent_chat_allowances(user_id, from_device_id,
-target_device_id)` — directed pairs a user has already approved once and
-chosen to trust going forward ("always allow this agent to chat to that
-agent"), checked by `isAllowed` before every park decision. A pair is
-recorded from the approval card (`always_allow: true` on `POST
-/agent-chat/answer`) or from `matron-admin agent-chat approve ...
---always-allow`, and removed via `POST /agent-chat/allowances/revoke` or
-`matron-admin agent-chat allowances <username> --revoke <from_id>:<to_id>`.
-**JOIN direction rule:** an `agent_join` row self-targets
-(`agent_device_id` names the joiner, who is also `initiator_device_id`), so
-the pair worth remembering is `(initiator_device_id -> room's recorded
-owner)`, not `(initiator_device_id -> itself)`; an `agent_invite` row's
-initiator and target are already the two distinct devices, so the pair is
-`(initiator_device_id -> target_device_id)` as given.
-
-**Managing allowances from a client.** Two more client-gated endpoints, so
-a standing consent is visible and reversible from the app that granted it
-rather than only from the CLI:
-
-- **`GET /agent-chat/allowances`** → `{allowances: [{from_device_id,
-  target_device_id, from_name, target_name, created_at}]}`, every directed
-  pair this user has approved. Client-gated for a reason beyond the usual:
-  the list is a map of exactly which asks would sail through unchallenged,
-  which is not an agent's to read.
-- **`POST /agent-chat/allowances/revoke`** `{from_device_id,
-  target_device_id}` → `{ok:true, removed}`. Revocation is idempotent — a
-  pair that was not there is `removed:false` with a `200`, never a `404`,
-  because the user asked for the consent to be gone and it is. Also
-  client-gated: an agent able to revoke could clear an allowance covering a
-  pair it wants re-asked, putting the ask back in front of the user on its
-  own schedule.
-
-**Device revocation clears both.** `POST /devices/:id/revoke` also deletes
-every `agent_chat_allowances` row naming that device (either end) and every
-`convo_agents` row where it is the participant. `devices.id` is a plain
+**Device revocation clears room membership.** `POST /devices/:id/revoke`
+also deletes every `convo_agents` row where the revoked device is the
+participant. `devices.id` is a plain
 `INTEGER PRIMARY KEY`, so SQLite assigns `max(rowid)+1` and the device
 created after the newest one is revoked lands on exactly its id — without
 this, retiring an agent and registering its replacement would hand the
@@ -984,13 +931,15 @@ a client device to hand, or a user whose apps predate the card UI:
 
 ```
 matron-admin agent-chat pending <username>
-matron-admin agent-chat approve <username> <room_id> <device_id> [--always-allow]
+matron-admin agent-chat approve <username> <room_id> <device_id>
 matron-admin agent-chat deny <username> <room_id> <device_id>
-matron-admin agent-chat allowances <username> [--revoke <from_id>:<to_id>]
 ```
 
 `pending` lists one line per `awaiting_user` row for that user (room id,
-target device id/name, topic, justification, relative age).
+target device id/name, topic, justification, relative age). `approve`
+rejects a `--always-allow` flag outright — it exits non-zero with a message
+that the flag no longer exists and every agent-chat request now asks the
+user, rather than silently approving without it.
 `approve`/`deny` re-run the same room-ownership check `POST
 /agent-chat/answer` does (`conversations.owner_user_id` must match the
 named user) before touching the row — this is not skippable just because

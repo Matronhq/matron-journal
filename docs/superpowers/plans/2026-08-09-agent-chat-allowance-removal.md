@@ -444,5 +444,5 @@ git commit -m "docs: agent chat asks every time"
 ## Done when
 
 - `npm test` passes with no allowance tests remaining and no new failures.
-- `grep -rn -i "allowance\|always_allow" src bin test README.md docs/protocol.md` returns only the `DROP TABLE` migration and its comment.
+- `grep -rn -i "allowance\|always_allow" src bin test README.md docs/protocol.md` turns up no *live* allowance code and no *stale* documentation — not literally zero hits. Expect the `DROP TABLE agent_chat_allowances` migration and its comment in `src/db.js`, and prose that accurately describes the current behaviour: that there is no standing allowance and no fast path (e.g. `src/ws.js`'s `agent_invite`/`agent_join` comments), and that `always_allow` is rejected outright (e.g. `src/http.js`'s `POST /agent-chat/answer` handler and `bin/matron-admin.js`'s `--always-allow` rejection, plus the matching note in `docs/protocol.md`). Any hit that isn't one of those — a reachable allowance code path, or documentation of the old bypass, endpoints, or flag — is stale and must go.
 - A seeded `agent_chat_allowances` row cannot change the behaviour of an `agent_invite`, because the table is gone.
