@@ -22,7 +22,7 @@ const CLIENT_SEND_TYPES = new Set(['text', 'file', 'image'])
 // server upgrade to this whitelist, never through a bare agent frame.
 const AGENT_PUBLISH_TYPES = new Set([
   'text', 'prompt', 'prompt_reply', 'tool_output', 'diff',
-  'permission_request', 'file', 'image', 'edit',
+  'permission_request', 'file', 'image', 'edit', 'summary',
 ])
 
 // activity op (typing/tool-use indicators, spec §6 ephemeral): the only

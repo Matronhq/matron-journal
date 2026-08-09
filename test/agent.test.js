@@ -322,12 +322,34 @@ test('agent publish type whitelist: rejects server-generated/unknown types, acce
     agent.frames.filter((x) => x.kind === 'control' && x.op === 'error' && x.code === 'bad_request' && x.ref === 'publish').length >= rejected.length)
   assert.equal(s.db.prepare("SELECT COUNT(*) n FROM events WHERE convo_id='sess-wl'").get().n, 0)
 
-  const allowed = ['text', 'prompt', 'prompt_reply', 'tool_output', 'diff', 'permission_request', 'file', 'image', 'edit']
+  const allowed = ['text', 'prompt', 'prompt_reply', 'tool_output', 'diff', 'permission_request', 'file', 'image', 'edit', 'summary']
   for (const type of allowed) {
     agent.send({ op: 'publish', convo_id: 'sess-wl', type, payload: { body: 'ok' } })
   }
-  await agent.waitFor((f) => f.kind === 'journal' && f.type === 'edit') // the last one sent
+  await agent.waitFor((f) => f.kind === 'journal' && f.type === 'summary') // the last one sent
   assert.equal(s.db.prepare("SELECT COUNT(*) n FROM events WHERE convo_id='sess-wl'").get().n, allowed.length)
+  agent.close()
+})
+
+test('summary events append and fan out but never touch snippet or unread', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const ag = createAgent(s.db, dan.id, 'dev-2')
+  const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+  agent.send({ op: 'convo_upsert', convo_id: 'sess-sum' })
+  agent.send({ op: 'publish', convo_id: 'sess-sum', type: 'text', payload: { body: 'real message' } })
+  await agent.waitFor((f) => f.kind === 'journal' && f.type === 'text')
+  const before = s.db.prepare("SELECT snippet, unread_count, last_seq FROM conversations WHERE id='sess-sum'").get()
+
+  agent.send({ op: 'publish', convo_id: 'sess-sum', type: 'summary', payload: { toc: 'Fixed the bug', detail: 'Working on X.', model: 'gpt-5.6-luna' } })
+  await agent.waitFor((f) => f.kind === 'journal' && f.type === 'summary')
+
+  const after = s.db.prepare("SELECT snippet, unread_count, last_seq FROM conversations WHERE id='sess-sum'").get()
+  assert.equal(after.snippet, before.snippet)            // no snippet change
+  assert.equal(after.unread_count, before.unread_count)  // no unread bump
+  assert.ok(after.last_seq > before.last_seq)            // seq still advances
   agent.close()
 })
 
