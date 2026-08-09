@@ -12,7 +12,6 @@ import { resolveMediaDir, writeBlobSync } from '../src/media.js'
 import { runAdmin, parseExpiresSeconds } from '../bin/matron-admin.js'
 import { startTestServer } from './helpers.js'
 import { parkInvite, getParticipant } from '../src/participants.js'
-import { listAllowances } from '../src/allowances.js'
 
 test('admin CLI: user add, agent add, status', async () => {
   const db = openDb(':memory:')
@@ -198,7 +197,7 @@ test('admin CLI: device list and device revoke', async () => {
   db.close()
 })
 
-test('admin CLI: agent-chat pending/approve prints room+topic and the sweep-delivery note, --always-allow records the directed pair', async () => {
+test('admin CLI: agent-chat pending/approve prints room+topic and the sweep-delivery note', async () => {
   const db = openDb(':memory:')
   const dan = await createUser(db, 'dan', 'pw')
   const owner = createAgent(db, dan.id, 'owner-agent') // room owner, and the invite's initiator
@@ -215,7 +214,7 @@ test('admin CLI: agent-chat pending/approve prints room+topic and the sweep-deli
   assert.match(pendingOut, /need a hand/)
   assert.match(pendingOut, new RegExp(`device ${target.deviceId} \\(target-agent\\)`))
 
-  const approveOut = await runAdmin(db, ['agent-chat', 'approve', 'dan', 'room1', String(target.deviceId), '--always-allow'])
+  const approveOut = await runAdmin(db, ['agent-chat', 'approve', 'dan', 'room1', String(target.deviceId)])
   assert.match(approveOut, /invited/)
   // Both facts the CLI cannot make happen itself must be said, per the brief.
   assert.match(approveOut, /sweep/i)
@@ -225,32 +224,29 @@ test('admin CLI: agent-chat pending/approve prints room+topic and the sweep-deli
   assert.equal(row.state, 'invited')
   assert.equal(row.delivered_at, null) // delivery is the pump's job, not this command's
 
-  const pairs = listAllowances(db, dan.id)
-  assert.equal(pairs.length, 1)
-  assert.equal(pairs[0].from_device_id, owner.deviceId)
-  assert.equal(pairs[0].target_device_id, target.deviceId)
-
   db.close()
 })
 
-test('admin CLI: agent-chat approve honours the JOIN direction rule (self-targeting row -> pair to the room owner)', async () => {
+test('admin CLI: agent-chat approve rejects --always-allow rather than silently approving (the flag no longer exists)', async () => {
   const db = openDb(':memory:')
   const dan = await createUser(db, 'dan', 'pw')
   const owner = createAgent(db, dan.id, 'owner-agent')
-  const joiner = createAgent(db, dan.id, 'joiner-agent')
+  const target = createAgent(db, dan.id, 'target-agent')
   upsertConversation(db, { id: 'room1', ownerUserId: dan.id, title: 'Ops Room', agentDeviceId: owner.deviceId })
-  // A join request's row self-targets: agent_device_id === initiator_device_id (the joiner).
   parkInvite(db, {
-    convoId: 'room1', agentDeviceId: joiner.deviceId, initiatorDeviceId: joiner.deviceId,
-    justification: 'let me in', topic: '',
+    convoId: 'room1', agentDeviceId: target.deviceId, initiatorDeviceId: owner.deviceId,
+    justification: 'need a hand', topic: 'deploy',
   })
 
-  await runAdmin(db, ['agent-chat', 'approve', 'dan', 'room1', String(joiner.deviceId), '--always-allow'])
+  await assert.rejects(
+    runAdmin(db, ['agent-chat', 'approve', 'dan', 'room1', String(target.deviceId), '--always-allow']),
+    /--always-allow/
+  )
 
-  const pairs = listAllowances(db, dan.id)
-  assert.equal(pairs.length, 1)
-  assert.equal(pairs[0].from_device_id, joiner.deviceId)
-  assert.equal(pairs[0].target_device_id, owner.deviceId) // the room's recorded owner, not the joiner itself
+  // rejected outright — not silently approved, and not left in some
+  // half-applied state.
+  const row = getParticipant(db, 'room1', target.deviceId)
+  assert.equal(row.state, 'awaiting_user')
 
   db.close()
 })

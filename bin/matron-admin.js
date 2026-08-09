@@ -10,7 +10,6 @@ import { resolveMediaDir } from '../src/media.js'
 import { resolvePreapproveKeyPath } from '../src/preapprove-key.js'
 import { runOffload, runExpireLogs } from '../src/retention.js'
 import { listAwaiting, answerParkedInvite } from '../src/participants.js'
-import { addAllowance } from '../src/allowances.js'
 
 const USAGE = `usage:
   matron-admin user add <name> (--password <pw> | --password-stdin | env MATRON_PASSWORD)
@@ -23,7 +22,7 @@ const USAGE = `usage:
   matron-admin offload [--days N]
   matron-admin expire-logs [--hours N]
   matron-admin agent-chat pending <username>
-  matron-admin agent-chat approve <username> <room_id> <device_id> [--always-allow]
+  matron-admin agent-chat approve <username> <room_id> <device_id>
   matron-admin agent-chat deny <username> <room_id> <device_id>
   matron-admin status`
 
@@ -106,13 +105,11 @@ function requireUser(db, username) {
 // row: this CLI takes a username precisely so a parked ask cannot be
 // approved/denied against the wrong user's room just because the operator
 // (or a scripting mistake) named the wrong room/device id. Joins
-// conversations for owner_user_id (the check itself) and agent_device_id
-// (the room's recorded owner, needed for the --always-allow JOIN direction
-// rule below) in one query.
+// conversations for owner_user_id, the check itself, in one query.
 function loadAwaitingRow(db, roomId, deviceId) {
   return db.prepare(`
     SELECT ca.convo_id, ca.agent_device_id, ca.initiator_device_id, ca.state,
-           c.owner_user_id, c.agent_device_id AS room_agent_device_id
+           c.owner_user_id
     FROM convo_agents ca JOIN conversations c ON c.id = ca.convo_id
     WHERE ca.convo_id=? AND ca.agent_device_id=?
   `).get(roomId, deviceId)
@@ -380,7 +377,15 @@ export async function runAdmin(db, argv, deps = {}) {
   }
   if (a === 'agent-chat' && b === 'approve') {
     const [, , username, roomId, deviceIdRaw] = argv
-    const alwaysAllow = argv.includes('--always-allow')
+    // `--always-allow` was the standing-consent grant. It is gone, and the
+    // flag is rejected rather than silently ignored: an operator who typed
+    // it and got a silent success would believe they'd granted standing
+    // consent that no longer exists — every agent-chat request now parks
+    // and asks the user, with no fast path (mirrors the `always_allow`
+    // rejection on POST /agent-chat/answer).
+    if (argv.includes('--always-allow')) {
+      throw new Error(`${USAGE}\n\n--always-allow no longer exists — every agent-chat request now asks the user`)
+    }
     if (!username || !roomId || !deviceIdRaw) throw new Error(USAGE)
     const deviceId = Number(deviceIdRaw)
     if (!Number.isInteger(deviceId)) throw new Error(USAGE)
@@ -396,21 +401,10 @@ export async function runAdmin(db, argv, deps = {}) {
     if (!answerParkedInvite(db, { convoId: roomId, agentDeviceId: deviceId, approve: true })) {
       throw new Error(`room ${roomId} device ${deviceId} is not awaiting approval (already answered, or never parked)`)
     }
-    // JOIN direction rule: a join request's row self-targets (the row's
-    // agent_device_id IS the initiator — the joiner), so the pair to
-    // remember is (initiator -> the room's recorded owner), not
-    // (initiator -> itself). An invite's row has a distinct initiator (the
-    // room owner) and target, so the pair is (initiator -> target) as-is.
-    const isJoin = row.initiator_device_id === deviceId
-    const allowTarget = isJoin ? row.room_agent_device_id : deviceId
-    if (alwaysAllow) {
-      addAllowance(db, { userId: user.id, fromDeviceId: row.initiator_device_id, targetDeviceId: allowTarget })
-    }
     return [
       `approved: room ${roomId} device ${deviceId} is now invited (asked by device ${row.initiator_device_id}).`,
-      alwaysAllow ? `always-allow recorded: device ${row.initiator_device_id} -> device ${allowTarget} (no future approval needed for this pair).` : null,
       "this CLI cannot reach the running server's hub — the invite is delivered by the journal's sweep-tick pump, within one sweep interval, or sooner if that agent connects/hellos in the meantime.",
-    ].filter(Boolean).join('\n')
+    ].join('\n')
   }
   if (a === 'agent-chat' && b === 'deny') {
     const [, , username, roomId, deviceIdRaw] = argv
