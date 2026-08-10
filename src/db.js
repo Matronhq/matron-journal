@@ -88,6 +88,25 @@ CREATE TABLE IF NOT EXISTS convo_agents(
   delivered_at INTEGER,
   PRIMARY KEY(convo_id, agent_device_id)
 );
+CREATE TABLE IF NOT EXISTS agent_spawn_requests(
+  id                TEXT PRIMARY KEY,
+  user_id           INTEGER NOT NULL,
+  from_device_id    INTEGER NOT NULL,
+  from_convo_id     TEXT NOT NULL,
+  target_device_id  INTEGER NOT NULL,
+  workdir           TEXT NOT NULL,
+  task              TEXT NOT NULL,
+  topic             TEXT NOT NULL DEFAULT '',
+  state             TEXT NOT NULL CHECK(state IN
+                      ('awaiting_user','approved','started',
+                       'denied','expired','failed')),
+  room_id           TEXT,
+  child_convo_id    TEXT,
+  created_at        INTEGER NOT NULL,
+  answered_at       INTEGER,
+  resolved_at       INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_spawn_state ON agent_spawn_requests(state, from_device_id);
 -- Search index (spec: agent journal search). Deliberately INSERT-trigger
 -- only: \`events\` is append-only — plain INSERT in journal.js append(), no
 -- DELETE anywhere, and retention only rewrites tool_output payloads, which
