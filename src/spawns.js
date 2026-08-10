@@ -126,9 +126,16 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
     // frame below — telling the parent is the one thing this tail cannot
     // skip.
     try {
+      // `code` here is the target bridge's own error_code (e.g. from a
+      // failed `start` RPC reply, ws.js's RPC_NAME_MAX_CHARS=64-capped
+      // msg.error.code) — peer-authored, not journal-composed — so it goes
+      // through the same sanitizePeerText sieve as fromName below before
+      // landing in a room message every participant reads. Same 'unknown'
+      // fallback the outcome frame below already used for a missing code.
+      const safeCode = sanitizePeerText(code, 64) || 'unknown'
       appendAndBroadcast(db, hub, {
         userId: row.user_id, convoId: roomId, sender: 'journal', type: 'text',
-        payload: { body: `❌ spawn failed — ${code}. This room's child session never started.` },
+        payload: { body: `❌ spawn failed — ${safeCode}. This room's child session never started.` },
       })
     } catch (err) {
       console.error('approveSpawn: epitaph write failed (room likely never created)', err)
@@ -214,9 +221,18 @@ export function sanitizeSpawnActivity(raw) {
   return { live_sessions: raw.live_sessions, last_hour }
 }
 
+// JS's own ceiling on a representable time value (Number.MAX_SAFE_INTEGER-ish
+// but tighter — the ECMA-262 spec's actual bound, ±8,640,000,000,000,000ms
+// either side of the epoch). Below the lower check, an as_of that clears
+// Number.isInteger and > 0 but exceeds THIS throws a RangeError out of
+// `new Date(as_of).toISOString()` in every downstream renderer (e.g.
+// matron-bridge lib/agent-boxes-format.js's formatBox) — reject it here
+// instead of letting every reader guard against it separately.
+const AS_OF_MAX_MS = 8640000000000000
+
 export function sanitizeSpawnLimits(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
-  if (!Number.isInteger(raw.as_of) || raw.as_of <= 0) return null
+  if (!Number.isInteger(raw.as_of) || raw.as_of <= 0 || raw.as_of > AS_OF_MAX_MS) return null
   if (!Array.isArray(raw.lines)) return null
   const lines = []
   for (const l of raw.lines.slice(0, LIMITS_MAX_LINES)) {

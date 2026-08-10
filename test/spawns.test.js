@@ -8,7 +8,7 @@ import {
   sanitizeSpawnActivity, sanitizeSpawnLimits,
 } from '../src/spawns.js'
 import { parkInvite } from '../src/participants.js'
-import { upsertConversation } from '../src/journal.js'
+import { upsertConversation, messagesBefore } from '../src/journal.js'
 
 async function seed() {
   const db = openDb(':memory:')
@@ -152,6 +152,26 @@ test('late start reply after orphan sweep sends no started frame', async () => {
     'sweep already told the parent; the late success must stay silent')
 })
 
+// The target bridge's error.code is peer-authored and only length-capped on
+// the wire (ws.js RPC_NAME_MAX_CHARS=64, any characters) — a malicious or
+// buggy target must not be able to inject a forged extra line into the
+// failure epitaph this journal writes into a room every participant reads.
+test('approveSpawn sanitizes a malicious error_code before writing the failure epitaph into the room', async () => {
+  const { db, dan, parent, target } = await seed()
+  makeRow(db, dan, parent, target, 's-evil')
+  claimApprove(db, 's-evil')
+  const hub = { sendToDevice: () => true, broadcastJournal: () => {} }
+  const broker = { issue: async () => ({ ok: false, error: { code: 'bad\ncode\x00 with «forged» line' } }) }
+  const roomId = 'room-evil'
+  const out = await approveSpawn({ db, hub, broker, startTimeoutMs: 50, roomId }, getSpawn(db, 's-evil'))
+  assert.equal(out, 'failed')
+  const epitaph = messagesBefore(db, dan.id, roomId, {}).find((m) => m.type === 'text' && m.sender === 'journal')
+  assert.ok(epitaph, 'epitaph message should exist')
+  assert.ok(!epitaph.payload.body.includes('\n'))
+  assert.ok(!epitaph.payload.body.includes('\x00'))
+  assert.ok(epitaph.payload.body.includes('bad code with «forged» line'))
+})
+
 test('sanitizeSpawnActivity accepts a valid block and caps last_hour at 20', () => {
   const raw = {
     live_sessions: 2,
@@ -185,6 +205,15 @@ test('sanitizeSpawnLimits accepts a valid block, caps lines at 12, drops malform
   assert.equal(sanitizeSpawnLimits({ as_of: 0, lines: [line] }), null)
   assert.equal(sanitizeSpawnLimits({ as_of: 1, lines: [{ ...line, percent: 'x' }] }), null)
   assert.equal(sanitizeSpawnLimits({ as_of: 1, lines: 'nope' }), null)
+})
+
+test('sanitizeSpawnLimits rejects an as_of beyond JS Date range (8.64e15ms) that would throw downstream', () => {
+  const line = { id: 'session', label: 'Session', percent: 5 }
+  assert.equal(sanitizeSpawnLimits({ as_of: 1e16, lines: [line] }), null)
+  // The exact boundary is still accepted.
+  assert.equal(sanitizeSpawnLimits({ as_of: 8640000000000000, lines: [line] }).as_of, 8640000000000000)
+  // One past the boundary is rejected.
+  assert.equal(sanitizeSpawnLimits({ as_of: 8640000000000001, lines: [line] }), null)
 })
 
 test('sanitizeSpawnLimits omits absent resets fields rather than nulling', () => {

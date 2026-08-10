@@ -1521,7 +1521,12 @@ typing text commands into the control conversation.
 - v1 method vocabulary (bridge-owned, normative in the spec):
   `recent_folders {} -> {folders:[{path, last_used}], activity?, limits?}` and
   `start {workdir?, browser?, prompt?, room_id?, from_name?} -> {convo_id}`
-  (errors `bad_workdir`, `spawn_failed`; unknown methods `unknown_method`).
+  (errors `bad_workdir` — workdir does not resolve to a directory on the
+  target box; `spawn_failed` — the target threw while starting the session;
+  `bad_request` — `room_id` was sent without `prompt`, or `room_id` on its
+  own is otherwise invalid; `unsupported_mode` — the target bridge has no
+  spawn wiring (e.g. session id unknown at spawn, or spawn-room support
+  absent); unknown methods `unknown_method`).
   `prompt`/`room_id`/`from_name` are the parameters the journal-originated
   `start` call behind spawn approval sends (see "Agent-spawned sessions"
   above); a client-relayed `start` sends `workdir`/`browser` instead.
