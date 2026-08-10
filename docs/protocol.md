@@ -12,9 +12,16 @@ the machine-checkable version of this page.
   Brute-force protection: 5 attempts/min per IP (429 `rate_limited`), plus per-username
   lockout after 5 consecutive failures — 30s doubling per failure up to 1h, cleared by
   a successful login (429 `locked_out` with `retry_after` seconds + `Retry-After` header).
-- `GET /snapshot` (Bearer) -> `{conversations, seq}`. Each conversation row
+- `GET /snapshot` (Bearer) -> `{conversations, agents, seq}`. Each conversation row
   carries `parent_convo_id` (`null` for a normal conversation; set for a
-  subagent child — see "Child conversations"). Every agent caller — private
+  subagent child — see "Child conversations") and `agent_device_id` (the
+  agent box that manages it; `null` for legacy rows created before ownership
+  was recorded). `agents` is `[{device_id, name}]` for the caller's
+  `kind='agent'` devices — the id→name table a client needs to render which
+  box owns a conversation, so no second round-trip is required. It obeys the
+  same privacy predicate as the conversation list: an ordinary (non-private)
+  agent caller never sees private boxes. Client devices are absent by
+  design — they are not boxes. Every agent caller — private
   or not — gets `snippet` omitted from every row (it can carry `tool_output`
   text, a credential surface); an ordinary (non-private) agent additionally
   has private-owned conversations excluded entirely — see "Device privacy"
@@ -360,14 +367,23 @@ an agent token, selected by which query parameter is present:
   user or device. Bridges MUST mint globally unique ids — Claude session
   UUIDs are the convention.
 - `convo_upsert` appends a `convo_meta` journal event
-  (`payload:{title, parent_convo_id}`, sender = the agent device, e.g.
+  (`payload:{title, parent_convo_id, agent_device_id}`, sender = the agent device, e.g.
   `agent:dev-2`) whenever it changes an existing conversation's title, sets
   a non-empty title at creation, or creates a child (`parent_convo_id` set,
   even titleless — the linkage must ride the journal, or a live client would
   list the child as a normal conversation until its next `/snapshot`) — so
   other devices learn renames and child linkage live instead of only via
   `/snapshot`. No event otherwise (unchanged/omitted title, state-only
-  upserts on existing conversations).
+  upserts on existing conversations). `agent_device_id` is the upserting
+  connection's own device — the same id `convo_upsert` records on the row —
+  so a live client can attribute a brand-new conversation to its box without
+  waiting for the next `/snapshot`.
+- `device_meta` — `{kind:'device_meta', device_id, name}`, sent to a user's
+  **client** sockets when `POST /devices/:id/rename` succeeds. Transient: not
+  a journal event, carries no seq, and is never replayed. A client that
+  misses it learns the new name from the `agents` list in its next
+  `GET /snapshot`. Agent connections never receive it — a box keeps no
+  roster.
 - `convo_upsert` accepts an optional `parent_convo_id` linking a durable child
   conversation to its parent (subagent sub-chats). It is a non-empty string
   (id length cap 128; malformed → `bad_request`), **set once at creation and
@@ -1273,6 +1289,16 @@ deletes the row exactly like `matron-admin device revoke`; not-owned and
 nonexistent ids are indistinguishable (404 `{error:'not_found'}`).
 Self-revocation is allowed and acts as a logout. WS enforcement is the
 same next-frame-or-≤60s-sweep described above.
+
+`POST /devices/:id/rename` (Bearer, client devices only — agents get 403)
+renames a device, body `{name}`, 200 `{ok:true, device:{device_id, name}}`.
+The name is sanitised (control characters flattened, whitespace collapsed,
+trimmed) and then capped at 40 characters — over the cap is rejected with
+400 `{error:'bad_request'}`, never truncated, as is an empty or non-string
+name. Not-owned and nonexistent ids are indistinguishable (404), same as
+revoke. Any device kind may be renamed, including the caller's own, and
+duplicate names are allowed (pairing only warns about them). A success fans
+a `device_meta` frame out to the user's client sockets.
 
 ## Agent pairing (device authorization)
 

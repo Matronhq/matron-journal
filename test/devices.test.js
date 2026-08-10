@@ -160,3 +160,31 @@ test('POST /devices/:id/rename: renames, sanitises, caps, owner-scoped, client-g
   // unauthenticated -> 401
   assert.equal((await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', body: { name: 'x' } })).status, 401)
 })
+
+test('rename fans out device_meta to client sockets only', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'hunter22')
+  const agent = createAgent(s.db, dan.id, 'dev-9')
+  await createUser(s.db, 'pat', 'password')
+  const patLogin = await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'password', device_name: 'pat-phone' } })
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'hunter22', device_name: 'mac' } })
+
+  const client = await makeWsClient(s.base, { token: login.json.token, cursor: 0 })
+  t.after(() => client.close())
+  const box = await makeWsClient(s.base, { token: agent.token, cursor: 0 })
+  t.after(() => box.close())
+  const stranger = await makeWsClient(s.base, { token: patLogin.json.token, cursor: 0 })
+  t.after(() => stranger.close())
+
+  const r = await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', token: login.json.token, body: { name: 'dev-y' } })
+  assert.equal(r.status, 200)
+
+  const frame = await client.waitFor((f) => f.kind === 'device_meta')
+  assert.deepEqual(frame, { kind: 'device_meta', device_id: agent.deviceId, name: 'dev-y' })
+  // agents never receive it (a box has no roster to update), and another
+  // user's socket never sees it at all
+  await new Promise((res) => setTimeout(res, 150))
+  assert.equal(box.frames.filter((f) => f.kind === 'device_meta').length, 0)
+  assert.equal(stranger.frames.filter((f) => f.kind === 'device_meta').length, 0)
+})
