@@ -71,3 +71,8 @@ export function countPendingAsks(db, fromDeviceId) {
       + (SELECT COUNT(*) FROM agent_spawn_requests WHERE state='awaiting_user' AND from_device_id=?) AS c
   `).get(fromDeviceId, fromDeviceId).c
 }
+
+// Task 8 fills in the orchestration body (room creation, agent start). This
+// stub exists so Task 7's route can call it; Task 8 replaces this with the
+// full implementation.
+export async function approveSpawn() {}

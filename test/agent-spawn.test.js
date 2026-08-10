@@ -201,3 +201,50 @@ test('spawn_targets is agent-only and hides private boxes from ordinary agents',
   const reply = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets', 5000)
   assert.equal(reply.boxes.some((b) => b.name === 'secret-box'), false)
 })
+
+async function parkedSpawn(t, opts = {}) {
+  const fleet = await spawnFleet(t, opts)
+  const { targetDev, parent, client } = fleet
+  parent.send({
+    op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo',
+    target_device_id: targetDev.deviceId, workdir: '/w', task: 'do it', topic: 'job',
+  })
+  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  await client.waitFor(isSpawnCard)
+  parent.frames.length = 0
+  client.frames.length = 0
+  return { ...fleet, spawnId: ack.spawn_id }
+}
+
+test('deny resolves the row and tells the parent plainly: declined', async (t) => {
+  const { s, clientToken, parent, spawnId } = await parkedSpawn(t)
+  const r = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'deny' } })
+  assert.equal(r.status, 200)
+  assert.equal(getSpawn(s.db, spawnId).state, 'denied')
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
+  assert.equal(out.request_id, spawnId)
+  assert.equal(out.outcome, 'declined') // spec: no peer to hide behind — a plain no
+  // second answer of any kind conflicts
+  const again = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } })
+  assert.equal(again.status, 409)
+})
+
+test('answer endpoint gates: agent tokens 403 (even the parent), unknown id 404, always_allow 400', async (t) => {
+  const { s, parentDev, clientToken, spawnId } = await parkedSpawn(t)
+  const asAgent = await s.http('/agent-spawn/answer', { method: 'POST', token: parentDev.token, body: { request_id: spawnId, decision: 'approve' } })
+  assert.equal(asAgent.status, 403)
+  const unknown = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: 'no-such-row', decision: 'deny' } })
+  assert.equal(unknown.status, 404)
+  const standing = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve', always_allow: true } })
+  assert.equal(standing.status, 400)
+  assert.equal(getSpawn(s.db, spawnId).state, 'awaiting_user') // untouched by the three rejections
+})
+
+test("another user's client cannot see or answer the row (404, anti-enumeration)", async (t) => {
+  const { s, spawnId } = await parkedSpawn(t)
+  const eve = await createUser(s.db, 'eve', 'pw2')
+  const evilLogin = await s.http('/login', { method: 'POST', body: { username: 'eve', password: 'pw2', device_name: 'phone' } })
+  const r = await s.http('/agent-spawn/answer', { method: 'POST', token: evilLogin.json.token, body: { request_id: spawnId, decision: 'approve' } })
+  assert.equal(r.status, 404)
+  assert.equal(getSpawn(s.db, spawnId).state, 'awaiting_user')
+})
