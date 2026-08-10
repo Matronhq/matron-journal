@@ -8,7 +8,17 @@ import {
   listAwaiting, expireAwaiting,
 } from '../src/participants.js'
 
-const db = () => openDb(':memory:')
+// These tests name devices by literal id (1, 2, 3…) and care only about the
+// participant state machine — but `convo_agents.agent_device_id` cascades from
+// `devices` now, so those ids have to exist. Seed a fixed handful up front and
+// the tests below read as they always did.
+const db = () => {
+  const d = openDb(':memory:')
+  d.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+  const ins = d.prepare("INSERT INTO devices(id, user_id, kind, name, token_hash, created_at) VALUES(?,1,'agent',?,?,0)")
+  for (let id = 1; id <= 10; id++) ins.run(id, `dev-${id}`, `hash-${id}`)
+  return d
+}
 
 test('inviteParticipant creates a pending row and reports no prior row', () => {
   const d = db()

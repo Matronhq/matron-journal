@@ -909,13 +909,22 @@ double-*deliver* — and `matron-admin agent-chat approve` says as much in
 its own output, since the CLI itself has no path to the hub whatsoever and
 the delivery genuinely happens later, out of its hands.
 
-**Device revocation clears room membership.** `POST /devices/:id/revoke`
-also deletes every `convo_agents` row where the revoked device is the
-participant. `devices.id` is a plain
-`INTEGER PRIMARY KEY`, so SQLite assigns `max(rowid)+1` and the device
-created after the newest one is revoked lands on exactly its id — without
-this, retiring an agent and registering its replacement would hand the
-replacement the retired agent's room memberships by number alone.
+**Device revocation clears room membership.** Deleting a device deletes
+every `convo_agents` row where it is the participant, by way of
+`agent_device_id REFERENCES devices(id) ON DELETE CASCADE`. `devices.id` is
+a plain `INTEGER PRIMARY KEY`, so SQLite assigns `max(rowid)+1` and the
+device created after the newest one is revoked lands on exactly its id —
+without this, retiring an agent and registering its replacement would hand
+the replacement the retired agent's room memberships by number alone.
+
+The constraint carries this rather than the revoke sites, because there are
+two of them: `POST /devices/:id/revoke` used to do the cleanup itself and
+`matron-admin device revoke` did not, so the same operation left different
+state depending on which door it came through.
+
+`initiator_device_id` deliberately has no such constraint. It records who
+*asked*, and a parked ask outlives its requester: the row stays, and
+`/agent-chat/pending` reports a `null` name for the device that is gone.
 
 **Cap.** Outstanding `awaiting_user` rows per *requesting* device are
 capped at `MAX_AWAITING_PER_REQUESTER` (3); over the cap, `agent_invite`/
@@ -1246,7 +1255,8 @@ listens without ever sending — a lost or compromised phone — is cut off
 too, with the same error frame and `4001` close. WS enforcement is
 therefore **next-frame or ≤60s, whichever comes first**.
 `matron-admin device list <username>` shows each device's kind, cursor,
-and last-seen time.
+and last-seen time. Room membership goes with the row — see "Device
+revocation clears room membership" under agent chat.
 
 Owners can also revoke from a client device over HTTP:
 `POST /devices/:id/revoke` (Bearer, client devices only — agents get 403)

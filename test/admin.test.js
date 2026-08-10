@@ -6,12 +6,12 @@ import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { openDb, insertBlob } from '../src/db.js'
-import { authToken, createUser, createAgent, login } from '../src/auth.js'
+import { authToken, createUser, createAgent, login, authorizeAgentWrite } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
 import { resolveMediaDir, writeBlobSync } from '../src/media.js'
 import { runAdmin, parseExpiresSeconds } from '../bin/matron-admin.js'
 import { startTestServer } from './helpers.js'
-import { parkInvite, getParticipant } from '../src/participants.js'
+import { parkInvite, answerParkedInvite, answerInvite, getParticipant } from '../src/participants.js'
 
 test('admin CLI: user add, agent add, status', async () => {
   const db = openDb(':memory:')
@@ -193,6 +193,33 @@ test('admin CLI: device list and device revoke', async () => {
   const noUser = await createUser(db, 'lonely', 'pw')
   const noneOut = await runAdmin(db, ['device', 'list', 'lonely'])
   assert.match(noneOut, /no devices/i)
+
+  db.close()
+})
+
+// The CLI revoke used to be a bare DELETE on devices while the HTTP route
+// cleaned up convo_agents alongside it, so the same command by a different
+// door left the membership row standing — and `devices.id` is a plain INTEGER
+// PRIMARY KEY, so the next agent created lands on exactly the revoked id and
+// inherited its room. "Retire an agent, register its replacement" is the
+// ordinary sequence that hits this.
+test('admin CLI: device revoke clears room membership, so a reused id inherits nothing', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const owner = createAgent(db, dan.id, 'owner-agent')
+  const doomed = createAgent(db, dan.id, 'doomed-agent')
+  upsertConversation(db, { id: 'room1', ownerUserId: dan.id, title: 'Ops Room', agentDeviceId: owner.deviceId })
+  parkInvite(db, { convoId: 'room1', agentDeviceId: doomed.deviceId, initiatorDeviceId: owner.deviceId })
+  answerParkedInvite(db, { convoId: 'room1', agentDeviceId: doomed.deviceId, approve: true })
+  answerInvite(db, { convoId: 'room1', agentDeviceId: doomed.deviceId, accept: true })
+  assert.equal(authorizeAgentWrite(db, dan.id, doomed.deviceId, 'room1'), true, 'precondition: it could write')
+
+  await runAdmin(db, ['device', 'revoke', String(doomed.deviceId)])
+  assert.equal(getParticipant(db, 'room1', doomed.deviceId), null, 'the membership row goes with the device')
+
+  const fresh = createAgent(db, dan.id, 'replacement-agent')
+  assert.equal(fresh.deviceId, doomed.deviceId, 'precondition: SQLite reused the id')
+  assert.equal(authorizeAgentWrite(db, dan.id, fresh.deviceId, 'room1'), false, 'the replacement starts from nothing')
 
   db.close()
 })

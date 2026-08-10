@@ -64,9 +64,21 @@ CREATE TABLE IF NOT EXISTS link_preapprovals(
   expires_at INTEGER NOT NULL,
   created_at INTEGER NOT NULL
 );
+-- \`agent_device_id\` cascades from devices deliberately. \`devices.id\` is a
+-- plain INTEGER PRIMARY KEY, so SQLite hands a deleted rowid straight to the
+-- next device created; a membership row that outlives its device therefore
+-- grants a brand new agent write access to an old room (authorizeAgentWrite)
+-- purely by inheriting its number. Enforcing that in the schema rather than
+-- at each revoke site is the point: revocation happens from the HTTP route
+-- and from the admin CLI, and the CLI used to forget.
+--
+-- \`initiator_device_id\` has NO such constraint, and must not: it records who
+-- ASKED, and a still-pending row whose requester was revoked is a real row
+-- the owner may still want to see (listAwaiting LEFT JOINs devices for
+-- exactly this case). Cascading there would delete live asks.
 CREATE TABLE IF NOT EXISTS convo_agents(
   convo_id TEXT NOT NULL,
-  agent_device_id INTEGER NOT NULL,
+  agent_device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
   initiator_device_id INTEGER NOT NULL,
   state TEXT NOT NULL CHECK(state IN ('awaiting_user','invited','joined','refused','denied','left','expired')),
   justification TEXT NOT NULL DEFAULT '',
@@ -258,6 +270,46 @@ export function openDb(path) {
   const convoAgentCols = db.prepare('PRAGMA table_info(convo_agents)').all()
   if (!convoAgentCols.some((c) => c.name === 'target_convo_id')) {
     db.exec('ALTER TABLE convo_agents ADD COLUMN target_convo_id TEXT')
+  }
+  // Retrofit the agent_device_id -> devices cascade onto databases created
+  // before it (see the CREATE TABLE above for why it exists). Last of the
+  // convo_agents migrations for the same reason the ALTER is second: this
+  // recreates the table from a fixed definition, so anything placed after it
+  // would be lost on the databases that take every migration.
+  //
+  // The copy filters rows whose device is already gone. That is not
+  // defensive tidying — those rows are the bug this constraint closes, left
+  // behind by `matron-admin device revoke`, and with foreign_keys=ON the
+  // INSERT would fail outright rather than carry them across.
+  const caNow = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='convo_agents'").get()
+  if (caNow && !caNow.sql.includes('ON DELETE CASCADE')) {
+    const orphans = db.prepare(
+      'SELECT COUNT(*) n FROM convo_agents WHERE agent_device_id NOT IN (SELECT id FROM devices)'
+    ).get().n
+    db.exec(`
+      CREATE TABLE convo_agents_fk(
+        convo_id TEXT NOT NULL,
+        agent_device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        initiator_device_id INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('awaiting_user','invited','joined','refused','denied','left','expired')),
+        justification TEXT NOT NULL DEFAULT '',
+        topic TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        answered_at INTEGER,
+        delivered_at INTEGER,
+        target_convo_id TEXT,
+        PRIMARY KEY(convo_id, agent_device_id)
+      );
+      INSERT INTO convo_agents_fk
+        SELECT convo_id, agent_device_id, initiator_device_id, state, justification, topic,
+               created_at, answered_at, delivered_at, target_convo_id
+          FROM convo_agents WHERE agent_device_id IN (SELECT id FROM devices);
+      DROP TABLE convo_agents;
+      ALTER TABLE convo_agents_fk RENAME TO convo_agents;
+    `)
+    if (orphans > 0) {
+      console.log(`convo_agents: dropped ${orphans} membership row(s) whose device was already revoked`)
+    }
   }
   // Standing agent-chat consent ("always allow A -> B") is gone: every ask
   // parks for the user now. Dropped rather than left in place, because a

@@ -5,7 +5,7 @@ import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEven
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice } from './db.js'
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
-import { listAwaiting, answerParkedInvite, getParticipant, forgetDeviceParticipation } from './participants.js'
+import { listAwaiting, answerParkedInvite, getParticipant } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
@@ -443,12 +443,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // via the ≤60s sweep. Not-owned and nonexistent are indistinguishable.
         const revokedId = Number(dm[1])
         if (!revokeOwnedDevice(db, who.userId, revokedId)) return json(res, 404, { error: 'not_found' })
-        // `devices.id` is a plain INTEGER PRIMARY KEY, so SQLite hands the
-        // highest deleted rowid to the next device created. Anything keyed on
-        // a device id therefore has to be cleared with the device, or a brand
-        // new agent inherits the revoked one's room membership (convo_agents)
-        // purely by number.
-        forgetDeviceParticipation(db, who.userId, revokedId)
+        // Room membership goes with it, via the convo_agents cascade in
+        // db.js — not a call here. This route used to do the cleanup itself,
+        // which left `matron-admin device revoke` quietly not doing it.
         return json(res, 200, { ok: true })
       }
       if (req.method === 'POST' && url.pathname === '/pair/approve') {

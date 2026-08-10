@@ -123,17 +123,6 @@ export function listAwaiting(db, userId) {
   `).all(userId)
 }
 
-// Every participation row naming this device, across the user's rooms.
-// Called when a device is revoked: device ids are reused after a delete, and
-// a leftover state='joined' row would hand a brand new agent write access to
-// an old room (authorizeAgentWrite) purely by inheriting its number.
-export function forgetDeviceParticipation(db, userId, deviceId) {
-  return db.prepare(`
-    DELETE FROM convo_agents WHERE agent_device_id=?
-      AND convo_id IN (SELECT id FROM conversations WHERE owner_user_id=?)
-  `).run(deviceId, userId).changes
-}
-
 // Sweep half of the 24h awaiting_user TTL, mirroring expireInvites below:
 // flip stale parked rows and report them so the caller can tell the
 // requester its ask timed out. RETURNING keeps flip-and-report atomic.

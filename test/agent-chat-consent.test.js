@@ -730,23 +730,22 @@ test('GET /agent-chat/pending carries the requesting and target device names', a
 
 // `deviceName` (http.js) is shared by every route that names a device from a
 // LEFT JOIN, including this one (listAwaiting) — not just the now-removed
-// allowances list. `convo_agents` has no FK/cascade to `devices`, so a device
-// row disappearing out from under a still-parked ask is reachable (it's what
-// the real revoke flow's window looks like), and the row must still list
-// with a null name rather than collapsing to "" the way sanitizePeerText
+// allowances list. Revoking the REQUESTER is what still reaches the null
+// branch: `agent_device_id` cascades from devices, but `initiator_device_id`
+// deliberately does not (see the convo_agents schema), so retiring the asking
+// agent leaves its parked ask standing with nothing to name it. The row must
+// list with a null name rather than collapsing to "" the way sanitizePeerText
 // alone would.
-test('a device gone from under a parked ask leaves a null name in /agent-chat/pending, never an empty string', async (t) => {
-  const { s, agB, clientToken, a } = await roomFleet(t)
+test('a requester gone from under its own parked ask leaves a null name in /agent-chat/pending, never an empty string', async (t) => {
+  const { s, agA, agB, clientToken, a } = await roomFleet(t)
   a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'need logs' })
   await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
-  // Delete the device row directly, the way a dangling participant row is
-  // actually produced — no cascade cleans up convo_agents behind it.
-  s.db.prepare('DELETE FROM devices WHERE id=?').run(agB.deviceId)
+  s.db.prepare('DELETE FROM devices WHERE id=?').run(agA.deviceId)
 
   const r = await s.http('/agent-chat/pending', { token: clientToken })
   assert.equal(r.status, 200)
-  assert.equal(r.json.pending[0].agent_name, null, 'null, not "" — the apps render the id instead')
-  assert.equal(r.json.pending[0].initiator_name, 'dev-a')
+  assert.equal(r.json.pending[0].initiator_name, null, 'null, not "" — the apps render the id instead')
+  assert.equal(r.json.pending[0].agent_name, 'dev-b', 'the ask itself survives its requester')
 })
 
 // The other leg of `deviceName`: sanitisation, not just null-preservation.
