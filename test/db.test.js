@@ -215,27 +215,52 @@ test('clientDevicesForPush and listDevices expose push_prefs', async () => {
   assert.deepEqual(roster[0].push_prefs, { attention: false, done: true, activity: false })
 })
 
+// `agent_device_id` names a real device now (see the cascade tests below), so
+// every convo_agents fixture needs one.
+const seedDevice = (db, id) => {
+  db.prepare("INSERT OR IGNORE INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+  db.prepare("INSERT INTO devices(id, user_id, kind, name, token_hash, created_at) VALUES(?,1,'agent',?,?,0)")
+    .run(id, `d${id}`, `h${id}`)
+  return id
+}
+
+// Stand up a database on the CURRENT schema, then hand a raw handle to
+// `downgrade` to put convo_agents back into a pre-migration shape. Building
+// the other twenty tables with openDb rather than by hand is what keeps these
+// fixtures from drifting out of date with the real schema.
+const preMigrationDb = (dbPath, downgrade) => {
+  openDb(dbPath).close()
+  const raw = new Database(dbPath)
+  raw.pragma('foreign_keys = OFF')
+  downgrade(raw)
+  raw.close()
+}
+
 test('convo_agents accepts the consent states and columns', () => {
   const db = openDb(':memory:')
+  const dev = seedDevice(db, 2)
   db.prepare(`INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, justification, topic, created_at, delivered_at)
-             VALUES('r', 2, 1, 'awaiting_user', 'j', 't', 5, NULL)`).run()
+             VALUES('r', ?, 1, 'awaiting_user', 'j', 't', 5, NULL)`).run(dev)
   db.prepare("UPDATE convo_agents SET state='denied' WHERE convo_id='r'").run()
   assert.equal(db.prepare("SELECT state FROM convo_agents WHERE convo_id='r'").get().state, 'denied')
   assert.throws(() => db.prepare("UPDATE convo_agents SET state='bogus' WHERE convo_id='r'").run())
 })
 
-test('old-schema convo_agents is rebuilt in place, rows preserved, delivered_at backfilled', () => {
+test('old-schema convo_agents is rebuilt in place, rows preserved, delivered_at backfilled', (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-convo-agents-migration-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const dbPath = path.join(dir, 'pre-migration.db')
 
-  const raw = new Database(dbPath)
-  raw.exec(`CREATE TABLE convo_agents(
-    convo_id TEXT NOT NULL, agent_device_id INTEGER NOT NULL, initiator_device_id INTEGER NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('invited','joined','refused','left','expired')),
-    justification TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, answered_at INTEGER,
-    PRIMARY KEY(convo_id, agent_device_id));
-    INSERT INTO convo_agents VALUES('r', 2, 1, 'joined', 'why', 111, 222);`)
-  raw.close()
+  preMigrationDb(dbPath, (raw) => {
+    seedDevice(raw, 2)
+    raw.exec(`DROP TABLE convo_agents;
+      CREATE TABLE convo_agents(
+        convo_id TEXT NOT NULL, agent_device_id INTEGER NOT NULL, initiator_device_id INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('invited','joined','refused','left','expired')),
+        justification TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, answered_at INTEGER,
+        PRIMARY KEY(convo_id, agent_device_id));
+      INSERT INTO convo_agents VALUES('r', 2, 1, 'joined', 'why', 111, 222);`)
+  })
 
   const db = openDb(dbPath)
   const row = db.prepare("SELECT * FROM convo_agents WHERE convo_id='r'").get()
@@ -246,7 +271,72 @@ test('old-schema convo_agents is rebuilt in place, rows preserved, delivered_at 
   db.close()
 
   assert.doesNotThrow(() => openDb(dbPath).close())
-  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+// The cascade, and the deliberate asymmetry between the two device columns.
+// This is the whole mechanism behind device revocation clearing rooms — no
+// revoke site calls a cleanup helper any more, so if the constraint goes, so
+// does the protection, silently.
+test('convo_agents: agent_device_id cascades from devices, initiator_device_id does not', () => {
+  const db = openDb(':memory:')
+  const a = seedDevice(db, 1)
+  const b = seedDevice(db, 2)
+  db.prepare("INSERT INTO conversations(id, owner_user_id, created_at) VALUES('room',1,0)").run()
+  db.prepare(`INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, created_at)
+              VALUES('room',?,?,'joined',0)`).run(b, a)
+
+  db.prepare('DELETE FROM devices WHERE id=?').run(a)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM convo_agents').get().n, 1,
+    'losing the requester must not delete the ask it made')
+
+  db.prepare('DELETE FROM devices WHERE id=?').run(b)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM convo_agents').get().n, 0,
+    'losing the member deletes its membership')
+})
+
+test('convo_agents: an unknown agent_device_id is rejected outright', () => {
+  const db = openDb(':memory:')
+  db.prepare("INSERT INTO users(name, password_hash, created_at) VALUES('dan','x',0)").run()
+  db.prepare("INSERT INTO conversations(id, owner_user_id, created_at) VALUES('room',1,0)").run()
+  assert.throws(() => db.prepare(`INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, created_at)
+                                  VALUES('room',999,999,'joined',0)`).run(), /FOREIGN KEY/)
+})
+
+test('convo_agents migration adds the cascade and drops rows the old revoke path stranded', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-convo-agents-fk-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'pre-fk.db')
+
+  // Current-schema convo_agents minus the constraint — what every database
+  // written before this migration looks like, holding one live membership row
+  // and one left behind by `matron-admin device revoke`.
+  preMigrationDb(dbPath, (raw) => {
+    seedDevice(raw, 7)
+    raw.exec(`DROP TABLE convo_agents;
+      CREATE TABLE convo_agents(
+        convo_id TEXT NOT NULL, agent_device_id INTEGER NOT NULL, initiator_device_id INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('awaiting_user','invited','joined','refused','denied','left','expired')),
+        justification TEXT NOT NULL DEFAULT '', topic TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL,
+        answered_at INTEGER, delivered_at INTEGER, target_convo_id TEXT,
+        PRIMARY KEY(convo_id, agent_device_id));
+      INSERT INTO convo_agents VALUES('room',7,7,'joined','why','deploy',111,222,333,'target-1');
+      INSERT INTO convo_agents VALUES('room',404,7,'joined','stale','',1,2,3,NULL);`)
+  })
+
+  const db = openDb(dbPath)
+  const rows = db.prepare('SELECT * FROM convo_agents').all()
+  assert.equal(rows.length, 1, 'the row whose device is already gone does not survive the rebuild')
+  // Every column carried across, not just the ones the constraint is about.
+  assert.deepEqual(
+    [rows[0].agent_device_id, rows[0].state, rows[0].justification, rows[0].topic,
+      rows[0].created_at, rows[0].answered_at, rows[0].delivered_at, rows[0].target_convo_id],
+    [7, 'joined', 'why', 'deploy', 111, 222, 333, 'target-1'])
+
+  db.prepare('DELETE FROM devices WHERE id=7').run()
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM convo_agents').get().n, 0, 'and the cascade is live afterwards')
+  db.close()
+
+  assert.doesNotThrow(() => openDb(dbPath).close(), 'migration is idempotent')
 })
 
 test('openDb: agent_chat_allowances is gone from a fresh database', () => {

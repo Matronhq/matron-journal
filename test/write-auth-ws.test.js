@@ -105,8 +105,11 @@ test('room-upsert gate: an uninvited stranger cannot upsert a room that has any 
 })
 
 test("room-upsert gate: another user's agent probing a room id gets the generic forbidden, not the room-specific detail", async (t) => {
-  const { s, dan, agA } = await fleet(t)
-  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: 'dev-x', initiatorDeviceId: agA.deviceId, justification: 'x' })
+  const { s, dan, agA, agB } = await fleet(t)
+  // Any participant row makes 'room' a room; agB is simply dan's other agent.
+  // (This read a device NAME before — with the convo_agents cascade in place,
+  // agent_device_id has to be a real device id.)
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x' })
   const eve = await createUser(s.db, 'eve', 'pw')
   const agE = createAgent(s.db, eve.id, 'dev-e')
   const e = await makeWsClient(s.base, { token: agE.token, cursor: null })
