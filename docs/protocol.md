@@ -497,7 +497,16 @@ an agent token, selected by which query parameter is present:
 - Unread semantics: a user's own `send` never increments `unread_count` (it's
   their own message); agent-published/finalized events do. `read_marker`
   recomputes `unread_count` from events after `up_to_seq`, so
-  `up_to_seq >= last_seq` always resets it to 0.
+  `up_to_seq >= last_seq` always resets it to 0. Certain event kinds are
+  never counted toward unread: `convo_meta` (a rename), `summary` (TOC metadata),
+  and `edit` (not new activity).
+- `summary` events: agent-publishable message kind carrying `{toc, detail, model}`
+  (payload is opaque to the server — no field-level validation or size caps
+  enforced; the server only checks the payload is a non-null object; any
+  truncation is bridge-side). TOC summaries are derived metadata: journal-synced
+  (fans out and replays to all devices), never FTS-indexed, never increment
+  `unread_count`, and never trigger APNs push (journal-sync-only, like
+  `convo_meta` — clients learn them from the replay, not from notifications).
 - Agent `publish` rejects any `idem_key` starting with `fin:` (reserved for
   `finalize`'s internally composed `fin:<ref>` keys) with
   `{op:'error', code:'bad_request', detail:'idem_key prefix fin: is
@@ -1428,6 +1437,9 @@ considers each of that user's *client* devices with a registered token
 - `convo_meta` never pushes at all — a title rename is journal-sync
   material, not a notification (connected devices learn it from the
   journal frame).
+- `summary` never pushes at all — TOC summaries are derived metadata
+  (not new activity), journal-sync material for browsing, never push
+  (fans out and replays to all devices, but silent notification-wise).
 - routine content (`text`, `tool_output`, `diff`, ...) pushes at priority 5,
   coalesced per (device, conversation): a leading push when idle, then at
   most one trailing push per 10s window while events keep arriving
