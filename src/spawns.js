@@ -154,7 +154,16 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
     // reply is a bad reply, same 'bad_start_reply' the missing-field case
     // already gets below.
     if (r.ok && typeof r.result?.convo_id === 'string' && r.result.convo_id && r.result.convo_id.length <= CONVO_ID_MAX_CHARS) {
-      markStarted(db, row.id, { roomId, childConvoId: r.result.convo_id })
+      // Exactly-once guard, mirroring fail()'s: markStarted is state-scoped
+      // (WHERE state='approved'), so a false means something else — in
+      // practice only the orphan sweep — already resolved this row and told
+      // the parent 'failed'. A contradicting 'started' frame must not follow
+      // it. Unreachable while startTimeoutMs stays under the orphan TTL, but
+      // nothing enforces that relationship between the two configs.
+      if (!markStarted(db, row.id, { roomId, childConvoId: r.result.convo_id })) {
+        console.error('approveSpawn: start reply arrived after the row was already resolved — outcome frame suppressed')
+        return 'failed'
+      }
       hub.sendToDevice(row.user_id, row.from_device_id, {
         kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'started',
         room_id: roomId, child_convo_id: r.result.convo_id,

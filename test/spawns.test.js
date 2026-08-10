@@ -4,7 +4,7 @@ import { openDb } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
 import {
   createSpawnRequest, getSpawn, denySpawn, claimApprove,
-  markStarted, markFailed, expireSpawns, countPendingAsks,
+  markStarted, markFailed, expireSpawns, expireApproved, countPendingAsks, approveSpawn,
 } from '../src/spawns.js'
 import { parkInvite } from '../src/participants.js'
 import { upsertConversation } from '../src/journal.js'
@@ -122,4 +122,31 @@ test('countPendingAsks sums awaiting_user across BOTH tables', async () => {
   // resolved rows drop out
   denySpawn(db, 's1')
   assert.equal(countPendingAsks(db, parent.deviceId), 2)
+})
+
+// The success-path twin of fail()'s exactly-once guard: a start reply that
+// lands after the orphan sweep already resolved the row must not produce a
+// second (contradicting) outcome frame. Deterministic re-creation of the
+// race: the stub broker flips the row to failed (as the sweep would) before
+// answering ok.
+test('late start reply after orphan sweep sends no started frame', async () => {
+  const { db, dan, parent, target } = await seed()
+  makeRow(db, dan, parent, target, 's-race')
+  claimApprove(db, 's-race')
+  const frames = []
+  const hub = {
+    sendToDevice: (userId, deviceId, msg) => { frames.push(msg); return true },
+    broadcastJournal: () => {},
+  }
+  const broker = {
+    issue: async () => {
+      expireApproved(db, 0) // sweep wins the race while the RPC is in flight
+      return { ok: true, result: { convo_id: 'child-1' } }
+    },
+  }
+  const out = await approveSpawn({ db, hub, broker, startTimeoutMs: 50 }, getSpawn(db, 's-race'))
+  assert.equal(out, 'failed')
+  assert.equal(getSpawn(db, 's-race').state, 'failed')
+  assert.equal(frames.filter((f) => f.kind === 'spawn' && f.event === 'outcome').length, 0,
+    'sweep already told the parent; the late success must stay silent')
 })
