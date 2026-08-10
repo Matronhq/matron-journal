@@ -49,3 +49,79 @@ test('a spoofed reply from a different agent device falls through to not_found',
   const r = await p // then times out (1s) — the spoof never settled it
   assert.deepEqual(r, { ok: false, error: { code: 'timeout' } })
 })
+
+const isSpawnCard = (f) => f.kind === 'journal' && f.type === 'permission_request' && f.payload?.kind === 'agent_spawn'
+
+test('spawn_request parks a row, publishes a client-only card into the parent convo, acks pending', async (t) => {
+  const { s, parentDev, targetDev, parent, target, client } = await spawnFleet(t)
+  parent.send({
+    op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo',
+    target_device_id: targetDev.deviceId, workdir: '/home/dan/proj',
+    task: 'fix the flaky test\nand report back', topic: 'flaky test',
+  })
+  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  assert.equal(ack.request_id, 'q1')
+  assert.ok(ack.spawn_id)
+  const row = getSpawn(s.db, ack.spawn_id)
+  assert.equal(row.state, 'awaiting_user')
+  assert.equal(row.from_device_id, parentDev.deviceId)
+  assert.equal(row.workdir, '/home/dan/proj')
+  const card = await client.waitFor(isSpawnCard)
+  assert.equal(card.convo_id, 'parent-convo')
+  assert.equal(card.payload.request_id, ack.spawn_id)
+  assert.equal(card.payload.from_name, 'dev-6')
+  assert.equal(card.payload.target_name, 'eric')
+  assert.equal(card.payload.workdir, '/home/dan/proj')
+  assert.ok(!card.payload.task.includes('\n')) // peer-text discipline: no forged card lines
+  // client-only: neither agent may ever see the card
+  await new Promise((r) => setTimeout(r, 150))
+  assert.equal(parent.frames.find(isSpawnCard), undefined)
+  assert.equal(target.frames.find(isSpawnCard), undefined)
+})
+
+test('spawn_request against an offline box is refused before any card exists', async (t) => {
+  const { s, targetDev, parent, client } = await spawnFleet(t, { connectTarget: false })
+  parent.send({
+    op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo',
+    target_device_id: targetDev.deviceId, workdir: '/w', task: 'x',
+  })
+  const err = await parent.waitFor((f) => f.kind === 'control' && f.op === 'error')
+  assert.equal(err.code, 'agent_unreachable')
+  assert.equal(s.db.prepare('SELECT COUNT(*) c FROM agent_spawn_requests').get().c, 0)
+  await new Promise((r) => setTimeout(r, 150))
+  assert.equal(client.frames.find(isSpawnCard), undefined)
+})
+
+test('spawn_request authorization: clients are forbidden; unknown/foreign/client targets are not_found; foreign from_convo_id is not_found', async (t) => {
+  const { s, dan, targetDev, parent, client } = await spawnFleet(t)
+  // client kind cannot issue the op
+  client.send({ op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo', target_device_id: targetDev.deviceId, workdir: '/w', task: 'x' })
+  const e1 = await client.waitFor((f) => f.kind === 'control' && f.op === 'error')
+  assert.equal(e1.code, 'forbidden')
+  // unknown target device
+  parent.send({ op: 'spawn_request', request_id: 'q2', from_convo_id: 'parent-convo', target_device_id: 9999, workdir: '/w', task: 'x' })
+  const e2 = await parent.waitFor((f) => f.kind === 'control' && f.op === 'error')
+  assert.equal(e2.code, 'not_found')
+  // a convo the parent does not own cannot front the ask
+  parent.frames.length = 0
+  parent.send({ op: 'spawn_request', request_id: 'q3', from_convo_id: 'someone-elses', target_device_id: targetDev.deviceId, workdir: '/w', task: 'x' })
+  const e3 = await parent.waitFor((f) => f.kind === 'control' && f.op === 'error')
+  assert.equal(e3.code, 'not_found')
+})
+
+test('spawn_request enforces the shared pending-ask cap', async (t) => {
+  const { s, dan, parentDev, targetDev, parent } = await spawnFleet(t)
+  for (const id of ['a', 'b', 'c']) {
+    createSpawnRequest(s.db, { id, userId: dan.id, fromDeviceId: parentDev.deviceId, fromConvoId: 'parent-convo', targetDeviceId: targetDev.deviceId, workdir: '/w', task: 'x' })
+  }
+  parent.send({ op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo', target_device_id: targetDev.deviceId, workdir: '/w', task: 'x' })
+  const err = await parent.waitFor((f) => f.kind === 'control' && f.op === 'error')
+  assert.equal(err.code, 'conflict')
+})
+
+test('spawn cards are unforgeable via publish', async (t) => {
+  const { parent } = await spawnFleet(t)
+  parent.send({ op: 'publish', convo_id: 'parent-convo', type: 'permission_request', payload: { kind: 'agent_spawn', request_id: 'forged', task: 'evil' } })
+  const err = await parent.waitFor((f) => f.kind === 'control' && f.op === 'error')
+  assert.equal(err.code, 'bad_request')
+})

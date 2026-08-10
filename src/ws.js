@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { applyBridgePrivate, isPrivateDevice } from './db.js'
@@ -5,7 +6,7 @@ import { eventsAfter, append, markRead, upsertConversation, toEventShape, isClie
 import { joinedAgentIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
-import { countPendingAsks } from './spawns.js'
+import { countPendingAsks, createSpawnRequest } from './spawns.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -60,6 +61,11 @@ const SESSION_OUTCOME_MAX_CHARS = 32
 // stays small, same defensive stance as ACTIVITY_DETAIL_MAX_CHARS.
 const INVITE_TOPIC_MAX_CHARS = 200
 const INVITE_TEXT_MAX_CHARS = 1000
+// Spawn asks (spec: 2026-08-09 agent-spawned sessions). task is BOTH the
+// child's seed prompt and the card text the user approves — one blob, so
+// the text the user reads is the text that takes effect.
+const SPAWN_TASK_MAX_CHARS = 2000
+const SPAWN_WORKDIR_MAX_CHARS = 1024
 // Conversation titles quoted on a consent card to say WHICH session is
 // asking and which is being asked (spec: agent chat request naming). Titles
 // are agent-written, so they are peer text like from_name and get the same
@@ -754,6 +760,67 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
               : { error: { code: msg.error.code, ...(typeof msg.error.detail === 'string' ? { detail: msg.error.detail } : {}) } }),
           },
         })
+        break
+      }
+      case 'spawn_request': {
+        if (conn.kind !== 'agent') return fail('forbidden')
+        if (!conn.registered) return fail('not_ready')
+        const rid = msg.request_id
+        if (typeof rid !== 'string' || rid.length === 0 || rid.length > RPC_ID_MAX_CHARS) return fail('bad_request', 'bad request_id')
+        if (typeof msg.workdir !== 'string' || !msg.workdir || msg.workdir.length > SPAWN_WORKDIR_MAX_CHARS) return fail('bad_request', 'bad workdir')
+        if (typeof msg.task !== 'string' || !msg.task || msg.task.length > SPAWN_TASK_MAX_CHARS) return fail('bad_request', 'bad task')
+        if (msg.topic != null && (typeof msg.topic !== 'string' || msg.topic.length > INVITE_TOPIC_MAX_CHARS)) return fail('bad_request', 'bad topic')
+        if (!Number.isInteger(msg.target_device_id)) return fail('bad_request', 'bad target_device_id')
+        if (msg.target_device_id === conn.deviceId) return fail('bad_request', 'cannot spawn on self')
+        // Ownership stance copied from agent_request/agent_invite: unknown
+        // id, another user's device, a client device — and a private device
+        // seen by an ordinary agent — are indistinguishable not_found.
+        const target = db.prepare('SELECT user_id, kind, private, name FROM devices WHERE id=?').get(msg.target_device_id)
+        if (!target || target.user_id !== conn.userId || target.kind !== 'agent'
+          || (target.private === 1 && !isPrivateDevice(db, conn.deviceId))) return fail('not_found')
+        // Which of the parent's own conversations is asking — REQUIRED here
+        // (the card and the outcome both land in it), same authorisation
+        // shape as agent_invite's from_convo_id.
+        if (typeof msg.from_convo_id !== 'string' || !msg.from_convo_id) return fail('bad_request', 'bad from_convo_id')
+        const fromConvo = db.prepare(
+          'SELECT owner_user_id, agent_device_id, parent_convo_id, title FROM conversations WHERE id=?'
+        ).get(msg.from_convo_id)
+        if (!fromConvo || fromConvo.owner_user_id !== conn.userId
+          || fromConvo.agent_device_id !== conn.deviceId
+          || fromConvo.parent_convo_id != null) return fail('not_found')
+        // An unreachable box is refused BEFORE any card is published — never
+        // spend the user's tap on something that cannot work. Same liveness
+        // rule as hub.sendRpcRequest without sending anything.
+        const online = hub.connsOf(conn.userId).some((c) => c.deviceId === msg.target_device_id && c.ws.readyState === 1)
+        if (!online) return fail('agent_unreachable')
+        const task = sanitizePeerText(msg.task, SPAWN_TASK_MAX_CHARS)
+        if (!task) return fail('bad_request', 'bad task')
+        const topic = sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS)
+        // Shared attention throttle — counts chat asks AND spawn asks.
+        if (countPendingAsks(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
+          return fail('conflict', 'too many requests awaiting user approval')
+        }
+        const spawnId = randomUUID()
+        createSpawnRequest(db, {
+          id: spawnId, userId: conn.userId, fromDeviceId: conn.deviceId,
+          fromConvoId: msg.from_convo_id, targetDeviceId: msg.target_device_id,
+          workdir: msg.workdir, task, topic,
+        })
+        // Client-only card (isClientOnlyEvent covers kind:'agent_spawn'),
+        // published into the PARENT's own conversation — where the user is
+        // already talking to the agent that is asking.
+        appendAndFan({
+          userId: conn.userId, convoId: msg.from_convo_id, sender: `agent:${conn.name}`, type: 'permission_request',
+          payload: {
+            kind: 'agent_spawn', request_id: spawnId,
+            from_device_id: conn.deviceId, from_name: sanitizePeerText(conn.name, PEER_NAME_CAP),
+            from_convo_id: msg.from_convo_id,
+            from_convo_title: sanitizePeerText(fromConvo.title, CARD_TITLE_MAX_CHARS),
+            target_device_id: msg.target_device_id, target_name: sanitizePeerText(target.name, PEER_NAME_CAP),
+            workdir: msg.workdir, task, topic,
+          },
+        })
+        conn.ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: rid, spawn_id: spawnId }))
         break
       }
       case 'agent_invite': {
