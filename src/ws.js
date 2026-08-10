@@ -450,7 +450,7 @@ export function attachWs({
         // reserialization, which JSON.parse's whitespace-stripping would
         // shrink. `data` is a Buffer here (ws delivers text frames as
         // Buffers), so .length is the byte count.
-        handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs })
+        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -506,7 +506,7 @@ export function notifyStale(hub, entry, reason = 'stale') {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000 }) {
+export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000 }) {
   const fail = (code, detail) => {
     conn.ws.send(JSON.stringify({
       kind: 'control', op: 'error', code, ref: msg.op,
@@ -823,6 +823,35 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
           },
         })
         conn.ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: rid, spawn_id: spawnId }))
+        break
+      }
+      case 'spawn_targets': {
+        if (conn.kind !== 'agent') return fail('forbidden')
+        if (!conn.registered) return fail('not_ready')
+        const rid = msg.request_id
+        if (typeof rid !== 'string' || rid.length === 0 || rid.length > RPC_ID_MAX_CHARS) return fail('bad_request', 'bad request_id')
+        // Same visibility rule as the roster: self excluded (a self-entry is
+        // a self-spawn trap), private boxes hidden from ordinary agents.
+        const callerPrivate = isPrivateDevice(db, conn.deviceId)
+        const boxes = db.prepare(
+          "SELECT id AS device_id, name, private FROM devices WHERE user_id=? AND kind='agent' AND id!=?"
+        ).all(conn.userId, conn.deviceId)
+          .filter((d) => callerPrivate || d.private !== 1)
+        const live = new Set(hub.connsOf(conn.userId).filter((c) => c.ws.readyState === 1).map((c) => c.deviceId))
+        // Folder discovery rides the broker (spec: "once it exists, folder
+        // discovery rides it for free"). Offline boxes are listed with no
+        // folders and no RPC; a box that fails or times out degrades to []
+        // — discovery must never error because one box is sick.
+        const out = await Promise.all(boxes.map(async (d) => {
+          const online = live.has(d.device_id)
+          let folders = []
+          if (online) {
+            const r = await broker.issue(hub, conn.userId, d.device_id, 'recent_folders', null, { timeoutMs: spawnFoldersTimeoutMs })
+            if (r.ok && Array.isArray(r.result?.folders)) folders = r.result.folders
+          }
+          return { device_id: d.device_id, name: d.name, online, folders }
+        }))
+        conn.ws.send(JSON.stringify({ kind: 'spawn', event: 'targets', request_id: rid, boxes: out }))
         break
       }
       case 'agent_invite': {

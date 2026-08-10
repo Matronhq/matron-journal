@@ -155,3 +155,49 @@ test('spawn_request sanitizes workdir like task — newlines removed from row an
   // card payload also sanitized
   assert.ok(!card.payload.workdir.includes('\n'), 'card workdir should not contain newline after sanitization')
 })
+
+test('spawn_targets lists other agent boxes with online flags and brokered folders', async (t) => {
+  const { s, targetDev, parent, target } = await spawnFleet(t)
+  // answer the folder RPC like a bridge would
+  target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
+    target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { folders: [{ path: '/home/dan/app', last_used: 5 }] } })
+  })
+  parent.send({ op: 'spawn_targets', request_id: 'q1' })
+  const reply = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets')
+  assert.equal(reply.request_id, 'q1')
+  const eric = reply.boxes.find((b) => b.device_id === targetDev.deviceId)
+  assert.equal(eric.name, 'eric')
+  assert.equal(eric.online, true)
+  assert.deepEqual(eric.folders, [{ path: '/home/dan/app', last_used: 5 }])
+  // self is never listed
+  assert.equal(reply.boxes.some((b) => b.name === 'dev-6'), false)
+})
+
+test('spawn_targets: offline box listed with no folders; folder timeout degrades to empty', async (t) => {
+  const { s, dan, targetDev, parent } = await spawnFleet(t, { connectTarget: false, serverOpts: { spawnFoldersTimeoutMs: 50 } })
+  const silent = createAgent(s.db, dan.id, 'mute-box')
+  const mute = await makeWsClient(s.base, { token: silent.token, cursor: null })
+  await mute.waitFor((f) => f.op === 'hello_ok')
+  t.after(() => mute.close())
+  parent.send({ op: 'spawn_targets', request_id: 'q1' })
+  const reply = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets', 5000)
+  const eric = reply.boxes.find((b) => b.device_id === targetDev.deviceId)
+  assert.equal(eric.online, false)      // offline: no RPC even attempted
+  assert.deepEqual(eric.folders, [])
+  const muteBox = reply.boxes.find((b) => b.name === 'mute-box')
+  assert.equal(muteBox.online, true)    // online but never answered: timeout → []
+  assert.deepEqual(muteBox.folders, [])
+})
+
+test('spawn_targets is agent-only and hides private boxes from ordinary agents', async (t) => {
+  const { s, dan, parent, client } = await spawnFleet(t)
+  client.send({ op: 'spawn_targets', request_id: 'q1' })
+  const err = await client.waitFor((f) => f.kind === 'control' && f.op === 'error')
+  assert.equal(err.code, 'forbidden')
+  const priv = createAgent(s.db, dan.id, 'secret-box')
+  s.db.prepare('UPDATE devices SET private=1 WHERE id=?').run(priv.deviceId)
+  parent.frames.length = 0
+  parent.send({ op: 'spawn_targets', request_id: 'q2' })
+  const reply = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets', 5000)
+  assert.equal(reply.boxes.some((b) => b.name === 'secret-box'), false)
+})
