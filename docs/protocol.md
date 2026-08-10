@@ -1080,14 +1080,27 @@ A `permission_request` event with `payload.kind: 'agent_spawn'` is appended to t
 {
   "kind": "agent_spawn",
   "request_id": "the spawn row's id",
+  "from_device_id": 7,
   "from_name": "the parent device's name",
+  "from_convo_id": "the parent conversation's id",
+  "from_convo_title": "the parent conversation's title",
+  "target_device_id": 12,
   "target_name": "the target device's name",
   "workdir": "string",
-  "task": "string (sanitized: newlines removed, collapsed)"
+  "task": "string (the child's seed prompt, also the card's text)",
+  "topic": "string (optional, title fragment for the card)"
 }
 ```
 
-Like agent-chat cards, this is a **client-only event** excluded from agent delivery and unforgeable via `publish`. Task and workdir are both peer text and undergo the same sanitisation (control characters become spaces, trimmed to their respective caps).
+Like agent-chat cards, this is a **client-only event** excluded from agent delivery and unforgeable via `publish`.
+
+**Identification fields.** `from_device_id` and `target_device_id` identify the two boxes in the spawn pair and map to the devices' own ids — `from_device_id` is always the requesting parent. `from_name` and `target_name` are the devices' sanitised names (control characters become spaces, capped to `PEER_NAME_CAP`), sent because a device's name is how the user knows which box is which on the conversation list. A client rendering the card state must identify which is parent and which is target using the device ids.
+
+**Originating conversation.** `from_convo_id` and `from_convo_title` identify the **parent conversation** — the session the parent owns and is asking from, and where this card is being published. A client that missed the live card or wants to review all spawn requests uses these fields to correlate the card to its originating thread. `from_convo_id` is authorisation, not decoration, exactly as in agent-chat: the requesting device must own this conversation, or the `spawn_request` is rejected `not_found`. A title is shown to the user as the asker's identity, so an unchecked one would let a requester borrow another conversation's name to be trusted by. Both id and title are sent because neither alone identifies a conversation to a user — a room's title has no identifying prefix (unlike a bridge-seeded session title), and two conversations can share wording. A title is a snapshot taken when the ask was made: the card is an immutable event, so a later retitle does not rewrite it.
+
+**Prompt and context.** `task` is both the child's seed prompt for the `start` RPC and the card's text that the user approves — one blob, so the text the user reads is the text that takes effect. `workdir` is the child's working directory, sent as context so the user can understand what environment the spawn will run in. Both are peer text and undergo the same sanitisation (control characters become spaces, trimmed to `SPAWN_TASK_MAX_CHARS` and `SPAWN_WORKDIR_MAX_CHARS` respectively). `topic` is optional and provides a shorter title fragment (capped to `INVITE_TOPIC_MAX_CHARS`) — when present, used as the card's headline instead of truncating the task itself.
+
+sent with `sender: "agent:<name>"`, same sender convention as any other agent-authored event.
 
 ### Answering
 
