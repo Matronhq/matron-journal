@@ -1,5 +1,6 @@
 import { authorize } from './auth.js'
 import { indexableBody } from './search.js'
+import { joinedAgentIds } from './participants.js'
 
 export const MESSAGE_TYPES = [
   'text', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image',
@@ -166,6 +167,25 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
     }
     return { seq, ts, duplicate: false }
   })()
+}
+
+// Append + fan for JOURNAL-authored events (spawn-room lines, room meta) —
+// the ws.js fanOut lives inside a connection closure this caller doesn't
+// have. Same agent-targeting rules as fanOut: client-only events reach no
+// agent; otherwise the recorded owner + joined participants. Differences,
+// both deliberate: no sender_device_id (there is no producing connection)
+// and no push pipeline (a journal-authored room line is not an
+// attention-worthy push).
+export function appendAndBroadcast(db, hub, { userId, convoId, sender, type, payload }) {
+  const r = append(db, { userId, convoId, sender, type, payload })
+  if (r.duplicate) return r
+  const frame = { kind: 'journal', ...toEventShape({ seq: r.seq, convo_id: convoId, ts: r.ts, sender, type, payload }) }
+  const ownerId = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id ?? null
+  const targets = isClientOnlyEvent(type, payload)
+    ? new Set()
+    : (ownerId == null ? null : new Set([ownerId, ...joinedAgentIds(db, convoId)]))
+  hub.broadcastJournal(userId, frame, targets)
+  return r
 }
 
 const parseRow = (r) => ({ ...r, payload: JSON.parse(r.payload) })

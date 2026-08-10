@@ -6,6 +6,10 @@
 // file writes — the convo_agents lesson, where an unlisted value made an
 // upsert fail silently.
 
+import { randomUUID } from 'node:crypto'
+import { upsertConversation, appendAndBroadcast } from './journal.js'
+import { recordJoined } from './participants.js'
+
 export function createSpawnRequest(db, { id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic = '', now = Date.now() }) {
   db.prepare(`
     INSERT INTO agent_spawn_requests(id, user_id, from_device_id, from_convo_id, target_device_id,
@@ -72,7 +76,41 @@ export function countPendingAsks(db, fromDeviceId) {
   `).get(fromDeviceId, fromDeviceId).c
 }
 
-// Task 8 fills in the orchestration body (room creation, agent start). This
-// stub exists so Task 7's route can call it; Task 8 replaces this with the
-// full implementation.
-export async function approveSpawn() {}
+// Spec step 4/5 — everything after the user's tap. Ordering is load-bearing:
+// room first, then spawn. Spawning first would, on a room-creation failure,
+// leave a live agent on another box with no channel and no provenance. The
+// broker's timeout guarantees this settles; every path resolves the row and
+// tells the parent exactly once.
+export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = randomUUID() }, row) {
+  const title = row.topic || row.task.slice(0, 80)
+  // The parent owns the room (conversations.agent_device_id), the target is
+  // its joined participant — the same shape an accepted chat invite leaves.
+  upsertConversation(db, { id: roomId, ownerUserId: row.user_id, title, sessionState: 'running', agentDeviceId: row.from_device_id })
+  recordJoined(db, { convoId: roomId, agentDeviceId: row.target_device_id, initiatorDeviceId: row.from_device_id })
+  // Live clients learn the room exists now, not at their next /snapshot —
+  // the same two frames convo_upsert fans for a fresh conversation.
+  appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'session_status', payload: { state: 'running' } })
+  appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null } })
+  const r = await broker.issue(hub, row.user_id, row.target_device_id, 'start',
+    { workdir: row.workdir, prompt: row.task, room_id: roomId }, { timeoutMs: startTimeoutMs })
+  if (r.ok && typeof r.result?.convo_id === 'string' && r.result.convo_id) {
+    markStarted(db, row.id, { roomId, childConvoId: r.result.convo_id })
+    hub.sendToDevice(row.user_id, row.from_device_id, {
+      kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'started',
+      room_id: roomId, child_convo_id: r.result.convo_id,
+    })
+    return 'started'
+  }
+  const code = r.ok ? 'bad_start_reply' : (r.error?.code ?? 'unknown')
+  markFailed(db, row.id)
+  // The room already exists and both users can see it — it gets the same
+  // epitaph a dead chat room gets, then the parent hears failed, once.
+  appendAndBroadcast(db, hub, {
+    userId: row.user_id, convoId: roomId, sender: 'journal', type: 'text',
+    payload: { body: `❌ spawn failed — ${code}. This room's child session never started.` },
+  })
+  hub.sendToDevice(row.user_id, row.from_device_id, {
+    kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'failed', error_code: code,
+  })
+  return 'failed'
+}

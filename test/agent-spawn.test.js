@@ -249,8 +249,86 @@ test("another user's client cannot see or answer the row (404, anti-enumeration)
   assert.equal(getSpawn(s.db, spawnId).state, 'awaiting_user')
 })
 
+test('approve: room exists BEFORE start rpc; started outcome carries room and child ids', async (t) => {
+  const { s, dan, parentDev, targetDev, clientToken, parent, target, client, spawnId } = await parkedSpawn(t)
+  // Bridge side of the start rpc: assert the room already exists when the
+  // rpc arrives (ordering is load-bearing), then answer like journal-rpc.js
+  const bridgeTurn = target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start').then((req) => {
+    assert.equal(req.request.params.prompt, 'do it')
+    assert.equal(req.request.params.workdir, '/w')
+    const room = s.db.prepare('SELECT * FROM conversations WHERE id=?').get(req.request.params.room_id)
+    assert.ok(room, 'room row must exist before the bridge is asked to spawn')
+    assert.equal(room.agent_device_id, parentDev.deviceId) // parent owns the room
+    target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { convo_id: 'child-convo-1' } })
+    return req.request.params.room_id
+  })
+  const r = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } })
+  assert.equal(r.status, 200)
+  const roomId = await bridgeTurn
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
+  assert.equal(out.outcome, 'started')
+  assert.equal(out.room_id, roomId)
+  assert.equal(out.child_convo_id, 'child-convo-1')
+  const row = getSpawn(s.db, spawnId)
+  assert.equal(row.state, 'started')
+  assert.equal(row.room_id, roomId)
+  assert.equal(row.child_convo_id, 'child-convo-1')
+  // both ends of the pair are in: parent as recorded owner, target joined
+  const joined = s.db.prepare('SELECT agent_device_id, state FROM convo_agents WHERE convo_id=?').all(roomId)
+  assert.deepEqual(joined, [{ agent_device_id: targetDev.deviceId, state: 'joined' }])
+})
+
+test('approve with the target gone by approval time: failed outcome, room gets the epitaph', async (t) => {
+  const { s, clientToken, parent, target, spawnId } = await parkedSpawn(t, { serverOpts: { spawnStartTimeoutMs: 30000 } })
+  target.close() // box dies between the card and the tap
+  await new Promise((r) => setTimeout(r, 50))
+  const r = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } })
+  assert.equal(r.status, 200)
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome', 5000)
+  assert.equal(out.outcome, 'failed')
+  assert.equal(out.error_code, 'agent_unreachable')
+  const row = getSpawn(s.db, spawnId)
+  assert.equal(row.state, 'failed')
+  // the epitaph line landed in the room (room_id stays null on the FAILED
+  // row — it never started — so find the room via the epitaph event itself)
+  const epitaph = s.db.prepare("SELECT payload FROM events WHERE type='text' AND sender='journal'").all()
+    .map((e) => JSON.parse(e.payload))
+  assert.ok(epitaph.some((p) => p.body.includes('spawn failed')))
+})
+
+test('start timeout resolves failed — never left hanging', async (t) => {
+  const { s, clientToken, parent, spawnId } = await parkedSpawn(t, { serverOpts: { spawnStartTimeoutMs: 100 } })
+  // target stays connected but never answers the start rpc
+  await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } })
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome', 5000)
+  assert.equal(out.outcome, 'failed')
+  assert.equal(out.error_code, 'timeout')
+  assert.equal(getSpawn(s.db, spawnId).state, 'failed')
+})
+
+test('two approve taps spawn once: the loser gets 409 and no second room appears', async (t) => {
+  const { s, clientToken, target, spawnId } = await parkedSpawn(t)
+  target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start').then((req) => {
+    target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { convo_id: 'child-1' } })
+  })
+  const [a, b] = await Promise.all([
+    s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } }),
+    s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } }),
+  ])
+  assert.deepEqual([a.status, b.status].sort(), [200, 409])
+  // exactly one room: the parked row's convo plus ONE new conversation
+  await new Promise((r) => setTimeout(r, 200))
+  const convos = s.db.prepare("SELECT COUNT(*) c FROM conversations WHERE id != 'parent-convo'").get().c
+  assert.equal(convos, 1)
+})
+
 test('approve claims the row atomically; second approve conflicts', async (t) => {
-  const { s, dan, parentDev, targetDev, clientToken } = await spawnFleet(t)
+  // spawnStartTimeoutMs kept short: this test only asserts on the claim
+  // (the row's 'approved' state and the second tap's 409), not on the
+  // orchestration outcome — nothing here answers the 'start' rpc, so the
+  // background approveSpawn() the route fires would otherwise sit on the
+  // default 30s timeout well past this test's own teardown.
+  const { s, dan, parentDev, targetDev, clientToken } = await spawnFleet(t, { serverOpts: { spawnStartTimeoutMs: 100 } })
   const spawnId = 'test-spawn-id'
   createSpawnRequest(s.db, {
     id: spawnId, userId: dan.id, fromDeviceId: parentDev.deviceId,
