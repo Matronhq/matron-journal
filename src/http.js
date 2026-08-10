@@ -1,6 +1,6 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
-import { login, authToken, changePassword, revokeOwnedDevice, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
+import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice } from './db.js'
 import { receiveBlob } from './media.js'
@@ -15,6 +15,11 @@ import { searchMessages, indexableBody } from './search.js'
 // "this device is gone" and "this device is named the empty string" are
 // different facts, and the apps render the id instead for the former.
 const deviceName = (raw) => (raw == null ? null : sanitizePeerText(raw, PEER_NAME_CAP))
+
+// User-facing device-name cap. Deliberately tighter than PEER_NAME_CAP (80,
+// the sanitiser's bound for peer-written text): a device name is a chip
+// label in the apps, and 40 chars is already more than a chip can show.
+const DEVICE_NAME_MAX = 40
 
 const json = (res, status, obj) => {
   if (res.writableEnded || res.destroyed) return
@@ -447,6 +452,23 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // db.js — not a call here. This route used to do the cleanup itself,
         // which left `matron-admin device revoke` quietly not doing it.
         return json(res, 200, { ok: true })
+      }
+      const rn = url.pathname.match(/^\/devices\/(\d+)\/rename$/)
+      if (req.method === 'POST' && rn) {
+        // Client-gated like /devices and /password: an agent has no business
+        // renaming its user's devices (or itself — the name is the user's
+        // label for the box, not the box's self-description).
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const { name } = await readBody(req)
+        if (typeof name !== 'string') return json(res, 400, { error: 'bad_request' })
+        // Sanitise BEFORE measuring: the cap is on what we store, and the
+        // sieve (control chars -> space, whitespace collapsed, trimmed) is
+        // the same one every peer-written name goes through.
+        const clean = deviceName(name)
+        if (!clean || clean.length > DEVICE_NAME_MAX) return json(res, 400, { error: 'bad_request' })
+        const renamedId = Number(rn[1])
+        if (!renameOwnedDevice(db, who.userId, renamedId, clean)) return json(res, 404, { error: 'not_found' })
+        return json(res, 200, { ok: true, device: { device_id: renamedId, name: clean } })
       }
       if (req.method === 'POST' && url.pathname === '/pair/approve') {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })

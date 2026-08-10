@@ -103,3 +103,60 @@ test('GET /devices connected reflects live WS sockets', async (t) => {
   }
   assert.equal(r.json.devices.find((d) => d.kind === 'agent').connected, false)
 })
+
+test('POST /devices/:id/rename: renames, sanitises, caps, owner-scoped, client-gated', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'hunter22')
+  const agent = createAgent(s.db, dan.id, 'dev-9')
+  await createUser(s.db, 'pat', 'password')
+  const pat = await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'password', device_name: 'x' } })
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'hunter22', device_name: 'dan-mac' } })
+  const token = login.json.token
+
+  // happy path
+  const ok = await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', token, body: { name: 'dev-y' } })
+  assert.equal(ok.status, 200)
+  assert.deepEqual(ok.json, { ok: true, device: { device_id: agent.deviceId, name: 'dev-y' } })
+  const roster = await s.http('/devices', { token })
+  assert.equal(roster.json.devices.find((d) => d.device_id === agent.deviceId).name, 'dev-y')
+
+  // a client device (including self) may be renamed too
+  const self = await s.http(`/devices/${login.json.device_id}/rename`, { method: 'POST', token, body: { name: 'Dan Mac' } })
+  assert.equal(self.status, 200)
+  assert.equal(self.json.device.name, 'Dan Mac')
+
+  // control characters and newlines are flattened, surrounding space trimmed
+  const dirty = await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', token, body: { name: '  dev\n\ty  ' } })
+  assert.equal(dirty.status, 200)
+  assert.equal(dirty.json.device.name, 'dev y')
+
+  // duplicate names are allowed (pairing only warns)
+  const dup = await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', token, body: { name: 'dan-mac' } })
+  assert.equal(dup.status, 200)
+
+  // empty / whitespace-only / non-string / >40 chars -> 400
+  for (const name of ['', '   ', 42, null, undefined, 'x'.repeat(41)]) {
+    const r = await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', token, body: { name } })
+    assert.equal(r.status, 400, `expected 400 for ${JSON.stringify(name)}`)
+    assert.deepEqual(r.json, { error: 'bad_request' })
+  }
+  // exactly 40 is accepted
+  const at40 = await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', token, body: { name: 'y'.repeat(40) } })
+  assert.equal(at40.status, 200)
+
+  // not owned / nonexistent -> 404, indistinguishable
+  const notOwned = await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', token: pat.json.token, body: { name: 'mine now' } })
+  assert.equal(notOwned.status, 404)
+  assert.deepEqual(notOwned.json, { error: 'not_found' })
+  const missing = await s.http('/devices/999999/rename', { method: 'POST', token, body: { name: 'ghost' } })
+  assert.equal(missing.status, 404)
+
+  // agent bearers are gated like /password
+  const asAgent = await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', token: agent.token, body: { name: 'self-serve' } })
+  assert.equal(asAgent.status, 403)
+  assert.deepEqual(asAgent.json, { error: 'forbidden' })
+
+  // unauthenticated -> 401
+  assert.equal((await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', body: { name: 'x' } })).status, 401)
+})

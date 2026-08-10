@@ -102,6 +102,13 @@ export function revokeOwnedDevice(db, userId, deviceId) {
   return db.prepare('DELETE FROM devices WHERE id=? AND user_id=?').run(deviceId, userId).changes > 0
 }
 
+// Cosmetic rename, owner-scoped like revokeOwnedDevice. Returns false when
+// the device is not this user's (or does not exist) — the caller cannot
+// distinguish the two, same anti-enumeration stance as revoke.
+export function renameOwnedDevice(db, userId, deviceId, name) {
+  return db.prepare('UPDATE devices SET name=? WHERE id=? AND user_id=?').run(name, deviceId, userId).changes > 0
+}
+
 // v1 owner check. Sharing later = extend this + a grants table (spec §7).
 export function authorize(db, userId, convoId) {
   const row = db.prepare('SELECT owner_user_id FROM conversations WHERE id=?').get(convoId)
