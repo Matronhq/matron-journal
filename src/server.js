@@ -16,6 +16,7 @@ import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
 import { runOffload, runExpireLogs } from './retention.js'
 import { backfillSearchIndex } from './search.js'
+import { makeRpcBroker } from './rpc-broker.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
@@ -220,7 +221,7 @@ function warnIfBindTrustsSpoofableIp(bind) {
 export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
-  toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath,
+  toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
@@ -256,6 +257,7 @@ export function startServer({
   const resolvedMediaUserQuotaBytes = mediaUserQuotaBytes ?? resolveNumericEnv('MATRON_MEDIA_USER_QUOTA_BYTES', process.env.MATRON_MEDIA_USER_QUOTA_BYTES, DEFAULT_MEDIA_USER_QUOTA_BYTES)
   const resolvedMaxReplay = maxReplay ?? resolveNumericEnv('MATRON_MAX_REPLAY', process.env.MATRON_MAX_REPLAY, DEFAULT_MAX_REPLAY)
   const hub = makeHub()
+  const broker = makeRpcBroker()
   const toolStreams = makeToolStreamStore({
     maxBytes: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BYTES', process.env.MATRON_TOOL_STREAM_MAX_BYTES, 1048576),
     maxBuffers: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BUFFERS', process.env.MATRON_TOOL_STREAM_MAX_BUFFERS, 64),
@@ -268,7 +270,7 @@ export function startServer({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
-    preapproveKey: resolvedPreapproveKey,
+    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
@@ -278,6 +280,7 @@ export function startServer({
     rpcMaxBytes: resolveNumericEnv('MATRON_RPC_MAX_BYTES', process.env.MATRON_RPC_MAX_BYTES, 16384),
     ...(revocationSweepMs !== undefined ? { revocationSweepMs } : {}),
     ...(inviteTtlMs !== undefined ? { inviteTtlMs } : {}),
+    broker, spawnFoldersTimeoutMs,
   })
   let retentionInterval = null
   let walCheckpointInterval = null
@@ -298,6 +301,7 @@ export function startServer({
         db,
         server,
         hub,
+        broker,
         toolStreams,
         pushPipeline,
         preapproveKey: resolvedPreapproveKey,

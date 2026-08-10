@@ -167,6 +167,7 @@ export function attachWs({
   server, db, hub, pingMs = 55000, pushPipeline = noopPushPipeline,
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
   revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES, inviteTtlMs = 1800000,
+  broker, spawnFoldersTimeoutMs = 4000,
 }) {
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES })
   const statusCache = makeStatusCache()
@@ -443,7 +444,7 @@ export function attachWs({
         // reserialization, which JSON.parse's whitespace-stripping would
         // shrink. `data` is a Buffer here (ws delivers text frames as
         // Buffers), so .length is the byte count.
-        handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes, frameBytes: data.length })
+        handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -499,7 +500,7 @@ export function notifyStale(hub, entry, reason = 'stale') {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0 }) {
+export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000 }) {
   const fail = (code, detail) => {
     conn.ws.send(JSON.stringify({
       kind: 'control', op: 'error', code, ref: msg.op,
@@ -733,6 +734,13 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         // delivery — surface it as a correlated bad_request here instead of
         // an uncorrelated internal error there.
         try { JSON.stringify(msg) } catch { return failRpc('bad_request', 'unserializable frame') }
+        // Journal-originated requests (spawn brokering, folder discovery)
+        // resolve internally instead of being forwarded — the broker checks
+        // that THIS device, on THIS user, is the one the request went to.
+        // Unmatched replies fall through to the client-forward path below,
+        // where to_device_id 0 lands in the same not_found every unknown
+        // device gets.
+        if (broker && broker.resolve(rid, { userId: conn.userId, deviceId: conn.deviceId, msg })) break
         const target = db.prepare('SELECT user_id, kind FROM devices WHERE id=?').get(msg.to_device_id)
         if (!target || target.user_id !== conn.userId || target.kind !== 'client') return failRpc('not_found')
         // Multicast (see hub.sendRpcResponse); a fully disconnected client
