@@ -57,3 +57,17 @@ export function expireSpawns(db, ttlMs, now = Date.now()) {
     "UPDATE agent_spawn_requests SET state='expired', answered_at=?, resolved_at=? WHERE state='awaiting_user' AND created_at<=? RETURNING id, user_id, from_device_id, from_convo_id"
   ).all(now, now, now - ttlMs)
 }
+
+// The shared attention throttle (spec: cap on outstanding asks). Counts BOTH
+// tables — pending spawn rows live here, pending chat asks in convo_agents —
+// because what the user is being protected from is cards, not any one
+// table's cards. An agent that exhausted its chat budget must not spawn
+// freely, or vice versa. Checked against MAX_AWAITING_PER_REQUESTER on all
+// three ask surfaces (agent_invite, agent_join, spawn_request).
+export function countPendingAsks(db, fromDeviceId) {
+  return db.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM convo_agents WHERE state='awaiting_user' AND initiator_device_id=?)
+      + (SELECT COUNT(*) FROM agent_spawn_requests WHERE state='awaiting_user' AND from_device_id=?) AS c
+  `).get(fromDeviceId, fromDeviceId).c
+}

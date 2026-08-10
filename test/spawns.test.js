@@ -4,8 +4,10 @@ import { openDb } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
 import {
   createSpawnRequest, getSpawn, denySpawn, claimApprove,
-  markStarted, markFailed, expireSpawns,
+  markStarted, markFailed, expireSpawns, countPendingAsks,
 } from '../src/spawns.js'
+import { parkInvite } from '../src/participants.js'
+import { upsertConversation } from '../src/journal.js'
 
 async function seed() {
   const db = openDb(':memory:')
@@ -98,4 +100,26 @@ test('an unknown state can never be written (CHECK constraint)', async () => {
   const { db, dan, parent, target } = await seed()
   makeRow(db, dan, parent, target)
   assert.throws(() => db.prepare("UPDATE agent_spawn_requests SET state='ended' WHERE id='spawn-1'").run())
+})
+
+test('countPendingAsks sums awaiting_user across BOTH tables', async () => {
+  const { db, dan, parent, target } = await seed()
+  upsertConversation(db, { id: 'room-x', ownerUserId: dan.id, title: 'x', sessionState: 'running', agentDeviceId: parent.deviceId })
+
+  // spawn rows alone
+  makeRow(db, dan, parent, target, 's1')
+  makeRow(db, dan, parent, target, 's2')
+  assert.equal(countPendingAsks(db, parent.deviceId), 2)
+
+  // chat rows alone (fresh device so the count starts at zero)
+  parkInvite(db, { convoId: 'room-x', agentDeviceId: target.deviceId, initiatorDeviceId: target.deviceId, justification: 'j' })
+  assert.equal(countPendingAsks(db, target.deviceId), 1)
+
+  // the mix: 2 spawn + 1 chat = 3 for parent once it also parks a chat ask
+  parkInvite(db, { convoId: 'room-x', agentDeviceId: parent.deviceId, initiatorDeviceId: parent.deviceId, justification: 'j' })
+  assert.equal(countPendingAsks(db, parent.deviceId), 3)
+
+  // resolved rows drop out
+  denySpawn(db, 's1')
+  assert.equal(countPendingAsks(db, parent.deviceId), 2)
 })

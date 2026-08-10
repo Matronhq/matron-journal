@@ -2,9 +2,10 @@ import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { applyBridgePrivate, isPrivateDevice } from './db.js'
 import { eventsAfter, append, markRead, upsertConversation, toEventShape, isClientOnlyEvent } from './journal.js'
-import { joinedAgentIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, awaitingCount, expireAwaiting } from './participants.js'
+import { joinedAgentIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
+import { countPendingAsks } from './spawns.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -821,8 +822,9 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         // Every ask parks for the user's consent — there is no standing
         // allowance and no fast path, so nothing reaches the target's socket
         // before a human answers. Capped per requester device so one chatty
-        // agent can't flood the user's attention queue with asks.
-        if (awaitingCount(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
+        // agent can't flood the user's attention queue with asks. The sum
+        // counts both chat asks (convo_agents) and spawn requests.
+        if (countPendingAsks(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
           return fail('conflict', 'too many requests awaiting user approval')
         }
         const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id, initiatorDeviceId: conn.deviceId, justification, topic, targetConvoId })
@@ -885,8 +887,9 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         // Every ask parks for the user's consent — there is no standing
         // allowance and no fast path, so nothing reaches the room owner's
         // socket before a human answers. Capped per requester device so one
-        // chatty agent can't flood the user's attention queue with asks.
-        if (awaitingCount(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
+        // chatty agent can't flood the user's attention queue with asks. The
+        // sum counts both chat asks (convo_agents) and spawn requests.
+        if (countPendingAsks(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
           return fail('conflict', 'too many requests awaiting user approval')
         }
         const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId, initiatorDeviceId: conn.deviceId, justification, topic: '' })
