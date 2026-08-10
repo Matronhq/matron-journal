@@ -328,7 +328,7 @@ test('approve claims the row atomically; second approve conflicts', async (t) =>
   // orchestration outcome — nothing here answers the 'start' rpc, so the
   // background approveSpawn() the route fires would otherwise sit on the
   // default 30s timeout well past this test's own teardown.
-  const { s, dan, parentDev, targetDev, clientToken } = await spawnFleet(t, { serverOpts: { spawnStartTimeoutMs: 100 } })
+  const { s, dan, parentDev, targetDev, clientToken, parent } = await spawnFleet(t, { serverOpts: { spawnStartTimeoutMs: 100 } })
   const spawnId = 'test-spawn-id'
   createSpawnRequest(s.db, {
     id: spawnId, userId: dan.id, fromDeviceId: parentDev.deviceId,
@@ -344,4 +344,10 @@ test('approve claims the row atomically; second approve conflicts', async (t) =>
   // Second approve attempt conflicts
   const r2 = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } })
   assert.equal(r2.status, 409)
+  // Drain the background approveSpawn() the first tap fired before teardown
+  // closes the DB out from under it (nothing here answers the 'start' rpc,
+  // so it settles failed/timeout — same wait the adjacent "start timeout
+  // resolves failed" test uses).
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome', 5000)
+  assert.equal(out.outcome, 'failed')
 })
