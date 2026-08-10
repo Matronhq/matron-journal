@@ -793,6 +793,8 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         // rule as hub.sendRpcRequest without sending anything.
         const online = hub.connsOf(conn.userId).some((c) => c.deviceId === msg.target_device_id && c.ws.readyState === 1)
         if (!online) return fail('agent_unreachable')
+        const workdir = sanitizePeerText(msg.workdir, SPAWN_WORKDIR_MAX_CHARS)
+        if (!workdir) return fail('bad_request', 'bad workdir')
         const task = sanitizePeerText(msg.task, SPAWN_TASK_MAX_CHARS)
         if (!task) return fail('bad_request', 'bad task')
         const topic = sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS)
@@ -804,7 +806,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         createSpawnRequest(db, {
           id: spawnId, userId: conn.userId, fromDeviceId: conn.deviceId,
           fromConvoId: msg.from_convo_id, targetDeviceId: msg.target_device_id,
-          workdir: msg.workdir, task, topic,
+          workdir, task, topic,
         })
         // Client-only card (isClientOnlyEvent covers kind:'agent_spawn'),
         // published into the PARENT's own conversation — where the user is
@@ -817,7 +819,7 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
             from_convo_id: msg.from_convo_id,
             from_convo_title: sanitizePeerText(fromConvo.title, CARD_TITLE_MAX_CHARS),
             target_device_id: msg.target_device_id, target_name: sanitizePeerText(target.name, PEER_NAME_CAP),
-            workdir: msg.workdir, task, topic,
+            workdir, task, topic,
           },
         })
         conn.ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: rid, spawn_id: spawnId }))

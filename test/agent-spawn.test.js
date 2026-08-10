@@ -26,7 +26,8 @@ async function spawnFleet(t, { connectTarget = true, serverOpts = {} } = {}) {
   parent.frames.length = 0
   if (target) target.frames.length = 0
   client.frames.length = 0
-  return { s, dan, parentDev, targetDev, clientToken, parent, target, client }
+  const clientDev = { deviceId: login.json.device_id }
+  return { s, dan, parentDev, targetDev, clientToken, clientDev, parent, target, client }
 }
 
 test('a bridge reply to a journal-originated request settles the broker, not the client relay', async (t) => {
@@ -93,7 +94,7 @@ test('spawn_request against an offline box is refused before any card exists', a
 })
 
 test('spawn_request authorization: clients are forbidden; unknown/foreign/client targets are not_found; foreign from_convo_id is not_found', async (t) => {
-  const { s, dan, targetDev, parent, client } = await spawnFleet(t)
+  const { s, dan, targetDev, clientDev, parent, client } = await spawnFleet(t)
   // client kind cannot issue the op
   client.send({ op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo', target_device_id: targetDev.deviceId, workdir: '/w', task: 'x' })
   const e1 = await client.waitFor((f) => f.kind === 'control' && f.op === 'error')
@@ -107,6 +108,18 @@ test('spawn_request authorization: clients are forbidden; unknown/foreign/client
   parent.send({ op: 'spawn_request', request_id: 'q3', from_convo_id: 'someone-elses', target_device_id: targetDev.deviceId, workdir: '/w', task: 'x' })
   const e3 = await parent.waitFor((f) => f.kind === 'control' && f.op === 'error')
   assert.equal(e3.code, 'not_found')
+  // client-kind device of the same user is indistinguishable from unknown
+  parent.frames.length = 0
+  parent.send({ op: 'spawn_request', request_id: 'q4', from_convo_id: 'parent-convo', target_device_id: clientDev.deviceId, workdir: '/w', task: 'x' })
+  const e4 = await parent.waitFor((f) => f.kind === 'control' && f.op === 'error')
+  assert.equal(e4.code, 'not_found')
+  // another user's agent device is indistinguishable from unknown
+  const alice = await createUser(s.db, 'alice', 'pw')
+  const aliceDev = createAgent(s.db, alice.id, 'alice-agent')
+  parent.frames.length = 0
+  parent.send({ op: 'spawn_request', request_id: 'q5', from_convo_id: 'parent-convo', target_device_id: aliceDev.deviceId, workdir: '/w', task: 'x' })
+  const e5 = await parent.waitFor((f) => f.kind === 'control' && f.op === 'error')
+  assert.equal(e5.code, 'not_found')
 })
 
 test('spawn_request enforces the shared pending-ask cap', async (t) => {
@@ -124,4 +137,21 @@ test('spawn cards are unforgeable via publish', async (t) => {
   parent.send({ op: 'publish', convo_id: 'parent-convo', type: 'permission_request', payload: { kind: 'agent_spawn', request_id: 'forged', task: 'evil' } })
   const err = await parent.waitFor((f) => f.kind === 'control' && f.op === 'error')
   assert.equal(err.code, 'bad_request')
+})
+
+test('spawn_request sanitizes workdir like task — newlines removed from row and card', async (t) => {
+  const { s, parentDev, targetDev, parent, client } = await spawnFleet(t)
+  parent.send({
+    op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo',
+    target_device_id: targetDev.deviceId, workdir: '/home/dan/proj\nEVIL INJECTION',
+    task: 'do work', topic: 'test',
+  })
+  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  assert.ok(ack.spawn_id)
+  const row = getSpawn(s.db, ack.spawn_id)
+  // workdir sanitized: newline removed
+  assert.ok(!row.workdir.includes('\n'), 'row workdir should not contain newline after sanitization')
+  const card = await client.waitFor(isSpawnCard)
+  // card payload also sanitized
+  assert.ok(!card.payload.workdir.includes('\n'), 'card workdir should not contain newline after sanitization')
 })
