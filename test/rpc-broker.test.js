@@ -30,6 +30,14 @@ test('unreachable target resolves immediately without waiting for the timeout', 
   assert.equal(broker.pendingCount(), 0)
 })
 
+test('hub.sendRpcRequest throwing resolves immediately with send_failed, not reject', async () => {
+  const broker = makeRpcBroker()
+  const badHub = { sendRpcRequest() { throw new Error('boom') } }
+  const r = await broker.issue(badHub, 1, 42, 'start', {}, { timeoutMs: 60000 })
+  assert.deepEqual(r, { ok: false, error: { code: 'send_failed' } })
+  assert.equal(broker.pendingCount(), 0)
+})
+
 test('timeout resolves {ok:false, code:timeout}; a late reply is then unclaimed', async () => {
   const broker = makeRpcBroker()
   const hub = fakeHub()

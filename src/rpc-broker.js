@@ -29,14 +29,22 @@ export function makeRpcBroker() {
             pending.delete(requestId)
             resolve(outcome)
           },
+          // Ref'd timer (no unref) is deliberate: an unref'd timer whose event loop
+          // empties abandons the awaited promise mid-flight, violating settle-exactly-once.
+          // Trade-off: ref'd timer holds the process open up to timeoutMs on shutdown,
+          // which is acceptable to guarantee the timeout fires and settles the promise.
           timer: setTimeout(() => entry.settle({ ok: false, error: { code: 'timeout' } }), timeoutMs),
         }
         pending.set(requestId, entry)
-        const delivered = hub.sendRpcRequest(userId, deviceId, {
-          kind: 'rpc',
-          request: { request_id: requestId, from_device_id: 0, method, params },
-        })
-        if (!delivered) entry.settle({ ok: false, error: { code: 'agent_unreachable' } })
+        try {
+          const delivered = hub.sendRpcRequest(userId, deviceId, {
+            kind: 'rpc',
+            request: { request_id: requestId, from_device_id: 0, method, params },
+          })
+          if (!delivered) entry.settle({ ok: false, error: { code: 'agent_unreachable' } })
+        } catch (err) {
+          entry.settle({ ok: false, error: { code: 'send_failed' } })
+        }
       })
     },
     // Called from ws.js's agent_response handler. Returns whether this reply
