@@ -5,6 +5,7 @@ import { createUser, createAgent } from '../src/auth.js'
 import {
   createSpawnRequest, getSpawn, denySpawn, claimApprove,
   markStarted, markFailed, expireSpawns, expireApproved, countPendingAsks, approveSpawn,
+  sanitizeSpawnActivity, sanitizeSpawnLimits,
 } from '../src/spawns.js'
 import { parkInvite } from '../src/participants.js'
 import { upsertConversation } from '../src/journal.js'
@@ -149,4 +150,44 @@ test('late start reply after orphan sweep sends no started frame', async () => {
   assert.equal(getSpawn(db, 's-race').state, 'failed')
   assert.equal(frames.filter((f) => f.kind === 'spawn' && f.event === 'outcome').length, 0,
     'sweep already told the parent; the late success must stay silent')
+})
+
+test('sanitizeSpawnActivity accepts a valid block and caps last_hour at 20', () => {
+  const raw = {
+    live_sessions: 2,
+    last_hour: Array.from({ length: 25 }, (_, i) => ({ path: `/w/${i}`, sessions: i + 1 })),
+  }
+  const out = sanitizeSpawnActivity(raw)
+  assert.equal(out.live_sessions, 2)
+  assert.equal(out.last_hour.length, 20)
+  assert.deepEqual(out.last_hour[0], { path: '/w/0', sessions: 1 })
+})
+
+test('sanitizeSpawnActivity rejects malformed blocks whole', () => {
+  assert.equal(sanitizeSpawnActivity(null), null)
+  assert.equal(sanitizeSpawnActivity({ live_sessions: -1, last_hour: [] }), null)
+  assert.equal(sanitizeSpawnActivity({ live_sessions: 1, last_hour: [{ path: '', sessions: 1 }] }), null)
+  assert.equal(sanitizeSpawnActivity({ live_sessions: 1, last_hour: [{ path: '/ok', sessions: 0 }] }), null)
+  assert.equal(sanitizeSpawnActivity({ live_sessions: 'x', last_hour: [] }), null)
+})
+
+test('sanitizeSpawnActivity flattens newlines in paths', () => {
+  const out = sanitizeSpawnActivity({ live_sessions: 0, last_hour: [{ path: '/a\nb', sessions: 1 }] })
+  assert.ok(!out.last_hour[0].path.includes('\n'))
+})
+
+test('sanitizeSpawnLimits accepts a valid block, caps lines at 12, drops malformed whole', () => {
+  const line = { id: 'session', label: 'Session', percent: 39, resets: 'Aug 11, 1:00am (UTC)', resets_at: '2026-08-11T01:00:00.000Z' }
+  const out = sanitizeSpawnLimits({ as_of: 123, lines: Array.from({ length: 15 }, () => ({ ...line })) })
+  assert.equal(out.as_of, 123)
+  assert.equal(out.lines.length, 12)
+  assert.deepEqual(out.lines[0], line)
+  assert.equal(sanitizeSpawnLimits({ as_of: 0, lines: [line] }), null)
+  assert.equal(sanitizeSpawnLimits({ as_of: 1, lines: [{ ...line, percent: 'x' }] }), null)
+  assert.equal(sanitizeSpawnLimits({ as_of: 1, lines: 'nope' }), null)
+})
+
+test('sanitizeSpawnLimits omits absent resets fields rather than nulling', () => {
+  const out = sanitizeSpawnLimits({ as_of: 1, lines: [{ id: 'session', label: 'Session', percent: 5 }] })
+  assert.ok(!('resets' in out.lines[0]) && !('resets_at' in out.lines[0]))
 })

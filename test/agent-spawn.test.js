@@ -173,6 +173,39 @@ test('spawn_targets lists other agent boxes with online flags and brokered folde
   assert.equal(reply.boxes.some((b) => b.name === 'dev-6'), false)
 })
 
+test('spawn_targets: valid capacity blocks pass through; a malformed block is dropped but the box stays', async (t) => {
+  const { s, dan, targetDev, parent, target } = await spawnFleet(t)
+  const second = createAgent(s.db, dan.id, 'sicky')
+  const bad = await makeWsClient(s.base, { token: second.token, cursor: null })
+  await bad.waitFor((f) => f.op === 'hello_ok')
+  t.after(() => bad.close())
+  target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
+    target.send({
+      op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true,
+      result: {
+        folders: [{ path: '/home/dan/app', last_used: 5 }],
+        activity: { live_sessions: 1, last_hour: [{ path: '/w', sessions: 2 }] },
+        limits: { as_of: 5, lines: [{ id: 'session', label: 'Session', percent: 10 }] },
+      },
+    })
+  })
+  bad.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
+    bad.send({
+      op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true,
+      result: { folders: [], activity: { live_sessions: -5, last_hour: [] } },
+    })
+  })
+  parent.send({ op: 'spawn_targets', request_id: 'q1' })
+  const reply = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets')
+  const eric = reply.boxes.find((b) => b.device_id === targetDev.deviceId)
+  assert.deepEqual(eric.activity, { live_sessions: 1, last_hour: [{ path: '/w', sessions: 2 }] })
+  assert.deepEqual(eric.limits, { as_of: 5, lines: [{ id: 'session', label: 'Session', percent: 10 }] })
+  const sicky = reply.boxes.find((b) => b.device_id === second.deviceId)
+  assert.deepEqual(sicky.folders, [])
+  assert.ok(!('activity' in sicky)) // malformed block dropped whole, box still listed
+  assert.ok(!('limits' in sicky)) // no limits reported at all — omitted, not null
+})
+
 test('spawn_targets: offline box listed with no folders; folder timeout degrades to empty', async (t) => {
   const { s, dan, targetDev, parent } = await spawnFleet(t, { connectTarget: false, serverOpts: { spawnFoldersTimeoutMs: 50 } })
   const silent = createAgent(s.db, dan.id, 'mute-box')
@@ -256,6 +289,7 @@ test('approve: room exists BEFORE start rpc; started outcome carries room and ch
   const bridgeTurn = target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start').then((req) => {
     assert.equal(req.request.params.prompt, 'do it')
     assert.equal(req.request.params.workdir, '/w')
+    assert.equal(req.request.params.from_name, 'dev-6') // parent device name, for the child's opening turn
     const room = s.db.prepare('SELECT * FROM conversations WHERE id=?').get(req.request.params.room_id)
     assert.ok(room, 'room row must exist before the bridge is asked to spawn')
     assert.equal(room.agent_device_id, parentDev.deviceId) // parent owns the room

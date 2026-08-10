@@ -9,6 +9,7 @@
 import { randomUUID } from 'node:crypto'
 import { upsertConversation, appendAndBroadcast, CONVO_ID_MAX_CHARS } from './journal.js'
 import { recordJoined } from './participants.js'
+import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 
 export function createSpawnRequest(db, { id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic = '', now = Date.now() }) {
   db.prepare(`
@@ -147,8 +148,16 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
     // the same two frames convo_upsert fans for a fresh conversation.
     appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'session_status', payload: { state: 'running' } })
     appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null } })
+    // The parent device's name may be gone by approval time (deleted between
+    // the ask and the tap) — omitted rather than forced, same as every other
+    // optional wire field.
+    const fromName = sanitizePeerText(
+      db.prepare('SELECT name FROM devices WHERE id=?').get(row.from_device_id)?.name,
+      PEER_NAME_CAP,
+    )
     const r = await broker.issue(hub, row.user_id, row.target_device_id, 'start',
-      { workdir: row.workdir, prompt: row.task, room_id: roomId }, { timeoutMs: startTimeoutMs })
+      { workdir: row.workdir, prompt: row.task, room_id: roomId, ...(fromName ? { from_name: fromName } : {}) },
+      { timeoutMs: startTimeoutMs })
     // Bridge-returned convo_id, capped the same as every other externally-
     // supplied convo id (CONVO_ID_MAX_CHARS) — an oversized or non-string
     // reply is a bad reply, same 'bad_start_reply' the missing-field case
@@ -175,4 +184,61 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
     console.error('approveSpawn orchestration threw before settling', err)
     return fail('internal')
   }
+}
+
+// Shape-validation for the capacity blocks a bridge may attach to its
+// recent_folders reply (spec: 2026-08-10 bridge capacity design). All-or-
+// nothing per block: one malformed entry drops the whole optional block —
+// but never the box — because a half-validated capacity report is worse
+// than none. Strings are flattened through sanitizePeerText: they originate
+// from another box's `claude` output and filesystem, and render in an
+// agent-facing reply.
+const ACTIVITY_MAX_ENTRIES = 20
+const LIMITS_MAX_LINES = 12
+const LIMIT_STR_CAP = 100
+const SESSIONS_SANE_MAX = 10000
+
+export function sanitizeSpawnActivity(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  if (!Number.isInteger(raw.live_sessions) || raw.live_sessions < 0 || raw.live_sessions > SESSIONS_SANE_MAX) return null
+  if (!Array.isArray(raw.last_hour)) return null
+  const last_hour = []
+  for (const e of raw.last_hour.slice(0, ACTIVITY_MAX_ENTRIES)) {
+    if (!e || typeof e !== 'object') return null
+    if (typeof e.path !== 'string' || !e.path || e.path.length > 1024) return null
+    if (!Number.isInteger(e.sessions) || e.sessions < 1 || e.sessions > SESSIONS_SANE_MAX) return null
+    const path = sanitizePeerText(e.path, 1024)
+    if (!path) return null
+    last_hour.push({ path, sessions: e.sessions })
+  }
+  return { live_sessions: raw.live_sessions, last_hour }
+}
+
+export function sanitizeSpawnLimits(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  if (!Number.isInteger(raw.as_of) || raw.as_of <= 0) return null
+  if (!Array.isArray(raw.lines)) return null
+  const lines = []
+  for (const l of raw.lines.slice(0, LIMITS_MAX_LINES)) {
+    if (!l || typeof l !== 'object') return null
+    if (typeof l.id !== 'string' || !l.id || l.id.length > LIMIT_STR_CAP) return null
+    if (typeof l.label !== 'string' || !l.label || l.label.length > LIMIT_STR_CAP) return null
+    if (!Number.isInteger(l.percent) || l.percent < 0 || l.percent > 1000) return null
+    const id = sanitizePeerText(l.id, LIMIT_STR_CAP)
+    const label = sanitizePeerText(l.label, LIMIT_STR_CAP)
+    if (!id || !label) return null
+    const out = { id, label, percent: l.percent }
+    if (l.resets !== undefined) {
+      if (typeof l.resets !== 'string' || l.resets.length > LIMIT_STR_CAP) return null
+      const resets = sanitizePeerText(l.resets, LIMIT_STR_CAP)
+      if (!resets) return null
+      out.resets = resets
+    }
+    if (l.resets_at !== undefined) {
+      if (typeof l.resets_at !== 'string' || !l.resets_at || l.resets_at.length > 40) return null
+      out.resets_at = l.resets_at
+    }
+    lines.push(out)
+  }
+  return { as_of: raw.as_of, lines }
 }

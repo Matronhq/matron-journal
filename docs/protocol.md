@@ -1072,9 +1072,11 @@ Acknowledgement: `{kind:'spawn', event:'pending', request_id, spawn_id}` — the
 }
 ```
 
-Reply: `{kind:'spawn', event:'targets', request_id, boxes: [{device_id, name, online, folders: [{path, last_used}]}]}`. Each box carries whether it is currently online and — if reachable — a list of recent working directories it has reported. Self (the requesting device) is never listed. Private devices are hidden from non-private agents.
+Reply: `{kind:'spawn', event:'targets', request_id, boxes: [{device_id, name, online, folders: [{path, last_used}], activity?, limits?}]}`. Each box carries whether it is currently online and — if reachable — a list of recent working directories it has reported. Self (the requesting device) is never listed. Private devices are hidden from non-private agents.
 
 Folder discovery rides the RPC broker: for each *online* box the journal itself issues a **journal-originated** `recent_folders` RPC (see "Journal-originated requests" under "Agent RPC" below — `from_device_id: 0`, answered with `to_device_id: 0`) and waits up to `spawnFoldersTimeoutMs` for the reply. A bridge that never learns to answer this method will simply time out to `folders: []` for every request rather than erroring; offline boxes are listed with no RPC attempted at all.
+
+**Capacity blocks (optional).** A bridge may additionally report its current load in the same `recent_folders` reply, as `activity: {live_sessions, last_hour: [{path, sessions}]}` (capped to 20 `last_hour` entries) and `limits: {as_of, lines: [{id, label, percent, resets?, resets_at?}]}` (capped to 12 `lines`; `resets`/`resets_at` are per-line and each independently optional). Both are validated all-or-nothing (`sanitizeSpawnActivity`/`sanitizeSpawnLimits` in `src/spawns.js`): any malformed entry drops the whole block from that box's reply, but never the box itself — a bridge that predates these fields, or whose reply fails validation, simply shows up with folders and no `activity`/`limits` keys (omitted, not null).
 
 ### Consent card
 
@@ -1111,7 +1113,7 @@ sent with `sender: "agent:<name>"`, same sender convention as any other agent-au
 **`POST /agent-spawn/answer`** `{request_id, decision: "approve"|"deny"}` — client-only (`403` for agent tokens). `request_id` must resolve to a **row belonging to the caller's own user**; an unknown row and one owned by another user are indistinguishable (`404 {error:'not_found'}`, never `403` — anti-enumeration). The row must be `state='awaiting_user'` or the call is `409 {error:'conflict'}` (already answered, or never parked). A body carrying `always_allow` at all — any value — is `400 {error:'bad_request'}`.
 
 - **`deny`** flips the row to `denied` and sends the parent `{kind:'spawn', event:'outcome', request_id, outcome:'declined'}` (if reachable).
-- **`approve`** flips the row to `approved`, creates a new `conversations` row owned by the parent, and joins the target as a participant — room-first, same ordering rule as agent-chat, so a room-creation failure never leaves a live agent spawned on another box with no channel and no provenance. Before the `start` RPC is issued, `session_status` and `convo_meta` journal events are broadcast into the new room — the same two frames `convo_upsert` fans for a fresh conversation — so live clients learn the room exists immediately, and they fan to the target agent too, since it is already a joined participant by this point. Only then does the journal issue the `start` RPC to the target with `params: {prompt: <task>, workdir: <workdir>, room_id: <new room id>}`. The parent hears one of: `outcome:'started'` (with `room_id` and `child_convo_id`), `outcome:'failed'` (with `error_code`), or times out to `failed/timeout` if the target never answers.
+- **`approve`** flips the row to `approved`, creates a new `conversations` row owned by the parent, and joins the target as a participant — room-first, same ordering rule as agent-chat, so a room-creation failure never leaves a live agent spawned on another box with no channel and no provenance. Before the `start` RPC is issued, `session_status` and `convo_meta` journal events are broadcast into the new room — the same two frames `convo_upsert` fans for a fresh conversation — so live clients learn the room exists immediately, and they fan to the target agent too, since it is already a joined participant by this point. Only then does the journal issue the `start` RPC to the target with `params: {prompt: <task>, workdir: <workdir>, room_id: <new room id>, from_name?: <parent device's sanitised name>}`. `from_name` gives the target's opening turn the parent's identity without a separate lookup; it is omitted rather than sent empty if the parent device row is gone by approval time. The parent hears one of: `outcome:'started'` (with `room_id` and `child_convo_id`), `outcome:'failed'` (with `error_code`), or times out to `failed/timeout` if the target never answers.
 
 ### Outcome frames
 
@@ -1517,12 +1519,14 @@ typing text commands into the control conversation.
   effects, no retention surface. Timeouts are the client's job; at-most-once
   delivery, re-asking is the retry.
 - v1 method vocabulary (bridge-owned, normative in the spec):
-  `recent_folders {} -> {folders:[{path, last_used}]}` and
-  `start {workdir?, browser?, prompt?, room_id?} -> {convo_id}` (errors
-  `bad_workdir`, `spawn_failed`; unknown methods `unknown_method`).
-  `prompt`/`room_id` are the parameters the journal-originated `start` call
-  behind spawn approval sends (see "Agent-spawned sessions" above); a
-  client-relayed `start` sends `workdir`/`browser` instead. Cross-channel
+  `recent_folders {} -> {folders:[{path, last_used}], activity?, limits?}` and
+  `start {workdir?, browser?, prompt?, room_id?, from_name?} -> {convo_id}`
+  (errors `bad_workdir`, `spawn_failed`; unknown methods `unknown_method`).
+  `prompt`/`room_id`/`from_name` are the parameters the journal-originated
+  `start` call behind spawn approval sends (see "Agent-spawned sessions"
+  above); a client-relayed `start` sends `workdir`/`browser` instead.
+  `activity`/`limits` on the `recent_folders` reply are the optional capacity
+  blocks (see "Agent-spawned sessions" → "spawn_targets" above). Cross-channel
   ordering between the `start` response and its `convo_upsert` is not
   guaranteed.
 

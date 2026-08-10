@@ -6,7 +6,7 @@ import { eventsAfter, append, markRead, upsertConversation, toEventShape, isClie
 import { joinedAgentIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
-import { countPendingAsks, createSpawnRequest, expireSpawns, expireApproved } from './spawns.js'
+import { countPendingAsks, createSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits } from './spawns.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -878,14 +878,26 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const out = await Promise.all(boxes.map(async (d) => {
           const online = live.has(d.device_id)
           let folders = []
+          let activity = null
+          let limits = null
           if (online) {
             const r = await broker.issue(hub, conn.userId, d.device_id, 'recent_folders', null, { timeoutMs: spawnFoldersTimeoutMs })
             if (r.ok && Array.isArray(r.result?.folders)) folders = r.result.folders
+            if (r.ok) {
+              // Optional capacity blocks (2026-08-10 bridge capacity spec): validated
+              // all-or-nothing; a bridge that predates them just lists folders.
+              activity = sanitizeSpawnActivity(r.result?.activity)
+              limits = sanitizeSpawnLimits(r.result?.limits)
+            }
           }
           // Sanitised like every other client-bound device name (roster,
           // consent cards) — the recipient here is an agent, not a client, so
           // this is cheap insurance rather than closing a real hole.
-          return { device_id: d.device_id, name: sanitizePeerText(d.name, PEER_NAME_CAP), online, folders }
+          return {
+            device_id: d.device_id, name: sanitizePeerText(d.name, PEER_NAME_CAP), online, folders,
+            ...(activity ? { activity } : {}),
+            ...(limits ? { limits } : {}),
+          }
         }))
         conn.ws.send(JSON.stringify({ kind: 'spawn', event: 'targets', request_id: rid, boxes: out }))
         break
