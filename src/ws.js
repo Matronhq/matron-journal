@@ -6,7 +6,7 @@ import { eventsAfter, append, markRead, upsertConversation, toEventShape, isClie
 import { joinedAgentIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
-import { countPendingAsks, createSpawnRequest } from './spawns.js'
+import { countPendingAsks, createSpawnRequest, expireSpawns } from './spawns.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -246,6 +246,19 @@ export function attachWs({
         hub.sendToDevice(convo.owner_user_id, row.initiator_device_id, {
           kind: 'invite', event: 'answer', room_id: row.convo_id,
           peer_device_id: row.agent_device_id, accept: false, reason: 'refused',
+        })
+      }
+      // Spawn-ask TTL — same 24h clock as chat's parked asks and the same
+      // sweep tick. Unlike chat's masking ('refused', never 'expired'),
+      // spawn asks report expiry honestly: spawn denials are already told
+      // plainly as 'declined' (there is no peer to hide behind), so
+      // distinguishing "the user never answered" from "the user said no"
+      // reveals nothing the parent doesn't already learn from a denial.
+      // The cap (countPendingAsks) is what stops a re-ask loop, not
+      // ambiguity. Rows carry their own user/device ids — no lookups.
+      for (const row of expireSpawns(db, AWAITING_USER_TTL_MS)) {
+        hub.sendToDevice(row.user_id, row.from_device_id, {
+          kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'expired',
         })
       }
       const conns = hub.allConns()

@@ -351,3 +351,13 @@ test('approve claims the row atomically; second approve conflicts', async (t) =>
   const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome', 5000)
   assert.equal(out.outcome, 'failed')
 })
+
+test('an unanswered spawn ask expires on the sweep and the parent hears expired', async (t) => {
+  const { s, parent, spawnId } = await parkedSpawn(t, { serverOpts: { revocationSweepMs: 100 } })
+  // Age the row past the 24h TTL by hand; the next sweep tick must flip it.
+  s.db.prepare('UPDATE agent_spawn_requests SET created_at = created_at - (25*60*60*1000) WHERE id=?').run(spawnId)
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome', 5000)
+  assert.equal(out.request_id, spawnId)
+  assert.equal(out.outcome, 'expired')
+  assert.equal(getSpawn(s.db, spawnId).state, 'expired')
+})

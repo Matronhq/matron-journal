@@ -1038,6 +1038,92 @@ scoping" above) now reach not just the recorded owner but every currently-
 room's actual conversation content), distinct from this section's ephemeral
 invite-lifecycle relay.
 
+## Agent-spawned sessions (`spawn`)
+
+(spec: `docs/superpowers/specs/2026-08-09-agent-spawns-session-design.md`.)
+A parent agent may ask a target agent to start a new session (child conversation) with a given prompt, parked across human latency while the user consents. The journal brokers the request and handles the consensus flow.
+
+### Operations
+
+**`spawn_request`:** A parent agent requests the user's consent to spawn a session on a target agent device.
+
+```json
+{
+  "op": "spawn_request",
+  "request_id": "string (UUID or similar)",
+  "from_convo_id": "string (conversation id the parent owns)",
+  "target_device_id": integer,
+  "workdir": "string",
+  "task": "string (the child's seed prompt, capped at 2000 chars)",
+  "topic": "string (optional, title fragment for the card, capped at 200 chars)"
+}
+```
+
+Acknowledgement: `{kind:'spawn', event:'pending', request_id, spawn_id}` — the spawn row is now parked in `awaiting_user` state, and a `permission_request` event has been appended to the parent's conversation with `payload.kind: 'agent_spawn'` (client-only).
+
+**`spawn_targets`:** A parent agent queries what other agent boxes are available for spawning.
+
+```json
+{
+  "op": "spawn_targets",
+  "request_id": "string (UUID or similar)"
+}
+```
+
+Reply: `{kind:'spawn', event:'targets', request_id, boxes: [{device_id, name, online, folders: [{path, last_used}]}]}`. Each box carries whether it is currently online and — if reachable — a list of recent working directories it has reported. Self (the requesting device) is never listed. Private devices are hidden from non-private agents.
+
+### Consent card
+
+A `permission_request` event with `payload.kind: 'agent_spawn'` is appended to the **parent conversation** — the conversation the parent owns and is asking from, named `from_convo_id` in the operation. The payload includes:
+
+```json
+{
+  "kind": "agent_spawn",
+  "request_id": "the spawn row's id",
+  "from_name": "the parent device's name",
+  "target_name": "the target device's name",
+  "workdir": "string",
+  "task": "string (sanitized: newlines removed, collapsed)"
+}
+```
+
+Like agent-chat cards, this is a **client-only event** excluded from agent delivery and unforgeable via `publish`. Task and workdir are both peer text and undergo the same sanitisation (control characters become spaces, trimmed to their respective caps).
+
+### Answering
+
+**`POST /agent-spawn/answer`** `{request_id, decision: "approve"|"deny"}` — client-only (`403` for agent tokens). `request_id` must resolve to a **row belonging to the caller's own user**; an unknown row and one owned by another user are indistinguishable (`404 {error:'not_found'}`, never `403` — anti-enumeration). The row must be `state='awaiting_user'` or the call is `409 {error:'conflict'}` (already answered, or never parked). A body carrying `always_allow` at all — any value — is `400 {error:'bad_request'}`.
+
+- **`deny`** flips the row to `denied` and sends the parent `{kind:'spawn', event:'outcome', request_id, outcome:'declined'}` (if reachable).
+- **`approve`** flips the row to `approved`, creates a new `conversations` row owned by the parent, joins the target as a participant, and issues a `start` RPC to the target with `params: {prompt: <task>, workdir: <workdir>, room_id: <new room id>}`. The parent hears one of: `outcome:'started'` (with `room_id` and `child_convo_id`), `outcome:'failed'` (with `error_code`), or times out to `failed/timeout` if the target never answers.
+
+### Outcome frames
+
+All settlement notifications to the parent take the form `{kind:'spawn', event:'outcome', request_id, outcome: '<state>', ...}`:
+
+```json
+{
+  "kind": "spawn",
+  "event": "outcome",
+  "request_id": "the spawn row's id",
+  "outcome": "started | declined | expired | failed",
+  "room_id": "new room id (started only)",
+  "child_convo_id": "child session id reported by the target (started only)",
+  "error_code": "code describing the failure (failed only)"
+}
+```
+
+The five states flow from: `started` (approval granted and target answered), `declined` (user denied), `expired` (24h TTL without user action), `failed` (target unreachable, didn't answer in time, or returned bad start response). Exactly one outcome frame reaches the parent per parked request.
+
+**Journal-originated RPC:** When the journal issues the `start` RPC itself (during approval orchestration), it sets `from_device_id: 0` — a reserved value signifying the journal is the originator, not a peer agent. The target's bridge uses this to seed the new session without a peer device context.
+
+### Expiry
+
+A parked `awaiting_user` spawn request older than `AWAITING_USER_TTL_MS` (24 hours, same clock as agent-chat awaiting-user rows, clocked from `created_at`) is flipped to `expired` by the periodic sweep timer and the parent is notified. Unlike agent-chat, where expiry is masked as `reason:'refused'` (to hide from the requester that the user is unresponsive), **spawn expiry is reported honestly as `outcome:'expired'`** — spawn denials are already told plainly as `'declined'`, and there is no peer to hide behind, so distinguishing "the user never answered" from "the user said no" reveals nothing the parent doesn't already learn from a denial.
+
+### Pending-ask cap
+
+Outstanding `awaiting_user` rows per *requesting* device are capped at `MAX_AWAITING_PER_REQUESTER` (3), shared with agent-chat invites and joins — the cap is what stops a re-ask loop, not TTL ambiguity or answer masking. Over the cap, `spawn_request` fails `{code:'conflict', detail:'too many requests awaiting user approval'}`.
+
 ## Device privacy
 
 (spec: `docs/superpowers/specs/2026-08-07-agent-visibility-privacy-design.md`.)
