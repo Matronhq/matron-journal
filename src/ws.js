@@ -1179,7 +1179,15 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
           appendAndFan({
             userId: conn.userId, convoId: msg.convo_id,
             sender: `agent:${conn.name}`, type: 'convo_meta',
-            payload: { title: convo.title, parent_convo_id: convo.parent_convo_id ?? null },
+            // agent_device_id rides the meta event so a live client can show
+            // which box owns a conversation the moment it appears, without
+            // waiting for the next /snapshot. Always this connection's
+            // device — upsertConversation records the same id.
+            payload: {
+              title: convo.title,
+              parent_convo_id: convo.parent_convo_id ?? null,
+              agent_device_id: conn.deviceId,
+            },
           })
         }
         break

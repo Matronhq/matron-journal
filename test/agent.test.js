@@ -443,3 +443,20 @@ test('agent stream with a non-string replace_text is rejected (bad_request), con
   assert.ok(!agent.frames.some((f) => f.op === 'error' && f.code === 'internal'), 'no internal error frame')
   agent.close()
 })
+
+test('convo_meta carries the upserting agent device id so a live client can chip a brand-new convo', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'hunter22')
+  const agent = createAgent(s.db, dan.id, 'dev-y')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'hunter22', device_name: 'mac' } })
+  const client = await makeWsClient(s.base, { token: login.json.token, cursor: 0 })
+  t.after(() => client.close())
+  const box = await makeWsClient(s.base, { token: agent.token, cursor: 0 })
+  t.after(() => box.close())
+
+  box.send({ op: 'convo_upsert', convo_id: 'c-new', title: 'Fix the parser' })
+  const meta = await client.waitFor((f) => f.kind === 'journal' && f.type === 'convo_meta')
+  assert.equal(meta.payload.title, 'Fix the parser')
+  assert.equal(meta.payload.agent_device_id, agent.deviceId)
+})
