@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3'
+import { healBakedTitles } from './heal-titles.js'
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users(
@@ -316,6 +317,9 @@ export function openDb(path) {
   // table of grants that nothing consults still reads like a live security
   // control to the next person who finds it.
   db.exec('DROP TABLE IF EXISTS agent_chat_allowances')
+  // One-time title cleanup (spec: agent box rename). Gated on user_version
+  // inside, so this is a cheap pragma read on every subsequent open.
+  healBakedTitles(db, { log: (m) => console.log(m) })
   return db
 }
 
