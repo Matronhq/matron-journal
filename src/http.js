@@ -6,7 +6,6 @@ import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, s
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
 import { listAwaiting, answerParkedInvite, getParticipant, forgetDeviceParticipation } from './participants.js'
-import { addAllowance, removeAllowance, listAllowances, forgetDeviceAllowances } from './allowances.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
@@ -368,46 +367,20 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         }))
         return json(res, 200, { pending })
       }
-      if (req.method === 'GET' && url.pathname === '/agent-chat/allowances') {
-        // The standing consents the user has granted ("always allow A → B"),
-        // so an app can show and revoke them. Client-gated: an agent must not
-        // be able to read which pairs the user has pre-approved — that is a
-        // map of what it could get away with asking for.
-        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
-        const allowances = listAllowances(db, who.userId).map((r) => ({
-          ...r,
-          from_name: deviceName(r.from_name),
-          target_name: deviceName(r.target_name),
-        }))
-        return json(res, 200, { allowances })
-      }
-      if (req.method === 'POST' && url.pathname === '/agent-chat/allowances/revoke') {
-        // Withdrawing a standing consent. Client-gated for the obvious reason
-        // and one less obvious: an agent able to revoke could clear an
-        // allowance covering a pair it wants re-asked, putting the ask back
-        // in front of the user on its own schedule.
-        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
-        const { from_device_id, target_device_id } = await readBody(req)
-        if (!Number.isInteger(from_device_id) || !Number.isInteger(target_device_id)) {
-          return json(res, 400, { error: 'bad_request' })
-        }
-        // `removed:false` for an allowance that was not there is a 200, not a
-        // 404: revocation is idempotent, and the user asking for a consent to
-        // be gone got what they asked for either way.
-        const removed = removeAllowance(db, {
-          userId: who.userId, fromDeviceId: from_device_id, targetDeviceId: target_device_id,
-        })
-        return json(res, 200, { ok: true, removed })
-      }
       if (req.method === 'POST' && url.pathname === '/agent-chat/answer') {
         // Client-gated: an agent must never answer a consent ask, including
         // one addressed to itself — the whole point of parking is that only
         // the human decides.
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
         const body = await readBody(req)
-        const { room_id, target_device_id, decision, always_allow } = body
+        const { room_id, target_device_id, decision } = body
         if (decision !== 'approve' && decision !== 'deny') return json(res, 400, { error: 'bad_request' })
         if (typeof room_id !== 'string' || !Number.isInteger(target_device_id)) return json(res, 400, { error: 'bad_request' })
+        // `always_allow` was the standing-consent grant. It is gone, and a
+        // body still carrying it is rejected rather than ignored: a caller
+        // that believes it granted standing consent which does not exist is
+        // worse off than one told plainly that the field is not accepted.
+        if ('always_allow' in body) return json(res, 400, { error: 'bad_request' })
         const room = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(room_id)
         // Unknown room and a room owned by someone else are indistinguishable
         // (404, never 403) — same anti-enumeration stance as
@@ -430,13 +403,6 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // (and, below, the directed-pair target) is the room owner, not the
         // joiner itself.
         const isJoin = row.initiator_device_id === target_device_id
-        if (always_allow === true) {
-          addAllowance(db, {
-            userId: who.userId,
-            fromDeviceId: row.initiator_device_id,
-            targetDeviceId: isJoin ? room.agent_device_id : target_device_id,
-          })
-        }
         // Scoped to this row's own recipient: the unscoped pump sweeps every
         // undelivered row system-wide, so an unrelated row's successful
         // delivery could otherwise make `sent > 0` true while THIS row's
@@ -480,9 +446,8 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // `devices.id` is a plain INTEGER PRIMARY KEY, so SQLite hands the
         // highest deleted rowid to the next device created. Anything keyed on
         // a device id therefore has to be cleared with the device, or a brand
-        // new agent inherits the revoked one's standing consent (allowances)
-        // and room membership (convo_agents) purely by number.
-        forgetDeviceAllowances(db, who.userId, revokedId)
+        // new agent inherits the revoked one's room membership (convo_agents)
+        // purely by number.
         forgetDeviceParticipation(db, who.userId, revokedId)
         return json(res, 200, { ok: true })
       }

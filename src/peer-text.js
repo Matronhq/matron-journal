@@ -1,8 +1,7 @@
 // Bounds a sanitised device name wherever one is handed to a client — the
 // `from_name` embedded in a consent card (ws.js) and the names on
-// GET /agent-chat/pending and /agent-chat/allowances (http.js). Lives here,
-// beside the sieve it is always applied with, so the two surfaces cannot
-// drift to different caps.
+// GET /agent-chat/pending (http.js). Lives here, beside the sieve it is
+// always applied with, so the two surfaces cannot drift to different caps.
 export const PEER_NAME_CAP = 80
 
 // Flatten peer-written text to one safe line before storing or publishing

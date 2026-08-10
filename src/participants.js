@@ -124,9 +124,8 @@ export function listAwaiting(db, userId) {
 }
 
 // Every participation row naming this device, across the user's rooms.
-// Called when a device is revoked, for the same reason
-// forgetDeviceAllowances is: device ids are reused after a delete, and a
-// leftover state='joined' row would hand a brand new agent write access to
+// Called when a device is revoked: device ids are reused after a delete, and
+// a leftover state='joined' row would hand a brand new agent write access to
 // an old room (authorizeAgentWrite) purely by inheriting its number.
 export function forgetDeviceParticipation(db, userId, deviceId) {
   return db.prepare(`
@@ -158,24 +157,24 @@ export function leaveConvo(db, { convoId, agentDeviceId, now = Date.now() }) {
 
 // Unconditional delete — no restoration of any prior renewed row. Direct
 // callers (tests, admin-style cleanup) that want that ought to use
-// `isParticipant`/inspect the row themselves first; ws.js's own
-// offline-invite-undo path uses `undoInvite` below instead, specifically
-// because a bare delete here would erase a renewed row's prior history
-// (see undoInvite's doc comment).
+// `isParticipant`/inspect the row themselves first; a bare delete here would
+// erase a renewed row's prior history, which is what `undoInvite` below
+// exists to avoid (see its doc comment).
 export function removeParticipant(db, convoId, agentDeviceId) {
   db.prepare('DELETE FROM convo_agents WHERE convo_id=? AND agent_device_id=?').run(convoId, agentDeviceId)
 }
 
-// Undo of an invite/join whose delivery failed (the target had no live
-// socket when the request frame was sent) — the caller sees `offline` and
-// the table must not keep a pending row nobody was told about. Unlike a bare
-// `removeParticipant` delete, this restores whatever `prior` row
-// `inviteParticipant` captured (a renewed `refused`/`left`/`expired` row)
-// rather than erasing it — otherwise a refused device could wipe its own
-// refusal history just by join-requesting while the room owner happens to
-// be offline. `prior: null` (inviteParticipant found no earlier row at all)
-// means the row it just inserted was wholly new — delete it, same as the
-// old behavior.
+// Restores whatever `prior` row `inviteParticipant` captured (a renewed
+// `refused`/`left`/`expired` row) rather than erasing it — otherwise a
+// refused device could wipe its own refusal history just by
+// join-requesting. `prior: null` (inviteParticipant found no earlier row at
+// all) means the row it just inserted was wholly new — delete it, same as
+// the old behavior. This used to undo a failed delivery attempt in ws.js (a
+// request frame sent to a target with no live socket); Task 1 removed that
+// path — every ask parks instead of attempting delivery, so parking never
+// fails and never needs undoing. `undoInvite` has no production caller left;
+// it is retained as a helper for its own direct unit test in
+// test/participants.test.js, which pins this restore-vs-delete behavior.
 export function undoInvite(db, convoId, agentDeviceId, prior) {
   if (prior == null) {
     removeParticipant(db, convoId, agentDeviceId)

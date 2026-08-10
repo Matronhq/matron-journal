@@ -3,25 +3,26 @@ import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { getParticipant, inviteParticipant, answerInvite, markDelivered } from '../src/participants.js'
-import { addAllowance } from '../src/allowances.js'
 import { handleOp } from '../src/ws.js'
 
-// Task 7 made `agent_invite`/`agent_join` park for user consent by default —
-// no relay to the target at all unless a standing allowance covers the
-// directed pair (see src/allowances.js, test/agent-chat-consent.test.js).
-// This file's job is the OLDER contract: once a pair IS allowed, the relay
-// (busy ack, refuse, accept, offline undo) behaves exactly as it did before
-// consent-gating existed. So `fleet` seeds a bidirectional allowance up
-// front — both directions, since the join-flow test below has B ask A —
-// putting every test in this file on the relay path, same as pre-Task-7.
+// Task 1 removed the standing "always allow A -> B" fast path (isAllowed) —
+// every agent_invite/agent_join now parks for the user's consent, every
+// time, with no way to pre-approve a directed pair ahead of the ask (see
+// src/participants.js, test/agent-chat-consent.test.js). This file's job is
+// the relay CONTRACT once a park is actually answered — busy ack, refuse,
+// accept — which behaves exactly as it did before consent-gating existed.
+// So wherever a test needs to observe a relayed
+// frame, it sends the ask, lets it park, and approves it for real via
+// approvePark() below (the same HTTP route a client's approve tap uses) —
+// never by seeding a bypass.
 async function fleet(t) {
   const s = await startTestServer()
   t.after(() => s.close())
   const dan = await createUser(s.db, 'dan', 'pw')
   const agA = createAgent(s.db, dan.id, 'dev-a')
   const agB = createAgent(s.db, dan.id, 'dev-b')
-  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: agB.deviceId })
-  addAllowance(s.db, { userId: dan.id, fromDeviceId: agB.deviceId, targetDeviceId: agA.deviceId })
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const clientToken = login.json.token
   const a = await makeWsClient(s.base, { token: agA.token, cursor: null })
   const b = await makeWsClient(s.base, { token: agB.token, cursor: null })
   await a.waitFor((f) => f.op === 'hello_ok')
@@ -29,20 +30,33 @@ async function fleet(t) {
   t.after(() => { a.close(); b.close() })
   a.send({ op: 'convo_upsert', convo_id: 'room', title: 'room', session_state: 'running' })
   await a.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
-  return { s, dan, agA, agB, a, b }
+  return { s, dan, agA, agB, clientToken, a, b }
+}
+
+// Approves a parked ask via the same HTTP route a client's approve tap
+// takes. `participantDeviceId` is the row's key — the invitee for an
+// agent_invite, or the joiner itself for an agent_join (a join self-targets;
+// see ws.js's agent_join handler).
+async function approvePark(s, clientToken, roomId, participantDeviceId) {
+  const r = await s.http('/agent-chat/answer', {
+    method: 'POST', token: clientToken,
+    body: { room_id: roomId, target_device_id: participantDeviceId, decision: 'approve' },
+  })
+  assert.equal(r.status, 200, 'approving the park must succeed')
+  return r.json
 }
 
 test('full invite happy path: request → delivered → ack → answer(accept) → joined', async (t) => {
-  const { s, agB, a, b } = await fleet(t)
+  const { s, agB, clientToken, a, b } = await fleet(t)
   a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'need your logs' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.target_device_id === agB.deviceId)
+  await approvePark(s, clientToken, 'room', agB.deviceId)
 
   const req = await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
   assert.equal(req.room_id, 'room')
   assert.equal(req.from_name, 'dev-a')
   assert.equal(req.topic, 'ci')
   assert.equal(req.justification, 'need your logs')
-
-  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.target_device_id === agB.deviceId)
 
   b.send({ op: 'agent_invite_ack', room_id: 'room', session_state: 'idle' })
   const ack = await a.waitFor((f) => f.kind === 'invite' && f.event === 'ack')
@@ -58,8 +72,10 @@ test('full invite happy path: request → delivered → ack → answer(accept) �
 })
 
 test('refusal carries the reason back and blocks the room for the target', async (t) => {
-  const { s, agB, a, b } = await fleet(t)
+  const { s, agB, clientToken, a, b } = await fleet(t)
   a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'x' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.target_device_id === agB.deviceId)
+  await approvePark(s, clientToken, 'room', agB.deviceId)
   await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
   b.send({ op: 'agent_invite_answer', room_id: 'room', accept: false, reason: 'mid-release, no' })
   const ans = await a.waitFor((f) => f.kind === 'invite' && f.event === 'answer')
@@ -73,12 +89,14 @@ test('refusal carries the reason back and blocks the room for the target', async
 })
 
 test('join flow: peer asks, owner acks busy and accepts via peer_device_id', async (t) => {
-  const { s, agA, agB, a, b } = await fleet(t)
+  const { s, agA, agB, clientToken, a, b } = await fleet(t)
   b.send({ op: 'agent_join', room_id: 'room', justification: 'I have context on this bug' })
+  await b.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.target_device_id === agA.deviceId)
+  await approvePark(s, clientToken, 'room', agB.deviceId)
+
   const jr = await a.waitFor((f) => f.kind === 'invite' && f.event === 'join_request')
   assert.equal(jr.from_device_id, agB.deviceId)
   assert.equal(jr.from_name, 'dev-b')
-  await b.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.target_device_id === agA.deviceId)
 
   a.send({ op: 'agent_invite_ack', room_id: 'room', session_state: 'busy', peer_device_id: agB.deviceId })
   const ack = await b.waitFor((f) => f.kind === 'invite' && f.event === 'ack')
@@ -95,7 +113,7 @@ test('join flow: peer asks, owner acks busy and accepts via peer_device_id', asy
 })
 
 test('validation and authorization failures', async (t) => {
-  const { s, dan, agA, agB, a, b } = await fleet(t)
+  const { s, dan, agA, agB, clientToken, a, b } = await fleet(t)
   const expectErr = async (w, msg, code) => {
     w.send(msg)
     const err = await w.waitFor((f) => f.op === 'error' && f.ref === msg.op)
@@ -115,11 +133,16 @@ test('validation and authorization failures', async (t) => {
   const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
   const clientDeviceId = s.db.prepare("SELECT id FROM devices WHERE kind='client' ORDER BY id DESC LIMIT 1").get().id
   await expectErr(a, { op: 'agent_invite', room_id: 'room', target_device_id: clientDeviceId, justification: 'x' }, 'not_found')
-  // Double-invite: first goes through, second conflicts.
+  // Double-invite: first parks, second conflicts — a pending park is not
+  // renewable (see parkInvite's RENEWABLE set in participants.js), so this
+  // needs no approval step to observe.
   a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'x' })
-  await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.target_device_id === agB.deviceId)
   await expectErr(a, { op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'x' }, 'conflict')
-  // Answer without a pending invite (already answered).
+  // Answer without a pending invite (already answered): approve the park for
+  // real first, so the row is actually 'invited' and answerable.
+  await approvePark(s, clientToken, 'room', agB.deviceId)
+  await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
   b.send({ op: 'agent_invite_answer', room_id: 'room', accept: true })
   await a.waitFor((f) => f.kind === 'invite' && f.event === 'answer')
   await expectErr(b, { op: 'agent_invite_answer', room_id: 'room', accept: true }, 'conflict')
@@ -132,17 +155,31 @@ test('validation and authorization failures', async (t) => {
   await expectErr(c, { op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'x' }, 'forbidden')
 })
 
-test('inviting an offline device fails with offline and leaves no row', async (t) => {
-  const { s, dan, agA, a } = await fleet(t)
+test('inviting a device that has never connected still parks; approving it leaves an undelivered row, not an error', async (t) => {
+  const { s, dan, agA, clientToken, a } = await fleet(t)
   const ghost = createAgent(s.db, dan.id, 'dev-ghost') // never connects
-  // Relay-path coverage: an unallowed pair would park instead of ever
-  // touching liveness, which is a different test (see
-  // agent-chat-consent.test.js's MAX_AWAITING/park scenarios).
-  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: ghost.deviceId })
+  // Task 1 removed the standing-allowance fast path that used to attempt
+  // immediate delivery on the FIRST ask and fail synchronously with
+  // 'offline' (undoing the row). Every first ask parks now, regardless of
+  // the target's liveness — even a device that has never once connected
+  // gets the same park, not a liveness check up front.
   a.send({ op: 'agent_invite', room_id: 'room', target_device_id: ghost.deviceId, justification: 'x' })
-  const err = await a.waitFor((f) => f.op === 'error' && f.ref === 'agent_invite')
-  assert.equal(err.code, 'offline')
-  assert.equal(getParticipant(s.db, 'room', ghost.deviceId), null)
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.target_device_id === ghost.deviceId)
+  assert.equal(getParticipant(s.db, 'room', ghost.deviceId).state, 'awaiting_user')
+
+  // Approving it attempts delivery for real and finds nobody home — the row
+  // stays 'invited', undelivered, not undone (see invite-delivery.js's pump
+  // and the matching HTTP contract pinned in test/agent-chat-consent.test.js:
+  // "POST /agent-chat/answer approve, target offline").
+  const r = await s.http('/agent-chat/answer', {
+    method: 'POST', token: clientToken,
+    body: { room_id: 'room', target_device_id: ghost.deviceId, decision: 'approve' },
+  })
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.json, { ok: true, delivered: false })
+  const row = getParticipant(s.db, 'room', ghost.deviceId)
+  assert.equal(row.state, 'invited')
+  assert.equal(row.delivered_at, null)
 })
 
 test('agent_leave flips joined to left and notifies the owner', async (t) => {
@@ -202,10 +239,11 @@ test('owner leave answers a pending JOIN REQUEST instead of orphaning the reques
   // flips its row invited -> left, which also puts it out of reach of the
   // expiry sweep (predicate: state='invited'). Without an answer here the
   // requesting bridge waits forever with no server-side recovery.
-  const { s, agB, a, b } = await fleet(t)
+  const { s, agB, clientToken, a, b } = await fleet(t)
   b.send({ op: 'agent_join', room_id: 'room', justification: 'I have context on this bug' })
-  await a.waitFor((f) => f.kind === 'invite' && f.event === 'join_request')
   await b.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  await approvePark(s, clientToken, 'room', agB.deviceId)
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'join_request')
 
   a.send({ op: 'agent_leave', room_id: 'room' })
   const ans = await b.waitFor((f) => f.kind === 'invite' && f.event === 'answer')
@@ -226,20 +264,22 @@ test('owner leave also dissolves a PARKED (awaiting_user) join request: initiato
   // socket) survived a dissolved room — the card stayed live for a dead
   // room and the requester waited out the full 24h park TTL instead of
   // hearing the same synthetic 'left' answer an 'invited' row gets.
-  const { s, dan, agA, agB, a, b } = await fleet(t)
+  const { s, dan, agA, agB, clientToken, a, b } = await fleet(t)
   const agC = createAgent(s.db, dan.id, 'dev-c')
   const c = await makeWsClient(s.base, { token: agC.token, cursor: null })
   await c.waitFor((f) => f.op === 'hello_ok')
   t.after(() => c.close())
 
-  // B: pre-approved (fleet() seeds the allowance both ways) join request —
-  // lands 'invited', delivered to the owner. Same shape as the test above.
+  // B: approve the park for real (Task 1 removed the standing-allowance
+  // fast path fleet() used to pre-seed) — lands 'invited', delivered to the
+  // owner. Same shape as the test above.
   b.send({ op: 'agent_join', room_id: 'room', justification: 'I have context on this bug' })
-  await a.waitFor((f) => f.kind === 'invite' && f.event === 'join_request')
   await b.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  await approvePark(s, clientToken, 'room', agB.deviceId)
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'join_request')
 
-  // C: no allowance for this pair, so the join request parks for the
-  // user's consent instead of ever reaching A's socket.
+  // C: no approval, so the join request stays parked for the user's consent
+  // instead of ever reaching A's socket.
   c.send({ op: 'agent_join', room_id: 'room', justification: 'let me help too' })
   await c.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
   assert.equal(getParticipant(s.db, 'room', agC.deviceId).state, 'awaiting_user')
@@ -261,9 +301,8 @@ test('owner leave also dissolves a PARKED (awaiting_user) join request: initiato
 
   // The now-dead card must not be answerable — a client trying to approve
   // it hits the same 409 an already-answered row gets.
-  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
   const answerAttempt = await s.http('/agent-chat/answer', {
-    method: 'POST', token: login.json.token,
+    method: 'POST', token: clientToken,
     body: { room_id: 'room', target_device_id: agC.deviceId, decision: 'approve' },
   })
   assert.equal(answerAttempt.status, 409)
@@ -372,9 +411,11 @@ test('agent_invite_ack/agent_invite_answer/agent_leave reject an unregistered ag
   assert.equal(getParticipant(s.db, 'room', agB.deviceId).state, 'invited')
 })
 
-test('a refused row is restored (not erased) when a retry join fails because the owner is offline', async (t) => {
-  const { s, agA, agB, a, b } = await fleet(t)
+test('a retried join after a refusal renews the row: parks again with the new justification, prior initiator replaced', async (t) => {
+  const { s, agA, agB, clientToken, a, b } = await fleet(t)
   a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'first ask' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.target_device_id === agB.deviceId)
+  await approvePark(s, clientToken, 'room', agB.deviceId)
   await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
   b.send({ op: 'agent_invite_answer', room_id: 'room', accept: false, reason: 'not now' })
   await a.waitFor((f) => f.kind === 'invite' && f.event === 'answer')
@@ -382,21 +423,21 @@ test('a refused row is restored (not erased) when a retry join fails because the
   assert.equal(refused.state, 'refused')
   assert.equal(refused.justification, 'first ask')
 
-  // Take the owner offline so the retry's delivery fails.
-  a.close()
-  await new Promise((r) => setTimeout(r, 150))
-
+  // A retried join after a refusal is RENEWABLE (see participants.js's
+  // RENEWABLE set) — it parks again for the user's consent, same as any
+  // first ask, regardless of the owner's connectivity. (Pre-Task-1, an
+  // ALLOWED pair's retry attempted immediate delivery and — if the owner
+  // happened to be offline — restored the prior refused row rather than
+  // leaving a dangling one; that undo path, `undoInvite`, is still
+  // unit-tested directly in test/participants.test.js, but has no
+  // production caller left now that every ask parks: parking never attempts
+  // delivery, so it never fails and never needs to undo anything.)
   b.send({ op: 'agent_join', room_id: 'room', justification: 'let me back in' })
-  const err = await b.waitFor((f) => f.op === 'error' && f.ref === 'agent_join')
-  assert.equal(err.code, 'offline')
-
-  // The failed retry must restore the PRIOR refused row exactly — not erase
-  // it (a bare delete would let a refused device wipe its own refusal
-  // history just by join-requesting while the owner happens to be offline).
-  const after = getParticipant(s.db, 'room', agB.deviceId)
-  assert.equal(after.state, 'refused')
-  assert.equal(after.justification, 'first ask', 'original refusal justification must survive, not the failed retry\'s')
-  assert.equal(after.initiator_device_id, agA.deviceId, 'original initiator (the owner\'s invite) must survive')
+  await b.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.target_device_id === agA.deviceId)
+  const renewed = getParticipant(s.db, 'room', agB.deviceId)
+  assert.equal(renewed.state, 'awaiting_user')
+  assert.equal(renewed.justification, 'let me back in')
+  assert.equal(renewed.initiator_device_id, agB.deviceId, 'a join self-initiates, replacing the owner-initiated invite row')
 })
 
 test('room-op error frames carry room_id for correlation', async (t) => {
@@ -414,9 +455,10 @@ test('room-op error frames carry room_id for correlation', async (t) => {
   // Unknown room (not_found) — the id is well-formed, so it still echoes.
   err = await expectErr(b, { op: 'agent_join', room_id: 'nope', justification: 'x' }, 'not_found')
   assert.equal(err.room_id, 'nope')
-  // Double-invite (conflict).
+  // Double-invite (conflict) — a pending park already conflicts, no
+  // approval needed to observe it.
   a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'x' })
-  await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.target_device_id === agB.deviceId)
   err = await expectErr(a, { op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'x' }, 'conflict')
   assert.equal(err.room_id, 'room')
 })
@@ -461,8 +503,8 @@ test('an unanswered invite expires and the initiator is told', async (t) => {
   const dan = await createUser(s.db, 'dan', 'pw')
   const agA = createAgent(s.db, dan.id, 'dev-a')
   const agB = createAgent(s.db, dan.id, 'dev-b')
-  // Relay-path coverage (Task 7 parks an unallowed pair instead).
-  addAllowance(s.db, { userId: dan.id, fromDeviceId: agA.deviceId, targetDeviceId: agB.deviceId })
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const clientToken = login.json.token
   const a = await makeWsClient(s.base, { token: agA.token, cursor: null })
   const b = await makeWsClient(s.base, { token: agB.token, cursor: null })
   await a.waitFor((f) => f.op === 'hello_ok')
@@ -471,10 +513,15 @@ test('an unanswered invite expires and the initiator is told', async (t) => {
   a.send({ op: 'convo_upsert', convo_id: 'room', session_state: 'running' })
   await a.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
   a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: 'x' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && f.target_device_id === agB.deviceId)
+  // Task 1 removed the standing-allowance fast path: reach the same
+  // delivered/invited starting point through the real consent route
+  // instead of pre-seeding a bypass — send, park, approve.
+  await approvePark(s, clientToken, 'room', agB.deviceId)
   await b.waitFor((f) => f.kind === 'invite' && f.event === 'request')
   // New contract: the 30-minute (here, 150ms) answer clock starts at
-  // delivered_at, not created_at (Task 4). The allowance-path relay above
-  // now stamps delivery itself (Task 7's markDelivered call) — this
+  // delivered_at, not created_at (Task 4). The approve step above already
+  // stamps delivery (deliverPendingInvites -> markDelivered) — this
   // redundant direct stamp only guards against a future path that stops
   // doing so on its own; markDelivered's delivered_at-IS-NULL guard makes it
   // a harmless no-op here.

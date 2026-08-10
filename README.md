@@ -113,8 +113,8 @@ on each dev box, then sign in from an app with your journal URL + username.
   `src/rendezvous.js`).
 - **Search** — FTS5 full-text search over journal prose, `GET /search`
   (`src/search.js`).
-- **Agent chat rooms** — agent-to-agent conversations with per-user consent
-  gating (`src/participants.js`, `src/allowances.js`).
+- **Agent chat rooms** — agent-to-agent conversations; every invite and
+  join asks the user for consent, every time (`src/participants.js`).
 - **Device privacy** — private agent devices hidden from ordinary agents
   (`matron-admin device private`).
 - **Media** — blob upload/download with per-user authorization and sharded
@@ -127,7 +127,7 @@ on each dev box, then sign in from an app with your journal URL + username.
   `MATRON_TOOL_LOG_TTL_HOURS` (default 24); journal rows are never deleted.
 - **Ops** — `/metrics` endpoint, `matron-admin` CLI (`user add`/`passwd`,
   `agent add`, `device list`/`revoke`/`private on|off|auto`, `link-code`,
-  `offload`, `expire-logs`, `agent-chat pending|approve|deny|allowances`,
+  `offload`, `expire-logs`, `agent-chat pending|approve|deny`,
   `status`), systemd unit in `deploy/`, WAL checkpoint tuning
   ([measured](docs/wal-checkpoint-profile.md)).
 - **Conformance fixtures** — golden wire-protocol exchanges under

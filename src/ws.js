@@ -2,8 +2,7 @@ import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { applyBridgePrivate, isPrivateDevice } from './db.js'
 import { eventsAfter, append, markRead, upsertConversation, toEventShape, isClientOnlyEvent } from './journal.js'
-import { joinedAgentIds, inviteParticipant, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, undoInvite, getParticipant, isKnownParticipant, expireInvites, parkInvite, awaitingCount, markDelivered, expireAwaiting } from './participants.js'
-import { isAllowed } from './allowances.js'
+import { joinedAgentIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, awaitingCount, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 
@@ -819,35 +818,10 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         // justification and publish an empty card body. Re-check post-
         // sanitisation with the same error the empty-string case gets.
         if (!justification) return fail('bad_request', 'bad justification')
-        if (isAllowed(db, conn.userId, conn.deviceId, msg.target_device_id)) {
-          // User pre-approved this directed pair: the pre-consent flow,
-          // verbatim — invite, immediate delivery attempt, undo+offline on a
-          // dead socket, PLUS the delivery stamp the old flow never wrote.
-          const r = inviteParticipant(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id, initiatorDeviceId: conn.deviceId, justification, targetConvoId })
-          if (!r.ok) return fail('conflict', `already ${r.state}`)
-          // Single-socket delivery (sendRpcRequest): a request turn must not
-          // double-inject on a mid-reconnect bridge. false = offline — undo
-          // the row so no pending invite exists that nobody was told about,
-          // and the caller hears it immediately (spec: honest fast status).
-          const delivered = hub.sendRpcRequest(conn.userId, msg.target_device_id, {
-            kind: 'invite', event: 'request', room_id: msg.room_id,
-            from_device_id: conn.deviceId, from_name: conn.name, topic, justification,
-            // Omitted, never null, when the requester sent none — see the
-            // matching shape in invite-delivery.js.
-            ...(targetConvoId ? { target_convo_id: targetConvoId } : {}),
-          })
-          if (!delivered) {
-            undoInvite(db, msg.room_id, msg.target_device_id, r.prior)
-            return fail('offline')
-          }
-          markDelivered(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id })
-          conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: msg.target_device_id }))
-          break
-        }
-        // No standing allowance for this directed pair: park for the user's
-        // consent instead of ever reaching the target's socket. Capped per
-        // requester device so one chatty agent can't flood the user's
-        // attention queue with asks.
+        // Every ask parks for the user's consent — there is no standing
+        // allowance and no fast path, so nothing reaches the target's socket
+        // before a human answers. Capped per requester device so one chatty
+        // agent can't flood the user's attention queue with asks.
         if (awaitingCount(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
           return fail('conflict', 'too many requests awaiting user approval')
         }
@@ -908,22 +882,10 @@ export function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, 
         // in which case the card degrades to a nameless owner rather than
         // throwing inside the op handler.
         const ownerName = db.prepare('SELECT name FROM devices WHERE id=?').get(room.agent_device_id)?.name ?? ''
-        if (isAllowed(db, conn.userId, conn.deviceId, room.agent_device_id)) {
-          // Same pre-consent flow, verbatim, PLUS the delivery stamp.
-          const r = inviteParticipant(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId, initiatorDeviceId: conn.deviceId, justification })
-          if (!r.ok) return fail('conflict', `already ${r.state}`)
-          const delivered = hub.sendRpcRequest(conn.userId, room.agent_device_id, {
-            kind: 'invite', event: 'join_request', room_id: msg.room_id,
-            from_device_id: conn.deviceId, from_name: conn.name, justification,
-          })
-          if (!delivered) {
-            undoInvite(db, msg.room_id, conn.deviceId, r.prior)
-            return fail('offline')
-          }
-          markDelivered(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId })
-          conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: room.agent_device_id }))
-          break
-        }
+        // Every ask parks for the user's consent — there is no standing
+        // allowance and no fast path, so nothing reaches the room owner's
+        // socket before a human answers. Capped per requester device so one
+        // chatty agent can't flood the user's attention queue with asks.
         if (awaitingCount(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
           return fail('conflict', 'too many requests awaiting user approval')
         }
