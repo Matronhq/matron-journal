@@ -191,3 +191,11 @@ test('sanitizeSpawnLimits omits absent resets fields rather than nulling', () =>
   const out = sanitizeSpawnLimits({ as_of: 1, lines: [{ id: 'session', label: 'Session', percent: 5 }] })
   assert.ok(!('resets' in out.lines[0]) && !('resets_at' in out.lines[0]))
 })
+
+test('sanitizeSpawnLimits flattens control characters in resets_at like every other peer string', () => {
+  const out = sanitizeSpawnLimits({
+    as_of: 1,
+    lines: [{ id: 'session', label: 'Session', percent: 5, resets_at: '2026-08-11T01\n:00:00.000Z' }],
+  })
+  assert.ok(!out.lines[0].resets_at.includes('\n'))
+})

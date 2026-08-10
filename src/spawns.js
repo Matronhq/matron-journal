@@ -235,8 +235,10 @@ export function sanitizeSpawnLimits(raw) {
       out.resets = resets
     }
     if (l.resets_at !== undefined) {
-      if (typeof l.resets_at !== 'string' || !l.resets_at || l.resets_at.length > 40) return null
-      out.resets_at = l.resets_at
+      if (typeof l.resets_at !== 'string' || l.resets_at.length > 40) return null
+      const resets_at = sanitizePeerText(l.resets_at, 40)
+      if (!resets_at) return null
+      out.resets_at = resets_at
     }
     lines.push(out)
   }
