@@ -248,3 +248,22 @@ test("another user's client cannot see or answer the row (404, anti-enumeration)
   assert.equal(r.status, 404)
   assert.equal(getSpawn(s.db, spawnId).state, 'awaiting_user')
 })
+
+test('approve claims the row atomically; second approve conflicts', async (t) => {
+  const { s, dan, parentDev, targetDev, clientToken } = await spawnFleet(t)
+  const spawnId = 'test-spawn-id'
+  createSpawnRequest(s.db, {
+    id: spawnId, userId: dan.id, fromDeviceId: parentDev.deviceId,
+    fromConvoId: 'parent-convo', targetDeviceId: targetDev.deviceId,
+    workdir: '/w', task: 'test', topic: 'test',
+  })
+  // First approve claim succeeds
+  const r1 = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } })
+  assert.equal(r1.status, 200)
+  const row = getSpawn(s.db, spawnId)
+  assert.equal(row.state, 'approved')
+  assert.ok(row.answered_at) // timestamp set
+  // Second approve attempt conflicts
+  const r2 = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } })
+  assert.equal(r2.status, 409)
+})
