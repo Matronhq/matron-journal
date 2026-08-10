@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { getSpawn, createSpawnRequest } from '../src/spawns.js'
+import { getSpawn, createSpawnRequest, claimApprove, approveSpawn } from '../src/spawns.js'
 
 // Fleet: one user, a parent agent (dev-6), a target agent (eric), a client.
 // Parent owns 'parent-convo' — the conversation the consent card lands in.
@@ -360,4 +360,64 @@ test('an unanswered spawn ask expires on the sweep and the parent hears expired'
   assert.equal(out.request_id, spawnId)
   assert.equal(out.outcome, 'expired')
   assert.equal(getSpawn(s.db, spawnId).state, 'expired')
+})
+
+test('a row stranded in approved (restart-before-settle gap) is recovered by the sweep: failed/orphaned, exactly once', async (t) => {
+  const { s, dan, parentDev, targetDev, parent } = await spawnFleet(t, { serverOpts: { revocationSweepMs: 100 } })
+  const spawnId = 'orphan-1'
+  createSpawnRequest(s.db, {
+    id: spawnId, userId: dan.id, fromDeviceId: parentDev.deviceId,
+    fromConvoId: 'parent-convo', targetDeviceId: targetDev.deviceId,
+    workdir: '/w', task: 'do it', topic: 'job',
+  })
+  // Simulate claimApprove having won, then the in-memory broker never
+  // settling it (e.g. a restart in that gap) — the row sits in 'approved'
+  // with no live orchestration left to resolve it.
+  assert.ok(claimApprove(s.db, spawnId))
+  // Backdate answered_at past the 5-minute orphan TTL by hand; the next
+  // sweep tick must flip it.
+  s.db.prepare('UPDATE agent_spawn_requests SET answered_at = answered_at - (6*60*1000) WHERE id=?').run(spawnId)
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome', 5000)
+  assert.equal(out.request_id, spawnId)
+  assert.equal(out.outcome, 'failed')
+  assert.equal(out.error_code, 'orphaned')
+  assert.equal(getSpawn(s.db, spawnId).state, 'failed')
+  // Exactly one outcome frame — let a couple more sweep ticks pass and
+  // confirm no duplicate arrives (the state-scoped UPDATE must make the
+  // second tick's WHERE clause match zero rows).
+  await new Promise((r) => setTimeout(r, 300))
+  const outcomes = parent.frames.filter((f) => f.kind === 'spawn' && f.event === 'outcome' && f.request_id === spawnId)
+  assert.equal(outcomes.length, 1)
+})
+
+test('approveSpawn: a throw before the room exists still notifies the parent exactly once (epitaph write is best-effort)', async (t) => {
+  const { s, parentDev, targetDev } = await spawnFleet(t)
+  // No users row for this id — upsertConversation's INSERT into
+  // conversations (owner_user_id REFERENCES users(id), foreign_keys=ON)
+  // throws before the room is ever created, exercising the "throw before
+  // broker.issue" path from inside the try block itself.
+  const bogusUserId = 999999
+  const spawnId = 'no-room-1'
+  createSpawnRequest(s.db, {
+    id: spawnId, userId: bogusUserId, fromDeviceId: parentDev.deviceId,
+    fromConvoId: 'parent-convo', targetDeviceId: targetDev.deviceId,
+    workdir: '/w', task: 'x',
+  })
+  assert.ok(claimApprove(s.db, spawnId))
+  const sent = []
+  const originalSendToDevice = s.hub.sendToDevice.bind(s.hub)
+  s.hub.sendToDevice = (userId, deviceId, frame) => {
+    sent.push({ userId, deviceId, frame })
+    return originalSendToDevice(userId, deviceId, frame)
+  }
+  t.after(() => { s.hub.sendToDevice = originalSendToDevice })
+  const outcome = await approveSpawn({ db: s.db, hub: s.hub, broker: s.broker, startTimeoutMs: 1000 }, getSpawn(s.db, spawnId))
+  assert.equal(outcome, 'failed')
+  assert.equal(getSpawn(s.db, spawnId).state, 'failed')
+  // The epitaph write (into a room that never got created) failed silently;
+  // the outcome frame must still have gone out, exactly once.
+  const outcomeSends = sent.filter((c) => c.frame.kind === 'spawn' && c.frame.event === 'outcome')
+  assert.equal(outcomeSends.length, 1)
+  assert.equal(outcomeSends[0].frame.outcome, 'failed')
+  assert.equal(outcomeSends[0].frame.error_code, 'internal')
 })

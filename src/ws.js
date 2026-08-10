@@ -2,11 +2,11 @@ import { randomUUID } from 'node:crypto'
 import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { applyBridgePrivate, isPrivateDevice } from './db.js'
-import { eventsAfter, append, markRead, upsertConversation, toEventShape, isClientOnlyEvent } from './journal.js'
+import { eventsAfter, append, markRead, upsertConversation, toEventShape, isClientOnlyEvent, CONVO_ID_MAX_CHARS } from './journal.js'
 import { joinedAgentIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
-import { countPendingAsks, createSpawnRequest, expireSpawns } from './spawns.js'
+import { countPendingAsks, createSpawnRequest, expireSpawns, expireApproved } from './spawns.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -46,10 +46,8 @@ const STATUS_CACHE_MAX = 2048
 const RPC_MAX_BYTES = 16384
 const RPC_ID_MAX_CHARS = 128
 const RPC_NAME_MAX_CHARS = 64 // method and error.code
-// Cap for a parent_convo_id sent by a bridge — same 128-char id ceiling as
-// RPC request ids. Convo ids are conventionally Claude session UUIDs (36
-// chars); this is a defensive upper bound, not a format assertion.
-const CONVO_ID_MAX_CHARS = 128
+// CONVO_ID_MAX_CHARS (128, imported above) caps a parent_convo_id sent by a
+// bridge — see its doc comment in journal.js for why it lives there.
 // Cap for a session_outcome sent by a bridge. Shape-only, like the
 // parent_convo_id check: the outcome vocabulary belongs to the writing bridge
 // (today 'completed' | 'interrupted' | 'failed'), and the journal deliberately
@@ -81,6 +79,12 @@ const CARD_TITLE_MAX_CHARS = 120
 // card, now lives in peer-text.js — http.js applies the same cap.)
 const AWAITING_USER_TTL_MS = 24 * 3600_000
 const MAX_AWAITING_PER_REQUESTER = 3
+// Stranded-'approved' recovery TTL (see spawns.js expireApproved's doc
+// comment) — comfortably beyond the 30s default start timeout so this sweep
+// never races a live approveSpawn still legitimately in flight, but short
+// enough that a restart-before-settle gap doesn't leave the parent hanging
+// for anywhere near as long as the 24h awaiting-user TTL above.
+const APPROVED_ORPHAN_TTL_MS = 5 * 60_000
 // Cap for a convo_upsert's rolling summary (spec: agent chat phase 2) — same
 // defensive stance as the invite text caps above.
 const SUMMARY_MAX_CHARS = 1000
@@ -259,6 +263,18 @@ export function attachWs({
       for (const row of expireSpawns(db, AWAITING_USER_TTL_MS)) {
         hub.sendToDevice(row.user_id, row.from_device_id, {
           kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'expired',
+        })
+      }
+      // Stranded-'approved' recovery (see spawns.js expireApproved's doc
+      // comment): a row a claimApprove won but whose orchestration never
+      // settled — a restart in the gap before approveSpawn resolves it, or a
+      // throw inside approveSpawn that its own catch only logs. Reported to
+      // the parent as a plain failure, distinct code so it's diagnosable —
+      // this is the one outcome a healthy orchestration never produces
+      // itself.
+      for (const row of expireApproved(db, APPROVED_ORPHAN_TTL_MS)) {
+        hub.sendToDevice(row.user_id, row.from_device_id, {
+          kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'failed', error_code: 'orphaned',
         })
       }
       const conns = hub.allConns()
@@ -627,8 +643,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // Catch-up for live tool-output streams: whoever just started viewing
         // gets full scrollback-so-far, one sync frame per active buffer, sent
         // directly (not via hub coalescing) and synchronously — no append can
-        // interleave before these because handleOp runs in one event-loop
-        // turn. Scoped to the conn's own user; buffersFor enforces it too.
+        // interleave before these because this `viewing` case body is entirely
+        // synchronous (no `await`), start to finish, in one event-loop turn.
+        // NOT a property of handleOp as a whole any more — spawn_targets
+        // awaits mid-handler, so a message dispatched to that case can
+        // interleave with other work between its awaits. Scoped to the conn's
+        // own user; buffersFor enforces it too.
         if (conn.viewingConvoId && conn.kind === 'client') {
           for (const b of toolStreams.buffersFor(conn.userId, conn.viewingConvoId)) {
             conn.ws.send(JSON.stringify({
@@ -862,7 +882,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             const r = await broker.issue(hub, conn.userId, d.device_id, 'recent_folders', null, { timeoutMs: spawnFoldersTimeoutMs })
             if (r.ok && Array.isArray(r.result?.folders)) folders = r.result.folders
           }
-          return { device_id: d.device_id, name: d.name, online, folders }
+          // Sanitised like every other client-bound device name (roster,
+          // consent cards) — the recipient here is an agent, not a client, so
+          // this is cheap insurance rather than closing a real hole.
+          return { device_id: d.device_id, name: sanitizePeerText(d.name, PEER_NAME_CAP), online, folders }
         }))
         conn.ws.send(JSON.stringify({ kind: 'spawn', event: 'targets', request_id: rid, boxes: out }))
         break

@@ -7,7 +7,7 @@
 // upsert fail silently.
 
 import { randomUUID } from 'node:crypto'
-import { upsertConversation, appendAndBroadcast } from './journal.js'
+import { upsertConversation, appendAndBroadcast, CONVO_ID_MAX_CHARS } from './journal.js'
 import { recordJoined } from './participants.js'
 
 export function createSpawnRequest(db, { id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic = '', now = Date.now() }) {
@@ -62,6 +62,25 @@ export function expireSpawns(db, ttlMs, now = Date.now()) {
   ).all(now, now, now - ttlMs)
 }
 
+// Stranded-`approved` recovery — the sweep's backstop for the gap between
+// claimApprove flipping a row to 'approved' and the in-memory broker
+// settling it (started/failed). Two ways in: (a) the process restarts
+// between the claim and the broker settling — nothing left in memory will
+// ever resolve the row; (b) approveSpawn throws before broker.issue (e.g. the
+// room-creation writes fail) and the caller's own catch only logs. Either
+// way the row would sit in 'approved' forever, breaking "every request
+// resolves exactly once and the parent is told exactly once". TTL is
+// measured off answered_at (the claim timestamp) and set well beyond the
+// 30s default start timeout so this never races a live approveSpawn still
+// legitimately in flight. State-scoped like expireSpawns above: RETURNING
+// keeps flip-and-report atomic, and the WHERE state='approved' guarantees a
+// row a live orchestration just resolved (started/failed) is never touched.
+export function expireApproved(db, ttlMs, now = Date.now()) {
+  return db.prepare(
+    "UPDATE agent_spawn_requests SET state='failed', resolved_at=? WHERE state='approved' AND answered_at<=? RETURNING id, user_id, from_device_id"
+  ).all(now, now - ttlMs)
+}
+
 // The shared attention throttle (spec: cap on outstanding asks). Counts BOTH
 // tables — pending spawn rows live here, pending chat asks in convo_agents —
 // because what the user is being protected from is cards, not any one
@@ -79,38 +98,72 @@ export function countPendingAsks(db, fromDeviceId) {
 // Spec step 4/5 — everything after the user's tap. Ordering is load-bearing:
 // room first, then spawn. Spawning first would, on a room-creation failure,
 // leave a live agent on another box with no channel and no provenance. The
-// broker's timeout guarantees this settles; every path resolves the row and
-// tells the parent exactly once.
+// broker's timeout guarantees the `start` rpc itself settles; the try/catch
+// below guarantees the ORCHESTRATION settles too, even if something throws
+// before broker.issue is ever reached (e.g. upsertConversation/
+// appendAndBroadcast hitting a DB error) — otherwise the row is left
+// 'approved' forever with the caller's own `.catch(console.error)` the only
+// thing that ever sees the failure. The stranded-'approved' sweep
+// (expireApproved) is the remaining backstop for the case even this can't
+// cover: the process dying mid-orchestration, taking this stack frame with
+// it.
 export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = randomUUID() }, row) {
-  const title = row.topic || row.task.slice(0, 80)
-  // The parent owns the room (conversations.agent_device_id), the target is
-  // its joined participant — the same shape an accepted chat invite leaves.
-  upsertConversation(db, { id: roomId, ownerUserId: row.user_id, title, sessionState: 'running', agentDeviceId: row.from_device_id })
-  recordJoined(db, { convoId: roomId, agentDeviceId: row.target_device_id, initiatorDeviceId: row.from_device_id })
-  // Live clients learn the room exists now, not at their next /snapshot —
-  // the same two frames convo_upsert fans for a fresh conversation.
-  appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'session_status', payload: { state: 'running' } })
-  appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null } })
-  const r = await broker.issue(hub, row.user_id, row.target_device_id, 'start',
-    { workdir: row.workdir, prompt: row.task, room_id: roomId }, { timeoutMs: startTimeoutMs })
-  if (r.ok && typeof r.result?.convo_id === 'string' && r.result.convo_id) {
-    markStarted(db, row.id, { roomId, childConvoId: r.result.convo_id })
+  // Exactly-once guard: markFailed is state-scoped (WHERE state='approved'),
+  // so its changes-count tells us whether THIS call is the one resolving the
+  // row out of 'approved'. A false here means someone else already did
+  // (the orphan sweep, or — impossible in practice, but cheap to guard —
+  // another concurrent path) and neither the epitaph nor the outcome frame
+  // may be sent a second time.
+  const fail = (code) => {
+    if (!markFailed(db, row.id)) return 'failed'
+    // Best-effort epitaph: normally the room already exists (both users can
+    // see it, so it gets the same epitaph a dead chat room gets) — but a
+    // throw from THIS call's own try block can land here before
+    // upsertConversation ever ran, in which case there is no room row to
+    // write into and appendAndBroadcast itself throws (append() requires an
+    // existing, owned conversation). That must never swallow the outcome
+    // frame below — telling the parent is the one thing this tail cannot
+    // skip.
+    try {
+      appendAndBroadcast(db, hub, {
+        userId: row.user_id, convoId: roomId, sender: 'journal', type: 'text',
+        payload: { body: `❌ spawn failed — ${code}. This room's child session never started.` },
+      })
+    } catch (err) {
+      console.error('approveSpawn: epitaph write failed (room likely never created)', err)
+    }
     hub.sendToDevice(row.user_id, row.from_device_id, {
-      kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'started',
-      room_id: roomId, child_convo_id: r.result.convo_id,
+      kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'failed', error_code: code,
     })
-    return 'started'
+    return 'failed'
   }
-  const code = r.ok ? 'bad_start_reply' : (r.error?.code ?? 'unknown')
-  markFailed(db, row.id)
-  // The room already exists and both users can see it — it gets the same
-  // epitaph a dead chat room gets, then the parent hears failed, once.
-  appendAndBroadcast(db, hub, {
-    userId: row.user_id, convoId: roomId, sender: 'journal', type: 'text',
-    payload: { body: `❌ spawn failed — ${code}. This room's child session never started.` },
-  })
-  hub.sendToDevice(row.user_id, row.from_device_id, {
-    kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'failed', error_code: code,
-  })
-  return 'failed'
+  try {
+    const title = row.topic || row.task.slice(0, 80)
+    // The parent owns the room (conversations.agent_device_id), the target is
+    // its joined participant — the same shape an accepted chat invite leaves.
+    upsertConversation(db, { id: roomId, ownerUserId: row.user_id, title, sessionState: 'running', agentDeviceId: row.from_device_id })
+    recordJoined(db, { convoId: roomId, agentDeviceId: row.target_device_id, initiatorDeviceId: row.from_device_id })
+    // Live clients learn the room exists now, not at their next /snapshot —
+    // the same two frames convo_upsert fans for a fresh conversation.
+    appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'session_status', payload: { state: 'running' } })
+    appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null } })
+    const r = await broker.issue(hub, row.user_id, row.target_device_id, 'start',
+      { workdir: row.workdir, prompt: row.task, room_id: roomId }, { timeoutMs: startTimeoutMs })
+    // Bridge-returned convo_id, capped the same as every other externally-
+    // supplied convo id (CONVO_ID_MAX_CHARS) — an oversized or non-string
+    // reply is a bad reply, same 'bad_start_reply' the missing-field case
+    // already gets below.
+    if (r.ok && typeof r.result?.convo_id === 'string' && r.result.convo_id && r.result.convo_id.length <= CONVO_ID_MAX_CHARS) {
+      markStarted(db, row.id, { roomId, childConvoId: r.result.convo_id })
+      hub.sendToDevice(row.user_id, row.from_device_id, {
+        kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'started',
+        room_id: roomId, child_convo_id: r.result.convo_id,
+      })
+      return 'started'
+    }
+    return fail(r.ok ? 'bad_start_reply' : (r.error?.code ?? 'unknown'))
+  } catch (err) {
+    console.error('approveSpawn orchestration threw before settling', err)
+    return fail('internal')
+  }
 }

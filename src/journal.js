@@ -6,13 +6,28 @@ export const MESSAGE_TYPES = [
   'text', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image',
 ]
 
+// Cap for a convo id wherever one arrives from outside the process —
+// ws.js's parent_convo_id/room_id validation and spawns.js's approveSpawn
+// capping the bridge-returned `start` rpc's convo_id — same 128-char id
+// ceiling as RPC request ids. Convo ids are conventionally Claude session
+// UUIDs (36 chars); this is a defensive upper bound, not a format
+// assertion. Lives here (not ws.js, where it originated) because spawns.js
+// needs it too and importing it from ws.js would be circular (ws.js already
+// imports from spawns.js).
+export const CONVO_ID_MAX_CHARS = 128
+
 // Events that must never reach an agent device, live or replayed. The
 // agent-chat approval card carries a peer agent's justification — the whole
 // consent design exists to keep that text away from agents until the user
 // approves, and the target agent MANAGES the room conversation the card sits
-// in, so the default fan-out would hand it straight over. One predicate,
-// consumed by ws.js fanOut, ws.js hello replay, and http.js message reads —
-// inlining the check at each site is how they drift apart.
+// in, so the default fan-out would hand it straight over. The agent-spawn
+// card is the same story from the other side: it carries the child's seed
+// prompt as task text the user has not yet approved, published into the
+// PARENT's own conversation — a parent agent must not read back its own
+// unapproved ask, any more than a chat target may read an invite it hasn't
+// accepted. One predicate, consumed by ws.js fanOut, ws.js hello replay, and
+// http.js message reads — inlining the check at each site is how they drift
+// apart.
 export function isClientOnlyEvent(type, payload) {
   return type === 'permission_request' && !!payload && typeof payload === 'object'
     && (payload.kind === 'agent_chat' || payload.kind === 'agent_spawn')
