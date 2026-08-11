@@ -868,26 +868,43 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // Client-only card (isClientOnlyEvent covers kind:'agent_spawn'),
         // published into the PARENT's own conversation — where the user is
         // already talking to the agent that is asking. The row was inserted
-        // FIRST (the card must carry a real request_id) — so a publish
-        // failure here must take the row back out, or a phantom
-        // awaiting_user row squats on the shared pending cap for 24h with
-        // no card the user could ever answer.
+        // FIRST (the card must carry a real request_id) — so an append
+        // failure must take the row back out, or a phantom awaiting_user
+        // row squats on the shared pending cap for 24h with no card the
+        // user could ever answer. Append and broadcast are deliberately
+        // SPLIT here (not appendAndFan): the durable append is the commit
+        // point that decides row-vs-discard — discarding after a mere
+        // broadcast failure would orphan an already-journaled card whose
+        // request_id no longer resolves. A broadcast failure after the
+        // append is a delivery concern only (same stance as fanOut's own
+        // push tail): row and card both exist, clients catch up at their
+        // next snapshot.
+        const cardSender = `agent:${conn.name}`
+        const cardPayload = {
+          kind: 'agent_spawn', request_id: spawnId,
+          from_device_id: conn.deviceId, from_name: sanitizePeerText(conn.name, PEER_NAME_CAP),
+          from_convo_id: msg.from_convo_id,
+          from_convo_title: sanitizePeerText(fromConvo.title, CARD_TITLE_MAX_CHARS),
+          target_device_id: msg.target_device_id, target_name: sanitizePeerText(target.name, PEER_NAME_CAP),
+          workdir, task, topic,
+        }
+        let cardAppend
         try {
-          appendAndFan({
-            userId: conn.userId, convoId: msg.from_convo_id, sender: `agent:${conn.name}`, type: 'permission_request',
-            payload: {
-              kind: 'agent_spawn', request_id: spawnId,
-              from_device_id: conn.deviceId, from_name: sanitizePeerText(conn.name, PEER_NAME_CAP),
-              from_convo_id: msg.from_convo_id,
-              from_convo_title: sanitizePeerText(fromConvo.title, CARD_TITLE_MAX_CHARS),
-              target_device_id: msg.target_device_id, target_name: sanitizePeerText(target.name, PEER_NAME_CAP),
-              workdir, task, topic,
-            },
-          })
+          cardAppend = append(db, { userId: conn.userId, convoId: msg.from_convo_id, sender: cardSender, type: 'permission_request', payload: cardPayload })
         } catch (err) {
-          console.error('spawn_request: card publish failed, discarding row', err)
+          console.error('spawn_request: card append failed, discarding row', err)
           discardSpawnRequest(db, spawnId)
           return fail('internal', 'card publish failed')
+        }
+        if (!cardAppend.duplicate) {
+          try {
+            fanOut(journalFrame({
+              seq: cardAppend.seq, convo_id: msg.from_convo_id, ts: cardAppend.ts,
+              sender: cardSender, type: 'permission_request', payload: cardPayload,
+            }))
+          } catch (err) {
+            console.error('spawn_request: card broadcast failed (card is journaled; clients catch up via snapshot)', err)
+          }
         }
         conn.ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: rid, spawn_id: spawnId }))
         break
