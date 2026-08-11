@@ -1038,6 +1038,122 @@ scoping" above) now reach not just the recorded owner but every currently-
 room's actual conversation content), distinct from this section's ephemeral
 invite-lifecycle relay.
 
+## Agent-spawned sessions (`spawn`)
+
+(spec: `docs/superpowers/specs/2026-08-09-agent-spawns-session-design.md`.)
+A parent agent may ask a target agent to start a new session (child conversation) with a given prompt, parked across human latency while the user consents. The journal brokers the request and handles the consensus flow.
+
+### Operations
+
+**`spawn_request`:** A parent agent requests the user's consent to spawn a session on a target agent device.
+
+```json
+{
+  "op": "spawn_request",
+  "request_id": "string (UUID or similar)",
+  "from_convo_id": "string (conversation id the parent owns)",
+  "target_device_id": integer,
+  "workdir": "string (capped at 1024 chars)",
+  "task": "string (the child's seed prompt, capped at 2000 chars)",
+  "topic": "string (optional, title fragment for the card, capped at 200 chars)"
+}
+```
+
+Acknowledgement: `{kind:'spawn', event:'pending', request_id, spawn_id}` — the spawn row is now parked in `awaiting_user` state, and a `permission_request` event has been appended to the parent's conversation with `payload.kind: 'agent_spawn'` (client-only).
+
+**Errors.** `forbidden` for a client connection (agent-only, same stance as the room ops); `not_ready` if sent before this connection's own hello replay completes (mid-replay it's invisible to the delivery scan an outcome frame would need). `bad_request` covers: a missing/non-string/oversized `request_id` (≤128 chars, `RPC_ID_MAX_CHARS`); an empty or oversized `workdir` (≤1024 chars, `SPAWN_WORKDIR_MAX_CHARS`) or `task` (≤2000 chars, `SPAWN_TASK_MAX_CHARS`) — and the same check re-run *after* peer-text sanitisation, so an all-control-character string that sanitises down to empty is rejected too; an oversized `topic` when present (≤200 chars, `INVITE_TOPIC_MAX_CHARS`); a non-integer `target_device_id`; targeting **self** (`target_device_id === conn.deviceId`); and a missing/empty `from_convo_id`. `not_found` covers: an unknown `target_device_id`, one belonging to another user, a client-kind device, or a private device seen by a non-private caller — all indistinguishable, anti-enumeration, same stance as `agent_invite`'s `target_device_id`; and a `from_convo_id` that doesn't resolve to a top-level conversation this device owns (foreign, unknown, or a child conversation — `parent_convo_id` set), mirroring `agent_invite`'s `from_convo_id` check. `agent_unreachable` — the target box has no live registered connection right now; checked, and refused, **before** the consent card is published, so the user's tap is never spent on an ask that cannot work. `conflict` (`detail:'too many requests awaiting user approval'`) — the requesting device already has `MAX_AWAITING_PER_REQUESTER` (3) rows in `awaiting_user`, counted jointly with agent-chat's pending asks (see "Pending-ask cap" below).
+
+**`spawn_targets`:** A parent agent queries what other agent boxes are available for spawning.
+
+```json
+{
+  "op": "spawn_targets",
+  "request_id": "string (UUID or similar)"
+}
+```
+
+Reply: `{kind:'spawn', event:'targets', request_id, boxes: [{device_id, name, online, folders: [{path, last_used}], activity?, limits?}]}`. Each box carries whether it is currently online and — if reachable — a list of recent working directories it has reported. Self (the requesting device) is never listed. Private devices are hidden from non-private agents.
+
+Folder discovery rides the RPC broker: for each *online* box the journal itself issues a **journal-originated** `recent_folders` RPC (see "Journal-originated requests" under "Agent RPC" below — `from_device_id: 0`, answered with `to_device_id: 0`) and waits up to `spawnFoldersTimeoutMs` for the reply. A bridge that never learns to answer this method will simply time out to `folders: []` for every request rather than erroring; offline boxes are listed with no RPC attempted at all.
+
+**Capacity blocks (optional).** A bridge may additionally report its current load in the same `recent_folders` reply, as `activity: {live_sessions, last_hour: [{path, sessions}]}` (capped to 20 `last_hour` entries) and `limits: {as_of, lines: [{id, label, percent, resets?, resets_at?}]}` (capped to 12 `lines`; `resets`/`resets_at` are per-line and each independently optional). Both are validated all-or-nothing (`sanitizeSpawnActivity`/`sanitizeSpawnLimits` in `src/spawns.js`): any malformed entry drops the whole block from that box's reply, but never the box itself — a bridge that predates these fields, or whose reply fails validation, simply shows up with folders and no `activity`/`limits` keys (omitted, not null).
+
+### Consent card
+
+A `permission_request` event with `payload.kind: 'agent_spawn'` is appended to the **parent conversation** — the conversation the parent owns and is asking from, named `from_convo_id` in the operation. The payload includes:
+
+```json
+{
+  "kind": "agent_spawn",
+  "request_id": "the spawn row's id",
+  "from_device_id": 7,
+  "from_name": "the parent device's name",
+  "from_convo_id": "the parent conversation's id",
+  "from_convo_title": "the parent conversation's title",
+  "target_device_id": 12,
+  "target_name": "the target device's name",
+  "workdir": "string",
+  "task": "string (the child's seed prompt, also the card's text)",
+  "topic": "string (optional, title fragment for the card)"
+}
+```
+
+Like agent-chat cards, this is a **client-only event** excluded from agent delivery and unforgeable via `publish`.
+
+**Identification fields.** `from_device_id` and `target_device_id` identify the two boxes in the spawn pair and map to the devices' own ids — `from_device_id` is always the requesting parent. `from_name` and `target_name` are the devices' sanitised names (control characters become spaces, capped to `PEER_NAME_CAP`), sent because a device's name is how the user knows which box is which on the conversation list. A client rendering the card state must identify which is parent and which is target using the device ids.
+
+**Originating conversation.** `from_convo_id` and `from_convo_title` identify the **parent conversation** — the session the parent owns and is asking from, and where this card is being published. A client that missed the live card or wants to review all spawn requests uses these fields to correlate the card to its originating thread. `from_convo_id` is authorisation, not decoration, exactly as in agent-chat: it must be a **top-level conversation** (`parent_convo_id` must be null — a child/sub-chat can never front an ask) that the requesting device actually owns, or the `spawn_request` is rejected `not_found`. A title is shown to the user as the asker's identity, so an unchecked one would let a requester borrow another conversation's name to be trusted by. Both id and title are sent because neither alone identifies a conversation to a user — a room's title has no identifying prefix (unlike a bridge-seeded session title), and two conversations can share wording. A title is a snapshot taken when the ask was made: the card is an immutable event, so a later retitle does not rewrite it.
+
+**Prompt and context.** `task` is both the child's seed prompt for the `start` RPC and the card's text that the user approves — one blob, so the text the user reads is the text that takes effect. `workdir` is the child's working directory, sent as context so the user can understand what environment the spawn will run in. Both are peer text and undergo the same sanitisation (control characters become spaces, trimmed to `SPAWN_TASK_MAX_CHARS` and `SPAWN_WORKDIR_MAX_CHARS` respectively). `topic` is optional and provides a shorter title fragment (capped to `INVITE_TOPIC_MAX_CHARS`) — when present, used as the card's headline instead of truncating the task itself.
+
+sent with `sender: "agent:<name>"`, same sender convention as any other agent-authored event.
+
+### Answering
+
+**`POST /agent-spawn/answer`** `{request_id, decision: "approve"|"deny"}` — client-only (`403` for agent tokens). `request_id` must resolve to a **row belonging to the caller's own user**; an unknown row and one owned by another user are indistinguishable (`404 {error:'not_found'}`, never `403` — anti-enumeration). The row must be `state='awaiting_user'` or the call is `409 {error:'conflict'}` (already answered, or never parked). A body carrying `always_allow` at all — any value — is `400 {error:'bad_request'}`.
+
+- **`deny`** flips the row to `denied` and sends the parent `{kind:'spawn', event:'outcome', request_id, outcome:'declined'}` (if reachable).
+- **`approve`** flips the row to `approved`, creates a new `conversations` row owned by the parent, and joins the target as a participant — room-first, same ordering rule as agent-chat, so a room-creation failure never leaves a live agent spawned on another box with no channel and no provenance. Before the `start` RPC is issued, `session_status` and `convo_meta` journal events are broadcast into the new room — the same two frames `convo_upsert` fans for a fresh conversation — so live clients learn the room exists immediately, and they fan to the target agent too, since it is already a joined participant by this point. Only then does the journal issue the `start` RPC to the target with `params: {prompt: <task>, workdir: <workdir>, room_id: <new room id>, from_name?: <parent device's sanitised name>}`. `from_name` gives the target's opening turn the parent's identity without a separate lookup; it is omitted rather than sent empty if the parent device row is gone by approval time. The parent hears one of: `outcome:'started'` (with `room_id` and `child_convo_id`), `outcome:'failed'` (with `error_code`), or times out to `failed/timeout` if the target never answers.
+
+### Outcome frames
+
+All settlement notifications to the parent take the form `{kind:'spawn', event:'outcome', request_id, outcome: '<state>', ...}`:
+
+```json
+{
+  "kind": "spawn",
+  "event": "outcome",
+  "request_id": "the spawn row's id",
+  "outcome": "started | declined | expired | failed",
+  "room_id": "new room id (started only)",
+  "child_convo_id": "child session id reported by the target (started only)",
+  "error_code": "code describing the failure (failed only)"
+}
+```
+
+The four outcomes flow from: `started` (approval granted and target answered), `declined` (user denied), `expired` (24h TTL without user action), `failed` (target unreachable, didn't answer in time, returned a bad start response, or — see "Stranded-`approved` recovery" below — orphaned by a restart or an internal error mid-orchestration). These outcomes are coarser than the six `agent_spawn_requests.state` values: `awaiting_user` and `approved` are transient parking states with no outcome frame of their own, folded into whichever of the four above the row eventually resolves to. **Emission is exactly-once; delivery is at-most-once.** Every parked request resolves to exactly one terminal state and exactly one outcome frame is ever *sent* for it — but the send is fire-and-forget to the parent's live sockets (like `/agent-chat/answer` frames), not journaled or replayed, so a parent offline at resolution time misses the frame entirely. The durable row itself (`agent_spawn_requests.state`) is the source of truth; durable outcome delivery (appending the outcome as a journal event into `from_convo_id`) is a recorded follow-up.
+
+**Journal-originated RPC:** When the journal issues the `start` RPC itself (during approval orchestration), it sets `from_device_id: 0` — a reserved value signifying the journal is the originator, not a peer agent. The target's bridge uses this to seed the new session without a peer device context.
+
+### Expiry
+
+A parked `awaiting_user` spawn request older than `AWAITING_USER_TTL_MS` (24 hours, same clock as agent-chat awaiting-user rows, clocked from `created_at`) is flipped to `expired` by the periodic sweep timer and the parent is notified. Unlike agent-chat, where expiry is masked as `reason:'refused'` (to hide from the requester that the user is unresponsive), **spawn expiry is reported honestly as `outcome:'expired'`** — spawn denials are already told plainly as `'declined'`, and there is no peer to hide behind, so distinguishing "the user never answered" from "the user said no" reveals nothing the parent doesn't already learn from a denial.
+
+### Stranded-`approved` recovery
+
+`approved` is meant to be momentary — the claim (`claimApprove`) that lets exactly one `POST /agent-spawn/answer` tap own the expensive orchestration, settled moments later by `outcome:'started'` or `outcome:'failed'`. Two things can strand a row there instead: the journal process restarting in the gap between the claim and the in-memory orchestration settling it (nothing left in memory will ever resolve the row), or an exception inside the orchestration *before* the `start` RPC is even issued (a DB error creating the room, say) — the route that fired the orchestration only logs such a throw, it never re-derives an outcome. Both leave the row `approved` forever and the parent never told, breaking "every request resolves exactly once and the parent is told exactly once."
+
+Two mechanisms close this, layered the same way `expireSpawns` covers `awaiting_user`:
+
+- The orchestration itself (`approveSpawn`) wraps its body in a try/catch: a throw before `broker.issue` routes to the same failure tail a bad `start` reply gets, with `error_code: 'internal'`.
+- The periodic sweep timer additionally flips any `approved` row whose `answered_at` (the claim timestamp) is older than the orphan TTL — derived as `max(5 minutes, 2 × the configured start timeout)`, so a raised `spawnStartTimeoutMs` can never let the sweep fail a row whose orchestration is still legitimately awaiting the target's reply — to `failed`, and notifies the parent with `error_code: 'orphaned'`. If the orchestration got as far as creating the room before the restart (the room linkage is persisted onto the row *before* the `start` RPC is issued), the sweep also writes the same `❌ spawn failed` epitaph into that room a live failure writes, so the user is never left with an unexplained dead room. This is the backstop for the restart case, where nothing is left to run the try/catch above at all.
+
+Both paths use the same state-scoped `UPDATE ... WHERE state='approved'` (`markFailed` / the sweep's own update) that the rest of the state machine relies on: whichever one wins the race is the only one whose outcome frame is ever sent, so a row a live orchestration successfully resolved (`started` or `failed`) can never also be reported `orphaned` by a sweep tick that happens to land moments later.
+
+### Pending-ask cap
+
+Outstanding `awaiting_user` rows per *requesting* device are capped at `MAX_AWAITING_PER_REQUESTER` (3), shared with agent-chat invites and joins — the cap is what stops a re-ask loop, not TTL ambiguity or answer masking. Over the cap, `spawn_request` fails `{code:'conflict', detail:'too many requests awaiting user approval'}`.
+
 ## Device privacy
 
 (spec: `docs/superpowers/specs/2026-08-07-agent-visibility-privacy-design.md`.)
@@ -1391,19 +1507,52 @@ typing text commands into the control conversation.
   double-execute a non-idempotent `start`). `from_device_id` is stamped
   server-side.
 - Agent op: `agent_response {request_id, to_device_id, ok, result?, error?}`
-  (agent connections only). `to_device_id` must be a client device of the
-  same user (else `not_found`); `ok:false` requires `error.code`. Delivered
-  as `{kind:'rpc', response:{request_id, agent_device_id, ok, result?|
-  error?}}` to ALL live sockets of that device (responses are
+  (agent connections only). For a reply to a client-relayed request,
+  `to_device_id` must be a client device of the same user (else `not_found`);
+  a reply to a **journal-originated** request instead carries
+  `to_device_id: 0` and is settled internally rather than relayed — see
+  "Journal-originated requests" below. `ok:false` requires `error.code`.
+  Delivered as `{kind:'rpc', response:{request_id, agent_device_id, ok,
+  result?|error?}}` to ALL live sockets of that device (responses are
   side-effect-free; clients dedupe by `request_id`).
 - The relay is stateless and nothing is journaled: no seq, no unread/push
   effects, no retention surface. Timeouts are the client's job; at-most-once
   delivery, re-asking is the retry.
 - v1 method vocabulary (bridge-owned, normative in the spec):
-  `recent_folders {} -> {folders:[{path, last_used}]}` and
-  `start {workdir?, browser?} -> {convo_id}` (errors `bad_workdir`,
-  `spawn_failed`; unknown methods `unknown_method`). Cross-channel ordering
-  between the `start` response and its `convo_upsert` is not guaranteed.
+  `recent_folders {} -> {folders:[{path, last_used}], activity?, limits?}` and
+  `start {workdir?, browser?, prompt?, room_id?, from_name?} -> {convo_id}`
+  (errors `bad_workdir` — workdir does not resolve to a directory on the
+  target box; `spawn_failed` — the target threw while starting the session;
+  `bad_request` — `room_id` was sent without `prompt`, or `room_id` on its
+  own is otherwise invalid; `unsupported_mode` — the target bridge has no
+  spawn wiring (e.g. session id unknown at spawn, or spawn-room support
+  absent); unknown methods `unknown_method`).
+  `prompt`/`room_id`/`from_name` are the parameters the journal-originated
+  `start` call behind spawn approval sends (see "Agent-spawned sessions"
+  above); a client-relayed `start` sends `workdir`/`browser` instead.
+  `activity`/`limits` on the `recent_folders` reply are the optional capacity
+  blocks (see "Agent-spawned sessions" → "spawn_targets" above). Cross-channel
+  ordering between the `start` response and its `convo_upsert` is not
+  guaranteed.
+
+**Journal-originated requests.** The journal itself can be the RPC caller —
+not just the relay between a client and an agent. Spawn approval's `start`
+call and spawn-target discovery's `recent_folders` call (see "Agent-spawned
+sessions" above) are both issued by the journal directly, over the same
+single-consumer delivery path a client-relayed `agent_request` uses. These
+requests carry `from_device_id: 0` — a reserved value no real device row can
+ever have (SQLite `AUTOINCREMENT` starts at 1) — signalling that the journal,
+not a peer agent, is the caller. The agent answers with an ordinary
+`agent_response`, addressed with `to_device_id: 0`; the journal's RPC broker
+recognises that reserved id and settles the pending request internally
+instead of relaying it onward to a (nonexistent) client device — this is why
+the "`to_device_id` must be a client device of the same user" rule above does
+not apply to these replies. The broker still checks that the responder is who
+the request actually went to: only a reply from the same `userId`/`deviceId`
+pair the journal addressed the request to may settle it; a reply from any
+other device for the same `request_id` falls through to the ordinary
+client-forward path instead, where `to_device_id: 0` is not a client device
+and the reply lands `not_found`.
 
 ## Push notifications (APNs)
 
