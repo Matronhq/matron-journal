@@ -83,8 +83,8 @@ export function emitSpawnOutcome(db, hub, { userId, fromDeviceId, fromConvoId, r
 
 // Sweep-driven 24h TTL, mirroring participants.expireAwaiting: flip stale
 // parked rows and report them so the sweep can tell each parent its ask
-// timed out. RETURNING keeps flip-and-report atomic. user_id/from_device_id
-// ride along so the caller needs no per-row lookups.
+// timed out. RETURNING keeps flip-and-report atomic. user_id/from_device_id/
+// from_convo_id ride along so the caller needs no per-row lookups.
 export function expireSpawns(db, ttlMs, now = Date.now()) {
   return db.prepare(
     "UPDATE agent_spawn_requests SET state='expired', answered_at=?, resolved_at=? WHERE state='awaiting_user' AND created_at<=? RETURNING id, user_id, from_device_id, from_convo_id"
@@ -169,10 +169,12 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
     // failed `start` RPC reply, ws.js's RPC_NAME_MAX_CHARS=64-capped
     // msg.error.code) — peer-authored, not journal-composed — so it goes
     // through the same sanitizePeerText sieve as fromName below. Used for
-    // BOTH the room epitaph and the outcome frame: the frame lands on the
-    // parent bridge and, later, consent-card clients, so a raw code with
-    // embedded newlines must never cross the wire either. Same 'unknown'
-    // fallback for a missing code.
+    // the room epitaph, the ephemeral outcome frame, AND the durable
+    // spawn_outcome payload emitSpawnOutcome journals below: the frame
+    // lands on the parent bridge and, later, consent-card clients, and the
+    // durable event replays to both, so a raw code with embedded newlines
+    // must never cross any of those wires. Same 'unknown' fallback for a
+    // missing code.
     const safeCode = sanitizePeerText(code, 64) || 'unknown'
     try {
       appendAndBroadcast(db, hub, {

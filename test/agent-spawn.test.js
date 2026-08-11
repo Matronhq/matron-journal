@@ -564,6 +564,16 @@ test('started: the durable spawn_outcome event carries room+child ids and no err
   assert.equal(parentEvt.payload.outcome, 'started')
 })
 
+test('resolution updates the parent convo snippet and bumps unread — symmetry with the card (spawn_outcome is a MESSAGE_TYPE)', async (t) => {
+  const { s, clientToken, spawnId } = await parkedSpawn(t)
+  const afterCard = s.db.prepare("SELECT unread_count FROM conversations WHERE id='parent-convo'").get().unread_count
+  const r = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'deny' } })
+  assert.equal(r.status, 200)
+  const convo = s.db.prepare("SELECT snippet, unread_count FROM conversations WHERE id='parent-convo'").get()
+  assert.equal(convo.snippet, '🚫 Spawn declined')
+  assert.equal(convo.unread_count, afterCard + 1)
+})
+
 test('declined: the durable spawn_outcome event carries only outcome+request_id', async (t) => {
   const { s, clientToken, parent, client, spawnId } = await parkedSpawn(t)
   const r = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'deny' } })
@@ -571,10 +581,18 @@ test('declined: the durable spawn_outcome event carries only outcome+request_id'
   const ephemeral = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
   assert.equal(ephemeral.outcome, 'declined')
   const clientEvt = await client.waitFor((f) => isOutcomeEvent(f, spawnId))
+  assert.equal(clientEvt.convo_id, 'parent-convo')
   assert.equal(clientEvt.payload.outcome, 'declined')
   assert.deepEqual(Object.keys(clientEvt.payload).sort(), ['outcome', 'request_id'])
   const parentEvt = await parent.waitFor((f) => isOutcomeEvent(f, spawnId))
   assert.equal(parentEvt.payload.outcome, 'declined')
+  // Exactly-once guard: the durable append must never fire twice for one
+  // resolution — the state-scoped UPDATE in denySpawn is what guarantees
+  // this, but the guarantee is only worth as much as this assertion.
+  const count = s.db.prepare(
+    "SELECT COUNT(*) AS c FROM events WHERE type='spawn_outcome' AND json_extract(payload,'$.request_id')=?"
+  ).get(spawnId).c
+  assert.equal(count, 1)
 })
 
 test('failed: a bridge start-rpc error produces a durable spawn_outcome event with error_code', async (t) => {
@@ -587,6 +605,7 @@ test('failed: a bridge start-rpc error produces a durable spawn_outcome event wi
   const ephemeral = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome', 5000)
   assert.equal(ephemeral.outcome, 'failed')
   const clientEvt = await client.waitFor((f) => isOutcomeEvent(f, spawnId))
+  assert.equal(clientEvt.convo_id, 'parent-convo')
   assert.equal(clientEvt.payload.outcome, 'failed')
   assert.equal(clientEvt.payload.error_code, 'bad_thing')
   assert.deepEqual(Object.keys(clientEvt.payload).sort(), ['error_code', 'outcome', 'request_id'])
@@ -600,6 +619,7 @@ test('expired: the sweep journals a durable spawn_outcome event with no extra ke
   const ephemeral = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome', 5000)
   assert.equal(ephemeral.outcome, 'expired')
   const clientEvt = await client.waitFor((f) => isOutcomeEvent(f, spawnId))
+  assert.equal(clientEvt.convo_id, 'parent-convo')
   assert.equal(clientEvt.payload.outcome, 'expired')
   assert.deepEqual(Object.keys(clientEvt.payload).sort(), ['outcome', 'request_id'])
   const parentEvt = await parent.waitFor((f) => isOutcomeEvent(f, spawnId))
@@ -620,6 +640,7 @@ test('orphaned: the stranded-approved sweep journals a durable spawn_outcome eve
   assert.equal(ephemeral.outcome, 'failed')
   assert.equal(ephemeral.error_code, 'orphaned')
   const clientEvt = await client.waitFor((f) => isOutcomeEvent(f, spawnId))
+  assert.equal(clientEvt.convo_id, 'parent-convo')
   assert.equal(clientEvt.payload.outcome, 'failed')
   assert.equal(clientEvt.payload.error_code, 'orphaned')
   assert.deepEqual(Object.keys(clientEvt.payload).sort(), ['error_code', 'outcome', 'request_id'])

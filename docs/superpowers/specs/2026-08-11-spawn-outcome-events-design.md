@@ -110,13 +110,21 @@ the durable event; and a client that sees neither still converges on replay.
 
 ### Snippet, push, indexing
 
+- `spawn_outcome` joins `MESSAGE_TYPES`: the card (`permission_request`) is a
+  message type that sets the conversation snippet and bumps unread, so its
+  resolution must be too — otherwise the chat-list row keeps advertising
+  `🤝 Agent spawn request` after the ask is settled, and the snippet branch
+  below would be dead code (`append()` only calls `snippetOf` for message
+  types). The unread bump is correct for `expired`/orphaned `failed` (the
+  user didn't act and should be told) and harmless for answered outcomes
+  (the user is looking at the conversation, which clears unread).
 - `snippetOf` gains explicit `spawn_outcome` snippets: `started` →
   `🚀 Spawned session started`, `declined` → `🚫 Spawn declined`, `expired` →
-  `⌛ Spawn request expired`, `failed` → `❌ Spawn failed`. (Without this the
-  parent conversation's chat-list row would read `[spawn_outcome]`.)
-- Push: no `classify` change — the default `{priority: 5, coalesce: true,
-  kind: 'activity'}` is right (quiet; the user usually just acted, and a
-  started child generates its own activity).
+  `⌛ Spawn request expired`, `failed` → `❌ Spawn failed`.
+- Push: none. Journal-authored events (`appendAndBroadcast`) never enter the
+  push pipeline — only agent-published events via the ws append path do — so
+  no `classify` change and no notification, which is right: a started child
+  generates its own activity, and answered outcomes were just acted on.
 - Not indexable: `indexableBody` already ignores unknown types; a test pins
   that `spawn_outcome` is not searchable.
 
