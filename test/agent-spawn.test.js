@@ -648,6 +648,70 @@ test('orphaned: the stranded-approved sweep journals a durable spawn_outcome eve
   assert.equal(parentEvt.payload.outcome, 'failed')
 })
 
+// --- Task 2 hardening: forgery, resilience, replay -------------------------
+
+test('spawn_outcome is unforgeable via publish', async (t) => {
+  const { s, parent, client } = await spawnFleet(t)
+  parent.send({ op: 'publish', convo_id: 'parent-convo', type: 'spawn_outcome', payload: { request_id: 'forged', outcome: 'started' } })
+  const err = await parent.waitFor((f) => f.kind === 'control' && f.op === 'error')
+  assert.equal(err.code, 'bad_request')
+  await new Promise((r) => setTimeout(r, 50))
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM events WHERE type='spawn_outcome'").get().n, 0,
+    'the forged event must never be appended to the journal')
+  assert.ok(!client.frames.some((f) => f.kind === 'journal' && f.type === 'spawn_outcome'), 'nothing reached the client either')
+})
+
+test('spawn_outcome is unforgeable via finalize', async (t) => {
+  const { s, parent, client } = await spawnFleet(t)
+  parent.send({ op: 'finalize', convo_id: 'parent-convo', message_ref: 'm1', type: 'spawn_outcome', payload: { request_id: 'forged', outcome: 'started' } })
+  const err = await parent.waitFor((f) => f.kind === 'control' && f.op === 'error')
+  assert.equal(err.code, 'bad_request')
+  await new Promise((r) => setTimeout(r, 50))
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM events WHERE type='spawn_outcome'").get().n, 0,
+    'the forged event must never be appended to the journal')
+  assert.ok(!client.frames.some((f) => f.kind === 'journal' && f.type === 'spawn_outcome'), 'nothing reached the client either')
+})
+
+test('deny after the parent conversation row is gone: 200 still returns, the ephemeral frame still reaches the parent, no durable event exists, and the server keeps answering', async (t) => {
+  const { s, clientToken, parent, spawnId } = await parkedSpawn(t)
+  // from_convo_id may have been deleted since the ask was parked — the
+  // append inside emitSpawnOutcome throws (append() requires an existing,
+  // owned conversation); the design says that must be logged and swallowed,
+  // never allowed to break the answer route or suppress the ephemeral frame.
+  s.db.prepare("DELETE FROM conversations WHERE id='parent-convo'").run()
+  const r = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'deny' } })
+  assert.equal(r.status, 200)
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
+  assert.equal(out.outcome, 'declined')
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM events WHERE type='spawn_outcome'").get().n, 0,
+    'the durable append failed silently — no row was left behind')
+  // The server must still be alive and answering other requests — the
+  // append failure must not have thrown out of the request handler.
+  const alive = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'phone2' } })
+  assert.equal(alive.status, 200)
+})
+
+test("agent replay: a fresh parent-agent connection's hello replay contains the resolved spawn's durable outcome event; the card itself stays absent", async (t) => {
+  const { s, parentDev, clientToken, spawnId } = await parkedSpawn(t)
+  const r = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'deny' } })
+  assert.equal(r.status, 200)
+  const agentReplay = await makeWsClient(s.base, { token: parentDev.token, cursor: 0 })
+  t.after(() => agentReplay.close())
+  await agentReplay.waitFor((f) => isOutcomeEvent(f, spawnId))
+  assert.ok(!agentReplay.journal().some(isSpawnCard), 'the client-only card must stay absent from the agent replay')
+})
+
+test("client replay: a fresh client connection's replay contains BOTH the card and the durable outcome event", async (t) => {
+  const { s, clientToken, spawnId } = await parkedSpawn(t)
+  const r = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'deny' } })
+  assert.equal(r.status, 200)
+  const clientReplay = await makeWsClient(s.base, { token: clientToken, cursor: 0 })
+  t.after(() => clientReplay.close())
+  await clientReplay.waitFor((f) => isOutcomeEvent(f, spawnId))
+  assert.ok(clientReplay.journal().some(isSpawnCard), 'the card must still be present in client replay')
+  assert.ok(clientReplay.journal().some((f) => isOutcomeEvent(f, spawnId)), 'the durable outcome event must be present in client replay')
+})
+
 test('discardSpawnRequest removes only unanswered rows', async (t) => {
   const { s, dan, parentDev, targetDev } = await spawnFleet(t)
   const mk = (id) => createSpawnRequest(s.db, {
