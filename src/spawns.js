@@ -219,8 +219,12 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
     // Bridge-returned convo_id, capped the same as every other externally-
     // supplied convo id (CONVO_ID_MAX_CHARS) — an oversized or non-string
     // reply is a bad reply, same 'bad_start_reply' the missing-field case
-    // already gets below.
-    if (r.ok && typeof r.result?.convo_id === 'string' && r.result.convo_id && r.result.convo_id.length <= CONVO_ID_MAX_CHARS) {
+    // already gets below. Sanitisation is a REJECT, not a rewrite: this id
+    // now persists into the durable spawn_outcome payload and replays to
+    // card-rendering clients, so control characters make it a bad reply —
+    // but an id must never be silently mutated into a different id.
+    if (r.ok && typeof r.result?.convo_id === 'string' && r.result.convo_id && r.result.convo_id.length <= CONVO_ID_MAX_CHARS
+      && sanitizePeerText(r.result.convo_id, CONVO_ID_MAX_CHARS) === r.result.convo_id) {
       // Exactly-once guard, mirroring fail()'s: markStarted is state-scoped
       // (WHERE state='approved'), so a false means something else — in
       // practice only the orphan sweep — already resolved this row and told

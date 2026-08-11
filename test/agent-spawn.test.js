@@ -597,7 +597,7 @@ test('declined: the durable spawn_outcome event carries only outcome+request_id'
 
 test('failed: a bridge start-rpc error produces a durable spawn_outcome event with error_code', async (t) => {
   const { s, clientToken, parent, target, client, spawnId } = await parkedSpawn(t)
-  target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start').then((req) => {
+  const bridgeTurn = target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start').then((req) => {
     target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: false, error: { code: 'bad_thing' } })
   })
   const r = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } })
@@ -611,6 +611,25 @@ test('failed: a bridge start-rpc error produces a durable spawn_outcome event wi
   assert.deepEqual(Object.keys(clientEvt.payload).sort(), ['error_code', 'outcome', 'request_id'])
   const parentEvt = await parent.waitFor((f) => isOutcomeEvent(f, spawnId))
   assert.equal(parentEvt.payload.outcome, 'failed')
+  await bridgeTurn
+})
+
+test('a start reply whose convo_id carries control characters is a bad reply, not a rewritten id', async (t) => {
+  const { s, clientToken, parent, target, spawnId } = await parkedSpawn(t)
+  const bridgeTurn = target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start').then((req) => {
+    target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { convo_id: 'child\n1' } })
+  })
+  const r = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } })
+  assert.equal(r.status, 200)
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome', 5000)
+  assert.equal(out.outcome, 'failed')
+  assert.equal(out.error_code, 'bad_start_reply')
+  // The forged id must not survive anywhere — not on the row, not in the
+  // durable payload (which for a failure carries error_code only).
+  assert.equal(getSpawn(s.db, spawnId).child_convo_id, null)
+  const payload = s.db.prepare("SELECT payload FROM events WHERE type='spawn_outcome' AND json_extract(payload,'$.request_id')=?").get(spawnId)
+  assert.deepEqual(Object.keys(JSON.parse(payload.payload)).sort(), ['error_code', 'outcome', 'request_id'])
+  await bridgeTurn
 })
 
 test('expired: the sweep journals a durable spawn_outcome event with no extra keys', async (t) => {

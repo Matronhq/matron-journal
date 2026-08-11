@@ -142,6 +142,10 @@ Recorded here as the cross-repo contract the client specs build on:
 - Old clients render `spawn_outcome` through their generic unknown-type
   fallback; acceptable because spawns cannot occur before the new
   bridge/journal are deployed.
+- The inverse also holds: cards minted before this deploys never get an
+  outcome event. Clients render them answerable and converge through the
+  409 (expired-style copy) — same path as a card whose durable event was
+  lost to an append failure.
 
 ## Error handling
 
