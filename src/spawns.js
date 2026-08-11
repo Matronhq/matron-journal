@@ -78,8 +78,18 @@ export function expireSpawns(db, ttlMs, now = Date.now()) {
 // row a live orchestration just resolved (started/failed) is never touched.
 export function expireApproved(db, ttlMs, now = Date.now()) {
   return db.prepare(
-    "UPDATE agent_spawn_requests SET state='failed', resolved_at=? WHERE state='approved' AND answered_at<=? RETURNING id, user_id, from_device_id"
+    "UPDATE agent_spawn_requests SET state='failed', resolved_at=? WHERE state='approved' AND answered_at<=? RETURNING id, user_id, from_device_id, room_id"
   ).all(now, now - ttlMs)
+}
+
+// Undo for a spawn ask whose consent card never made it out: spawn_request
+// inserts the row FIRST (the card must carry a real request_id), so a
+// publish failure right after would otherwise leave a phantom
+// awaiting_user row — no card for the user to answer, yet still counting
+// against the shared MAX_AWAITING_PER_REQUESTER cap for the full 24h TTL.
+// State-scoped DELETE: only an unanswered row is ever discarded.
+export function discardSpawnRequest(db, id) {
+  return db.prepare("DELETE FROM agent_spawn_requests WHERE id=? AND state='awaiting_user'").run(id).changes > 0
 }
 
 // The shared attention throttle (spec: cap on outstanding asks). Counts BOTH
@@ -125,14 +135,16 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
     // existing, owned conversation). That must never swallow the outcome
     // frame below — telling the parent is the one thing this tail cannot
     // skip.
+    // `code` here is the target bridge's own error_code (e.g. from a
+    // failed `start` RPC reply, ws.js's RPC_NAME_MAX_CHARS=64-capped
+    // msg.error.code) — peer-authored, not journal-composed — so it goes
+    // through the same sanitizePeerText sieve as fromName below. Used for
+    // BOTH the room epitaph and the outcome frame: the frame lands on the
+    // parent bridge and, later, consent-card clients, so a raw code with
+    // embedded newlines must never cross the wire either. Same 'unknown'
+    // fallback for a missing code.
+    const safeCode = sanitizePeerText(code, 64) || 'unknown'
     try {
-      // `code` here is the target bridge's own error_code (e.g. from a
-      // failed `start` RPC reply, ws.js's RPC_NAME_MAX_CHARS=64-capped
-      // msg.error.code) — peer-authored, not journal-composed — so it goes
-      // through the same sanitizePeerText sieve as fromName below before
-      // landing in a room message every participant reads. Same 'unknown'
-      // fallback the outcome frame below already used for a missing code.
-      const safeCode = sanitizePeerText(code, 64) || 'unknown'
       appendAndBroadcast(db, hub, {
         userId: row.user_id, convoId: roomId, sender: 'journal', type: 'text',
         payload: { body: `❌ spawn failed — ${safeCode}. This room's child session never started.` },
@@ -141,7 +153,7 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
       console.error('approveSpawn: epitaph write failed (room likely never created)', err)
     }
     hub.sendToDevice(row.user_id, row.from_device_id, {
-      kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'failed', error_code: code,
+      kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'failed', error_code: safeCode,
     })
     return 'failed'
   }
@@ -155,6 +167,15 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
     // the same two frames convo_upsert fans for a fresh conversation.
     appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'session_status', payload: { state: 'running' } })
     appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null } })
+    // Persist the room linkage NOW, before the `start` RPC — the row is
+    // still 'approved', so a restart in the RPC gap leaves the sweep
+    // (expireApproved) a room_id to report and write the epitaph into.
+    // Without this, markStarted was the first writer of room_id and a
+    // restart-orphaned row pointed at nothing: the user was left with an
+    // unexplained dead room and the parent with an unlocatable failure.
+    // State-scoped like every other write; markStarted re-setting the same
+    // value later is harmless.
+    db.prepare("UPDATE agent_spawn_requests SET room_id=? WHERE id=? AND state='approved'").run(roomId, row.id)
     // The parent device's name may be gone by approval time (deleted between
     // the ask and the tap) — omitted rather than forced, same as every other
     // optional wire field.

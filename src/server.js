@@ -280,7 +280,9 @@ export function startServer({
     rpcMaxBytes: resolveNumericEnv('MATRON_RPC_MAX_BYTES', process.env.MATRON_RPC_MAX_BYTES, 16384),
     ...(revocationSweepMs !== undefined ? { revocationSweepMs } : {}),
     ...(inviteTtlMs !== undefined ? { inviteTtlMs } : {}),
-    broker, spawnFoldersTimeoutMs,
+    // spawnStartTimeoutMs rides along so the orphan sweep's TTL can never
+    // undercut a configured start timeout (attachWs derives the TTL).
+    broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs,
   })
   let retentionInterval = null
   let walCheckpointInterval = null

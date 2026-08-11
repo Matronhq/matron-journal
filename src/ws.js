@@ -2,11 +2,11 @@ import { randomUUID } from 'node:crypto'
 import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { applyBridgePrivate, isPrivateDevice } from './db.js'
-import { eventsAfter, append, markRead, upsertConversation, toEventShape, isClientOnlyEvent, CONVO_ID_MAX_CHARS } from './journal.js'
+import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, CONVO_ID_MAX_CHARS } from './journal.js'
 import { joinedAgentIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
-import { countPendingAsks, createSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits } from './spawns.js'
+import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits } from './spawns.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -79,12 +79,17 @@ const CARD_TITLE_MAX_CHARS = 120
 // card, now lives in peer-text.js — http.js applies the same cap.)
 const AWAITING_USER_TTL_MS = 24 * 3600_000
 const MAX_AWAITING_PER_REQUESTER = 3
-// Stranded-'approved' recovery TTL (see spawns.js expireApproved's doc
-// comment) — comfortably beyond the 30s default start timeout so this sweep
-// never races a live approveSpawn still legitimately in flight, but short
-// enough that a restart-before-settle gap doesn't leave the parent hanging
-// for anywhere near as long as the 24h awaiting-user TTL above.
-const APPROVED_ORPHAN_TTL_MS = 5 * 60_000
+// Stranded-'approved' recovery TTL floor (see spawns.js expireApproved's
+// doc comment) — comfortably beyond the 30s default start timeout so this
+// sweep never races a live approveSpawn still legitimately in flight, but
+// short enough that a restart-before-settle gap doesn't leave the parent
+// hanging for anywhere near as long as the 24h awaiting-user TTL above.
+// A FLOOR, not the value: spawnStartTimeoutMs is configurable, and a start
+// timeout raised past this constant would let the sweep fail a row whose
+// orchestration is still legitimately awaiting the target's reply — the
+// effective TTL is derived in attachWs (2x the start timeout, at minimum
+// this) so the two configs can never cross.
+const APPROVED_ORPHAN_TTL_FLOOR_MS = 5 * 60_000
 // Cap for a convo_upsert's rolling summary (spec: agent chat phase 2) — same
 // defensive stance as the invite text caps above.
 const SUMMARY_MAX_CHARS = 1000
@@ -177,8 +182,11 @@ export function attachWs({
   server, db, hub, pingMs = 55000, pushPipeline = noopPushPipeline,
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
   revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES, inviteTtlMs = 1800000,
-  broker, spawnFoldersTimeoutMs = 4000,
+  broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000,
 }) {
+  // Derived, never raw: the orphan sweep must always outlast a live `start`
+  // RPC still in flight (see APPROVED_ORPHAN_TTL_FLOOR_MS's comment).
+  const approvedOrphanTtlMs = Math.max(APPROVED_ORPHAN_TTL_FLOOR_MS, spawnStartTimeoutMs * 2)
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES })
   const statusCache = makeStatusCache()
   // Prepared once, reused for the per-frame revocation recheck below — one
@@ -272,7 +280,23 @@ export function attachWs({
       // the parent as a plain failure, distinct code so it's diagnosable —
       // this is the one outcome a healthy orchestration never produces
       // itself.
-      for (const row of expireApproved(db, APPROVED_ORPHAN_TTL_MS)) {
+      for (const row of expireApproved(db, approvedOrphanTtlMs)) {
+        // A room_id on the row means the orchestration got as far as
+        // creating the room before it was orphaned (approveSpawn persists
+        // the linkage before issuing `start`) — give that room the same
+        // epitaph a live failure writes, so the user isn't left with an
+        // unexplained dead room. Best-effort, exactly like fail()'s: the
+        // outcome frame below is the one thing this tail cannot skip.
+        if (row.room_id) {
+          try {
+            appendAndBroadcast(db, hub, {
+              userId: row.user_id, convoId: row.room_id, sender: 'journal', type: 'text',
+              payload: { body: '❌ spawn failed — orphaned. This room\'s child session never started.' },
+            })
+          } catch (err) {
+            console.error('orphan sweep: epitaph write failed', err)
+          }
+        }
         hub.sendToDevice(row.user_id, row.from_device_id, {
           kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'failed', error_code: 'orphaned',
         })
@@ -843,18 +867,28 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         })
         // Client-only card (isClientOnlyEvent covers kind:'agent_spawn'),
         // published into the PARENT's own conversation — where the user is
-        // already talking to the agent that is asking.
-        appendAndFan({
-          userId: conn.userId, convoId: msg.from_convo_id, sender: `agent:${conn.name}`, type: 'permission_request',
-          payload: {
-            kind: 'agent_spawn', request_id: spawnId,
-            from_device_id: conn.deviceId, from_name: sanitizePeerText(conn.name, PEER_NAME_CAP),
-            from_convo_id: msg.from_convo_id,
-            from_convo_title: sanitizePeerText(fromConvo.title, CARD_TITLE_MAX_CHARS),
-            target_device_id: msg.target_device_id, target_name: sanitizePeerText(target.name, PEER_NAME_CAP),
-            workdir, task, topic,
-          },
-        })
+        // already talking to the agent that is asking. The row was inserted
+        // FIRST (the card must carry a real request_id) — so a publish
+        // failure here must take the row back out, or a phantom
+        // awaiting_user row squats on the shared pending cap for 24h with
+        // no card the user could ever answer.
+        try {
+          appendAndFan({
+            userId: conn.userId, convoId: msg.from_convo_id, sender: `agent:${conn.name}`, type: 'permission_request',
+            payload: {
+              kind: 'agent_spawn', request_id: spawnId,
+              from_device_id: conn.deviceId, from_name: sanitizePeerText(conn.name, PEER_NAME_CAP),
+              from_convo_id: msg.from_convo_id,
+              from_convo_title: sanitizePeerText(fromConvo.title, CARD_TITLE_MAX_CHARS),
+              target_device_id: msg.target_device_id, target_name: sanitizePeerText(target.name, PEER_NAME_CAP),
+              workdir, task, topic,
+            },
+          })
+        } catch (err) {
+          console.error('spawn_request: card publish failed, discarding row', err)
+          discardSpawnRequest(db, spawnId)
+          return fail('internal', 'card publish failed')
+        }
         conn.ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: rid, spawn_id: spawnId }))
         break
       }
@@ -863,6 +897,15 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!conn.registered) return fail('not_ready')
         const rid = msg.request_id
         if (typeof rid !== 'string' || rid.length === 0 || rid.length > RPC_ID_MAX_CHARS) return fail('bad_request', 'bad request_id')
+        // Single-flight per connection: every spawn_targets frame fans one
+        // recent_folders RPC out to EVERY online box and holds up to
+        // spawnFoldersTimeoutMs for each — without this, a looping agent
+        // could stack unbounded concurrent fan-outs on one socket and spam
+        // every box the user owns. One in flight is all discovery ever
+        // needs; a second concurrent ask is a caller bug, told as the same
+        // 'conflict' the pending-ask cap uses.
+        if (conn.spawnTargetsInflight) return fail('conflict', 'spawn_targets already in flight')
+        conn.spawnTargetsInflight = true
         // Same visibility rule as the roster: self excluded (a self-entry is
         // a self-spawn trap), private boxes hidden from ordinary agents.
         const callerPrivate = isPrivateDevice(db, conn.deviceId)
@@ -875,31 +918,35 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // discovery rides it for free"). Offline boxes are listed with no
         // folders and no RPC; a box that fails or times out degrades to []
         // — discovery must never error because one box is sick.
-        const out = await Promise.all(boxes.map(async (d) => {
-          const online = live.has(d.device_id)
-          let folders = []
-          let activity = null
-          let limits = null
-          if (online) {
-            const r = await broker.issue(hub, conn.userId, d.device_id, 'recent_folders', null, { timeoutMs: spawnFoldersTimeoutMs })
-            if (r.ok && Array.isArray(r.result?.folders)) folders = r.result.folders
-            if (r.ok) {
-              // Optional capacity blocks (2026-08-10 bridge capacity spec): validated
-              // all-or-nothing; a bridge that predates them just lists folders.
-              activity = sanitizeSpawnActivity(r.result?.activity)
-              limits = sanitizeSpawnLimits(r.result?.limits)
+        try {
+          const out = await Promise.all(boxes.map(async (d) => {
+            const online = live.has(d.device_id)
+            let folders = []
+            let activity = null
+            let limits = null
+            if (online) {
+              const r = await broker.issue(hub, conn.userId, d.device_id, 'recent_folders', null, { timeoutMs: spawnFoldersTimeoutMs })
+              if (r.ok && Array.isArray(r.result?.folders)) folders = r.result.folders
+              if (r.ok) {
+                // Optional capacity blocks (2026-08-10 bridge capacity spec): validated
+                // all-or-nothing; a bridge that predates them just lists folders.
+                activity = sanitizeSpawnActivity(r.result?.activity)
+                limits = sanitizeSpawnLimits(r.result?.limits)
+              }
             }
-          }
-          // Sanitised like every other client-bound device name (roster,
-          // consent cards) — the recipient here is an agent, not a client, so
-          // this is cheap insurance rather than closing a real hole.
-          return {
-            device_id: d.device_id, name: sanitizePeerText(d.name, PEER_NAME_CAP), online, folders,
-            ...(activity ? { activity } : {}),
-            ...(limits ? { limits } : {}),
-          }
-        }))
-        conn.ws.send(JSON.stringify({ kind: 'spawn', event: 'targets', request_id: rid, boxes: out }))
+            // Sanitised like every other client-bound device name (roster,
+            // consent cards) — the recipient here is an agent, not a client, so
+            // this is cheap insurance rather than closing a real hole.
+            return {
+              device_id: d.device_id, name: sanitizePeerText(d.name, PEER_NAME_CAP), online, folders,
+              ...(activity ? { activity } : {}),
+              ...(limits ? { limits } : {}),
+            }
+          }))
+          conn.ws.send(JSON.stringify({ kind: 'spawn', event: 'targets', request_id: rid, boxes: out }))
+        } finally {
+          conn.spawnTargetsInflight = false
+        }
         break
       }
       case 'agent_invite': {

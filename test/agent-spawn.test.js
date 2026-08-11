@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { getSpawn, createSpawnRequest, claimApprove, approveSpawn } from '../src/spawns.js'
+import { getSpawn, createSpawnRequest, claimApprove, approveSpawn, discardSpawnRequest } from '../src/spawns.js'
 
 // Fleet: one user, a parent agent (dev-6), a target agent (eric), a client.
 // Parent owns 'parent-convo' — the conversation the consent card lands in.
@@ -323,9 +323,10 @@ test('approve with the target gone by approval time: failed outcome, room gets t
   assert.equal(out.error_code, 'agent_unreachable')
   const row = getSpawn(s.db, spawnId)
   assert.equal(row.state, 'failed')
-  // the epitaph line landed in the room (room_id stays null on the FAILED
-  // row — it never started — so find the room via the epitaph event itself)
-  const epitaph = s.db.prepare("SELECT payload FROM events WHERE type='text' AND sender='journal'").all()
+  // The room linkage is persisted BEFORE the start rpc, so even a FAILED
+  // row points at the room that carries its epitaph.
+  assert.ok(row.room_id)
+  const epitaph = s.db.prepare("SELECT payload FROM events WHERE convo_id=? AND type='text' AND sender='journal'").all(row.room_id)
     .map((e) => JSON.parse(e.payload))
   assert.ok(epitaph.some((p) => p.body.includes('spawn failed')))
 })
@@ -454,4 +455,106 @@ test('approveSpawn: a throw before the room exists still notifies the parent exa
   assert.equal(outcomeSends.length, 1)
   assert.equal(outcomeSends[0].frame.outcome, 'failed')
   assert.equal(outcomeSends[0].frame.error_code, 'internal')
+})
+
+test("a bridge's failed start reply: the peer-authored error code is sanitized before the outcome frame", async (t) => {
+  const { s, clientToken, parent, target, spawnId } = await parkedSpawn(t)
+  target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start').then((req) => {
+    // A code with an embedded newline passes agent_response's own gate
+    // (string, 1..64 chars) — the outcome frame must still be line-safe.
+    target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: false, error: { code: 'boom\ncode' } })
+  })
+  const r = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } })
+  assert.equal(r.status, 200)
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome', 5000)
+  assert.equal(out.outcome, 'failed')
+  assert.equal(out.error_code, 'boom code') // sanitizePeerText: control chars flattened
+  assert.ok(!out.error_code.includes('\n'))
+})
+
+test('orphan sweep TTL scales with spawnStartTimeoutMs — a long start timeout is never undercut', async (t) => {
+  // 10-minute start timeout -> effective orphan TTL is 20 minutes, not the
+  // 5-minute floor. A row 6 minutes into its claim must be left alone.
+  const { s, dan, parentDev, targetDev, parent } = await spawnFleet(t, {
+    serverOpts: { revocationSweepMs: 100, spawnStartTimeoutMs: 10 * 60 * 1000 },
+  })
+  const spawnId = 'slow-start-1'
+  createSpawnRequest(s.db, {
+    id: spawnId, userId: dan.id, fromDeviceId: parentDev.deviceId,
+    fromConvoId: 'parent-convo', targetDeviceId: targetDev.deviceId,
+    workdir: '/w', task: 'slow', topic: '',
+  })
+  assert.ok(claimApprove(s.db, spawnId))
+  s.db.prepare('UPDATE agent_spawn_requests SET answered_at = answered_at - (6*60*1000) WHERE id=?').run(spawnId)
+  await new Promise((r) => setTimeout(r, 400))
+  assert.equal(getSpawn(s.db, spawnId).state, 'approved') // sweep must NOT have flipped it
+  assert.equal(parent.frames.filter((f) => f.kind === 'spawn' && f.event === 'outcome').length, 0)
+  // Past the derived TTL (20 min) the sweep takes it, as ever.
+  s.db.prepare('UPDATE agent_spawn_requests SET answered_at = answered_at - (15*60*1000) WHERE id=?').run(spawnId)
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome', 5000)
+  assert.equal(out.outcome, 'failed')
+  assert.equal(out.error_code, 'orphaned')
+})
+
+test('restart after the room exists: the sweep finds the persisted linkage and writes the epitaph into the room', async (t) => {
+  const { s, dan, parentDev, targetDev, parent } = await spawnFleet(t, { serverOpts: { revocationSweepMs: 100 } })
+  const spawnId = 'orphan-with-room-1'
+  const roomId = 'orphan-room-x'
+  createSpawnRequest(s.db, {
+    id: spawnId, userId: dan.id, fromDeviceId: parentDev.deviceId,
+    fromConvoId: 'parent-convo', targetDeviceId: targetDev.deviceId,
+    workdir: '/w', task: 'do it', topic: 'job',
+  })
+  assert.ok(claimApprove(s.db, spawnId))
+  // An orchestration that dies mid-flight: room created, start rpc issued,
+  // never settles (a never-resolving broker stands in for the process
+  // restart that strands the row).
+  approveSpawn(
+    { db: s.db, hub: s.hub, broker: { issue: () => new Promise(() => {}) }, startTimeoutMs: 30000, roomId },
+    getSpawn(s.db, spawnId),
+  )
+  await new Promise((r) => setTimeout(r, 100))
+  // The linkage is on the row BEFORE the rpc could ever settle.
+  assert.equal(getSpawn(s.db, spawnId).room_id, roomId)
+  s.db.prepare('UPDATE agent_spawn_requests SET answered_at = answered_at - (6*60*1000) WHERE id=?').run(spawnId)
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome', 5000)
+  assert.equal(out.outcome, 'failed')
+  assert.equal(out.error_code, 'orphaned')
+  // The dead room is explained, not abandoned.
+  const epitaph = s.db.prepare("SELECT payload FROM events WHERE convo_id=? AND type='text' AND sender='journal'").all(roomId)
+    .map((e) => JSON.parse(e.payload))
+  assert.ok(epitaph.some((p) => p.body.includes('orphaned')))
+})
+
+test('discardSpawnRequest removes only unanswered rows', async (t) => {
+  const { s, dan, parentDev, targetDev } = await spawnFleet(t)
+  const mk = (id) => createSpawnRequest(s.db, {
+    id, userId: dan.id, fromDeviceId: parentDev.deviceId,
+    fromConvoId: 'parent-convo', targetDeviceId: targetDev.deviceId,
+    workdir: '/w', task: 'x', topic: '',
+  })
+  mk('discard-1')
+  assert.equal(discardSpawnRequest(s.db, 'discard-1'), true)
+  assert.equal(getSpawn(s.db, 'discard-1'), undefined)
+  // An answered (claimed) row is out of discard's reach — state-scoped.
+  mk('discard-2')
+  assert.ok(claimApprove(s.db, 'discard-2'))
+  assert.equal(discardSpawnRequest(s.db, 'discard-2'), false)
+  assert.equal(getSpawn(s.db, 'discard-2').state, 'approved')
+})
+
+test('spawn_targets is single-flight per connection: a concurrent second ask is refused conflict', async (t) => {
+  // Short folder timeout so the first fan-out (target never answers
+  // recent_folders) resolves quickly after proving the overlap.
+  const { parent } = await spawnFleet(t, { serverOpts: { spawnFoldersTimeoutMs: 500 } })
+  parent.send({ op: 'spawn_targets', request_id: 'sf-1' })
+  parent.send({ op: 'spawn_targets', request_id: 'sf-2' })
+  const err = await parent.waitFor((f) => f.kind === 'control' && f.op === 'error', 5000)
+  assert.equal(err.code, 'conflict')
+  const first = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets', 5000)
+  assert.equal(first.request_id, 'sf-1')
+  // The guard clears once the fan-out settles — a fresh ask goes through.
+  parent.send({ op: 'spawn_targets', request_id: 'sf-3' })
+  const third = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets' && f.request_id === 'sf-3', 5000)
+  assert.ok(third)
 })
