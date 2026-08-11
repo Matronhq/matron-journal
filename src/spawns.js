@@ -53,6 +53,34 @@ export function markFailed(db, id, now = Date.now()) {
   ).run(now, id).changes > 0
 }
 
+// Durable outcome + ephemeral frame, in that order — the settlement
+// reporter every terminal transition routes through. The append is
+// best-effort: from_convo_id may point at a conversation deleted since the
+// ask was parked (append() throws on a missing/foreign conversation), and
+// telling the parent is the one thing this tail cannot skip — so a failed
+// append is logged and the frame still goes out. Exactly-once emission
+// stays the CALLER's job (the state-scoped UPDATEs): by the time this
+// runs, the caller has already won the transition. Agent-visible on
+// purpose (not in isClientOnlyEvent): the parent owns from_convo_id, so
+// replay hands it the outcome durably — the fix for the at-most-once
+// delivery gap protocol.md used to document.
+export function emitSpawnOutcome(db, hub, { userId, fromDeviceId, fromConvoId, requestId, outcome, roomId, childConvoId, errorCode }) {
+  const extras = {
+    ...(roomId ? { room_id: roomId } : {}),
+    ...(childConvoId ? { child_convo_id: childConvoId } : {}),
+    ...(errorCode ? { error_code: errorCode } : {}),
+  }
+  try {
+    appendAndBroadcast(db, hub, {
+      userId, convoId: fromConvoId, sender: 'journal', type: 'spawn_outcome',
+      payload: { request_id: requestId, outcome, ...extras },
+    })
+  } catch (err) {
+    console.error('emitSpawnOutcome: durable outcome append failed', err)
+  }
+  hub.sendToDevice(userId, fromDeviceId, { kind: 'spawn', event: 'outcome', request_id: requestId, outcome, ...extras })
+}
+
 // Sweep-driven 24h TTL, mirroring participants.expireAwaiting: flip stale
 // parked rows and report them so the sweep can tell each parent its ask
 // timed out. RETURNING keeps flip-and-report atomic. user_id/from_device_id
@@ -76,9 +104,11 @@ export function expireSpawns(db, ttlMs, now = Date.now()) {
 // legitimately in flight. State-scoped like expireSpawns above: RETURNING
 // keeps flip-and-report atomic, and the WHERE state='approved' guarantees a
 // row a live orchestration just resolved (started/failed) is never touched.
+// user_id/from_device_id/room_id/from_convo_id ride along so the caller
+// needs no per-row lookups.
 export function expireApproved(db, ttlMs, now = Date.now()) {
   return db.prepare(
-    "UPDATE agent_spawn_requests SET state='failed', resolved_at=? WHERE state='approved' AND answered_at<=? RETURNING id, user_id, from_device_id, room_id"
+    "UPDATE agent_spawn_requests SET state='failed', resolved_at=? WHERE state='approved' AND answered_at<=? RETURNING id, user_id, from_device_id, room_id, from_convo_id"
   ).all(now, now - ttlMs)
 }
 
@@ -152,9 +182,7 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
     } catch (err) {
       console.error('approveSpawn: epitaph write failed (room likely never created)', err)
     }
-    hub.sendToDevice(row.user_id, row.from_device_id, {
-      kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'failed', error_code: safeCode,
-    })
+    emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'failed', errorCode: safeCode })
     return 'failed'
   }
   try {
@@ -201,10 +229,7 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
         console.error('approveSpawn: start reply arrived after the row was already resolved — outcome frame suppressed')
         return 'failed'
       }
-      hub.sendToDevice(row.user_id, row.from_device_id, {
-        kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'started',
-        room_id: roomId, child_convo_id: r.result.convo_id,
-      })
+      emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'started', roomId, childConvoId: r.result.convo_id })
       return 'started'
     }
     return fail(r.ok ? 'bad_start_reply' : (r.error?.code ?? 'unknown'))

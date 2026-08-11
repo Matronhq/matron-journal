@@ -53,6 +53,10 @@ test('a spoofed reply from a different agent device falls through to not_found',
 
 const isSpawnCard = (f) => f.kind === 'journal' && f.type === 'permission_request' && f.payload?.kind === 'agent_spawn'
 
+// Shared predicate for the new durable event.
+const isOutcomeEvent = (f, spawnId) => f.kind === 'journal' && f.type === 'spawn_outcome'
+  && f.payload?.request_id === spawnId
+
 test('spawn_request parks a row, publishes a client-only card into the parent convo, acks pending', async (t) => {
   const { s, parentDev, targetDev, parent, target, client } = await spawnFleet(t)
   parent.send({
@@ -524,6 +528,103 @@ test('restart after the room exists: the sweep finds the persisted linkage and w
   const epitaph = s.db.prepare("SELECT payload FROM events WHERE convo_id=? AND type='text' AND sender='journal'").all(roomId)
     .map((e) => JSON.parse(e.payload))
   assert.ok(epitaph.some((p) => p.body.includes('orphaned')))
+})
+
+// Durable spawn_outcome events (spec: 2026-08-11 spawn outcome events) — a
+// journal event alongside the ephemeral {kind:'spawn',event:'outcome'}
+// frame every terminal transition already sends. Each case below re-drives
+// one of the five call sites and asserts BOTH: the ephemeral frame still
+// arrives at the parent agent (additive, not a replacement) AND the durable
+// event lands in the parent convo — visible to the client (owns dan's
+// conversations) and, since spawn_outcome is agent-visible, to the parent
+// agent itself (it owns parent-convo).
+
+test('started: the durable spawn_outcome event carries room+child ids and no error_code, and reaches both client and parent agent', async (t) => {
+  const { s, clientToken, parent, target, client, spawnId } = await parkedSpawn(t)
+  const bridgeTurn = target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start').then((req) => {
+    target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { convo_id: 'child-convo-9' } })
+    return req.request.params.room_id
+  })
+  const r = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } })
+  assert.equal(r.status, 200)
+  const roomId = await bridgeTurn
+  // ephemeral frame is additive, still arrives
+  const ephemeral = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
+  assert.equal(ephemeral.outcome, 'started')
+  // durable event reaches the client
+  const clientEvt = await client.waitFor((f) => isOutcomeEvent(f, spawnId))
+  assert.equal(clientEvt.convo_id, 'parent-convo')
+  assert.equal(clientEvt.payload.outcome, 'started')
+  assert.equal(clientEvt.payload.room_id, roomId)
+  assert.equal(clientEvt.payload.child_convo_id, 'child-convo-9')
+  assert.deepEqual(Object.keys(clientEvt.payload).sort(), ['child_convo_id', 'outcome', 'request_id', 'room_id'])
+  // durable event ALSO reaches the parent agent live — it owns parent-convo,
+  // and spawn_outcome is deliberately not client-only.
+  const parentEvt = await parent.waitFor((f) => isOutcomeEvent(f, spawnId))
+  assert.equal(parentEvt.payload.outcome, 'started')
+})
+
+test('declined: the durable spawn_outcome event carries only outcome+request_id', async (t) => {
+  const { s, clientToken, parent, client, spawnId } = await parkedSpawn(t)
+  const r = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'deny' } })
+  assert.equal(r.status, 200)
+  const ephemeral = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
+  assert.equal(ephemeral.outcome, 'declined')
+  const clientEvt = await client.waitFor((f) => isOutcomeEvent(f, spawnId))
+  assert.equal(clientEvt.payload.outcome, 'declined')
+  assert.deepEqual(Object.keys(clientEvt.payload).sort(), ['outcome', 'request_id'])
+  const parentEvt = await parent.waitFor((f) => isOutcomeEvent(f, spawnId))
+  assert.equal(parentEvt.payload.outcome, 'declined')
+})
+
+test('failed: a bridge start-rpc error produces a durable spawn_outcome event with error_code', async (t) => {
+  const { s, clientToken, parent, target, client, spawnId } = await parkedSpawn(t)
+  target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start').then((req) => {
+    target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: false, error: { code: 'bad_thing' } })
+  })
+  const r = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } })
+  assert.equal(r.status, 200)
+  const ephemeral = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome', 5000)
+  assert.equal(ephemeral.outcome, 'failed')
+  const clientEvt = await client.waitFor((f) => isOutcomeEvent(f, spawnId))
+  assert.equal(clientEvt.payload.outcome, 'failed')
+  assert.equal(clientEvt.payload.error_code, 'bad_thing')
+  assert.deepEqual(Object.keys(clientEvt.payload).sort(), ['error_code', 'outcome', 'request_id'])
+  const parentEvt = await parent.waitFor((f) => isOutcomeEvent(f, spawnId))
+  assert.equal(parentEvt.payload.outcome, 'failed')
+})
+
+test('expired: the sweep journals a durable spawn_outcome event with no extra keys', async (t) => {
+  const { s, parent, client, spawnId } = await parkedSpawn(t, { serverOpts: { revocationSweepMs: 100 } })
+  s.db.prepare('UPDATE agent_spawn_requests SET created_at = created_at - (25*60*60*1000) WHERE id=?').run(spawnId)
+  const ephemeral = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome', 5000)
+  assert.equal(ephemeral.outcome, 'expired')
+  const clientEvt = await client.waitFor((f) => isOutcomeEvent(f, spawnId))
+  assert.equal(clientEvt.payload.outcome, 'expired')
+  assert.deepEqual(Object.keys(clientEvt.payload).sort(), ['outcome', 'request_id'])
+  const parentEvt = await parent.waitFor((f) => isOutcomeEvent(f, spawnId))
+  assert.equal(parentEvt.payload.outcome, 'expired')
+})
+
+test('orphaned: the stranded-approved sweep journals a durable spawn_outcome event with error_code orphaned', async (t) => {
+  const { s, dan, parentDev, targetDev, parent, client } = await spawnFleet(t, { serverOpts: { revocationSweepMs: 100 } })
+  const spawnId = 'orphan-durable-1'
+  createSpawnRequest(s.db, {
+    id: spawnId, userId: dan.id, fromDeviceId: parentDev.deviceId,
+    fromConvoId: 'parent-convo', targetDeviceId: targetDev.deviceId,
+    workdir: '/w', task: 'do it', topic: 'job',
+  })
+  assert.ok(claimApprove(s.db, spawnId))
+  s.db.prepare('UPDATE agent_spawn_requests SET answered_at = answered_at - (6*60*1000) WHERE id=?').run(spawnId)
+  const ephemeral = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome', 5000)
+  assert.equal(ephemeral.outcome, 'failed')
+  assert.equal(ephemeral.error_code, 'orphaned')
+  const clientEvt = await client.waitFor((f) => isOutcomeEvent(f, spawnId))
+  assert.equal(clientEvt.payload.outcome, 'failed')
+  assert.equal(clientEvt.payload.error_code, 'orphaned')
+  assert.deepEqual(Object.keys(clientEvt.payload).sort(), ['error_code', 'outcome', 'request_id'])
+  const parentEvt = await parent.waitFor((f) => isOutcomeEvent(f, spawnId))
+  assert.equal(parentEvt.payload.outcome, 'failed')
 })
 
 test('discardSpawnRequest removes only unanswered rows', async (t) => {
