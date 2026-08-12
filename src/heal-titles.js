@@ -10,32 +10,88 @@
 // by the apps) rather than text, and bridges no longer bake it in. This
 // heals what is already stored.
 //
-// Deliberately conservative: the label is capped at 12 non-space chars, the
-// fallback fragment must be exactly two alphanumerics, and the seed form
-// only strips when what follows is a single space-free token. `Fix: parser
-// bug` and `TODO: ship the thing` must survive — they are ordinary titles
-// that merely contain a colon.
-const FALLBACK = /^[^\s:]{1,12}:[0-9a-zA-Z]{2}\s+/
-const SEED = /^[^\s:]{1,12}:\s+(\S+)$/
+// SHAPE ALONE IS NOT EVIDENCE. `Q: help`, `2: fix` and `Note: document` all
+// have the seed shape and none of them is a baked prefix. This migration
+// rewrites a live database exactly once (the user_version gate below), so a
+// false positive is unrecoverable data loss, while a false negative leaves a
+// cosmetic `DEV-: ` in a title that the next Gemini title pass refreshes
+// anyway. So every strip has to name a label this database can VOUCH for:
+// the prefix token must equal a SERVER_LABEL derivable from one of the
+// user's own agent-box device names. Unknown token -> no rewrite.
+const LABEL_MAX_CHARS = 12
+// `LABEL` + `:` + exactly two alphanumerics (a UUID or Matrix-localpart
+// fragment) + space — the fallback/Gemini form.
+const FALLBACK = /^([^\s:]{1,12}):[0-9a-zA-Z]{2}\s+/
+// `LABEL` + `: ` + a single space-free token to the end — the workdir seed.
+const SEED = /^([^\s:]{1,12}):\s+(\S+)$/
 
-export function stripServerLabel(title) {
+// The SERVER_LABEL a box with this device name would have produced. The
+// bridge derives it from the hostname (matron-bridge index.js): `dev-3` ->
+// `3`; anything else -> the first four characters, upper-cased. Both
+// candidates are kept because a journal device name is chosen at pairing and
+// only conventionally equals the hostname, and the whole name is kept too
+// for boxes that set SERVER_LABEL explicitly to their own name. Compared
+// case-insensitively: the bridge upper-cases the slice, pairing does not.
+//
+// Candidates that could never appear as a `LABEL:` prefix — empty, longer
+// than the label cap, or containing whitespace or a colon (client names like
+// `Dan Mac`) — are dropped rather than matched loosely.
+export function labelCandidates(name) {
+  if (typeof name !== 'string') return []
+  const trimmed = name.trim()
+  if (!trimmed) return []
+  const numbered = /^\w+-(\d+)/.exec(trimmed)
+  const out = numbered ? [numbered[1]] : []
+  out.push(trimmed.slice(0, 4), trimmed)
+  return [...new Set(out
+    .filter((l) => l && l.length <= LABEL_MAX_CHARS && !/[\s:]/.test(l))
+    .map((l) => l.toLowerCase()))]
+}
+
+// Union of the candidates for a list of device names, ready for
+// stripServerLabel.
+export function labelSet(names) {
+  const set = new Set()
+  for (const n of names) for (const c of labelCandidates(n)) set.add(c)
+  return set
+}
+
+// `labels` is a Set of lower-cased known SERVER_LABELs (see labelSet). No
+// labels means no rewrite — that is the safe direction.
+export function stripServerLabel(title, labels) {
   if (typeof title !== 'string' || !title) return ''
-  if (FALLBACK.test(title)) return title.replace(FALLBACK, '')
+  if (!labels || labels.size === 0) return title
+  const known = (m) => labels.has(m[1].toLowerCase())
+  const fallback = title.match(FALLBACK)
+  if (fallback && known(fallback)) return title.slice(fallback[0].length)
   const seed = title.match(SEED)
-  if (seed) return seed[1]
+  if (seed && known(seed)) return seed[2]
   return title
 }
 
 // Runs once per database, gated on PRAGMA user_version (unused elsewhere in
-// this repo, so version 1 is ours). An ungated re-run would eventually eat
-// an organic title that happens to match, so the gate is the safety
-// property, not an optimisation. `force` is for tests only.
+// this repo, so version 1 is ours). The gate is a belt to the label check's
+// braces: healed titles no longer match, so a re-run is a no-op anyway.
+// `force` is for tests only.
 //
 // Every rewrite is logged: BYOS users run this unattended on their own
 // server and deserve an audit trail of what their titles used to be.
 export function healBakedTitles(db, { log = () => {}, force = false } = {}) {
   if (!force && db.pragma('user_version', { simple: true }) >= 1) return { scanned: 0, healed: 0 }
-  const rows = db.prepare('SELECT id, title FROM conversations').all()
+  // Only agent boxes ever baked a label. Two views of the same names: the
+  // box's own labels, used when a conversation records which box manages it,
+  // and the owner's union for the rows that predate that column.
+  const agents = db.prepare("SELECT id, user_id, name FROM devices WHERE kind='agent'").all()
+  const byDevice = new Map()
+  const byUser = new Map()
+  for (const a of agents) {
+    const labels = new Set(labelCandidates(a.name))
+    byDevice.set(a.id, { userId: a.user_id, labels })
+    let union = byUser.get(a.user_id)
+    if (!union) byUser.set(a.user_id, (union = new Set()))
+    for (const c of labels) union.add(c)
+  }
+  const rows = db.prepare('SELECT id, owner_user_id, title, agent_device_id FROM conversations').all()
   const update = db.prepare('UPDATE conversations SET title=? WHERE id=?')
   let healed = 0
   const run = db.transaction(() => {
@@ -44,7 +100,15 @@ export function healBakedTitles(db, { log = () => {}, force = false } = {}) {
       // rewritten to '' by stripServerLabel's guard — a heal must never
       // erase a title it does not recognise.
       if (typeof row.title !== 'string') continue
-      const next = stripServerLabel(row.title)
+      // The recorded box is the strongest provenance available, so prefer
+      // its labels alone. An id that no longer resolves (the box was
+      // revoked) or belongs to someone else falls back to the owner's union
+      // rather than to nothing: those are still labels this database can
+      // vouch for, and a revoked box is exactly the case with baked titles
+      // left behind.
+      const own = row.agent_device_id == null ? null : byDevice.get(row.agent_device_id)
+      const labels = own && own.userId === row.owner_user_id ? own.labels : byUser.get(row.owner_user_id)
+      const next = stripServerLabel(row.title, labels)
       if (next === row.title) continue
       update.run(next, row.id)
       healed++
