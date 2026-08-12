@@ -380,10 +380,14 @@ an agent token, selected by which query parameter is present:
   waiting for the next `/snapshot`.
 - `device_meta` — `{kind:'device_meta', device_id, name}`, sent to a user's
   **client** sockets when `POST /devices/:id/rename` succeeds. Transient: not
-  a journal event, carries no seq, and is never replayed. A client that
-  misses it learns the new name from the `agents` list in its next
-  `GET /snapshot`. Agent connections never receive it — a box keeps no
-  roster.
+  a journal event, carries no seq, and is never replayed. Recovery for a
+  client that misses one depends on the renamed device's kind, because every
+  kind may be renamed but `/snapshot`'s `agents` list carries only agent
+  boxes: an **agent** rename is picked up from that list on the next
+  `GET /snapshot`; a **client** rename appears only in `GET /devices`, which
+  lists every device kind, so a client that renders other client devices
+  re-reads the roster there. Agent connections never receive `device_meta` —
+  a box keeps no roster.
 - `convo_upsert` accepts an optional `parent_convo_id` linking a durable child
   conversation to its parent (subagent sub-chats). It is a non-empty string
   (id length cap 128; malformed → `bad_request`), **set once at creation and
@@ -1414,7 +1418,10 @@ trimmed) and then capped at 40 characters — over the cap is rejected with
 name. Not-owned and nonexistent ids are indistinguishable (404), same as
 revoke. Any device kind may be renamed, including the caller's own, and
 duplicate names are allowed (pairing only warns about them). A success fans
-a `device_meta` frame out to the user's client sockets.
+a `device_meta` frame out to the user's client sockets; a client that was
+offline for it re-reads the name from `/snapshot`'s `agents` list (agent
+boxes) or from `GET /devices` (any kind, client devices included) — see
+`device_meta` under "WebSocket" above.
 
 ## Agent pairing (device authorization)
 
