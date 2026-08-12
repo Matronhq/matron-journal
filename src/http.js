@@ -9,6 +9,7 @@ import { listAwaiting, answerParkedInvite, getParticipant } from './participants
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
+import { getSpawn, denySpawn, claimApprove, approveSpawn } from './spawns.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
 // card's `from_name` gets. NULL stays null rather than collapsing to '' —
@@ -92,7 +93,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000 }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -418,6 +419,41 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         deliverPendingInvites(db, hub, { deviceId: isJoin ? room.agent_device_id : target_device_id })
         const delivered = getParticipant(db, room_id, target_device_id)?.delivered_at != null
         return json(res, 200, { ok: true, delivered })
+      }
+      if (req.method === 'POST' && url.pathname === '/agent-spawn/answer') {
+        // Client-gated: an agent must never answer a consent ask, including
+        // one addressed to itself — the whole point of parking is that only
+        // the human decides. Same stance as /agent-chat/answer.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const body = await readBody(req)
+        const { request_id, decision } = body
+        if (decision !== 'approve' && decision !== 'deny') return json(res, 400, { error: 'bad_request' })
+        if (typeof request_id !== 'string' || !request_id) return json(res, 400, { error: 'bad_request' })
+        // No standing consent exists for spawns and never has — but reject
+        // the field rather than ignore it, exactly as /agent-chat/answer
+        // does: a caller that believes it granted something must be told.
+        if ('always_allow' in body) return json(res, 400, { error: 'bad_request' })
+        const row = getSpawn(db, request_id)
+        // Unknown id and another user's row are indistinguishable.
+        if (!row || row.user_id !== who.userId) return json(res, 404, { error: 'not_found' })
+        if (decision === 'deny') {
+          if (!denySpawn(db, request_id)) return json(res, 409, { error: 'conflict' })
+          // Reported plainly (spec: no peer to hide behind) — 'declined',
+          // never a fabricated box-side failure.
+          hub.sendToDevice(who.userId, row.from_device_id, { kind: 'spawn', event: 'outcome', request_id, outcome: 'declined' })
+          return json(res, 200, { ok: true })
+        }
+        // The tap CLAIMS the row; a zero row-count means another tap already
+        // won — 409, and nothing expensive has started (spec failure table:
+        // two approve taps spawn once).
+        if (!claimApprove(db, request_id)) return json(res, 409, { error: 'conflict' })
+        // Everything after the claim is expensive and externally visible;
+        // it runs off the request cycle — the app needs its 200 now, the
+        // outcome reaches the parent as a turn. Errors are contained: the
+        // broker timeout guarantees approveSpawn itself always settles.
+        approveSpawn({ db, hub, broker, startTimeoutMs: spawnStartTimeoutMs }, getSpawn(db, request_id))
+          .catch((err) => console.error('agent-spawn approve orchestration failed', err))
+        return json(res, 200, { ok: true })
       }
       if (req.method === 'GET' && url.pathname === '/search') {
         // User-scoped full-text search (spec: agent journal search). Open to

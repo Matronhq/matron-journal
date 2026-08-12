@@ -57,6 +57,14 @@ export function parkInvite(db, { convoId, agentDeviceId, initiatorDeviceId, just
   return upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state: 'awaiting_user', justification, topic, targetConvoId })
 }
 
+// A direct joined row, no invite round-trip — the spawn approval path
+// (spec: "records both agents as joined; approving the spawn approved the
+// pair"). The room owner is recorded on conversations.agent_device_id as
+// everywhere else, so only the NON-owner participant gets a row here.
+export function recordJoined(db, { convoId, agentDeviceId, initiatorDeviceId }) {
+  return upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state: 'joined', justification: '', topic: '' })
+}
+
 // Resolves a parked row per the user's decision. Approve restarts
 // created_at (the 30-minute answer-from-target clock has not started yet —
 // delivered_at stays NULL until markDelivered fires) and clears answered_at
