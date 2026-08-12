@@ -4,12 +4,18 @@ import { openDb } from '../src/db.js'
 import { labelCandidates, labelSet, stripServerLabel, healBakedTitles } from '../src/heal-titles.js'
 
 test('labelCandidates mirrors the bridge SERVER_LABEL derivation', () => {
-  // hostname `dev-3` -> `3`; anything else -> first four chars, upper-cased
-  // (compared lower-cased here). The whole name rides along for boxes that
-  // set SERVER_LABEL explicitly.
+  // `hostname.match(/^(\w+)-(\d+)/)` -> the digits; otherwise the first four
+  // chars, upper-cased (compared lower-cased here). The whole name rides
+  // along for boxes that set SERVER_LABEL explicitly.
   assert.deepEqual(labelCandidates('dev-2'), ['2', 'dev-', 'dev-2'])
   assert.deepEqual(labelCandidates('dev-y'), ['dev-', 'dev-y'])
   assert.deepEqual(labelCandidates('mac'), ['mac'])
+  // The numbered branch is ANY word, not `dev-`: the bridge's own line
+  // comment says "dev-3" but its regex does not, and a box named `build-7`
+  // really does label itself `7`. Dropping that candidate would not be the
+  // conservative choice, it would be wrong about a real bridge.
+  assert.deepEqual(labelCandidates('build-7'), ['7', 'buil', 'build-7'])
+  assert.deepEqual(labelCandidates('dev-12'), ['12', 'dev-', 'dev-12'])
   // a name that could never appear as a `LABEL:` prefix yields nothing
   assert.deepEqual(labelCandidates('Dan Mac'), [])
   assert.deepEqual(labelCandidates('   '), [])

@@ -25,13 +25,31 @@ const FALLBACK = /^([^\s:]{1,12}):[0-9a-zA-Z]{2}\s+/
 // `LABEL` + `: ` + a single space-free token to the end — the workdir seed.
 const SEED = /^([^\s:]{1,12}):\s+(\S+)$/
 
-// The SERVER_LABEL a box with this device name would have produced. The
-// bridge derives it from the hostname (matron-bridge index.js): `dev-3` ->
-// `3`; anything else -> the first four characters, upper-cased. Both
-// candidates are kept because a journal device name is chosen at pairing and
-// only conventionally equals the hostname, and the whole name is kept too
-// for boxes that set SERVER_LABEL explicitly to their own name. Compared
-// case-insensitively: the bridge upper-cases the slice, pairing does not.
+// The SERVER_LABEL a box with this device name would have produced,
+// reproducing the bridge's derivation verbatim (matron-bridge index.js, the
+// `const SERVER_LABEL = process.env.SERVER_LABEL || (() => {...})()` IIFE):
+//
+//   const match = hostname.match(/^(\w+)-(\d+)/)
+//   if (match) return match[2]                  // just the number
+//   return hostname.slice(0, 4).toUpperCase()
+//
+// The numbered branch is `\w+-\d+` — ANY word, not `dev-` specifically,
+// whatever the line comment above it in the bridge says. A box named
+// `build-7` genuinely labels itself `7`, so `7` has to be a candidate for
+// that box or its titles never heal. Narrowing this to `dev-` would not be
+// the conservative choice; it would just be wrong about a real bridge.
+//
+// Where the two sides genuinely cannot be made to agree, this errs toward
+// producing NO usable candidate, which means no strip:
+//   - the bridge slices the HOSTNAME, and a journal device name is chosen at
+//     pairing and only conventionally equals it. Both the four-char slice and
+//     the whole name are offered; if the operator named the device something
+//     unrelated to the hostname, neither matches and nothing is stripped.
+//   - an explicit `SERVER_LABEL=` in the box's environment is unknowable from
+//     here. The whole-name candidate covers the common case of setting it to
+//     the box's own name; any other value simply never heals.
+// Comparison is case-insensitive: the bridge upper-cases its slice, pairing
+// does not.
 //
 // Candidates that could never appear as a `LABEL:` prefix — empty, longer
 // than the label cap, or containing whitespace or a colon (client names like
