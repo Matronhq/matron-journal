@@ -536,3 +536,25 @@ test('GET /roster works for client tokens too and requires auth', async (t) => {
   const anon = await s.http('/roster')
   assert.equal(anon.status, 401)
 })
+
+test('GET /snapshot exposes each convo agent_device_id and the agents id->name list', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'hunter22')
+  const agent = createAgent(s.db, dan.id, 'dev-y')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'hunter22', device_name: 'mac' } })
+
+  s.db.prepare('INSERT INTO conversations(id, owner_user_id, title, created_at, agent_device_id) VALUES(?,?,?,?,?)')
+    .run('c-owned', dan.id, 'Fix the parser', Date.now(), agent.deviceId)
+  s.db.prepare('INSERT INTO conversations(id, owner_user_id, title, created_at) VALUES(?,?,?,?)')
+    .run('c-orphan', dan.id, 'No box yet', Date.now())
+
+  const r = await s.http('/snapshot', { token: login.json.token })
+  assert.equal(r.status, 200)
+  const owned = r.json.conversations.find((c) => c.id === 'c-owned')
+  const orphan = r.json.conversations.find((c) => c.id === 'c-orphan')
+  assert.equal(owned.agent_device_id, agent.deviceId)
+  assert.equal(orphan.agent_device_id, null)
+  // agents: agent devices only — the client device is not a box
+  assert.deepEqual(r.json.agents, [{ device_id: agent.deviceId, name: 'dev-y' }])
+})

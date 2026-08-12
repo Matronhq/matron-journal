@@ -1,5 +1,6 @@
 import { authorize } from './auth.js'
 import { indexableBody } from './search.js'
+import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { joinedAgentIds } from './participants.js'
 
 export const MESSAGE_TYPES = [
@@ -231,7 +232,7 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   const conversations = db.prepare(
     `SELECT id, title, session_state, session_outcome, last_seq, unread_count,
             ${omitSnippet ? 'NULL' : 'snippet'} AS snippet,
-            parent_convo_id, summary, created_at,
+            parent_convo_id, summary, created_at, agent_device_id,
             (SELECT ts FROM events e WHERE e.convo_id = conversations.id
              ORDER BY e.seq DESC LIMIT 1) AS last_ts
      FROM conversations WHERE owner_user_id=?${excludePrivateOwned
@@ -240,8 +241,23 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
        : ''}
      ORDER BY last_seq DESC`
   ).all(userId)
+  // id -> name for the user's agent boxes, so a client can render the
+  // owning box of each conversation without a second round-trip. Same
+  // privacy predicate as the conversation filter above: a filtered
+  // (ordinary agent) caller must not learn private boxes exist. Client
+  // devices are deliberately absent — they are not boxes.
+  // Names go out through the same sieve /devices uses: pairing predates the
+  // rename endpoint's validation, so a stored name can still carry newlines
+  // or control characters.
+  const agents = db.prepare(
+    `SELECT id AS device_id, name FROM devices
+     WHERE user_id=? AND kind='agent'${excludePrivateOwned ? ' AND private=0' : ''} ORDER BY id`
+  ).all(userId).map((a) => ({
+    device_id: a.device_id,
+    name: a.name == null ? null : sanitizePeerText(a.name, PEER_NAME_CAP),
+  }))
   const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)
-  return { conversations, seq: head ? head.seq : 0 }
+  return { conversations, agents, seq: head ? head.seq : 0 }
 }
 
 export function eventsAfter(db, userId, cursor, limit = 500) {
