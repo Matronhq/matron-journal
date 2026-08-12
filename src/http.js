@@ -504,11 +504,20 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         if (!clean || clean.length > DEVICE_NAME_MAX) return json(res, 400, { error: 'bad_request' })
         const renamedId = Number(rn[1])
         if (!renameOwnedDevice(db, who.userId, renamedId, clean)) return json(res, 404, { error: 'not_found' })
-        // Live roster patch for the user's other apps. Transient (not a
-        // journal event): a device name is not conversation history, and a
-        // client that was offline picks the new name up from its next
-        // /snapshot `agents` list. Clients only — an agent keeps no roster.
         for (const c of hub.connsOf(who.userId)) {
+          // A live socket carries the device name it authenticated with
+          // (ws.js hello: `conn = { ws, ...who }`), and everything that
+          // names the producing device reads it from there — journal
+          // `sender` strings (`agent:dev-2`), and the `from_name` baked into
+          // an agent-chat/agent-spawn consent card. Leave it and a connected
+          // bridge keeps minting the pre-rename name until it reconnects,
+          // which for a long-lived box is days. Patch the connection, not
+          // just the row.
+          if (c.deviceId === renamedId) c.name = clean
+          // Live roster patch for the user's other apps. Transient (not a
+          // journal event): a device name is not conversation history, and a
+          // client that was offline picks the new name up from its next
+          // /snapshot `agents` list. Clients only — an agent keeps no roster.
           if (c.kind === 'client' && c.ws.readyState === 1) {
             c.ws.send(JSON.stringify({ kind: 'device_meta', device_id: renamedId, name: clean }))
           }

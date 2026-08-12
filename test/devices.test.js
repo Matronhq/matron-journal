@@ -191,3 +191,46 @@ test('rename fans out device_meta to client sockets only', async (t) => {
   assert.equal(box.frames.filter((f) => f.kind === 'device_meta').length, 0)
   assert.equal(stranger.frames.filter((f) => f.kind === 'device_meta').length, 0)
 })
+
+test('rename patches the live socket, so a connected box mints the new name at once', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'hunter22')
+  const agent = createAgent(s.db, dan.id, 'dev-9')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'hunter22', device_name: 'mac' } })
+
+  // the box connects BEFORE the rename and never reconnects — the whole
+  // point: a real bridge holds one socket open for days
+  const box = await makeWsClient(s.base, { token: agent.token, cursor: 0 })
+  t.after(() => box.close())
+  await box.waitFor((f) => f.op === 'hello_ok')
+  box.send({ op: 'convo_upsert', convo_id: 's1', title: 'before' })
+  const first = await box.waitFor((f) => f.kind === 'journal' && f.type === 'convo_meta')
+  assert.equal(first.sender, 'agent:dev-9')
+
+  const r = await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', token: login.json.token, body: { name: 'dev-y' } })
+  assert.equal(r.status, 200)
+
+  // same socket, next event: the sender follows the rename immediately
+  box.send({ op: 'convo_upsert', convo_id: 's1', title: 'after' })
+  const second = await box.waitFor((f) => f.kind === 'journal' && f.type === 'convo_meta' && f.payload.title === 'after')
+  assert.equal(second.sender, 'agent:dev-y')
+  assert.equal(s.db.prepare("SELECT sender FROM events WHERE type='convo_meta' ORDER BY seq DESC LIMIT 1").get().sender,
+    'agent:dev-y')
+
+  // and the consent card a live box mints carries the new name too
+  const peer = createAgent(s.db, dan.id, 'dev-8')
+  const peerWs = await makeWsClient(s.base, { token: peer.token, cursor: 0 })
+  t.after(() => peerWs.close())
+  await peerWs.waitFor((f) => f.op === 'hello_ok')
+  const client = await makeWsClient(s.base, { token: login.json.token, cursor: 0 })
+  t.after(() => client.close())
+  await client.waitFor((f) => f.op === 'hello_ok')
+  box.send({
+    op: 'agent_invite', room_id: 's1', target_device_id: peer.deviceId,
+    justification: 'need a hand', topic: 'x',
+  })
+  const card = await client.waitFor((f) => f.kind === 'journal' && f.type === 'permission_request')
+  assert.equal(card.payload.from_name, 'dev-y')
+  assert.equal(card.sender, 'agent:dev-y')
+})

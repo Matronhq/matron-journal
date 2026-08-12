@@ -1423,6 +1423,13 @@ offline for it re-reads the name from `/snapshot`'s `agents` list (agent
 boxes) or from `GET /devices` (any kind, client devices included) — see
 `device_meta` under "WebSocket" above.
 
+A rename takes effect on the renamed device's own **live** WebSocket too, not
+just from its next connection: every event that names the producing device —
+journal `sender` strings (`agent:dev-2`) and the `from_name` in an
+agent-chat/agent-spawn consent card — carries the new name from the next op
+onwards. Already-journaled events keep the name they were written with;
+`sender` is history, not a live reference.
+
 ## Agent pairing (device authorization)
 
 `gh auth login`-style enrollment for headless boxes (spec:
