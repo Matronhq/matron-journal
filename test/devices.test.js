@@ -131,9 +131,12 @@ test('POST /devices/:id/rename: renames, sanitises, caps, owner-scoped, client-g
   assert.equal(dirty.status, 200)
   assert.equal(dirty.json.device.name, 'dev y')
 
-  // duplicate names are allowed (pairing only warns)
-  const dup = await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', token, body: { name: 'dan-mac' } })
+  // duplicate names are allowed (pairing only warns) — 'Dan Mac' is exactly
+  // the client device's current name, set above, so this is a real collision
+  const dup = await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', token, body: { name: 'Dan Mac' } })
   assert.equal(dup.status, 200)
+  const collided = await s.http('/devices', { token })
+  assert.equal(collided.json.devices.filter((d) => d.name === 'Dan Mac').length, 2)
 
   // empty / whitespace-only / non-string / >40 chars -> 400
   for (const name of ['', '   ', 42, null, undefined, 'x'.repeat(41)]) {
