@@ -108,24 +108,26 @@ export const DEFAULT_MEDIA_REAP_LOW_PCT = 70
 // entry) must all turn the reaper off with one warn line, never run it
 // with surprise thresholds. Returns { highPct, lowPct } or null.
 export function resolveReapPcts({ mediaReapHighPct, mediaReapLowPct } = {}) {
-  const resolveOne = (override, envName, defaultValue) => {
+  const resolveOne = (override, envName, optName, defaultValue) => {
     const fromEnv = override === undefined
     const raw = fromEnv ? process.env[envName] : override
     if (raw === undefined) return defaultValue
-    const name = fromEnv ? envName : envName.replace('MATRON_', '').toLowerCase()
+    const name = fromEnv ? envName : optName
     const n = Number(raw)
     if (!Number.isInteger(n) || n < 0 || n > 100) {
       console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid — media reaper disabled`)
       return null
     }
     if (n === 0) {
-      console.warn(`retention: ${name}=0 — media reaper disabled`)
+      // JSON.stringify(raw), not `0`: Number('') is 0, so an empty env
+      // assignment lands here too and "=0" would misdirect the diagnosis.
+      console.warn(`retention: ${name}=${JSON.stringify(raw)} resolves to 0 — media reaper disabled`)
       return null
     }
     return n
   }
-  const highPct = resolveOne(mediaReapHighPct, 'MATRON_MEDIA_REAP_HIGH_PCT', DEFAULT_MEDIA_REAP_HIGH_PCT)
-  const lowPct = resolveOne(mediaReapLowPct, 'MATRON_MEDIA_REAP_LOW_PCT', DEFAULT_MEDIA_REAP_LOW_PCT)
+  const highPct = resolveOne(mediaReapHighPct, 'MATRON_MEDIA_REAP_HIGH_PCT', 'mediaReapHighPct', DEFAULT_MEDIA_REAP_HIGH_PCT)
+  const lowPct = resolveOne(mediaReapLowPct, 'MATRON_MEDIA_REAP_LOW_PCT', 'mediaReapLowPct', DEFAULT_MEDIA_REAP_LOW_PCT)
   if (highPct === null || lowPct === null) return null
   if (lowPct >= highPct) {
     console.warn(`retention: media reap low-water ${lowPct}% >= high-water ${highPct}% — media reaper disabled`)

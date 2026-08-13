@@ -470,45 +470,142 @@ test('runReapMedia reaps oldest attachments down to the low-water mark, tombston
   assert.deepEqual(again, { reaped: 0, bytesFreed: 0 }, 'second run under the high-water mark must be a no-op')
 })
 
-test('runReapMedia never touches tool_output blobs, even when they are the oldest and pressure remains', async () => {
-  const { db, dan } = await setup()
-  const mediaDir = tmpMediaDir()
-  // Offloaded tool_output blob (oldest, 800 bytes) + one attachment (300).
-  // used = 1100 >= 900 high water. Only the attachment is a candidate; after
-  // reaping it, used (800) is still above the 700 target but the pass must
-  // stop rather than eat the tool_output blob.
-  const toolBlob = writeBlobSync(mediaDir, Buffer.alloc(800, 2))
+// Shared setup for the tool_output-vs-attachment tests: an offloaded
+// tool_output blob of `toolBytes` plus attachments.
+function seedToolBlob(db, mediaDir, { userId, bytes, daysAgo }) {
+  const toolBlob = writeBlobSync(mediaDir, Buffer.alloc(bytes, 2))
   insertBlob(db, {
-    id: toolBlob.id, ownerUserId: dan.id, contentType: 'application/json',
+    id: toolBlob.id, ownerUserId: userId, contentType: 'application/json',
     size: toolBlob.size, sha256: toolBlob.sha256, diskPath: toolBlob.diskPath,
   })
-  const tool = append(db, {
-    userId: dan.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output',
+  const r = append(db, {
+    userId, convoId: 'c1', sender: 'agent:a', type: 'tool_output',
     payload: { type: 'tool_output', snippet: 'ran tests', blob_ref: toolBlob.id }, blobRef: toolBlob.id,
   })
-  backdate(db, tool.seq, dan.id, 90)
-  const file = seedAttachment(db, mediaDir, { userId: dan.id, bytes: 300, daysAgo: 5 })
+  backdate(db, r.seq, userId, daysAgo)
+  return { blob: toolBlob, seq: r.seq }
+}
 
-  // Defensive guard: a blob referenced by BOTH an attachment event and a
-  // non-attachment event must never be reaped via the attachment reference.
+test('runReapMedia never reaps a tool_output blob, even when it is the oldest', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  // Tool blob (100, oldest) + two attachments (500 each). used = 1100 >= 900
+  // high water; un-reapable floor is only 100, so reaping proceeds — and must
+  // take the oldest ATTACHMENT, never the older tool blob. One reap gets to
+  // 600 <= 700 target.
+  const tool = seedToolBlob(db, mediaDir, { userId: dan.id, bytes: 100, daysAgo: 90 })
+  const fileA = seedAttachment(db, mediaDir, { userId: dan.id, bytes: 500, daysAgo: 40 })
+  const fileB = seedAttachment(db, mediaDir, { userId: dan.id, bytes: 500, daysAgo: 10 })
+
+  const r = runReapMedia(db, { quotaBytes: 1000 })
+  assert.deepEqual(r, { reaped: 1, bytesFreed: 500 })
+  assert.ok(getBlob(db, tool.blob.id), 'tool_output blob must survive quota pressure')
+  assert.ok(fs.existsSync(tool.blob.diskPath))
+  assert.equal(getBlob(db, fileA.blob.id), undefined, 'oldest attachment must be the one reaped')
+  assert.ok(getBlob(db, fileB.blob.id))
+})
+
+test('runReapMedia refuses to reap when the un-reapable floor alone keeps the user above target', async (t) => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  // Tool blob 800 + attachment 300: used = 1100 >= 900 high water, but the
+  // un-reapable floor (800) already exceeds the 700 target — reaping every
+  // attachment could never reach it. The pass must skip the user with a warn
+  // and delete NOTHING (the old behaviour ground through every attachment,
+  // including brand-new ones, every tick, forever).
+  const tool = seedToolBlob(db, mediaDir, { userId: dan.id, bytes: 800, daysAgo: 90 })
+  const file = seedAttachment(db, mediaDir, { userId: dan.id, bytes: 300, daysAgo: 5 })
+  // An attachment-type event pointing at the tool blob must not make it
+  // reapable either (its tool_output reference wins).
   const mixed = append(db, {
     userId: dan.id, convoId: 'c1', sender: 'user:dan', type: 'file',
-    payload: { blob_ref: toolBlob.id, name: 'weird.json', content_type: 'application/json', size: 800 }, blobRef: toolBlob.id,
+    payload: { blob_ref: tool.blob.id, name: 'weird.json', content_type: 'application/json', size: 800 }, blobRef: tool.blob.id,
   })
   backdate(db, mixed.seq, dan.id, 89)
 
+  const warns = []
+  const mute = t.mock.method(console, 'warn', (...a) => { warns.push(a.join(' ')) })
+  t.after(() => mute.mock.restore())
+
   const r = runReapMedia(db, { quotaBytes: 1000 })
-  assert.deepEqual(r, { reaped: 1, bytesFreed: 300 })
-  assert.ok(getBlob(db, toolBlob.id), 'tool_output blob must survive quota pressure')
-  assert.ok(fs.existsSync(toolBlob.diskPath))
+  assert.deepEqual(r, { reaped: 0, bytesFreed: 0 })
+  assert.ok(getBlob(db, tool.blob.id))
+  assert.ok(getBlob(db, file.blob.id), 'no attachment may be sacrificed to an unreachable target')
+  assert.ok(fs.existsSync(file.blob.diskPath))
+  assert.ok(warns.some((w) => w.includes('un-reapable')), 'skip must be loud')
+
+  // Sustained pressure: the next tick must skip again, not churn.
+  const again = runReapMedia(db, { quotaBytes: 1000 })
+  assert.deepEqual(again, { reaped: 0, bytesFreed: 0 })
+})
+
+test('runReapMedia: a stray blob_ref on a text event does not pin an attachment blob', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  // ws.js passes msg.blob_ref through unvalidated on text sends — a
+  // caption-style text event referencing the attachment's blob must not
+  // exempt that blob from the reaper (only tool_output references pin).
+  const file = seedAttachment(db, mediaDir, { userId: dan.id, bytes: 950, daysAgo: 10 })
+  const textRef = append(db, {
+    userId: dan.id, convoId: 'c1', sender: 'user:dan', type: 'text',
+    payload: { body: 'see attached', blob_ref: file.blob.id }, blobRef: file.blob.id,
+  })
+
+  const r = runReapMedia(db, { quotaBytes: 1000 })
+  assert.deepEqual(r, { reaped: 1, bytesFreed: 950 })
   assert.equal(getBlob(db, file.blob.id), undefined)
+  assert.equal(JSON.parse(db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(dan.id, file.seq).payload).expired, true)
+  // The text event is not an attachment: its payload must be left alone.
+  const textRow = db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(dan.id, textRef.seq)
+  assert.equal(JSON.parse(textRow.payload).expired, undefined)
+})
+
+test("runReapMedia never rewrites another user's event referencing the reaped blob", async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const bev = await createUser(db, 'bev', 'pw')
+  upsertConversation(db, { id: 'cb', ownerUserId: bev.id })
+  const file = seedAttachment(db, mediaDir, { userId: dan.id, bytes: 950, daysAgo: 10 })
+  // Pathological cross-user reference (blob ids are unguessable in practice):
+  // bev's event points at dan's blob. Reaping dan's blob must not touch
+  // bev's payload, and bev's newer event must not influence dan's reap order.
+  const bevs = append(db, {
+    userId: bev.id, convoId: 'cb', sender: 'user:bev', type: 'file',
+    payload: { blob_ref: file.blob.id, name: 'not-mine.pdf', size: 950, note: 'bev private' }, blobRef: file.blob.id,
+  })
+
+  const r = runReapMedia(db, { quotaBytes: 1000 })
+  assert.deepEqual(r, { reaped: 1, bytesFreed: 950 })
+  assert.equal(getBlob(db, file.blob.id), undefined)
+  const bevRow = db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(bev.id, bevs.seq)
+  const bevPayload = JSON.parse(bevRow.payload)
+  assert.equal(bevPayload.expired, undefined, "another user's event must never be tombstoned")
+  assert.equal(bevPayload.note, 'bev private')
+})
+
+test('runReapMedia skips loudly on an invalid quota instead of selecting everything', async (t) => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const file = seedAttachment(db, mediaDir, { userId: dan.id, bytes: 950, daysAgo: 10 })
+  const mute = t.mock.method(console, 'warn', () => {})
+  t.after(() => mute.mock.restore())
+  // quotaBytes 0 would make high = target = 0: every user selected and the
+  // stop condition unreachable — must refuse up front.
+  for (const bad of [0, -5, undefined, NaN, 'lots']) {
+    const r = runReapMedia(db, { quotaBytes: bad })
+    assert.deepEqual(r, { reaped: 0, bytesFreed: 0 }, `quotaBytes=${bad} must be a loud no-op`)
+  }
+  assert.ok(getBlob(db, file.blob.id))
 })
 
 test('runReapMedia skips orphan blobs (uploaded but not yet attached to an event)', async () => {
   const { db, dan } = await setup()
   const mediaDir = tmpMediaDir()
   // An upload sits orphaned between POST /media and the ws send that attaches
-  // it — reaping it would corrupt an in-flight attachment.
+  // it — reaping it would corrupt an in-flight attachment. Today the
+  // exclusion is structural (candidates join through events), so this test
+  // is a regression tripwire for any rewrite that scans the blobs table
+  // directly.
   const orphan = writeBlobSync(mediaDir, Buffer.alloc(600, 3))
   insertBlob(db, {
     id: orphan.id, ownerUserId: dan.id, contentType: 'image/png',
@@ -582,6 +679,7 @@ test('resolveReapPcts: defaults, overrides, disable-on-zero, fail-closed on garb
   assert.deepEqual(resolveReapPcts({ mediaReapHighPct: 95, mediaReapLowPct: 50 }), { highPct: 95, lowPct: 50 })
   assert.equal(resolveReapPcts({ mediaReapHighPct: 0 }), null, '0 must disable the reaper')
   assert.equal(resolveReapPcts({ mediaReapHighPct: 'lots' }), null, 'garbage must disable, never delete data')
+  assert.equal(resolveReapPcts({ mediaReapLowPct: 'some' }), null, 'garbage LOW must disable too')
   assert.equal(resolveReapPcts({ mediaReapHighPct: 101 }), null, '>100% is invalid')
   assert.equal(resolveReapPcts({ mediaReapHighPct: 60, mediaReapLowPct: 80 }), null, 'low >= high must disable')
 
@@ -589,6 +687,10 @@ test('resolveReapPcts: defaults, overrides, disable-on-zero, fail-closed on garb
   process.env.MATRON_MEDIA_REAP_LOW_PCT = '40'
   assert.deepEqual(resolveReapPcts({}), { highPct: 80, lowPct: 40 })
   assert.deepEqual(resolveReapPcts({ mediaReapHighPct: 95 }), { highPct: 95, lowPct: 40 }, 'override beats env per-knob')
+  process.env.MATRON_MEDIA_REAP_LOW_PCT = 'nonsense'
+  assert.equal(resolveReapPcts({}), null, 'env-sourced garbage must disable')
+  process.env.MATRON_MEDIA_REAP_LOW_PCT = ''
+  assert.equal(resolveReapPcts({}), null, "empty env assignment (Number('') === 0) must disable")
   delete process.env.MATRON_MEDIA_REAP_HIGH_PCT
   delete process.env.MATRON_MEDIA_REAP_LOW_PCT
 })
