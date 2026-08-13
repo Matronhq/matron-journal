@@ -95,6 +95,15 @@ the machine-checkable version of this page.
   `Content-Disposition: attachment` so an uploader-chosen content-type can never
   render as active content on the API origin. Owner-only; missing or not-owned
   are indistinguishable, both 404 `{error:'not_found'}`.
+  A blob may also disappear later via the quota-pressure reaper: once a user's
+  total blob bytes reach `MATRON_MEDIA_REAP_HIGH_PCT` (default 90%) of the
+  quota, the retention scheduler deletes their oldest `file`/`image`
+  attachment blobs (never `tool_output` blobs, never orphan uploads) until the
+  footprint is back under `MATRON_MEDIA_REAP_LOW_PCT` (default 70%). Each
+  reaped event's payload is rewritten in place to a tombstone — the original
+  fields (`name`, `size`, `content_type`, `caption`) with `blob_ref: null` and
+  `expired: true` — so fresh syncs render an "expired" attachment; clients
+  that already hold the event learn from the 404 on `GET /media/:id`.
 - `POST /push/register` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`): `{apns_token, environment}` with `environment` in
   `{'sandbox','prod'}` registers a device for push; `{apns_token: null}`

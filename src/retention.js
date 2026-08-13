@@ -150,3 +150,84 @@ export function runExpireLogs(db, { hours = 24, mediaDir }) {
   }
   return { expired }
 }
+
+// Quota-pressure attachment reaper (third retention pass). Does nothing until
+// a user's total blob footprint reaches highPct% of the per-user quota, then
+// deletes their oldest attachment blobs (file/image events only) until the
+// footprint is back under lowPct%. Age-based reaping was rejected on purpose:
+// the per-chat media browser exists to surface old attachments, so media
+// lives forever unless the disk ceiling is actually threatened.
+//
+// What is never a candidate:
+//   - tool_output blobs (offload/live-log lifecycles own those, above);
+//   - orphan blobs with no referencing event — an upload sits orphaned
+//     between POST /media and the ws send that attaches it, so reaping
+//     orphans would corrupt an in-flight attachment;
+//   - defensively, any blob also referenced by a non-attachment event.
+//
+// Each reaped blob's referencing events are rewritten to a tombstone — the
+// original payload with blob_ref nulled and expired:true, so name/size/
+// caption survive and clients can render "Expired" instead of a dead
+// download. Same per-row transaction + unlink-after-commit stance as
+// runExpireLogs (ENOENT is the expected steady state on a re-run after a
+// crash between commit and unlink).
+//
+// NOTE: clients that already synced an event never re-fetch it, so a live
+// client learns a blob is gone from the 404 on GET /media, not from the
+// tombstone — the tombstone serves fresh syncs and new devices.
+const ATTACHMENT_TYPES = "('image','file')"
+
+export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70 }) {
+  const high = Math.floor(quotaBytes * highPct / 100)
+  const target = Math.floor(quotaBytes * lowPct / 100)
+  const users = db.prepare(
+    'SELECT owner_user_id AS userId, SUM(size) AS bytes FROM blobs GROUP BY owner_user_id HAVING bytes >= ?'
+  ).all(high)
+
+  const candidates = db.prepare(
+    `SELECT e.blob_ref AS blobRef, MIN(e.ts) AS oldestTs, b.size AS size
+     FROM events e JOIN blobs b ON b.id = e.blob_ref
+     WHERE b.owner_user_id = ? AND e.type IN ${ATTACHMENT_TYPES}
+       AND NOT EXISTS (SELECT 1 FROM events x WHERE x.blob_ref = e.blob_ref AND x.type NOT IN ${ATTACHMENT_TYPES})
+     GROUP BY e.blob_ref
+     ORDER BY oldestTs ASC`
+  )
+  const refs = db.prepare(
+    `SELECT user_id, seq, payload FROM events WHERE blob_ref = ? AND type IN ${ATTACHMENT_TYPES}`
+  )
+  const updateEvent = db.prepare('UPDATE events SET payload=?, blob_ref=NULL WHERE user_id=? AND seq=?')
+  const deleteBlobRow = db.prepare('DELETE FROM blobs WHERE id=?')
+
+  let reaped = 0
+  let bytesFreed = 0
+  for (const user of users) {
+    let used = user.bytes
+    for (const cand of candidates.all(user.userId)) {
+      if (used <= target) break
+      const blob = getBlob(db, cand.blobRef)
+      if (!blob) continue
+      db.transaction(() => {
+        for (const ref of refs.all(cand.blobRef)) {
+          let payload
+          try { payload = JSON.parse(ref.payload) } catch { payload = null }
+          const tombstone = {
+            ...(payload && typeof payload === 'object' ? payload : {}),
+            blob_ref: null,
+            expired: true,
+          }
+          updateEvent.run(JSON.stringify(tombstone), ref.user_id, ref.seq)
+        }
+        deleteBlobRow.run(cand.blobRef)
+      })()
+      try {
+        fs.unlinkSync(blob.disk_path)
+      } catch (err) {
+        if (err.code !== 'ENOENT') console.error(`retention: failed to unlink reaped blob ${blob.id} at ${blob.disk_path}`, err)
+      }
+      used -= cand.size
+      bytesFreed += cand.size
+      reaped += 1
+    }
+  }
+  return { reaped, bytesFreed }
+}
