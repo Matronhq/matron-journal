@@ -556,8 +556,13 @@ test('runReapMedia: a stray blob_ref on a text event does not pin an attachment 
   assert.equal(getBlob(db, file.blob.id), undefined)
   assert.equal(JSON.parse(db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(dan.id, file.seq).payload).expired, true)
   // The text event is not an attachment: its payload must be left alone.
-  const textRow = db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(dan.id, textRef.seq)
+  const textRow = db.prepare('SELECT payload, blob_ref FROM events WHERE user_id=? AND seq=?').get(dan.id, textRef.seq)
   assert.equal(JSON.parse(textRow.payload).expired, undefined)
+  // Its blob_ref column intentionally still names the now-deleted blob —
+  // non-attachment refs are left dangling by design (nothing dereferences
+  // them; a resolver would get the same 404 a stale client gets). Pin it so
+  // a future change here is loud.
+  assert.equal(textRow.blob_ref, file.blob.id)
 })
 
 test("runReapMedia never rewrites another user's event referencing the reaped blob", async () => {
