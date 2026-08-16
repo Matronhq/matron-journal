@@ -158,7 +158,10 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
     return 'failed'
   }
   try {
-    const title = row.topic || row.task.slice(0, 80)
+    // Same title convention as bridge-minted agent-chat rooms (🔗 marker +
+    // 2-char room short): a spawn room is a multi-agent room too, and the
+    // chat list should say so the same way.
+    const title = `🔗 [${roomId.slice(0, 2)}] ${row.topic || row.task.slice(0, 80)}`
     // The parent owns the room (conversations.agent_device_id), the target is
     // its joined participant — the same shape an accepted chat invite leaves.
     upsertConversation(db, { id: roomId, ownerUserId: row.user_id, title, sessionState: 'running', agentDeviceId: row.from_device_id })
