@@ -171,8 +171,16 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
     appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'session_status', payload: { state: 'running' } })
     // participants rides the same meta so the spawn room chips both boxes
     // (parent owner + spawned target) the moment it appears (spec:
-    // multi-agent room tags).
-    appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null, participants: participantIds(db, roomId) } })
+    // multi-agent room tags). Best-effort: the row's title and membership
+    // are already committed (upsertConversation/recordJoined above) and
+    // /snapshot serves both, so a failed live fan must log and let the
+    // spawn proceed — not trip the outer catch into reporting a failed
+    // outcome for a room that exists with joined membership.
+    try {
+      appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null, participants: participantIds(db, roomId) } })
+    } catch (err) {
+      console.error('approveSpawn: room meta fan failed (title and membership already committed)', err)
+    }
     // Persist the room linkage NOW, before the `start` RPC — the row is
     // still 'approved', so a restart in the RPC gap leaves the sweep
     // (expireApproved) a room_id to report and write the epitaph into.
