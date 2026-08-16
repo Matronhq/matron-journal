@@ -8,7 +8,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { upsertConversation, appendAndBroadcast, CONVO_ID_MAX_CHARS } from './journal.js'
-import { recordJoined } from './participants.js'
+import { recordJoined, participantIds } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 
 export function createSpawnRequest(db, { id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic = '', now = Date.now() }) {
@@ -166,7 +166,10 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
     // Live clients learn the room exists now, not at their next /snapshot —
     // the same two frames convo_upsert fans for a fresh conversation.
     appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'session_status', payload: { state: 'running' } })
-    appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null } })
+    // participants rides the same meta so the spawn room chips both boxes
+    // (parent owner + spawned target) the moment it appears (spec:
+    // multi-agent room tags).
+    appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null, participants: participantIds(db, roomId) } })
     // Persist the room linkage NOW, before the `start` RPC — the row is
     // still 'approved', so a restart in the RPC gap leaves the sweep
     // (expireApproved) a room_id to report and write the epitaph into.

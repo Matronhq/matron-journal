@@ -3,7 +3,7 @@ import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { applyBridgePrivate, isPrivateDevice } from './db.js'
 import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, CONVO_ID_MAX_CHARS } from './journal.js'
-import { joinedAgentIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
+import { joinedAgentIds, participantIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits } from './spawns.js'
@@ -660,6 +660,23 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
     const row = db.prepare('SELECT parent_convo_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, conn.userId)
     return !!row && row.parent_convo_id != null
   }
+  // Membership convo_meta fan (spec: multi-agent room tags): live clients
+  // re-chip a room the moment its membership changes. Best-effort like every
+  // other post-commit notification in the invite lifecycle — by the time
+  // this runs the membership flip is already committed, so a failing
+  // append/broadcast must log and move on, not surface as {code:'internal'}
+  // (the caller would retry an op that already happened) or strand the peer
+  // notifications that follow it.
+  const fanParticipants = (roomId) => {
+    try {
+      appendAndBroadcast(db, hub, {
+        userId: conn.userId, convoId: roomId, sender: 'journal',
+        type: 'convo_meta', payload: { participants: participantIds(db, roomId) },
+      })
+    } catch (err) {
+      console.error('participants meta fan failed (the membership change itself already committed)', err)
+    }
+  }
   try {
     switch (msg.op) {
       case 'viewing': {
@@ -1176,6 +1193,8 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!answerInvite(db, { convoId: msg.room_id, agentDeviceId: rowDeviceId, accept: msg.accept })) {
           return fail('conflict', 'no pending invite')
         }
+        // Membership grew. Refusals change nothing and fan nothing.
+        if (msg.accept) fanParticipants(msg.room_id)
         hub.sendToDevice(conn.userId, row.initiator_device_id, {
           kind: 'invite', event: 'answer', room_id: msg.room_id,
           peer_device_id: rowDeviceId, accept: msg.accept, from_device_id: conn.deviceId,
@@ -1214,6 +1233,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // takes this branch and stays idempotent.
         if (room.agent_device_id === conn.deviceId && hasParticipants(db, msg.room_id)) {
           const { joined, pending } = leaveAllParticipants(db, msg.room_id)
+          // Membership shrank to the owner alone. Only when someone was
+          // actually joined: a repeat dissolve of an already-empty room must
+          // stay a no-op on the event stream, not append a duplicate meta.
+          if (joined.length > 0) fanParticipants(msg.room_id)
           // Everyone who was actually in the room hears the owner leave.
           for (const deviceId of joined) {
             notify(deviceId, {
@@ -1247,6 +1270,8 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!leaveConvo(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId })) {
           return fail('conflict', 'not a joined participant')
         }
+        // Same re-chip as the dissolve branch above, one departure at a time.
+        fanParticipants(msg.room_id)
         // A participant left: tell the room's recorded owner, if there is
         // one. (No need to exclude the caller — a caller that IS the owner
         // has no convo_agents row to have been 'joined' in, so leaveConvo

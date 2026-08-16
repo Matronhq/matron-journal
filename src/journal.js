@@ -241,6 +241,33 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
        : ''}
      ORDER BY last_seq DESC`
   ).all(userId)
+  // Room membership, so a client can chip every participating box, not just
+  // the recorded owner (spec: multi-agent room tags). One grouped query for
+  // all of this user's joined convo_agents rows, attached per-convo as
+  // `participants` (owner + joined, deduped, sorted). Convos with no joined
+  // row — solo sessions, dissolved rooms — omit the key entirely, so the
+  // wire stays byte-identical for everything that is not a live room. Same
+  // private-device sieve as the `agents` list below: a filtered caller must
+  // not learn a private box's id from a membership array.
+  const joinedRows = db.prepare(
+    `SELECT ca.convo_id, ca.agent_device_id FROM convo_agents ca
+     JOIN conversations c ON c.id = ca.convo_id
+     WHERE c.owner_user_id=? AND ca.state='joined'${excludePrivateOwned
+       ? ` AND NOT EXISTS(SELECT 1 FROM devices d WHERE d.id=ca.agent_device_id AND d.private=1)`
+       : ''}`
+  ).all(userId)
+  const joinedByConvo = new Map()
+  for (const r of joinedRows) {
+    if (!joinedByConvo.has(r.convo_id)) joinedByConvo.set(r.convo_id, [])
+    joinedByConvo.get(r.convo_id).push(r.agent_device_id)
+  }
+  for (const c of conversations) {
+    const joined = joinedByConvo.get(c.id)
+    if (!joined) continue
+    const ids = new Set(joined)
+    if (c.agent_device_id != null) ids.add(c.agent_device_id)
+    c.participants = [...ids].sort((a, b) => a - b)
+  }
   // id -> name for the user's agent boxes, so a client can render the
   // owning box of each conversation without a second round-trip. Same
   // privacy predicate as the conversation filter above: a filtered
