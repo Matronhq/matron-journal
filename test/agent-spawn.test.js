@@ -186,13 +186,14 @@ test('spawn_targets: valid capacity blocks pass through; a malformed block is dr
         folders: [{ path: '/home/dan/app', last_used: 5 }],
         activity: { live_sessions: 1, last_hour: [{ path: '/w', sessions: 2 }] },
         limits: { as_of: 5, lines: [{ id: 'session', label: 'Session', percent: 10 }] },
+        disk: { free_bytes: 1024, total_bytes: 4096 },
       },
     })
   })
   bad.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
     bad.send({
       op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true,
-      result: { folders: [], activity: { live_sessions: -5, last_hour: [] } },
+      result: { folders: [], activity: { live_sessions: -5, last_hour: [] }, disk: { free_bytes: 9, total_bytes: 4 } },
     })
   })
   parent.send({ op: 'spawn_targets', request_id: 'q1' })
@@ -200,10 +201,12 @@ test('spawn_targets: valid capacity blocks pass through; a malformed block is dr
   const eric = reply.boxes.find((b) => b.device_id === targetDev.deviceId)
   assert.deepEqual(eric.activity, { live_sessions: 1, last_hour: [{ path: '/w', sessions: 2 }] })
   assert.deepEqual(eric.limits, { as_of: 5, lines: [{ id: 'session', label: 'Session', percent: 10 }] })
+  assert.deepEqual(eric.disk, { free_bytes: 1024, total_bytes: 4096 })
   const sicky = reply.boxes.find((b) => b.device_id === second.deviceId)
   assert.deepEqual(sicky.folders, [])
   assert.ok(!('activity' in sicky)) // malformed block dropped whole, box still listed
   assert.ok(!('limits' in sicky)) // no limits reported at all — omitted, not null
+  assert.ok(!('disk' in sicky)) // free > total is nonsense — dropped whole, box still listed
 })
 
 test('spawn_targets: offline box listed with no folders; folder timeout degrades to empty', async (t) => {

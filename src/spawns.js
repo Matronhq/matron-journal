@@ -265,6 +265,19 @@ export function sanitizeSpawnActivity(raw) {
 // instead of letting every reader guard against it separately.
 const AS_OF_MAX_MS = 8640000000000000
 
+// Disk block: two byte counts, no peer strings. isSafeInteger, not
+// isInteger — 2^60 passes isInteger (it is a representable float with no
+// fraction) and would then survive into arithmetic downstream renderers do
+// on it. free may equal total (fresh empty volume) but never exceed it, and
+// a zero-total filesystem is nonsense, not data.
+export function sanitizeSpawnDisk(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  if (!Number.isSafeInteger(raw.free_bytes) || raw.free_bytes < 0) return null
+  if (!Number.isSafeInteger(raw.total_bytes) || raw.total_bytes <= 0) return null
+  if (raw.free_bytes > raw.total_bytes) return null
+  return { free_bytes: raw.free_bytes, total_bytes: raw.total_bytes }
+}
+
 export function sanitizeSpawnLimits(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
   if (!Number.isInteger(raw.as_of) || raw.as_of <= 0 || raw.as_of > AS_OF_MAX_MS) return null
