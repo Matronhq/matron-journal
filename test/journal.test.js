@@ -333,3 +333,19 @@ test('agent_chat card snippet is fixed — never the justification', () => {
   assert.equal(s, '🤝 Agent chat request')
   assert.ok(!s.includes('SECRET'))
 })
+
+test('last_ts counts message events only — status/meta/read_marker rows do not resurface a chat', async () => {
+  const { db, dan } = await setup()
+  append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:dev-2', type: 'text', payload: { body: 'real message' } })
+  const messageTS = db.prepare("SELECT ts FROM events WHERE convo_id='c1' ORDER BY seq DESC LIMIT 1").get().ts
+  // Non-message rows land in `events` with fresh timestamps: the reaper's
+  // session_status, membership/rename convo_meta fans, and read_marker
+  // echoes. Stamp them well after the message to prove they are ignored —
+  // append() stamps Date.now(), so push each row's ts forward directly.
+  append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:dev-2', type: 'session_status', payload: { state: 'done' } })
+  append(db, { userId: dan.id, convoId: 'c1', sender: 'journal', type: 'convo_meta', payload: { participants: [1, 2] } })
+  markRead(db, dan.id, 'c1', 1)
+  db.prepare("UPDATE events SET ts = ts + 3600000 WHERE convo_id='c1' AND type != 'text'").run()
+  const snap = snapshot(db, dan.id)
+  assert.equal(snap.conversations.find((c) => c.id === 'c1').last_ts, messageTS)
+})
