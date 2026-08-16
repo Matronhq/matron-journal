@@ -8,7 +8,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { upsertConversation, appendAndBroadcast, CONVO_ID_MAX_CHARS } from './journal.js'
-import { recordJoined } from './participants.js'
+import { recordJoined, participantIds } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 
 export function createSpawnRequest(db, { id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic = '', now = Date.now() }) {
@@ -158,7 +158,10 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
     return 'failed'
   }
   try {
-    const title = row.topic || row.task.slice(0, 80)
+    // Same title convention as bridge-minted agent-chat rooms (🔗 marker +
+    // 2-char room short): a spawn room is a multi-agent room too, and the
+    // chat list should say so the same way.
+    const title = `🔗 [${roomId.slice(0, 2)}] ${row.topic || row.task.slice(0, 80)}`
     // The parent owns the room (conversations.agent_device_id), the target is
     // its joined participant — the same shape an accepted chat invite leaves.
     upsertConversation(db, { id: roomId, ownerUserId: row.user_id, title, sessionState: 'running', agentDeviceId: row.from_device_id })
@@ -166,7 +169,18 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId = r
     // Live clients learn the room exists now, not at their next /snapshot —
     // the same two frames convo_upsert fans for a fresh conversation.
     appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'session_status', payload: { state: 'running' } })
-    appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null } })
+    // participants rides the same meta so the spawn room chips both boxes
+    // (parent owner + spawned target) the moment it appears (spec:
+    // multi-agent room tags). Best-effort: the row's title and membership
+    // are already committed (upsertConversation/recordJoined above) and
+    // /snapshot serves both, so a failed live fan must log and let the
+    // spawn proceed — not trip the outer catch into reporting a failed
+    // outcome for a room that exists with joined membership.
+    try {
+      appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null, participants: participantIds(db, roomId) } })
+    } catch (err) {
+      console.error('approveSpawn: room meta fan failed (title and membership already committed)', err)
+    }
     // Persist the room linkage NOW, before the `start` RPC — the row is
     // still 'approved', so a restart in the RPC gap leaves the sweep
     // (expireApproved) a room_id to report and write the epitaph into.

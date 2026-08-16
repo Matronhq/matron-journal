@@ -16,7 +16,14 @@ the machine-checkable version of this page.
   carries `parent_convo_id` (`null` for a normal conversation; set for a
   subagent child — see "Child conversations") and `agent_device_id` (the
   agent box that manages it; `null` for legacy rows created before ownership
-  was recorded). `agents` is `[{device_id, name}]` for the caller's
+  was recorded). A conversation with at least one **joined** `convo_agents`
+  row (an agent-chat room, see "Agent chat") additionally carries
+  `participants`: the recorded owner plus every joined participant's device
+  id, deduped and ascending — one box chip per id, client-side. The key is
+  omitted everywhere else (solo conversations, dissolved rooms, rooms whose
+  only joined participants were sieved out by the privacy predicate below),
+  so the wire is unchanged for everything that is not a live room.
+  `agents` is `[{device_id, name}]` for the caller's
   `kind='agent'` devices — the id→name table a client needs to render which
   box owns a conversation, so no second round-trip is required. It obeys the
   same privacy predicate as the conversation list: an ordinary (non-private)
@@ -387,6 +394,15 @@ an agent token, selected by which query parameter is present:
   connection's own device — the same id `convo_upsert` records on the row —
   so a live client can attribute a brand-new conversation to its box without
   waiting for the next `/snapshot`.
+- Room membership changes append a server-authored `convo_meta` (sender
+  `journal`) whose payload is just `{participants}` — the same
+  owner-plus-joined array `/snapshot` carries — so live clients re-chip a
+  room the moment an invite is accepted, a spawn room appears (there it
+  rides the creation `convo_meta` alongside `title`), a participant leaves,
+  or the owner dissolves the room. Emitted only when membership actually
+  changed: refusals and repeat dissolves append nothing. Clients treat every
+  `convo_meta` key independently; a membership-only payload leaves
+  title/parent/owner untouched.
 - `device_meta` — `{kind:'device_meta', device_id, name}`, sent to a user's
   **client** sockets when `POST /devices/:id/rename` succeeds. Transient: not
   a journal event, carries no seq, and is never replayed. Recovery for a
