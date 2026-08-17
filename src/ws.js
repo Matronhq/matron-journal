@@ -6,7 +6,7 @@ import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, 
 import { joinedAgentIds, participantIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
-import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk } from './spawns.js'
+import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, emitSpawnOutcome } from './spawns.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -269,9 +269,7 @@ export function attachWs({
       // The cap (countPendingAsks) is what stops a re-ask loop, not
       // ambiguity. Rows carry their own user/device ids — no lookups.
       for (const row of expireSpawns(db, AWAITING_USER_TTL_MS)) {
-        hub.sendToDevice(row.user_id, row.from_device_id, {
-          kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'expired',
-        })
+        emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'expired' })
       }
       // Stranded-'approved' recovery (see spawns.js expireApproved's doc
       // comment): a row a claimApprove won but whose orchestration never
@@ -297,9 +295,7 @@ export function attachWs({
             console.error('orphan sweep: epitaph write failed', err)
           }
         }
-        hub.sendToDevice(row.user_id, row.from_device_id, {
-          kind: 'spawn', event: 'outcome', request_id: row.id, outcome: 'failed', error_code: 'orphaned',
-        })
+        emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'failed', errorCode: 'orphaned' })
       }
       const conns = hub.allConns()
       if (conns.length === 0) return
