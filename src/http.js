@@ -1,6 +1,6 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
-import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
+import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice } from './db.js'
 import { receiveBlob } from './media.js'
@@ -21,6 +21,17 @@ const deviceName = (raw) => (raw == null ? null : sanitizePeerText(raw, PEER_NAM
 // the sanitiser's bound for peer-written text): a device name is a chip
 // label in the apps, and 40 chars is already more than a chip can show.
 const DEVICE_NAME_MAX = 40
+
+// A roster tag is ONE grapheme by contract — the letter beside the box name.
+// Same control-char sieve names go through, then the first grapheme so a
+// compound emoji survives whole. Nothing left over means "clear" (null).
+const graphemes = new Intl.Segmenter()
+const tagChar = (raw) => {
+  const clean = deviceName(raw)
+  if (!clean) return null
+  for (const g of graphemes.segment(clean)) return g.segment
+  return null
+}
 
 const json = (res, status, obj) => {
   if (res.writableEnded || res.destroyed) return
@@ -166,7 +177,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // Mint at claim (spec): the devices row first exists HERE. The pair
         // is already deleted; if createAgent somehow threw, the box retries
         // with a fresh code and no orphan row exists either way.
-        const d = createAgent(db, c.userId, c.agentName)
+        const d = createAgent(db, c.userId, c.agentName, c.tagChar)
         return json(res, 200, { status: 'approved', token: d.token, device_id: d.deviceId })
       }
       if (req.method === 'POST' && url.pathname === '/link/claim') {
@@ -505,6 +516,10 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         if (!clean || clean.length > DEVICE_NAME_MAX) return json(res, 400, { error: 'bad_request' })
         const renamedId = Number(rn[1])
         if (!renameOwnedDevice(db, who.userId, renamedId, clean)) return json(res, 404, { error: 'not_found' })
+        // The frame carries the standing tag too — device_meta is "here is
+        // this device's current meta", not a name-only delta, so a roster
+        // built from frames alone never loses the letter.
+        const renamedTag = db.prepare('SELECT tag_char FROM devices WHERE id=?').get(renamedId).tag_char
         for (const c of hub.connsOf(who.userId)) {
           // A live socket carries the device name it authenticated with
           // (ws.js hello: `conn = { ws, ...who }`), and everything that
@@ -520,19 +535,42 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           // client that was offline picks the new name up from its next
           // /snapshot `agents` list. Clients only — an agent keeps no roster.
           if (c.kind === 'client' && c.ws.readyState === 1) {
-            c.ws.send(JSON.stringify({ kind: 'device_meta', device_id: renamedId, name: clean }))
+            c.ws.send(JSON.stringify({ kind: 'device_meta', device_id: renamedId, name: clean, tag_char: renamedTag }))
           }
         }
         return json(res, 200, { ok: true, device: { device_id: renamedId, name: clean } })
       }
+      const tg = url.pathname.match(/^\/devices\/(\d+)\/tag$/)
+      if (req.method === 'POST' && tg) {
+        // Rename's twin (spec: box tag characters): client-gated, owner-
+        // scoped, and fanned out the same way. `tag_char: null` (or an
+        // input that sieves to nothing) clears back to automatic; an absent
+        // key is a 400, so "clear" is always said out loud.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const { tag_char } = await readBody(req)
+        if (tag_char !== null && typeof tag_char !== 'string') return json(res, 400, { error: 'bad_request' })
+        const cleanTag = tagChar(tag_char)
+        const taggedId = Number(tg[1])
+        if (!setOwnedDeviceTag(db, who.userId, taggedId, cleanTag)) return json(res, 404, { error: 'not_found' })
+        // No live-socket name patch here — the tag never appears in journal
+        // sender strings or consent cards, only in client rosters.
+        const taggedName = deviceName(db.prepare('SELECT name FROM devices WHERE id=?').get(taggedId).name)
+        for (const c of hub.connsOf(who.userId)) {
+          if (c.kind === 'client' && c.ws.readyState === 1) {
+            c.ws.send(JSON.stringify({ kind: 'device_meta', device_id: taggedId, name: taggedName, tag_char: cleanTag }))
+          }
+        }
+        return json(res, 200, { ok: true, device: { device_id: taggedId, name: taggedName, tag_char: cleanTag } })
+      }
       if (req.method === 'POST' && url.pathname === '/pair/approve') {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
-        const { pair_code, agent_name } = await readBody(req)
+        const { pair_code, agent_name, tag_char } = await readBody(req)
         if (typeof pair_code !== 'string' || !pair_code ||
-            typeof agent_name !== 'string' || !agent_name) {
+            typeof agent_name !== 'string' || !agent_name ||
+            (tag_char != null && typeof tag_char !== 'string')) {
           return json(res, 400, { error: 'bad_request' })
         }
-        const r = pairs.approve(pair_code, { userId: who.userId, agentName: agent_name })
+        const r = pairs.approve(pair_code, { userId: who.userId, agentName: agent_name, tagChar: tagChar(tag_char) })
         // conflict (already approved) is distinguishable — the caller is
         // authenticated, so this leaks nothing exploitable and tells a
         // double-tapping user the truth. Unknown and expired stay merged
