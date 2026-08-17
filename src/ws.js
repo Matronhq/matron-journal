@@ -182,7 +182,7 @@ export function attachWs({
   server, db, hub, pingMs = 55000, pushPipeline = noopPushPipeline,
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
   revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES, inviteTtlMs = 1800000,
-  broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000,
+  broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, waker = null,
 }) {
   // Derived, never raw: the orphan sweep must always outlast a live `start`
   // RPC still in flight (see APPROVED_ORPHAN_TTL_FLOOR_MS's comment).
@@ -499,7 +499,7 @@ export function attachWs({
         // reserialization, which JSON.parse's whitespace-stripping would
         // shrink. `data` is a Buffer here (ws delivers text frames as
         // Buffers), so .length is the byte count.
-        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs })
+        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, waker })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -555,7 +555,7 @@ export function notifyStale(hub, entry, reason = 'stale') {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000 }) {
+export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, waker = null }) {
   const fail = (code, detail) => {
     conn.ws.send(JSON.stringify({
       kind: 'control', op: 'error', code, ref: msg.op,
@@ -656,6 +656,29 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
     const row = db.prepare('SELECT parent_convo_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, conn.userId)
     return !!row && row.parent_convo_id != null
   }
+  // Wake-on-message (src/wake.js): when traffic targets an agent device with
+  // no live socket, ask the infra layer to start its (possibly idle-stopped)
+  // box. Purely additive: every op keeps its existing answer — the journal
+  // already persists what matters (send/prompt_reply) or refuses cleanly
+  // (agent_unreachable), and the bridge catches up from its cursor once the
+  // box is back. Same-user scoping mirrors the anti-enumeration stance of
+  // the call sites: a foreign device id never reaches the waker.
+  const wakeIfOffline = (agentDeviceId) => {
+    if (!waker || !waker.enabled || !Number.isInteger(agentDeviceId)) return
+    const online = hub.connsOf(conn.userId).some((c) => c.deviceId === agentDeviceId && c.ws.readyState === 1)
+    if (online) return
+    const dev = db.prepare('SELECT name, kind FROM devices WHERE id=? AND user_id=?').get(agentDeviceId, conn.userId)
+    if (!dev || dev.kind !== 'agent') return
+    waker.wake(dev.name)
+  }
+  // The send/prompt_reply variant: those ops name a conversation, not a
+  // device, so resolve the managing agent first (null for legacy rows and
+  // client-broadcast convos — nothing to wake).
+  const wakeConvoAgent = (convoId) => {
+    if (!waker || !waker.enabled) return
+    const row = db.prepare('SELECT agent_device_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, conn.userId)
+    if (row && row.agent_device_id != null) wakeIfOffline(row.agent_device_id)
+  }
   // Membership convo_meta fan (spec: multi-agent room tags): live clients
   // re-chip a room the moment its membership changes. Best-effort like every
   // other post-commit notification in the invite lifecycle — by the time
@@ -731,6 +754,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           blobRef: msg.blob_ref ?? null,
           idemKey: msg.local_id ? `client:${conn.deviceId}:${msg.local_id}` : null,
         })
+        // After the append (which authorizes the convo): a message for a
+        // stopped box should also start that box.
+        wakeConvoAgent(msg.convo_id)
         break
       }
       case 'prompt_reply': {
@@ -743,6 +769,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           sender: `user:${conn.username}`, type: 'prompt_reply',
           payload: { target_seq: msg.target_seq, choice: msg.choice ?? null, text: msg.text ?? null },
         })
+        wakeConvoAgent(msg.convo_id)
         break
       }
       case 'agent_request': {
@@ -783,7 +810,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           kind: 'rpc',
           request: { request_id: rid, from_device_id: conn.deviceId, method: msg.method, params: msg.params ?? null },
         })
-        if (!delivered) return failRpc('agent_unreachable')
+        if (!delivered) {
+          // Still refused — no RPC queueing — but the box starts booting, so
+          // the caller's retry lands on a live bridge.
+          wakeIfOffline(msg.agent_device_id)
+          return failRpc('agent_unreachable')
+        }
         break
       }
       case 'agent_response': {
@@ -862,7 +894,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // spend the user's tap on something that cannot work. Same liveness
         // rule as hub.sendRpcRequest without sending anything.
         const online = hub.connsOf(conn.userId).some((c) => c.deviceId === msg.target_device_id && c.ws.readyState === 1)
-        if (!online) return fail('agent_unreachable')
+        if (!online) {
+          // Same shape as agent_request above: refuse now, boot the box so
+          // the parent's retry can succeed.
+          wakeIfOffline(msg.target_device_id)
+          return fail('agent_unreachable')
+        }
         const workdir = sanitizePeerText(msg.workdir, SPAWN_WORKDIR_MAX_CHARS)
         if (!workdir) return fail('bad_request', 'bad workdir')
         const task = sanitizePeerText(msg.task, SPAWN_TASK_MAX_CHARS)
