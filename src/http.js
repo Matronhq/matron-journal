@@ -25,12 +25,26 @@ const DEVICE_NAME_MAX = 40
 // A roster tag is ONE grapheme by contract — the letter beside the box name.
 // Same control-char sieve names go through, then the first grapheme so a
 // compound emoji survives whole. Nothing left over means "clear" (null).
+// Two extra sieves guard the contract: a grapheme cluster is not one code
+// point, so a Zalgo combining stack or a ZWJ chain can ride in as "one
+// character" up to the sanitiser's 80-unit cap — 16 code points clears every
+// real emoji sequence (family-of-4 with skin tones is 11, a subdivision flag
+// is 7) and drops the rest. And a cluster made only of format/space
+// characters (RLO, LRI, ZWSP, soft hyphen) is a non-null tag that renders as
+// nothing — worse than null, because null is what tells clients to derive
+// the automatic letter. Both sieve to null, the documented "clear" outcome.
 const graphemes = new Intl.Segmenter()
+const TAG_CODEPOINT_MAX = 16
 const tagChar = (raw) => {
   const clean = deviceName(raw)
   if (!clean) return null
-  for (const g of graphemes.segment(clean)) return g.segment
-  return null
+  let first = null
+  for (const g of graphemes.segment(clean)) { first = g.segment; break }
+  if (!first || [...first].length > TAG_CODEPOINT_MAX) return null
+  // Visibility test only — the ZWJ inside a legitimate 👩‍💻 stays in the
+  // returned value; a cluster that strips to nothing is invisible.
+  if (!first.replace(/[\p{Cf}\p{Cc}\p{Zs}]/gu, '')) return null
+  return first
 }
 
 const json = (res, status, obj) => {
@@ -538,7 +552,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
             c.ws.send(JSON.stringify({ kind: 'device_meta', device_id: renamedId, name: clean, tag_char: renamedTag }))
           }
         }
-        return json(res, 200, { ok: true, device: { device_id: renamedId, name: clean } })
+        // The 200 body carries the trio like the frame does — device_meta is
+        // "current meta", and rename's own response shouldn't disagree.
+        return json(res, 200, { ok: true, device: { device_id: renamedId, name: clean, tag_char: renamedTag } })
       }
       const tg = url.pathname.match(/^\/devices\/(\d+)\/tag$/)
       if (req.method === 'POST' && tg) {

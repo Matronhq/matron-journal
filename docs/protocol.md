@@ -1484,10 +1484,16 @@ clients show beside a box; when it is null clients derive a letter from the
 device name — journal-held so the same character shows on every one of the
 user's devices. Input goes through the device-name sieve and then only the
 FIRST grapheme is kept (a compound emoji counts as one grapheme and survives
-whole). `null`, empty, and whitespace-only all clear back to automatic
-(stored NULL); an absent key or non-string non-null value is 400
-`{error:'bad_request'}`. Owner-scoping, 404 merging, and the `device_meta`
-fan-out all match rename exactly.
+whole). A "grapheme" is further bounded: a cluster of more than 16 code
+points (a Zalgo combining stack, a ZWJ chain) or one that consists only of
+format/space characters (RLO, ZWSP, soft hyphen — a non-null tag that would
+render as nothing) also sieves to null. `null`, empty, whitespace-only, and
+those sieved-out inputs all clear back to automatic (stored NULL); an absent
+key or non-string non-null value is 400 `{error:'bad_request'}`.
+Owner-scoping, 404 merging, and the `device_meta` fan-out all match rename
+exactly; rename's own 200 body carries the standing `tag_char` too. Note the
+recovery split matches names: a client-kind device's tag is only in
+`GET /devices` — `/snapshot`'s `agents` list carries tags for agent boxes.
 
 A rename takes effect on the renamed device's own **live** WebSocket too, not
 just from its next connection: every event that names the producing device —

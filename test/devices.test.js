@@ -117,7 +117,7 @@ test('POST /devices/:id/rename: renames, sanitises, caps, owner-scoped, client-g
   // happy path
   const ok = await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', token, body: { name: 'dev-y' } })
   assert.equal(ok.status, 200)
-  assert.deepEqual(ok.json, { ok: true, device: { device_id: agent.deviceId, name: 'dev-y' } })
+  assert.deepEqual(ok.json, { ok: true, device: { device_id: agent.deviceId, name: 'dev-y', tag_char: null } })
   const roster = await s.http('/devices', { token })
   assert.equal(roster.json.devices.find((d) => d.device_id === agent.deviceId).name, 'dev-y')
 
@@ -219,6 +219,22 @@ test('POST /devices/:id/tag: sets, clears, keeps one grapheme, owner-scoped, cli
   const emoji = await s.http(`/devices/${agent.deviceId}/tag`, { method: 'POST', token, body: { tag_char: ' 👩‍💻xy ' } })
   assert.equal(emoji.status, 200)
   assert.equal(emoji.json.device.tag_char, '👩‍💻')
+
+  // a grapheme cluster is not one code point: a Zalgo combining stack or a
+  // ZWJ chain is "one grapheme" up to the sanitiser's cap — over 16 code
+  // points sieves to null (clear), it never rides in as a tag
+  const zalgo = 'a' + '\u0301'.repeat(60)
+  const zwjChain = Array(27).fill('👩').join('\u200D')
+  // an invisible cluster (RLO, ZWSP, LRI, soft hyphen lead) is a non-null
+  // tag that renders as nothing and defeats the null-means-automatic
+  // fallback — it sieves to null too
+  const invisible = ['\u202Eevil', '\u200Bx', '\u2066abc', '\u00ADabc']
+  for (const junk of [zalgo, zwjChain, ...invisible]) {
+    await s.http(`/devices/${agent.deviceId}/tag`, { method: 'POST', token, body: { tag_char: 'z' } })
+    const r = await s.http(`/devices/${agent.deviceId}/tag`, { method: 'POST', token, body: { tag_char: junk } })
+    assert.equal(r.status, 200, `expected 200 for ${JSON.stringify(junk)}`)
+    assert.equal(r.json.device.tag_char, null, `expected null for ${JSON.stringify(junk)}`)
+  }
 
   // null / empty / whitespace-only clear back to automatic
   for (const cleared of [null, '', '   ']) {
