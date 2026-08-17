@@ -17,6 +17,7 @@ import { resolveMediaDir } from './media.js'
 import { runOffload, runExpireLogs, runReapMedia } from './retention.js'
 import { backfillSearchIndex } from './search.js'
 import { makeRpcBroker } from './rpc-broker.js'
+import { makeWaker } from './wake.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
@@ -275,7 +276,7 @@ export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
   toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
-  mediaReapHighPct, mediaReapLowPct,
+  mediaReapHighPct, mediaReapLowPct, waker,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
@@ -312,6 +313,9 @@ export function startServer({
   const resolvedMaxReplay = maxReplay ?? resolveNumericEnv('MATRON_MAX_REPLAY', process.env.MATRON_MAX_REPLAY, DEFAULT_MAX_REPLAY)
   const hub = makeHub()
   const broker = makeRpcBroker()
+  // Wake-on-message for idle-stopped agent boxes (src/wake.js). Off unless
+  // MATRON_WAKE_CMD is set (or a waker is injected by tests).
+  const resolvedWaker = waker || makeWaker()
   const toolStreams = makeToolStreamStore({
     maxBytes: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BYTES', process.env.MATRON_TOOL_STREAM_MAX_BYTES, 1048576),
     maxBuffers: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BUFFERS', process.env.MATRON_TOOL_STREAM_MAX_BUFFERS, 64),
@@ -336,7 +340,7 @@ export function startServer({
     ...(inviteTtlMs !== undefined ? { inviteTtlMs } : {}),
     // spawnStartTimeoutMs rides along so the orphan sweep's TTL can never
     // undercut a configured start timeout (attachWs derives the TTL).
-    broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs,
+    broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, waker: resolvedWaker,
   })
   let retentionInterval = null
   let walCheckpointInterval = null
