@@ -6,7 +6,7 @@ import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, 
 import { joinedAgentIds, participantIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
-import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, emitSpawnOutcome } from './spawns.js'
+import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, emitSpawnOutcome } from './spawns.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -954,6 +954,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             let folders = []
             let activity = null
             let limits = null
+            let disk = null
             if (online) {
               const r = await broker.issue(hub, conn.userId, d.device_id, 'recent_folders', null, { timeoutMs: spawnFoldersTimeoutMs })
               if (r.ok && Array.isArray(r.result?.folders)) folders = r.result.folders
@@ -962,6 +963,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
                 // all-or-nothing; a bridge that predates them just lists folders.
                 activity = sanitizeSpawnActivity(r.result?.activity)
                 limits = sanitizeSpawnLimits(r.result?.limits)
+                disk = sanitizeSpawnDisk(r.result?.disk)
               }
             }
             // Sanitised like every other client-bound device name (roster,
@@ -971,6 +973,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
               device_id: d.device_id, name: sanitizePeerText(d.name, PEER_NAME_CAP), online, folders,
               ...(activity ? { activity } : {}),
               ...(limits ? { limits } : {}),
+              ...(disk ? { disk } : {}),
             }
           }))
           conn.ws.send(JSON.stringify({ kind: 'spawn', event: 'targets', request_id: rid, boxes: out }))
