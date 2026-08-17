@@ -248,6 +248,14 @@ test('snippetOf session_status reads as the turn-finished alert, matching the re
   assert.equal(snippetOf('session_status', null), 'Turn finished')
 })
 
+test('snippetOf spawn_outcome shows an outcome-specific placeholder, falling back to [spawn_outcome] for an unknown/missing outcome', () => {
+  assert.equal(snippetOf('spawn_outcome', { outcome: 'started' }), '🚀 Spawned session started')
+  assert.equal(snippetOf('spawn_outcome', { outcome: 'declined' }), '🚫 Spawn declined')
+  assert.equal(snippetOf('spawn_outcome', { outcome: 'expired' }), '⌛ Spawn request expired')
+  assert.equal(snippetOf('spawn_outcome', { outcome: 'failed' }), '❌ Spawn failed')
+  assert.equal(snippetOf('spawn_outcome', {}), '[spawn_outcome]')
+})
+
 test('append with type session_status and a malformed payload throws a clean, descriptive error (not a raw DB crash)', async () => {
   const { db, dan } = await setup()
   for (const badPayload of [null, undefined, {}, 'nope', 42, { state: 42 }]) {

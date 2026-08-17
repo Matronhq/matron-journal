@@ -4,7 +4,7 @@ import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { joinedAgentIds } from './participants.js'
 
 export const MESSAGE_TYPES = [
-  'text', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image',
+  'text', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image', 'spawn_outcome',
 ]
 
 // SQL literal of MESSAGE_TYPES for the last_ts subqueries (snapshot here,
@@ -56,6 +56,14 @@ export function snippetOf(type, payload) {
   // rule because a caption is the user's own words about this specific
   // attachment — the most specific description available.
   if ((type === 'image' || type === 'file') && p.caption) return String(p.caption).slice(0, 120)
+  if (type === 'spawn_outcome') {
+    // Object.hasOwn, not `m[p.outcome]`: p.outcome is agent-authored (the
+    // bridge's `start` reply flows into it via the error path), so a value
+    // like 'constructor' or 'toString' must not resolve to an inherited
+    // Object.prototype value instead of falling through to the placeholder.
+    const m = { started: '🚀 Spawned session started', declined: '🚫 Spawn declined', expired: '⌛ Spawn request expired', failed: '❌ Spawn failed' }
+    return Object.hasOwn(m, p.outcome) ? m[p.outcome] : '[spawn_outcome]'
+  }
   if (p.snippet) return String(p.snippet).slice(0, 120)
   if (type === 'tool_output' && p.command) return `$ ${String(p.command)}`.slice(0, 120)
   // Matches the relay's fixed 'done'-category alert (see relay.js

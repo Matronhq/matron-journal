@@ -9,7 +9,7 @@ import { listAwaiting, answerParkedInvite, getParticipant } from './participants
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
-import { getSpawn, denySpawn, claimApprove, approveSpawn } from './spawns.js'
+import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
 // card's `from_name` gets. NULL stays null rather than collapsing to '' —
@@ -441,7 +441,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           if (!denySpawn(db, request_id)) return json(res, 409, { error: 'conflict' })
           // Reported plainly (spec: no peer to hide behind) — 'declined',
           // never a fabricated box-side failure.
-          hub.sendToDevice(who.userId, row.from_device_id, { kind: 'spawn', event: 'outcome', request_id, outcome: 'declined' })
+          emitSpawnOutcome(db, hub, { userId: who.userId, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: request_id, outcome: 'declined' })
           return json(res, 200, { ok: true })
         }
         // The tap CLAIMS the row; a zero row-count means another tap already
