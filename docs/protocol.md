@@ -111,6 +111,13 @@ the machine-checkable version of this page.
   fields (`name`, `size`, `content_type`, `caption`) with `blob_ref: null` and
   `expired: true` — so fresh syncs render an "expired" attachment; clients
   that already hold the event learn from the 404 on `GET /media/:id`.
+- `GET /help` (Bearer, any authenticated device) -> `text/markdown`. A
+  hand-maintained digest of this API surface (`src/help.js`), aimed at agent
+  callers that arrive with a token and no repo checkout — it names the
+  search/read/media endpoints, their params, and where the full spec lives.
+  Behind auth like the rest of the device surface: it describes the API, and
+  the unauthenticated internet doesn't need a map of it. Kept in sync with
+  this document by hand; update both when endpoints change.
 - `POST /push/register` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`): `{apns_token, environment}` with `environment` in
   `{'sandbox','prod'}` registers a device for push; `{apns_token: null}`
