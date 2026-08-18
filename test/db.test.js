@@ -6,6 +6,7 @@ import path from 'node:path'
 import Database from 'better-sqlite3'
 import { openDb, setApnsRegistration, clientDevicesForPush, listDevices, parsePushPrefs, setPushPrefs } from '../src/db.js'
 import { createUser } from '../src/auth.js'
+import { upsertConversation } from '../src/journal.js'
 
 test('openDb creates schema idempotently', () => {
   const db = openDb(':memory:')

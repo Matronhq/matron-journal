@@ -4,7 +4,7 @@ import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { joinedAgentIds } from './participants.js'
 
 export const MESSAGE_TYPES = [
-  'text', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image', 'spawn_outcome',
+  'text', 'peer_message', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image', 'spawn_outcome',
 ]
 
 // SQL literal of MESSAGE_TYPES for the last_ts subqueries (snapshot here,
@@ -49,6 +49,7 @@ export function snippetOf(type, payload) {
     return p.kind === 'agent_spawn' ? '🤝 Agent spawn request' : '🤝 Agent chat request'
   }
   if (type === 'text') return String(p.body || '').slice(0, 120)
+  if (type === 'peer_message') return `💬 ${sanitizePeerText(p.body)}`.slice(0, 120)
   if (type === 'prompt') return `? ${String(p.question || '').slice(0, 110)}`
   if (type === 'permission_request') return `permission: ${String(p.description || '').slice(0, 100)}`
   // A captioned attachment reads better in the chat list as what the user
