@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS agent_spawn_requests(
   workdir           TEXT NOT NULL,
   task              TEXT NOT NULL,
   topic             TEXT NOT NULL DEFAULT '',
+  model             TEXT,
   state             TEXT NOT NULL CHECK(state IN
                       ('awaiting_user','approved','started',
                        'denied','expired','failed')),
@@ -339,6 +340,22 @@ export function openDb(path) {
     if (orphans > 0) {
       console.log(`convo_agents: dropped ${orphans} membership row(s) whose device was already revoked`)
     }
+  }
+  // Which Claude model the spawned session should run (spec: agent-spawned
+  // sessions). An alias like 'opus' or a full model id — the target bridge's
+  // vocabulary, not the journal's, so no CHECK: a bridge that learns a new
+  // alias must not start failing against an older server, exactly the
+  // session_outcome stance above. Shape is bounded at the ws boundary
+  // (SPAWN_MODEL_MAX_CHARS) and relayed only when non-empty, so a target that
+  // predates the field sees the same `start` params it always saw.
+  //
+  // Nullable rather than NOT NULL DEFAULT '' (topic's shape) because rows
+  // predating this column read NULL and no backfill can invent an answer for
+  // them; every reader is a falsy test, so '' and NULL mean the same thing —
+  // "the requester named no model".
+  const spawnCols = db.prepare('PRAGMA table_info(agent_spawn_requests)').all()
+  if (!spawnCols.some((c) => c.name === 'model')) {
+    db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN model TEXT')
   }
   // Standing agent-chat consent ("always allow A -> B") is gone: every ask
   // parks for the user now. Dropped rather than left in place, because a
