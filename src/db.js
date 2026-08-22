@@ -193,6 +193,13 @@ export function openDb(path) {
   if (!deviceCols.some((c) => c.name === 'private_pinned')) {
     db.exec('ALTER TABLE devices ADD COLUMN private_pinned INTEGER NOT NULL DEFAULT 0')
   }
+  // User-chosen roster tag character (spec: box tag characters). ONE grapheme,
+  // NULL = automatic (clients derive a letter from the name). Journal-held so
+  // the same letter shows on every device — it used to live in each app's
+  // local defaults, which is exactly why it never followed the user.
+  if (!deviceCols.some((c) => c.name === 'tag_char')) {
+    db.exec('ALTER TABLE devices ADD COLUMN tag_char TEXT')
+  }
   // An APNs token names a physical app install, so at most one device row may
   // hold it. Re-pairing creates a NEW device row, and until setApnsRegistration
   // learned to claim the token, every superseded row kept it: on dev-2 one Mac
@@ -472,7 +479,7 @@ export function listDevices(db, userId) {
   const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)
   const headSeq = head ? head.seq : 0
   return db.prepare(
-    'SELECT id AS device_id, kind, name, created_at, cursor, last_seen_at, push_prefs FROM devices WHERE user_id=? ORDER BY id'
+    'SELECT id AS device_id, kind, name, tag_char, created_at, cursor, last_seen_at, push_prefs FROM devices WHERE user_id=? ORDER BY id'
   ).all(userId).map((d) => ({ ...d, lag: headSeq - d.cursor, push_prefs: parsePushPrefs(d.push_prefs) }))
 }
 

@@ -298,11 +298,14 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   // rename endpoint's validation, so a stored name can still carry newlines
   // or control characters.
   const agents = db.prepare(
-    `SELECT id AS device_id, name FROM devices
+    `SELECT id AS device_id, name, tag_char FROM devices
      WHERE user_id=? AND kind='agent'${excludePrivateOwned ? ' AND private=0' : ''} ORDER BY id`
   ).all(userId).map((a) => ({
     device_id: a.device_id,
     name: a.name == null ? null : sanitizePeerText(a.name, PEER_NAME_CAP),
+    // tag_char is born validated (the /tag and /pair/approve sieves are the
+    // only writers), so it goes out as stored — no pairing-era legacy here.
+    tag_char: a.tag_char ?? null,
   }))
   const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)
   return { conversations, agents, seq: head ? head.seq : 0 }

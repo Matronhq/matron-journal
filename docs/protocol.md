@@ -23,7 +23,7 @@ the machine-checkable version of this page.
   omitted everywhere else (solo conversations, dissolved rooms, rooms whose
   only joined participants were sieved out by the privacy predicate below),
   so the wire is unchanged for everything that is not a live room.
-  `agents` is `[{device_id, name}]` for the caller's
+  `agents` is `[{device_id, name, tag_char}]` for the caller's
   `kind='agent'` devices — the id→name table a client needs to render which
   box owns a conversation, so no second round-trip is required. It obeys the
   same privacy predicate as the conversation list: an ordinary (non-private)
@@ -183,11 +183,16 @@ the machine-checkable version of this page.
   `{pair_code, poll_token, expires_in}`. Pending pairs are in-memory only
   (10-minute TTL, 64 outstanding max — 429 `rate_limited` beyond either);
   a restart forgets them.
-- `POST /pair/approve {pair_code, agent_name}` (Bearer, client devices
-  only) -> `{status:'approved'}`. Binds the pair to the approving caller's
-  user. Exactly once per pair: already-approved is 409 `{error:'conflict'}`;
-  unknown and expired are indistinguishable 404s. Codes are normalized
-  (case/hyphens/spaces) before lookup.
+- `POST /pair/approve {pair_code, agent_name, tag_char?}` (Bearer, client
+  devices only) -> `{status:'approved'}`. Binds the pair to the approving
+  caller's user. Exactly once per pair: already-approved is 409
+  `{error:'conflict'}`; unknown and expired are indistinguishable 404s.
+  Codes are normalized (case/hyphens/spaces) before lookup. `tag_char` is
+  optional and goes through the same sieve as `POST /devices/:id/tag` (one
+  grapheme kept; empty sieves to null = automatic); a non-string non-null
+  value is 400 and leaves the pair pending. The minted device carries it
+  from birth — so a box named `dev-b` can show as `b` on every client
+  without a follow-up tag call.
 - `POST /pair/preview {pair_code}` (Bearer, client devices only) ->
   `{requester_ip, expires_in}` for a pending pair — the approval screen shows
   who is asking before the user approves. `requester_ip` is the IP that
@@ -403,8 +408,12 @@ an agent token, selected by which query parameter is present:
   changed: refusals and repeat dissolves append nothing. Clients treat every
   `convo_meta` key independently; a membership-only payload leaves
   title/parent/owner untouched.
-- `device_meta` — `{kind:'device_meta', device_id, name}`, sent to a user's
-  **client** sockets when `POST /devices/:id/rename` succeeds. Transient: not
+- `device_meta` — `{kind:'device_meta', device_id, name, tag_char}`, sent to
+  a user's **client** sockets when `POST /devices/:id/rename` or
+  `POST /devices/:id/tag` succeeds. The frame always carries the device's
+  full current meta (a rename repeats the standing `tag_char`, a tag change
+  repeats the standing `name`), so a roster built from frames alone never
+  loses either half. Transient: not
   a journal event, carries no seq, and is never replayed. Recovery for a
   client that misses one depends on the renamed device's kind, because every
   kind may be renamed but `/snapshot`'s `agents` list carries only agent
@@ -1471,6 +1480,24 @@ a `device_meta` frame out to the user's client sockets; a client that was
 offline for it re-reads the name from `/snapshot`'s `agents` list (agent
 boxes) or from `GET /devices` (any kind, client devices included) — see
 `device_meta` under "WebSocket" above.
+
+`POST /devices/:id/tag` (Bearer, client devices only — agents get 403) sets
+the device's roster tag character, body `{tag_char}`, 200 `{ok:true,
+device:{device_id, name, tag_char}}`. The tag is the one-character label
+clients show beside a box; when it is null clients derive a letter from the
+device name — journal-held so the same character shows on every one of the
+user's devices. Input goes through the device-name sieve and then only the
+FIRST grapheme is kept (a compound emoji counts as one grapheme and survives
+whole). A "grapheme" is further bounded: a cluster of more than 16 code
+points (a Zalgo combining stack, a ZWJ chain) or one that consists only of
+format/space characters (RLO, ZWSP, soft hyphen — a non-null tag that would
+render as nothing) also sieves to null. `null`, empty, whitespace-only, and
+those sieved-out inputs all clear back to automatic (stored NULL); an absent
+key or non-string non-null value is 400 `{error:'bad_request'}`.
+Owner-scoping, 404 merging, and the `device_meta` fan-out all match rename
+exactly; rename's own 200 body carries the standing `tag_char` too. Note the
+recovery split matches names: a client-kind device's tag is only in
+`GET /devices` — `/snapshot`'s `agents` list carries tags for agent boxes.
 
 A rename takes effect on the renamed device's own **live** WebSocket too, not
 just from its next connection: every event that names the producing device —
