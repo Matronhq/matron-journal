@@ -160,6 +160,49 @@ test('spawn_request sanitizes workdir like task — newlines removed from row an
   assert.ok(!card.payload.workdir.includes('\n'), 'card workdir should not contain newline after sanitization')
 })
 
+test('spawn_request carries an optional model onto the row and the card, sanitized like every other peer string', async (t) => {
+  const { s, targetDev, parent, client } = await spawnFleet(t)
+  parent.send({
+    op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo',
+    target_device_id: targetDev.deviceId, workdir: '/w', task: 'do work',
+    model: 'claude-opus-4\n-20250514',
+  })
+  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  const row = getSpawn(s.db, ack.spawn_id)
+  assert.equal(row.model, 'claude-opus-4 -20250514')
+  const card = await client.waitFor(isSpawnCard)
+  assert.equal(card.payload.model, 'claude-opus-4 -20250514')
+})
+
+test('spawn_request omits model on the card when none was asked for', async (t) => {
+  const { s, targetDev, parent, client } = await spawnFleet(t)
+  parent.send({
+    op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo',
+    target_device_id: targetDev.deviceId, workdir: '/w', task: 'do work',
+  })
+  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  assert.equal(getSpawn(s.db, ack.spawn_id).model, '')
+  const card = await client.waitFor(isSpawnCard)
+  assert.ok(!('model' in card.payload), 'absent model must not surface as an empty chip on the card')
+})
+
+test('spawn_request rejects a non-string or oversized model, same stance as topic', async (t) => {
+  const { targetDev, parent } = await spawnFleet(t)
+  parent.send({
+    op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo',
+    target_device_id: targetDev.deviceId, workdir: '/w', task: 'x', model: { alias: 'opus' },
+  })
+  const e1 = await parent.waitFor((f) => f.kind === 'control' && f.op === 'error')
+  assert.equal(e1.code, 'bad_request')
+  parent.frames.length = 0
+  parent.send({
+    op: 'spawn_request', request_id: 'q2', from_convo_id: 'parent-convo',
+    target_device_id: targetDev.deviceId, workdir: '/w', task: 'x', model: 'm'.repeat(65),
+  })
+  const e2 = await parent.waitFor((f) => f.kind === 'control' && f.op === 'error')
+  assert.equal(e2.code, 'bad_request')
+})
+
 test('spawn_targets lists other agent boxes with online flags and brokered folders', async (t) => {
   const { s, targetDev, parent, target } = await spawnFleet(t)
   // answer the folder RPC like a bridge would

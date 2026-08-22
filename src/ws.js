@@ -64,6 +64,12 @@ const INVITE_TEXT_MAX_CHARS = 1000
 // the text the user reads is the text that takes effect.
 const SPAWN_TASK_MAX_CHARS = 2000
 const SPAWN_WORKDIR_MAX_CHARS = 1024
+// The optional model a spawn may request — an alias ('opus') or a full model
+// id ('claude-opus-4-20250514'). The vocabulary belongs to the target bridge,
+// so this is a length bound only, not an allowlist: a bridge that learns a new
+// alias must work against an older journal. 64 is the same cap RPC method and
+// error-code names get — identifier-shaped peer text, not body copy.
+const SPAWN_MODEL_MAX_CHARS = 64
 // Conversation titles quoted on a consent card to say WHICH session is
 // asking and which is being asked (spec: agent chat request naming). Titles
 // are agent-written, so they are peer text like from_name and get the same
@@ -872,6 +878,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (typeof msg.workdir !== 'string' || !msg.workdir || msg.workdir.length > SPAWN_WORKDIR_MAX_CHARS) return fail('bad_request', 'bad workdir')
         if (typeof msg.task !== 'string' || !msg.task || msg.task.length > SPAWN_TASK_MAX_CHARS) return fail('bad_request', 'bad task')
         if (msg.topic != null && (typeof msg.topic !== 'string' || msg.topic.length > INVITE_TOPIC_MAX_CHARS)) return fail('bad_request', 'bad topic')
+        // Optional, same shape rule as topic: absent is fine, present must be
+        // a bounded string. Deliberately NOT re-checked for emptiness after
+        // sanitisation the way workdir/task are — a model that sieves down to
+        // nothing means "no model named", which is a legal ask, not a bad one.
+        if (msg.model != null && (typeof msg.model !== 'string' || msg.model.length > SPAWN_MODEL_MAX_CHARS)) return fail('bad_request', 'bad model')
         if (!Number.isInteger(msg.target_device_id)) return fail('bad_request', 'bad target_device_id')
         if (msg.target_device_id === conn.deviceId) return fail('bad_request', 'cannot spawn on self')
         // Ownership stance copied from agent_request/agent_invite: unknown
@@ -905,6 +916,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const task = sanitizePeerText(msg.task, SPAWN_TASK_MAX_CHARS)
         if (!task) return fail('bad_request', 'bad task')
         const topic = sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS)
+        const model = sanitizePeerText(msg.model, SPAWN_MODEL_MAX_CHARS)
         // Shared attention throttle — counts chat asks AND spawn asks.
         if (countPendingAsks(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
           return fail('conflict', 'too many requests awaiting user approval')
@@ -913,7 +925,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         createSpawnRequest(db, {
           id: spawnId, userId: conn.userId, fromDeviceId: conn.deviceId,
           fromConvoId: msg.from_convo_id, targetDeviceId: msg.target_device_id,
-          workdir, task, topic,
+          workdir, task, topic, model,
         })
         // Client-only card (isClientOnlyEvent covers kind:'agent_spawn'),
         // published into the PARENT's own conversation — where the user is
@@ -937,6 +949,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           from_convo_title: sanitizePeerText(fromConvo.title, CARD_TITLE_MAX_CHARS),
           target_device_id: msg.target_device_id, target_name: sanitizePeerText(target.name, PEER_NAME_CAP),
           workdir, task, topic,
+          // Omitted rather than sent empty (the capacity blocks' stance, not
+          // topic's): a client renders this as a "will run on <model>" chip,
+          // and an empty one would read as a model named "".
+          ...(model ? { model } : {}),
         }
         let cardAppend
         try {
