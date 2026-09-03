@@ -156,9 +156,16 @@ agent_boxes()
                  default_workdir, folders: [{path, last_used}] } ] }
 ```
 
-Self is excluded, and the list is withheld entirely when the bridge's own
-identity is unknown — the same fail-closed stance `agent_roster` takes,
-for the same reason (a self-entry is a self-spawn trap).
+The caller's own box IS listed, flagged `self: true` (2026-09-03: the user
+may want the new session on the machine they are already talking to — the
+one with InDesign on it, say). The "self-spawn trap" a self entry was once
+thought to be (a looping agent spawning copies of itself) is fenced by the
+consent card every spawn passes through and the per-requester pending cap,
+so `spawn_request` accepts `target_device_id === self` too; the start rpc
+lands on the caller's own bridge, which already hosts several sessions side
+by side. `agent_roster` still excludes self (there is nothing to chat to).
+The list is still withheld entirely when the bridge's own identity is
+unknown — the same fail-closed stance `agent_roster` takes.
 
 ```
 agent_session_start({ device_id, workdir, task, topic? })

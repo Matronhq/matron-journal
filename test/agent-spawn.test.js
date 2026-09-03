@@ -205,6 +205,10 @@ test('spawn_request rejects a non-string or oversized model, same stance as topi
 
 test('spawn_targets lists other agent boxes with online flags and brokered folders', async (t) => {
   const { s, targetDev, parent, target } = await spawnFleet(t)
+  // the caller is a box too now, so it is asked for its own folders
+  parent.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
+    parent.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { folders: [] } })
+  })
   // answer the folder RPC like a bridge would
   target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
     target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { folders: [{ path: '/home/dan/app', last_used: 5 }] } })
@@ -216,12 +220,57 @@ test('spawn_targets lists other agent boxes with online flags and brokered folde
   assert.equal(eric.name, 'eric')
   assert.equal(eric.online, true)
   assert.deepEqual(eric.folders, [{ path: '/home/dan/app', last_used: 5 }])
-  // self is never listed
-  assert.equal(reply.boxes.some((b) => b.name === 'dev-6'), false)
+  // self IS listed (the user may want the session on this very machine),
+  // flagged so a caller can tell it apart, and not flagged on anyone else
+  const me = reply.boxes.find((b) => b.name === 'dev-6')
+  assert.equal(me.self, true)
+  assert.equal(me.online, true)
+  assert.equal('self' in eric, false)
+})
+
+test('spawn_targets: the caller answers its own recent_folders rpc, so the self entry carries folders too', async (t) => {
+  const { parentDev, parent } = await spawnFleet(t, { connectTarget: false })
+  parent.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
+    parent.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { folders: [{ path: '/Users/dan/Dev', last_used: 7 }] } })
+  })
+  parent.send({ op: 'spawn_targets', request_id: 'q-self' })
+  const reply = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets')
+  const me = reply.boxes.find((b) => b.device_id === parentDev.deviceId)
+  assert.equal(me.self, true)
+  assert.deepEqual(me.folders, [{ path: '/Users/dan/Dev', last_used: 7 }])
+})
+
+test('spawn on self: the card names the same box both ways, approve sends the start rpc to the caller, the room has the caller as owner and only participant', async (t) => {
+  const { s, parentDev, clientToken, parent, client } = await spawnFleet(t, { connectTarget: false })
+  parent.send({ op: 'spawn_request', request_id: 'rs', from_convo_id: 'parent-convo', target_device_id: parentDev.deviceId, workdir: '/w', task: 'carry on here' })
+  const card = await client.waitFor((f) => f.kind === 'journal' && f.type === 'permission_request' && f.payload?.kind === 'agent_spawn')
+  assert.equal(card.payload.from_device_id, parentDev.deviceId)
+  assert.equal(card.payload.target_device_id, parentDev.deviceId)
+  assert.equal(card.payload.target_name, 'dev-6')
+  const spawnId = card.payload.request_id
+  const bridgeTurn = parent.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start').then((req) => {
+    assert.equal(req.request.params.prompt, 'carry on here')
+    assert.equal(req.request.params.from_name, 'dev-6')
+    parent.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { convo_id: 'child-on-self' } })
+    return req.request.params.room_id
+  })
+  const r = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } })
+  assert.equal(r.status, 200)
+  const roomId = await bridgeTurn
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
+  assert.equal(out.outcome, 'started')
+  assert.equal(out.child_convo_id, 'child-on-self')
+  const room = s.db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(roomId)
+  assert.equal(room.agent_device_id, parentDev.deviceId)
+  const joined = s.db.prepare('SELECT agent_device_id, state FROM convo_agents WHERE convo_id=?').all(roomId)
+  assert.deepEqual(joined, [{ agent_device_id: parentDev.deviceId, state: 'joined' }])
 })
 
 test('spawn_targets: valid capacity blocks pass through; a malformed block is dropped but the box stays', async (t) => {
   const { s, dan, targetDev, parent, target } = await spawnFleet(t)
+  parent.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
+    parent.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { folders: [] } })
+  })
   const second = createAgent(s.db, dan.id, 'sicky')
   const bad = await makeWsClient(s.base, { token: second.token, cursor: null })
   await bad.waitFor((f) => f.op === 'hello_ok')
