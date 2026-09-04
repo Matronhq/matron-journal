@@ -13,7 +13,8 @@ docs/protocol.md in the matron-journal repo ("Journal search" for the index).
 ## Finding things
 
 - \`GET /search?q=<terms>&limit=<n>&convo_id=<id>\` — full-text search over
-  every one of your user's conversations, across all their devices. Terms are
+  every conversation visible to this device. An ordinary (non-private) agent
+  never sees conversations owned by private devices. Terms are
   ANDed literals (raw FTS5 syntax is neutralised); \`q\` max 256 chars;
   \`limit\` defaults 20, clamps at 50; \`convo_id\` narrows to one
   conversation. Hits: \`{convo_id, title, seq, ts, sender, snippet, live}\` —
@@ -21,8 +22,10 @@ docs/protocol.md in the matron-journal repo ("Journal search" for the index).
   matches in \`**\`, \`live: true\` means that conversation's agent session is
   running now. Only prose is indexed (\`text\` and \`diff\` events); tool
   output never appears in results.
-- \`GET /roster\` — \`{agents, conversations}\` metadata for the user's
-  devices and conversations (agent callers get \`snippet\` omitted).
+- \`GET /roster\` — \`{agents, conversations}\` metadata for the devices
+  and conversations visible to this device. Ordinary agent callers get
+  private devices and private-owned conversations omitted; every agent
+  caller gets \`snippet\` omitted.
 
 ## Reading
 
@@ -30,8 +33,9 @@ docs/protocol.md in the matron-journal repo ("Journal search" for the index).
   first; \`limit\` 1..200. Agent callers can only page conversations this
   device owns or has joined; others 404.
 - \`GET /convo/:id/messages?around_seq=<seq>&limit=\` — a context window
-  centred on a seq (pair it with a \`/search\` hit). Works on ANY of your
-  user's conversations: a foreign read returns indexed prose only, clamps
+  centred on a seq (pair it with a \`/search\` hit). Works on any
+  conversation visible to this device (private-owned ones 404 for an
+  ordinary agent): a foreign read returns indexed prose only, clamps
   \`limit\` to 30, and is logged server-side.
 - \`GET /snapshot\` — bootstrap state for this device.
 
