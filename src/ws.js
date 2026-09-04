@@ -884,7 +884,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // nothing means "no model named", which is a legal ask, not a bad one.
         if (msg.model != null && (typeof msg.model !== 'string' || msg.model.length > SPAWN_MODEL_MAX_CHARS)) return fail('bad_request', 'bad model')
         if (!Number.isInteger(msg.target_device_id)) return fail('bad_request', 'bad target_device_id')
-        if (msg.target_device_id === conn.deviceId) return fail('bad_request', 'cannot spawn on self')
+        // Spawning on the caller's own box is allowed: the start rpc lands on
+        // the same bridge, which already runs several sessions side by side
+        // (same-bridge rooms), and the user's consent card gates it like any
+        // other spawn.
         // Ownership stance copied from agent_request/agent_invite: unknown
         // id, another user's device, a client device — and a private device
         // seen by an ordinary agent — are indistinguishable not_found.
@@ -989,12 +992,17 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // 'conflict' the pending-ask cap uses.
         if (conn.spawnTargetsInflight) return fail('conflict', 'spawn_targets already in flight')
         conn.spawnTargetsInflight = true
-        // Same visibility rule as the roster: self excluded (a self-entry is
-        // a self-spawn trap), private boxes hidden from ordinary agents.
+        // Private boxes hidden from ordinary agents, as the roster does. Unlike
+        // the roster, the caller's OWN box is listed (flagged self:true): the
+        // user may want the new session on the machine they are already
+        // talking to — the one with InDesign on it, say. The "self-spawn
+        // trap" (a looping agent spawning copies of itself) is fenced by the
+        // consent card every spawn goes through and the per-requester
+        // pending cap, not by hiding the box.
         const callerPrivate = isPrivateDevice(db, conn.deviceId)
         const boxes = db.prepare(
-          "SELECT id AS device_id, name, private FROM devices WHERE user_id=? AND kind='agent' AND id!=?"
-        ).all(conn.userId, conn.deviceId)
+          "SELECT id AS device_id, name, private FROM devices WHERE user_id=? AND kind='agent'"
+        ).all(conn.userId)
           .filter((d) => callerPrivate || d.private !== 1)
         const live = new Set(hub.connsOf(conn.userId).filter((c) => c.ws.readyState === 1).map((c) => c.deviceId))
         // Folder discovery rides the broker (spec: "once it exists, folder
@@ -1024,6 +1032,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             // this is cheap insurance rather than closing a real hole.
             return {
               device_id: d.device_id, name: sanitizePeerText(d.name, PEER_NAME_CAP), online, folders,
+              ...(d.device_id === conn.deviceId ? { self: true } : {}),
               ...(activity ? { activity } : {}),
               ...(limits ? { limits } : {}),
               ...(disk ? { disk } : {}),
