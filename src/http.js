@@ -9,6 +9,7 @@ import { listAwaiting, answerParkedInvite, getParticipant } from './participants
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
+import { serveHelp } from './help.js'
 import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
@@ -278,6 +279,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       }
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
+      if (req.method === 'GET' && url.pathname === '/help') {
+        // API discovery for agent callers (see src/help.js). Behind auth like
+        // the rest of the device surface: it describes the API, and the
+        // unauthenticated internet doesn't need a map of it.
+        return serveHelp(res)
+      }
       if (req.method === 'GET' && url.pathname === '/snapshot') {
         // Two independent rules layered on top of the client shape (spec:
         // agent visibility & privacy, task 8):
