@@ -60,3 +60,22 @@ export function makeWaker({
     },
   }
 }
+
+// Shared by ws.js (send / prompt_reply / agent_request / spawn_request) and
+// items-http.js (user-authored item markers): traffic for an agent device
+// with no live socket asks the infra layer to start its box. Same-user
+// scoping mirrors the anti-enumeration stance of every call site.
+export function wakeIfOffline({ db, hub, waker }, userId, agentDeviceId) {
+  if (!waker || !waker.enabled || !Number.isInteger(agentDeviceId)) return
+  const online = hub.connsOf(userId).some((c) => c.deviceId === agentDeviceId && c.ws.readyState === 1)
+  if (online) return
+  const dev = db.prepare('SELECT name, kind FROM devices WHERE id=? AND user_id=?').get(agentDeviceId, userId)
+  if (!dev || dev.kind !== 'agent') return
+  waker.wake(dev.name)
+}
+
+export function wakeConvoAgent({ db, hub, waker }, userId, convoId) {
+  if (!waker || !waker.enabled) return
+  const row = db.prepare('SELECT agent_device_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)
+  if (row && row.agent_device_id != null) wakeIfOffline({ db, hub, waker }, userId, row.agent_device_id)
+}
