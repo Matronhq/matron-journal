@@ -1169,6 +1169,17 @@ test('POST /items: client creates a task, agent gets woken, marker sender is use
   assert.equal(JSON.parse(ev.payload).by, 'user')
 })
 
+test('POST /items on_behalf_of: agent files a user-created task; clients may not send the field', async (t) => {
+  const { s, agent, client, wakeCalls } = await fleet(t)
+  const r = await mkItem(s, agent.token, { kind: 'task', title: 'From queue', on_behalf_of: 'user' })
+  assert.equal(r.status, 201); assert.equal(r.json.item.created_by, 'user')
+  const ev = s.db.prepare("SELECT sender, payload FROM events WHERE type='item' ORDER BY seq DESC LIMIT 1").get()
+  assert.equal(ev.sender, 'agent:dev-2'); assert.equal(JSON.parse(ev.payload).by, 'user')
+  assert.equal(wakeCalls.length, 0)
+  assert.equal((await mkItem(s, client, { on_behalf_of: 'user' })).status, 400)
+  assert.equal((await mkItem(s, agent.token, { on_behalf_of: 'agent' })).status, 400)
+})
+
 test('POST /items idempotency header', async (t) => {
   const { s, agent } = await fleet(t)
   const a = await s.http('/items', { method: 'POST', token: agent.token, headers: { 'idempotency-key': 'k1' }, body: { kind: 'task', title: 'T', convo_id: 'c1' } })
@@ -1300,8 +1311,8 @@ function visibleItem(db, who, idOrNum) {
   return item
 }
 
-function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action, comment = null }) {
-  const by = who.kind === 'agent' ? 'agent' : 'user'
+function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action, comment = null, by = null }) {
+  if (by == null) by = who.kind === 'agent' ? 'agent' : 'user'
   const payload = itemMarkerPayload({ item, action, by, comment })
   const sender = senderOf(db, who)
   let r
@@ -1318,7 +1329,9 @@ function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action, comme
   } catch (err) {
     console.error('items: push onAppend failed', err)
   }
-  if (by === 'user' && action !== 'reordered') wakeConvoAgent({ db, hub, waker }, who.userId, item.origin_convo_id)
+  // Wake keys off the WRITER's device kind, not `by`: an agent filing on
+  // behalf of the user is already awake.
+  if (who.kind !== 'agent' && action !== 'reordered') wakeConvoAgent({ db, hub, waker }, who.userId, item.origin_convo_id)
 }
 
 const oneOf = (v, list) => v == null ? null : (list.includes(v) ? v : undefined)
@@ -1367,6 +1380,12 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
     const convo = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(body.convo_id)
     if (!convo || convo.owner_user_id !== who.userId) { json(res, 404, { error: 'not_found' }); return true }
     if (filteredAgent(db, who) && convo.agent_device_id != null && isPrivateDevice(db, convo.agent_device_id)) { json(res, 404, { error: 'not_found' }); return true }
+    // on_behalf_of:'user' lets the bridge file a task the USER asked for (the
+    // queued-card "Make task" tap) as user-created: created_by and the
+    // marker's `by` read 'user', so the apps show who really filed it. The
+    // marker's sender stays the agent device (no wake, no self-prompt).
+    if (body.on_behalf_of !== undefined && (body.on_behalf_of !== 'user' || who.kind !== 'agent')) { json(res, 400, { error: 'bad_request' }); return true }
+    const createdBy = body.on_behalf_of === 'user' || who.kind !== 'agent' ? 'user' : 'agent'
     let out
     try {
       out = createItem(db, {
@@ -1374,14 +1393,14 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
         awaiting: body.awaiting === null ? null : awaiting,
         position: body.position, after: body.after, before: body.before,
         originConvoId: body.convo_id, originDeviceId: who.deviceId,
-        createdBy: who.kind === 'agent' ? 'agent' : 'user',
+        createdBy,
         supersedes: body.supersedes ?? null, idemKey: idemKeyOf(req, who),
       })
     } catch (err) {
       if (err.message === 'bad_after_before' || err.message === 'bad_supersedes') { json(res, 400, { error: 'bad_request' }); return true }
       throw err
     }
-    if (!out.duplicate) emitMarker(ctx, who, { item: out.item, action: 'created' })
+    if (!out.duplicate) emitMarker(ctx, who, { item: out.item, action: 'created', by: createdBy })
     json(res, out.duplicate ? 200 : 201, { item: out.item })
     return true
   }
@@ -1440,7 +1459,7 @@ In `src/server.js`, add `waker: resolvedWaker,` to the `makeHttpHandler({...})` 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `node --test test/items-http.test.js`
-Expected: PASS (6 tests).
+Expected: PASS (7 tests).
 
 - [ ] **Step 5: Run the whole suite and commit**
 
@@ -1631,7 +1650,7 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `node --test test/items-http.test.js`
-Expected: PASS (11 tests).
+Expected: PASS (12 tests).
 
 - [ ] **Step 5: Full suite and commit**
 
@@ -1700,7 +1719,7 @@ itself on every mutating route — agents cannot `publish` one.
 |---|---|---|
 | `GET /items` | `convo, kind, state, awaiting, label, sort=rank\|updated, since, limit≤500, cursor` | `{items:[…], next_cursor}` |
 | `GET /items/:id` | `:id` = `it_…` or `#num` (URL-encode `#`) | `{item, comments:[…]}` |
-| `POST /items` | `{kind, title, body?, labels?, links?, attachments?, awaiting?, position?, after?, before?, convo_id, supersedes?}` + optional `Idempotency-Key` | 201 `{item}` (200 on replay) |
+| `POST /items` | `{kind, title, body?, labels?, links?, attachments?, awaiting?, position?, after?, before?, convo_id, supersedes?, on_behalf_of?:'user' (agent callers only)}` + optional `Idempotency-Key` | 201 `{item}` (200 on replay) |
 | `PATCH /items/:id` | `{title?, body?, labels?, links?, awaiting?}` | `{item}` |
 | `POST /items/:id/comments` | `{body?, attachments?}` (one required) + optional `Idempotency-Key` | 201 `{item, comment}` |
 | `PATCH /items/:id/comments/:cid` | `{blob_ref, transcript}` — agent only | `{comment}` |
