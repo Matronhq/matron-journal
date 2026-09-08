@@ -4,6 +4,7 @@
 // user-authored writes, and the push pipeline.
 import { appendAndBroadcast, toEventShape } from './journal.js'
 import { isPrivateDevice } from './db.js'
+import { authorizeAgentWrite } from './auth.js'
 import { wakeConvoAgent } from './wake.js'
 import { json, readBody } from './http-body.js'
 import { ITEM_KINDS, AWAITING, validateItemFields, createItem, getItem, listItems, listComments, updateItem } from './items.js'
@@ -33,9 +34,13 @@ function answerKnownError(res, err) {
   return status === 409 ? conflict(res) : badRequest(res)
 }
 
+// null = header absent, undefined = header present but unusable (→ 400).
+// Never silently ignored: a client that believes its retry is being deduped
+// would otherwise create a second item and never know.
 const idemKeyOf = (req, who) => {
   const k = req.headers['idempotency-key']
-  if (typeof k !== 'string' || !k || k.length > IDEM_KEY_MAX) return null
+  if (k === undefined) return null
+  if (typeof k !== 'string' || !k || k.length > IDEM_KEY_MAX) return undefined
   // Scoped to the calling device: two devices replaying the same key are two
   // different intents, and a key is only unique per (user_id, idem_key).
   return `${who.deviceId}:${k}`
@@ -140,16 +145,26 @@ async function handleCreate(ctx, req, res, who) {
     if (body[k] !== undefined && (typeof body[k] !== 'string' || !body[k] || body[k].length > ID_MAX)) return badRequest(res)
   }
   if (typeof body.convo_id !== 'string') return badRequest(res)
-  // The origin conversation must be the caller's user's. Agents additionally
-  // hit the sieve: an ordinary agent cannot file into a private convo.
-  const convo = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(body.convo_id)
-  if (!convo || convo.owner_user_id !== who.userId) return notFound(res)
-  if (filteredAgent(db, who) && convo.agent_device_id != null && isPrivateDevice(db, convo.agent_device_id)) return notFound(res)
   // on_behalf_of:'user' lets the bridge file a task the USER asked for (the
   // queued-card "Make task" tap) as user-created: created_by and the
   // marker's `by` read 'user', so the apps show who really filed it. The
   // marker's sender stays the agent device (no wake, no self-prompt).
   if (body.on_behalf_of !== undefined && (body.on_behalf_of !== 'user' || who.kind !== 'agent')) return badRequest(res)
+  const idemKey = idemKeyOf(req, who)
+  if (idemKey === undefined) return badRequest(res)
+  // Every body-only rule is settled above, so a malformed field answers 400
+  // even when the conversation is one this caller may not see.
+  //
+  // The origin conversation must be the caller's user's; an AGENT must
+  // additionally clear the same gate every other agent-authored append does
+  // (ws.js publish/prompt/stream, /convo/:id/messages): it owns the
+  // conversation or has joined it. 404, never 403 — a refusal must be
+  // indistinguishable from a conversation that isn't there. Then the sieve:
+  // an ordinary agent cannot file into a private-owned convo even if joined.
+  const convo = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(body.convo_id)
+  if (!convo || convo.owner_user_id !== who.userId) return notFound(res)
+  if (who.kind === 'agent' && !authorizeAgentWrite(db, who.userId, who.deviceId, body.convo_id)) return notFound(res)
+  if (filteredAgent(db, who) && convo.agent_device_id != null && isPrivateDevice(db, convo.agent_device_id)) return notFound(res)
   const createdBy = body.on_behalf_of === 'user' || who.kind !== 'agent' ? 'user' : 'agent'
   let out
   try {
@@ -159,7 +174,7 @@ async function handleCreate(ctx, req, res, who) {
       position: body.position, after: body.after, before: body.before,
       originConvoId: body.convo_id, originDeviceId: who.deviceId,
       createdBy,
-      supersedes: body.supersedes ?? null, idemKey: idemKeyOf(req, who),
+      supersedes: body.supersedes ?? null, idemKey,
     })
   } catch (err) {
     if (answerKnownError(res, err)) return true
@@ -206,7 +221,10 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
     return false
   }
 
-  const m = path.match(/^\/items\/([^/]+)(?:\/(comments|close|reopen|rank))?(?:\/([^/]+))?$/)
+  // The trailing id is nested inside the sub segment on purpose: flattened,
+  // `/items/:id/<junk>` matched as [id, null, junk] and served/mutated the
+  // item as if the junk weren't there.
+  const m = path.match(/^\/items\/([^/]+)(?:\/(comments|close|reopen|rank)(?:\/([^/]+))?)?$/)
   if (!m) return false
   let idOrNum
   try { idOrNum = decodeURIComponent(m[1]) } catch { return badRequest(res) }

@@ -210,11 +210,26 @@ export function createItem(db, {
     const id = newId('it')
     const num = nextNum(db, userId)
     const aw = awaiting === undefined ? defaultAwaiting(kind) : awaiting
-    db.prepare(`INSERT INTO items(id,user_id,num,kind,state,resolution,awaiting,rank,title,body,labels,links,supersedes,
-      origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at)
-      VALUES(?,?,?,?,'open',NULL,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(id, userId, num, kind, aw, rank, title, body, JSON.stringify(labels), JSON.stringify(links), supersedes,
-        originConvoId, originDeviceId, createdBy, idemKey, now, now)
+    try {
+      db.prepare(`INSERT INTO items(id,user_id,num,kind,state,resolution,awaiting,rank,title,body,labels,links,supersedes,
+        origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at)
+        VALUES(?,?,?,?,'open',NULL,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(id, userId, num, kind, aw, rank, title, body, JSON.stringify(labels), JSON.stringify(links), supersedes,
+          originConvoId, originDeviceId, createdBy, idemKey, now, now)
+    } catch (err) {
+      // A racing writer on another connection committed the same
+      // (user_id, idem_key) between our lookup above and this INSERT. That
+      // is precisely the case the key exists to handle, so hand back their
+      // row rather than surfacing a raw constraint error as a 500. (The
+      // `num` this call minted is spent — a gap in the user's numbering is
+      // a fair price for never double-filing an item.) Any other unique
+      // violation is a real bug and still throws.
+      if (idemKey && err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+        const dup = db.prepare('SELECT id FROM items WHERE user_id=? AND idem_key=?').get(userId, idemKey)
+        if (dup) return { item: getItem(db, userId, dup.id), duplicate: true }
+      }
+      throw err
+    }
     if (attachments.length) {
       // Item-body attachments ride on a synthetic first comment of kind
       // 'status' with meta.role='body' so the thread has one place for

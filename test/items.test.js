@@ -83,6 +83,37 @@ test('createItem idempotency returns the original row', async () => {
   assert.equal(r2.item.id, r1.item.id); assert.equal(r2.item.title, 'Do the thing')
 })
 
+test('createItem: a racing writer on the same idem_key yields their row, not a constraint error', async () => {
+  const { db, dan } = await seed()
+  const realPrepare = db.prepare.bind(db)
+  let armed = true
+  // Stand in for a second connection committing the same key in the window
+  // between createItem's dup lookup and its INSERT: the lookup still misses,
+  // then the INSERT trips the (user_id, idem_key) unique index.
+  db.prepare = (sql) => {
+    const st = realPrepare(sql)
+    if (!armed || !sql.startsWith('SELECT * FROM items WHERE user_id=? AND idem_key=?')) return st
+    armed = false
+    return {
+      get: (...args) => {
+        const miss = st.get(...args)
+        realPrepare(`INSERT INTO items(id,user_id,num,kind,state,awaiting,rank,title,origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at)
+          VALUES('it_race',?,99,'task','open','agent',77,'Theirs','c1',1,'agent','k1',0,0)`).run(dan.id)
+        return miss
+      },
+    }
+  }
+  let out
+  try {
+    out = createItem(db, base({ userId: dan.id, idemKey: 'k1', title: 'Mine' }))
+  } finally {
+    db.prepare = realPrepare
+  }
+  assert.equal(out.duplicate, true)
+  assert.equal(out.item.id, 'it_race'); assert.equal(out.item.title, 'Theirs')
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM items').get().n, 1)
+})
+
 test('getItem accepts id, #num, num; other user 404s', async () => {
   const { db, dan, pat } = await seed()
   const a = createItem(db, base({ userId: dan.id })).item

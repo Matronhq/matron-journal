@@ -4,6 +4,7 @@ import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import { pinDevicePrivate } from '../src/db.js'
+import { recordJoined } from '../src/participants.js'
 import { closeItem } from '../src/items.js'
 
 // Fleet: dan (client 'mac' + agent dev-2 managing c1), pat (own agent, own convo).
@@ -82,6 +83,9 @@ test('POST /items on_behalf_of: agent files a user-created task; clients may not
   assert.equal(wakeCalls.length, 0)
   assert.equal((await mkItem(s, client, { on_behalf_of: 'user' })).status, 400)
   assert.equal((await mkItem(s, agent.token, { on_behalf_of: 'agent' })).status, 400)
+  // A body-only rule is settled before the conversation is looked up, so a
+  // client sending the field never learns whether that convo exists.
+  assert.equal((await mkItem(s, client, { on_behalf_of: 'user', convo_id: 'nope' })).status, 400)
 })
 
 test('POST /items idempotency header', async (t) => {
@@ -169,6 +173,40 @@ test('PATCH /items/:id: awaiting on a closed item is a conflict, clearing it is 
   const ok = await s.http(`/items/${id}`, { method: 'PATCH', token: client, body: { title: 'Still closed', awaiting: null } })
   assert.equal(ok.status, 200); assert.equal(ok.json.item.state, 'closed'); assert.equal(ok.json.item.awaiting, null)
   assert.equal(wakeCalls.length, 0) // an edit is not traffic for the box
+})
+
+test('POST /items: an agent may only file into a conversation it owns or has joined', async (t) => {
+  const { s, dan, agent, client } = await fleet(t)
+  const other = createAgent(s.db, dan.id, 'dev-3')
+  upsertConversation(s.db, { id: 'c3', ownerUserId: dan.id, title: 'C3', agentDeviceId: other.deviceId })
+  const foreign = await mkItem(s, agent.token, { convo_id: 'c3', title: 'Not mine' })
+  assert.equal(foreign.status, 404); assert.equal(foreign.json.error, 'not_found')
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM items').get().n, 0)
+  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='item'").get().n, 0)
+  // The managing box may, and so may a joined participant...
+  assert.equal((await mkItem(s, other.token, { convo_id: 'c3', title: 'Mine' })).status, 201)
+  recordJoined(s.db, { convoId: 'c3', agentDeviceId: agent.deviceId, initiatorDeviceId: other.deviceId })
+  assert.equal((await mkItem(s, agent.token, { convo_id: 'c3', title: 'Joined' })).status, 201)
+  // ...and the write gate never applies to the user's own client.
+  assert.equal((await mkItem(s, client, { convo_id: 'c3', title: 'Dan\'s' })).status, 201)
+})
+
+test('POST /items: a malformed Idempotency-Key is rejected, never silently ignored', async (t) => {
+  const { s, agent } = await fleet(t)
+  const post = (key) => s.http('/items', { method: 'POST', token: agent.token, headers: { 'idempotency-key': key }, body: { kind: 'task', title: 'T', convo_id: 'c1' } })
+  assert.equal((await post('')).status, 400)
+  assert.equal((await post('k'.repeat(129))).status, 400)
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM items').get().n, 0)
+  assert.equal((await post('k'.repeat(128))).status, 201)
+})
+
+test('a junk sub-path is never treated as the item itself', async (t) => {
+  const { s, agent, client } = await fleet(t)
+  const id = (await mkItem(s, agent.token, {})).json.item.id
+  assert.equal((await s.http(`/items/${id}/commentz`, { token: client })).status, 404)
+  assert.equal((await s.http(`/items/${id}/anything`, { method: 'PATCH', token: client, body: { title: 'Hijacked' } })).status, 404)
+  assert.equal((await s.http(`/items/${id}/comments/ic_1/extra`, { token: client })).status, 404)
+  assert.equal((await s.http(`/items/${id}`, { token: client })).json.item.title, 'Which auth?')
 })
 
 test('oversized item body gets 413 and no item is written', async (t) => {
