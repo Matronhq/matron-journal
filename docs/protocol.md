@@ -1239,6 +1239,103 @@ Both paths use the same state-scoped `UPDATE ... WHERE state='approved'` (`markF
 
 Outstanding `awaiting_user` rows per *requesting* device are capped at `MAX_AWAITING_PER_REQUESTER` (3), shared with agent-chat invites and joins — the cap is what stops a re-ask loop, not TTL ambiguity or answer masking. Over the cap, `spawn_request` fails `{code:'conflict', detail:'too many requests awaiting user approval'}`.
 
+## Items (task & decision tracker)
+
+Spec: `docs/superpowers/specs/2026-09-08-task-decision-tracker-design.md`.
+
+Items are journal-owned rows (`items`, `item_comments`), scoped to the
+user like everything else, with a per-user `#num` starting at 1. The
+conversation log carries only **marker events** of type `item`, written by
+the journal itself on every mutating route — agents cannot `publish` one.
+
+### Routes (Bearer, either device kind)
+
+| Route | Body / query | Response |
+|---|---|---|
+| `GET /items` | `convo, kind, state, awaiting, label, sort=rank\|updated, since, limit≤500, cursor` | `{items:[…], next_cursor}` |
+| `GET /items/:id` | `:id` = `it_…` or `#num` (URL-encode `#`) | `{item, comments:[…]}` |
+| `POST /items` | `{kind, title, body?, labels?, links?, attachments?, awaiting?, position?, after?, before?, convo_id, supersedes?, on_behalf_of?:'user' (agent callers only)}` + optional `Idempotency-Key` | 201 `{item}` (200 on replay) |
+| `PATCH /items/:id` | `{title?, body?, labels?, links?, awaiting?}` | `{item}` |
+| `POST /items/:id/comments` | `{body?, attachments?}` (one required) + optional `Idempotency-Key` | 201 `{item, comment}` (200 on replay) |
+| `PATCH /items/:id/comments/:cid` | `{blob_ref, transcript}` — agent only, else 403 | `{comment}` |
+| `POST /items/:id/close` | `{resolution, comment?}` | `{item, comment}`; 409 if already closed |
+| `POST /items/:id/reopen` | `{comment?}` | `{item, comment}`; 409 if already open |
+| `POST /items/:id/rank` | exactly one of `{position:'top'\|'bottom'}` / `{after}` / `{before}` — zero or two given is 400 | `{item}`; 409 if the item is closed |
+
+Item shape: `{id, user_id, num, kind, state, resolution, awaiting, rank,
+title, body, labels[], links[{url,title?}], supersedes, origin_convo_id,
+origin_device_id, created_by, idem_key, created_at, updated_at, closed_at,
+comment_count, last_comment_at, attachments[], has_image}`. `attachments`
+here is the item **body**'s attachments (set at create only, v1) — a
+comment's own attachments live on the comment. Comment shape:
+`{id, item_id, user_id, author, device_id, kind:'comment'|'status', body,
+idem_key, created_at, attachments[{blob_ref,mime,name,size,transcript?}],
+meta}`. `meta` is `null` for an ordinary comment and `{from:{state,
+resolution,awaiting}, to:{…}}` for the synthetic `status` comment a
+close/reopen writes.
+
+Rules: a `question` starts `awaiting:'user'`, a `task` `awaiting:'agent'`,
+a `decision` `null`. A **user** comment always sets `awaiting:'agent'` and
+reopens a closed item. Close clears `awaiting`. Reopen restores the kind
+default (decision → `null`). `rank` is one order per user; midpoint
+insertion, server-side renormalisation when a midpoint would land within
+epsilon of a neighbour.
+
+Visibility: an ordinary (non-private) agent never sees an item whose origin
+conversation is managed by a private device — list omits it, every other
+route 404s — same predicate as `/search`. Unknown ids, other users' items,
+and sieved items are all 404 (never 403 — a refusal must be
+indistinguishable from an item that doesn't exist).
+
+Agent write gate: every agent-authored mutation (create, comment, close,
+reopen, rank, transcript patch) additionally requires `authorizeAgentWrite`
+on the item's origin conversation — the agent manages it (owns
+`agent_device_id`, or the conversation has none yet) or has joined it
+(`convo_agents` with `state='joined'`). Refused the same way as any other
+visibility failure: 404, never 403.
+
+### Idempotency
+
+`POST /items` and `POST /items/:id/comments` accept an `Idempotency-Key`
+header, scoped to `${device_id}:${key}`. A header present but empty, too
+long, or non-string is 400 `bad_request` — a client that believes its retry
+is being deduped must never have that silently ignored. A key already
+associated with a row (the *same* item for a comment; any item for a
+create, since the create-side lookup matches on the key alone) replays
+that row verbatim: `200` instead of `201`, and **no second marker is
+emitted**. A comment key reused against a *different* item is a genuine
+conflict — `409 {"error":"conflict"}` (`idem_key_conflict`) — since a key
+is unique per `(user_id, idem_key)` in the schema, not per item.
+
+### Marker event
+
+```json
+{ "seq": 123, "convo_id": "c1", "ts": 1699999999000,
+  "sender": "user:dan" | "agent:dev-2", "type": "item",
+  "payload": { "item_id": "it_…", "num": 12, "kind": "question", "title": "…",
+    "action": "created|commented|closed|reopened|reordered", "by": "user|agent",
+    "awaiting": "user|agent|null", "resolution": "…|null",
+    "comment": { "id": "ic_…", "body": "…", "attachments": [ … ] } } }
+```
+
+Same envelope (`seq, convo_id, ts, sender, type, payload`) as every other
+journal event. `comment` is present only when the action carried comment
+text or attachments (a bare close/reopen with no note omits it). The
+event's `sender` is the writer's device, so a client-authored marker is a
+user event on the origin conversation: the wake-on-message path fires for
+`created|commented|closed|reopened` written by a client device (never for
+an agent's own write — it's already awake), and bridges treat those as
+inbound turns. `reordered` never wakes and never pushes.
+
+Push: `attention` when an agent-sourced marker leaves an item
+`awaiting:'user'` via `created` (regardless of `by`, e.g. an
+`on_behalf_of:'user'` create) or via `commented`/`reopened` with
+`by:'agent'`; everything else (including every user-authored marker, and
+every `reordered`) is journal-sync only. Not a `MESSAGE_TYPES` entry: no
+unread-badge or conversation-preview-snippet effect — but the push body
+text still runs the event's payload through `snippetOf`, which formats an
+`❓`/`⚖`/`☐` glyph + `#num title` for the alert.
+
 ## Device privacy
 
 (spec: `docs/superpowers/specs/2026-08-07-agent-visibility-privacy-design.md`.)
