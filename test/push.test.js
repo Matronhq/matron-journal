@@ -54,23 +54,14 @@ function registerDevice(db, userId, name, { token = `${name}-token`, env = 'prod
   return deviceId
 }
 
-// Fixture for tests that just need one user, one client push device, one
-// conversation, and a pipeline whose fake apnsClient records every send —
-// mirrors `setup()`/`registerDevice()` above (device creation +
-// setApnsRegistration + push_prefs all-on) plus the one conversation the
-// item-marker tests append events into. `sent` aliases the stub's `calls`
-// array (same recording the rest of this file inspects as `stub.calls`).
+// Thin wrapper around `setup(t)` for tests that also need one registered
+// client push device: adds that device and exposes `stub.calls` as `sent`
+// (same recording the rest of this file inspects as `stub.calls`) plus the
+// convo id `setup` already creates ('c1').
 async function setupPipeline(t) {
-  const db = openDb(':memory:')
-  const hub = makeHub()
-  const dan = await createUser(db, 'dan', 'pw')
-  const stub = makeStubApnsClient()
-  const pipeline = makePushPipeline({ db, hub, apnsClient: stub })
-  t.after(() => pipeline.close())
-  const convoId = 'c1'
-  upsertConversation(db, { id: convoId, ownerUserId: dan.id, title: 'convo one' })
+  const { db, hub, dan, stub, pipeline } = await setup(t)
   const clientDeviceId = registerDevice(db, dan.id, 'phone')
-  return { db, hub, pipeline, sent: stub.calls, dan, convoId, clientDevice: { id: clientDeviceId } }
+  return { db, hub, pipeline, sent: stub.calls, dan, convoId: 'c1', clientDevice: { id: clientDeviceId } }
 }
 
 test('disabled mode (no apnsClient) is inert', async (t) => {
@@ -804,7 +795,7 @@ test('end-to-end wiring: convo_upsert threads the previous session state into th
   agent.close()
 })
 
-test('item markers: agent-created question pushes as attention; user-authored and reorder markers are silent', async (t) => {
+test('item markers: agent-created question pushes as attention; user-authored, non-awaiting, and reorder markers are silent', async (t) => {
   // Use the same fixture setup as the test above this one: a user, a client
   // device with an apns token, a conversation, and a pipeline with a fake
   // APNs client that records `sent` payloads.
@@ -816,7 +807,29 @@ test('item markers: agent-created question pushes as attention; user-authored an
   assert.equal(sent[0].category, 'attention')
   pipeline.onAppend(dan.id, { seq: 11, convo_id: convoId, ts: 2, sender: 'agent:dev-2', type: 'item', payload: { ...base, action: 'closed', awaiting: null, resolution: 'answered' } }, 0)
   pipeline.onAppend(dan.id, { seq: 12, convo_id: convoId, ts: 3, sender: 'agent:dev-2', type: 'item', payload: { ...base, action: 'reordered', awaiting: 'user' } }, 0)
-  pipeline.onAppend(dan.id, { seq: 13, convo_id: convoId, ts: 4, sender: 'user:dan', type: 'item', payload: { ...base, action: 'commented', by: 'user', awaiting: 'agent' } }, clientDevice.id)
-  assert.equal(sent.length, 1)
-  void hub; void db
+  // Isolates the `awaiting === 'user'` clause: a `created` marker NOT
+  // awaiting the user must stay silent even though `action` alone would
+  // otherwise satisfy the rule — deleting the awaiting check would wrongly
+  // push this one.
+  pipeline.onAppend(dan.id, { seq: 14, convo_id: convoId, ts: 5, sender: 'agent:dev-2', type: 'item', payload: { ...base, action: 'created', awaiting: 'agent' } }, 0)
+  assert.equal(sent.length, 1, 'created but not awaiting the user must stay silent')
+  // Spec alignment (design spec ~:207-210, binding over the original brief):
+  // commented/reopened only push when by='agent' — a user-authored comment
+  // marker must not re-alert the user about their own words, even when
+  // awaiting='user' and the sender label alone (agent:dev-2) would not
+  // otherwise silence it.
+  pipeline.onAppend(dan.id, { seq: 15, convo_id: convoId, ts: 6, sender: 'agent:dev-2', type: 'item', payload: { ...base, action: 'commented', by: 'user', awaiting: 'user' } }, 0)
+  assert.equal(sent.length, 1, 'a commented marker authored by the user must stay silent even when awaiting the user')
+  // An agent-authored reopen that hands the item back to the user does push.
+  pipeline.onAppend(dan.id, { seq: 16, convo_id: convoId, ts: 7, sender: 'agent:dev-2', type: 'item', payload: { ...base, action: 'reopened', by: 'agent', awaiting: 'user' } }, 0)
+  assert.equal(sent.length, 2, 'an agent-reopened marker left awaiting the user must push')
+  // The user-sender rule itself, isolated from origin-device exclusion: a
+  // push-worthy marker (created, awaiting user) sent with sender `user:*`
+  // must still be silenced by the early user-sender check. Origin device is
+  // 0 here — NOT clientDevice.id — so the only device is not excluded by
+  // being the event's origin; if the user-sender rule were removed, this
+  // event would otherwise push.
+  pipeline.onAppend(dan.id, { seq: 13, convo_id: convoId, ts: 4, sender: 'user:dan', type: 'item', payload: { ...base, action: 'created', awaiting: 'user' } }, 0)
+  assert.equal(sent.length, 2, 'a user-authored marker must never push, even when action/awaiting alone would qualify')
+  void hub; void db; void clientDevice
 })
