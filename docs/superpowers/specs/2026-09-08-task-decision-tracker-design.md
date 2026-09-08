@@ -160,7 +160,7 @@ agent's marker turns into a prompt — see *Routing*).
 |---|---|
 | `GET /items?convo=&kind=&state=&awaiting=&label=&sort=rank|updated&since=&limit=&cursor=` | List. `since` = `updated_at` watermark for cheap polling. Default `limit` 100, max 500. Returns `{items:[…], next_cursor?}`; each item carries `comment_count`, `last_comment_at`, `has_image`. |
 | `GET /items/:id` | One item + full thread `{item, comments:[…]}`. Accepts `#num` as well as id. |
-| `POST /items` | Create. Body `{kind, title, body?, labels?, links?, attachments?, awaiting?, position?, after?, before?, convo_id?, supersedes?}`. Agents default `convo_id` to their current conversation (bridge fills it in); clients must pass it. Returns the item. |
+| `POST /items` | Create. Body `{kind, title, body?, labels?, links?, attachments?, awaiting?, position?, after?, before?, convo_id?, supersedes?, on_behalf_of?}`. Agents default `convo_id` to their current conversation (bridge fills it in); clients must pass it. `on_behalf_of: "user"` (agent callers only) records the item as user-created with a marker `by: "user"`, for the queued-card "Make task" tap, which the bridge performs with its own token; the marker's sender stays the agent device so it neither wakes nor re-prompts. Returns the item. |
 | `PATCH /items/:id` | Update `title, body, labels, links, awaiting`. Author-agnostic. |
 | `POST /items/:id/comments` | `{body, attachments?}` → comment. Applies the `awaiting` flip rules. |
 | `PATCH /items/:id/comments/:cid` | Agent-only, `{transcript}` on one attachment. |
