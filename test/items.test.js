@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { openDb } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
-import { createItem, getItem, listItems, validateItemFields, resolveRank, RANK_EPSILON } from '../src/items.js'
+import { createItem, getItem, listItems, validateItemFields, resolveRank, RANK_EPSILON, rerankItem, renormaliseRanks, RANK_GAP } from '../src/items.js'
 import { addComment, closeItem, reopenItem, updateItem, setAttachmentTranscript, listComments } from '../src/items.js'
 
 test('schema: items, item_comments, item_counters exist with the expected columns', () => {
@@ -316,4 +316,43 @@ test('setAttachmentTranscript writes into exactly one attachment', async () => {
   assert.equal(out.attachments[0].transcript, 'hello'); assert.equal(out.attachments[1].transcript, undefined)
   assert.equal(getItem(db, dan.id, t.id).updated_at, 500)
   assert.equal(setAttachmentTranscript(db, { userId: dan.id, itemId: t.id, commentId: c.id, blobRef: 'nope', transcript: 'x' }), null)
+})
+
+test('rerankItem: midpoints, top, bottom, self-neighbour rejected, closed neighbour rejected', async () => {
+  const { db, dan } = await seed()
+  const [a, b, c] = ['A', 'B', 'C'].map((t) => createItem(db, base({ userId: dan.id, title: t })).item)
+  assert.equal(rerankItem(db, { userId: dan.id, itemId: c.id, after: a.id, before: b.id }).rank, (a.rank + b.rank) / 2)
+  assert.equal(rerankItem(db, { userId: dan.id, itemId: c.id, position: 'top' }).rank, a.rank - RANK_GAP)
+  assert.equal(rerankItem(db, { userId: dan.id, itemId: c.id, position: 'bottom' }).rank, b.rank + RANK_GAP)
+  // "before b" alone lands between its predecessor (a) and b
+  assert.equal(rerankItem(db, { userId: dan.id, itemId: c.id, before: b.id }).rank, (a.rank + b.rank) / 2)
+  // "after b" alone with nothing after b → b + 1024
+  assert.equal(rerankItem(db, { userId: dan.id, itemId: c.id, after: b.id }).rank, b.rank + RANK_GAP)
+  assert.throws(() => rerankItem(db, { userId: dan.id, itemId: c.id, after: c.id }), /bad_after_before/)
+  closeItem(db, { userId: dan.id, itemId: a.id, resolution: 'done', author: 'agent', deviceId: 1 })
+  assert.throws(() => rerankItem(db, { userId: dan.id, itemId: c.id, after: a.id }), /bad_after_before/)
+  assert.equal(rerankItem(db, { userId: 999, itemId: c.id, position: 'top' }), null)
+})
+
+test('rerankItem renormalises when the gap is exhausted', async () => {
+  const { db, dan } = await seed()
+  const a = createItem(db, base({ userId: dan.id, title: 'A' })).item
+  const b = createItem(db, base({ userId: dan.id, title: 'B' })).item
+  const c = createItem(db, base({ userId: dan.id, title: 'C' })).item
+  db.prepare('UPDATE items SET rank=? WHERE id=?').run(1, a.id)
+  db.prepare('UPDATE items SET rank=? WHERE id=?').run(1 + 1e-7, b.id)
+  const moved = rerankItem(db, { userId: dan.id, itemId: c.id, after: a.id, before: b.id })
+  const ranks = db.prepare("SELECT id, rank FROM items WHERE user_id=? AND state='open' ORDER BY rank").all(dan.id)
+  assert.deepEqual(ranks.map((r) => r.id), [a.id, moved.id, b.id])
+  assert.ok(ranks.every((r, i) => i === 0 || ranks[i].rank - ranks[i - 1].rank >= 1))
+})
+
+test('renormaliseRanks preserves order and spaces by RANK_GAP', async () => {
+  const { db, dan } = await seed()
+  const ids = ['x', 'y', 'z'].map((t) => createItem(db, base({ userId: dan.id, title: t })).item.id)
+  db.prepare('UPDATE items SET rank=0.5 WHERE id=?').run(ids[2])
+  renormaliseRanks(db, dan.id)
+  const rows = db.prepare("SELECT id, rank FROM items WHERE user_id=? ORDER BY rank").all(dan.id)
+  assert.deepEqual(rows.map((r) => r.id), [ids[2], ids[0], ids[1]])
+  assert.deepEqual(rows.map((r) => r.rank), [1024, 2048, 3072])
 })
