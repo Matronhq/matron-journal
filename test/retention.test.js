@@ -705,9 +705,15 @@ test('media reap never touches a blob referenced only by an item comment', async
   upsertConversation(db, { id: 'c1', ownerUserId: dan.id, title: 'T' })
   const it = createItem(db, { userId: dan.id, kind: 'task', title: 'T', originConvoId: 'c1', originDeviceId: 1, createdBy: 'agent' }).item
   addComment(db, { userId: dan.id, itemId: it.id, author: 'user', deviceId: 1, body: '', attachments: [{ blob_ref: blobB, mime: 'image/png', name: 'p', size: 10 }] })
-  runReapMedia(db, { quotaBytes: quota, highPct: 50, lowPct: 10 })
+  const r = runReapMedia(db, { quotaBytes: quota, highPct: 50, lowPct: 10 })
+  // The discriminating assertion: the pass must actually have reaped A, not
+  // silently no-op'd (a broken quota threshold or a misfiring floor
+  // pre-check would otherwise leave blob B untouched trivially, and the
+  // count-1 assertion below would pass vacuously).
+  assert.deepEqual(r, { reaped: 1, bytesFreed: 500 })
+  assert.equal(getBlob(db, blobA), undefined, 'blob A (the real candidate) must be gone')
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM blobs WHERE id=?').get(blobB).n, 1)
-  void blobA; void mediaDir
+  void mediaDir
 })
 
 test('resolveReapPcts: defaults, overrides, disable-on-zero, fail-closed on garbage or inverted marks', (t) => {
