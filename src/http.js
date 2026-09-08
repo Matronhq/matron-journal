@@ -11,6 +11,7 @@ import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
 import { serveHelp } from './help.js'
 import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
+import { json, readBody } from './http-body.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
 // card's `from_name` gets. NULL stays null rather than collapsing to '' —
@@ -47,52 +48,6 @@ const tagChar = (raw) => {
   if (!first.replace(/[\p{Cf}\p{Cc}\p{Zs}]/gu, '')) return null
   return first
 }
-
-const json = (res, status, obj) => {
-  if (res.writableEnded || res.destroyed) return
-  res.writeHead(status, { 'content-type': 'application/json' })
-  res.end(JSON.stringify(obj))
-}
-
-const readBody = (req) => new Promise((resolve, reject) => {
-  let data = ''
-  let settled = false
-  const fail = (err) => { if (!settled) { settled = true; reject(err) } }
-  req.setEncoding('utf8')
-  req.on('data', (c) => {
-    data += c
-    if (data.length > 1e6) {
-      req.removeAllListeners('data')
-      req.pause()
-      fail(Object.assign(new Error('body too large'), { statusCode: 413 }))
-    }
-  })
-  req.on('end', () => {
-    if (settled) return
-    settled = true
-    if (!data) { resolve({}); return }
-    let parsed
-    try {
-      parsed = JSON.parse(data)
-    } catch {
-      reject(Object.assign(new Error('invalid JSON body'), { statusCode: 400 }))
-      return
-    }
-    // Shared guard for every POST handler below: any JSON value that isn't a
-    // plain object (literal `null`, an array, or a bare string/number/bool)
-    // would otherwise reach a handler's `const {x} = body` destructure and
-    // either throw outright (null → 500) or silently produce `undefined`
-    // fields that fail deeper and less legibly (e.g. as a DB bind-type
-    // error → 500).
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      reject(Object.assign(new Error('request body must be a JSON object'), { statusCode: 400 }))
-      return
-    }
-    resolve(parsed)
-  })
-  req.on('close', () => fail(new Error('connection closed')))
-  req.on('error', fail)
-})
 
 const bearer = (req) => (req.headers.authorization || '').replace(/^Bearer /, '') || null
 
