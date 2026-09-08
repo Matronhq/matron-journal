@@ -54,6 +54,25 @@ function registerDevice(db, userId, name, { token = `${name}-token`, env = 'prod
   return deviceId
 }
 
+// Fixture for tests that just need one user, one client push device, one
+// conversation, and a pipeline whose fake apnsClient records every send —
+// mirrors `setup()`/`registerDevice()` above (device creation +
+// setApnsRegistration + push_prefs all-on) plus the one conversation the
+// item-marker tests append events into. `sent` aliases the stub's `calls`
+// array (same recording the rest of this file inspects as `stub.calls`).
+async function setupPipeline(t) {
+  const db = openDb(':memory:')
+  const hub = makeHub()
+  const dan = await createUser(db, 'dan', 'pw')
+  const stub = makeStubApnsClient()
+  const pipeline = makePushPipeline({ db, hub, apnsClient: stub })
+  t.after(() => pipeline.close())
+  const convoId = 'c1'
+  upsertConversation(db, { id: convoId, ownerUserId: dan.id, title: 'convo one' })
+  const clientDeviceId = registerDevice(db, dan.id, 'phone')
+  return { db, hub, pipeline, sent: stub.calls, dan, convoId, clientDevice: { id: clientDeviceId } }
+}
+
 test('disabled mode (no apnsClient) is inert', async (t) => {
   const db = openDb(':memory:')
   const hub = makeHub()
@@ -783,4 +802,21 @@ test('end-to-end wiring: convo_upsert threads the previous session state into th
   assert.equal(stub.calls.filter((c) => c.category === 'done').length, 1, 'waiting -> done must stay silent')
 
   agent.close()
+})
+
+test('item markers: agent-created question pushes as attention; user-authored and reorder markers are silent', async (t) => {
+  // Use the same fixture setup as the test above this one: a user, a client
+  // device with an apns token, a conversation, and a pipeline with a fake
+  // APNs client that records `sent` payloads.
+  const { db, hub, pipeline, sent, dan, convoId, clientDevice } = await setupPipeline(t)
+  const base = { item_id: 'it_x', num: 1, kind: 'question', title: 'Which auth?', by: 'agent', awaiting: 'user', resolution: null }
+  pipeline.onAppend(dan.id, { seq: 10, convo_id: convoId, ts: 1, sender: 'agent:dev-2', type: 'item', payload: { ...base, action: 'created' } }, 0)
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].payload.aps.alert.body, '❓ #1 Which auth?')
+  assert.equal(sent[0].category, 'attention')
+  pipeline.onAppend(dan.id, { seq: 11, convo_id: convoId, ts: 2, sender: 'agent:dev-2', type: 'item', payload: { ...base, action: 'closed', awaiting: null, resolution: 'answered' } }, 0)
+  pipeline.onAppend(dan.id, { seq: 12, convo_id: convoId, ts: 3, sender: 'agent:dev-2', type: 'item', payload: { ...base, action: 'reordered', awaiting: 'user' } }, 0)
+  pipeline.onAppend(dan.id, { seq: 13, convo_id: convoId, ts: 4, sender: 'user:dan', type: 'item', payload: { ...base, action: 'commented', by: 'user', awaiting: 'agent' } }, clientDevice.id)
+  assert.equal(sent.length, 1)
+  void hub; void db
 })

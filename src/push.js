@@ -43,6 +43,15 @@ function classify(type, payload, sender, prevState) {
   if (type === 'convo_meta') return null
   // TOC summary events are derived metadata, not new activity — journal-sync only.
   if (type === 'summary') return null
+  // Tracker markers (spec: task-decision-tracker). Only "the agent needs
+  // you" pushes: a new/reopened/commented item left awaiting the user. Agent
+  // closes, reorders, and every user-authored marker are journal-sync only
+  // (the user:* rule above already covers the latter).
+  if (type === 'item') {
+    const p = payload && typeof payload === 'object' ? payload : {}
+    const needsUser = p.awaiting === 'user' && (p.action === 'created' || p.action === 'commented' || p.action === 'reopened')
+    return needsUser ? { priority: 10, coalesce: false, kind: 'attention' } : null
+  }
   // Routine content: text/tool_output/diff/prompt_reply/file/image/etc. —
   // batched so a busy session is one updating notification, not hundreds.
   return { priority: 5, coalesce: true, kind: 'activity' }

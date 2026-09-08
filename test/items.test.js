@@ -5,6 +5,8 @@ import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import { createItem, getItem, listItems, validateItemFields, resolveRank, RANK_EPSILON, rerankItem, renormaliseRanks, RANK_GAP } from '../src/items.js'
 import { addComment, closeItem, reopenItem, updateItem, setAttachmentTranscript, listComments } from '../src/items.js'
+import { itemMarkerPayload, ITEM_EVENT_TYPE } from '../src/items-marker.js'
+import { snippetOf } from '../src/journal.js'
 
 test('schema: items, item_comments, item_counters exist with the expected columns', () => {
   const db = openDb(':memory:')
@@ -362,4 +364,23 @@ test('renormaliseRanks preserves order and spaces by RANK_GAP', async () => {
   const rows = db.prepare("SELECT id, rank FROM items WHERE user_id=? ORDER BY rank").all(dan.id)
   assert.deepEqual(rows.map((r) => r.id), [ids[2], ids[0], ids[1]])
   assert.deepEqual(rows.map((r) => r.rank), [1024, 2048, 3072])
+})
+
+test('itemMarkerPayload carries the spec fields and trims the comment', async () => {
+  const { db, dan } = await seed()
+  const q = createItem(db, base({ userId: dan.id, kind: 'question', title: 'Which auth?' })).item
+  const r = addComment(db, { userId: dan.id, itemId: q.id, author: 'user', deviceId: 9, body: 'use A',
+    attachments: [{ blob_ref: 'b', mime: 'audio/mp4', name: 'v.m4a', size: 1 }] })
+  const p = itemMarkerPayload({ item: r.item, action: 'commented', by: 'user', comment: r.comment })
+  assert.equal(ITEM_EVENT_TYPE, 'item')
+  assert.deepEqual(Object.keys(p).sort(), ['action', 'awaiting', 'by', 'comment', 'item_id', 'kind', 'num', 'resolution', 'title'])
+  assert.equal(p.comment.body, 'use A'); assert.equal(p.comment.attachments[0].transcript, null)
+  const created = itemMarkerPayload({ item: q, action: 'created', by: 'agent' })
+  assert.equal(created.comment, undefined); assert.equal(created.awaiting, 'user')
+})
+
+test('snippetOf renders item markers', () => {
+  assert.equal(snippetOf('item', { kind: 'question', num: 12, title: 'Which auth library?' }), '❓ #12 Which auth library?')
+  assert.equal(snippetOf('item', { kind: 'task', num: 3, title: 'T' }), '☐ #3 T')
+  assert.equal(snippetOf('item', { kind: 'decision', num: 4, title: 'D' }), '⚖ #4 D')
 })
