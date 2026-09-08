@@ -304,3 +304,103 @@ export function listItems(db, userId, {
 export function needsUserCounts(db, userId) {
   return db.prepare("SELECT origin_convo_id AS convo_id, COUNT(*) AS n FROM items WHERE user_id=? AND state='open' AND awaiting='user' GROUP BY origin_convo_id").all(userId)
 }
+
+function touch(db, itemId, now) {
+  db.prepare('UPDATE items SET updated_at=? WHERE id=?').run(now, itemId)
+}
+
+function insertComment(db, { itemId, userId, author, deviceId, kind, body, attachments, meta, idemKey, now }) {
+  const id = newId('ic')
+  db.prepare(`INSERT INTO item_comments(id,item_id,user_id,author,device_id,kind,body,attachments,meta,idem_key,created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(id, itemId, userId, author, deviceId, kind, body, JSON.stringify(attachments ?? []), meta == null ? null : JSON.stringify(meta), idemKey, now)
+  return rowToComment(db.prepare('SELECT * FROM item_comments WHERE id=?').get(id))
+}
+
+const ownedRow = (db, userId, itemId) => db.prepare('SELECT * FROM items WHERE id=? AND user_id=?').get(itemId, userId)
+
+export function addComment(db, { userId, itemId, author, deviceId, body = '', attachments = [], idemKey = null, now = Date.now() }) {
+  return db.transaction(() => {
+    const row = ownedRow(db, userId, itemId)
+    if (!row) return null
+    if (idemKey) {
+      const dup = db.prepare('SELECT * FROM item_comments WHERE user_id=? AND idem_key=?').get(userId, idemKey)
+      if (dup) return { item: getItem(db, userId, itemId), comment: rowToComment(dup), duplicate: true }
+    }
+    const comment = insertComment(db, { itemId, userId, author, deviceId, kind: 'comment', body, attachments, meta: null, idemKey, now })
+    if (author === 'user') {
+      // The user's words always hand the ball to the agent, and wake a
+      // closed item back up (spec: "any further user comment on a closed
+      // item reopens it awaiting the agent").
+      db.prepare("UPDATE items SET state='open', resolution=NULL, closed_at=NULL, awaiting='agent', updated_at=? WHERE id=?").run(now, itemId)
+    } else {
+      touch(db, itemId, now)
+    }
+    return { item: getItem(db, userId, itemId), comment, duplicate: false }
+  })()
+}
+
+const statusOf = (row) => ({ state: row.state, resolution: row.resolution, awaiting: row.awaiting })
+
+export function closeItem(db, { userId, itemId, resolution, author, deviceId, comment = '', now = Date.now() }) {
+  return db.transaction(() => {
+    const row = ownedRow(db, userId, itemId)
+    if (!row || row.state === 'closed') return null
+    const to = { state: 'closed', resolution, awaiting: null }
+    db.prepare("UPDATE items SET state='closed', resolution=?, awaiting=NULL, closed_at=?, updated_at=? WHERE id=?").run(resolution, now, now, itemId)
+    const c = insertComment(db, { itemId, userId, author, deviceId, kind: 'status', body: comment, attachments: [], meta: { from: statusOf(row), to }, idemKey: null, now })
+    return { item: getItem(db, userId, itemId), comment: c }
+  })()
+}
+
+export function reopenItem(db, { userId, itemId, author, deviceId, comment = '', now = Date.now() }) {
+  return db.transaction(() => {
+    const row = ownedRow(db, userId, itemId)
+    if (!row || row.state === 'open') return null
+    const awaiting = row.kind === 'decision' ? null : defaultAwaiting(row.kind)
+    const to = { state: 'open', resolution: null, awaiting }
+    db.prepare("UPDATE items SET state='open', resolution=NULL, awaiting=?, closed_at=NULL, updated_at=? WHERE id=?").run(awaiting, now, itemId)
+    const c = insertComment(db, { itemId, userId, author, deviceId, kind: 'status', body: comment, attachments: [], meta: { from: statusOf(row), to }, idemKey: null, now })
+    return { item: getItem(db, userId, itemId), comment: c }
+  })()
+}
+
+export function updateItem(db, { userId, itemId, fields, now = Date.now() }) {
+  return db.transaction(() => {
+    const row = ownedRow(db, userId, itemId)
+    if (!row) return null
+    const sets = ['updated_at=?']
+    const args = [now]
+    if (fields.title !== undefined) { sets.push('title=?'); args.push(fields.title) }
+    if (fields.body !== undefined) { sets.push('body=?'); args.push(fields.body) }
+    if (fields.labels !== undefined) { sets.push('labels=?'); args.push(JSON.stringify(fields.labels)) }
+    if (fields.links !== undefined) { sets.push('links=?'); args.push(JSON.stringify(fields.links)) }
+    if (fields.awaiting !== undefined) { sets.push('awaiting=?'); args.push(fields.awaiting) }
+    db.prepare(`UPDATE items SET ${sets.join(', ')} WHERE id=?`).run(...args, itemId)
+    return getItem(db, userId, itemId)
+  })()
+}
+
+export function setAttachmentTranscript(db, { userId, itemId, commentId, blobRef, transcript, now = Date.now() }) {
+  return db.transaction(() => {
+    const c = db.prepare('SELECT * FROM item_comments WHERE id=? AND item_id=? AND user_id=?').get(commentId, itemId, userId)
+    if (!c) return null
+    const atts = parseJson(c.attachments, [])
+    const target = atts.find((a) => a.blob_ref === blobRef)
+    if (!target) return null
+    target.transcript = transcript
+    db.prepare('UPDATE item_comments SET attachments=? WHERE id=?').run(JSON.stringify(atts), commentId)
+    touch(db, itemId, now)
+    return rowToComment(db.prepare('SELECT * FROM item_comments WHERE id=?').get(commentId))
+  })()
+}
+
+export function rerankItem(db, { userId, itemId, position, after, before, now = Date.now() }) {
+  return db.transaction(() => {
+    const row = ownedRow(db, userId, itemId)
+    if (!row) return null
+    const rank = resolveRank(db, userId, { position, after, before, excludeId: itemId })
+    db.prepare('UPDATE items SET rank=?, updated_at=? WHERE id=?').run(rank, now, itemId)
+    return getItem(db, userId, itemId)
+  })()
+}
