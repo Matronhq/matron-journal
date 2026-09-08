@@ -1246,7 +1246,16 @@ Spec: `docs/superpowers/specs/2026-09-08-task-decision-tracker-design.md`.
 Items are journal-owned rows (`items`, `item_comments`), scoped to the
 user like everything else, with a per-user `#num` starting at 1. The
 conversation log carries only **marker events** of type `item`, written by
-the journal itself on every mutating route — agents cannot `publish` one.
+the journal itself on **every** mutating route — create, comment, close,
+reopen, rank, and `PATCH` (`updated`) alike; the only markerless write is
+the agent's transcript write-back, which finishes a job the apps already
+know about. Agents cannot `publish` one (`item` is not an
+`AGENT_PUBLISH_TYPES` member — a bare publish is `bad_request`). Each
+marker is appended **after** the item's own transaction has committed, not
+inside it: a broadcast can never advertise a write that then rolls back,
+and the cost of that ordering is that a marker append which itself fails
+(e.g. the origin conversation was deleted underneath it) is logged and
+swallowed — the item write stands.
 
 ### Routes (Bearer, either device kind)
 
@@ -1254,8 +1263,8 @@ the journal itself on every mutating route — agents cannot `publish` one.
 |---|---|---|
 | `GET /items` | `convo, kind, state, awaiting, label, sort=rank\|updated, since, limit≤500, cursor` | `{items:[…], next_cursor}` |
 | `GET /items/:id` | `:id` = `it_…` or `#num` (URL-encode `#`) | `{item, comments:[…]}` |
-| `POST /items` | `{kind, title, body?, labels?, links?, attachments?, awaiting?, position?, after?, before?, convo_id, supersedes?, on_behalf_of?:'user' (agent callers only)}` + optional `Idempotency-Key` | 201 `{item}` (200 on replay) |
-| `PATCH /items/:id` | `{title?, body?, labels?, links?, awaiting?}` | `{item}` |
+| `POST /items` | `{kind, title, body?, labels?, links?, attachments?, awaiting?, position?, after?, before?, convo_id, supersedes?, on_behalf_of?:'user' (agent callers only)}` + optional `Idempotency-Key`; **at most one** of `position`/`after`/`before` (two is 400, consistent with `/rank`; none means bottom) | 201 `{item}` (200 on replay) |
+| `PATCH /items/:id` | `{title?, body?, labels?, links?, awaiting?}` — `attachments` is **400** (create-only in v1; it used to be dropped silently, which told a client its blob had landed) | `{item}` |
 | `POST /items/:id/comments` | `{body?, attachments?}` (one required) + optional `Idempotency-Key` | 201 `{item, comment}` (200 on replay) |
 | `PATCH /items/:id/comments/:cid` | `{blob_ref, transcript}` — agent only, else 403 | `{comment}` |
 | `POST /items/:id/close` | `{resolution, comment?}` | `{item, comment}`; 409 if already closed |
@@ -1264,18 +1273,34 @@ the journal itself on every mutating route — agents cannot `publish` one.
 
 Item shape: `{id, user_id, num, kind, state, resolution, awaiting, rank,
 title, body, labels[], links[{url,title?}], supersedes, origin_convo_id,
-origin_device_id, created_by, idem_key, created_at, updated_at, closed_at,
+origin_device_id, created_by, created_at, updated_at, closed_at,
 comment_count, last_comment_at, attachments[], has_image}`. `attachments`
 here is the item **body**'s attachments (set at create only, v1) — a
 comment's own attachments live on the comment. Comment shape:
-`{id, item_id, user_id, author, device_id, kind:'comment'|'status', body,
-idem_key, created_at, attachments[{blob_ref,mime,name,size,transcript?}],
-meta}`. `meta` is `null` for an ordinary comment and `{from:{state,
+`{id, item_id, author, device_id, kind:'comment'|'status', body,
+created_at, attachments[{blob_ref,mime,name,size,transcript?}], meta}`.
+`meta` is `null` for an ordinary comment and `{from:{state,
 resolution,awaiting}, to:{…}}` for the synthetic `status` comment a
-close/reopen writes.
+close/reopen writes. `idem_key` is an internal column on both and is never
+returned (same stance as the event shape's `user_id`/`idem_key`/`blob_ref`
+strip); a comment omits `user_id` too — the caller is the owner by
+construction.
 
-Rules: a `question` starts `awaiting:'user'`, a `task` `awaiting:'agent'`,
-a `decision` `null`. A **user** comment always sets `awaiting:'agent'` and
+An attachment's `transcript` is **agent-attested**: it is written only by
+`PATCH /items/:id/comments/:cid`, and one supplied by a client on a create
+or a comment is stripped before storage (not a 400 — the blob still lands,
+just without the forged words). It is the text the apps show in place of a
+voice note, so it must never be caller-authored.
+
+Rules: the `awaiting` default at creation depends on the kind **and on who
+filed it**. An agent-filed item takes the kind default — a `question`
+starts `awaiting:'user'` (it is a question *for* the user), a `task`
+`awaiting:'agent'`, a `decision` `null`. A **user-created** item (a client
+caller, or an agent's `on_behalf_of:'user'`) starts `awaiting:'agent'` for
+both `task` and `question` — a user's question is asked *of* the agent —
+and `null` for a `decision`. An explicit `awaiting` in the body always
+wins, `null` included. A reopen restores the *kind* default regardless of
+who created the item. A **user** comment always sets `awaiting:'agent'` and
 reopens a closed item. Close clears `awaiting`. Reopen restores the kind
 default (decision → `null`). `rank` is one order per user; midpoint
 insertion, server-side renormalisation when a midpoint would land within
@@ -1287,9 +1312,13 @@ route 404s — same predicate as `/search`. Unknown ids, other users' items,
 and sieved items are all 404 (never 403 — a refusal must be
 indistinguishable from an item that doesn't exist).
 
-Agent write gate: every agent-authored mutation (create, comment, close,
-reopen, rank, transcript patch) additionally requires `authorizeAgentWrite`
-on the item's origin conversation — the agent manages it (owns
+Agent write gate: every agent-authored mutation additionally requires
+`authorizeAgentWrite` on the item's origin conversation. For an existing
+item this is enforced once, above the method dispatch — **every** non-`GET`
+method on `/items/:id[…]` (`PATCH`, comment, close, reopen, rank,
+transcript patch) clears it by construction rather than by each handler
+remembering to; a create clears the same gate against its body's
+`convo_id` — the agent manages it (owns
 `agent_device_id`, or the conversation has none yet) or has joined it
 (`convo_agents` with `state='joined'`). Refused the same way as any other
 visibility failure: 404, never 403.
@@ -1313,25 +1342,32 @@ is unique per `(user_id, idem_key)` in the schema, not per item.
 { "seq": 123, "convo_id": "c1", "ts": 1699999999000,
   "sender": "user:dan" | "agent:dev-2", "type": "item",
   "payload": { "item_id": "it_…", "num": 12, "kind": "question", "title": "…",
-    "action": "created|commented|closed|reopened|reordered", "by": "user|agent",
+    "action": "created|commented|closed|reopened|reordered|updated", "by": "user|agent",
     "awaiting": "user|agent|null", "resolution": "…|null",
     "comment": { "id": "ic_…", "body": "…", "attachments": [ … ] } } }
 ```
 
 Same envelope (`seq, convo_id, ts, sender, type, payload`) as every other
 journal event. `comment` is present only when the action carried comment
-text or attachments (a bare close/reopen with no note omits it). The
-event's `sender` is the writer's device, so a client-authored marker is a
-user event on the origin conversation: the wake-on-message path fires for
-`created|commented|closed|reopened` written by a client device (never for
-an agent's own write — it's already awake), and bridges treat those as
-inbound turns. `reordered` never wakes and never pushes.
+text or attachments (a bare close/reopen with no note omits it). `updated`
+is the `PATCH` marker — a retitle, relabel, or a hand-moved `awaiting`, so
+connected clients learn of the edit without re-polling `/items`; it carries
+no `comment`. The event's `sender` is the writer's device, so a
+client-authored marker is a user event on the origin conversation: the
+wake-on-message path fires for `created|commented|closed|reopened` written
+by a client device (never for an agent's own write — it's already awake),
+and bridges treat those as inbound turns. `reordered` and `updated` are the
+quiet pair: neither ever wakes and neither ever pushes.
 
-Push: `attention` when an agent-sourced marker leaves an item
-`awaiting:'user'` via `created` (regardless of `by`, e.g. an
-`on_behalf_of:'user'` create) or via `commented`/`reopened` with
-`by:'agent'`; everything else (including every user-authored marker, and
-every `reordered`) is journal-sync only. Not a `MESSAGE_TYPES` entry: no
+Push: `attention` only when an **agent-authored** marker (`by:'agent'`)
+leaves an item `awaiting:'user'` via `created`, `commented`, or `reopened`.
+The `by:'agent'` guard applies to every action, `created` included: an
+`on_behalf_of:'user'` create is the item the user just asked for, filed by
+the agent device — so the `user:*`-sender rule does not catch it — and
+buzzing their pocket about their own request is exactly the
+self-notification that rule exists to prevent. Everything else (every
+user-authored marker, every `closed`, `reordered`, and `updated`) is
+journal-sync only. Not a `MESSAGE_TYPES` entry: no
 unread-badge or conversation-preview-snippet effect — but the push body
 text still runs the event's payload through `snippetOf`, which formats an
 `❓`/`⚖`/`☐` glyph + `#num title` for the alert.

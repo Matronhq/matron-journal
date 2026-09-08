@@ -39,6 +39,39 @@ docs/protocol.md in the matron-journal repo ("Journal search" for the index).
   \`limit\` to 30, and is logged server-side.
 - \`GET /snapshot\` — bootstrap state for this device.
 
+## Items (task & decision tracker)
+
+Items are \`task\`/\`question\`/\`decision\` rows scoped to the user, with a
+per-user \`#num\`. Every mutating route below also appends an \`item\` marker
+event to the item's origin conversation — you cannot \`publish\` one yourself.
+\`:id\` is \`it_…\` or \`#num\` (URL-encode the \`#\`). As an agent you may only
+write to items whose origin conversation you manage or have joined; anything
+else 404s.
+
+- \`GET /items?convo=&kind=&state=&awaiting=&label=&sort=rank|updated&since=&limit=&cursor=\`
+  — one ranked list per user; \`{items, next_cursor}\`, limit ≤ 500.
+- \`GET /items/:id\` — \`{item, comments}\` (comments oldest first).
+- \`POST /items\` \`{kind, title, body?, labels?, links?, attachments?,
+  awaiting?, convo_id, supersedes?, on_behalf_of?:'user', and at most one of
+  position:'top'|'bottom' / after / before}\` → 201 \`{item}\`. Send
+  \`on_behalf_of:'user'\` when the USER asked for the item, so it reads as
+  theirs. Optional \`Idempotency-Key\` header (replay → 200, no second marker).
+- \`PATCH /items/:id\` \`{title?, body?, labels?, links?, awaiting?}\` → 200
+  \`{item}\`; \`attachments\` is 400 (create-only in v1), and moving
+  \`awaiting\` on a closed item is 409.
+- \`POST /items/:id/comments\` \`{body?, attachments?}\` (at least one) → 201
+  \`{item, comment}\`. A USER comment always flips \`awaiting\` to \`agent\`
+  and reopens a closed item; yours as an agent never flips it.
+- \`PATCH /items/:id/comments/:cid\` \`{blob_ref, transcript}\` — agent-only
+  write-back after transcribing a voice-note attachment. This is the ONLY way
+  a transcript is stored; one sent on a create/comment is dropped.
+- \`POST /items/:id/close\` \`{resolution:'done'|'answered'|'decided'|'reversed'|'cancelled', comment?}\`
+  → 200 \`{item, comment}\`; 409 if already closed. Closing clears \`awaiting\`.
+- \`POST /items/:id/reopen\` \`{comment?}\` → 200 \`{item, comment}\`; 409 if
+  already open. Restores the kind's default \`awaiting\`.
+- \`POST /items/:id/rank\` — exactly one of \`{position:'top'|'bottom'}\` /
+  \`{after}\` / \`{before}\` → 200 \`{item}\`; 409 on a closed item.
+
 ## Media
 
 - \`POST /media\` (raw body, Content-Type captured) →

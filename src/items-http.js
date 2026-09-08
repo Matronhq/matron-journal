@@ -144,6 +144,10 @@ async function handleCreate(ctx, req, res, who) {
   if (!v.ok) return badRequest(res)
   if (body.awaiting !== undefined && body.awaiting !== null && !AWAITING.includes(body.awaiting)) return badRequest(res)
   if (body.position !== undefined && !POSITIONS.includes(body.position)) return badRequest(res)
+  // At most one destination, same rule as /rank (which additionally requires
+  // one): two of them is an ambiguous intent. None is fine here — a create
+  // with no placement lands at the bottom.
+  if (['position', 'after', 'before'].filter((k) => body[k] !== undefined).length > 1) return badRequest(res)
   for (const k of ['after', 'before', 'supersedes', 'convo_id']) {
     if (body[k] !== undefined && (typeof body[k] !== 'string' || !body[k] || body[k].length > ID_MAX)) return badRequest(res)
   }
@@ -189,12 +193,16 @@ async function handleCreate(ctx, req, res, who) {
   return true
 }
 
-async function handlePatch(db, req, res, who, item) {
+async function handlePatch(ctx, req, res, who, item) {
+  const { db } = ctx
   const body = await readBody(req)
+  // Body attachments are set at create only (v1). Silently dropping them
+  // told a client its blob had landed when nothing was written, so an
+  // attempt is a bad request rather than a no-op field.
+  if (body.attachments !== undefined) return badRequest(res)
   const v = validateItemFields(body, { partial: true })
   if (!v.ok) return badRequest(res)
   const fields = { ...v.value }
-  delete fields.attachments // body attachments are set at create only (v1)
   if (body.awaiting !== undefined) {
     if (body.awaiting !== null && !AWAITING.includes(body.awaiting)) return badRequest(res)
     // A closed item awaits nobody (the close cleared it): handing the ball
@@ -207,8 +215,11 @@ async function handlePatch(db, req, res, who, item) {
   const updated = updateItem(db, { userId: who.userId, itemId: item.id, fields })
   // Only reachable if the item vanished between the read and the write.
   if (!updated) return notFound(res)
-  // No marker: a pure edit is not a transition, and the apps re-read the
-  // item rather than being told about a retitle.
+  // Every mutating route appends a marker, this one included: a retitle or a
+  // hand-moved `awaiting` is a change connected clients must see without
+  // re-polling. It is a quiet action though — no wake, no push (see
+  // ITEM_ACTIONS in items-marker.js).
+  emitMarker(ctx, who, { item: updated, action: 'updated' })
   json(res, 200, { item: updated })
   return true
 }
@@ -239,9 +250,20 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
   const item = visibleItem(db, who, idOrNum)
   if (!item) return notFound(res)
 
+  // The agent write gate, hoisted above the method dispatch so EVERY
+  // non-GET method on /items/:id[...] clears it by construction rather than
+  // by each handler remembering to: an agent owns the item's origin
+  // conversation or has joined it (the same gate handleCreate applies to
+  // its own body's convo_id). 404, never 403 — a refusal must be
+  // indistinguishable from an item that isn't there, and visibleItem has
+  // already applied the privacy sieve. A client writing to its own user's
+  // item is never gated.
+  if (req.method !== 'GET' && who.kind === 'agent'
+      && !authorizeAgentWrite(db, who.userId, who.deviceId, item.origin_convo_id)) return notFound(res)
+
   if (!sub) {
     if (req.method === 'GET') { json(res, 200, { item, comments: listComments(db, item.id) }); return true }
-    if (req.method === 'PATCH') return handlePatch(db, req, res, who, item)
+    if (req.method === 'PATCH') return handlePatch(ctx, req, res, who, item)
     return false
   }
 
@@ -255,12 +277,9 @@ const okNote = (v) => v === undefined || (typeof v === 'string' && v.length <= B
 // Every sub-route is a mutation of an already-visible item.
 async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
   const { db } = ctx
-  // An AGENT clears the same write gate the create path applies: it owns the
-  // item's origin conversation or has joined it. 404, never 403 — a refusal
-  // must be indistinguishable from an item that isn't there, and visibleItem
-  // has already applied the privacy sieve. A client writing to its own
-  // user's item is never gated.
-  if (who.kind === 'agent' && !authorizeAgentWrite(db, who.userId, who.deviceId, item.origin_convo_id)) return notFound(res)
+  // The agent write gate ran in handleItemsRoute, above the method dispatch
+  // — every path below is already past it.
+  //
   // There is no on_behalf_of on a comment: the caller's own device kind is
   // the author, full stop.
   const author = who.kind === 'agent' ? 'agent' : 'user'

@@ -44,16 +44,19 @@ function classify(type, payload, sender, prevState) {
   // TOC summary events are derived metadata, not new activity — journal-sync only.
   if (type === 'summary') return null
   // Tracker markers (spec: task-decision-tracker ~:207-210). Only "the
-  // agent needs you" pushes: a brand-new item left awaiting the user, or an
-  // agent-authored comment/reopen that hands the ball back to the user. A
-  // user's own commented/reopened marker must NOT push (they already know;
-  // the user:* rule above also already covers this, `by` here is belt and
-  // suspenders for any future non-user-sender path). Agent closes,
-  // reorders, and every user-authored marker are journal-sync only.
+  // agent needs you" pushes: an agent-authored create, comment, or reopen
+  // that leaves the item awaiting the user. The `by === 'agent'` guard
+  // applies to EVERY action, `created` included — an agent filing on the
+  // user's behalf (`on_behalf_of:'user'`, the queued-card "Make task" tap)
+  // writes `by:'user'`, and buzzing someone's pocket about the item they
+  // just asked for is the same self-notification the user:* rule above
+  // exists to prevent (that rule doesn't catch it: the sender is the agent
+  // device). Agent closes, reorders, updates, and every user-authored
+  // marker are journal-sync only.
   if (type === 'item') {
     const p = payload && typeof payload === 'object' ? payload : {}
-    const needsUser = p.awaiting === 'user'
-      && (p.action === 'created' || ((p.action === 'commented' || p.action === 'reopened') && p.by === 'agent'))
+    const needsUser = p.awaiting === 'user' && p.by === 'agent'
+      && (p.action === 'created' || p.action === 'commented' || p.action === 'reopened')
     return needsUser ? { priority: 10, coalesce: false, kind: 'attention' } : null
   }
   // Routine content: text/tool_output/diff/prompt_reply/file/image/etc. —

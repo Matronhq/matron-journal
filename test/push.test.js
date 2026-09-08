@@ -823,6 +823,16 @@ test('item markers: agent-created question pushes as attention; user-authored, n
   // An agent-authored reopen that hands the item back to the user does push.
   pipeline.onAppend(dan.id, { seq: 16, convo_id: convoId, ts: 7, sender: 'agent:dev-2', type: 'item', payload: { ...base, action: 'reopened', by: 'agent', awaiting: 'user' } }, 0)
   assert.equal(sent.length, 2, 'an agent-reopened marker left awaiting the user must push')
+  // The by='agent' guard covers `created` too: an on_behalf_of:'user' create
+  // is the item the user just asked for, filed by the agent device (so the
+  // user:* sender rule does NOT catch it) — buzzing their pocket about their
+  // own request is the self-notification that rule exists to prevent.
+  pipeline.onAppend(dan.id, { seq: 17, convo_id: convoId, ts: 8, sender: 'agent:dev-2', type: 'item', payload: { ...base, action: 'created', by: 'user', awaiting: 'user' } }, 0)
+  assert.equal(sent.length, 2, 'a created marker authored by the user must stay silent even when awaiting the user')
+  // 'updated' (a PATCH) is journal-sync material like 'reordered': never a
+  // push, however the edit left `awaiting`.
+  pipeline.onAppend(dan.id, { seq: 18, convo_id: convoId, ts: 9, sender: 'agent:dev-2', type: 'item', payload: { ...base, action: 'updated', by: 'agent', awaiting: 'user' } }, 0)
+  assert.equal(sent.length, 2, 'an updated marker must never push')
   // The user-sender rule itself, isolated from origin-device exclusion: a
   // push-worthy marker (created, awaiting user) sent with sender `user:*`
   // must still be silenced by the early user-sender check. Origin device is

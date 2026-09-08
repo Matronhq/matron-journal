@@ -81,6 +81,10 @@ test('POST /items on_behalf_of: agent files a user-created task; clients may not
   const ev = s.db.prepare("SELECT sender, payload FROM events WHERE type='item' ORDER BY seq DESC LIMIT 1").get()
   assert.equal(ev.sender, 'agent:dev-2'); assert.equal(JSON.parse(ev.payload).by, 'user')
   assert.equal(wakeCalls.length, 0)
+  // A question filed FOR the user is a question asked OF the agent: it takes
+  // the user-created default (awaiting the agent), not the kind default.
+  const q = await mkItem(s, agent.token, { on_behalf_of: 'user' })
+  assert.equal(q.status, 201); assert.equal(q.json.item.created_by, 'user'); assert.equal(q.json.item.awaiting, 'agent')
   assert.equal((await mkItem(s, client, { on_behalf_of: 'user' })).status, 400)
   assert.equal((await mkItem(s, agent.token, { on_behalf_of: 'agent' })).status, 400)
   // A body-only rule is settled before the conversation is looked up, so a
@@ -149,18 +153,34 @@ test('privacy sieve: an ordinary agent cannot see items born in a private device
   assert.equal(filed.status, 404); assert.equal(filed.json.error, 'not_found')
 })
 
-test('PATCH /items/:id updates fields; marker not emitted for pure edits; awaiting validated', async (t) => {
-  const { s, agent, client } = await fleet(t)
+test('PATCH /items/:id updates fields and emits one updated marker; awaiting validated; attachments rejected', async (t) => {
+  const { s, agent, client, wakeCalls } = await fleet(t)
   const made = await mkItem(s, agent.token, {})
   const id = made.json.item.id
+  const ws = await makeWsClient(s.base, { token: client, cursor: null })
+  await ws.waitFor((f) => f.op === 'hello_ok')
   const before = s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='item'").get().n
-  const r = await s.http(`/items/${id}`, { method: 'PATCH', token: client, body: { title: 'Renamed', awaiting: null } })
-  assert.equal(r.status, 200); assert.equal(r.json.item.title, 'Renamed'); assert.equal(r.json.item.awaiting, null)
+  const r = await s.http(`/items/${id}`, { method: 'PATCH', token: client, body: { title: 'Renamed', awaiting: 'agent' } })
+  assert.equal(r.status, 200); assert.equal(r.json.item.title, 'Renamed'); assert.equal(r.json.item.awaiting, 'agent')
+  // Every mutating route appends a marker — a PATCH included.
+  const marker = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'item' && f.payload.action === 'updated')
+  assert.equal(marker.convo_id, 'c1'); assert.equal(marker.sender, 'user:dan')
+  assert.equal(marker.payload.title, 'Renamed'); assert.equal(marker.payload.awaiting, 'agent')
+  assert.equal(marker.payload.by, 'user'); assert.equal(marker.payload.comment, undefined)
+  ws.close()
   assert.equal((await s.http(`/items/${id}`, { method: 'PATCH', token: client, body: { awaiting: 'nobody' } })).status, 400)
   assert.equal((await s.http(`/items/${id}`, { method: 'PATCH', token: client, body: { title: '' } })).status, 400)
   assert.equal((await s.http(`/items/${id}`, { method: 'PATCH', token: client, body: {} })).status, 400)
+  // Attachments are a create-only field (v1): silently dropping them told a
+  // client its blob had landed, so an attempt is refused outright.
+  const att = await s.http(`/items/${id}`, { method: 'PATCH', token: client, body: { title: 'With blob', attachments: [{ blob_ref: 'b1', mime: 'image/png', name: 'a.png', size: 3 }] } })
+  assert.equal(att.status, 400); assert.equal(att.json.error, 'bad_request')
+  assert.equal((await s.http(`/items/${id}`, { method: 'PATCH', token: client, body: { attachments: [] } })).status, 400)
+  assert.equal((await s.http(`/items/${id}`, { token: client })).json.item.title, 'Renamed') // the rejected patch changed nothing
   assert.equal((await s.http('/items/it_nope', { method: 'PATCH', token: client, body: { title: 'X' } })).status, 404)
-  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='item'").get().n, before)
+  // Exactly one marker for the one successful patch; no failed patch added one.
+  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='item'").get().n, before + 1)
+  assert.equal(wakeCalls.length, 0) // 'updated' is not a wake action
 })
 
 test('PATCH /items/:id: awaiting on a closed item is a conflict, clearing it is not', async (t) => {
@@ -320,13 +340,27 @@ test('sub-routes: an agent must clear the same write gate the create path applie
   const id = (await s.http('/items', { method: 'POST', token: other.token, body: { kind: 'task', title: 'Theirs', convo_id: 'c3' } })).json.item.id
   // dev-2 may SEE it (same user, nothing private) but may not write to it.
   assert.equal((await s.http(`/items/${id}`, { token: agent.token })).status, 200)
-  for (const [sub, body] of [['comments', { body: 'x' }], ['close', { resolution: 'done' }], ['reopen', {}], ['rank', { position: 'top' }]]) {
-    const r = await s.http(`/items/${id}/${sub}`, { method: 'POST', token: agent.token, body })
-    assert.equal(r.status, 404, sub); assert.equal(r.json.error, 'not_found')
+  // The gate is hoisted above the method dispatch, so it covers PATCH on the
+  // item itself as well as every POST sub-route.
+  const writes = [
+    ['PATCH', '', { title: 'Hijacked' }],
+    ['POST', '/comments', { body: 'x' }],
+    ['POST', '/close', { resolution: 'done' }],
+    ['POST', '/reopen', {}],
+    ['POST', '/rank', { position: 'top' }],
+  ]
+  for (const [method, sub, body] of writes) {
+    const r = await s.http(`/items/${id}${sub}`, { method, token: agent.token, body })
+    assert.equal(r.status, 404, `${method} ${sub}`); assert.equal(r.json.error, 'not_found')
   }
   assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM item_comments').get().n, 0)
+  assert.equal((await s.http(`/items/${id}`, { token: agent.token })).json.item.title, 'Theirs') // the refused PATCH changed nothing
+  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='item'").get().n, 1) // only the create's marker
   recordJoined(s.db, { convoId: 'c3', agentDeviceId: agent.deviceId, initiatorDeviceId: other.deviceId })
   assert.equal((await s.http(`/items/${id}/comments`, { method: 'POST', token: agent.token, body: { body: 'x' } })).status, 201)
+  // ...and the managing box could patch it all along.
+  const patched = await s.http(`/items/${id}`, { method: 'PATCH', token: other.token, body: { title: 'Retitled' } })
+  assert.equal(patched.status, 200); assert.equal(patched.json.item.title, 'Retitled')
 })
 
 test('comments: a malformed Idempotency-Key is rejected; a key reused across items is a conflict', async (t) => {
@@ -373,4 +407,126 @@ test('transcript: bounded, markerless, silent — and a trailing segment never m
   // The trailing segment belongs to the sub-route, so a junk one is not a close.
   assert.equal((await s.http(`/items/${id}/close/junk`, { method: 'POST', token: agent.token, body: { resolution: 'done' } })).status, 404)
   assert.equal((await s.http(`/items/${id}`, { token: client })).json.item.state, 'open')
+})
+
+test('POST /items: at most one of position/after/before', async (t) => {
+  const { s, agent, client } = await fleet(t)
+  const a = (await mkItem(s, agent.token, { kind: 'task', title: 'A' })).json.item
+  const b = (await mkItem(s, agent.token, { kind: 'task', title: 'B' })).json.item
+  // Two destinations is an ambiguous intent, same rule as /rank.
+  assert.equal((await mkItem(s, client, { position: 'top', after: a.id })).status, 400)
+  assert.equal((await mkItem(s, client, { after: a.id, before: b.id })).status, 400)
+  assert.equal((await mkItem(s, client, { position: 'bottom', before: b.id })).status, 400)
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM items').get().n, 2)
+  // Zero is fine (bottom by default), and so is exactly one.
+  assert.equal((await mkItem(s, client, { title: 'None' })).status, 201)
+  assert.equal((await mkItem(s, client, { title: 'One', position: 'top' })).status, 201)
+})
+
+test('POST /items/:id/comments: a client-supplied attachment transcript is stripped, never stored', async (t) => {
+  const { s, agent, client } = await fleet(t)
+  const id = (await mkItem(s, agent.token, {})).json.item.id
+  const ws = await makeWsClient(s.base, { token: client, cursor: null })
+  await ws.waitFor((f) => f.op === 'hello_ok')
+  const r = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: {
+    body: 'listen', attachments: [{ blob_ref: 'b1', mime: 'audio/mp4', name: 'v.m4a', size: 3, transcript: 'forged' }],
+  } })
+  assert.equal(r.status, 201)
+  // A transcript is agent-attested (the PATCH transcript route only): the
+  // response, the stored row, and the marker all carry no forged text.
+  assert.equal(r.json.comment.attachments[0].transcript ?? null, null)
+  assert.equal(r.json.comment.attachments[0].blob_ref, 'b1')
+  const stored = JSON.parse(s.db.prepare('SELECT attachments FROM item_comments WHERE id=?').get(r.json.comment.id).attachments)
+  assert.equal(stored[0].transcript ?? null, null)
+  const marker = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'item' && f.payload.action === 'commented')
+  assert.equal(marker.payload.comment.attachments[0].transcript, null)
+  ws.close()
+  // The same field on a create is dropped just as quietly.
+  const made = await mkItem(s, client, { title: 'With audio', attachments: [{ blob_ref: 'b2', mime: 'audio/mp4', name: 'w.m4a', size: 3, transcript: 'forged too' }] })
+  assert.equal(made.status, 201)
+  assert.equal(made.json.item.attachments[0].transcript ?? null, null)
+})
+
+test('POST /items/:id/comments: a user comment on a CLOSED item reopens it awaiting the agent', async (t) => {
+  const { s, agent, client, wakeCalls } = await fleet(t)
+  const id = (await mkItem(s, agent.token, {})).json.item.id
+  assert.equal((await s.http(`/items/${id}/close`, { method: 'POST', token: agent.token, body: { resolution: 'answered' } })).status, 200)
+  assert.equal(wakeCalls.length, 0) // the agent's own close does not wake it
+  const ws = await makeWsClient(s.base, { token: client, cursor: null })
+  await ws.waitFor((f) => f.op === 'hello_ok')
+  const r = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { body: 'actually…' } })
+  assert.equal(r.status, 201)
+  assert.equal(r.json.item.state, 'open'); assert.equal(r.json.item.awaiting, 'agent')
+  assert.equal(r.json.item.resolution, null); assert.equal(r.json.item.closed_at, null)
+  // The marker reports the post-transition item, not the closed one it found.
+  const marker = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'item' && f.payload.action === 'commented')
+  assert.equal(marker.payload.awaiting, 'agent'); assert.equal(marker.payload.resolution, null)
+  assert.equal(marker.payload.by, 'user'); assert.equal(marker.payload.comment.body, 'actually…')
+  ws.close()
+  // A reopening comment is inbound traffic: the box gets woken for it.
+  assert.deepEqual(wakeCalls, ['dev-2'])
+  assert.equal((await s.http(`/items/${id}`, { token: client })).json.item.state, 'open')
+})
+
+test('an agent may not publish an item marker over the WS', async (t) => {
+  const { s, agent } = await fleet(t)
+  const ws = await makeWsClient(s.base, { token: agent.token, cursor: null })
+  await ws.waitFor((f) => f.op === 'hello_ok')
+  // 'item' is not in AGENT_PUBLISH_TYPES: markers are server-minted by the
+  // /items routes only, so a forged one is a bad_request and lands nothing.
+  ws.send({ op: 'publish', convo_id: 'c1', type: 'item', payload: { item_id: 'it_forged', num: 99, kind: 'question', title: 'Forged', action: 'created', by: 'agent', awaiting: 'user', resolution: null } })
+  await ws.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.code === 'bad_request' && f.ref === 'publish')
+  assert.equal(ws.ws.readyState, 1)
+  ws.close()
+  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='item'").get().n, 0)
+})
+
+test('POST /items with attachments: the blob rides on the item and lights has_image in the list', async (t) => {
+  const { s, agent, client } = await fleet(t)
+  const made = await mkItem(s, agent.token, {
+    title: 'Look at this', attachments: [{ blob_ref: 'b1', mime: 'image/png', name: 'shot.png', size: 42 }],
+  })
+  assert.equal(made.status, 201)
+  assert.equal(made.json.item.attachments.length, 1)
+  assert.equal(made.json.item.has_image, true)
+  const one = await s.http(`/items/${made.json.item.id}`, { token: client })
+  assert.equal(one.status, 200)
+  assert.deepEqual(one.json.item.attachments, [{ blob_ref: 'b1', mime: 'image/png', name: 'shot.png', size: 42 }])
+  assert.equal(one.json.item.has_image, true)
+  // The synthetic body comment carrying the blobs is not part of the thread.
+  assert.deepEqual(one.json.comments, [])
+  const list = await s.http('/items', { token: client })
+  assert.equal(list.json.items[0].has_image, true)
+  assert.equal(list.json.items[0].attachments[0].blob_ref, 'b1')
+  // A non-image attachment leaves has_image false.
+  const doc = await mkItem(s, agent.token, { title: 'A doc', attachments: [{ blob_ref: 'b2', mime: 'application/pdf', name: 'a.pdf', size: 9 }] })
+  assert.equal(doc.json.item.has_image, false)
+  assert.equal((await mkItem(s, agent.token, { attachments: [{ blob_ref: 'b3', mime: 'image/png' }] })).status, 400)
+})
+
+test('POST /items supersedes: another of the user\'s items round-trips; a foreign one is 400', async (t) => {
+  const { s, agent, client, patAgent } = await fleet(t)
+  const original = (await mkItem(s, agent.token, { kind: 'decision', title: 'Use A' })).json.item
+  const revised = await mkItem(s, client, { kind: 'decision', title: 'Use B instead', supersedes: original.id })
+  assert.equal(revised.status, 201)
+  assert.equal(revised.json.item.supersedes, original.id)
+  assert.equal((await s.http(`/items/${revised.json.item.id}`, { token: client })).json.item.supersedes, original.id)
+  assert.equal((await s.http('/items', { token: client })).json.items.find((i) => i.id === revised.json.item.id).supersedes, original.id)
+  // Another user's item is not a supersedable id — the same 400 an unknown one gets.
+  const theirs = (await s.http('/items', { method: 'POST', token: patAgent.token, body: { kind: 'decision', title: 'P', convo_id: 'p1' } })).json.item
+  assert.equal((await mkItem(s, client, { kind: 'decision', supersedes: theirs.id })).status, 400)
+})
+
+test('item and comment API shapes carry no internal columns', async (t) => {
+  const { s, agent, client } = await fleet(t)
+  const made = await s.http('/items', { method: 'POST', token: agent.token, headers: { 'idempotency-key': 'k1' }, body: { kind: 'task', title: 'T', convo_id: 'c1' } })
+  assert.ok(!('idem_key' in made.json.item))
+  const c = await s.http(`/items/${made.json.item.id}/comments`, { method: 'POST', token: client, headers: { 'idempotency-key': 'c1' }, body: { body: 'x' } })
+  assert.ok(!('idem_key' in c.json.comment))
+  assert.ok(!('user_id' in c.json.comment))
+  const one = await s.http(`/items/${made.json.item.id}`, { token: client })
+  assert.ok(!('idem_key' in one.json.item))
+  assert.ok(!('idem_key' in one.json.comments[0]))
+  assert.ok(!('user_id' in one.json.comments[0]))
+  assert.ok(!('idem_key' in (await s.http('/items', { token: client })).json.items[0]))
 })

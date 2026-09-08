@@ -3,7 +3,12 @@
 // never publishable by an agent. Not a MESSAGE_TYPE (no unread/snippet
 // column impact) — push.js and journal.js's snippetOf special-case it.
 export const ITEM_EVENT_TYPE = 'item'
-export const ITEM_ACTIONS = ['created', 'commented', 'closed', 'reopened', 'reordered']
+// 'updated' (a PATCH: retitle, relabel, or a hand-moved `awaiting`) and
+// 'reordered' are the two quiet ones: both are journal-sync material, so
+// neither wakes a sleeping box (WAKE_ACTIONS in items-http.js) nor pushes
+// (classify() in push.js). They still get a marker so a connected client
+// learns of the change without re-polling /items.
+export const ITEM_ACTIONS = ['created', 'commented', 'closed', 'reopened', 'reordered', 'updated']
 
 export function itemMarkerPayload({ item, action, by, comment = null }) {
   const payload = {

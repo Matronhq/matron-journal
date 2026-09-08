@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { openDb } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
-import { createItem, getItem, listItems, validateItemFields, resolveRank, RANK_EPSILON, rerankItem, renormaliseRanks, RANK_GAP } from '../src/items.js'
+import { createItem, getItem, listItems, validateItemFields, resolveRank, RANK_EPSILON, rerankItem, renormaliseRanks, RANK_GAP, createDefaultAwaiting } from '../src/items.js'
 import { addComment, closeItem, reopenItem, updateItem, setAttachmentTranscript, listComments } from '../src/items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE } from '../src/items-marker.js'
 import { snippetOf } from '../src/journal.js'
@@ -73,6 +73,50 @@ test('createItem numbers per user, ranks at the bottom, and honours position/aft
   assert.equal(q.awaiting, 'user')
   const d = createItem(db, base({ userId: dan.id, kind: 'decision' })).item
   assert.equal(d.awaiting, null)
+})
+
+test('createItem: a user-filed task/question awaits the AGENT; an agent-filed one keeps the kind default', async () => {
+  const { db, dan } = await seed()
+  const mk = (o) => createItem(db, base({ userId: dan.id, ...o })).item
+  // Agent-filed: the kind defaults (a question is a question FOR the user).
+  assert.equal(mk({ createdBy: 'agent', kind: 'task' }).awaiting, 'agent')
+  assert.equal(mk({ createdBy: 'agent', kind: 'question' }).awaiting, 'user')
+  assert.equal(mk({ createdBy: 'agent', kind: 'decision' }).awaiting, null)
+  // User-filed: the ball is with the agent for both actionable kinds — a
+  // user's question is asked OF the agent, not left waiting on themselves.
+  assert.equal(mk({ createdBy: 'user', kind: 'task' }).awaiting, 'agent')
+  assert.equal(mk({ createdBy: 'user', kind: 'question' }).awaiting, 'agent')
+  assert.equal(mk({ createdBy: 'user', kind: 'decision' }).awaiting, null)
+  // An explicit value always wins over either default, null included.
+  assert.equal(mk({ createdBy: 'user', kind: 'question', awaiting: 'user' }).awaiting, 'user')
+  assert.equal(mk({ createdBy: 'agent', kind: 'task', awaiting: null }).awaiting, null)
+  assert.equal(createDefaultAwaiting('question', 'user'), 'agent')
+  assert.equal(createDefaultAwaiting('question', 'agent'), 'user')
+})
+
+test('validateItemFields strips a client-supplied attachment transcript unless allowTranscript', () => {
+  const att = [{ blob_ref: 'b1', mime: 'audio/mp4', name: 'v.m4a', size: 3, transcript: 'forged' }]
+  const stripped = validateItemFields({ title: 't', attachments: att }).value.attachments[0]
+  assert.equal(stripped.transcript, undefined)
+  assert.equal(stripped.blob_ref, 'b1') // the rest of the attachment survives
+  const kept = validateItemFields({ title: 't', attachments: att }, { allowTranscript: true }).value.attachments[0]
+  assert.equal(kept.transcript, 'forged')
+  // Still bounded when it IS allowed.
+  assert.equal(validateItemFields({ title: 't', attachments: [{ ...att[0], transcript: 'x'.repeat(32769) }] }, { allowTranscript: true }).ok, false)
+  // ...and an over-long one is simply dropped, not a 400, when it isn't.
+  assert.equal(validateItemFields({ title: 't', attachments: [{ ...att[0], transcript: 'x'.repeat(32769) }] }).ok, true)
+})
+
+test('rowToItem / rowToComment do not expose internal columns', async () => {
+  const { db, dan } = await seed()
+  const t = createItem(db, base({ userId: dan.id, idemKey: 'k1' })).item
+  assert.ok(!('idem_key' in t), 'item shape must not carry idem_key')
+  assert.equal(db.prepare('SELECT idem_key FROM items WHERE id=?').get(t.id).idem_key, 'k1') // still stored
+  const c = addComment(db, { userId: dan.id, itemId: t.id, author: 'user', deviceId: 9, body: 'x', idemKey: 'c1' }).comment
+  assert.ok(!('idem_key' in c), 'comment shape must not carry idem_key')
+  assert.ok(!('user_id' in c), 'comment shape must not carry user_id')
+  assert.equal(db.prepare('SELECT idem_key FROM item_comments WHERE id=?').get(c.id).idem_key, 'c1')
+  assert.deepEqual(Object.keys(c).sort(), ['attachments', 'author', 'body', 'created_at', 'device_id', 'id', 'item_id', 'kind', 'meta'])
 })
 
 test('createItem idempotency returns the original row', async () => {

@@ -21,7 +21,13 @@ const newId = (prefix) => `${prefix}_${randomBytes(8).toString('hex')}`
 
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
 
-function validateAttachments(list) {
+// `allowTranscript` defaults FALSE, and no HTTP route turns it on: a
+// transcript is agent-attested output of the transcribe job, written only by
+// PATCH /items/:id/comments/:cid (setAttachmentTranscript). A client that
+// posts one on a create/comment gets it dropped on the floor rather than
+// stored — otherwise anyone could forge words into a voice note's transcript,
+// which is exactly the text the apps display in place of the audio.
+function validateAttachments(list, { allowTranscript = false } = {}) {
   if (list === undefined) return { ok: true, value: [] }
   if (!Array.isArray(list) || list.length > ATTACHMENTS_MAX) return { ok: false }
   const out = []
@@ -32,7 +38,7 @@ function validateAttachments(list) {
     if (typeof a.name !== 'string' || a.name.length > 255) return { ok: false }
     if (!Number.isInteger(a.size) || a.size < 0) return { ok: false }
     const att = { blob_ref: a.blob_ref, mime: a.mime, name: a.name, size: a.size }
-    if (a.transcript !== undefined) {
+    if (allowTranscript && a.transcript !== undefined) {
       if (typeof a.transcript !== 'string' || a.transcript.length > BODY_MAX) return { ok: false }
       att.transcript = a.transcript
     }
@@ -43,7 +49,9 @@ function validateAttachments(list) {
 
 // Normalises and bounds every user/agent-writable field. `partial` (PATCH)
 // lets `title` be absent; a present field is always validated in full.
-export function validateItemFields(fields, { partial = false } = {}) {
+// `allowTranscript` is passed straight through to validateAttachments (see
+// there: off for every route, so a client-supplied transcript is stripped).
+export function validateItemFields(fields, { partial = false, allowTranscript = false } = {}) {
   if (!isPlainObject(fields)) return { ok: false }
   const value = {}
   if (fields.title !== undefined || !partial) {
@@ -81,7 +89,7 @@ export function validateItemFields(fields, { partial = false } = {}) {
       value.links.push(link)
     }
   }
-  const att = validateAttachments(fields.attachments)
+  const att = validateAttachments(fields.attachments, { allowTranscript })
   if (!att.ok) return { ok: false }
   if (fields.attachments !== undefined) value.attachments = att.value
   return { ok: true, value }
@@ -89,9 +97,12 @@ export function validateItemFields(fields, { partial = false } = {}) {
 
 const parseJson = (s, fallback) => { try { return JSON.parse(s) } catch { return fallback } }
 
+// `idem_key` is an internal column (same stance as toEventShape in
+// journal.js): the caller sent the key, so handing it back tells it nothing,
+// and echoing another device's key would be a small leak.
 export function rowToItem(row) {
   if (!row) return null
-  const { labels, links, attachments, ...rest } = row
+  const { labels, links, attachments, idem_key: _idemKey, ...rest } = row
   const out = {
     ...rest,
     labels: parseJson(labels, []),
@@ -103,17 +114,30 @@ export function rowToItem(row) {
   return out
 }
 
+// Same internal-column strip as rowToItem, plus `user_id`: every comment
+// route is already scoped to the caller's own user, so the field is noise.
 export function rowToComment(row) {
   if (!row) return null
-  const { attachments, meta, ...rest } = row
+  const { attachments, meta, idem_key: _idemKey, user_id: _userId, ...rest } = row
   return { ...rest, attachments: parseJson(attachments, []), meta: meta == null ? null : parseJson(meta, null) }
 }
 
-// Default `awaiting` per kind at creation (spec: Semantics).
+// Default `awaiting` per kind at creation (spec: Semantics). Also the value
+// a reopen restores.
 export function defaultAwaiting(kind) {
   if (kind === 'question') return 'user'
   if (kind === 'task') return 'agent'
   return null
+}
+
+// ...but WHO filed it matters at creation time: the kind defaults above
+// describe an AGENT-filed item (an agent's question is a question *for* the
+// user). A user filing a question is asking the agent, and a user filing a
+// task is asking for work — both start `awaiting:'agent'`. A decision
+// records something already settled and awaits nobody either way.
+export function createDefaultAwaiting(kind, createdBy) {
+  if (createdBy === 'user') return kind === 'decision' ? null : 'agent'
+  return defaultAwaiting(kind)
 }
 
 // Mirrors journal.js's user_seq counter idiom: one statement, atomic even
@@ -209,7 +233,7 @@ export function createItem(db, {
     const rank = resolveRank(db, userId, { position, after, before })
     const id = newId('it')
     const num = nextNum(db, userId)
-    const aw = awaiting === undefined ? defaultAwaiting(kind) : awaiting
+    const aw = awaiting === undefined ? createDefaultAwaiting(kind, createdBy) : awaiting
     try {
       db.prepare(`INSERT INTO items(id,user_id,num,kind,state,resolution,awaiting,rank,title,body,labels,links,supersedes,
         origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at)
@@ -317,11 +341,6 @@ export function listItems(db, userId, {
     ? encCursor([sort === 'updated' ? last.updated_at : last.rank, last.num])
     : null
   return { items: page, next_cursor }
-}
-
-// "Needs you" count per origin conversation — the chat-list badge feed.
-export function needsUserCounts(db, userId) {
-  return db.prepare("SELECT origin_convo_id AS convo_id, COUNT(*) AS n FROM items WHERE user_id=? AND state='open' AND awaiting='user' GROUP BY origin_convo_id").all(userId)
 }
 
 function touch(db, itemId, now) {
