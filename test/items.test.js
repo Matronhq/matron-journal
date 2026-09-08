@@ -229,13 +229,16 @@ test('createItem attachments: synthetic body comment written, item decorated wit
 test('addComment flips awaiting to agent for user comments and reopens closed items', async () => {
   const { db, dan } = await seed()
   const q = createItem(db, base({ userId: dan.id, kind: 'question' })).item
-  const r = addComment(db, { userId: dan.id, itemId: q.id, author: 'user', deviceId: 9, body: 'use A' })
+  const r = addComment(db, { userId: dan.id, itemId: q.id, author: 'user', deviceId: 9, body: 'use A', now: 100 })
   assert.equal(r.item.awaiting, 'agent'); assert.equal(r.comment.kind, 'comment'); assert.equal(r.duplicate, false)
-  const a = addComment(db, { userId: dan.id, itemId: q.id, author: 'agent', deviceId: 1, body: 'ok' })
+  assert.equal(getItem(db, dan.id, q.id).updated_at, 100)
+  const a = addComment(db, { userId: dan.id, itemId: q.id, author: 'agent', deviceId: 1, body: 'ok', now: 200 })
   assert.equal(a.item.awaiting, 'agent') // agent comments never flip by themselves
-  closeItem(db, { userId: dan.id, itemId: q.id, resolution: 'answered', author: 'agent', deviceId: 1 })
-  const again = addComment(db, { userId: dan.id, itemId: q.id, author: 'user', deviceId: 9, body: 'actually…' })
+  assert.equal(getItem(db, dan.id, q.id).updated_at, 200) // agent comments still bump updated_at
+  closeItem(db, { userId: dan.id, itemId: q.id, resolution: 'answered', author: 'agent', deviceId: 1, now: 300 })
+  const again = addComment(db, { userId: dan.id, itemId: q.id, author: 'user', deviceId: 9, body: 'actually…', now: 400 })
   assert.equal(again.item.state, 'open'); assert.equal(again.item.resolution, null); assert.equal(again.item.awaiting, 'agent')
+  assert.equal(getItem(db, dan.id, q.id).updated_at, 400)
   assert.equal(listComments(db, q.id).length, 4) // comment, comment, status(close), comment
   // idempotent
   const k1 = addComment(db, { userId: dan.id, itemId: q.id, author: 'user', deviceId: 9, body: 'x', idemKey: 'c1' })
@@ -244,21 +247,55 @@ test('addComment flips awaiting to agent for user comments and reopens closed it
   assert.equal(addComment(db, { userId: 999, itemId: q.id, author: 'user', deviceId: 9, body: 'x' }), null)
 })
 
+test('addComment idem_key is scoped per item; reusing it on a different item conflicts', async () => {
+  const { db, dan } = await seed()
+  const t1 = createItem(db, base({ userId: dan.id, title: 'T1' })).item
+  const t2 = createItem(db, base({ userId: dan.id, title: 'T2' })).item
+  const first = addComment(db, { userId: dan.id, itemId: t1.id, author: 'user', deviceId: 9, body: 'a', idemKey: 'shared' })
+  assert.equal(first.duplicate, false)
+  // Same key, same item: idempotent replay returns the original comment.
+  const replay = addComment(db, { userId: dan.id, itemId: t1.id, author: 'user', deviceId: 9, body: 'b', idemKey: 'shared' })
+  assert.equal(replay.duplicate, true); assert.equal(replay.comment.id, first.comment.id)
+  // Same key, different item: must not silently hand back t1's comment
+  // under t2 — that would misattribute a reply. Conflict instead.
+  assert.throws(
+    () => addComment(db, { userId: dan.id, itemId: t2.id, author: 'user', deviceId: 9, body: 'c', idemKey: 'shared' }),
+    /idem_key_conflict/
+  )
+  // t2 got no comment out of the failed attempt.
+  assert.equal(listComments(db, t2.id).length, 0)
+})
+
 test('closeItem / reopenItem write status comments and enforce state', async () => {
   const { db, dan } = await seed()
   const t = createItem(db, base({ userId: dan.id })).item
-  const c = closeItem(db, { userId: dan.id, itemId: t.id, resolution: 'done', author: 'agent', deviceId: 1, comment: 'shipped' })
+  const c = closeItem(db, { userId: dan.id, itemId: t.id, resolution: 'done', author: 'agent', deviceId: 1, comment: 'shipped', now: 100 })
   assert.equal(c.item.state, 'closed'); assert.equal(c.item.resolution, 'done'); assert.equal(c.item.awaiting, null)
   assert.ok(c.item.closed_at)
   assert.equal(c.comment.kind, 'status'); assert.equal(c.comment.body, 'shipped')
+  // task's default awaiting at creation is 'agent' (defaultAwaiting('task')).
+  assert.deepEqual(c.comment.meta.from, { state: 'open', resolution: null, awaiting: 'agent' })
   assert.deepEqual(c.comment.meta.to, { state: 'closed', resolution: 'done', awaiting: null })
+  assert.equal(getItem(db, dan.id, t.id).updated_at, 100)
   assert.equal(closeItem(db, { userId: dan.id, itemId: t.id, resolution: 'done', author: 'agent', deviceId: 1 }), null)
-  const r = reopenItem(db, { userId: dan.id, itemId: t.id, author: 'user', deviceId: 9 })
+  const r = reopenItem(db, { userId: dan.id, itemId: t.id, author: 'user', deviceId: 9, now: 200 })
   assert.equal(r.item.state, 'open'); assert.equal(r.item.awaiting, 'agent'); assert.equal(r.item.closed_at, null)
+  assert.equal(getItem(db, dan.id, t.id).updated_at, 200)
   assert.equal(reopenItem(db, { userId: dan.id, itemId: t.id, author: 'user', deviceId: 9 }), null)
   const d = createItem(db, base({ userId: dan.id, kind: 'decision' })).item
   closeItem(db, { userId: dan.id, itemId: d.id, resolution: 'reversed', author: 'user', deviceId: 9 })
   assert.equal(reopenItem(db, { userId: dan.id, itemId: d.id, author: 'agent', deviceId: 1 }).item.awaiting, null)
+})
+
+test('listComments orders same-millisecond rows by insertion order (rowid), not by random id', async () => {
+  const { db, dan } = await seed()
+  const t = createItem(db, base({ userId: dan.id })).item
+  // A comment immediately followed by a close, both stamped with the same
+  // `now` — created_at alone can't disambiguate the order.
+  const cm = addComment(db, { userId: dan.id, itemId: t.id, author: 'user', deviceId: 9, body: 'first', now: 50 }).comment
+  const cl = closeItem(db, { userId: dan.id, itemId: t.id, resolution: 'done', author: 'agent', deviceId: 1, now: 50 }).comment
+  const ids = listComments(db, t.id).map((c) => c.id)
+  assert.deepEqual(ids, [cm.id, cl.id])
 })
 
 test('updateItem patches fields and awaiting; bumps updated_at', async () => {
@@ -275,7 +312,8 @@ test('setAttachmentTranscript writes into exactly one attachment', async () => {
   const t = createItem(db, base({ userId: dan.id })).item
   const c = addComment(db, { userId: dan.id, itemId: t.id, author: 'user', deviceId: 9, body: '',
     attachments: [{ blob_ref: 'b1', mime: 'audio/mp4', name: 'v.m4a', size: 10 }, { blob_ref: 'b2', mime: 'image/png', name: 'p.png', size: 1 }] }).comment
-  const out = setAttachmentTranscript(db, { userId: dan.id, itemId: t.id, commentId: c.id, blobRef: 'b1', transcript: 'hello' })
+  const out = setAttachmentTranscript(db, { userId: dan.id, itemId: t.id, commentId: c.id, blobRef: 'b1', transcript: 'hello', now: 500 })
   assert.equal(out.attachments[0].transcript, 'hello'); assert.equal(out.attachments[1].transcript, undefined)
+  assert.equal(getItem(db, dan.id, t.id).updated_at, 500)
   assert.equal(setAttachmentTranscript(db, { userId: dan.id, itemId: t.id, commentId: c.id, blobRef: 'nope', transcript: 'x' }), null)
 })

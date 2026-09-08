@@ -248,7 +248,11 @@ export function getItem(db, userId, idOrNum) {
 }
 
 export function listComments(db, itemId) {
-  return db.prepare("SELECT * FROM item_comments WHERE item_id=? AND NOT (kind='status' AND meta LIKE '%\"role\":\"body\"%') ORDER BY created_at ASC, id ASC")
+  // rowid (not id) as the tiebreaker: id is random hex, so two rows written
+  // in the same millisecond (e.g. a comment immediately followed by a
+  // close's status row) would otherwise come back in nondeterministic
+  // order. rowid reflects actual insertion order for this ordinary table.
+  return db.prepare("SELECT * FROM item_comments WHERE item_id=? AND NOT (kind='status' AND meta LIKE '%\"role\":\"body\"%') ORDER BY created_at ASC, rowid ASC")
     .all(itemId).map(rowToComment)
 }
 
@@ -324,10 +328,21 @@ export function addComment(db, { userId, itemId, author, deviceId, body = '', at
     const row = ownedRow(db, userId, itemId)
     if (!row) return null
     if (idemKey) {
-      const dup = db.prepare('SELECT * FROM item_comments WHERE user_id=? AND idem_key=?').get(userId, idemKey)
+      // Scoped to this item: idem_key is only unique per (user_id,
+      // idem_key) in the schema, so a key first used on item A and
+      // replayed against item B must NOT silently hand back A's comment
+      // under B's id. Below, the INSERT itself catches that cross-item
+      // reuse via the UNIQUE constraint and reports it as a conflict.
+      const dup = db.prepare('SELECT * FROM item_comments WHERE user_id=? AND item_id=? AND idem_key=?').get(userId, itemId, idemKey)
       if (dup) return { item: getItem(db, userId, itemId), comment: rowToComment(dup), duplicate: true }
     }
-    const comment = insertComment(db, { itemId, userId, author, deviceId, kind: 'comment', body, attachments, meta: null, idemKey, now })
+    let comment
+    try {
+      comment = insertComment(db, { itemId, userId, author, deviceId, kind: 'comment', body, attachments, meta: null, idemKey, now })
+    } catch (err) {
+      if (idemKey && err.code === 'SQLITE_CONSTRAINT_UNIQUE') throw new Error('idem_key_conflict')
+      throw err
+    }
     if (author === 'user') {
       // The user's words always hand the ball to the agent, and wake a
       // closed item back up (spec: "any further user comment on a closed
