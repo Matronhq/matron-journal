@@ -143,36 +143,52 @@ export function renormaliseRanks(db, userId) {
 
 // Resolves a target rank from {position, after, before}. Throws
 // Error('bad_after_before') when a named neighbour is not one of the user's
-// OPEN items. `excludeId` keeps a reorder from using itself as a neighbour.
+// OPEN items, when after/before name the same item, or when they're
+// inverted (before ranked at-or-below after — renormalising can't fix a
+// structural inversion, only a tight gap, so this must fail fast rather
+// than loop). `excludeId` keeps a reorder from using itself as a neighbour.
 export function resolveRank(db, userId, { position, after, before, excludeId = null }) {
   const bounds = rankBounds(db, userId)
   if (after == null && before == null) {
     if (position === 'top') return bounds.lo == null ? RANK_GAP : bounds.lo - RANK_GAP
     return bounds.hi == null ? RANK_GAP : bounds.hi + RANK_GAP
   }
-  let lo = null, hi = null
-  if (after != null) {
-    if (after === excludeId) throw new Error('bad_after_before')
-    lo = openRankOf(db, userId, after)
-    if (lo == null) throw new Error('bad_after_before')
+  if (after != null && before != null && after === before) throw new Error('bad_after_before')
+
+  const computeBounds = () => {
+    let lo = null, hi = null
+    if (after != null) {
+      if (after === excludeId) throw new Error('bad_after_before')
+      lo = openRankOf(db, userId, after)
+      if (lo == null) throw new Error('bad_after_before')
+    }
+    if (before != null) {
+      if (before === excludeId) throw new Error('bad_after_before')
+      hi = openRankOf(db, userId, before)
+      if (hi == null) throw new Error('bad_after_before')
+    }
+    if (lo == null) {
+      // "before X" only: sit between X's predecessor and X.
+      const prev = db.prepare("SELECT MAX(rank) AS r FROM items WHERE user_id=? AND state='open' AND rank < ? AND id<>?").get(userId, hi, excludeId ?? '').r
+      lo = prev == null ? hi - RANK_GAP * 2 : prev
+    }
+    if (hi == null) {
+      const next = db.prepare("SELECT MIN(rank) AS r FROM items WHERE user_id=? AND state='open' AND rank > ? AND id<>?").get(userId, lo, excludeId ?? '').r
+      hi = next == null ? lo + RANK_GAP * 2 : next
+    }
+    return { lo, hi }
   }
-  if (before != null) {
-    if (before === excludeId) throw new Error('bad_after_before')
-    hi = openRankOf(db, userId, before)
-    if (hi == null) throw new Error('bad_after_before')
-  }
-  if (lo == null) {
-    // "before X" only: sit between X's predecessor and X.
-    const prev = db.prepare("SELECT MAX(rank) AS r FROM items WHERE user_id=? AND state='open' AND rank < ? AND id<>?").get(userId, hi, excludeId ?? '').r
-    lo = prev == null ? hi - RANK_GAP * 2 : prev
-  }
-  if (hi == null) {
-    const next = db.prepare("SELECT MIN(rank) AS r FROM items WHERE user_id=? AND state='open' AND rank > ? AND id<>?").get(userId, lo, excludeId ?? '').r
-    hi = next == null ? lo + RANK_GAP * 2 : next
-  }
+
+  let { lo, hi } = computeBounds()
+  if (hi <= lo) throw new Error('bad_after_before')
   if (hi - lo < RANK_EPSILON) {
+    // A genuine but too-tight gap: renormalise once (spreads every open
+    // item back to 1024·n, preserving order) and recompute directly — no
+    // recursion, so this can fire at most once per call no matter how many
+    // items are open.
     renormaliseRanks(db, userId)
-    return resolveRank(db, userId, { position, after, before, excludeId })
+    ;({ lo, hi } = computeBounds())
+    if (hi <= lo) throw new Error('bad_after_before')
   }
   return (lo + hi) / 2
 }
@@ -244,6 +260,10 @@ export function listItems(db, userId, {
   convoId = null, kind = null, state = null, awaiting = null, label = null, sort = 'rank', since = null,
   limit = 100, cursor = null, excludePrivateOwned = false,
 } = {}) {
+  // Default 100, max 500 (spec: listItems). Coerce first — an unclamped
+  // string limit went straight into a SQL LIMIT via bind param concatenation
+  // and could exceed the page cap or bind a non-numeric value.
+  limit = Math.min(Math.max(Number(limit) || 100, 1), 500)
   const where = ['i.user_id = ?']
   const args = [userId]
   if (convoId != null) { where.push('i.origin_convo_id = ?'); args.push(convoId) }
