@@ -239,3 +239,138 @@ test('push: a new item awaiting the user alerts the client; a user-authored one 
   await new Promise((r) => setTimeout(r, 50))
   assert.equal(stub.calls.filter((c) => c.deviceToken === 'phone-token' && c.payload.aps.alert).length, 1)
 })
+
+test('comments: user comment flips awaiting, emits a commented marker with the body, wakes the box', async (t) => {
+  const { s, agent, client, wakeCalls } = await fleet(t)
+  const made = await mkItem(s, agent.token, {})
+  const id = made.json.item.id
+  const ws = await makeWsClient(s.base, { token: client, cursor: null })
+  await ws.waitFor((f) => f.op === 'hello_ok')
+  const r = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { body: 'use A', attachments: [{ blob_ref: 'b1', mime: 'audio/mp4', name: 'v.m4a', size: 3 }] } })
+  assert.equal(r.status, 201); assert.equal(r.json.item.awaiting, 'agent'); assert.equal(r.json.comment.attachments[0].blob_ref, 'b1')
+  const marker = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'item' && f.payload.action === 'commented')
+  assert.equal(marker.sender, 'user:dan'); assert.equal(marker.payload.comment.body, 'use A'); assert.equal(marker.payload.awaiting, 'agent')
+  assert.equal(marker.payload.comment.attachments[0].transcript, null)
+  ws.close()
+  assert.deepEqual(wakeCalls, ['dev-2'])
+  assert.equal((await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: {} })).status, 400)
+  assert.equal((await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { body: 'x'.repeat(32769) } })).status, 400)
+  // agent comment: no wake, awaiting unchanged
+  const a = await s.http(`/items/${id}/comments`, { method: 'POST', token: agent.token, body: { body: 'noted' } })
+  assert.equal(a.status, 201); assert.equal(a.json.item.awaiting, 'agent'); assert.equal(wakeCalls.length, 1)
+})
+
+test('comments idempotency and transcript patch (agent-only)', async (t) => {
+  const { s, agent, client } = await fleet(t)
+  const id = (await mkItem(s, agent.token, {})).json.item.id
+  const h = { 'idempotency-key': 'c-1' }
+  const a = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, headers: h, body: { body: 'x', attachments: [{ blob_ref: 'b1', mime: 'audio/mp4', name: 'v', size: 1 }] } })
+  const b = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, headers: h, body: { body: 'y' } })
+  assert.equal(a.status, 201); assert.equal(b.status, 200); assert.equal(b.json.comment.id, a.json.comment.id)
+  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='item' AND payload LIKE '%commented%'").get().n, 1)
+  const cid = a.json.comment.id
+  assert.equal((await s.http(`/items/${id}/comments/${cid}`, { method: 'PATCH', token: client, body: { blob_ref: 'b1', transcript: 'hi' } })).status, 403)
+  const p = await s.http(`/items/${id}/comments/${cid}`, { method: 'PATCH', token: agent.token, body: { blob_ref: 'b1', transcript: 'hi' } })
+  assert.equal(p.status, 200); assert.equal(p.json.comment.attachments[0].transcript, 'hi')
+  assert.equal((await s.http(`/items/${id}/comments/${cid}`, { method: 'PATCH', token: agent.token, body: { blob_ref: 'zz', transcript: 'hi' } })).status, 404)
+  assert.equal((await s.http(`/items/${id}/comments/${cid}`, { method: 'PATCH', token: agent.token, body: { blob_ref: 'b1' } })).status, 400)
+})
+
+test('close / reopen: state machine, 409s, markers, agent close does not wake', async (t) => {
+  const { s, agent, client, wakeCalls } = await fleet(t)
+  const id = (await mkItem(s, agent.token, {})).json.item.id
+  const c = await s.http(`/items/${id}/close`, { method: 'POST', token: agent.token, body: { resolution: 'answered', comment: 'done' } })
+  assert.equal(c.status, 200); assert.equal(c.json.item.state, 'closed'); assert.equal(c.json.comment.kind, 'status')
+  assert.equal((await s.http(`/items/${id}/close`, { method: 'POST', token: agent.token, body: { resolution: 'answered' } })).status, 409)
+  assert.equal((await s.http(`/items/${id}/close`, { method: 'POST', token: agent.token, body: { resolution: 'meh' } })).status, 400)
+  assert.equal(wakeCalls.length, 0)
+  const r = await s.http(`/items/${id}/reopen`, { method: 'POST', token: client, body: { comment: 'not yet' } })
+  assert.equal(r.status, 200); assert.equal(r.json.item.state, 'open'); assert.equal(r.json.item.awaiting, 'user')
+  assert.equal(wakeCalls.length, 1)
+  assert.equal((await s.http(`/items/${id}/reopen`, { method: 'POST', token: client, body: {} })).status, 409)
+  const actions = s.db.prepare("SELECT payload FROM events WHERE type='item' ORDER BY seq").all().map((e) => JSON.parse(e.payload).action)
+  assert.deepEqual(actions, ['created', 'closed', 'reopened'])
+})
+
+test('rank: reorder emits a silent reordered marker and never wakes', async (t) => {
+  const { s, agent, client, wakeCalls } = await fleet(t)
+  const a = (await mkItem(s, agent.token, { kind: 'task', title: 'A' })).json.item
+  const b = (await mkItem(s, agent.token, { kind: 'task', title: 'B' })).json.item
+  const r = await s.http(`/items/${b.id}/rank`, { method: 'POST', token: client, body: { position: 'top' } })
+  assert.equal(r.status, 200); assert.ok(r.json.item.rank < a.rank)
+  assert.equal(wakeCalls.length, 0)
+  assert.equal((await s.http(`/items/${b.id}/rank`, { method: 'POST', token: client, body: { after: b.id } })).status, 400)
+  assert.equal((await s.http(`/items/${b.id}/rank`, { method: 'POST', token: client, body: {} })).status, 400)
+  const last = JSON.parse(s.db.prepare("SELECT payload FROM events WHERE type='item' ORDER BY seq DESC LIMIT 1").get().payload)
+  assert.equal(last.action, 'reordered')
+})
+
+test('sub-routes on a foreign or hidden item are 404, never 403', async (t) => {
+  const { s, agent, patAgent } = await fleet(t)
+  const id = (await mkItem(s, agent.token, {})).json.item.id
+  for (const sub of ['comments', 'close', 'reopen', 'rank']) {
+    assert.equal((await s.http(`/items/${id}/${sub}`, { method: 'POST', token: patAgent.token, body: { resolution: 'done', body: 'x', position: 'top' } })).status, 404)
+  }
+})
+
+test('sub-routes: an agent must clear the same write gate the create path applies', async (t) => {
+  const { s, dan, agent } = await fleet(t)
+  const other = createAgent(s.db, dan.id, 'dev-3')
+  upsertConversation(s.db, { id: 'c3', ownerUserId: dan.id, title: 'C3', agentDeviceId: other.deviceId })
+  const id = (await s.http('/items', { method: 'POST', token: other.token, body: { kind: 'task', title: 'Theirs', convo_id: 'c3' } })).json.item.id
+  // dev-2 may SEE it (same user, nothing private) but may not write to it.
+  assert.equal((await s.http(`/items/${id}`, { token: agent.token })).status, 200)
+  for (const [sub, body] of [['comments', { body: 'x' }], ['close', { resolution: 'done' }], ['reopen', {}], ['rank', { position: 'top' }]]) {
+    const r = await s.http(`/items/${id}/${sub}`, { method: 'POST', token: agent.token, body })
+    assert.equal(r.status, 404, sub); assert.equal(r.json.error, 'not_found')
+  }
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM item_comments').get().n, 0)
+  recordJoined(s.db, { convoId: 'c3', agentDeviceId: agent.deviceId, initiatorDeviceId: other.deviceId })
+  assert.equal((await s.http(`/items/${id}/comments`, { method: 'POST', token: agent.token, body: { body: 'x' } })).status, 201)
+})
+
+test('comments: a malformed Idempotency-Key is rejected; a key reused across items is a conflict', async (t) => {
+  const { s, agent, client } = await fleet(t)
+  const a = (await mkItem(s, agent.token, {})).json.item.id
+  const b = (await mkItem(s, agent.token, { title: 'Other' })).json.item.id
+  const post = (id, key) => s.http(`/items/${id}/comments`, { method: 'POST', token: client, headers: { 'idempotency-key': key }, body: { body: 'x' } })
+  assert.equal((await post(a, '')).status, 400)
+  assert.equal((await post(a, 'k'.repeat(129))).status, 400)
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM item_comments').get().n, 0)
+  assert.equal((await post(a, 'shared')).status, 201)
+  const clash = await post(b, 'shared')
+  assert.equal(clash.status, 409); assert.equal(clash.json.error, 'conflict')
+})
+
+test('rank: exactly one of position/after/before, and only open items are ranked', async (t) => {
+  const { s, agent, client } = await fleet(t)
+  const a = (await mkItem(s, agent.token, { kind: 'task', title: 'A' })).json.item
+  const b = (await mkItem(s, agent.token, { kind: 'task', title: 'B' })).json.item
+  const rank = (id, body) => s.http(`/items/${id}/rank`, { method: 'POST', token: client, body })
+  assert.equal((await rank(b.id, { after: a.id, before: a.id })).status, 400)
+  assert.equal((await rank(b.id, { position: 'top', after: a.id })).status, 400)
+  assert.equal((await rank(b.id, { position: 'middle' })).status, 400)
+  assert.equal((await rank(b.id, { after: '' })).status, 400)
+  assert.equal((await rank(b.id, { before: a.id })).status, 200)
+  assert.equal((await s.http(`/items/${a.id}/close`, { method: 'POST', token: agent.token, body: { resolution: 'done' } })).status, 200)
+  const closed = await rank(a.id, { position: 'top' })
+  assert.equal(closed.status, 409); assert.equal(closed.json.error, 'conflict')
+})
+
+test('transcript: bounded, markerless, silent — and a trailing segment never mutates the item', async (t) => {
+  const { s, agent, client, wakeCalls } = await fleet(t)
+  const id = (await mkItem(s, agent.token, {})).json.item.id
+  const c = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { body: 'v', attachments: [{ blob_ref: 'b1', mime: 'audio/mp4', name: 'v', size: 1 }] } })
+  const cid = c.json.comment.id
+  const patch = (body) => s.http(`/items/${id}/comments/${cid}`, { method: 'PATCH', token: agent.token, body })
+  assert.equal((await patch({ blob_ref: 'b1', transcript: 'x'.repeat(32769) })).status, 400)
+  assert.equal((await patch({ blob_ref: '', transcript: 'hi' })).status, 400)
+  assert.equal((await s.http(`/items/${id}/comments/ic_nope`, { method: 'PATCH', token: agent.token, body: { blob_ref: 'b1', transcript: 'hi' } })).status, 404)
+  const before = s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='item'").get().n
+  assert.equal((await patch({ blob_ref: 'b1', transcript: 'hi' })).status, 200)
+  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='item'").get().n, before)
+  assert.equal(wakeCalls.length, 1) // the comment woke the box; the transcript did not
+  // The trailing segment belongs to the sub-route, so a junk one is not a close.
+  assert.equal((await s.http(`/items/${id}/close/junk`, { method: 'POST', token: agent.token, body: { resolution: 'done' } })).status, 404)
+  assert.equal((await s.http(`/items/${id}`, { token: client })).json.item.state, 'open')
+})

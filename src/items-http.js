@@ -7,7 +7,10 @@ import { isPrivateDevice } from './db.js'
 import { authorizeAgentWrite } from './auth.js'
 import { wakeConvoAgent } from './wake.js'
 import { json, readBody } from './http-body.js'
-import { ITEM_KINDS, AWAITING, validateItemFields, createItem, getItem, listItems, listComments, updateItem } from './items.js'
+import {
+  ITEM_KINDS, AWAITING, RESOLUTIONS, BODY_MAX, validateItemFields, createItem, getItem, listItems, listComments,
+  updateItem, addComment, setAttachmentTranscript, closeItem, reopenItem, rerankItem,
+} from './items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE, ITEM_ACTIONS } from './items-marker.js'
 
 const SORTS = ['rank', 'updated']
@@ -242,8 +245,118 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
     return false
   }
 
-  // Sub-routes land in Task 8.
   return handleItemSubRoute(ctx, req, res, who, item, sub, subId)
 }
 
-async function handleItemSubRoute() { return false }
+// A status/close/reopen note is optional but, when present, bounded like any
+// other body the user writes.
+const okNote = (v) => v === undefined || (typeof v === 'string' && v.length <= BODY_MAX)
+
+// Every sub-route is a mutation of an already-visible item.
+async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
+  const { db } = ctx
+  // An AGENT clears the same write gate the create path applies: it owns the
+  // item's origin conversation or has joined it. 404, never 403 — a refusal
+  // must be indistinguishable from an item that isn't there, and visibleItem
+  // has already applied the privacy sieve. A client writing to its own
+  // user's item is never gated.
+  if (who.kind === 'agent' && !authorizeAgentWrite(db, who.userId, who.deviceId, item.origin_convo_id)) return notFound(res)
+  // There is no on_behalf_of on a comment: the caller's own device kind is
+  // the author, full stop.
+  const author = who.kind === 'agent' ? 'agent' : 'user'
+
+  if (sub === 'comments' && subId == null && req.method === 'POST') {
+    const body = await readBody(req)
+    const idemKey = idemKeyOf(req, who)
+    if (idemKey === undefined) return badRequest(res)
+    const v = validateItemFields({ body: body.body ?? '', attachments: body.attachments }, { partial: true })
+    if (!v.ok) return badRequest(res)
+    const text = v.value.body ?? ''
+    const attachments = v.value.attachments ?? []
+    // A comment with neither words nor blobs is nothing at all — it would
+    // still flip `awaiting` and wake the box, so it is a bad request.
+    if (!text.trim() && attachments.length === 0) return badRequest(res)
+    let out
+    try {
+      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, body: text, attachments, idemKey })
+    } catch (err) {
+      if (answerKnownError(res, err)) return true
+      throw err
+    }
+    // Only reachable if the item vanished between the read and the write.
+    if (!out) return notFound(res)
+    // A replayed idempotency key must not fan a second marker out.
+    if (!out.duplicate) emitMarker(ctx, who, { item: out.item, action: 'commented', comment: out.comment })
+    json(res, out.duplicate ? 200 : 201, { item: out.item, comment: out.comment })
+    return true
+  }
+
+  if (sub === 'comments' && subId != null && req.method === 'PATCH') {
+    // Transcript write-back is the bridge's job after it transcribes a
+    // voice-note attachment; a client never patches a comment.
+    if (who.kind !== 'agent') { json(res, 403, { error: 'forbidden' }); return true }
+    const body = await readBody(req)
+    if (typeof body.blob_ref !== 'string' || !body.blob_ref) return badRequest(res)
+    if (typeof body.transcript !== 'string' || body.transcript.length > BODY_MAX) return badRequest(res)
+    // Unknown comment and unknown blob_ref answer the same 404.
+    const c = setAttachmentTranscript(db, { userId: who.userId, itemId: item.id, commentId: subId, blobRef: body.blob_ref, transcript: body.transcript })
+    if (!c) return notFound(res)
+    // No marker and no wake: filling in a transcript is not new traffic,
+    // it is the agent finishing a job the apps already know about.
+    json(res, 200, { comment: c })
+    return true
+  }
+
+  if (sub === 'close' && subId == null && req.method === 'POST') {
+    const body = await readBody(req)
+    if (!RESOLUTIONS.includes(body.resolution)) return badRequest(res)
+    if (!okNote(body.comment)) return badRequest(res)
+    const out = closeItem(db, { userId: who.userId, itemId: item.id, resolution: body.resolution, author, deviceId: who.deviceId, comment: body.comment ?? '' })
+    // The item was visible a statement ago, so the only real cause is that
+    // it is already closed — a state conflict, not a missing item.
+    if (!out) return conflict(res)
+    emitMarker(ctx, who, { item: out.item, action: 'closed', comment: out.comment })
+    json(res, 200, { item: out.item, comment: out.comment })
+    return true
+  }
+
+  if (sub === 'reopen' && subId == null && req.method === 'POST') {
+    const body = await readBody(req)
+    if (!okNote(body.comment)) return badRequest(res)
+    const out = reopenItem(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, comment: body.comment ?? '' })
+    if (!out) return conflict(res) // already open
+    emitMarker(ctx, who, { item: out.item, action: 'reopened', comment: out.comment })
+    json(res, 200, { item: out.item, comment: out.comment })
+    return true
+  }
+
+  if (sub === 'rank' && subId == null && req.method === 'POST') {
+    const body = await readBody(req)
+    // Exactly one destination. Two of them is an ambiguous intent, none is
+    // a no-op that would still cost a marker.
+    const given = ['position', 'after', 'before'].filter((k) => body[k] !== undefined)
+    if (given.length !== 1) return badRequest(res)
+    if (body.position !== undefined && !POSITIONS.includes(body.position)) return badRequest(res)
+    for (const k of ['after', 'before']) {
+      if (body[k] !== undefined && (typeof body[k] !== 'string' || !body[k] || body[k].length > ID_MAX)) return badRequest(res)
+    }
+    // Only open items carry a place in the list (resolveRank reads open
+    // ranks only), so ranking a closed one is a state conflict.
+    if (item.state === 'closed') return conflict(res)
+    let out
+    try {
+      out = rerankItem(db, { userId: who.userId, itemId: item.id, position: body.position, after: body.after, before: body.before })
+    } catch (err) {
+      if (answerKnownError(res, err)) return true
+      throw err
+    }
+    if (!out) return notFound(res)
+    // Bookkeeping, not traffic: emitMarker skips the wake for 'reordered'
+    // and push.js's classify() returns null for it.
+    emitMarker(ctx, who, { item: out, action: 'reordered' })
+    json(res, 200, { item: out })
+    return true
+  }
+
+  return false
+}
