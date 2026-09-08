@@ -11,6 +11,7 @@ import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
 import { serveHelp } from './help.js'
 import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
+import { handleItemsRoute } from './items-http.js'
 import { json, readBody } from './http-body.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
@@ -74,7 +75,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000 }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, waker = null }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -234,6 +235,10 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       }
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
+      // The tracker's own surface (src/items-http.js) — mounted first so
+      // its /items* paths never collide with the chain below, and inside the
+      // outer try/catch so readBody's 400/413 map like every other route's.
+      if (await handleItemsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
       if (req.method === 'GET' && url.pathname === '/help') {
         // API discovery for agent callers (see src/help.js). Behind auth like
         // the rest of the device surface: it describes the API, and the
