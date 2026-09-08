@@ -319,7 +319,7 @@ test('setAttachmentTranscript writes into exactly one attachment', async () => {
 })
 
 test('rerankItem: midpoints, top, bottom, self-neighbour rejected, closed neighbour rejected', async () => {
-  const { db, dan } = await seed()
+  const { db, dan, pat } = await seed()
   const [a, b, c] = ['A', 'B', 'C'].map((t) => createItem(db, base({ userId: dan.id, title: t })).item)
   assert.equal(rerankItem(db, { userId: dan.id, itemId: c.id, after: a.id, before: b.id }).rank, (a.rank + b.rank) / 2)
   assert.equal(rerankItem(db, { userId: dan.id, itemId: c.id, position: 'top' }).rank, a.rank - RANK_GAP)
@@ -328,9 +328,16 @@ test('rerankItem: midpoints, top, bottom, self-neighbour rejected, closed neighb
   assert.equal(rerankItem(db, { userId: dan.id, itemId: c.id, before: b.id }).rank, (a.rank + b.rank) / 2)
   // "after b" alone with nothing after b → b + 1024
   assert.equal(rerankItem(db, { userId: dan.id, itemId: c.id, after: b.id }).rank, b.rank + RANK_GAP)
+  // updated_at is bumped with explicit now
+  const moved = rerankItem(db, { userId: dan.id, itemId: c.id, after: a.id, before: b.id, now: 900 })
+  assert.equal(moved.updated_at, 900)
+  assert.equal(getItem(db, dan.id, c.id).updated_at, 900)
   assert.throws(() => rerankItem(db, { userId: dan.id, itemId: c.id, after: c.id }), /bad_after_before/)
   closeItem(db, { userId: dan.id, itemId: a.id, resolution: 'done', author: 'agent', deviceId: 1 })
   assert.throws(() => rerankItem(db, { userId: dan.id, itemId: c.id, after: a.id }), /bad_after_before/)
+  // foreign neighbour (another user's open item) is rejected
+  const foreign = createItem(db, base({ userId: pat.id, title: 'Foreign' })).item
+  assert.throws(() => rerankItem(db, { userId: dan.id, itemId: c.id, after: foreign.id }), /bad_after_before/)
   assert.equal(rerankItem(db, { userId: 999, itemId: c.id, position: 'top' }), null)
 })
 
