@@ -74,3 +74,7 @@ counting chars not bytes; edit/summary events don't update snippet/unread
 opts out of APNs push (like `convo_meta`), whereas `edit` pushes normally —
 a known inconsistency in scope (edit's push inclusion predates the push-opt-out
 pattern) and never replicated to other event kinds.
+
+## General / features
+
+- Items tracker v2: due dates, assignees, GitHub sync — see spec non-goals.
