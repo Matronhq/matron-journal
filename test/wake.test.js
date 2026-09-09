@@ -57,13 +57,35 @@ test('waker appends the box name to the argv and debounces per box', async () =>
   assert.deepEqual(readFileSync(out, 'utf8').split('\n').filter(Boolean).sort(), ['henry', 'mavis'])
 })
 
-test('a failed wake clears the debounce so the next message retries', async () => {
+test('a transient wake failure retries after the failure backoff, not on the next message', async () => {
   let errors = 0
-  const w = makeWaker({ cmd: `${process.execPath} -e process.exit(1)`, debounceMs: 60000, log: { log: () => {}, error: () => { errors++ } } })
+  let fired = 0
+  const log = { log: () => { fired++ }, error: () => { errors++ } }
+  const w = makeWaker({ cmd: `${process.execPath} -e process.exit(1)`, debounceMs: 60000, failBackoffMs: 200, log })
   assert.equal(w.wake('henry'), true)
   await until(() => errors === 1)
-  assert.equal(w.wake('henry'), true)
+  assert.equal(w.wake('henry'), true) // still inside the backoff: suppressed
+  assert.equal(fired, 1)
+  await settle(250)
+  assert.equal(w.wake('henry'), true) // backoff elapsed: fires again
   await until(() => errors === 2)
+  assert.equal(fired, 2)
+})
+
+test('a refused wake (exit 2) keeps the full debounce window', async () => {
+  let errors = 0
+  let fired = 0
+  const log = { log: () => { fired++ }, error: () => { errors++ } }
+  const w = makeWaker({ cmd: `${process.execPath} -e process.exit(2)`, debounceMs: 400, failBackoffMs: 50, log })
+  assert.equal(w.wake('dev-j'), true)
+  await until(() => errors === 1)
+  await settle(100) // past the failure backoff, inside the debounce
+  assert.equal(w.wake('dev-j'), true)
+  assert.equal(fired, 1, 'a refusal is not retried on the next message')
+  await settle(350)
+  assert.equal(w.wake('dev-j'), true)
+  await until(() => errors === 2)
+  assert.equal(fired, 2, 'retried once the window elapsed')
 })
 
 // --- ws integration ---------------------------------------------------------

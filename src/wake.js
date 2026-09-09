@@ -15,6 +15,14 @@ import { spawn } from 'node:child_process'
 // while the box booted. Nothing here blocks or throws into the ws path.
 
 const DEFAULT_DEBOUNCE_MS = 60000
+// After a wake command fails, how long before the next message may retry.
+// Exit 2 is the wake command's own verdict that the box cannot be woken
+// (unknown box, refused by every host), so it keeps the full debounce
+// window: retrying a refusal on every message is a storm, not a retry
+// (dev-j on 2026-09-09: 179 refused wakes in 2.5 h, one per message). Any
+// other failure (ssh could not connect, killed) is treated as transient.
+const DEFAULT_FAIL_BACKOFF_MS = 10000
+const REFUSED_EXIT_CODE = 2
 // A box name is an incus instance name; the forced command on the far end
 // re-validates against live incus state, this is just the cheap local half.
 const BOX_NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/
@@ -22,6 +30,7 @@ const BOX_NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/
 export function makeWaker({
   cmd = process.env.MATRON_WAKE_CMD,
   debounceMs = DEFAULT_DEBOUNCE_MS,
+  failBackoffMs = DEFAULT_FAIL_BACKOFF_MS,
   log = console,
 } = {}) {
   const argv = (cmd || '').trim().split(/\s+/).filter(Boolean)
@@ -47,9 +56,15 @@ export function makeWaker({
         child.on('error', (err) => log.error(`wake: ${box}: spawn failed`, err))
         child.on('close', (code) => {
           if (code !== 0) {
-            // Clear the debounce so the next message retries immediately
-            // instead of eating the window on a failed attempt.
-            if (lastFired.get(box) === now) lastFired.delete(box)
+            // Re-arm the debounce from the moment of failure: a transient
+            // failure may retry after failBackoffMs, never on the very next
+            // message. A refusal (exit 2) gets the full window: nothing
+            // changes between two messages that would make the box wakeable.
+            if (lastFired.get(box) === now) {
+              const failedAt = Date.now()
+              const wait = code === REFUSED_EXIT_CODE ? debounceMs : Math.min(failBackoffMs, debounceMs)
+              lastFired.set(box, failedAt - (debounceMs - wait))
+            }
             log.error(`wake: ${box}: exit ${code}${stderr ? `: ${stderr.trim()}` : ''}`)
           }
         })
