@@ -64,6 +64,10 @@ export function snippetOf(type, payload) {
     const m = { started: '🚀 Spawned session started', declined: '🚫 Spawn declined', expired: '⌛ Spawn request expired', failed: '❌ Spawn failed' }
     return Object.hasOwn(m, p.outcome) ? m[p.outcome] : '[spawn_outcome]'
   }
+  if (type === 'item') {
+    const glyph = p.kind === 'question' ? '❓' : p.kind === 'decision' ? '⚖' : '☐'
+    return `${glyph} #${Number(p.num) || 0} ${String(p.title || '')}`.slice(0, 120)
+  }
   if (p.snippet) return String(p.snippet).slice(0, 120)
   if (type === 'tool_output' && p.command) return `$ ${String(p.command)}`.slice(0, 120)
   // Matches the relay's fixed 'done'-category alert (see relay.js

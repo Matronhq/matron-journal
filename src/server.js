@@ -328,7 +328,7 @@ export function startServer({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
-    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs,
+    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, waker: resolvedWaker,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,

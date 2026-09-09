@@ -11,6 +11,8 @@ import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
 import { serveHelp } from './help.js'
 import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
+import { handleItemsRoute } from './items-http.js'
+import { json, readBody } from './http-body.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
 // card's `from_name` gets. NULL stays null rather than collapsing to '' —
@@ -48,52 +50,6 @@ const tagChar = (raw) => {
   return first
 }
 
-const json = (res, status, obj) => {
-  if (res.writableEnded || res.destroyed) return
-  res.writeHead(status, { 'content-type': 'application/json' })
-  res.end(JSON.stringify(obj))
-}
-
-const readBody = (req) => new Promise((resolve, reject) => {
-  let data = ''
-  let settled = false
-  const fail = (err) => { if (!settled) { settled = true; reject(err) } }
-  req.setEncoding('utf8')
-  req.on('data', (c) => {
-    data += c
-    if (data.length > 1e6) {
-      req.removeAllListeners('data')
-      req.pause()
-      fail(Object.assign(new Error('body too large'), { statusCode: 413 }))
-    }
-  })
-  req.on('end', () => {
-    if (settled) return
-    settled = true
-    if (!data) { resolve({}); return }
-    let parsed
-    try {
-      parsed = JSON.parse(data)
-    } catch {
-      reject(Object.assign(new Error('invalid JSON body'), { statusCode: 400 }))
-      return
-    }
-    // Shared guard for every POST handler below: any JSON value that isn't a
-    // plain object (literal `null`, an array, or a bare string/number/bool)
-    // would otherwise reach a handler's `const {x} = body` destructure and
-    // either throw outright (null → 500) or silently produce `undefined`
-    // fields that fail deeper and less legibly (e.g. as a DB bind-type
-    // error → 500).
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      reject(Object.assign(new Error('request body must be a JSON object'), { statusCode: 400 }))
-      return
-    }
-    resolve(parsed)
-  })
-  req.on('close', () => fail(new Error('connection closed')))
-  req.on('error', fail)
-})
-
 const bearer = (req) => (req.headers.authorization || '').replace(/^Bearer /, '') || null
 
 // Constant-time compare, same idiom as src/rendezvous.js's secretMatches:
@@ -119,7 +75,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000 }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, waker = null }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -279,6 +235,10 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       }
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
+      // The tracker's own surface (src/items-http.js) — mounted first so
+      // its /items* paths never collide with the chain below, and inside the
+      // outer try/catch so readBody's 400/413 map like every other route's.
+      if (await handleItemsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
       if (req.method === 'GET' && url.pathname === '/help') {
         // API discovery for agent callers (see src/help.js). Behind auth like
         // the rest of the device surface: it describes the API, and the

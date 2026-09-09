@@ -109,6 +109,56 @@ CREATE TABLE IF NOT EXISTS agent_spawn_requests(
   resolved_at       INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_spawn_state ON agent_spawn_requests(state, from_device_id);
+-- Task & decision tracker (spec: 2026-09-08 task-decision-tracker). Tables
+-- are the source of truth; the conversation log only carries 'item' marker
+-- events written by src/items-http.js. CHECKs list every value src/items.js
+-- writes (the convo_agents lesson: an unlisted value fails silently).
+CREATE TABLE IF NOT EXISTS items(
+  id               TEXT PRIMARY KEY,
+  user_id          INTEGER NOT NULL REFERENCES users(id),
+  num              INTEGER NOT NULL,
+  kind             TEXT NOT NULL CHECK(kind IN ('task','question','decision')),
+  state            TEXT NOT NULL CHECK(state IN ('open','closed')),
+  resolution       TEXT CHECK(resolution IN ('done','answered','decided','reversed','cancelled')),
+  awaiting         TEXT CHECK(awaiting IN ('user','agent')),
+  rank             REAL NOT NULL,
+  title            TEXT NOT NULL,
+  body             TEXT NOT NULL DEFAULT '',
+  labels           TEXT NOT NULL DEFAULT '[]',
+  links            TEXT NOT NULL DEFAULT '[]',
+  supersedes       TEXT REFERENCES items(id),
+  origin_convo_id  TEXT NOT NULL,
+  origin_device_id INTEGER NOT NULL,
+  created_by       TEXT NOT NULL CHECK(created_by IN ('user','agent')),
+  idem_key         TEXT,
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL,
+  closed_at        INTEGER,
+  UNIQUE(user_id, num),
+  UNIQUE(user_id, idem_key)
+);
+CREATE INDEX IF NOT EXISTS idx_items_user_state ON items(user_id, state, rank);
+CREATE INDEX IF NOT EXISTS idx_items_convo ON items(origin_convo_id, state);
+CREATE INDEX IF NOT EXISTS idx_items_updated ON items(user_id, updated_at);
+CREATE TABLE IF NOT EXISTS item_comments(
+  id          TEXT PRIMARY KEY,
+  item_id     TEXT NOT NULL REFERENCES items(id),
+  user_id     INTEGER NOT NULL REFERENCES users(id),
+  author      TEXT NOT NULL CHECK(author IN ('user','agent')),
+  device_id   INTEGER NOT NULL,
+  kind        TEXT NOT NULL CHECK(kind IN ('comment','status')),
+  body        TEXT NOT NULL DEFAULT '',
+  attachments TEXT NOT NULL DEFAULT '[]',
+  meta        TEXT,
+  idem_key    TEXT,
+  created_at  INTEGER NOT NULL,
+  UNIQUE(user_id, idem_key)
+);
+CREATE INDEX IF NOT EXISTS idx_item_comments_item ON item_comments(item_id, created_at);
+CREATE TABLE IF NOT EXISTS item_counters(
+  user_id  INTEGER PRIMARY KEY,
+  next_num INTEGER NOT NULL
+);
 -- Search index (spec: agent journal search). Deliberately INSERT-trigger
 -- only: \`events\` is append-only — plain INSERT in journal.js append(), no
 -- DELETE anywhere, and the only paths that rewrite an event's payload are

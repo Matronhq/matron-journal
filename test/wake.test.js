@@ -5,7 +5,10 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { makeWaker } from '../src/wake.js'
+import { makeWaker, wakeConvoAgent } from '../src/wake.js'
+import { makeHub } from '../src/hub.js'
+import { openDb } from '../src/db.js'
+import { upsertConversation } from '../src/journal.js'
 
 // Wake-on-message (src/wake.js): traffic addressed to an agent device with no
 // live socket fires the operator-configured wake command for that device's
@@ -137,4 +140,23 @@ test('spawn_request to an offline target wakes the box before refusing', async (
   assert.equal(err.code, 'agent_unreachable')
   await until(() => waker.calls.length === 1)
   assert.deepEqual(waker.calls, ['henry'])
+})
+
+// --- wakeConvoAgent (shared helper, used by ws.js and, from Task 7, the
+// HTTP items routes) ---------------------------------------------------------
+
+test('wakeConvoAgent resolves the managing agent and wakes it only when offline', async () => {
+  const db = openDb(':memory:')
+  const hub = makeHub()
+  const dan = await createUser(db, 'dan', 'pw')
+  const agent = createAgent(db, dan.id, 'dev-2')
+  upsertConversation(db, { id: 'c1', ownerUserId: dan.id, title: 'T', agentDeviceId: agent.deviceId })
+  const calls = []
+  const waker = { enabled: true, wake: (name) => calls.push(name) }
+  wakeConvoAgent({ db, hub, waker }, dan.id, 'c1')
+  assert.deepEqual(calls, ['dev-2'])
+  wakeConvoAgent({ db, hub, waker }, dan.id + 1, 'c1') // foreign user: nothing
+  wakeConvoAgent({ db, hub, waker: { enabled: false, wake: () => calls.push('x') } }, dan.id, 'c1')
+  wakeConvoAgent({ db, hub, waker: null }, dan.id, 'c1')
+  assert.deepEqual(calls, ['dev-2'])
 })

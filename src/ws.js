@@ -7,6 +7,7 @@ import { joinedAgentIds, participantIds, answerInvite, leaveConvo, leaveAllParti
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, emitSpawnOutcome } from './spawns.js'
+import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared } from './wake.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -662,29 +663,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
     const row = db.prepare('SELECT parent_convo_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, conn.userId)
     return !!row && row.parent_convo_id != null
   }
-  // Wake-on-message (src/wake.js): when traffic targets an agent device with
-  // no live socket, ask the infra layer to start its (possibly idle-stopped)
-  // box. Purely additive: every op keeps its existing answer — the journal
-  // already persists what matters (send/prompt_reply) or refuses cleanly
-  // (agent_unreachable), and the bridge catches up from its cursor once the
-  // box is back. Same-user scoping mirrors the anti-enumeration stance of
-  // the call sites: a foreign device id never reaches the waker.
-  const wakeIfOffline = (agentDeviceId) => {
-    if (!waker || !waker.enabled || !Number.isInteger(agentDeviceId)) return
-    const online = hub.connsOf(conn.userId).some((c) => c.deviceId === agentDeviceId && c.ws.readyState === 1)
-    if (online) return
-    const dev = db.prepare('SELECT name, kind FROM devices WHERE id=? AND user_id=?').get(agentDeviceId, conn.userId)
-    if (!dev || dev.kind !== 'agent') return
-    waker.wake(dev.name)
-  }
-  // The send/prompt_reply variant: those ops name a conversation, not a
-  // device, so resolve the managing agent first (null for legacy rows and
-  // client-broadcast convos — nothing to wake).
-  const wakeConvoAgent = (convoId) => {
-    if (!waker || !waker.enabled) return
-    const row = db.prepare('SELECT agent_device_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, conn.userId)
-    if (row && row.agent_device_id != null) wakeIfOffline(row.agent_device_id)
-  }
+  // Wake-on-message: when traffic targets an agent device with no live
+  // socket, ask the infra layer to start its (possibly idle-stopped) box.
+  // Purely additive: every op keeps its existing answer. Shared with the
+  // HTTP items routes — see src/wake.js for the full rationale.
+  const wakeIfOffline = (agentDeviceId) => wakeIfOfflineShared({ db, hub, waker }, conn.userId, agentDeviceId)
+  const wakeConvoAgent = (convoId) => wakeConvoAgentShared({ db, hub, waker }, conn.userId, convoId)
   // Membership convo_meta fan (spec: multi-agent room tags): live clients
   // re-chip a room the moment its membership changes. Best-effort like every
   // other post-commit notification in the invite lifecycle — by the time
