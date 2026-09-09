@@ -1263,13 +1263,13 @@ swallowed — the item write stands.
 |---|---|---|
 | `GET /items` | `convo, kind, state, awaiting, label, sort=rank\|updated, since, limit≤500, cursor` | `{items:[…], next_cursor}` |
 | `GET /items/:id` | `:id` = `it_…` or `#num` (URL-encode `#`) | `{item, comments:[…]}` |
-| `POST /items` | `{kind, title, body?, labels?, links?, attachments?, awaiting?, position?, after?, before?, convo_id, supersedes?, on_behalf_of?:'user' (agent callers only)}` + optional `Idempotency-Key`; **at most one** of `position`/`after`/`before` (two is 400, consistent with `/rank`; none means bottom) | 201 `{item}` (200 on replay) |
+| `POST /items` | `{kind, title, body?, labels?, links?, attachments?, awaiting?, position?, after?, before?, convo_id, supersedes?, on_behalf_of?:'user' (agent callers only)}` + optional `Idempotency-Key`; `position` is **exclusive** of `after`/`before` (given together is 400); `after`/`before` may be given alone or together (a midpoint between the two, consistent with `/rank`; none means bottom) | 201 `{item}` (200 on replay) |
 | `PATCH /items/:id` | `{title?, body?, labels?, links?, awaiting?}` — `attachments` is **400** (create-only in v1; it used to be dropped silently, which told a client its blob had landed) | `{item}` |
 | `POST /items/:id/comments` | `{body?, attachments?}` (one required) + optional `Idempotency-Key` | 201 `{item, comment}` (200 on replay) |
 | `PATCH /items/:id/comments/:cid` | `{blob_ref, transcript}` — agent only, else 403 | `{comment}` |
 | `POST /items/:id/close` | `{resolution, comment?}` | `{item, comment}`; 409 if already closed |
 | `POST /items/:id/reopen` | `{comment?}` | `{item, comment}`; 409 if already open |
-| `POST /items/:id/rank` | exactly one of `{position:'top'\|'bottom'}` / `{after}` / `{before}` — zero or two given is 400 | `{item}`; 409 if the item is closed |
+| `POST /items/:id/rank` | `position:'top'\|'bottom'` exclusive of `after`/`before` (given together is 400); `after`/`before` may be given alone or together (a midpoint); zero given is 400 | `{item}`; 409 if the item is closed |
 
 Item shape: `{id, user_id, num, kind, state, resolution, awaiting, rank,
 title, body, labels[], links[{url,title?}], supersedes, origin_convo_id,

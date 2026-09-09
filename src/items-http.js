@@ -144,10 +144,11 @@ async function handleCreate(ctx, req, res, who) {
   if (!v.ok) return badRequest(res)
   if (body.awaiting !== undefined && body.awaiting !== null && !AWAITING.includes(body.awaiting)) return badRequest(res)
   if (body.position !== undefined && !POSITIONS.includes(body.position)) return badRequest(res)
-  // At most one destination, same rule as /rank (which additionally requires
-  // one): two of them is an ambiguous intent. None is fine here — a create
-  // with no placement lands at the bottom.
-  if (['position', 'after', 'before'].filter((k) => body[k] !== undefined).length > 1) return badRequest(res)
+  // `position` is exclusive: given alongside either neighbour, the intent is
+  // ambiguous. `after` and `before` may be given alone or together — together
+  // means a midpoint between the two, which resolveRank already computes.
+  // None is fine here — a create with no placement lands at the bottom.
+  if (body.position !== undefined && (body.after !== undefined || body.before !== undefined)) return badRequest(res)
   for (const k of ['after', 'before', 'supersedes', 'convo_id']) {
     if (body[k] !== undefined && (typeof body[k] !== 'string' || !body[k] || body[k].length > ID_MAX)) return badRequest(res)
   }
@@ -351,10 +352,13 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
 
   if (sub === 'rank' && subId == null && req.method === 'POST') {
     const body = await readBody(req)
-    // Exactly one destination. Two of them is an ambiguous intent, none is
-    // a no-op that would still cost a marker.
+    // At least one destination — none is a no-op that would still cost a
+    // marker. `position` is exclusive of `after`/`before`; `after` and
+    // `before` may be given alone or together (together = midpoint between
+    // the two, which resolveRank already computes).
     const given = ['position', 'after', 'before'].filter((k) => body[k] !== undefined)
-    if (given.length !== 1) return badRequest(res)
+    if (given.length === 0) return badRequest(res)
+    if (body.position !== undefined && (body.after !== undefined || body.before !== undefined)) return badRequest(res)
     if (body.position !== undefined && !POSITIONS.includes(body.position)) return badRequest(res)
     for (const k of ['after', 'before']) {
       if (body[k] !== undefined && (typeof body[k] !== 'string' || !body[k] || body[k].length > ID_MAX)) return badRequest(res)

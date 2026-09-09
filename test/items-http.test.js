@@ -376,11 +376,17 @@ test('comments: a malformed Idempotency-Key is rejected; a key reused across ite
   assert.equal(clash.status, 409); assert.equal(clash.json.error, 'conflict')
 })
 
-test('rank: exactly one of position/after/before, and only open items are ranked', async (t) => {
+test('rank: position is exclusive of after/before; after+before together is a midpoint; only open items are ranked', async (t) => {
   const { s, agent, client } = await fleet(t)
   const a = (await mkItem(s, agent.token, { kind: 'task', title: 'A' })).json.item
   const b = (await mkItem(s, agent.token, { kind: 'task', title: 'B' })).json.item
+  const c = (await mkItem(s, agent.token, { kind: 'task', title: 'C' })).json.item
   const rank = (id, body) => s.http(`/items/${id}/rank`, { method: 'POST', token: client, body })
+  // after+before together is a midpoint, not an ambiguous pair (checked first,
+  // before any other reorder below moves a or b out of their creation order).
+  const mid = await rank(c.id, { after: a.id, before: b.id })
+  assert.equal(mid.status, 200)
+  assert.ok(a.rank < mid.json.item.rank && mid.json.item.rank < b.rank)
   assert.equal((await rank(b.id, { after: a.id, before: a.id })).status, 400)
   assert.equal((await rank(b.id, { position: 'top', after: a.id })).status, 400)
   assert.equal((await rank(b.id, { position: 'middle' })).status, 400)
@@ -409,15 +415,18 @@ test('transcript: bounded, markerless, silent — and a trailing segment never m
   assert.equal((await s.http(`/items/${id}`, { token: client })).json.item.state, 'open')
 })
 
-test('POST /items: at most one of position/after/before', async (t) => {
+test('POST /items: position is exclusive of after/before; after+before together is a midpoint', async (t) => {
   const { s, agent, client } = await fleet(t)
   const a = (await mkItem(s, agent.token, { kind: 'task', title: 'A' })).json.item
   const b = (await mkItem(s, agent.token, { kind: 'task', title: 'B' })).json.item
-  // Two destinations is an ambiguous intent, same rule as /rank.
+  // position combined with a neighbour is still an ambiguous intent.
   assert.equal((await mkItem(s, client, { position: 'top', after: a.id })).status, 400)
-  assert.equal((await mkItem(s, client, { after: a.id, before: b.id })).status, 400)
   assert.equal((await mkItem(s, client, { position: 'bottom', before: b.id })).status, 400)
-  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM items').get().n, 2)
+  // after+before together is a midpoint between the two neighbours.
+  const mid = await mkItem(s, client, { after: a.id, before: b.id })
+  assert.equal(mid.status, 201)
+  assert.ok(a.rank < mid.json.item.rank && mid.json.item.rank < b.rank)
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM items').get().n, 3)
   // Zero is fine (bottom by default), and so is exactly one.
   assert.equal((await mkItem(s, client, { title: 'None' })).status, 201)
   assert.equal((await mkItem(s, client, { title: 'One', position: 'top' })).status, 201)

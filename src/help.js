@@ -69,8 +69,9 @@ else 404s.
   → 200 \`{item, comment}\`; 409 if already closed. Closing clears \`awaiting\`.
 - \`POST /items/:id/reopen\` \`{comment?}\` → 200 \`{item, comment}\`; 409 if
   already open. Restores the kind's default \`awaiting\`.
-- \`POST /items/:id/rank\` — exactly one of \`{position:'top'|'bottom'}\` /
-  \`{after}\` / \`{before}\` → 200 \`{item}\`; 409 on a closed item.
+- \`POST /items/:id/rank\` — \`{position:'top'|'bottom'}\` exclusive, OR
+  \`{after}\`/\`{before}\` alone or together (a midpoint) → 200 \`{item}\`;
+  409 on a closed item.
 
 ## Media
 
