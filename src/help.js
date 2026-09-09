@@ -44,6 +44,9 @@ docs/protocol.md in the matron-journal repo ("Journal search" for the index).
 Items are \`task\`/\`question\`/\`decision\` rows scoped to the user, with a
 per-user \`#num\`. Every mutating route below also appends an \`item\` marker
 event to the item's origin conversation — you cannot \`publish\` one yourself.
+For old clients that can't render that marker, the journal also mirrors
+card-worthy actions (create/comment/close/reopen) as a flagged, hidden
+\`text\` event on the same conversation — never publish one of those either.
 \`:id\` is \`it_…\` or \`#num\` (URL-encode the \`#\`). As an agent, you may
 comment on, close, reopen, rank, or edit ANY item of this user's you can
 see — the tracker is user-scoped, not conversation-scoped. The only routes

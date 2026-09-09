@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { openDb, setApnsRegistration, setPushPrefs } from '../src/db.js'
 import { makeHub } from '../src/hub.js'
-import { makePushPipeline } from '../src/push.js'
+import { makePushPipeline, classify } from '../src/push.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
 import { handleOp } from '../src/ws.js'
@@ -222,6 +222,13 @@ test('a client "send" (sender user:*) never triggers an alert push, not even to 
   assert.ok(stub.calls.every((c) => c.payload.aps.alert.body === 'actual content'))
   assert.deepEqual(stub.calls.map((c) => c.deviceToken).sort(), ['origin-phone-token', 'other-laptop-token'].sort())
   void otherDeviceId
+})
+
+// Old-client fallback (spec: "Old-client fallback"): the marker already
+// decided whether this action pushes; the flagged text mirroring it must
+// not double it.
+test('classify: a flagged item fallback text never pushes, even from an agent sender', () => {
+  assert.equal(classify('text', { body: '📌 x', fallback_for: 'item' }, 'agent:dev-2', undefined), null)
 })
 
 test('origin-device exclusion applies to every push type, not just read_marker (defensive: a push recipient device that is also the event\'s origin is skipped)', async (t) => {

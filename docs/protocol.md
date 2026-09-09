@@ -1257,6 +1257,16 @@ and the cost of that ordering is that a marker append which itself fails
 (e.g. the origin conversation was deleted underneath it) is logged and
 swallowed — the item write stands.
 
+Immediately after a marker whose `action` is `created`, `commented`,
+`closed`, or `reopened` (never `reordered`/`updated`), the journal appends
+one more event — same conversation, same sender — to the same conversation:
+a plain `text` flagged `fallback_for: "item"` (plus `item_id`, `num`,
+`action`), so a pre-tracker client that cannot render `item` at all still
+sees the traffic (spec: "Old-client fallback"). New clients (the journal's
+own bridge and Apple apps) hide it; it never counts toward search or an
+extra push — the marker already made that decision. This is a temporary
+degrade path for clients predating the tracker, not a second timeline.
+
 ### Routes (Bearer, either device kind)
 
 | Route | Body / query | Response |

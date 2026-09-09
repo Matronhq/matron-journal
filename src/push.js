@@ -23,7 +23,7 @@ const ROUTINE_COALESCE_MS = 10000
 // stored in the event payload or broadcast on the wire, so the protocol
 // surface is unchanged. Absent (e.g. a call site that doesn't pass one) is
 // treated as "not running" — fails closed for this rule specifically.
-function classify(type, payload, sender, prevState) {
+export function classify(type, payload, sender, prevState) {
   // A user's own words/actions (sender `user:*`) must never trigger an
   // alert push, to ANY of that user's devices — not just the originating
   // one (that's origin-device exclusion, a separate, narrower rule below).
@@ -34,6 +34,12 @@ function classify(type, payload, sender, prevState) {
   // background-push branch in onAppend, never reaches classify()) and keeps
   // its existing behavior regardless of sender.
   if (typeof sender === 'string' && sender.startsWith('user:')) return null
+  // Old-client fallback (spec: "Old-client fallback"): a flagged text
+  // mirrors a marker that already made its own push decision — this rule
+  // has to check the agent sender too, since a `commented`/`closed`/
+  // `reopened` fallback from an agent would otherwise read as a normal
+  // agent-authored text and push a second time for one event.
+  if (type === 'text' && payload && typeof payload === 'object' && payload.fallback_for) return null
   if (type === 'prompt' || type === 'permission_request') return { priority: 10, coalesce: false, kind: 'attention' }
   if (type === 'session_status') {
     const state = payload && payload.state

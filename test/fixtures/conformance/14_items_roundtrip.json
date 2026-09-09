@@ -1,6 +1,6 @@
 {
   "name": "items: agent files a question; client reads, answers, agent closes; markers land in the origin convo",
-  "description": "Exercises POST/GET /items, POST /items/:id/comments, POST /items/:id/close and the 'item' marker events a client sees on the WS/HTTP read. Per-user numbering starts at 1; a user comment flips awaiting to agent; close clears it and comment_count only ever counts kind='comment' rows, never the status comments close/reopen write.",
+  "description": "Exercises POST/GET /items, POST /items/:id/comments, POST /items/:id/close and the 'item' marker events a client sees on the WS/HTTP read, including the old-client fallback 'text' event the journal mirrors right after each card-worthy marker. Per-user numbering starts at 1; a user comment flips awaiting to agent; close clears it and comment_count only ever counts kind='comment' rows, never the status comments close/reopen write.",
   "server": { "tmpDb": true },
   "seed": {
     "users": [ { "as": "dan", "name": "dan", "password": "fixture-pw-15" } ],
@@ -70,13 +70,22 @@
         { "seq": { "$type": "integer" }, "convo_id": "c1", "ts": { "$type": "integer" }, "sender": "agent:dev-2", "type": "item",
           "payload": { "item_id": { "$ref": "item_id" }, "num": 1, "kind": "question", "title": "Which auth library?",
                        "action": "created", "by": "agent", "awaiting": "user", "resolution": null } },
+        { "seq": { "$type": "integer" }, "convo_id": "c1", "ts": { "$type": "integer" }, "sender": "agent:dev-2", "type": "text",
+          "payload": { "body": "📌 Needs you — question #1: Which auth library?\nA or B?", "fallback_for": "item",
+                       "item_id": { "$ref": "item_id" }, "num": 1, "action": "created" } },
         { "seq": { "$type": "integer" }, "convo_id": "c1", "ts": { "$type": "integer" }, "sender": "user:dan", "type": "item",
           "payload": { "item_id": { "$ref": "item_id" }, "num": 1, "kind": "question", "title": "Which auth library?",
                        "action": "commented", "by": "user", "awaiting": "agent", "resolution": null,
                        "comment": { "id": { "$ref": "comment_id" }, "body": "Use A", "attachments": [] } } },
+        { "seq": { "$type": "integer" }, "convo_id": "c1", "ts": { "$type": "integer" }, "sender": "user:dan", "type": "text",
+          "payload": { "body": "📌 Question #1 \"Which auth library?\" — dan commented:\nUse A", "fallback_for": "item",
+                       "item_id": { "$ref": "item_id" }, "num": 1, "action": "commented" } },
         { "seq": { "$type": "integer" }, "convo_id": "c1", "ts": { "$type": "integer" }, "sender": "agent:dev-2", "type": "item",
           "payload": { "item_id": { "$ref": "item_id" }, "num": 1, "kind": "question", "title": "Which auth library?",
-                       "action": "closed", "by": "agent", "awaiting": null, "resolution": "answered" } }
+                       "action": "closed", "by": "agent", "awaiting": null, "resolution": "answered" } },
+        { "seq": { "$type": "integer" }, "convo_id": "c1", "ts": { "$type": "integer" }, "sender": "agent:dev-2", "type": "text",
+          "payload": { "body": "✅ Question #1 \"Which auth library?\" closed as answered", "fallback_for": "item",
+                       "item_id": { "$ref": "item_id" }, "num": 1, "action": "closed" } }
       ] } } }
   ]
 }

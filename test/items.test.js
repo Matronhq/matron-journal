@@ -5,7 +5,7 @@ import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import { createItem, getItem, listItems, validateItemFields, resolveRank, RANK_EPSILON, rerankItem, renormaliseRanks, RANK_GAP, createDefaultAwaiting } from '../src/items.js'
 import { addComment, closeItem, reopenItem, updateItem, setAttachmentTranscript, listComments } from '../src/items.js'
-import { itemMarkerPayload, ITEM_EVENT_TYPE } from '../src/items-marker.js'
+import { itemMarkerPayload, ITEM_EVENT_TYPE, itemFallbackText } from '../src/items-marker.js'
 import { snippetOf } from '../src/journal.js'
 
 test('schema: items, item_comments, item_counters exist with the expected columns', () => {
@@ -458,4 +458,17 @@ test('snippetOf renders item markers', () => {
   assert.equal(snippetOf('item', { kind: 'question', num: 12, title: 'Which auth library?' }), '❓ #12 Which auth library?')
   assert.equal(snippetOf('item', { kind: 'task', num: 3, title: 'T' }), '☐ #3 T')
   assert.equal(snippetOf('item', { kind: 'decision', num: 4, title: 'D' }), '⚖ #4 D')
+})
+
+test('itemFallbackText: the six shapes', () => {
+  const base = { item_id: 'it_1', num: 12, kind: 'question', title: 'Which auth library?', by: 'agent', awaiting: 'user', resolution: null }
+  assert.equal(itemFallbackText({ ...base, action: 'created' }, { actor: 'dev-2', body: 'we have two' }), '📌 Needs you — question #12: Which auth library?\nwe have two')
+  assert.equal(itemFallbackText({ ...base, action: 'created', by: 'user', awaiting: 'agent' }, { actor: 'dan' }), '📌 New question #12: Which auth library?')
+  assert.equal(itemFallbackText({ ...base, action: 'commented', comment: { id: 'ic', body: 'A or B?', attachments: [] } }, { actor: 'dev-2' }), '📌 Needs you — question #12 "Which auth library?" — dev-2 asked:\nA or B?')
+  assert.equal(itemFallbackText({ ...base, action: 'commented', by: 'user', awaiting: 'agent', comment: { id: 'ic', body: 'B', attachments: [{ name: 'note.m4a', mime: 'audio/mp4' }] } }, { actor: 'dan' }), '📌 Question #12 "Which auth library?" — dan commented:\nB\n[voice note note.m4a]')
+  assert.equal(itemFallbackText({ ...base, action: 'closed', resolution: 'answered', awaiting: null }, { actor: 'dan' }), '✅ Question #12 "Which auth library?" closed as answered')
+  assert.equal(itemFallbackText({ ...base, action: 'reopened', by: 'user', awaiting: 'agent' }, { actor: 'dan' }), '↩️ Question #12 "Which auth library?" reopened by dan')
+  assert.equal(itemFallbackText({ ...base, action: 'reordered' }, { actor: 'dan' }), null)
+  const long = 'x'.repeat(130)
+  assert.ok(itemFallbackText({ ...base, action: 'created', title: long, by: 'user', awaiting: 'agent' }, { actor: 'dan' }).startsWith('📌 New question #12: ' + 'x'.repeat(120) + '…'))
 })

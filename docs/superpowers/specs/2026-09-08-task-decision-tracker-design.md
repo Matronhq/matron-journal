@@ -211,6 +211,66 @@ what makes the wake and busy-queue paths work with no new plumbing.
 the title as the body ("❓ #12 Which auth library?"). Everything else is
 silent. Conformance fixtures added under `test/fixtures/conformance/`.
 
+## Old-client fallback (`fallback_for`, added 2026-09-09)
+
+Older clients cannot render `item` markers: pre-tracker iOS/Mac builds show
+"[unsupported event: item]", Android skips unknown types, matron-web dumps
+the raw payload, and a pre-tracker bridge drops user-authored markers. An
+agent that files a question and waits on the user would be waiting on
+someone who cannot see it. So the journal also writes a plain `text` event
+that every existing client already renders. This is a degrade path, not a
+second timeline: new clients hide it.
+
+**Emission (journal, `emitMarker`).** Immediately after a marker with
+`action` ∈ {`created`, `commented`, `closed`, `reopened`} is appended (never
+for `reordered`/`updated`), append one more event to the same conversation
+with the same `sender`:
+
+```json
+{ "type": "text",
+  "payload": { "body": "📌 …", "fallback_for": "item",
+               "item_id": "it_…", "num": 12, "action": "created" } }
+```
+
+The body is built by a pure function `itemFallbackText(markerPayload,
+{ actor, body })` in `src/items-marker.js`. `actor` is the display name
+(`agent:dev-2` → `dev-2`, `user:dan` → `dan`); `body` is the item body for
+`created` (the marker carries none). Kind word lowercase, title one-lined
+and cut to 120 chars with `…`, body/comment cut to 500 chars with `…`,
+attachments one per line as `[voice note <name>]` / `[attachment <name>]`:
+
+| action | first line | then |
+|---|---|---|
+| `created`, by agent, awaiting user | `📌 Needs you — <kind> #N: <title>` | body lines |
+| `created`, otherwise | `📌 New <kind> #N: <title>` | body lines |
+| `commented`, by agent, awaiting user | `📌 Needs you — <kind> #N "<title>" — <actor> asked:` | comment lines |
+| `commented`, otherwise | `📌 <Kind> #N "<title>" — <actor> commented:` | comment lines |
+| `closed` | `✅ <Kind> #N "<title>" closed as <resolution>` | comment lines |
+| `reopened` | `↩️ <Kind> #N "<title>" reopened by <actor>` | comment lines |
+
+A failed fallback append is logged and swallowed like a failed marker
+append; it never fails the request or the marker.
+
+**Server rules.** `push.js` `classify` returns `null` for any `text` whose
+payload has `fallback_for` (the marker already decided the push).
+`search.js` `indexableBody` returns `null` for it (a hit would land on a row
+new clients hide). Unread counts and snippets are deliberately **unchanged**:
+the fallback is a normal message to old and new clients alike, so an agent
+question now bumps unread and sets the chat-list snippet on every client.
+
+**Bridge.** `journal-input-router` ignores a `text` frame whose payload has
+`fallback_for` before any routing: the marker path already delivers the
+turn. A pre-tracker bridge routes a user-authored fallback as ordinary chat
+("📌 Task #12 … — dan commented: …"), which is the intended degrade.
+
+**Apps.** `JournalTimelineMapper` returns `nil` for a `text` event whose
+payload has `fallback_for`; the outbox delivery confirmation skips such
+frames. Nothing else changes — unread and snippet follow the server.
+Android and matron-web need no change; they render the text.
+
+**Lifetime.** Temporary by design: a later journal release stops emitting
+once pre-tracker clients are gone. Clients keep the filter; it is one guard.
+
 ## Routing (matron-bridge)
 
 `lib/journal-input-router.js` / `createJournalInputConsumer` gain a case

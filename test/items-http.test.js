@@ -325,6 +325,60 @@ test('rank: reorder emits a silent reordered marker and never wakes', async (t) 
   assert.equal(last.action, 'reordered')
 })
 
+// Old-client fallback (spec: "Old-client fallback"). The journal mirrors
+// every card-worthy marker as a flagged `text` event right after it, same
+// convo, same sender, so a pre-tracker client (which can't render `item` at
+// all) still sees the traffic. `reordered` produces no such text.
+test('fallback text: mirrors created/closed/commented markers, skips reordered', async (t) => {
+  const { s, agent, client } = await fleet(t)
+  const rows = () => s.db.prepare("SELECT type, sender, payload FROM events ORDER BY seq").all()
+    .map((e) => ({ type: e.type, sender: e.sender, payload: JSON.parse(e.payload) }))
+
+  const created = await mkItem(s, agent.token, { body: 'we have two' })
+  const id = created.json.item.id
+  assert.equal(created.json.item.awaiting, 'user')
+  let evs = rows()
+  const marker1 = evs.at(-2)
+  const fb1 = evs.at(-1)
+  assert.equal(marker1.type, 'item'); assert.equal(marker1.payload.action, 'created')
+  assert.equal(fb1.type, 'text'); assert.equal(fb1.sender, marker1.sender)
+  assert.equal(fb1.payload.fallback_for, 'item')
+  assert.equal(fb1.payload.item_id, id); assert.equal(fb1.payload.num, created.json.item.num)
+  assert.equal(fb1.payload.action, 'created')
+  assert.ok(fb1.payload.body.startsWith('📌 Needs you — '))
+
+  // rank: no fallback text at all — only the marker.
+  const before = rows().length
+  await s.http(`/items/${id}/rank`, { method: 'POST', token: client, body: { position: 'top' } })
+  evs = rows()
+  assert.equal(evs.length, before + 1)
+  assert.equal(evs.at(-1).type, 'item'); assert.equal(evs.at(-1).payload.action, 'reordered')
+
+  // close: fallback text with the ✅ shape.
+  const c = await s.http(`/items/${id}/close`, { method: 'POST', token: agent.token, body: { resolution: 'answered' } })
+  assert.equal(c.status, 200)
+  evs = rows()
+  const closeFb = evs.at(-1)
+  assert.equal(closeFb.type, 'text'); assert.equal(closeFb.payload.fallback_for, 'item'); assert.equal(closeFb.payload.action, 'closed')
+  assert.ok(closeFb.payload.body.startsWith('✅ '))
+
+  // reopen by the user: fallback text sender is user:dan.
+  const r = await s.http(`/items/${id}/reopen`, { method: 'POST', token: client, body: {} })
+  assert.equal(r.status, 200)
+  evs = rows()
+  const reopenFb = evs.at(-1)
+  assert.equal(reopenFb.type, 'text'); assert.equal(reopenFb.sender, 'user:dan'); assert.equal(reopenFb.payload.action, 'reopened')
+
+  // a user comment produces a fallback text with a user: sender too.
+  const cm = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { body: 'thanks' } })
+  assert.equal(cm.status, 201)
+  evs = rows()
+  const commentMarker = evs.at(-2)
+  const commentFb = evs.at(-1)
+  assert.equal(commentMarker.type, 'item'); assert.equal(commentMarker.payload.action, 'commented')
+  assert.equal(commentFb.type, 'text'); assert.equal(commentFb.sender, 'user:dan'); assert.equal(commentFb.payload.action, 'commented')
+})
+
 test('sub-routes on a foreign or hidden item are 404, never 403', async (t) => {
   const { s, agent, patAgent } = await fleet(t)
   const id = (await mkItem(s, agent.token, {})).json.item.id

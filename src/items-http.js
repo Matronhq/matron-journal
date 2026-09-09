@@ -11,7 +11,7 @@ import {
   ITEM_KINDS, AWAITING, RESOLUTIONS, BODY_MAX, validateItemFields, createItem, getItem, listItems, listComments,
   updateItem, addComment, setAttachmentTranscript, closeItem, reopenItem, rerankItem,
 } from './items.js'
-import { itemMarkerPayload, ITEM_EVENT_TYPE, ITEM_ACTIONS } from './items-marker.js'
+import { itemMarkerPayload, ITEM_EVENT_TYPE, ITEM_ACTIONS, itemFallbackText, FALLBACK_ACTIONS } from './items-marker.js'
 
 const SORTS = ['rank', 'updated']
 const STATES = ['open', 'closed']
@@ -98,8 +98,32 @@ function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action, comme
   } catch (err) {
     console.error('items: push onAppend failed', err)
   }
+  // Old-client fallback (spec: "Old-client fallback"): right after a
+  // card-worthy marker, mirror it as a plain `text` a pre-tracker client can
+  // already render. Same conversation, same sender as the marker. Its own
+  // append/push failures are logged and swallowed exactly like the marker's
+  // — this is a degrade path, never a reason to fail the request or the
+  // marker that already landed.
+  if (FALLBACK_ACTIONS.has(action)) {
+    const actor = sender.slice(sender.indexOf(':') + 1)
+    const text = itemFallbackText(payload, { actor, body: action === 'created' ? item.body : null })
+    if (text != null) {
+      const fbPayload = { body: text, fallback_for: 'item', item_id: item.id, num: item.num, action }
+      try {
+        const fr = appendAndBroadcast(db, hub, { userId: who.userId, convoId: item.origin_convo_id, sender, type: 'text', payload: fbPayload })
+        try {
+          pushPipeline.onAppend(who.userId, toEventShape({ seq: fr.seq, convo_id: item.origin_convo_id, ts: fr.ts, sender, type: 'text', payload: fbPayload }), who.deviceId)
+        } catch (err) {
+          console.error('items: fallback push onAppend failed', err)
+        }
+      } catch (err) {
+        console.error('items: fallback append failed', err)
+      }
+    }
+  }
   // Wake keys off the WRITER's device kind, not `by`: an agent filing on
-  // behalf of the user is already awake.
+  // behalf of the user is already awake. Keyed off the MARKER only — the
+  // fallback text never independently wakes anything.
   if (who.kind !== 'agent' && WAKE_ACTIONS.has(action)) wakeConvoAgent({ db, hub, waker }, who.userId, item.origin_convo_id)
 }
 
