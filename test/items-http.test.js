@@ -333,34 +333,43 @@ test('sub-routes on a foreign or hidden item are 404, never 403', async (t) => {
   }
 })
 
-test('sub-routes: an agent must clear the same write gate the create path applies', async (t) => {
-  const { s, dan, agent } = await fleet(t)
+test('sub-routes: any agent that can see an item may write to it; create and transcript stay gated', async (t) => {
+  const { s, dan, agent, client } = await fleet(t)
   const other = createAgent(s.db, dan.id, 'dev-3')
   upsertConversation(s.db, { id: 'c3', ownerUserId: dan.id, title: 'C3', agentDeviceId: other.deviceId })
   const id = (await s.http('/items', { method: 'POST', token: other.token, body: { kind: 'task', title: 'Theirs', convo_id: 'c3' } })).json.item.id
-  // dev-2 may SEE it (same user, nothing private) but may not write to it.
+  // dev-2 may SEE it (same user, nothing private) — and, per the new rule,
+  // may write to it too, even though it never joined c3.
   assert.equal((await s.http(`/items/${id}`, { token: agent.token })).status, 200)
-  // The gate is hoisted above the method dispatch, so it covers PATCH on the
-  // item itself as well as every POST sub-route.
-  const writes = [
-    ['PATCH', '', { title: 'Hijacked' }],
-    ['POST', '/comments', { body: 'x' }],
-    ['POST', '/close', { resolution: 'done' }],
-    ['POST', '/reopen', {}],
-    ['POST', '/rank', { position: 'top' }],
-  ]
-  for (const [method, sub, body] of writes) {
-    const r = await s.http(`/items/${id}${sub}`, { method, token: agent.token, body })
-    assert.equal(r.status, 404, `${method} ${sub}`); assert.equal(r.json.error, 'not_found')
-  }
-  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM item_comments').get().n, 0)
-  assert.equal((await s.http(`/items/${id}`, { token: agent.token })).json.item.title, 'Theirs') // the refused PATCH changed nothing
-  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='item'").get().n, 1) // only the create's marker
-  recordJoined(s.db, { convoId: 'c3', agentDeviceId: agent.deviceId, initiatorDeviceId: other.deviceId })
-  assert.equal((await s.http(`/items/${id}/comments`, { method: 'POST', token: agent.token, body: { body: 'x' } })).status, 201)
-  // ...and the managing box could patch it all along.
-  const patched = await s.http(`/items/${id}`, { method: 'PATCH', token: other.token, body: { title: 'Retitled' } })
-  assert.equal(patched.status, 200); assert.equal(patched.json.item.title, 'Retitled')
+  const before = s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='item'").get().n
+  const patched = await s.http(`/items/${id}`, { method: 'PATCH', token: agent.token, body: { title: 'Retitled by dev-2' } })
+  assert.equal(patched.status, 200); assert.equal(patched.json.item.title, 'Retitled by dev-2')
+  const commented = await s.http(`/items/${id}/comments`, { method: 'POST', token: agent.token, body: { body: 'from dev-2' } })
+  assert.equal(commented.status, 201)
+  const closed = await s.http(`/items/${id}/close`, { method: 'POST', token: agent.token, body: { resolution: 'done' } })
+  assert.equal(closed.status, 200); assert.equal(closed.json.item.state, 'closed')
+  const reopened = await s.http(`/items/${id}/reopen`, { method: 'POST', token: agent.token, body: {} })
+  assert.equal(reopened.status, 200); assert.equal(reopened.json.item.state, 'open')
+  const ranked = await s.http(`/items/${id}/rank`, { method: 'POST', token: agent.token, body: { position: 'top' } })
+  assert.equal(ranked.status, 200)
+  // Every one of those writes landed a marker on c3, all authored 'agent'.
+  const markers = s.db.prepare("SELECT payload FROM events WHERE type='item' ORDER BY seq").all().map((e) => JSON.parse(e.payload))
+  assert.equal(markers.length, before + 5)
+  for (const m of markers.slice(-5)) assert.equal(m.by, 'agent')
+
+  // Create still targets a conversation, so it stays gated: dev-2 has not
+  // joined c3.
+  const create = await s.http('/items', { method: 'POST', token: agent.token, body: { kind: 'task', title: 'Interloper', convo_id: 'c3' } })
+  assert.equal(create.status, 404)
+
+  // Transcript write-back stays gated on the item's origin conversation too:
+  // it is specifically the origin bridge's job.
+  const withVoice = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { body: 'v', attachments: [{ blob_ref: 'b1', mime: 'audio/mp4', name: 'v', size: 1 }] } })
+  const cid = withVoice.json.comment.id
+  const refusedTranscript = await s.http(`/items/${id}/comments/${cid}`, { method: 'PATCH', token: agent.token, body: { blob_ref: 'b1', transcript: 'hi' } })
+  assert.equal(refusedTranscript.status, 404)
+  const ownerTranscript = await s.http(`/items/${id}/comments/${cid}`, { method: 'PATCH', token: other.token, body: { blob_ref: 'b1', transcript: 'hi' } })
+  assert.equal(ownerTranscript.status, 200)
 })
 
 test('comments: a malformed Idempotency-Key is rejected; a key reused across items is a conflict', async (t) => {

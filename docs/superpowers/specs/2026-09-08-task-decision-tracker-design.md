@@ -150,11 +150,13 @@ CREATE TABLE IF NOT EXISTS item_counters (user_id INTEGER PRIMARY KEY, next_num 
 ## HTTP API (matron-journal, `src/http.js`)
 
 All routes Bearer-authenticated with existing device tokens; scoped by the
-token's `user_id`. `authorize` for client tokens, `authorizeAgentWrite`
-semantics for agent writes on items whose origin conversation the agent
-does not own (an agent may read anything of the user it can see through the
-sieve, and may comment on / close anything it can read; only the origin
-agent's marker turns into a prompt — see *Routing*).
+token's `user_id`. `authorize` for client tokens (an agent may read
+anything of the user it can see through the sieve, and may comment on /
+close anything it can read; only the origin agent's marker turns into a
+prompt — see *Routing*). `authorizeAgentWrite` still gates the two routes
+that target a conversation rather than an already-visible item: create
+(against the body's `convo_id`) and the transcript `PATCH` (against the
+item's origin conversation, since transcribing is the origin bridge's job).
 
 | Route | Purpose |
 |---|---|

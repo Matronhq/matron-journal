@@ -251,16 +251,16 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
   const item = visibleItem(db, who, idOrNum)
   if (!item) return notFound(res)
 
-  // The agent write gate, hoisted above the method dispatch so EVERY
-  // non-GET method on /items/:id[...] clears it by construction rather than
-  // by each handler remembering to: an agent owns the item's origin
-  // conversation or has joined it (the same gate handleCreate applies to
-  // its own body's convo_id). 404, never 403 — a refusal must be
-  // indistinguishable from an item that isn't there, and visibleItem has
-  // already applied the privacy sieve. A client writing to its own user's
-  // item is never gated.
-  if (req.method !== 'GET' && who.kind === 'agent'
-      && !authorizeAgentWrite(db, who.userId, who.deviceId, item.origin_convo_id)) return notFound(res)
+  // No origin-conversation gate here: the tracker is scoped to the USER, not
+  // to a conversation, so any of the user's boxes that can already see an
+  // item (visibleItem, above) may PATCH, comment on, close, reopen, or rank
+  // it — the same way any agent may read anything of the user's it can see.
+  // Two routes stay gated because they target a conversation rather than an
+  // already-visible item: handleCreate checks the body's `convo_id` (an
+  // agent must own or have joined the conversation it's filing INTO), and
+  // the transcript PATCH below (handleItemSubRoute's comments/:cid branch)
+  // is gated on the item's origin conversation because transcribing a
+  // voice-note attachment is specifically the origin bridge's job.
 
   if (!sub) {
     if (req.method === 'GET') { json(res, 200, { item, comments: listComments(db, item.id) }); return true }
@@ -278,11 +278,9 @@ const okNote = (v) => v === undefined || (typeof v === 'string' && v.length <= B
 // Every sub-route is a mutation of an already-visible item.
 async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
   const { db } = ctx
-  // The agent write gate ran in handleItemsRoute, above the method dispatch
-  // — every path below is already past it.
-  //
-  // There is no on_behalf_of on a comment: the caller's own device kind is
-  // the author, full stop.
+  // visibleItem (in handleItemsRoute) is the only gate every route below
+  // shares. There is no on_behalf_of on a comment: the caller's own device
+  // kind is the author, full stop.
   const author = who.kind === 'agent' ? 'agent' : 'user'
 
   if (sub === 'comments' && subId == null && req.method === 'POST') {
@@ -313,8 +311,13 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
 
   if (sub === 'comments' && subId != null && req.method === 'PATCH') {
     // Transcript write-back is the bridge's job after it transcribes a
-    // voice-note attachment; a client never patches a comment.
+    // voice-note attachment; a client never patches a comment. Unlike every
+    // other sub-route, this one IS gated on the item's origin conversation
+    // (same predicate handleCreate applies to a body's convo_id): 404, not
+    // 403, so the refusal is indistinguishable from a comment that isn't
+    // there — a foreign box probing for comment ids learns nothing either way.
     if (who.kind !== 'agent') { json(res, 403, { error: 'forbidden' }); return true }
+    if (!authorizeAgentWrite(db, who.userId, who.deviceId, item.origin_convo_id)) return notFound(res)
     const body = await readBody(req)
     if (typeof body.blob_ref !== 'string' || !body.blob_ref) return badRequest(res)
     if (typeof body.transcript !== 'string' || body.transcript.length > BODY_MAX) return badRequest(res)

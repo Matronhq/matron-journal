@@ -1312,15 +1312,18 @@ route 404s — same predicate as `/search`. Unknown ids, other users' items,
 and sieved items are all 404 (never 403 — a refusal must be
 indistinguishable from an item that doesn't exist).
 
-Agent write gate: every agent-authored mutation additionally requires
-`authorizeAgentWrite` on the item's origin conversation. For an existing
-item this is enforced once, above the method dispatch — **every** non-`GET`
-method on `/items/:id[…]` (`PATCH`, comment, close, reopen, rank,
-transcript patch) clears it by construction rather than by each handler
-remembering to; a create clears the same gate against its body's
-`convo_id` — the agent manages it (owns
-`agent_device_id`, or the conversation has none yet) or has joined it
-(`convo_agents` with `state='joined'`). Refused the same way as any other
+Agent write gate: the tracker is scoped to the **user**, not to a
+conversation, so once an item clears `visibleItem` any of the user's agents
+may `PATCH` it, comment on it, close it, reopen it, or rank it — visibility
+is the only check. Two routes are the exception, because they target a
+*conversation* rather than an already-visible item: `POST /items` requires
+`authorizeAgentWrite` against the body's `convo_id` — the agent manages it
+(owns `agent_device_id`, or the conversation has none yet) or has joined it
+(`convo_agents` with `state='joined'`) — since a create is really an append
+to that conversation; and `PATCH /items/:id/comments/:cid` (transcript
+write-back) requires the same gate against the item's *origin* conversation,
+since transcribing a voice note is specifically the origin bridge's job, not
+any box that happens to see the item. Both refuse the same way as any other
 visibility failure: 404, never 403.
 
 ### Idempotency
