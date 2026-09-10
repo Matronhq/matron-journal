@@ -224,13 +224,20 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
 export function appendAndBroadcast(db, hub, { userId, convoId, sender, type, payload }) {
   const r = append(db, { userId, convoId, sender, type, payload })
   if (r.duplicate) return r
-  const frame = { kind: 'journal', ...toEventShape({ seq: r.seq, convo_id: convoId, ts: r.ts, sender, type, payload }) }
+  broadcastAppended(db, hub, { userId, convoId, seq: r.seq, ts: r.ts, sender, type, payload })
+  return r
+}
+
+// The fan-out half of appendAndBroadcast, for callers that must append
+// INSIDE their own transaction (a milestone's marker seq is the row's
+// anchor) and broadcast only after it commits. Same targeting rules.
+export function broadcastAppended(db, hub, { userId, convoId, seq, ts, sender, type, payload }) {
+  const frame = { kind: 'journal', ...toEventShape({ seq, convo_id: convoId, ts, sender, type, payload }) }
   const ownerId = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id ?? null
   const targets = isClientOnlyEvent(type, payload)
     ? new Set()
     : (ownerId == null ? null : new Set([ownerId, ...joinedAgentIds(db, convoId)]))
   hub.broadcastJournal(userId, frame, targets)
-  return r
 }
 
 const parseRow = (r) => ({ ...r, payload: JSON.parse(r.payload) })

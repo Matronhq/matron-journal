@@ -7,7 +7,7 @@ import Database from 'better-sqlite3'
 import { openDb } from '../src/db.js'
 import { nextNum, newId } from '../src/items.js'
 import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE, MISSION_ACTIONS, milestoneMarkerPayload, missionMarkerPayload } from '../src/missions-marker.js'
-import { snippetOf } from '../src/journal.js'
+import { append, broadcastAppended, snippetOf, upsertConversation } from '../src/journal.js'
 import { classify } from '../src/push.js'
 
 test('schema: missions and milestones exist with the expected columns; mission_id on conversations and items', () => {
@@ -106,4 +106,17 @@ test('snippetOf renders both markers; classify never pushes them', () => {
   assert.equal(snippetOf('mission', { num: 61, title: 'M', action: 'created' }), '🏁 Mission #61 started: M')
   assert.equal(classify('milestone', { num: 63 }, 'agent:dev-2'), null)
   assert.equal(classify('mission', { num: 61, action: 'closed' }, 'user:dan'), null)
+})
+
+test('broadcastAppended fans the already-committed event with journal targeting', () => {
+  const db = openDb(':memory:')
+  db.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+  upsertConversation(db, { id: 'c1', ownerUserId: 1, title: 'C1' })
+  const frames = []
+  const hub = { broadcastJournal: (userId, frame, targets) => frames.push({ userId, frame, targets }) }
+  const r = append(db, { userId: 1, convoId: 'c1', sender: 'agent:dev-2', type: 'milestone', payload: { num: 1 } })
+  broadcastAppended(db, hub, { userId: 1, convoId: 'c1', seq: r.seq, ts: r.ts, sender: 'agent:dev-2', type: 'milestone', payload: { num: 1 } })
+  assert.equal(frames.length, 1)
+  assert.equal(frames[0].frame.kind, 'journal'); assert.equal(frames[0].frame.seq, r.seq); assert.equal(frames[0].frame.type, 'milestone')
+  assert.equal(frames[0].targets, null)  // no agent owner recorded → every agent
 })
