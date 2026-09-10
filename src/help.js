@@ -63,9 +63,13 @@ transcribing is the origin bridge's job); those 404 on refusal.
   position:'top'|'bottom' / after / before}\` → 201 \`{item}\`. Send
   \`on_behalf_of:'user'\` when the USER asked for the item, so it reads as
   theirs. Optional \`Idempotency-Key\` header (replay → 200, no second marker).
-- \`PATCH /items/:id\` \`{title?, body?, labels?, links?, awaiting?}\` → 200
-  \`{item}\`; \`attachments\` is 400 (create-only in v1), and moving
-  \`awaiting\` on a closed item is 409.
+- \`PATCH /items/:id\` \`{title?, body?, labels?, links?, awaiting?,
+  mission?: id|"#num"|null}\` → 200 \`{item}\`; \`attachments\` is 400
+  (create-only in v1), moving \`awaiting\` on a closed item is 409, and a
+  \`mission\` that does not exist or that you cannot see is 404 (never 403).
+  \`mission: null\` detaches. Every item carries \`mission_id\` and
+  \`mission_num\` — both null when it belongs to no mission; they are set by
+  this route or inherited when the item's conversation joins a mission.
 - \`POST /items/:id/comments\` \`{body?, attachments?}\` (at least one) → 201
   \`{item, comment}\`. A USER comment always flips \`awaiting\` to \`agent\`
   and reopens a closed item; yours as an agent never flips it.
@@ -82,11 +86,46 @@ transcribing is the origin bridge's job); those 404 on refusal.
 
 ## Missions & milestones
 
-Missions & milestones — POST /missions {title, body?, convo_id} (201 mission #num; 200 existing:true if the conversation already has one),
-GET /missions?state=open|closed, GET /missions/:id (mission, milestones newest first, open items, conversations), PATCH /missions/:id {title?, body?},
-POST /missions/:id/join {convo_id}, POST /missions/:id/close {summary} (409 blocked_by user_items|agent_items with the item list for agents),
-POST /milestones {convo_id, kind: user_input|progress, title, body?} (409 blocked_by no_mission until mission_start; the marker's seq is the anchor),
-GET /milestones?convo=<id>. PATCH /items/:id accepts mission: id|"#num"|null. Every POST takes Idempotency-Key.
+A mission is the record of one piece of work; milestones are its
+checkpoints. Both share the SAME per-user \`#num\` counter as items, and
+\`:id\` is \`ms_…\` or a bare number. There is no auto-create: post a
+milestone before \`POST /missions\` and you get 409 \`no_mission\`. A
+conversation joins a mission by starting one, by \`join\`, or by being
+spawned from a conversation that already has one (only if that mission is
+open, visible to you, and under 200 conversations — otherwise the child
+starts with none and can \`mission_start\` its own). Every POST here takes an optional
+\`Idempotency-Key\` (replay → 200, no second marker), and the mutating
+ones append a \`mission\` or \`milestone\` marker event you cannot
+\`publish\` yourself.
+
+- \`POST /missions\` \`{title, body?, convo_id}\` → 201 \`{mission}\`
+  with the next \`#num\`; 200 \`{mission, existing: true}\` if that
+  conversation already has one (nothing changes). Attaches the conversation
+  and repoints its unassigned items.
+- \`GET /missions?state=open|closed&since=<ms>\` → \`{missions}\` with
+  per-row \`open_items\`, \`needs_you\`, \`conversations\`,
+  \`milestones\`, \`last_milestone\`; most recent activity first.
+- \`GET /missions/:id\` → \`{mission, milestones (newest first), items
+  (open), conversations}\`.
+- \`PATCH /missions/:id\` \`{title?, body?}\` → 200 \`{mission}\`; 409
+  once the mission is closed.
+- \`POST /missions/:id/join\` \`{convo_id}\` → 200 \`{mission}\`; 409
+  \`other_mission\` if that conversation already has a different one, 409
+  \`closed\`, 400 at 200 conversations. Re-joining the same mission is a
+  no-op 200.
+- \`POST /missions/:id/close\` \`{summary}\` → 200 \`{mission}\`. As an
+  agent you are blocked by open items: 409 \`user_items\` (clear those
+  with the user first), else 409 \`agent_items\`, each with the
+  \`{num,title}\` list. Close them or move them to another mission first.
+- \`POST /milestones\` \`{convo_id, kind:'user_input'|'progress', title,
+  body?}\` → 201 \`{milestone, mission}\`. The marker's own \`seq\` is
+  the milestone's anchor — that is the jump target. 409 \`no_mission\` /
+  \`closed\`; 502 if the anchor marker could not be written (nothing is
+  created).
+- \`GET /milestones?convo=<id>\` → \`{milestones}\` newest first for one
+  conversation.
+- \`PATCH /items/:id\` also accepts \`mission: id|"#num"|null\` — move an
+  item to a mission, or detach it.
 
 ## Media
 

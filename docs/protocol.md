@@ -1274,7 +1274,7 @@ degrade path for clients predating the tracker, not a second timeline.
 | `GET /items` | `convo, kind, state, awaiting, label, sort=rank\|updated, since, limit≤500, cursor` | `{items:[…], next_cursor}` |
 | `GET /items/:id` | `:id` = `it_…` or `#num` (URL-encode `#`) | `{item, comments:[…]}` |
 | `POST /items` | `{kind, title, body?, labels?, links?, attachments?, awaiting?, position?, after?, before?, convo_id, supersedes?, on_behalf_of?:'user' (agent callers only)}` + optional `Idempotency-Key`; `position` is **exclusive** of `after`/`before` (given together is 400); `after`/`before` may be given alone or together (a midpoint between the two, consistent with `/rank`; none means bottom) | 201 `{item}` (200 on replay) |
-| `PATCH /items/:id` | `{title?, body?, labels?, links?, awaiting?}` — `attachments` is **400** (create-only in v1; it used to be dropped silently, which told a client its blob had landed) | `{item}` |
+| `PATCH /items/:id` | `{title?, body?, labels?, links?, awaiting?, mission?: id \| "#num" \| null}` — `attachments` is **400** (create-only in v1; it used to be dropped silently, which told a client its blob had landed), and a patch carrying neither a field nor `mission` is **400**. `mission` moves the item to that mission, or detaches it when `null`; it is an explicit move only, never inferred. Fields and the move are one write with one `updated_at`. | `{item}`. **404** if `mission` names a mission that does not exist **or** is invisible to the caller — the same sieve `GET /missions/:id` applies (see *Missions & milestones → Visibility*), never a 403, so a hidden mission is not an existence oracle here either. **409** only for `awaiting` on a closed item (clearing it with `null` is fine); a **closed mission is not refused** as a move target in v1 — closing a mission blocks on open items precisely so they can be moved, and a finished mission must stay correctable. |
 | `POST /items/:id/comments` | `{body?, attachments?}` (one required) + optional `Idempotency-Key` | 201 `{item, comment}` (200 on replay) |
 | `PATCH /items/:id/comments/:cid` | `{blob_ref, transcript}` — agent only, else 403 | `{comment}` |
 | `POST /items/:id/close` | `{resolution, comment?}` | `{item, comment}`; 409 if already closed |
@@ -1284,7 +1284,12 @@ degrade path for clients predating the tracker, not a second timeline.
 Item shape: `{id, user_id, num, kind, state, resolution, awaiting, rank,
 title, body, labels[], links[{url,title?}], supersedes, origin_convo_id,
 origin_device_id, created_by, created_at, updated_at, closed_at,
-comment_count, last_comment_at, attachments[], has_image}`. `attachments`
+comment_count, last_comment_at, attachments[], has_image, mission_id,
+mission_num}`. `mission_id`/`mission_num` are the mission this item belongs
+to — both `null` when it has none — set by `PATCH /items/:id {mission}` or
+inherited when the item's origin conversation joins a mission (see *Missions
+& milestones*, whose *Visibility* section covers what an ordinary agent may
+learn from `mission_num`). `attachments`
 here is the item **body**'s attachments (set at create only, v1) — a
 comment's own attachments live on the comment. Comment shape:
 `{id, item_id, author, device_id, kind:'comment'|'status', body,
@@ -1404,24 +1409,49 @@ mission is refused — `409 {"error":"conflict","blocked_by":"no_mission"}`
 — rather than minting one implicitly. `mission_start` (`POST /missions`)
 is the only way in.
 
+A conversation gains a mission in exactly three ways: `POST /missions`
+(which attaches its origin), `POST /missions/:id/join`, and **inheritance**
+— a spawned conversation takes its parent's mission at creation, and never
+afterwards (like `parent_convo_id`, it is immutable once the row exists).
+Inheritance is a way *into* a mission, so `join`'s gates apply to it
+identically: the parent's mission must be `open`, it must hold fewer than
+200 conversations (the raw count — never the sieved one the creator can
+see), and it must be **visible to the creating device** under the rule in
+*Visibility* below. That last gate refuses two shapes an ordinary
+(non-private) agent could otherwise be attached through: a **private-owned
+parent**, and a *public* parent the user has joined to a **private-origin**
+mission — the second is invisible from the parent row alone, and either
+one would hand the child a `mission_id` it can never read, join or post a
+milestone to. A child that fails any gate simply starts with no mission;
+its agent can `mission_start` its own.
+
 ### Routes (Bearer, either device kind)
 
 | Route | Body / query | Returns |
 |---|---|---|
-| `POST /missions` | `{title, body?, convo_id}` + optional `Idempotency-Key` | 201 `{mission}`. If `convo_id` already has a mission: 200 that mission with `existing: true`, nothing changed. Attaches the conversation, repoints its unassigned items. |
+| `POST /missions` | `{title, body?, convo_id}` + optional `Idempotency-Key` | 201 `{mission}`. If `convo_id` already has a mission: 200 that mission with `existing: true`, nothing changed — or **404** if that mission is invisible to the caller (see *Visibility*). Attaches the conversation, repoints its unassigned items. |
 | `GET /missions` | `?state=open\|closed` (omit = both), `?since=<ms>` | `{missions:[…]}` with per-row counts: `open_items`, `needs_you` (open and awaiting user), `conversations`, `milestones`, `last_milestone` `{num,title,kind,created_at}`. Sorted `last_milestone_at DESC NULLS LAST`, then `created_at DESC`. |
 | `GET /missions/:id` | | `{mission, milestones:[…] newest first, items:[open items], conversations:[{id,title,box,state}]}` |
 | `PATCH /missions/:id` | `{title?, body?}` | 200 `{mission}`; 409 `{blocked_by:'closed'}` |
 | `POST /missions/:id/join` | `{convo_id}` | 200 `{mission}`; 409 `{blocked_by:'other_mission'}` if the conversation already has a different mission, 409 `{blocked_by:'closed'}` if this one is closed, 400 `{error:'bad_request'}` once the mission already has 200 conversations. Repeat-joining the same mission is a no-op 200, not a conflict. Repoints the conversation's unassigned items. |
 | `POST /missions/:id/close` | `{summary}` | 200 `{mission}`, or 409 as in *Closing*, below. |
-| `POST /milestones` | `{convo_id, kind:'user_input'\|'progress', title, body?}` + optional `Idempotency-Key` | 201 `{milestone, mission}`; 409 `{blocked_by:'no_mission'}` if the conversation has none, 409 `{blocked_by:'closed'}` if its mission is closed; 502 `{error:'marker_append_failed'}` if the anchor marker couldn't be written (the milestone row is not created either — see "Marker events" below). |
-| `GET /milestones?convo=<id>` | | `{milestones:[…]}` newest first — the per-conversation view. |
-| `PATCH /items/:id` | gains `mission: id \| "#num" \| null` | existing route (see "Items" above); moves or detaches the item, gated by the same visibility rule as `GET /missions/:id` — a mission an ordinary agent can't see is never a reachable move target. Emits the item marker `updated`. |
+| `POST /milestones` | `{convo_id, kind:'user_input'\|'progress', title, body?}` + optional `Idempotency-Key` | 201 `{milestone, mission}`; 409 `{blocked_by:'no_mission'}` if the conversation has none — or if its mission is invisible to the caller (see *Visibility*), 409 `{blocked_by:'closed'}` if its mission is closed; 502 `{error:'marker_append_failed'}` if the anchor marker couldn't be written (the milestone row is not created either — see "Marker events" below). |
+| `GET /milestones?convo=<id>` | | `{milestones:[…]}` newest first — the per-conversation view. 400 without `convo`; 404 for an unknown conversation, another user's, or (for an ordinary agent) a private-owned one. |
+| `PATCH /items/:id` | gains `mission: id \| "#num" \| null` | existing route (see "Items" above); moves or detaches the item, gated by the same visibility rule as `GET /missions/:id` — a mission an ordinary agent can't see is never a reachable move target, and is **404**, not 403. A closed mission is still a legal target (see the Items table). Emits the item marker `updated`. |
 
 Errors follow the items routes: 400 on shape/limits, 404 on unknown or
 invisible (never 403 — a refusal must be indistinguishable from a mission
 that doesn't exist), 409 on state conflicts, 502 when the marker append
 fails.
+
+Row shapes: a mission is `{id, user_id, num, state, title, body,
+close_summary, closed_by, closed_over_open_items, origin_convo_id,
+origin_device_id, created_by, created_at, updated_at, last_milestone_at,
+closed_at}` plus the counts listed against `GET /missions` above; a
+milestone is `{id, mission_id, user_id, num, kind, title, body, convo_id,
+seq, device_id, created_by, created_at}`. `idem_key` is an internal column
+on both and is never returned — the same stance items take, and the only
+key either shape strips.
 
 ### Idempotency
 
@@ -1503,7 +1533,35 @@ private-owned conversation's contribution for a filtered agent, matching
 the `milestones`/`items`/`conversations` arrays the same caller gets back
 — the summary row and the detail arrays can never disagree about what a
 filtered caller is allowed to see. A private agent caller, and any client
-device, see the unfiltered set.
+device, see the unfiltered set. The sieve lives in `getMission` itself, not
+in the routes, so the two routes that resolve a mission from a
+*conversation* rather than from an `:id` are gated by it too: `POST
+/missions` on a conversation the user has joined to a private-origin
+mission answers **404** (never `existing: true` with the hidden row — that
+would confirm it exists), and `POST /milestones` on such a conversation
+answers `409 {"blocked_by":"no_mission"}` and writes nothing at all — no
+row, no number, no marker.
+
+**Accepted exception — numbers, never words.** Three values let a filtered
+caller learn that hidden rows *exist*, without ever naming them:
+
+- `closed_over_open_items` on a closed mission — the count of items still
+  open at close time, hidden ones included (the close was blocked by them,
+  so a filtered count would contradict the 409 the same caller just got);
+- `open_item_nums` in the `mission` close marker — the numbers of those
+  items, again including hidden ones;
+- `mission_num` on an item the caller *can* see whose mission it cannot —
+  an item on a public conversation that the user moved into a
+  private-origin mission.
+
+Each is a bare integer. No title, body, summary, conversation id, or item
+title ever crosses the sieve, and the counts a filtered caller reads on a
+mission row (`open_items`, `needs_you`, `conversations`, `milestones`,
+`last_milestone`) are all sieved as described above. The exception is
+deliberate: the close marker is the **user's own record** of an override
+they performed themselves, and `#num` is already one shared namespace
+across items, missions, and milestones — a number on its own identifies
+nothing a caller could then read.
 
 ## Device privacy
 
