@@ -1514,6 +1514,13 @@ underneath it) is logged and swallowed; the mission write stands. Apps use
 it only as an invalidation signal; it renders as a small inline notice
 ("🏁 Mission #61 closed").
 
+`title` on the `mission` payload and `mission_title` on the `milestone`
+payload are **omitted** when the marker is written into a conversation that
+is not private-owned while the mission's origin conversation is — see
+"Markers written across the boundary carry numbers only" under *Visibility*
+below. Everything else is unchanged, and consumers must treat both fields
+as optional.
+
 Neither type is publishable by an agent (not in `AGENT_PUBLISH_TYPES`); neither is
 a `MESSAGE_TYPES` entry; neither pushes. Both are pure navigation signals —
 `classify()` (`src/push.js`) returns `null` for `mission` and `milestone`
@@ -1550,18 +1557,37 @@ caller learn that hidden rows *exist*, without ever naming them:
   so a filtered count would contradict the 409 the same caller just got);
 - `open_item_nums` in the `mission` close marker — the numbers of those
   items, again including hidden ones;
-- `mission_num` on an item the caller *can* see whose mission it cannot —
-  an item on a public conversation that the user moved into a
-  private-origin mission.
+- `mission_num` and `mission_id` on an item the caller *can* see whose
+  mission it cannot — an item on a public conversation that the user moved
+  into a private-origin mission. The id is an opaque handle, not a word:
+  every mission route 404s on it just the same.
 
-Each is a bare integer. No title, body, summary, conversation id, or item
-title ever crosses the sieve, and the counts a filtered caller reads on a
+Each is a bare integer (or, for `mission_id`, an opaque id). No title,
+body, summary, conversation id, or item title ever crosses the sieve, and the counts a filtered caller reads on a
 mission row (`open_items`, `needs_you`, `conversations`, `milestones`,
 `last_milestone`) are all sieved as described above. The exception is
 deliberate: the close marker is the **user's own record** of an override
 they performed themselves, and `#num` is already one shared namespace
 across items, missions, and milestones — a number on its own identifies
 nothing a caller could then read.
+
+**Markers written across the boundary carry numbers only.** A mission born
+in a private device's conversation can still reach a **public** one: only
+the user sees both sides, and only the user can `join` that conversation to
+it or post a milestone on it. The resulting `mission` marker (`joined`, or
+any other action written somewhere other than the origin conversation) and
+`milestone` marker land in a conversation whose ordinary agents replay
+every event verbatim — the WS replay applies no per-type payload sieve — so
+the title is dropped at **write** time: whenever the mission's origin
+conversation is private-owned and the conversation being written to is not,
+the `mission` payload omits `title` and the `milestone` payload omits
+`mission_title`. `num` / `mission_num`, `action` and `by` remain, as do the
+milestone's own `title`, `body` and `kind` (the milestone was posted into
+that conversation by its author and is that conversation's own content).
+The marker itself is never suppressed — the user's timeline still needs the
+event, and a missing event would be its own signal. Markers written into
+the origin conversation, or into another private-owned conversation, are
+unchanged: nothing crossed.
 
 ## Device privacy
 

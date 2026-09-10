@@ -36,4 +36,11 @@ test('GET /help serves the API digest to authenticated devices only', async (t) 
   for (const field of ['mission_id', 'mission_num', 'mission: id|"#num"|null']) {
     assert.ok(body.includes(field), `/help must name ${field}`)
   }
+
+  // Fix round 2, minor 3: the two answers an agent cannot guess from the
+  // route list — POST /missions 404s when the conversation's existing mission
+  // is one it cannot see, and a CLOSED mission is still a legal move target
+  // for PATCH /items/:id {mission}.
+  assert.match(body, /404 if that existing\s+mission is one you cannot see/)
+  assert.match(body, /CLOSED mission is still a legal target/)
 })

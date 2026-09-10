@@ -13,7 +13,7 @@ import {
   updateMission, joinMission, closeMission, createMilestone, listMilestones, milestoneRow,
 } from './missions.js'
 import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE, missionMarkerPayload, milestoneMarkerPayload } from './missions-marker.js'
-import { filteredAgent, privateOwnedConvo } from './privacy.js'
+import { filteredAgent, privateOwnedConvo, markerTitleAllowed } from './privacy.js'
 
 const STATES = ['open', 'closed']
 
@@ -46,8 +46,18 @@ function writableConvo(db, who, convoId) {
 
 // Mission markers are written AFTER the mission's transaction committed —
 // never inside it (same stance as items' emitMarker).
+//
+// `withTitle` (fix round 2, Critical): `joined` is appended into whatever
+// conversation the user joined, which may be PUBLIC while the mission was
+// born private — the title is dropped there. `created`/`updated`/`closed`
+// always target the origin conversation, so the predicate is a no-op for
+// them; it is applied uniformly anyway rather than per-action, so a future
+// action written elsewhere is covered by construction.
 function emitMissionMarker({ db, hub }, who, { mission, action, convoId, openItemNums = null }) {
-  const payload = missionMarkerPayload({ mission, action, by: byOf(who), openItemNums })
+  const payload = missionMarkerPayload({
+    mission, action, by: byOf(who), openItemNums,
+    withTitle: markerTitleAllowed(db, mission.origin_convo_id, convoId),
+  })
   try {
     appendAndBroadcast(db, hub, { userId: who.userId, convoId, sender: senderOf(db, who), type: MISSION_EVENT_TYPE, payload })
   } catch (err) {
@@ -220,10 +230,12 @@ async function handleMilestoneCreate(ctx, req, res, who) {
   // milestoneMarkerPayload — the same function that shaped the STORED
   // marker inside missions.js's transaction — so the live frame and the
   // persisted event can never drift apart from hand-copied keys.
+  // `markerWithTitle` comes back from that same transaction rather than
+  // being re-derived here, for the same reason: one decision, one shape.
   try {
     broadcastAppended(db, hub, {
       userId: who.userId, convoId: body.convo_id, seq: out.seq, ts: out.ts, sender, type: MILESTONE_EVENT_TYPE,
-      payload: milestoneMarkerPayload({ milestone: out.milestone, mission: out.mission, by: byOf(who) }),
+      payload: milestoneMarkerPayload({ milestone: out.milestone, mission: out.mission, by: byOf(who), withTitle: out.markerWithTitle }),
     })
   } catch (err) { console.error('missions: milestone broadcast failed (row and marker already committed)', err) }
   json(res, 201, { milestone: out.milestone, mission: out.mission })

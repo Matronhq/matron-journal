@@ -4,6 +4,7 @@
 // layer maps to one status; anything else is a bug and reaches the 500.
 import { nextNum, newId, BODY_MAX } from './items.js'
 import { milestoneMarkerPayload } from './missions-marker.js'
+import { markerTitleAllowed } from './privacy.js'
 
 export const MILESTONE_KINDS = ['user_input', 'progress']
 export const TITLE_MAX = 200
@@ -24,12 +25,12 @@ export function missionRow(row) {
   return out
 }
 
-// Keeps `user_id`, like missionRow and the item shape do — only `idem_key`
-// is internal. (Final review minor: the three row shapes this feature
-// returns must agree on what a caller sees.)
+// `idem_key` is internal, and so is `user_id` (fix round 2, minor 2): it is
+// always the caller's own id — no route hands back another user's milestone —
+// so returning it only widened the wire shape for nothing.
 export function milestoneRow(row) {
   if (!row) return null
-  const { idem_key: _idemKey, ...rest } = row
+  const { idem_key: _idemKey, user_id: _userId, ...rest } = row
   return rest
 }
 
@@ -266,9 +267,16 @@ export function createMilestone(db, { userId, deviceId, createdBy, convoId, kind
     const num = nextNum(db, userId)
     const ts = now()
     const milestone = { id, num, kind, title, body }
+    // Numbers, never words, across the privacy boundary (fix round 2,
+    // Critical): the user may post a milestone on a PUBLIC conversation they
+    // joined to a private-origin mission, and that conversation's ordinary
+    // agents replay this stored marker verbatim. The milestone's own fields
+    // stay — it is this conversation's own content — but the mission title
+    // does not travel with it.
+    const markerWithTitle = markerTitleAllowed(db, mission.origin_convo_id, convoId)
     let r
     try {
-      r = appendMarker(milestoneMarkerPayload({ milestone, mission, by: createdBy }))
+      r = appendMarker(milestoneMarkerPayload({ milestone, mission, by: createdBy, withTitle: markerWithTitle }))
     } catch (err) {
       const e = new Error('marker_append_failed'); e.cause = err; throw e
     }
@@ -291,7 +299,7 @@ export function createMilestone(db, { userId, deviceId, createdBy, convoId, kind
       throw err.code === 'SQLITE_CONSTRAINT_UNIQUE' && idemKey ? new Error('idem_key_conflict') : err
     }
     db.prepare('UPDATE missions SET last_milestone_at=?, updated_at=? WHERE id=?').run(ts, ts, mission.id)
-    return { milestone: milestoneRow({ ...milestone, mission_id: mission.id, user_id: userId, convo_id: convoId, seq: r.seq, device_id: deviceId, created_by: createdBy, created_at: ts }), mission: getMission(db, userId, mission.id, { excludePrivateOwned }), duplicate: false, seq: r.seq, ts: r.ts }
+    return { milestone: milestoneRow({ ...milestone, mission_id: mission.id, user_id: userId, convo_id: convoId, seq: r.seq, device_id: deviceId, created_by: createdBy, created_at: ts }), mission: getMission(db, userId, mission.id, { excludePrivateOwned }), duplicate: false, seq: r.seq, ts: r.ts, markerWithTitle }
   })()
 }
 

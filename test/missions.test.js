@@ -8,6 +8,7 @@ import { openDb } from '../src/db.js'
 import { nextNum, newId } from '../src/items.js'
 import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE, MISSION_ACTIONS, milestoneMarkerPayload, missionMarkerPayload } from '../src/missions-marker.js'
 import { append, broadcastAppended, snippetOf, upsertConversation } from '../src/journal.js'
+import { markerTitleAllowed } from '../src/privacy.js'
 import { classify } from '../src/push.js'
 import {
   createMission, getMission, listMissions, missionDetail, updateMission, joinMission, closeMission, repointItems, validateMissionFields,
@@ -104,11 +105,63 @@ test('marker payloads carry exactly the documented fields', () => {
   assert.deepEqual(MISSION_ACTIONS, ['created', 'joined', 'updated', 'closed'])
 })
 
+// Fix round 2, Critical: across the privacy boundary a marker carries
+// numbers, never words. The builders are the single place that shape is
+// decided (stored marker, live broadcast and every WS replay all come from
+// them), so the flag is pinned here on the payloads themselves.
+test('marker payloads omit the mission title when withTitle is false, keeping every number', () => {
+  const mission = { id: 'ms_1', num: 61, title: 'SECRET-MISSION-TITLE' }
+  const milestone = { id: 'ml_1', num: 63, kind: 'user_input', title: 'Wired the migration', body: 'b' }
+  // The milestone's OWN title and body stay: that is the conversation's own
+  // content, posted into it by its author. Only the mission's title goes.
+  assert.deepEqual(milestoneMarkerPayload({ milestone, mission, by: 'user', withTitle: false }), {
+    milestone_id: 'ml_1', num: 63, kind: 'user_input', title: 'Wired the migration', body: 'b',
+    mission_id: 'ms_1', mission_num: 61, by: 'user',
+  })
+  for (const action of MISSION_ACTIONS) {
+    const p = missionMarkerPayload({ mission, action, by: 'user', withTitle: false })
+    assert.equal('title' in p, false, `${action} marker must not carry the title`)
+    assert.deepEqual(p, { mission_id: 'ms_1', num: 61, action, by: 'user' })
+  }
+  // open_item_nums is numbers already — it still travels.
+  assert.deepEqual(missionMarkerPayload({ mission, action: 'closed', by: 'user', openItemNums: [64, 70], withTitle: false }),
+    { mission_id: 'ms_1', num: 61, action: 'closed', by: 'user', open_item_nums: [64, 70] })
+  // No payload built either way may contain the title string anywhere.
+  const hidden = [
+    milestoneMarkerPayload({ milestone, mission, by: 'user', withTitle: false }),
+    ...MISSION_ACTIONS.map((action) => missionMarkerPayload({ mission, action, by: 'user', withTitle: false })),
+  ]
+  for (const p of hidden) assert.equal(JSON.stringify(p).includes('SECRET-MISSION-TITLE'), false)
+  // Default is unchanged: withTitle omitted means the title travels.
+  assert.equal(missionMarkerPayload({ mission, action: 'joined', by: 'user' }).title, 'SECRET-MISSION-TITLE')
+  assert.equal(milestoneMarkerPayload({ milestone, mission, by: 'user' }).mission_title, 'SECRET-MISSION-TITLE')
+})
+
+// The predicate the builders' flag comes from: private ORIGIN + non-private
+// TARGET is the only combination that drops the title.
+test('markerTitleAllowed: only a private-origin mission written into a non-private conversation loses its title', () => {
+  const db = seeded()
+  db.prepare("INSERT INTO devices(id, user_id, kind, name, token_hash, created_at, private) VALUES(9,1,'agent','priv','h2',0,1)").run()
+  upsertConversation(db, { id: 'secret', ownerUserId: 1, title: 'S', agentDeviceId: 9 })
+  upsertConversation(db, { id: 'secret2', ownerUserId: 1, title: 'S2', agentDeviceId: 9 })
+  assert.equal(markerTitleAllowed(db, 'secret', 'c1'), false)   // crosses the boundary
+  assert.equal(markerTitleAllowed(db, 'secret', 'secret'), true)  // origin conversation
+  assert.equal(markerTitleAllowed(db, 'secret', 'secret2'), true) // still behind the sieve
+  assert.equal(markerTitleAllowed(db, 'c1', 'c2'), true)          // nothing private involved
+  assert.equal(markerTitleAllowed(db, 'c1', 'secret'), true)      // public mission, private convo
+})
+
 test('snippetOf renders both markers; classify never pushes them', () => {
   assert.equal(snippetOf('milestone', { num: 63, kind: 'user_input', title: 'T' }), '🚩 #63 T')
   assert.equal(snippetOf('milestone', { num: 64, kind: 'progress', title: 'P' }), '🏁 #64 P')
   assert.equal(snippetOf('mission', { num: 61, title: 'M', action: 'closed' }), '🏁 Mission #61 closed')
   assert.equal(snippetOf('mission', { num: 61, title: 'M', action: 'created' }), '🏁 Mission #61 started: M')
+  // A title-less marker (one that crossed the privacy boundary) falls back to
+  // the number rather than rendering a dangling "started: ".
+  assert.equal(snippetOf('mission', { num: 61, action: 'created' }), '🏁 Mission #61 started')
+  assert.equal(snippetOf('mission', { num: 61, action: 'joined' }), '🏁 Joined mission #61')
+  assert.equal(snippetOf('mission', { num: 61, action: 'updated' }), '🏁 Mission #61 updated')
+  assert.equal(snippetOf('mission', { num: 61, action: 'closed' }), '🏁 Mission #61 closed')
   assert.equal(classify('milestone', { num: 63 }, 'agent:dev-2'), null)
   assert.equal(classify('mission', { num: 61, action: 'closed' }, 'user:dan'), null)
 })
@@ -483,11 +536,11 @@ test('inheritance gate: a PUBLIC parent joined to a private-ORIGIN mission is no
   assert.equal(missionOf(db, 'kid-client'), hidden.id)
 })
 
-// Final review minor: milestoneRow keeps `user_id` (missionRow and the item
-// shape both do — only `idem_key` is internal). The freshly-created row is
-// assembled in memory rather than re-read, so its key set has to be pinned
-// against a row that came back out of the database.
-test('milestoneRow: create, replay and list all return the same key set, user_id included', () => {
+// Fix round 2, minor 2: milestoneRow strips `user_id` as well as `idem_key`
+// — it is always the caller's own id and no route reads it back. The
+// freshly-created row is assembled in memory rather than re-read, so its key
+// set has to be pinned against a row that came back out of the database.
+test('milestoneRow: create, replay and list all return the same key set, without user_id or idem_key', () => {
   const db = seeded()
   createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' })
   const appendMarker = (payload) => append(db, { userId: 1, convoId: 'c1', sender: 'agent:dev-2', type: 'milestone', payload })
@@ -495,9 +548,11 @@ test('milestoneRow: create, replay and list all return the same key set, user_id
   const replayed = createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'progress', title: 'one', idemKey: '7:k', appendMarker }).milestone
   const listed = listMilestones(db, 1, { convoId: 'c1' })[0]
   const keys = (o) => Object.keys(o).sort()
-  assert.deepEqual(keys(fresh), ['convo_id', 'created_at', 'created_by', 'device_id', 'id', 'kind', 'mission_id', 'num', 'seq', 'title', 'user_id'].concat(['body']).sort())
+  assert.deepEqual(keys(fresh), ['convo_id', 'created_at', 'created_by', 'device_id', 'id', 'kind', 'mission_id', 'num', 'seq', 'title'].concat(['body']).sort())
   assert.deepEqual(keys(replayed), keys(fresh))
   assert.deepEqual(keys(listed), keys(fresh))
-  assert.equal(fresh.user_id, 1); assert.equal(listed.user_id, 1)
-  assert.equal('idem_key' in listed, false)
+  for (const row of [fresh, replayed, listed]) {
+    assert.equal('user_id' in row, false)
+    assert.equal('idem_key' in row, false)
+  }
 })

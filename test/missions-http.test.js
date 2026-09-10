@@ -331,6 +331,106 @@ test('privacy sieve: a public convo joined to a private-origin mission is not an
   assert.equal((await s.http('/missions', { token: agent.token })).json.missions.length, 0)
 })
 
+// ---------------------------------------------------------------------------
+// Fix round 2, Critical: the marker events themselves. C1 closed the ROUTES,
+// but the user — who legitimately sees both sides — can still join a PUBLIC
+// conversation to a private-origin mission and post a milestone there. Those
+// markers land in that public conversation, and ws.js replays events verbatim
+// (no per-type payload sieve), so an ordinary agent used to read the private
+// mission's TITLE out of its own replay while GET /missions/:id 404'd. The
+// title is now dropped at write time; the marker itself still lands.
+// ---------------------------------------------------------------------------
+test("privacy sieve: markers written across the boundary carry numbers only — an ordinary agent's replay never sees the private mission's title", async (t) => {
+  const { s, dan, agent, client } = await fleet(t)
+  const priv = createAgent(s.db, dan.id, 'private-box')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  upsertConversation(s.db, { id: 'secret', ownerUserId: dan.id, title: 'S', agentDeviceId: priv.deviceId })
+  const TITLE = 'SECRET-MISSION-TITLE'
+  const hidden = (await s.http('/missions', { method: 'POST', token: priv.token, body: { title: TITLE, body: 'secret goal', convo_id: 'secret' } })).json.mission
+  // Exactly the state the C1 fixture builds: only the user can join the
+  // public conversation to it, and only the user can post the milestone.
+  assert.equal((await s.http(`/missions/${hidden.id}/join`, { method: 'POST', token: client, body: { convo_id: 'c1' } })).status, 200)
+  const ms = await post(s, client, { title: 'a public step', body: 'own content' })
+  assert.equal(ms.status, 201)
+  // The mission is still invisible to c1's own ordinary agent on every route.
+  assert.equal((await s.http(`/missions/${hidden.id}`, { token: agent.token })).status, 404)
+
+  // The agent replays c1 from the beginning (cursor 0 = full replay) — the
+  // leak's actual path.
+  const ws = await makeWsClient(s.base, { token: agent.token, cursor: 0 })
+  await ws.waitFor((f) => f.op === 'hello_ok')
+  const milestoneFrame = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'milestone')
+  const joinFrame = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'mission')
+  for (const f of ws.journal()) {
+    assert.equal(f.convo_id, 'c1')  // the origin conversation never replays to it at all
+    assert.equal(JSON.stringify(f.payload).includes(TITLE), false, `${f.type} marker leaked the title`)
+  }
+  // The events still LAND, carrying every number: suppressing them would
+  // leave the user's own timeline with a hole.
+  assert.equal(joinFrame.payload.action, 'joined')
+  assert.equal(joinFrame.payload.num, hidden.num)
+  assert.equal(joinFrame.payload.mission_id, hidden.id)
+  assert.equal(joinFrame.payload.by, 'user')
+  assert.equal('title' in joinFrame.payload, false)
+  assert.equal(milestoneFrame.payload.mission_num, hidden.num)
+  assert.equal('mission_title' in milestoneFrame.payload, false)
+  // The milestone's OWN fields are that conversation's content and stay.
+  assert.equal(milestoneFrame.payload.title, 'a public step')
+  assert.equal(milestoneFrame.payload.body, 'own content')
+  assert.equal(milestoneFrame.seq, ms.json.milestone.seq)
+  ws.close()
+
+  // Same over the HTTP read of the same conversation, and in the STORED rows
+  // (the drop is at write time, so history cannot be replayed any other way).
+  const read = await s.http('/convo/c1/messages?limit=50', { token: agent.token })
+  assert.equal(JSON.stringify(read.json.events).includes(TITLE), false)
+  const stored = s.db.prepare("SELECT payload FROM events WHERE convo_id='c1' AND type IN ('mission','milestone')").all()
+  assert.equal(stored.length, 2)
+  for (const row of stored) assert.equal(row.payload.includes(TITLE), false)
+  // The conversation-preview snippet is not a back door either.
+  assert.equal(s.db.prepare("SELECT snippet FROM conversations WHERE id='c1'").get().snippet.includes(TITLE), false)
+
+  // The user's own replay of the ORIGIN conversation still names it: nothing
+  // crossed the boundary there, and the client is unfiltered.
+  const userWs = await makeWsClient(s.base, { token: client, cursor: 0 })
+  await userWs.waitFor((f) => f.op === 'hello_ok')
+  const created = await userWs.waitFor((f) => f.kind === 'journal' && f.type === 'mission' && f.convo_id === 'secret')
+  assert.equal(created.payload.action, 'created')
+  assert.equal(created.payload.title, TITLE)
+  // …and the user sees the title-less markers on c1, exactly as stored.
+  const userJoin = await userWs.waitFor((f) => f.kind === 'journal' && f.type === 'mission' && f.convo_id === 'c1')
+  assert.equal('title' in userJoin.payload, false)
+  userWs.close()
+  // A private agent still reads the mission itself in full — the sieve, not
+  // the marker, is what decides that.
+  assert.equal((await s.http(`/missions/${hidden.id}`, { token: priv.token })).json.mission.title, TITLE)
+})
+
+// A marker written into ANOTHER private-owned conversation has not crossed
+// anything: the title travels, or a private agent's own timeline would be
+// needlessly degraded.
+test('privacy sieve: a private-origin mission joined to a second PRIVATE conversation keeps its title in the marker', async (t) => {
+  const { s, dan, agent, client } = await fleet(t)
+  const priv = createAgent(s.db, dan.id, 'private-box')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  upsertConversation(s.db, { id: 'secret', ownerUserId: dan.id, title: 'S', agentDeviceId: priv.deviceId })
+  upsertConversation(s.db, { id: 'secret2', ownerUserId: dan.id, title: 'S2', agentDeviceId: priv.deviceId })
+  const TITLE = 'SECRET-MISSION-TITLE'
+  const hidden = (await s.http('/missions', { method: 'POST', token: priv.token, body: { title: TITLE, convo_id: 'secret' } })).json.mission
+  assert.equal((await s.http(`/missions/${hidden.id}/join`, { method: 'POST', token: priv.token, body: { convo_id: 'secret2' } })).status, 200)
+  assert.equal((await s.http('/milestones', { method: 'POST', token: priv.token, body: { convo_id: 'secret2', kind: 'progress', title: 'step' } })).status, 201)
+  const payloads = s.db.prepare("SELECT payload FROM events WHERE convo_id='secret2' AND type IN ('mission','milestone')").all().map((r) => JSON.parse(r.payload))
+  assert.equal(payloads.length, 2)
+  assert.equal(payloads.find((p) => p.action === 'joined').title, TITLE)
+  assert.equal(payloads.find((p) => p.mission_num !== undefined && p.milestone_id).mission_title, TITLE)
+  // The ordinary agent cannot replay either conversation in the first place.
+  const ws = await makeWsClient(s.base, { token: agent.token, cursor: 0 })
+  await ws.waitFor((f) => f.op === 'hello_ok')
+  await new Promise((r) => setTimeout(r, 100))
+  assert.deepEqual(ws.journal().filter((f) => f.convo_id.startsWith('secret')), [])
+  ws.close()
+})
+
 // Final review, minor: GET /missions/:id used to answer 200 with a `null`
 // body if the mission vanished between visibleMission and missionDetail's own
 // re-fetch. Forced deterministically (the db.prepare interception pattern

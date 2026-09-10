@@ -100,8 +100,10 @@ ones append a \`mission\` or \`milestone\` marker event you cannot
 
 - \`POST /missions\` \`{title, body?, convo_id}\` → 201 \`{mission}\`
   with the next \`#num\`; 200 \`{mission, existing: true}\` if that
-  conversation already has one (nothing changes). Attaches the conversation
-  and repoints its unassigned items.
+  conversation already has one (nothing changes), or 404 if that existing
+  mission is one you cannot see — same 404 as an unknown conversation, never
+  an existence oracle. Attaches the conversation and repoints its unassigned
+  items.
 - \`GET /missions?state=open|closed&since=<ms>\` → \`{missions}\` with
   per-row \`open_items\`, \`needs_you\`, \`conversations\`,
   \`milestones\`, \`last_milestone\`; most recent activity first.
@@ -125,7 +127,9 @@ ones append a \`mission\` or \`milestone\` marker event you cannot
 - \`GET /milestones?convo=<id>\` → \`{milestones}\` newest first for one
   conversation.
 - \`PATCH /items/:id\` also accepts \`mission: id|"#num"|null\` — move an
-  item to a mission, or detach it.
+  item to a mission, or detach it. A CLOSED mission is still a legal target:
+  closing blocks on open items precisely so you can move them, and a finished
+  mission has to stay correctable.
 
 ## Media
 

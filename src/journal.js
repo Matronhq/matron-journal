@@ -76,9 +76,13 @@ export function snippetOf(type, payload) {
     return `${glyph} #${Number(p.num) || 0} ${String(p.title || '')}`.slice(0, 120)
   }
   if (type === 'mission') {
+    // The title is absent whenever the marker crossed the privacy boundary
+    // (missions-marker.js's withTitle) as well as when the payload is
+    // malformed — the snippet falls back to the number, which is exactly what
+    // the boundary allows through.
     const n = Number(p.num) || 0
     if (p.action === 'closed') return `🏁 Mission #${n} closed`
-    if (p.action === 'created') return `🏁 Mission #${n} started: ${String(p.title || '')}`.slice(0, 120)
+    if (p.action === 'created') return (p.title ? `🏁 Mission #${n} started: ${String(p.title)}` : `🏁 Mission #${n} started`).slice(0, 120)
     if (p.action === 'joined') return `🏁 Joined mission #${n}`
     return `🏁 Mission #${n} updated`
   }
