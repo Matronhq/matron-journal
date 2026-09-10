@@ -639,3 +639,84 @@ test('ownership: another user\'s agent gets 404 on every mission route — detai
   assert.equal(still.json.mission.title, 'Missions'); assert.equal(still.json.mission.state, 'open')
   assert.equal(still.json.milestones.length, 1)
 })
+
+// Fix round 3, B1: repointItems (called from both createMission and
+// joinMission via attachConversation) used to leave the repointed item's
+// own updated_at untouched, so a client syncing GET /items?since= never
+// learned the item gained a mission. `since` is captured strictly between
+// the item's creation and the mission's creation (a real sleep either side,
+// not just two Date.now() calls, since both run synchronously in the same
+// millisecond otherwise) so the assertion actually exercises the bump: the
+// item's ORIGINAL updated_at is before the cursor; only a bumped one clears it.
+test('GET /items?since=: repointItems bumps the repointed items updated_at, so a since sync sees the new mission_id/mission_num', async (t) => {
+  const { s, agent, client } = await fleet(t)
+  const it = (await item(s, agent.token, {})).json.item
+  await new Promise((r) => setTimeout(r, 10))
+  const since = Date.now()
+  await new Promise((r) => setTimeout(r, 10))
+  const m = (await start(s, agent.token, {})).json.mission
+
+  const synced = await s.http(`/items?since=${since}`, { token: client })
+  assert.equal(synced.status, 200)
+  const found = synced.json.items.find((x) => x.id === it.id)
+  assert.ok(found, 'the repointed item must appear in a since= sync after gaining a mission')
+  assert.equal(found.mission_id, m.id)
+  assert.equal(found.mission_num, m.num)
+  assert.ok(found.updated_at >= since)
+
+  // Same bump on the join path, not just create: a second item on c2,
+  // joined to the same mission after its own since cursor.
+  const it2 = (await item(s, agent.token, { convo_id: 'c2' })).json.item
+  await new Promise((r) => setTimeout(r, 10))
+  const since2 = Date.now()
+  await new Promise((r) => setTimeout(r, 10))
+  assert.equal((await s.http(`/missions/${m.id}/join`, { method: 'POST', token: agent.token, body: { convo_id: 'c2' } })).status, 200)
+  const synced2 = await s.http(`/items?since=${since2}`, { token: client })
+  const found2 = synced2.json.items.find((x) => x.id === it2.id)
+  assert.ok(found2, 'joinMission\'s repoint must also bump updated_at')
+  assert.equal(found2.mission_id, m.id)
+})
+
+// Fix round 3, B2: `GET /missions` sorted on the STORED last_milestone_at
+// (and the row's own updated_at), both of which a milestone posted on a
+// private-owned conversation bumps whether or not the caller is allowed to
+// see it — an ordinary agent's list could jump a mission to the top while
+// its own row on that same list shows last_milestone: null, milestones: 0,
+// disagreeing with the position it was just given. The fix orders a
+// filtered caller's list on the SIEVED last-milestone timestamp instead;
+// the owner's own (unsieved) list is unchanged.
+test('GET /missions: list order follows the SIEVED last-milestone timestamp for a filtered caller — a hidden milestone cannot jump a mission to the top', async (t) => {
+  const { s, dan, agent, client } = await fleet(t)
+  const priv = createAgent(s.db, dan.id, 'private-box')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  upsertConversation(s.db, { id: 'secret2', ownerUserId: dan.id, title: 'S2', agentDeviceId: priv.deviceId })
+
+  const older = (await start(s, agent.token, { convo_id: 'c1', title: 'Older' })).json.mission
+  await new Promise((r) => setTimeout(r, 10))
+  const newer = (await start(s, agent.token, { convo_id: 'c2', title: 'Newer' })).json.mission
+
+  // Baseline, before any milestone: both last_milestone null, so the newer
+  // mission (later created_at) sorts first for everyone.
+  const baseline = (await s.http('/missions', { token: agent.token })).json.missions.map((x) => x.id)
+  assert.deepEqual(baseline, [newer.id, older.id])
+
+  // Join the private-owned convo to the OLDER mission, then post a milestone
+  // from it — this bumps `older`'s stored last_milestone_at/updated_at, but
+  // the milestone lives on a conversation the ordinary agent cannot see.
+  assert.equal((await s.http(`/missions/${older.id}/join`, { method: 'POST', token: priv.token, body: { convo_id: 'secret2' } })).status, 200)
+  const hidden = await post(s, priv.token, { convo_id: 'secret2', title: 'hidden step' })
+  assert.equal(hidden.status, 201)
+
+  const asAgent = await s.http('/missions', { token: agent.token })
+  const olderForAgent = asAgent.json.missions.find((x) => x.id === older.id)
+  assert.equal(olderForAgent.last_milestone, null)
+  assert.equal(olderForAgent.milestones, 0)
+  // The order must agree with the row it shows: `older` still has no
+  // visible milestone, so it must not have jumped ahead of `newer`.
+  assert.deepEqual(asAgent.json.missions.map((x) => x.id), [newer.id, older.id])
+
+  // The user's own (unsieved) list sees the real milestone and puts `older` first.
+  const asClient = await s.http('/missions', { token: client })
+  assert.deepEqual(asClient.json.missions.map((x) => x.id), [older.id, newer.id])
+  assert.equal(asClient.json.missions.find((x) => x.id === older.id).last_milestone.title, 'hidden step')
+})

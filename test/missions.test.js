@@ -302,6 +302,39 @@ test('getMission/listMissions/missionDetail: excludePrivateOwned sieves the COUN
   assert.equal(detailSieved.mission.open_items, detailSieved.items.length)
 })
 
+test('listMissions: excludePrivateOwned orders by the SIEVED last-milestone timestamp, not the stored (unsieved) one (fix round 3, B2)', () => {
+  const db = seeded()
+  db.prepare("INSERT INTO devices(id, user_id, kind, name, token_hash, created_at, private) VALUES(9,1,'agent','priv-box','h2',0,1)").run()
+  upsertConversation(db, { id: 'c3', ownerUserId: 1, title: 'C3', agentDeviceId: 9 })
+  const older = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'Older' }).mission
+  const newer = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c2', title: 'Newer' }).mission
+  // Deterministic creation order: `older` really is older.
+  db.prepare('UPDATE missions SET created_at=1000 WHERE id=?').run(older.id)
+  db.prepare('UPDATE missions SET created_at=2000 WHERE id=?').run(newer.id)
+
+  // Join a private-owned conversation to `older`, then post a milestone from
+  // it — this bumps `older`'s STORED last_milestone_at/updated_at
+  // unconditionally (createMilestone does this regardless of who can see the
+  // convo), even though the milestone lives where an ordinary agent can't
+  // look.
+  joinMission(db, { userId: 1, missionId: older.id, convoId: 'c3' })
+  const appendMarker = (payload) => append(db, { userId: 1, convoId: 'c3', sender: 'agent:priv-box', type: 'milestone', payload })
+  createMilestone(db, { userId: 1, deviceId: 9, createdBy: 'agent', convoId: 'c3', kind: 'progress', title: 'hidden step', appendMarker })
+  assert.ok(db.prepare('SELECT last_milestone_at FROM missions WHERE id=?').get(older.id).last_milestone_at > 2000)
+
+  // Sieved (ordinary agent): `older` has no VISIBLE milestone, so it must not
+  // outrank `newer` — the order falls back to created_at DESC, exactly as if
+  // the hidden milestone had never happened. The row it shows agrees.
+  const sieved = listMissions(db, 1, { excludePrivateOwned: true })
+  assert.deepEqual(sieved.map((m) => m.id).filter((id) => id === older.id || id === newer.id), [newer.id, older.id])
+  assert.equal(sieved.find((m) => m.id === older.id).last_milestone, null)
+
+  // Unsieved (the owner's own list): the real milestone puts `older` first.
+  const full = listMissions(db, 1, { excludePrivateOwned: false })
+  assert.deepEqual(full.map((m) => m.id).filter((id) => id === older.id || id === newer.id), [older.id, newer.id])
+  assert.equal(full.find((m) => m.id === older.id).last_milestone.title, 'hidden step')
+})
+
 test('listMissions: counts, sort by last milestone then creation, state filter, since; detail lists open items awaiting-user first', () => {
   const db = seeded()
   const a = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
@@ -322,13 +355,22 @@ test('listMissions: counts, sort by last milestone then creation, state filter, 
   assert.equal(d.conversations[0].title, 'C1'); assert.equal(d.conversations[0].box, 'dev-2'); assert.equal(d.conversations[0].state, 'running')
 })
 
-test('repointItems only moves items with no mission', () => {
+test('repointItems only moves items with no mission, and bumps updated_at on the ones it moves (fix round 3, B1)', () => {
   const db = seeded()
   const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
-  const it = createItem(db, { userId: 1, originDeviceId: 7, createdBy: 'agent', kind: 'task', title: 'T', originConvoId: 'c2' }).item
-  db.prepare('UPDATE items SET mission_id=? WHERE id=?').run('ms_other', it.id)
-  repointItems(db, 1, 'c2', m.id)
-  assert.equal(db.prepare('SELECT mission_id FROM items WHERE id=?').get(it.id).mission_id, 'ms_other')
+  const already = createItem(db, { userId: 1, originDeviceId: 7, createdBy: 'agent', kind: 'task', title: 'T', originConvoId: 'c2' }).item
+  db.prepare('UPDATE items SET mission_id=?, updated_at=0 WHERE id=?').run('ms_other', already.id)
+  const eligible = createItem(db, { userId: 1, originDeviceId: 7, createdBy: 'agent', kind: 'task', title: 'E', originConvoId: 'c2' }).item
+  db.prepare('UPDATE items SET updated_at=0 WHERE id=?').run(eligible.id)
+  repointItems(db, 1, 'c2', m.id, 9999)
+  // Already-assigned item: untouched, mission_id AND updated_at both survive.
+  const stillOther = db.prepare('SELECT mission_id, updated_at FROM items WHERE id=?').get(already.id)
+  assert.equal(stillOther.mission_id, 'ms_other'); assert.equal(stillOther.updated_at, 0)
+  // The eligible (unassigned) item: repointed, and its updated_at is the
+  // caller's ts — not left at its stale creation time, or the bug's tell,
+  // `GET /items?since=` never learns the item gained a mission_id.
+  const moved = db.prepare('SELECT mission_id, updated_at FROM items WHERE id=?').get(eligible.id)
+  assert.equal(moved.mission_id, m.id); assert.equal(moved.updated_at, 9999)
 })
 
 test('createMilestone: marker appended inside the transaction, seq stored, mission activity bumped; no mission → no_mission and nothing written', () => {

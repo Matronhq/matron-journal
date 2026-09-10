@@ -1429,11 +1429,11 @@ its agent can `mission_start` its own.
 
 | Route | Body / query | Returns |
 |---|---|---|
-| `POST /missions` | `{title, body?, convo_id}` + optional `Idempotency-Key` | 201 `{mission}`. If `convo_id` already has a mission: 200 that mission with `existing: true`, nothing changed — or **404** if that mission is invisible to the caller (see *Visibility*). Attaches the conversation, repoints its unassigned items. |
-| `GET /missions` | `?state=open\|closed` (omit = both), `?since=<ms>` | `{missions:[…]}` with per-row counts: `open_items`, `needs_you` (open and awaiting user), `conversations`, `milestones`, `last_milestone` `{num,title,kind,created_at}`. Sorted `last_milestone_at DESC NULLS LAST`, then `created_at DESC`. |
+| `POST /missions` | `{title, body?, convo_id}` + optional `Idempotency-Key` | 201 `{mission}`. If `convo_id` already has a mission: 200 that mission with `existing: true`, nothing changed — or **404** if that mission is invisible to the caller (see *Visibility*). Attaches the conversation, repoints its unassigned items (each repointed item's own `updated_at` is bumped too, so `GET /items?since=` learns it gained a mission). |
+| `GET /missions` | `?state=open\|closed` (omit = both), `?since=<ms>` | `{missions:[…]}` with per-row counts: `open_items`, `needs_you` (open and awaiting user), `conversations`, `milestones`, `last_milestone` `{num,title,kind,created_at}`. Sorted `last_milestone_at DESC NULLS LAST`, then `created_at DESC` — for a filtered (ordinary agent) caller this is the SIEVED last-milestone timestamp (the same sieved subquery the `last_milestone` field itself uses), so the order never disagrees with the row shown; an owner or private agent sorts on the stored column, which is the same thing. |
 | `GET /missions/:id` | | `{mission, milestones:[…] newest first, items:[open items], conversations:[{id,title,box,state}]}` |
 | `PATCH /missions/:id` | `{title?, body?}` | 200 `{mission}`; 409 `{blocked_by:'closed'}` |
-| `POST /missions/:id/join` | `{convo_id}` | 200 `{mission}`; 409 `{blocked_by:'other_mission'}` if the conversation already has a different mission, 409 `{blocked_by:'closed'}` if this one is closed, 400 `{error:'bad_request'}` once the mission already has 200 conversations. Repeat-joining the same mission is a no-op 200, not a conflict. Repoints the conversation's unassigned items. |
+| `POST /missions/:id/join` | `{convo_id}` | 200 `{mission}`; 409 `{blocked_by:'other_mission'}` if the conversation already has a different mission, 409 `{blocked_by:'closed'}` if this one is closed, 400 `{error:'bad_request'}` once the mission already has 200 conversations. Repeat-joining the same mission is a no-op 200, not a conflict. Repoints the conversation's unassigned items (same `updated_at` bump as `POST /missions`). |
 | `POST /missions/:id/close` | `{summary}` | 200 `{mission}`, or 409 as in *Closing*, below. |
 | `POST /milestones` | `{convo_id, kind:'user_input'\|'progress', title, body?}` + optional `Idempotency-Key` | 201 `{milestone, mission}`; 409 `{blocked_by:'no_mission'}` if the conversation has none — or if its mission is invisible to the caller (see *Visibility*), 409 `{blocked_by:'closed'}` if its mission is closed; 502 `{error:'marker_append_failed'}` if the anchor marker couldn't be written (the milestone row is not created either — see "Marker events" below). |
 | `GET /milestones?convo=<id>` | | `{milestones:[…]}` newest first — the per-conversation view. 400 without `convo`; 404 for an unknown conversation, another user's, or (for an ordinary agent) a private-owned one. |
@@ -1569,7 +1569,12 @@ mission row (`open_items`, `needs_you`, `conversations`, `milestones`,
 deliberate: the close marker is the **user's own record** of an override
 they performed themselves, and `#num` is already one shared namespace
 across items, missions, and milestones — a number on its own identifies
-nothing a caller could then read.
+nothing a caller could then read. `GET /missions?since=` is the same kind
+of exception: it still matches the STORED (unsieved) `updated_at`, so a
+hidden milestone can make a mission match a filtered caller's `?since` —
+but `since` only says *something changed*, never what or in what order
+(the row returned, and the list's own sort order, are both fully sieved),
+so nothing beyond a bare "changed" bit crosses the boundary.
 
 **Markers written across the boundary carry numbers only.** A mission born
 in a private device's conversation can still reach a **public** one: only

@@ -12,10 +12,12 @@ export const CONVOS_MAX = 200
 
 const now = () => Date.now()
 
-// idem_key is internal (same stance as rowToItem).
+// idem_key is internal (same stance as rowToItem). `sieved_last_milestone_at`
+// (fix round 3, B2) is a sort key countsSql computes for listMissions' ORDER
+// BY — never part of the wire shape.
 export function missionRow(row) {
   if (!row) return null
-  const { idem_key: _idemKey, ...rest } = row
+  const { idem_key: _idemKey, sieved_last_milestone_at: _sievedLastMilestoneAt, ...rest } = row
   const out = { ...rest, closed_over_open_items: Number(rest.closed_over_open_items || 0) }
   for (const k of ['open_items', 'needs_you', 'conversations', 'milestones']) if (k in out) out[k] = Number(out[k])
   if ('last_milestone_json' in out) {
@@ -74,7 +76,9 @@ function countsSql(excludePrivateOwned) {
     (SELECT COUNT(*) FROM conversations c WHERE c.mission_id = m.id ${convoSieve}) AS conversations,
     (SELECT COUNT(*) FROM milestones l WHERE l.mission_id = m.id ${milestoneSieve}) AS milestones,
     (SELECT json_object('num', l.num, 'title', l.title, 'kind', l.kind, 'created_at', l.created_at)
-       FROM milestones l WHERE l.mission_id = m.id ${milestoneSieve} ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS last_milestone_json
+       FROM milestones l WHERE l.mission_id = m.id ${milestoneSieve} ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS last_milestone_json,
+    (SELECT l.created_at FROM milestones l WHERE l.mission_id = m.id ${milestoneSieve}
+       ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS sieved_last_milestone_at
   `
 }
 
@@ -104,13 +108,17 @@ export function getMission(db, userId, idOrNum, { excludePrivateOwned = false } 
 }
 
 // Whenever a conversation GAINS a mission its unassigned items follow it.
-export function repointItems(db, userId, convoId, missionId) {
-  db.prepare('UPDATE items SET mission_id=? WHERE user_id=? AND origin_convo_id=? AND mission_id IS NULL').run(missionId, userId, convoId)
+// Fix round 3, B1: repointing an item must bump ITS OWN updated_at (the
+// caller's `ts`, not a fresh now() — one moment for the whole transaction)
+// or `GET /items?since=` and any client syncing on updated_at never learn
+// the item gained a mission after its conversation was created/joined.
+export function repointItems(db, userId, convoId, missionId, ts) {
+  db.prepare('UPDATE items SET mission_id=?, updated_at=? WHERE user_id=? AND origin_convo_id=? AND mission_id IS NULL').run(missionId, ts, userId, convoId)
 }
 
-function attachConversation(db, userId, convoId, missionId) {
+function attachConversation(db, userId, convoId, missionId, ts) {
   db.prepare('UPDATE conversations SET mission_id=? WHERE id=? AND owner_user_id=? AND mission_id IS NULL').run(missionId, convoId, userId)
-  repointItems(db, userId, convoId, missionId)
+  repointItems(db, userId, convoId, missionId, ts)
 }
 
 export function createMission(db, { userId, deviceId, createdBy, convoId, title, body = '', idemKey = null, excludePrivateOwned = false }) {
@@ -135,7 +143,7 @@ export function createMission(db, { userId, deviceId, createdBy, convoId, title,
       }
       throw err
     }
-    attachConversation(db, userId, convoId, id)
+    attachConversation(db, userId, convoId, id, ts)
     return { mission: getMission(db, userId, id, { excludePrivateOwned }), duplicate: false, existing: false }
   })()
 }
@@ -150,8 +158,18 @@ export function listMissions(db, userId, { state = null, since = null, excludePr
   // shared with getMission (see ORIGIN_SIEVE) so the list and the single-row
   // read can never disagree about what is hidden.
   if (excludePrivateOwned) where.push(ORIGIN_SIEVE)
+  // Fix round 3, B2: the stored m.last_milestone_at (and updated_at) are
+  // bumped by EVERY milestone, including one posted on a private-owned
+  // conversation the ordinary agent can't see — ordering on it would jump a
+  // mission to the top of a list that shows last_milestone: null,
+  // milestones: 0 for it, disagreeing with the row it displays. When
+  // excludePrivateOwned, order by the SIEVED last-milestone timestamp
+  // (sieved_last_milestone_at, the same sieved subquery countsSql uses for
+  // last_milestone) so the list order always agrees with what's shown. The
+  // owner/private-agent path is unchanged (stored column, unsieved).
+  const orderCol = excludePrivateOwned ? 'sieved_last_milestone_at' : 'm.last_milestone_at'
   const rows = db.prepare(`SELECT m.*, ${countsSql(excludePrivateOwned)} FROM missions m WHERE ${where.join(' AND ')}
-    ORDER BY (m.last_milestone_at IS NULL), m.last_milestone_at DESC, m.created_at DESC`).all(...args)
+    ORDER BY (${orderCol} IS NULL), ${orderCol} DESC, m.created_at DESC`).all(...args)
   return rows.map(missionRow)
 }
 
@@ -198,8 +216,9 @@ export function joinMission(db, { userId, missionId, convoId, excludePrivateOwne
     if (!convo.mission_id) {
       const n = db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE mission_id=?').get(m.id).n
       if (n >= CONVOS_MAX) throw new Error('too_many_convos')
-      attachConversation(db, userId, convoId, m.id)
-      db.prepare('UPDATE missions SET updated_at=? WHERE id=?').run(now(), m.id)
+      const ts = now()
+      attachConversation(db, userId, convoId, m.id, ts)
+      db.prepare('UPDATE missions SET updated_at=? WHERE id=?').run(ts, m.id)
     }
     return getMission(db, userId, m.id, { excludePrivateOwned })
   })()
