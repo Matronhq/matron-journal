@@ -12,6 +12,7 @@ import { searchMessages, indexableBody } from './search.js'
 import { serveHelp } from './help.js'
 import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
 import { handleItemsRoute } from './items-http.js'
+import { handleMissionsRoute } from './missions-http.js'
 import { json, readBody } from './http-body.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
@@ -239,6 +240,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       // its /items* paths never collide with the chain below, and inside the
       // outer try/catch so readBody's 400/413 map like every other route's.
       if (await handleItemsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
+      if (await handleMissionsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
       if (req.method === 'GET' && url.pathname === '/help') {
         // API discovery for agent callers (see src/help.js). Behind auth like
         // the rest of the device surface: it describes the API, and the

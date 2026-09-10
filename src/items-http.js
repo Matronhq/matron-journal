@@ -9,9 +9,10 @@ import { wakeConvoAgent } from './wake.js'
 import { json, readBody } from './http-body.js'
 import {
   ITEM_KINDS, AWAITING, RESOLUTIONS, BODY_MAX, validateItemFields, createItem, getItem, listItems, listComments,
-  updateItem, addComment, setAttachmentTranscript, closeItem, reopenItem, rerankItem,
+  updateItem, addComment, setAttachmentTranscript, closeItem, reopenItem, rerankItem, setItemMission,
 } from './items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE, ITEM_ACTIONS, itemFallbackText, FALLBACK_ACTIONS } from './items-marker.js'
+import { getMission } from './missions.js'
 
 const SORTS = ['rank', 'updated']
 const STATES = ['open', 'closed']
@@ -236,16 +237,29 @@ async function handlePatch(ctx, req, res, who, item) {
     if (body.awaiting !== null && item.state === 'closed') return conflict(res)
     fields.awaiting = body.awaiting
   }
-  if (Object.keys(fields).length === 0) return badRequest(res)
-  const updated = updateItem(db, { userId: who.userId, itemId: item.id, fields })
+  // Missions (spec 2026-09-10): explicit move or detach. `mission` is a
+  // mission id, "#num", a bare number, or null. Never inferred.
+  let missionTarget
+  if (body.mission !== undefined) {
+    if (body.mission === null) missionTarget = null
+    else {
+      const target = getMission(db, who.userId, body.mission)
+      if (!target) return notFound(res)
+      missionTarget = target.id
+    }
+  }
+  if (Object.keys(fields).length === 0 && body.mission === undefined) return badRequest(res)
+  const updated = Object.keys(fields).length === 0 ? item : updateItem(db, { userId: who.userId, itemId: item.id, fields })
   // Only reachable if the item vanished between the read and the write.
   if (!updated) return notFound(res)
+  let result = updated
+  if (missionTarget !== undefined || body.mission === null) result = setItemMission(db, { userId: who.userId, itemId: item.id, missionId: missionTarget ?? null })
   // Every mutating route appends a marker, this one included: a retitle or a
   // hand-moved `awaiting` is a change connected clients must see without
   // re-polling. It is a quiet action though — no wake, no push (see
   // ITEM_ACTIONS in items-marker.js).
-  emitMarker(ctx, who, { item: updated, action: 'updated' })
-  json(res, 200, { item: updated })
+  emitMarker(ctx, who, { item: result, action: 'updated' })
+  json(res, 200, { item: result })
   return true
 }
 

@@ -221,7 +221,15 @@ export function createMilestone(db, { userId, deviceId, createdBy, convoId, kind
       db.prepare(`INSERT INTO milestones(id,mission_id,user_id,num,kind,title,body,convo_id,seq,device_id,created_by,idem_key,created_at)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, mission.id, userId, num, kind, title, body, convoId, r.seq, deviceId, createdBy, idemKey, ts)
     } catch (err) {
-      if (idemKey && err.code === 'SQLITE_CONSTRAINT_UNIQUE') throw new Error('idem_key_conflict')
+      // Same stance as createMission's own INSERT-race catch: a concurrent
+      // request can win between the early idem_key check above and this
+      // INSERT. The loser reports the winner's row as a duplicate rather
+      // than surfacing a raw constraint error — untested for a genuine
+      // race (single-threaded better-sqlite3), same as createMission.
+      if (idemKey && err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+        const dup = db.prepare('SELECT id, mission_id FROM milestones WHERE user_id=? AND idem_key=?').get(userId, idemKey)
+        if (dup) return { milestone: milestoneRow(db.prepare('SELECT * FROM milestones WHERE id=?').get(dup.id)), mission: getMission(db, userId, dup.mission_id), duplicate: true }
+      }
       throw err
     }
     db.prepare('UPDATE missions SET last_milestone_at=?, updated_at=? WHERE id=?').run(ts, ts, mission.id)

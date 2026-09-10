@@ -269,6 +269,30 @@ test('closed mission rejects milestones; listMilestones is newest first per conv
   assert.throws(() => createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'progress', title: 'x', appendMarker }), /closed/)
 })
 
+test('createMilestone: an idem_key that wins the INSERT race (lands between the early check and the write) returns the winner as a duplicate, mirroring createMission', () => {
+  const db = seeded()
+  const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
+  const raceKey = '7:race'
+  // A real two-request race can't be forced in single-threaded better-sqlite3
+  // (same limitation createMission's own INSERT-race catch has — untested).
+  // Simulated deterministically instead: appendMarker runs INSIDE this
+  // transaction, after the early idem_key check has already passed, so
+  // inserting the "winning" row from inside it reproduces exactly what a
+  // second request landing in that window would leave behind — this
+  // transaction's own INSERT then collides on (user_id, idem_key).
+  const appendMarker = (payload) => {
+    db.prepare(`INSERT INTO milestones(id,mission_id,user_id,num,kind,title,body,convo_id,seq,device_id,created_by,idem_key,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run('ml_winner', m.id, 1, 999, 'progress', 'winner', '', 'c1', 42, 7, 'agent', raceKey, Date.now())
+    return append(db, { userId: 1, convoId: 'c1', sender: 'agent:dev-2', type: 'milestone', payload })
+  }
+  const r = createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'progress', title: 'loser', idemKey: raceKey, appendMarker })
+  assert.equal(r.duplicate, true)
+  assert.equal(r.milestone.id, 'ml_winner')
+  assert.equal(r.milestone.title, 'winner')
+  assert.equal(r.mission.id, m.id)
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM milestones').get().n, 1)
+})
+
 test('a spawned conversation inherits its parent mission at creation; a later upsert never changes it', () => {
   const db = seeded()
   const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
