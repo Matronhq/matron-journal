@@ -41,7 +41,7 @@ const byOf = (who) => (who.kind === 'agent' ? 'agent' : 'user')
 // a mission invisible to a GET must not become reachable as a move target,
 // or as an existence oracle, through a different route.
 export function visibleMission(db, who, idOrNum) {
-  const m = getMission(db, who.userId, idOrNum)
+  const m = getMission(db, who.userId, idOrNum, { excludePrivateOwned: filteredAgent(db, who) })
   if (!m) return null
   if (filteredAgent(db, who) && privateOwnedConvo(db, m.origin_convo_id)) return null
   return m
@@ -187,6 +187,10 @@ async function handleMilestoneCreate(ctx, req, res, who) {
     })
   } catch (err) {
     if (err.message === 'no_mission' || err.message === 'closed') return conflict(res, { blocked_by: err.message })
+    // TOCTOU: writableConvo just confirmed the convo, but it can vanish
+    // between that check and createMilestone's own read of it (same stance
+    // as handleCreate/handleJoin's no_convo catches above).
+    if (err.message === 'no_convo') return notFound(res)
     if (err.message === 'idem_key_conflict') {
       // The row that collided belongs to whichever request's INSERT won —
       // this one's own transaction (marker included) has already rolled

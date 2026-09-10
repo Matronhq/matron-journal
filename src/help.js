@@ -80,6 +80,14 @@ transcribing is the origin bridge's job); those 404 on refusal.
   \`{after}\`/\`{before}\` alone or together (a midpoint) → 200 \`{item}\`;
   409 on a closed item.
 
+## Missions & milestones
+
+Missions & milestones — POST /missions {title, body?, convo_id} (201 mission #num; 200 existing:true if the conversation already has one),
+GET /missions?state=open|closed, GET /missions/:id (mission, milestones newest first, open items, conversations), PATCH /missions/:id {title?, body?},
+POST /missions/:id/join {convo_id}, POST /missions/:id/close {summary} (409 blocked_by user_items|agent_items with the item list for agents),
+POST /milestones {convo_id, kind: user_input|progress, title, body?} (409 blocked_by no_mission until mission_start; the marker's seq is the anchor),
+GET /milestones?convo=<id>. PATCH /items/:id accepts mission: id|"#num"|null. Every POST takes Idempotency-Key.
+
 ## Media
 
 - \`POST /media\` (raw body, Content-Type captured) →

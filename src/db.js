@@ -276,7 +276,8 @@ export function openDb(path) {
   // the user's own client devices, which see everything unchanged. Enforced
   // at: GET /roster, GET /search, around_seq context reads, room ops (via
   // loadRoom) and invite targeting, read_marker, convo_upsert's
-  // private-owner takeover guard, GET /snapshot, and GET /metrics — see
+  // private-owner takeover guard, GET /snapshot, GET /metrics, and
+  // GET /missions, GET /missions/:id, GET /milestones — see
   // docs/protocol.md "Device privacy" for the full enumeration.
   // `private_pinned=1` records that
   // matron-admin owns the flag: the bridge's per-hello assertion is ignored

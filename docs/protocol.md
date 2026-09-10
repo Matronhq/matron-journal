@@ -1385,6 +1385,126 @@ unread-badge or conversation-preview-snippet effect — but the push body
 text still runs the event's payload through `snippetOf`, which formats an
 `❓`/`⚖`/`☐` glyph + `#num title` for the alert.
 
+## Missions & milestones
+
+Spec: `docs/superpowers/specs/2026-09-10-missions-milestones-design.md`.
+
+A mission (`missions`) is the human-readable record of one piece of work;
+milestones (`milestones`) are its checkpoints, each one a link back to
+where it happened. Both are journal-owned rows, scoped to the user, and
+share the **same per-user `#num` counter as items** — `#63` may be an
+item, a mission, or a milestone; there is no separate numbering space.
+Mounted like `src/items-http.js` (`src/missions-http.js`). `:id` accepts a
+mission id (`ms_…`) or a bare number, resolved within the caller's user.
+Device and agent credentials both work; `who.kind` drives the close rules
+below.
+
+There is **no auto-create**: `POST /milestones` on a conversation with no
+mission is refused — `409 {"error":"conflict","blocked_by":"no_mission"}`
+— rather than minting one implicitly. `mission_start` (`POST /missions`)
+is the only way in.
+
+### Routes (Bearer, either device kind)
+
+| Route | Body / query | Returns |
+|---|---|---|
+| `POST /missions` | `{title, body?, convo_id}` + optional `Idempotency-Key` | 201 `{mission}`. If `convo_id` already has a mission: 200 that mission with `existing: true`, nothing changed. Attaches the conversation, repoints its unassigned items. |
+| `GET /missions` | `?state=open\|closed` (omit = both), `?since=<ms>` | `{missions:[…]}` with per-row counts: `open_items`, `needs_you` (open and awaiting user), `conversations`, `milestones`, `last_milestone` `{num,title,kind,created_at}`. Sorted `last_milestone_at DESC NULLS LAST`, then `created_at DESC`. |
+| `GET /missions/:id` | | `{mission, milestones:[…] newest first, items:[open items], conversations:[{id,title,box,state}]}` |
+| `PATCH /missions/:id` | `{title?, body?}` | 200 `{mission}`; 409 `{blocked_by:'closed'}` |
+| `POST /missions/:id/join` | `{convo_id}` | 200 `{mission}`; 409 `{blocked_by:'other_mission'}` if the conversation already has a different mission, 409 `{blocked_by:'closed'}` if this one is closed. Repeat-joining the same mission is a no-op 200, not a conflict. Repoints the conversation's unassigned items. |
+| `POST /missions/:id/close` | `{summary}` | 200 `{mission}`, or 409 as in *Closing*, below. |
+| `POST /milestones` | `{convo_id, kind:'user_input'\|'progress', title, body?}` + optional `Idempotency-Key` | 201 `{milestone, mission}`; 409 `{blocked_by:'no_mission'}` if the conversation has none, 409 `{blocked_by:'closed'}` if its mission is closed; 502 `{error:'marker_append_failed'}` if the anchor marker couldn't be written (the milestone row is not created either — see "Marker events" below). |
+| `GET /milestones?convo=<id>` | | `{milestones:[…]}` newest first — the per-conversation view. |
+| `PATCH /items/:id` | gains `mission: id \| "#num" \| null` | existing route (see "Items" above); moves or detaches the item, gated by the same visibility rule as `GET /missions/:id` — a mission an ordinary agent can't see is never a reachable move target. Emits the item marker `updated`. |
+
+Errors follow the items routes: 400 on shape/limits, 404 on unknown or
+invisible (never 403 — a refusal must be indistinguishable from a mission
+that doesn't exist), 409 on state conflicts, 502 when the marker append
+fails.
+
+### Idempotency
+
+`POST /missions` and `POST /milestones` accept an `Idempotency-Key`
+header, namespaced `${device_id}:${key}` into `idem_key` — same
+convention as items. A header present but empty, too long, or non-string
+is 400 `bad_request`. A replay returns **200** with the existing row (even
+if the mission has since closed); a first write is **201**, and no second
+marker is ever emitted for a replay.
+
+### Closing
+
+`POST /missions/:id/close` behaves differently by caller kind. A client
+(`who.kind === 'client'`) close always succeeds over open items: it
+records `closed_over_open_items` (the count) and the marker's
+`open_item_nums` carries every item number that was still open at close
+time — a deliberate, visible override. An **agent** close is blocked by
+open items, checked in two tiers: any item still `awaiting: 'user'`
+blocks with `409 {"error":"conflict","blocked_by":"user_items","items":[{num,title}]}`
+(only the user can clear those); if none of those but other items are
+still open, `409 {"blocked_by":"agent_items","items":[…]}` — close each
+with a real resolution, or move it to the mission it belongs to
+(`PATCH /items/:id {mission}`). A hidden open item — on a private-owned
+conversation the calling agent can't see — still **blocks** the close (it
+exists and is open, whether or not this caller can see it), but the
+`items` array on the 409 is filtered to what the caller may actually see,
+so the response never names a private item or its title. Closing an
+already-closed mission is `409 {"blocked_by":"closed"}` regardless of
+caller kind.
+
+### Marker events
+
+Two new event types, written only by the journal from these routes.
+
+```json
+{ "type": "milestone",
+  "payload": { "milestone_id": "ml_…", "num": 63, "kind": "user_input",
+               "title": "Wired the journal migration", "body": "…",
+               "mission_id": "ms_…", "mission_num": 61, "mission_title": "Missions & milestones",
+               "by": "agent" } }
+```
+Appended to `convo_id`; **its own `seq` is the milestone's anchor**. It is
+the inline card and the jump target. The row and its marker are one write
+— the marker is appended *inside* the same transaction as the `milestones`
+INSERT, so if the append fails, nothing (not even the number) survives.
+
+```json
+{ "type": "mission",
+  "payload": { "mission_id": "ms_…", "num": 61, "title": "…",
+               "action": "created" | "joined" | "updated" | "closed",
+               "by": "user" | "agent",
+               "open_item_nums": [64, 70] } }        // only on a user-forced close
+```
+Appended to the conversation that performed the action (`created`/`joined`
+on that conversation; `updated`/`closed` on the origin conversation).
+Written **after** the mission's own transaction has committed, not inside
+it — a broadcast can never advertise a write that then rolls back, and a
+marker append that itself fails (e.g. the origin conversation vanished
+underneath it) is logged and swallowed; the mission write stands. Apps use
+it only as an invalidation signal; it renders as a small inline notice
+("🏁 Mission #61 closed").
+
+Neither type is publishable by an agent (not in `AGENT_PUBLISH_TYPES`); neither is
+a `MESSAGE_TYPES` entry; neither pushes. Both are pure navigation signals —
+`classify()` (`src/push.js`) returns `null` for `mission` and `milestone`
+unconditionally, and neither type affects an unread badge or a
+conversation-preview snippet.
+
+### Visibility
+
+Same one-caller predicate as items and `/search`: an ordinary
+(non-private) agent never sees a mission whose origin conversation is
+managed by a private device, nor a milestone posted from one — `GET
+/missions` and `GET /milestones` omit them, every other route 404s. A
+mission that spans conversations (via `join`) sieves per-conversation: a
+public mission's own `GET /missions/:id` and `GET /missions` counts
+(`conversations`, `milestones`, `last_milestone`) exclude any joined
+private-owned conversation's contribution for a filtered agent, matching
+the `milestones`/`items`/`conversations` arrays the same caller gets back
+— the summary row and the detail arrays can never disagree about what a
+filtered caller is allowed to see. A private agent caller, and any client
+device, see the unfiltered set.
+
 ## Device privacy
 
 (spec: `docs/superpowers/specs/2026-08-07-agent-visibility-privacy-design.md`.)
@@ -1433,13 +1553,13 @@ flag back to the next hello, without itself changing the value.
 `matron-admin device list` renders `private=yes|no`, with a `(pinned)` suffix
 when pinned.
 
-**The enforced surfaces — one caller rule, nine enforcement points.** Every
+**The enforced surfaces — one caller rule, ten enforcement points.** Every
 rule is conditioned on the identical predicate: filtering applies **only
 when the caller is an ordinary (non-private) agent**. `kind='client'`
 callers are never filtered, and a private agent caller is never filtered
 either — it is invisible, not blinded, so two private agents see each other
 and a private agent still gets the whole unfiltered roster/search/room set.
-The nine:
+The ten:
 
 - **`GET /roster`** — omits private agent devices and every top-level
   conversation whose `agent_device_id` is private.
@@ -1500,6 +1620,11 @@ The nine:
   this creates. Unlike every other surface in this list, this one is a
   **new, accepted** existence oracle rather than a byte-identical
   rejection — see "Byte-identical, deliberately" below.
+- **`GET /missions`, `GET /missions/:id`, `GET /milestones`** — same
+  predicate as `/roster`/`/search`; see "Missions & milestones" above for
+  the full behaviour (list omission, per-route 404, and the sieved
+  counts/`last_milestone` a spanning mission's summary and detail rows
+  agree on).
 - **`GET /snapshot`** — a differently-shaped rule of its own; see below.
 - **`GET /metrics`** — the `user.devices` list (`buildMetrics`,
   `src/metrics.js`) omits private devices for a filtered ordinary-agent

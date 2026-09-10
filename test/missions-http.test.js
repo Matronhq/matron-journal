@@ -4,6 +4,7 @@ import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import { pinDevicePrivate } from '../src/db.js'
+import { visibleMission } from '../src/missions-http.js'
 
 async function fleet(t) {
   const s = await startTestServer({})
@@ -245,4 +246,54 @@ test('forged publish of mission/milestone types is rejected; oversized bodies 40
   const big = await s.http('/missions', { method: 'POST', token: agent.token, body: { title: 'x', body: 'y'.repeat(40000), convo_id: 'c1' } })
   assert.equal(big.status, 400)
   assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM missions').get().n, 0)
+})
+
+// Task 7 re-review, extra 1: writableConvo confirms the conversation exists
+// right before createMilestone's own transaction re-reads it — a genuine
+// TOCTOU window if the row vanishes in between. Simulated deterministically
+// (no real concurrency needed): intercept db.prepare so the FIRST call to
+// createMilestone's own "does this convo exist" query deletes the row a
+// moment before it runs, reproducing the exact race the code comments
+// already describe for create/join without needing two overlapping requests.
+test('POST /milestones: convo deleted between the write-gate and the write (TOCTOU) maps no_convo to 404, never the generic 500', async (t) => {
+  const { s, agent } = await fleet(t)
+  const realPrepare = s.db.prepare.bind(s.db)
+  let armed = true
+  s.db.prepare = (sql) => {
+    if (armed && sql === 'SELECT mission_id FROM conversations WHERE id=? AND owner_user_id=?') {
+      armed = false
+      realPrepare('DELETE FROM conversations WHERE id=?').run('c1')
+    }
+    return realPrepare(sql)
+  }
+  let r
+  try { r = await post(s, agent.token, {}) } finally { s.db.prepare = realPrepare }
+  assert.equal(r.status, 404)
+  assert.deepEqual(r.json, { error: 'not_found' })
+})
+
+// Task 7 re-review, extra 2: visibleMission must hand back a row already
+// sieved for the caller — not just an id safe to reuse — so a future
+// consumer that serialises it directly (unlike today's two, which only read
+// .id) can never leak an ordinary agent's counts/last_milestone assembled
+// from a private-owned conversation it isn't allowed to see. Same fixture
+// shape as the "privacy sieve" test above (a public mission joined by a
+// private-owned conversation that then posts a milestone), but calls
+// visibleMission directly to pin the guarantee at its own source, not only
+// as observed through GET /missions/:id's separate missionDetail re-fetch.
+test('visibleMission returns sieved counts/last_milestone for an ordinary agent, not the raw row', async (t) => {
+  const { s, dan, agent } = await fleet(t)
+  const priv = createAgent(s.db, dan.id, 'private-box')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  upsertConversation(s.db, { id: 'secret2', ownerUserId: dan.id, title: 'S2', agentDeviceId: priv.deviceId })
+  const pub = (await start(s, agent.token, {})).json.mission
+  assert.equal((await s.http(`/missions/${pub.id}/join`, { method: 'POST', token: priv.token, body: { convo_id: 'secret2' } })).status, 200)
+  assert.equal((await post(s, priv.token, { convo_id: 'secret2', title: 'private step' })).status, 201)
+  const seenByOrdinaryAgent = visibleMission(s.db, { kind: 'agent', userId: dan.id, deviceId: agent.deviceId }, pub.id)
+  assert.equal(seenByOrdinaryAgent.milestones, 0)
+  assert.equal(seenByOrdinaryAgent.last_milestone, null)
+  assert.equal(seenByOrdinaryAgent.conversations, 1)
+  const seenByPrivateAgent = visibleMission(s.db, { kind: 'agent', userId: dan.id, deviceId: priv.deviceId }, pub.id)
+  assert.equal(seenByPrivateAgent.milestones, 1)
+  assert.equal(seenByPrivateAgent.last_milestone.title, 'private step')
 })
