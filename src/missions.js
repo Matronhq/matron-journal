@@ -3,6 +3,7 @@
 // as src/items.js: every recoverable failure is a tagged Error the HTTP
 // layer maps to one status; anything else is a bug and reaches the 500.
 import { nextNum, newId, BODY_MAX } from './items.js'
+import { milestoneMarkerPayload } from './missions-marker.js'
 
 export const MILESTONE_KINDS = ['user_input', 'progress']
 export const TITLE_MAX = 200
@@ -186,4 +187,50 @@ export function closeMission(db, { userId, missionId, by, summary }) {
       WHERE id=?`).run(summary, by, open.length, ts, ts, m.id)
     return { mission: getMission(db, userId, m.id), openItemNums: open.map((i) => i.num) }
   })()
+}
+
+// The milestone row and its marker are one write: appendMarker runs INSIDE
+// this transaction (append() is itself a sync better-sqlite3 transaction,
+// nested as a savepoint) and the returned seq is the row's anchor. If the
+// append throws, nothing — not even the number — survives.
+export function createMilestone(db, { userId, deviceId, createdBy, convoId, kind, title, body = '', idemKey = null, appendMarker }) {
+  return db.transaction(() => {
+    if (!MILESTONE_KINDS.includes(kind)) throw new Error('bad_kind')
+    if (idemKey) {
+      const dup = db.prepare('SELECT id, mission_id FROM milestones WHERE user_id=? AND idem_key=?').get(userId, idemKey)
+      if (dup) {
+        return { milestone: milestoneRow(db.prepare('SELECT * FROM milestones WHERE id=?').get(dup.id)), mission: getMission(db, userId, dup.mission_id), duplicate: true }
+      }
+    }
+    const convo = db.prepare('SELECT mission_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)
+    if (!convo) throw new Error('no_convo')
+    if (!convo.mission_id) throw new Error('no_mission')
+    const mission = getMission(db, userId, convo.mission_id)
+    if (mission.state === 'closed') throw new Error('closed')
+    const id = newId('ml')
+    const num = nextNum(db, userId)
+    const ts = now()
+    const milestone = { id, num, kind, title, body }
+    let r
+    try {
+      r = appendMarker(milestoneMarkerPayload({ milestone, mission, by: createdBy }))
+    } catch (err) {
+      const e = new Error('marker_append_failed'); e.cause = err; throw e
+    }
+    try {
+      db.prepare(`INSERT INTO milestones(id,mission_id,user_id,num,kind,title,body,convo_id,seq,device_id,created_by,idem_key,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, mission.id, userId, num, kind, title, body, convoId, r.seq, deviceId, createdBy, idemKey, ts)
+    } catch (err) {
+      if (idemKey && err.code === 'SQLITE_CONSTRAINT_UNIQUE') throw new Error('idem_key_conflict')
+      throw err
+    }
+    db.prepare('UPDATE missions SET last_milestone_at=?, updated_at=? WHERE id=?').run(ts, ts, mission.id)
+    return { milestone: milestoneRow({ ...milestone, mission_id: mission.id, convo_id: convoId, seq: r.seq, device_id: deviceId, created_by: createdBy, created_at: ts }), mission: getMission(db, userId, mission.id), duplicate: false, seq: r.seq, ts: r.ts }
+  })()
+}
+
+export function listMilestones(db, userId, { convoId, excludePrivateOwned = false }) {
+  const sieve = excludePrivateOwned ? `AND NOT ${PRIVATE_CONVO}` : ''
+  return db.prepare(`SELECT l.* FROM milestones l JOIN conversations c ON c.id = l.convo_id
+    WHERE l.user_id=? AND l.convo_id=? ${sieve} ORDER BY l.created_at DESC, l.seq DESC`).all(userId, convoId).map(milestoneRow)
 }

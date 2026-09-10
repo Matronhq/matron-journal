@@ -140,9 +140,15 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), sessionOutcome ?? null, summary ?? null, id)
   } else {
     const initialTitle = title || ''
+    // Missions (spec 2026-09-10): a spawned conversation inherits its
+    // parent's mission at creation. Set once here and never on the
+    // update path — same immutability as parent_convo_id.
+    const inheritedMission = parentConvoId
+      ? (db.prepare('SELECT mission_id FROM conversations WHERE id=? AND owner_user_id=?').get(parentConvoId, ownerUserId)?.mission_id ?? null)
+      : null
     db.prepare(
-      'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, created_at) VALUES(?,?,?,?,?,?,?,?,?)'
-    ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', Date.now())
+      'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, mission_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)'
+    ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', inheritedMission, Date.now())
     if (initialTitle || parentConvoId) metaChanged = true
   }
   const convo = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)

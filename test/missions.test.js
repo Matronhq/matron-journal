@@ -11,6 +11,7 @@ import { append, broadcastAppended, snippetOf, upsertConversation } from '../src
 import { classify } from '../src/push.js'
 import {
   createMission, getMission, listMissions, missionDetail, updateMission, joinMission, closeMission, repointItems, validateMissionFields,
+  createMilestone, listMilestones,
 } from '../src/missions.js'
 import { createItem } from '../src/items.js'
 
@@ -226,4 +227,55 @@ test('repointItems only moves items with no mission', () => {
   db.prepare('UPDATE items SET mission_id=? WHERE id=?').run('ms_other', it.id)
   repointItems(db, 1, 'c2', m.id)
   assert.equal(db.prepare('SELECT mission_id FROM items WHERE id=?').get(it.id).mission_id, 'ms_other')
+})
+
+test('createMilestone: marker appended inside the transaction, seq stored, mission activity bumped; no mission → no_mission and nothing written', () => {
+  const db = seeded()
+  const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
+  const appendMarker = (payload) => append(db, { userId: 1, convoId: 'c1', sender: 'agent:dev-2', type: 'milestone', payload })
+  const r = createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'user_input', title: 'Start', body: 'b', idemKey: '7:m1', appendMarker })
+  assert.equal(r.duplicate, false); assert.equal(r.milestone.num, 2); assert.equal(r.mission.id, m.id)
+  const ev = db.prepare("SELECT seq, payload FROM events WHERE type='milestone'").get()
+  assert.equal(ev.seq, r.milestone.seq)
+  assert.equal(JSON.parse(ev.payload).milestone_id, r.milestone.id)
+  assert.equal(getMission(db, 1, m.id).last_milestone_at, r.milestone.created_at)
+  assert.equal(getMission(db, 1, m.id).last_milestone.num, 2)
+  const again = createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'user_input', title: 'Start', idemKey: '7:m1', appendMarker })
+  assert.equal(again.duplicate, true); assert.equal(again.milestone.id, r.milestone.id)
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='milestone'").get().n, 1)
+  // c2 has no mission
+  assert.throws(() => createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c2', kind: 'progress', title: 'x', appendMarker }), /no_mission/)
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM milestones').get().n, 1)
+  assert.throws(() => createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'other', title: 'x', appendMarker }), /bad_kind/)
+})
+
+test('createMilestone: a failing marker append rolls the row back and surfaces marker_append_failed', () => {
+  const db = seeded()
+  createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' })
+  const boom = () => { throw new Error('disk on fire') }
+  assert.throws(() => createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'progress', title: 'x', appendMarker: boom }), /marker_append_failed/)
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM milestones').get().n, 0)
+  assert.equal(db.prepare('SELECT next_num FROM item_counters WHERE user_id=1').get().next_num, 2) // number allocation rolled back too
+})
+
+test('closed mission rejects milestones; listMilestones is newest first per conversation', () => {
+  const db = seeded()
+  const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
+  const appendMarker = (payload) => append(db, { userId: 1, convoId: 'c1', sender: 'agent:dev-2', type: 'milestone', payload })
+  createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'user_input', title: 'one', appendMarker })
+  createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'progress', title: 'two', appendMarker })
+  assert.deepEqual(listMilestones(db, 1, { convoId: 'c1' }).map((l) => l.title), ['two', 'one'])
+  closeMission(db, { userId: 1, missionId: m.id, by: 'agent', summary: 's' })
+  assert.throws(() => createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'progress', title: 'x', appendMarker }), /closed/)
+})
+
+test('a spawned conversation inherits its parent mission at creation; a later upsert never changes it', () => {
+  const db = seeded()
+  const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
+  upsertConversation(db, { id: 'child', ownerUserId: 1, title: 'kid', agentDeviceId: 7, parentConvoId: 'c1' })
+  assert.equal(db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('child').mission_id, m.id)
+  upsertConversation(db, { id: 'child', ownerUserId: 1, title: 'kid2' })
+  assert.equal(db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('child').mission_id, m.id)
+  upsertConversation(db, { id: 'orphan', ownerUserId: 1, title: 'o', agentDeviceId: 7, parentConvoId: 'c2' })
+  assert.equal(db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('orphan').mission_id, null)
 })
