@@ -93,9 +93,11 @@ milestone before \`POST /missions\` and you get 409 \`no_mission\`. A
 conversation joins a mission by starting one, by \`join\`, or by being
 spawned from a conversation that already has one (only if that mission is
 open, visible to you, and under 200 conversations — otherwise the child
-starts with none and can \`mission_start\` its own). Every POST here takes an optional
-\`Idempotency-Key\` (replay → 200, no second marker), and the mutating
-ones append a \`mission\` or \`milestone\` marker event you cannot
+starts with none and can \`mission_start\` its own). \`POST /missions\` and
+\`POST /milestones\` take an optional \`Idempotency-Key\` (replay → 200, no
+second marker); join and close are naturally repeatable (a repeat join of the
+same mission is a 200 no-op, a repeat close is 409 \`already_closed\`). The
+mutating routes append a \`mission\` or \`milestone\` marker event you cannot
 \`publish\` yourself.
 
 - \`POST /missions\` \`{title, body?, convo_id}\` → 201 \`{mission}\`
