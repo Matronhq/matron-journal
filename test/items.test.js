@@ -14,7 +14,7 @@ test('schema: items, item_comments, item_counters exist with the expected column
   assert.deepEqual(cols('items'), [
     'id', 'user_id', 'num', 'kind', 'state', 'resolution', 'awaiting', 'rank', 'title', 'body',
     'labels', 'links', 'supersedes', 'origin_convo_id', 'origin_device_id', 'created_by',
-    'idem_key', 'created_at', 'updated_at', 'closed_at',
+    'idem_key', 'created_at', 'updated_at', 'closed_at', 'mission_id',
   ])
   assert.deepEqual(cols('item_comments'), [
     'id', 'item_id', 'user_id', 'author', 'device_id', 'kind', 'body', 'attachments', 'meta', 'idem_key', 'created_at',
