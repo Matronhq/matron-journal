@@ -104,6 +104,27 @@ test('close: agent blocked by user items then agent items (409 with the list); u
   assert.equal((await s.http(`/items/${tk.id}`, { token: client })).json.item.state, 'open')
 })
 
+test('close: a hidden open item on a private-owned conversation still blocks the close, but is absent from an ordinary agent\'s 409 items list', async (t) => {
+  const { s, dan, agent } = await fleet(t)
+  const priv = createAgent(s.db, dan.id, 'private-box')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  upsertConversation(s.db, { id: 'secret3', ownerUserId: dan.id, title: 'S3', agentDeviceId: priv.deviceId })
+  const m = (await start(s, agent.token, {})).json.mission
+  const joined = await s.http(`/missions/${m.id}/join`, { method: 'POST', token: priv.token, body: { convo_id: 'secret3' } })
+  assert.equal(joined.status, 200)
+  const hidden = (await s.http('/items', { method: 'POST', token: priv.token, body: { kind: 'task', title: 'Hidden task', convo_id: 'secret3' } })).json.item
+  assert.equal(hidden.mission_id, m.id)
+  const close = (token) => s.http(`/missions/${m.id}/close`, { method: 'POST', token, body: { summary: 's' } })
+  // Ordinary agent: still blocked (the hidden item exists and is open), but
+  // the 409 names nothing it can't see.
+  const asOrdinary = await close(agent.token)
+  assert.equal(asOrdinary.status, 409); assert.equal(asOrdinary.json.blocked_by, 'agent_items'); assert.deepEqual(asOrdinary.json.items, [])
+  // The private device itself is unfiltered and sees the real item.
+  const asPrivate = await close(priv.token)
+  assert.equal(asPrivate.status, 409); assert.equal(asPrivate.json.blocked_by, 'agent_items')
+  assert.deepEqual(asPrivate.json.items, [{ num: hidden.num, title: 'Hidden task' }])
+})
+
 test('join: attaches c2 and repoints its items; refuses a second mission for a convo; PATCH updates and emits the marker on the origin', async (t) => {
   const { s, agent, client } = await fleet(t)
   const m = (await start(s, agent.token, {})).json.mission
@@ -165,24 +186,63 @@ test('privacy sieve: an ordinary agent cannot see a mission born in a private co
   // an ordinary agent cannot start a mission in a private convo or post milestones there
   assert.equal((await start(s, agent.token, { convo_id: 'secret' })).status, 404)
   assert.equal((await post(s, agent.token, { convo_id: 'secret' })).status, 404)
+  // Critical 3: a mission invisible to GET /missions/:id must not be reachable
+  // as a PATCH /items/:id {mission} target either — same 404, no existence oracle.
+  const pubItem = (await item(s, agent.token, {})).json.item
+  assert.equal((await s.http(`/items/${pubItem.id}`, { method: 'PATCH', token: agent.token, body: { mission: m.id } })).status, 404)
+  assert.equal((await s.http(`/items/${pubItem.id}`, { method: 'PATCH', token: agent.token, body: { mission: `#${m.num}` } })).status, 404)
+  assert.equal((await s.http(`/items/${pubItem.id}`, { token: agent.token })).json.item.mission_id, null)
   // a public mission that a private convo joined: the private convo's milestones are filtered for the ordinary agent
   const pub = (await start(s, agent.token, {})).json.mission
   const firstJoin = await s.http(`/missions/${pub.id}/join`, { method: 'POST', token: priv.token, body: { convo_id: 'secret2' } })
   assert.equal(firstJoin.status, 200)
   // A repeat join of the same mission (secret2 is already attached to pub) is a no-op: 200, not 409.
   assert.equal((await s.http(`/missions/${pub.id}/join`, { method: 'POST', token: priv.token, body: { convo_id: 'secret2' } })).status, 200)
+  // Important #5 / Critical 1: post a milestone from the private convo, then
+  // read pub both as the ordinary agent (sieved) and as the client
+  // (unsieved) — the milestone, the counts AND last_milestone must all agree
+  // with the (sieved) arrays, not just the arrays on their own.
+  const hiddenMilestone = await post(s, priv.token, { convo_id: 'secret2', title: 'private step' })
+  assert.equal(hiddenMilestone.status, 201)
+  const detailAsAgent = await s.http(`/missions/${pub.id}`, { token: agent.token })
+  assert.equal(detailAsAgent.status, 200)
+  assert.equal(detailAsAgent.json.milestones.length, 0)
+  assert.equal(detailAsAgent.json.mission.milestones, 0)
+  assert.equal(detailAsAgent.json.mission.last_milestone, null)
+  assert.equal(detailAsAgent.json.mission.conversations, 1)
+  assert.equal(detailAsAgent.json.conversations.length, 1)
+  const listAsAgent = (await s.http('/missions', { token: agent.token })).json.missions.find((x) => x.id === pub.id)
+  assert.equal(listAsAgent.milestones, 0); assert.equal(listAsAgent.last_milestone, null); assert.equal(listAsAgent.conversations, 1)
+  const detailAsClient = await s.http(`/missions/${pub.id}`, { token: client })
+  assert.equal(detailAsClient.json.milestones.length, 1)
+  assert.equal(detailAsClient.json.mission.milestones, 1)
+  assert.equal(detailAsClient.json.mission.last_milestone.title, 'private step')
+  assert.equal(detailAsClient.json.mission.conversations, 2)
 })
 
-test('forged publish of mission/milestone types is rejected; oversized bodies 413 with nothing written', async (t) => {
+test('forged publish of mission/milestone types is rejected; oversized bodies 400 with nothing written', async (t) => {
   const { s, agent } = await fleet(t)
   const ws = await makeWsClient(s.base, { token: agent.token, cursor: null })
   await ws.waitFor((f) => f.op === 'hello_ok')
   ws.send({ op: 'publish', convo_id: 'c1', type: 'milestone', payload: { num: 1 } })
-  const bad = await ws.waitFor((f) => f.op === 'error' || f.error)
-  assert.match(JSON.stringify(bad), /bad_request/)
+  const badMilestone = await ws.waitFor((f) => f.op === 'error' || f.error)
+  assert.match(JSON.stringify(badMilestone), /bad_request/)
+  const before = ws.frames.length
+  ws.send({ op: 'publish', convo_id: 'c1', type: 'mission', payload: { action: 'created' } })
+  const badMission = await new Promise((resolve, reject) => {
+    const t0 = Date.now()
+    const iv = setInterval(() => {
+      const hit = ws.frames.slice(before).find((f) => f.op === 'error' || f.error)
+      if (hit) { clearInterval(iv); resolve(hit) }
+      else if (Date.now() - t0 > 2000) { clearInterval(iv); reject(new Error('waitFor timeout')) }
+    }, 10)
+  })
+  assert.match(JSON.stringify(badMission), /bad_request/)
   ws.close()
   assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type IN ('milestone','mission')").get().n, 0)
+  // Well under readBody's 1 MB / 413 cap — this is deterministically a
+  // validation 400 (BODY_MAX), not a transport-size 413.
   const big = await s.http('/missions', { method: 'POST', token: agent.token, body: { title: 'x', body: 'y'.repeat(40000), convo_id: 'c1' } })
-  assert.ok(big.status === 400 || big.status === 413)
+  assert.equal(big.status, 400)
   assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM missions').get().n, 0)
 })

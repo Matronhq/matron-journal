@@ -12,7 +12,8 @@ import {
   updateItem, addComment, setAttachmentTranscript, closeItem, reopenItem, rerankItem, setItemMission,
 } from './items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE, ITEM_ACTIONS, itemFallbackText, FALLBACK_ACTIONS } from './items-marker.js'
-import { getMission } from './missions.js'
+import { visibleMission } from './missions-http.js'
+import { filteredAgent, privateOwnedConvo } from './privacy.js'
 
 const SORTS = ['rank', 'updated']
 const STATES = ['open', 'closed']
@@ -56,14 +57,6 @@ function senderOf(db, who) {
   // The `user:` prefix is load-bearing (push.js's own-event rule, journal.js's
   // unread predicate), so it survives even the impossible missing-row case.
   return `user:${row ? row.name : who.userId}`
-}
-
-// Ordinary-agent predicate shared with /roster, /search, /snapshot.
-const filteredAgent = (db, who) => who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
-
-const privateOwnedConvo = (db, convoId) => {
-  const owner = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id
-  return owner != null && isPrivateDevice(db, owner)
 }
 
 // Visible = owned by the caller's user and, for an ordinary agent, not born
@@ -238,12 +231,16 @@ async function handlePatch(ctx, req, res, who, item) {
     fields.awaiting = body.awaiting
   }
   // Missions (spec 2026-09-10): explicit move or detach. `mission` is a
-  // mission id, "#num", a bare number, or null. Never inferred.
+  // mission id, "#num", a bare number, or null. Never inferred. Gated by
+  // the same visibility sieve as GET /missions/:id — a mission an ordinary
+  // agent can't see must not be reachable as a move target either (it would
+  // both let the agent attach an item to hidden content and act as an
+  // existence oracle for private missions).
   let missionTarget
   if (body.mission !== undefined) {
     if (body.mission === null) missionTarget = null
     else {
-      const target = getMission(db, who.userId, body.mission)
+      const target = visibleMission(db, who, body.mission)
       if (!target) return notFound(res)
       missionTarget = target.id
     }
@@ -253,7 +250,7 @@ async function handlePatch(ctx, req, res, who, item) {
   // Only reachable if the item vanished between the read and the write.
   if (!updated) return notFound(res)
   let result = updated
-  if (missionTarget !== undefined || body.mission === null) result = setItemMission(db, { userId: who.userId, itemId: item.id, missionId: missionTarget ?? null })
+  if (missionTarget !== undefined) result = setItemMission(db, { userId: who.userId, itemId: item.id, missionId: missionTarget })
   // Every mutating route appends a marker, this one included: a retitle or a
   // hand-moved `awaiting` is a change connected clients must see without
   // re-polling. It is a quiet action though — no wake, no push (see

@@ -200,6 +200,55 @@ test('close: agent blocked by user items, then by agent items; user close record
   assert.throws(() => closeMission(db, { userId: 1, missionId: m.id, by: 'user', summary: 'x' }), /closed/)
 })
 
+test('closeMission: excludePrivateOwned filters the blocked-by items list, but a hidden open item still blocks the close', () => {
+  const db = seeded()
+  db.prepare("INSERT INTO devices(id, user_id, kind, name, token_hash, created_at, private) VALUES(9,1,'agent','priv-box','h2',0,1)").run()
+  upsertConversation(db, { id: 'c3', ownerUserId: 1, title: 'C3', agentDeviceId: 9 })
+  const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
+  joinMission(db, { userId: 1, missionId: m.id, convoId: 'c3' })
+  const hidden = createItem(db, { userId: 1, originDeviceId: 9, createdBy: 'agent', kind: 'task', title: 'Hidden', originConvoId: 'c3' }).item
+  assert.equal(hidden.mission_id, m.id); assert.equal(hidden.awaiting, 'agent')
+  // Sieved: the close is still blocked (a hidden open item exists), but the
+  // item named in the error is filtered away — an ordinary agent's 409 must
+  // never name a private item or its title.
+  let sieved
+  try { closeMission(db, { userId: 1, missionId: m.id, by: 'agent', summary: 's', excludePrivateOwned: true }) } catch (e) { sieved = e }
+  assert.equal(sieved.message, 'agent_items'); assert.deepEqual(sieved.items, [])
+  // Unsieved (a private agent, or an internal caller that never filters):
+  // the same item is named.
+  let full
+  try { closeMission(db, { userId: 1, missionId: m.id, by: 'agent', summary: 's', excludePrivateOwned: false }) } catch (e) { full = e }
+  assert.deepEqual(full.items, [{ num: hidden.num, title: 'Hidden' }])
+})
+
+test('getMission/listMissions/missionDetail: excludePrivateOwned sieves the COUNTS subqueries and last_milestone, not just missionDetail\'s own arrays', () => {
+  const db = seeded()
+  db.prepare("INSERT INTO devices(id, user_id, kind, name, token_hash, created_at, private) VALUES(9,1,'agent','priv-box','h2',0,1)").run()
+  upsertConversation(db, { id: 'c3', ownerUserId: 1, title: 'C3', agentDeviceId: 9 })
+  const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'Pub' }).mission
+  joinMission(db, { userId: 1, missionId: m.id, convoId: 'c3' })
+  createItem(db, { userId: 1, originDeviceId: 9, createdBy: 'agent', kind: 'task', title: 'Hidden item', originConvoId: 'c3' })
+  const appendMarker = (payload) => append(db, { userId: 1, convoId: 'c3', sender: 'agent:priv-box', type: 'milestone', payload })
+  createMilestone(db, { userId: 1, deviceId: 9, createdBy: 'agent', convoId: 'c3', kind: 'progress', title: 'hidden step', appendMarker })
+
+  const sieved = getMission(db, 1, m.id, { excludePrivateOwned: true })
+  assert.equal(sieved.conversations, 1); assert.equal(sieved.milestones, 0); assert.equal(sieved.open_items, 0)
+  assert.equal(sieved.last_milestone, null)
+  const full = getMission(db, 1, m.id, { excludePrivateOwned: false })
+  assert.equal(full.conversations, 2); assert.equal(full.milestones, 1); assert.equal(full.open_items, 1)
+  assert.equal(full.last_milestone.title, 'hidden step')
+
+  const listSieved = listMissions(db, 1, { excludePrivateOwned: true }).find((x) => x.id === m.id)
+  assert.equal(listSieved.milestones, 0); assert.equal(listSieved.conversations, 1); assert.equal(listSieved.last_milestone, null)
+  const listFull = listMissions(db, 1, { excludePrivateOwned: false }).find((x) => x.id === m.id)
+  assert.equal(listFull.milestones, 1); assert.equal(listFull.conversations, 2)
+
+  const detailSieved = missionDetail(db, 1, m.id, { excludePrivateOwned: true })
+  assert.equal(detailSieved.mission.milestones, 0); assert.equal(detailSieved.milestones.length, 0)
+  assert.equal(detailSieved.mission.conversations, detailSieved.conversations.length)
+  assert.equal(detailSieved.mission.open_items, detailSieved.items.length)
+})
+
 test('listMissions: counts, sort by last milestone then creation, state filter, since; detail lists open items awaiting-user first', () => {
   const db = seeded()
   const a = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
@@ -269,28 +318,42 @@ test('closed mission rejects milestones; listMilestones is newest first per conv
   assert.throws(() => createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'progress', title: 'x', appendMarker }), /closed/)
 })
 
-test('createMilestone: an idem_key that wins the INSERT race (lands between the early check and the write) returns the winner as a duplicate, mirroring createMission', () => {
+test('createMilestone: an idem_key collision at INSERT time throws idem_key_conflict and rolls the whole transaction back — no orphaned marker survives', () => {
   const db = seeded()
   const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
   const raceKey = '7:race'
-  // A real two-request race can't be forced in single-threaded better-sqlite3
-  // (same limitation createMission's own INSERT-race catch has — untested).
-  // Simulated deterministically instead: appendMarker runs INSIDE this
-  // transaction, after the early idem_key check has already passed, so
-  // inserting the "winning" row from inside it reproduces exactly what a
-  // second request landing in that window would leave behind — this
-  // transaction's own INSERT then collides on (user_id, idem_key).
+  // A genuine two-connection race (the early idem_key check passes, then a
+  // CONCURRENT request's row lands before this call's own INSERT) can't be
+  // forced here: better-sqlite3 is synchronous and single-writer, so two
+  // calls into createMilestone's db.transaction() can never interleave —
+  // one fully completes (or fully rolls back) before the next call even
+  // starts, and by the time a genuinely concurrent writer's committed row
+  // would be visible to this one at all, the EARLY check above would
+  // already have seen it too (same limitation createMission's own
+  // INSERT-race catch has — untested there for the same reason, per its
+  // own comment). Deterministic stand-in instead: land a colliding row via
+  // the appendMarker callback, which runs AFTER the early check but BEFORE
+  // this call's own INSERT — this reproduces the exact code path (a
+  // SQLITE_CONSTRAINT_UNIQUE at INSERT time) without claiming to reproduce
+  // true concurrency.
   const appendMarker = (payload) => {
     db.prepare(`INSERT INTO milestones(id,mission_id,user_id,num,kind,title,body,convo_id,seq,device_id,created_by,idem_key,created_at)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run('ml_winner', m.id, 1, 999, 'progress', 'winner', '', 'c1', 42, 7, 'agent', raceKey, Date.now())
     return append(db, { userId: 1, convoId: 'c1', sender: 'agent:dev-2', type: 'milestone', payload })
   }
-  const r = createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'progress', title: 'loser', idemKey: raceKey, appendMarker })
-  assert.equal(r.duplicate, true)
-  assert.equal(r.milestone.id, 'ml_winner')
-  assert.equal(r.milestone.title, 'winner')
-  assert.equal(r.mission.id, m.id)
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM milestones').get().n, 1)
+  assert.throws(
+    () => createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'progress', title: 'loser', idemKey: raceKey, appendMarker }),
+    /idem_key_conflict/,
+  )
+  // The whole transaction rolled back: not even the synthetic "winner" row
+  // (or its own marker event, appended via append() inside appendMarker)
+  // survives — let alone an orphaned marker for the loser's never-written
+  // id. This is exactly the property the earlier "return duplicate instead
+  // of throw" implementation broke: it committed a milestone event whose
+  // milestone_id pointed at a row that was never inserted (verified over
+  // real HTTP by the reviewer: one marker event, backing row absent).
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM milestones').get().n, 0)
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='milestone'").get().n, 0)
 })
 
 test('a spawned conversation inherits its parent mission at creation; a later upsert never changes it', () => {

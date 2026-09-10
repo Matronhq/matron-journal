@@ -47,23 +47,43 @@ export function validateMissionFields(body, { partial = false } = {}) {
   return { ok: true, value }
 }
 
-const COUNTS = `
-  (SELECT COUNT(*) FROM items i WHERE i.mission_id = m.id AND i.state='open') AS open_items,
-  (SELECT COUNT(*) FROM items i WHERE i.mission_id = m.id AND i.state='open' AND i.awaiting='user') AS needs_you,
-  (SELECT COUNT(*) FROM conversations c WHERE c.mission_id = m.id) AS conversations,
-  (SELECT COUNT(*) FROM milestones l WHERE l.mission_id = m.id) AS milestones,
-  (SELECT json_object('num', l.num, 'title', l.title, 'kind', l.kind, 'created_at', l.created_at)
-     FROM milestones l WHERE l.mission_id = m.id ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS last_milestone_json
-`
+// Review fix (Task 7, Critical 1): every COUNTS subquery must apply the same
+// private-owned-conversation sieve the caller's OWN arrays get in
+// missionDetail — otherwise an ordinary agent that can't see a private
+// convo's milestones/items/conversation still sees their totals (and the
+// last milestone's TITLE, in last_milestone_json) leak through the summary
+// row. Three separate joins because each subquery's own conversation
+// column differs: items by origin_convo_id, milestones by convo_id,
+// conversations are their own row.
+function countsSql(excludePrivateOwned) {
+  const itemSieve = excludePrivateOwned
+    ? `AND NOT EXISTS (SELECT 1 FROM conversations oc JOIN devices d ON d.id = oc.agent_device_id WHERE oc.id = i.origin_convo_id AND d.private = 1)`
+    : ''
+  const milestoneSieve = excludePrivateOwned
+    ? `AND NOT EXISTS (SELECT 1 FROM conversations mc JOIN devices d ON d.id = mc.agent_device_id WHERE mc.id = l.convo_id AND d.private = 1)`
+    : ''
+  const convoSieve = excludePrivateOwned
+    ? `AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.id = c.agent_device_id AND d.private = 1)`
+    : ''
+  return `
+    (SELECT COUNT(*) FROM items i WHERE i.mission_id = m.id AND i.state='open' ${itemSieve}) AS open_items,
+    (SELECT COUNT(*) FROM items i WHERE i.mission_id = m.id AND i.state='open' AND i.awaiting='user' ${itemSieve}) AS needs_you,
+    (SELECT COUNT(*) FROM conversations c WHERE c.mission_id = m.id ${convoSieve}) AS conversations,
+    (SELECT COUNT(*) FROM milestones l WHERE l.mission_id = m.id ${milestoneSieve}) AS milestones,
+    (SELECT json_object('num', l.num, 'title', l.title, 'kind', l.kind, 'created_at', l.created_at)
+       FROM milestones l WHERE l.mission_id = m.id ${milestoneSieve} ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS last_milestone_json
+  `
+}
 
-export function getMission(db, userId, idOrNum) {
+export function getMission(db, userId, idOrNum, { excludePrivateOwned = false } = {}) {
+  const counts = countsSql(excludePrivateOwned)
   let row
   if (typeof idOrNum === 'string' && idOrNum.startsWith('ms_')) {
-    row = db.prepare(`SELECT m.*, ${COUNTS} FROM missions m WHERE m.id=? AND m.user_id=?`).get(idOrNum, userId)
+    row = db.prepare(`SELECT m.*, ${counts} FROM missions m WHERE m.id=? AND m.user_id=?`).get(idOrNum, userId)
   } else {
     const n = Number(String(idOrNum).replace(/^#/, ''))
     if (!Number.isInteger(n) || n < 1) return null
-    row = db.prepare(`SELECT m.*, ${COUNTS} FROM missions m WHERE m.num=? AND m.user_id=?`).get(n, userId)
+    row = db.prepare(`SELECT m.*, ${counts} FROM missions m WHERE m.num=? AND m.user_id=?`).get(n, userId)
   }
   return missionRow(row)
 }
@@ -78,15 +98,15 @@ function attachConversation(db, userId, convoId, missionId) {
   repointItems(db, userId, convoId, missionId)
 }
 
-export function createMission(db, { userId, deviceId, createdBy, convoId, title, body = '', idemKey = null }) {
+export function createMission(db, { userId, deviceId, createdBy, convoId, title, body = '', idemKey = null, excludePrivateOwned = false }) {
   return db.transaction(() => {
     if (idemKey) {
       const dup = db.prepare('SELECT id FROM missions WHERE user_id=? AND idem_key=?').get(userId, idemKey)
-      if (dup) return { mission: getMission(db, userId, dup.id), duplicate: true, existing: false }
+      if (dup) return { mission: getMission(db, userId, dup.id, { excludePrivateOwned }), duplicate: true, existing: false }
     }
     const convo = db.prepare('SELECT mission_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)
     if (!convo) throw new Error('no_convo')
-    if (convo.mission_id) return { mission: getMission(db, userId, convo.mission_id), duplicate: false, existing: true }
+    if (convo.mission_id) return { mission: getMission(db, userId, convo.mission_id, { excludePrivateOwned }), duplicate: false, existing: true }
     const id = newId('ms')
     const num = nextNum(db, userId)
     const ts = now()
@@ -96,12 +116,12 @@ export function createMission(db, { userId, deviceId, createdBy, convoId, title,
     } catch (err) {
       if (idemKey && err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
         const dup = db.prepare('SELECT id FROM missions WHERE user_id=? AND idem_key=?').get(userId, idemKey)
-        if (dup) return { mission: getMission(db, userId, dup.id), duplicate: true, existing: false }
+        if (dup) return { mission: getMission(db, userId, dup.id, { excludePrivateOwned }), duplicate: true, existing: false }
       }
       throw err
     }
     attachConversation(db, userId, convoId, id)
-    return { mission: getMission(db, userId, id), duplicate: false, existing: false }
+    return { mission: getMission(db, userId, id, { excludePrivateOwned }), duplicate: false, existing: false }
   })()
 }
 
@@ -116,7 +136,7 @@ export function listMissions(db, userId, { state = null, since = null, excludePr
     where.push(`NOT EXISTS (SELECT 1 FROM conversations cv JOIN devices d ON d.id = cv.agent_device_id
       WHERE cv.id = m.origin_convo_id AND d.private = 1)`)
   }
-  const rows = db.prepare(`SELECT m.*, ${COUNTS} FROM missions m WHERE ${where.join(' AND ')}
+  const rows = db.prepare(`SELECT m.*, ${countsSql(excludePrivateOwned)} FROM missions m WHERE ${where.join(' AND ')}
     ORDER BY (m.last_milestone_at IS NULL), m.last_milestone_at DESC, m.created_at DESC`).all(...args)
   return rows.map(missionRow)
 }
@@ -124,7 +144,7 @@ export function listMissions(db, userId, { state = null, since = null, excludePr
 const PRIVATE_CONVO = `EXISTS (SELECT 1 FROM devices d WHERE d.id = c.agent_device_id AND d.private = 1)`
 
 export function missionDetail(db, userId, missionId, { excludePrivateOwned = false } = {}) {
-  const mission = getMission(db, userId, missionId)
+  const mission = getMission(db, userId, missionId, { excludePrivateOwned })
   if (!mission) return null
   const sieve = excludePrivateOwned ? `AND NOT ${PRIVATE_CONVO}` : ''
   const milestones = db.prepare(`SELECT l.* FROM milestones l JOIN conversations c ON c.id = l.convo_id
@@ -139,7 +159,7 @@ export function missionDetail(db, userId, missionId, { excludePrivateOwned = fal
   return { mission, milestones, items, conversations }
 }
 
-export function updateMission(db, { userId, missionId, fields }) {
+export function updateMission(db, { userId, missionId, fields, excludePrivateOwned = false }) {
   return db.transaction(() => {
     const cur = db.prepare('SELECT state FROM missions WHERE id=? AND user_id=?').get(missionId, userId)
     if (!cur) return null
@@ -149,11 +169,11 @@ export function updateMission(db, { userId, missionId, fields }) {
     if (fields.body !== undefined) { sets.push('body=?'); args.push(fields.body) }
     sets.push('updated_at=?'); args.push(now())
     db.prepare(`UPDATE missions SET ${sets.join(', ')} WHERE id=? AND user_id=?`).run(...args, missionId, userId)
-    return getMission(db, userId, missionId)
+    return getMission(db, userId, missionId, { excludePrivateOwned })
   })()
 }
 
-export function joinMission(db, { userId, missionId, convoId }) {
+export function joinMission(db, { userId, missionId, convoId, excludePrivateOwned = false }) {
   return db.transaction(() => {
     const m = db.prepare('SELECT id, state FROM missions WHERE id=? AND user_id=?').get(missionId, userId)
     if (!m) throw new Error('no_mission')
@@ -167,25 +187,38 @@ export function joinMission(db, { userId, missionId, convoId }) {
       attachConversation(db, userId, convoId, m.id)
       db.prepare('UPDATE missions SET updated_at=? WHERE id=?').run(now(), m.id)
     }
-    return getMission(db, userId, m.id)
+    return getMission(db, userId, m.id, { excludePrivateOwned })
   })()
 }
 
-export function closeMission(db, { userId, missionId, by, summary }) {
+// Review fix (Task 7, Critical 2): a hidden open item (on a private-owned
+// conversation the caller can't see) still BLOCKS the close — it exists and
+// is open, whether or not this caller can see it — but the `items` array on
+// the thrown error is filtered to what the caller may actually see, so an
+// ordinary agent's 409 never names a private item or its title.
+// `by === 'agent'` covers both an ordinary and a private agent; only the
+// ordinary one passes excludePrivateOwned true.
+export function closeMission(db, { userId, missionId, by, summary, excludePrivateOwned = false }) {
   return db.transaction(() => {
     const m = db.prepare('SELECT id, state FROM missions WHERE id=? AND user_id=?').get(missionId, userId)
     if (!m) throw new Error('no_mission')
     if (m.state === 'closed') throw new Error('closed')
-    const open = db.prepare(`SELECT num, title, awaiting FROM items WHERE mission_id=? AND state='open' ORDER BY num`).all(m.id)
+    const open = db.prepare(`
+      SELECT i.num, i.title, i.awaiting,
+        EXISTS (SELECT 1 FROM conversations oc JOIN devices d ON d.id = oc.agent_device_id
+                WHERE oc.id = i.origin_convo_id AND d.private = 1) AS is_private
+      FROM items i WHERE i.mission_id=? AND i.state='open' ORDER BY i.num
+    `).all(m.id)
+    const visible = (i) => !excludePrivateOwned || !i.is_private
     if (by === 'agent') {
-      const user = open.filter((i) => i.awaiting === 'user').map(({ num, title }) => ({ num, title }))
-      if (user.length) { const e = new Error('user_items'); e.items = user; throw e }
-      if (open.length) { const e = new Error('agent_items'); e.items = open.map(({ num, title }) => ({ num, title })); throw e }
+      const user = open.filter((i) => i.awaiting === 'user')
+      if (user.length) { const e = new Error('user_items'); e.items = user.filter(visible).map(({ num, title }) => ({ num, title })); throw e }
+      if (open.length) { const e = new Error('agent_items'); e.items = open.filter(visible).map(({ num, title }) => ({ num, title })); throw e }
     }
     const ts = now()
     db.prepare(`UPDATE missions SET state='closed', close_summary=?, closed_by=?, closed_over_open_items=?, closed_at=?, updated_at=?
       WHERE id=?`).run(summary, by, open.length, ts, ts, m.id)
-    return { mission: getMission(db, userId, m.id), openItemNums: open.map((i) => i.num) }
+    return { mission: getMission(db, userId, m.id, { excludePrivateOwned }), openItemNums: open.map((i) => i.num) }
   })()
 }
 
@@ -193,13 +226,13 @@ export function closeMission(db, { userId, missionId, by, summary }) {
 // this transaction (append() is itself a sync better-sqlite3 transaction,
 // nested as a savepoint) and the returned seq is the row's anchor. If the
 // append throws, nothing — not even the number — survives.
-export function createMilestone(db, { userId, deviceId, createdBy, convoId, kind, title, body = '', idemKey = null, appendMarker }) {
+export function createMilestone(db, { userId, deviceId, createdBy, convoId, kind, title, body = '', idemKey = null, appendMarker, excludePrivateOwned = false }) {
   return db.transaction(() => {
     if (!MILESTONE_KINDS.includes(kind)) throw new Error('bad_kind')
     if (idemKey) {
       const dup = db.prepare('SELECT id, mission_id FROM milestones WHERE user_id=? AND idem_key=?').get(userId, idemKey)
       if (dup) {
-        return { milestone: milestoneRow(db.prepare('SELECT * FROM milestones WHERE id=?').get(dup.id)), mission: getMission(db, userId, dup.mission_id), duplicate: true }
+        return { milestone: milestoneRow(db.prepare('SELECT * FROM milestones WHERE id=?').get(dup.id)), mission: getMission(db, userId, dup.mission_id, { excludePrivateOwned }), duplicate: true }
       }
     }
     const convo = db.prepare('SELECT mission_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)
@@ -221,19 +254,22 @@ export function createMilestone(db, { userId, deviceId, createdBy, convoId, kind
       db.prepare(`INSERT INTO milestones(id,mission_id,user_id,num,kind,title,body,convo_id,seq,device_id,created_by,idem_key,created_at)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, mission.id, userId, num, kind, title, body, convoId, r.seq, deviceId, createdBy, idemKey, ts)
     } catch (err) {
-      // Same stance as createMission's own INSERT-race catch: a concurrent
-      // request can win between the early idem_key check above and this
-      // INSERT. The loser reports the winner's row as a duplicate rather
-      // than surfacing a raw constraint error — untested for a genuine
-      // race (single-threaded better-sqlite3), same as createMission.
-      if (idemKey && err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
-        const dup = db.prepare('SELECT id, mission_id FROM milestones WHERE user_id=? AND idem_key=?').get(userId, idemKey)
-        if (dup) return { milestone: milestoneRow(db.prepare('SELECT * FROM milestones WHERE id=?').get(dup.id)), mission: getMission(db, userId, dup.mission_id), duplicate: true }
-      }
-      throw err
+      // Review fix (Task 7, Important #4): the marker was appended INSIDE
+      // this transaction (its seq is the row's anchor — see the comment
+      // above), so a colliding idem_key at INSERT time must roll the WHOLE
+      // transaction back, marker included. Returning a "duplicate" here
+      // instead (the previous fix) committed a milestone event whose
+      // milestone_id pointed at a row that was never written — verified
+      // over real HTTP by the reviewer (one marker event, backing row
+      // absent). The caller (missions-http.js) recovers by re-querying the
+      // winner's row AFTER this transaction has rolled back, exactly the
+      // way createMission's INSERT-race catch already recovers a mission —
+      // but that recovery cannot safely live inside this transaction, only
+      // after it.
+      throw err.code === 'SQLITE_CONSTRAINT_UNIQUE' && idemKey ? new Error('idem_key_conflict') : err
     }
     db.prepare('UPDATE missions SET last_milestone_at=?, updated_at=? WHERE id=?').run(ts, ts, mission.id)
-    return { milestone: milestoneRow({ ...milestone, mission_id: mission.id, convo_id: convoId, seq: r.seq, device_id: deviceId, created_by: createdBy, created_at: ts }), mission: getMission(db, userId, mission.id), duplicate: false, seq: r.seq, ts: r.ts }
+    return { milestone: milestoneRow({ ...milestone, mission_id: mission.id, convo_id: convoId, seq: r.seq, device_id: deviceId, created_by: createdBy, created_at: ts }), mission: getMission(db, userId, mission.id, { excludePrivateOwned }), duplicate: false, seq: r.seq, ts: r.ts }
   })()
 }
 

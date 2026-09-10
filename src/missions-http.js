@@ -9,9 +9,10 @@ import { json, readBody } from './http-body.js'
 import { BODY_MAX } from './items.js'
 import {
   MILESTONE_KINDS, TITLE_MAX, validateMissionFields, createMission, getMission, listMissions, missionDetail,
-  updateMission, joinMission, closeMission, createMilestone, listMilestones,
+  updateMission, joinMission, closeMission, createMilestone, listMilestones, milestoneRow,
 } from './missions.js'
-import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE, missionMarkerPayload } from './missions-marker.js'
+import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE, missionMarkerPayload, milestoneMarkerPayload } from './missions-marker.js'
+import { filteredAgent, privateOwnedConvo } from './privacy.js'
 
 const STATES = ['open', 'closed']
 const IDEM_KEY_MAX = 128
@@ -20,13 +21,6 @@ const badRequest = (res) => { json(res, 400, { error: 'bad_request' }); return t
 const notFound = (res) => { json(res, 404, { error: 'not_found' }); return true }
 const conflict = (res, extra = {}) => { json(res, 409, { error: 'conflict', ...extra }); return true }
 
-// Same shape as items-http.js (module-private there; duplicated on purpose
-// so the two surfaces never share a hidden coupling).
-const filteredAgent = (db, who) => who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
-const privateOwnedConvo = (db, convoId) => {
-  const owner = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id
-  return owner != null && isPrivateDevice(db, owner)
-}
 const idemKeyOf = (req, who) => {
   const k = req.headers['idempotency-key']
   if (k === undefined) return null
@@ -41,8 +35,12 @@ function senderOf(db, who) {
 const byOf = (who) => (who.kind === 'agent' ? 'agent' : 'user')
 
 // Visible = owned by the caller's user and, for an ordinary agent, not born
-// in a private device's conversation. Same 404 for every failure.
-function visibleMission(db, who, idOrNum) {
+// in a private device's conversation. Same 404 for every failure. Exported
+// (Task 7 review, Critical 3) so items-http.js's PATCH /items/:id {mission}
+// gates a move target through the exact same rule GET /missions/:id uses —
+// a mission invisible to a GET must not become reachable as a move target,
+// or as an existence oracle, through a different route.
+export function visibleMission(db, who, idOrNum) {
   const m = getMission(db, who.userId, idOrNum)
   if (!m) return null
   if (filteredAgent(db, who) && privateOwnedConvo(db, m.origin_convo_id)) return null
@@ -79,10 +77,18 @@ async function handleCreate(ctx, req, res, who) {
   const idemKey = idemKeyOf(req, who)
   if (idemKey === undefined) return badRequest(res)
   if (!writableConvo(db, who, body.convo_id)) return notFound(res)
-  const out = createMission(db, {
-    userId: who.userId, deviceId: who.deviceId, createdBy: byOf(who), convoId: body.convo_id,
-    title: v.value.title, body: v.value.body ?? '', idemKey,
-  })
+  let out
+  try {
+    out = createMission(db, {
+      userId: who.userId, deviceId: who.deviceId, createdBy: byOf(who), convoId: body.convo_id,
+      title: v.value.title, body: v.value.body ?? '', idemKey, excludePrivateOwned: filteredAgent(db, who),
+    })
+  } catch (err) {
+    // TOCTOU: writableConvo just confirmed the convo, but it can vanish
+    // between that check and this write (never a real 500).
+    if (err.message === 'no_convo') return notFound(res)
+    throw err
+  }
   if (out.existing) { json(res, 200, { mission: out.mission, existing: true }); return true }
   if (out.duplicate) { json(res, 200, { mission: out.mission }); return true }
   emitMissionMarker(ctx, who, { mission: out.mission, action: 'created', convoId: body.convo_id })
@@ -109,8 +115,9 @@ async function handlePatch(ctx, req, res, who, mission) {
   const v = validateMissionFields(body, { partial: true })
   if (!v.ok || Object.keys(v.value).length === 0) return badRequest(res)
   let updated
-  try { updated = updateMission(db, { userId: who.userId, missionId: mission.id, fields: v.value }) }
-  catch (err) { if (err.message === 'closed') return conflict(res, { blocked_by: 'closed' }); throw err }
+  try {
+    updated = updateMission(db, { userId: who.userId, missionId: mission.id, fields: v.value, excludePrivateOwned: filteredAgent(db, who) })
+  } catch (err) { if (err.message === 'closed') return conflict(res, { blocked_by: 'closed' }); throw err }
   if (!updated) return notFound(res)
   emitMissionMarker(ctx, who, { mission: updated, action: 'updated', convoId: updated.origin_convo_id })
   json(res, 200, { mission: updated })
@@ -123,10 +130,14 @@ async function handleJoin(ctx, req, res, who, mission) {
   if (!writableConvo(db, who, body.convo_id)) return notFound(res)
   const already = db.prepare('SELECT mission_id FROM conversations WHERE id=?').get(body.convo_id)?.mission_id
   let joined
-  try { joined = joinMission(db, { userId: who.userId, missionId: mission.id, convoId: body.convo_id }) }
-  catch (err) {
+  try {
+    joined = joinMission(db, { userId: who.userId, missionId: mission.id, convoId: body.convo_id, excludePrivateOwned: filteredAgent(db, who) })
+  } catch (err) {
     if (err.message === 'closed' || err.message === 'other_mission') return conflict(res, { blocked_by: err.message })
     if (err.message === 'too_many_convos') return badRequest(res)
+    // TOCTOU: the mission/convo were confirmed a moment ago (visibleMission,
+    // writableConvo) but either can vanish before this write.
+    if (err.message === 'no_mission' || err.message === 'no_convo') return notFound(res)
     throw err
   }
   if (already !== joined.id) emitMissionMarker(ctx, who, { mission: joined, action: 'joined', convoId: body.convo_id })
@@ -139,10 +150,13 @@ async function handleClose(ctx, req, res, who, mission) {
   const body = await readBody(req)
   if (typeof body.summary !== 'string' || !body.summary.trim() || Buffer.byteLength(body.summary, 'utf8') > BODY_MAX) return badRequest(res)
   let out
-  try { out = closeMission(db, { userId: who.userId, missionId: mission.id, by: byOf(who), summary: body.summary }) }
-  catch (err) {
+  try {
+    out = closeMission(db, { userId: who.userId, missionId: mission.id, by: byOf(who), summary: body.summary, excludePrivateOwned: filteredAgent(db, who) })
+  } catch (err) {
     if (err.message === 'closed') return conflict(res, { blocked_by: 'closed' })
     if (err.message === 'user_items' || err.message === 'agent_items') return conflict(res, { blocked_by: err.message, items: err.items })
+    // TOCTOU: the mission existed at visibleMission a moment ago.
+    if (err.message === 'no_mission') return notFound(res)
     throw err
   }
   emitMissionMarker(ctx, who, {
@@ -156,7 +170,6 @@ async function handleClose(ctx, req, res, who, mission) {
 async function handleMilestoneCreate(ctx, req, res, who) {
   const { db, hub } = ctx
   const body = await readBody(req)
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return badRequest(res)
   if (!MILESTONE_KINDS.includes(body.kind)) return badRequest(res)
   if (typeof body.title !== 'string' || !body.title.trim() || body.title.trim().length > TITLE_MAX) return badRequest(res)
   if (body.body !== undefined && (typeof body.body !== 'string' || Buffer.byteLength(body.body, 'utf8') > BODY_MAX)) return badRequest(res)
@@ -164,16 +177,32 @@ async function handleMilestoneCreate(ctx, req, res, who) {
   if (idemKey === undefined) return badRequest(res)
   if (!writableConvo(db, who, body.convo_id)) return notFound(res)
   const sender = senderOf(db, who)
+  const excludePrivateOwned = filteredAgent(db, who)
   let out
   try {
     out = createMilestone(db, {
       userId: who.userId, deviceId: who.deviceId, createdBy: byOf(who), convoId: body.convo_id,
-      kind: body.kind, title: body.title.trim(), body: body.body ?? '', idemKey,
+      kind: body.kind, title: body.title.trim(), body: body.body ?? '', idemKey, excludePrivateOwned,
       appendMarker: (payload) => append(db, { userId: who.userId, convoId: body.convo_id, sender, type: MILESTONE_EVENT_TYPE, payload }),
     })
   } catch (err) {
     if (err.message === 'no_mission' || err.message === 'closed') return conflict(res, { blocked_by: err.message })
-    if (err.message === 'idem_key_conflict') return conflict(res, { blocked_by: 'idem_key' })
+    if (err.message === 'idem_key_conflict') {
+      // The row that collided belongs to whichever request's INSERT won —
+      // this one's own transaction (marker included) has already rolled
+      // back. Re-query the winner OUTSIDE any transaction and answer
+      // exactly like an ordinary replay: 200, never a marker-less 409 (see
+      // missions.js's createMilestone for why this can't be recovered
+      // inside the transaction that just lost).
+      const dup = db.prepare('SELECT id, mission_id FROM milestones WHERE user_id=? AND idem_key=?').get(who.userId, idemKey)
+      if (dup) {
+        const milestone = milestoneRow(db.prepare('SELECT * FROM milestones WHERE id=?').get(dup.id))
+        const mission = getMission(db, who.userId, dup.mission_id, { excludePrivateOwned })
+        json(res, 200, { milestone, mission })
+        return true
+      }
+      throw err
+    }
     if (err.message === 'marker_append_failed') {
       console.error('missions: milestone marker append failed — milestone not created', err.cause)
       json(res, 502, { error: 'marker_append_failed' }); return true
@@ -181,12 +210,14 @@ async function handleMilestoneCreate(ctx, req, res, who) {
     throw err
   }
   if (out.duplicate) { json(res, 200, { milestone: out.milestone, mission: out.mission }); return true }
-  // Broadcast only now: the marker committed with the row.
+  // Broadcast only now: the marker committed with the row. Built with
+  // milestoneMarkerPayload — the same function that shaped the STORED
+  // marker inside missions.js's transaction — so the live frame and the
+  // persisted event can never drift apart from hand-copied keys.
   try {
     broadcastAppended(db, hub, {
       userId: who.userId, convoId: body.convo_id, seq: out.seq, ts: out.ts, sender, type: MILESTONE_EVENT_TYPE,
-      payload: { milestone_id: out.milestone.id, num: out.milestone.num, kind: out.milestone.kind, title: out.milestone.title, body: out.milestone.body,
-        mission_id: out.mission.id, mission_num: out.mission.num, mission_title: out.mission.title, by: byOf(who) },
+      payload: milestoneMarkerPayload({ milestone: out.milestone, mission: out.mission, by: byOf(who) }),
     })
   } catch (err) { console.error('missions: milestone broadcast failed (row and marker already committed)', err) }
   json(res, 201, { milestone: out.milestone, mission: out.mission })
