@@ -9,6 +9,10 @@ import { nextNum, newId } from '../src/items.js'
 import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE, MISSION_ACTIONS, milestoneMarkerPayload, missionMarkerPayload } from '../src/missions-marker.js'
 import { append, broadcastAppended, snippetOf, upsertConversation } from '../src/journal.js'
 import { classify } from '../src/push.js'
+import {
+  createMission, getMission, listMissions, missionDetail, updateMission, joinMission, closeMission, repointItems, validateMissionFields,
+} from '../src/missions.js'
+import { createItem } from '../src/items.js'
 
 test('schema: missions and milestones exist with the expected columns; mission_id on conversations and items', () => {
   const db = openDb(':memory:')
@@ -119,4 +123,107 @@ test('broadcastAppended fans the already-committed event with journal targeting'
   assert.equal(frames.length, 1)
   assert.equal(frames[0].frame.kind, 'journal'); assert.equal(frames[0].frame.seq, r.seq); assert.equal(frames[0].frame.type, 'milestone')
   assert.equal(frames[0].targets, null)  // no agent owner recorded → every agent
+})
+
+function seeded() {
+  const db = openDb(':memory:')
+  db.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+  db.prepare("INSERT INTO devices(id, user_id, kind, name, token_hash, created_at) VALUES(7,1,'agent','dev-2','h',0)").run()
+  upsertConversation(db, { id: 'c1', ownerUserId: 1, title: 'C1', agentDeviceId: 7 })
+  upsertConversation(db, { id: 'c2', ownerUserId: 1, title: 'C2', agentDeviceId: 7 })
+  return db
+}
+
+test('createMission: numbers from the shared pool, attaches the convo, repoints its items, replays are idempotent', () => {
+  const db = seeded()
+  const { item } = createItem(db, { userId: 1, originDeviceId: 7, createdBy: 'agent', kind: 'task', title: 'T', originConvoId: 'c1' })
+  assert.equal(item.num, 1); assert.equal(item.mission_id, null)
+  const r = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'M', body: 'goal', idemKey: '7:k1' })
+  assert.equal(r.duplicate, false); assert.equal(r.existing, false)
+  assert.equal(r.mission.num, 2); assert.equal(r.mission.state, 'open'); assert.equal(r.mission.origin_convo_id, 'c1')
+  assert.equal(db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('c1').mission_id, r.mission.id)
+  assert.equal(db.prepare('SELECT mission_id FROM items WHERE id=?').get(item.id).mission_id, r.mission.id)
+  // replay
+  const again = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'M', idemKey: '7:k1' })
+  assert.equal(again.duplicate, true); assert.equal(again.mission.id, r.mission.id)
+  // a second mission for the same convo: existing, nothing changed
+  const second = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'Other', idemKey: '7:k2' })
+  assert.equal(second.existing, true); assert.equal(second.mission.id, r.mission.id)
+  assert.equal(second.mission.title, 'M')
+  assert.equal(getMission(db, 1, '#2').id, r.mission.id); assert.equal(getMission(db, 1, r.mission.id).num, 2)
+  assert.equal(getMission(db, 1, 'ms_nope'), null); assert.equal(getMission(db, 2, 2), null)
+})
+
+test('validateMissionFields: title ≤200, body ≤32 KiB, partial allows either', () => {
+  assert.equal(validateMissionFields({ title: 'x'.repeat(201) }).ok, false)
+  assert.equal(validateMissionFields({ title: '' }).ok, false)
+  assert.equal(validateMissionFields({ title: 'ok', body: 'y'.repeat(32769) }).ok, false)
+  assert.deepEqual(validateMissionFields({ title: ' ok ', body: 'b' }).value, { title: 'ok', body: 'b' })
+  assert.equal(validateMissionFields({}, { partial: true }).ok, true)
+  assert.equal(validateMissionFields({}).ok, false)
+})
+
+test('join: attaches a second conversation and repoints its items; refuses a convo with another mission or a closed mission', () => {
+  const db = seeded()
+  const a = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
+  const { item } = createItem(db, { userId: 1, originDeviceId: 7, createdBy: 'agent', kind: 'task', title: 'T', originConvoId: 'c2' })
+  joinMission(db, { userId: 1, missionId: a.id, convoId: 'c2' })
+  assert.equal(db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('c2').mission_id, a.id)
+  assert.equal(db.prepare('SELECT mission_id FROM items WHERE id=?').get(item.id).mission_id, a.id)
+  upsertConversation(db, { id: 'c3', ownerUserId: 1, title: 'C3', agentDeviceId: 7 })
+  const b = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c3', title: 'B' }).mission
+  assert.throws(() => joinMission(db, { userId: 1, missionId: b.id, convoId: 'c2' }), /other_mission/)
+  closeMission(db, { userId: 1, missionId: b.id, by: 'agent', summary: 'done' })
+  upsertConversation(db, { id: 'c4', ownerUserId: 1, title: 'C4', agentDeviceId: 7 })
+  assert.throws(() => joinMission(db, { userId: 1, missionId: b.id, convoId: 'c4' }), /closed/)
+})
+
+test('close: agent blocked by user items, then by agent items; user close records the count; closed rejects update', () => {
+  const db = seeded()
+  const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
+  const q = createItem(db, { userId: 1, originDeviceId: 7, createdBy: 'agent', kind: 'question', title: 'Q?', originConvoId: 'c1' }).item
+  const t = createItem(db, { userId: 1, originDeviceId: 7, createdBy: 'agent', kind: 'task', title: 'T', originConvoId: 'c1' }).item
+  assert.equal(q.awaiting, 'user'); assert.equal(t.awaiting, 'agent')
+  let err
+  try { closeMission(db, { userId: 1, missionId: m.id, by: 'agent', summary: 's' }) } catch (e) { err = e }
+  assert.equal(err.message, 'user_items'); assert.deepEqual(err.items, [{ num: q.num, title: 'Q?' }])
+  db.prepare("UPDATE items SET state='closed', awaiting=NULL, resolution='answered' WHERE id=?").run(q.id)
+  try { closeMission(db, { userId: 1, missionId: m.id, by: 'agent', summary: 's' }) } catch (e) { err = e }
+  assert.equal(err.message, 'agent_items'); assert.deepEqual(err.items, [{ num: t.num, title: 'T' }])
+  const r = closeMission(db, { userId: 1, missionId: m.id, by: 'user', summary: 'forced' })
+  assert.equal(r.mission.state, 'closed'); assert.equal(r.mission.closed_by, 'user')
+  assert.equal(r.mission.closed_over_open_items, 1); assert.deepEqual(r.openItemNums, [t.num])
+  assert.equal(r.mission.close_summary, 'forced')
+  assert.equal(db.prepare('SELECT state, mission_id FROM items WHERE id=?').get(t.id).state, 'open')
+  assert.throws(() => updateMission(db, { userId: 1, missionId: m.id, fields: { title: 'x' } }), /closed/)
+  assert.throws(() => closeMission(db, { userId: 1, missionId: m.id, by: 'user', summary: 'x' }), /closed/)
+})
+
+test('listMissions: counts, sort by last milestone then creation, state filter, since; detail lists open items awaiting-user first', () => {
+  const db = seeded()
+  const a = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
+  const b = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c2', title: 'B' }).mission
+  createItem(db, { userId: 1, originDeviceId: 7, createdBy: 'agent', kind: 'question', title: 'Q', originConvoId: 'c1' })
+  createItem(db, { userId: 1, originDeviceId: 7, createdBy: 'agent', kind: 'task', title: 'T', originConvoId: 'c1' })
+  db.prepare('UPDATE missions SET last_milestone_at=? WHERE id=?').run(5000, b.id)
+  const rows = listMissions(db, 1, {})
+  assert.deepEqual(rows.map((m) => m.id), [b.id, a.id])
+  const ra = rows.find((m) => m.id === a.id)
+  assert.equal(ra.open_items, 2); assert.equal(ra.needs_you, 1); assert.equal(ra.conversations, 1); assert.equal(ra.milestones, 0)
+  assert.equal(ra.last_milestone, null)
+  assert.equal(listMissions(db, 1, { state: 'closed' }).length, 0)
+  assert.equal(listMissions(db, 1, { since: 4000 }).length, 2)  // updated_at ≥ since (both created now)
+  const d = missionDetail(db, 1, a.id, {})
+  assert.deepEqual(d.items.map((i) => i.title), ['Q', 'T'])
+  assert.deepEqual(d.conversations.map((c) => c.id), ['c1'])
+  assert.equal(d.conversations[0].title, 'C1'); assert.equal(d.conversations[0].box, 'dev-2'); assert.equal(d.conversations[0].state, 'running')
+})
+
+test('repointItems only moves items with no mission', () => {
+  const db = seeded()
+  const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
+  const it = createItem(db, { userId: 1, originDeviceId: 7, createdBy: 'agent', kind: 'task', title: 'T', originConvoId: 'c2' }).item
+  db.prepare('UPDATE items SET mission_id=? WHERE id=?').run('ms_other', it.id)
+  repointItems(db, 1, 'c2', m.id)
+  assert.equal(db.prepare('SELECT mission_id FROM items WHERE id=?').get(it.id).mission_id, 'ms_other')
 })
