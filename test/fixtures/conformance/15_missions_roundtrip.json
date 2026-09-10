@@ -25,7 +25,7 @@
     { "kind": "http", "method": "POST", "path": "/milestones", "token": { "$ref": "bridge.token" },
       "body": { "convo_id": "c1", "kind": "user_input", "title": "Dan asked for missions", "body": "the brief" },
       "expect": { "status": 201, "body": {
-        "milestone": { "id": { "$bind": "milestone_id" }, "mission_id": { "$ref": "mission_id" }, "num": 2, "kind": "user_input",
+        "milestone": { "id": { "$bind": "milestone_id" }, "mission_id": { "$ref": "mission_id" }, "user_id": { "$ref": "dan.user_id" }, "num": 2, "kind": "user_input",
           "title": "Dan asked for missions", "body": "the brief", "convo_id": "c1", "seq": { "$bind": "anchor_seq" },
           "device_id": { "$ref": "bridge.device_id" }, "created_by": "agent", "created_at": { "$type": "integer" } },
         "mission": { "$ignore": true } } } },

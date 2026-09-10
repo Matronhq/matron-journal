@@ -1,5 +1,8 @@
 import { authorize } from './auth.js'
+import { isPrivateDevice } from './db.js'
 import { indexableBody } from './search.js'
+import { CONVOS_MAX, getMission } from './missions.js'
+import { privateOwnedConvo } from './privacy.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { joinedAgentIds } from './participants.js'
 
@@ -90,6 +93,40 @@ export function snippetOf(type, payload) {
   return `[${type}]`
 }
 
+// Missions (spec 2026-09-10): the mission a spawned conversation inherits
+// from its parent at creation — or null. Inheritance is a way INTO a
+// mission, so `join`'s own gates apply to it (final review, I1), all three
+// of them:
+//
+//   1. the mission must be VISIBLE to the creator, through the very sieve
+//      `getMission` applies for `GET /missions/:id` and `join` — an
+//      ordinary (non-private) agent must not be attached to a mission it
+//      can never read or write, whether it reached it through a
+//      private-owned PARENT or through a public parent the user had joined
+//      to a private-ORIGIN mission (both are ways around the sieve, and
+//      the second is invisible from the parent row alone);
+//   2. the mission must be OPEN — a closed mission accepts no joins;
+//   3. it must hold fewer than CONVOS_MAX conversations — a spawn must
+//      never push a mission past a cap `join` refuses at.
+//
+// A child that fails any gate simply starts with no mission. A creator with
+// no device id (an internal or test upsert) counts as unfiltered, like
+// every other privacy predicate.
+function inheritableMission(db, { parentConvoId, ownerUserId, agentDeviceId }) {
+  const missionId = db.prepare('SELECT mission_id FROM conversations WHERE id=? AND owner_user_id=?')
+    .get(parentConvoId, ownerUserId)?.mission_id ?? null
+  if (!missionId) return null
+  const filtered = agentDeviceId != null && !isPrivateDevice(db, agentDeviceId)
+  if (filtered && privateOwnedConvo(db, parentConvoId)) return null
+  const mission = getMission(db, ownerUserId, missionId, { excludePrivateOwned: filtered })
+  if (!mission || mission.state !== 'open') return null
+  // The RAW count, never the row's `conversations` — that one is sieved for
+  // a filtered caller, and the cap is a limit on the table, not on what
+  // this creator happens to be allowed to see.
+  if (db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE mission_id=?').get(missionId).n >= CONVOS_MAX) return null
+  return missionId
+}
+
 // Returns the conversation row plus `metaChanged` and `prevSessionState`.
 // `metaChanged`: true when this call set metadata other devices must learn
 // live — an existing convo's title actually changed, a brand-new convo was
@@ -141,11 +178,10 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
   } else {
     const initialTitle = title || ''
     // Missions (spec 2026-09-10): a spawned conversation inherits its
-    // parent's mission at creation. Set once here and never on the
-    // update path — same immutability as parent_convo_id.
-    const inheritedMission = parentConvoId
-      ? (db.prepare('SELECT mission_id FROM conversations WHERE id=? AND owner_user_id=?').get(parentConvoId, ownerUserId)?.mission_id ?? null)
-      : null
+    // parent's mission at creation, subject to the gates in
+    // inheritableMission above. Set once here and never on the update path
+    // — same immutability as parent_convo_id.
+    const inheritedMission = parentConvoId ? inheritableMission(db, { parentConvoId, ownerUserId, agentDeviceId }) : null
     db.prepare(
       'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, mission_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)'
     ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', inheritedMission, Date.now())

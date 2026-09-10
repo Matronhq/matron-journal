@@ -24,9 +24,12 @@ export function missionRow(row) {
   return out
 }
 
+// Keeps `user_id`, like missionRow and the item shape do — only `idem_key`
+// is internal. (Final review minor: the three row shapes this feature
+// returns must agree on what a caller sees.)
 export function milestoneRow(row) {
   if (!row) return null
-  const { idem_key: _idemKey, user_id: _userId, ...rest } = row
+  const { idem_key: _idemKey, ...rest } = row
   return rest
 }
 
@@ -43,7 +46,6 @@ export function validateMissionFields(body, { partial = false } = {}) {
     if (typeof body.body !== 'string' || Buffer.byteLength(body.body, 'utf8') > BODY_MAX) return { ok: false }
     value.body = body.body
   }
-  if (partial && Object.keys(value).length === 0) return { ok: true, value }
   return { ok: true, value }
 }
 
@@ -75,15 +77,27 @@ function countsSql(excludePrivateOwned) {
   `
 }
 
+// Final review (C1): the ORIGIN sieve — a mission born in a private device's
+// conversation is invisible to an ordinary agent — belongs here, not only in
+// missions-http.js's visibleMission wrapper. Two routes resolve a mission
+// from a CONVERSATION rather than from an already-visible mission (POST
+// /missions on a convo that already has one, POST /milestones), and both
+// used to hand back (and, for milestones, write into) the unsieved row.
+// Same predicate listMissions applies to its WHERE clause; one caller
+// passing `excludePrivateOwned` now gets one consistent answer everywhere.
+const ORIGIN_SIEVE = `NOT EXISTS (SELECT 1 FROM conversations cv JOIN devices d ON d.id = cv.agent_device_id
+  WHERE cv.id = m.origin_convo_id AND d.private = 1)`
+
 export function getMission(db, userId, idOrNum, { excludePrivateOwned = false } = {}) {
   const counts = countsSql(excludePrivateOwned)
+  const sieve = excludePrivateOwned ? `AND ${ORIGIN_SIEVE}` : ''
   let row
   if (typeof idOrNum === 'string' && idOrNum.startsWith('ms_')) {
-    row = db.prepare(`SELECT m.*, ${counts} FROM missions m WHERE m.id=? AND m.user_id=?`).get(idOrNum, userId)
+    row = db.prepare(`SELECT m.*, ${counts} FROM missions m WHERE m.id=? AND m.user_id=? ${sieve}`).get(idOrNum, userId)
   } else {
     const n = Number(String(idOrNum).replace(/^#/, ''))
     if (!Number.isInteger(n) || n < 1) return null
-    row = db.prepare(`SELECT m.*, ${counts} FROM missions m WHERE m.num=? AND m.user_id=?`).get(n, userId)
+    row = db.prepare(`SELECT m.*, ${counts} FROM missions m WHERE m.num=? AND m.user_id=? ${sieve}`).get(n, userId)
   }
   return missionRow(row)
 }
@@ -130,12 +144,11 @@ export function listMissions(db, userId, { state = null, since = null, excludePr
   const args = [userId]
   if (state) { where.push('m.state = ?'); args.push(state) }
   if (since != null) { where.push('m.updated_at >= ?'); args.push(since) }
-  if (excludePrivateOwned) {
-    // Same shape as listItems' excludePrivateOwned: a mission born in a
-    // private device's conversation is invisible to an ordinary agent.
-    where.push(`NOT EXISTS (SELECT 1 FROM conversations cv JOIN devices d ON d.id = cv.agent_device_id
-      WHERE cv.id = m.origin_convo_id AND d.private = 1)`)
-  }
+  // Same shape as listItems' excludePrivateOwned: a mission born in a private
+  // device's conversation is invisible to an ordinary agent. One predicate,
+  // shared with getMission (see ORIGIN_SIEVE) so the list and the single-row
+  // read can never disagree about what is hidden.
+  if (excludePrivateOwned) where.push(ORIGIN_SIEVE)
   const rows = db.prepare(`SELECT m.*, ${countsSql(excludePrivateOwned)} FROM missions m WHERE ${where.join(' AND ')}
     ORDER BY (m.last_milestone_at IS NULL), m.last_milestone_at DESC, m.created_at DESC`).all(...args)
   return rows.map(missionRow)
@@ -232,13 +245,22 @@ export function createMilestone(db, { userId, deviceId, createdBy, convoId, kind
     if (idemKey) {
       const dup = db.prepare('SELECT id, mission_id FROM milestones WHERE user_id=? AND idem_key=?').get(userId, idemKey)
       if (dup) {
-        return { milestone: milestoneRow(db.prepare('SELECT * FROM milestones WHERE id=?').get(dup.id)), mission: getMission(db, userId, dup.mission_id, { excludePrivateOwned }), duplicate: true }
+        const mission = getMission(db, userId, dup.mission_id, { excludePrivateOwned })
+        // Hidden to this caller (C1) — answer exactly as a fresh post would,
+        // never a 200 carrying a null mission.
+        if (!mission) throw new Error('no_mission')
+        return { milestone: milestoneRow(db.prepare('SELECT * FROM milestones WHERE id=?').get(dup.id)), mission, duplicate: true }
       }
     }
     const convo = db.prepare('SELECT mission_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)
     if (!convo) throw new Error('no_convo')
     if (!convo.mission_id) throw new Error('no_mission')
-    const mission = getMission(db, userId, convo.mission_id)
+    // Resolved THROUGH the caller's own sieve (C1): a conversation the user
+    // joined to a private-origin mission must not become a write path into
+    // it for an ordinary agent. Refused before the marker append, so nothing
+    // — not the row, not the number, not the event — is written.
+    const mission = getMission(db, userId, convo.mission_id, { excludePrivateOwned })
+    if (!mission) throw new Error('no_mission')
     if (mission.state === 'closed') throw new Error('closed')
     const id = newId('ml')
     const num = nextNum(db, userId)
@@ -269,7 +291,7 @@ export function createMilestone(db, { userId, deviceId, createdBy, convoId, kind
       throw err.code === 'SQLITE_CONSTRAINT_UNIQUE' && idemKey ? new Error('idem_key_conflict') : err
     }
     db.prepare('UPDATE missions SET last_milestone_at=?, updated_at=? WHERE id=?').run(ts, ts, mission.id)
-    return { milestone: milestoneRow({ ...milestone, mission_id: mission.id, convo_id: convoId, seq: r.seq, device_id: deviceId, created_by: createdBy, created_at: ts }), mission: getMission(db, userId, mission.id, { excludePrivateOwned }), duplicate: false, seq: r.seq, ts: r.ts }
+    return { milestone: milestoneRow({ ...milestone, mission_id: mission.id, user_id: userId, convo_id: convoId, seq: r.seq, device_id: deviceId, created_by: createdBy, created_at: ts }), mission: getMission(db, userId, mission.id, { excludePrivateOwned }), duplicate: false, seq: r.seq, ts: r.ts }
   })()
 }
 

@@ -384,6 +384,31 @@ test('updateItem patches fields and awaiting; bumps updated_at', async () => {
   assert.equal(updateItem(db, { userId: 999, itemId: t.id, fields: { title: 'x' } }), null)
 })
 
+// Final review minor: PATCH /items/:id {title, mission} used to be two
+// statements in two transactions (updateItem + a since-deleted
+// setItemMission), so a half-applied patch was possible and the row was
+// stamped TWICE. `missionId` now rides along with the fields: one UPDATE,
+// one `updated_at` — pinned with an explicit `now` no second write could
+// share.
+test('updateItem: missionId rides along with the fields — one write, one updated_at; undefined leaves it alone, null detaches', async () => {
+  const { db, dan } = await seed()
+  db.prepare(`INSERT INTO missions(id,user_id,num,state,title,body,origin_convo_id,origin_device_id,created_by,created_at,updated_at)
+    VALUES('ms_a',?,900,'open','A','','c1',1,'agent',0,0)`).run(dan.id)
+  const t = createItem(db, base({ userId: dan.id, now: 5 })).item
+  assert.equal(t.mission_id, null)
+  const moved = updateItem(db, { userId: dan.id, itemId: t.id, fields: { title: 'New' }, missionId: 'ms_a', now: 7 })
+  assert.equal(moved.title, 'New'); assert.equal(moved.mission_id, 'ms_a'); assert.equal(moved.mission_num, 900)
+  assert.equal(moved.updated_at, 7)
+  assert.equal(db.prepare('SELECT updated_at FROM items WHERE id=?').get(t.id).updated_at, 7)
+  // Absent `missionId` must not silently detach.
+  const retitled = updateItem(db, { userId: dan.id, itemId: t.id, fields: { title: 'Again' }, now: 8 })
+  assert.equal(retitled.mission_id, 'ms_a')
+  // A mission-only patch (no fields) still bumps the stamp exactly once.
+  const detached = updateItem(db, { userId: dan.id, itemId: t.id, fields: {}, missionId: null, now: 9 })
+  assert.equal(detached.mission_id, null); assert.equal(detached.mission_num, null); assert.equal(detached.title, 'Again')
+  assert.equal(detached.updated_at, 9)
+})
+
 test('setAttachmentTranscript writes into exactly one attachment', async () => {
   const { db, dan } = await seed()
   const t = createItem(db, base({ userId: dan.id })).item

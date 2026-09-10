@@ -416,12 +416,18 @@ export function reopenItem(db, { userId, itemId, author, deviceId, comment = '',
   })()
 }
 
-export function updateItem(db, { userId, itemId, fields, now = Date.now() }) {
+// `missionId` (undefined = leave it alone, null = detach) rides along with
+// the ordinary fields so PATCH /items/:id {title, mission} is ONE transaction
+// and ONE `updated_at` bump — see items-http.js's handlePatch. It is an
+// explicit move or detach only; never inferred from an agent's tool
+// arguments (spec 2026-09-10: Items follow their conversation).
+export function updateItem(db, { userId, itemId, fields, missionId, now = Date.now() }) {
   return db.transaction(() => {
     const row = ownedRow(db, userId, itemId)
     if (!row) return null
     const sets = ['updated_at=?']
     const args = [now]
+    if (missionId !== undefined) { sets.push('mission_id=?'); args.push(missionId) }
     if (fields.title !== undefined) { sets.push('title=?'); args.push(fields.title) }
     if (fields.body !== undefined) { sets.push('body=?'); args.push(fields.body) }
     if (fields.labels !== undefined) { sets.push('labels=?'); args.push(JSON.stringify(fields.labels)) }
@@ -456,10 +462,3 @@ export function rerankItem(db, { userId, itemId, position, after, before, now = 
   })()
 }
 
-// PATCH /items/:id {mission}: explicit move or detach. Never inferred from
-// an agent's tool arguments beyond this route (spec: Items follow their
-// conversation).
-export function setItemMission(db, { userId, itemId, missionId }) {
-  db.prepare('UPDATE items SET mission_id=?, updated_at=? WHERE id=? AND user_id=?').run(missionId, Date.now(), itemId, userId)
-  return getItem(db, userId, itemId)
-}

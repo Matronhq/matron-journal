@@ -6,6 +6,7 @@ import { append, appendAndBroadcast, broadcastAppended } from './journal.js'
 import { isPrivateDevice } from './db.js'
 import { authorizeAgentWrite } from './auth.js'
 import { json, readBody } from './http-body.js'
+import { idemKeyOf, senderOf, badRequest, notFound, conflict } from './http-who.js'
 import { BODY_MAX } from './items.js'
 import {
   MILESTONE_KINDS, TITLE_MAX, validateMissionFields, createMission, getMission, listMissions, missionDetail,
@@ -15,23 +16,7 @@ import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE, missionMarkerPayload, milesto
 import { filteredAgent, privateOwnedConvo } from './privacy.js'
 
 const STATES = ['open', 'closed']
-const IDEM_KEY_MAX = 128
 
-const badRequest = (res) => { json(res, 400, { error: 'bad_request' }); return true }
-const notFound = (res) => { json(res, 404, { error: 'not_found' }); return true }
-const conflict = (res, extra = {}) => { json(res, 409, { error: 'conflict', ...extra }); return true }
-
-const idemKeyOf = (req, who) => {
-  const k = req.headers['idempotency-key']
-  if (k === undefined) return null
-  if (typeof k !== 'string' || !k || k.length > IDEM_KEY_MAX) return undefined
-  return `${who.deviceId}:${k}`
-}
-function senderOf(db, who) {
-  if (who.kind === 'agent') return `agent:${who.name}`
-  const row = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId)
-  return `user:${row ? row.name : who.userId}`
-}
 const byOf = (who) => (who.kind === 'agent' ? 'agent' : 'user')
 
 // Visible = owned by the caller's user and, for an ordinary agent, not born
@@ -40,12 +25,13 @@ const byOf = (who) => (who.kind === 'agent' ? 'agent' : 'user')
 // gates a move target through the exact same rule GET /missions/:id uses —
 // a mission invisible to a GET must not become reachable as a move target,
 // or as an existence oracle, through a different route.
-export function visibleMission(db, who, idOrNum) {
-  const m = getMission(db, who.userId, idOrNum, { excludePrivateOwned: filteredAgent(db, who) })
-  if (!m) return null
-  if (filteredAgent(db, who) && privateOwnedConvo(db, m.origin_convo_id)) return null
-  return m
-}
+//
+// A thin wrapper now (final review, C1): the origin sieve itself moved into
+// getMission, so the routes that resolve a mission from a CONVERSATION
+// instead of from an :id — POST /missions, POST /milestones — are gated by
+// the same rule without having to remember to call this.
+export const visibleMission = (db, who, idOrNum) =>
+  getMission(db, who.userId, idOrNum, { excludePrivateOwned: filteredAgent(db, who) })
 
 // The conversation gate for the two routes that target a conversation
 // rather than an already-visible mission (create, milestone, join).
@@ -89,6 +75,14 @@ async function handleCreate(ctx, req, res, who) {
     if (err.message === 'no_convo') return notFound(res)
     throw err
   }
+  // getMission sieved the row away: the conversation belongs to a mission
+  // this caller may not see (final review, C1). Same 404 as an unknown
+  // mission — answering "existing, but here is nothing" would still confirm
+  // that a hidden mission owns this conversation. Nothing was written on
+  // either of those two branches, so there is nothing to undo. (The freshly
+  // created branch cannot be null: writableConvo already refused a
+  // private-owned conversation for a filtered caller.)
+  if (!out.mission) return notFound(res)
   if (out.existing) { json(res, 200, { mission: out.mission, existing: true }); return true }
   if (out.duplicate) { json(res, 200, { mission: out.mission }); return true }
   emitMissionMarker(ctx, who, { mission: out.mission, action: 'created', convoId: body.convo_id })
@@ -140,6 +134,8 @@ async function handleJoin(ctx, req, res, who, mission) {
     if (err.message === 'no_mission' || err.message === 'no_convo') return notFound(res)
     throw err
   }
+  // Only reachable if the mission vanished inside its own transaction.
+  if (!joined) return notFound(res)
   if (already !== joined.id) emitMissionMarker(ctx, who, { mission: joined, action: 'joined', convoId: body.convo_id })
   json(res, 200, { mission: joined })
   return true
@@ -187,6 +183,10 @@ async function handleMilestoneCreate(ctx, req, res, who) {
     })
   } catch (err) {
     if (err.message === 'no_mission' || err.message === 'closed') return conflict(res, { blocked_by: err.message })
+    // Unreachable through this route (MILESTONE_KINDS is checked above) —
+    // kept mapped rather than dropped so the module's own guard, which other
+    // callers rely on, can never surface as a 500 if the two ever drift.
+    if (err.message === 'bad_kind') return badRequest(res)
     // TOCTOU: writableConvo just confirmed the convo, but it can vanish
     // between that check and createMilestone's own read of it (same stance
     // as handleCreate/handleJoin's no_convo catches above).
@@ -202,6 +202,8 @@ async function handleMilestoneCreate(ctx, req, res, who) {
       if (dup) {
         const milestone = milestoneRow(db.prepare('SELECT * FROM milestones WHERE id=?').get(dup.id))
         const mission = getMission(db, who.userId, dup.mission_id, { excludePrivateOwned })
+        // Sieved away (C1): answer as the fresh post would have.
+        if (!mission) return conflict(res, { blocked_by: 'no_mission' })
         json(res, 200, { milestone, mission })
         return true
       }
@@ -263,7 +265,11 @@ export async function handleMissionsRoute(ctx, req, res, url, who) {
   if (!mission) return notFound(res)
   if (!sub) {
     if (req.method === 'GET') {
-      json(res, 200, missionDetail(db, who.userId, mission.id, { excludePrivateOwned: filteredAgent(db, who) })); return true
+      // Only null if the mission vanished between the gate above and this
+      // re-read — 404 like any other missing mission, never `200 null`.
+      const detail = missionDetail(db, who.userId, mission.id, { excludePrivateOwned: filteredAgent(db, who) })
+      if (!detail) return notFound(res)
+      json(res, 200, detail); return true
     }
     if (req.method === 'PATCH') return handlePatch(ctx, req, res, who, mission)
     return false

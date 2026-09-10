@@ -11,7 +11,7 @@ import { append, broadcastAppended, snippetOf, upsertConversation } from '../src
 import { classify } from '../src/push.js'
 import {
   createMission, getMission, listMissions, missionDetail, updateMission, joinMission, closeMission, repointItems, validateMissionFields,
-  createMilestone, listMilestones,
+  createMilestone, listMilestones, CONVOS_MAX,
 } from '../src/missions.js'
 import { createItem } from '../src/items.js'
 
@@ -365,4 +365,139 @@ test('a spawned conversation inherits its parent mission at creation; a later up
   assert.equal(db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('child').mission_id, m.id)
   upsertConversation(db, { id: 'orphan', ownerUserId: 1, title: 'o', agentDeviceId: 7, parentConvoId: 'c2' })
   assert.equal(db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('orphan').mission_id, null)
+})
+
+// ---------------------------------------------------------------------------
+// Final review, C1: the origin sieve belongs INSIDE getMission, not only in
+// missions-http.js's visibleMission wrapper — every caller that resolves a
+// mission for a filtered agent (createMission's "existing", createMilestone's
+// own lookup) must get null, not the row.
+// ---------------------------------------------------------------------------
+function withPrivateBox() {
+  const db = seeded()
+  db.prepare("INSERT INTO devices(id, user_id, kind, name, token_hash, created_at, private) VALUES(9,1,'agent','priv-box','h2',0,1)").run()
+  upsertConversation(db, { id: 'secret', ownerUserId: 1, title: 'S', agentDeviceId: 9 })
+  return db
+}
+const missionOf = (db, convoId) => db.prepare('SELECT mission_id FROM conversations WHERE id=?').get(convoId).mission_id
+
+test('getMission: excludePrivateOwned hides a mission whose ORIGIN conversation is private-owned, by id and by #num', () => {
+  const db = withPrivateBox()
+  const m = createMission(db, { userId: 1, deviceId: 9, createdBy: 'agent', convoId: 'secret', title: 'Hidden', body: 'secret goal' }).mission
+  assert.equal(getMission(db, 1, m.id, { excludePrivateOwned: true }), null)
+  assert.equal(getMission(db, 1, `#${m.num}`, { excludePrivateOwned: true }), null)
+  assert.equal(getMission(db, 1, m.num, { excludePrivateOwned: true }), null)
+  assert.equal(getMission(db, 1, m.id, { excludePrivateOwned: false }).title, 'Hidden')
+  assert.equal(listMissions(db, 1, { excludePrivateOwned: true }).length, 0)
+  assert.equal(missionDetail(db, 1, m.id, { excludePrivateOwned: true }), null)
+})
+
+test('createMission: a filtered caller whose convo already belongs to a hidden mission gets no row back (no oracle)', () => {
+  const db = withPrivateBox()
+  const hidden = createMission(db, { userId: 1, deviceId: 9, createdBy: 'agent', convoId: 'secret', title: 'Hidden' }).mission
+  // The user joins an ordinary conversation to the hidden mission.
+  joinMission(db, { userId: 1, missionId: hidden.id, convoId: 'c1' })
+  const out = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'Mine', excludePrivateOwned: true })
+  assert.equal(out.existing, true)
+  assert.equal(out.mission, null)
+  // Unfiltered callers still see it.
+  const full = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'Mine' })
+  assert.equal(full.existing, true); assert.equal(full.mission.title, 'Hidden')
+})
+
+test('createMilestone: a filtered caller on a conversation whose mission is hidden gets no_mission and writes nothing', () => {
+  const db = withPrivateBox()
+  const hidden = createMission(db, { userId: 1, deviceId: 9, createdBy: 'agent', convoId: 'secret', title: 'Hidden' }).mission
+  joinMission(db, { userId: 1, missionId: hidden.id, convoId: 'c1' })
+  let appended = 0
+  const appendMarker = (payload) => { appended++; return append(db, { userId: 1, convoId: 'c1', sender: 'agent:dev-2', type: 'milestone', payload }) }
+  assert.throws(() => createMilestone(db, {
+    userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'progress', title: 'step', appendMarker, excludePrivateOwned: true,
+  }), /no_mission/)
+  assert.equal(appended, 0)
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM milestones').get().n, 0)
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='milestone'").get().n, 0)
+  // The private agent itself is unfiltered and may still post.
+  const ok = createMilestone(db, { userId: 1, deviceId: 9, createdBy: 'agent', convoId: 'secret', kind: 'progress', title: 'step', appendMarker: (p) => append(db, { userId: 1, convoId: 'secret', sender: 'agent:priv-box', type: 'milestone', payload: p }) })
+  assert.equal(ok.milestone.mission_id, hidden.id)
+})
+
+// ---------------------------------------------------------------------------
+// Final review, I1: inheritance is a way INTO a mission, so join's own gates
+// apply to it — an open mission, under the conversation cap, and never a
+// private-owned parent for an ordinary agent.
+// ---------------------------------------------------------------------------
+function packConvos(db, missionId, n, prefix) {
+  const ins = db.prepare("INSERT INTO conversations(id, owner_user_id, title, session_state, mission_id, created_at) VALUES(?,1,'x','running',?,0)")
+  for (let i = 0; i < n; i++) ins.run(`${prefix}${i}`, missionId)
+}
+
+test('inheritance gate: a closed parent mission is not inherited', () => {
+  const db = seeded()
+  const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
+  closeMission(db, { userId: 1, missionId: m.id, by: 'agent', summary: 'done' })
+  upsertConversation(db, { id: 'kid', ownerUserId: 1, title: 'k', agentDeviceId: 7, parentConvoId: 'c1' })
+  assert.equal(missionOf(db, 'kid'), null)
+})
+
+test('inheritance gate: a parent mission already at CONVOS_MAX is not inherited (the cap is never exceeded)', () => {
+  const db = seeded()
+  const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
+  packConvos(db, m.id, CONVOS_MAX - 1, 'pad')  // c1 + 199 = 200
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE mission_id=?').get(m.id).n, CONVOS_MAX)
+  upsertConversation(db, { id: 'kid', ownerUserId: 1, title: 'k', agentDeviceId: 7, parentConvoId: 'c1' })
+  assert.equal(missionOf(db, 'kid'), null)
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE mission_id=?').get(m.id).n, CONVOS_MAX)
+  // One under the cap still inherits.
+  db.prepare('UPDATE conversations SET mission_id=NULL WHERE id=?').run('pad0')
+  upsertConversation(db, { id: 'kid2', ownerUserId: 1, title: 'k', agentDeviceId: 7, parentConvoId: 'c1' })
+  assert.equal(missionOf(db, 'kid2'), m.id)
+})
+
+test('inheritance gate: a private-owned parent is not inherited by an ordinary agent, but is by a private one', () => {
+  const db = withPrivateBox()
+  const hidden = createMission(db, { userId: 1, deviceId: 9, createdBy: 'agent', convoId: 'secret', title: 'Hidden' }).mission
+  upsertConversation(db, { id: 'kid-ordinary', ownerUserId: 1, title: 'k', agentDeviceId: 7, parentConvoId: 'secret' })
+  assert.equal(missionOf(db, 'kid-ordinary'), null)
+  upsertConversation(db, { id: 'kid-private', ownerUserId: 1, title: 'k', agentDeviceId: 9, parentConvoId: 'secret' })
+  assert.equal(missionOf(db, 'kid-private'), hidden.id)
+})
+
+// The gate the parent row alone cannot show: the parent is an ORDINARY
+// conversation, so `privateOwnedConvo` says nothing — but the user joined
+// it to a mission whose ORIGIN is private, and that mission is invisible to
+// every ordinary agent on /missions, on join, and (C1) on POST /milestones.
+// Inheriting its id would attach a spawn to a mission it could never read,
+// write or even start its own inside.
+test('inheritance gate: a PUBLIC parent joined to a private-ORIGIN mission is not inherited by an ordinary agent', () => {
+  const db = withPrivateBox()
+  const hidden = createMission(db, { userId: 1, deviceId: 9, createdBy: 'agent', convoId: 'secret', title: 'Hidden' }).mission
+  joinMission(db, { userId: 1, missionId: hidden.id, convoId: 'c1' })  // the user can see both sides
+  assert.equal(missionOf(db, 'c1'), hidden.id)
+  upsertConversation(db, { id: 'kid-ordinary', ownerUserId: 1, title: 'k', agentDeviceId: 7, parentConvoId: 'c1' })
+  assert.equal(missionOf(db, 'kid-ordinary'), null)
+  // The private agent, and a plain client upsert with no device, still do.
+  upsertConversation(db, { id: 'kid-private', ownerUserId: 1, title: 'k', agentDeviceId: 9, parentConvoId: 'c1' })
+  assert.equal(missionOf(db, 'kid-private'), hidden.id)
+  upsertConversation(db, { id: 'kid-client', ownerUserId: 1, title: 'k', parentConvoId: 'c1' })
+  assert.equal(missionOf(db, 'kid-client'), hidden.id)
+})
+
+// Final review minor: milestoneRow keeps `user_id` (missionRow and the item
+// shape both do — only `idem_key` is internal). The freshly-created row is
+// assembled in memory rather than re-read, so its key set has to be pinned
+// against a row that came back out of the database.
+test('milestoneRow: create, replay and list all return the same key set, user_id included', () => {
+  const db = seeded()
+  createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' })
+  const appendMarker = (payload) => append(db, { userId: 1, convoId: 'c1', sender: 'agent:dev-2', type: 'milestone', payload })
+  const fresh = createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'progress', title: 'one', idemKey: '7:k', appendMarker }).milestone
+  const replayed = createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'progress', title: 'one', idemKey: '7:k', appendMarker }).milestone
+  const listed = listMilestones(db, 1, { convoId: 'c1' })[0]
+  const keys = (o) => Object.keys(o).sort()
+  assert.deepEqual(keys(fresh), ['convo_id', 'created_at', 'created_by', 'device_id', 'id', 'kind', 'mission_id', 'num', 'seq', 'title', 'user_id'].concat(['body']).sort())
+  assert.deepEqual(keys(replayed), keys(fresh))
+  assert.deepEqual(keys(listed), keys(fresh))
+  assert.equal(fresh.user_id, 1); assert.equal(listed.user_id, 1)
+  assert.equal('idem_key' in listed, false)
 })
