@@ -17,7 +17,7 @@ export const ATTACHMENTS_MAX = 20
 export const RANK_GAP = 1024
 export const RANK_EPSILON = 1e-6
 
-const newId = (prefix) => `${prefix}_${randomBytes(8).toString('hex')}`
+export const newId = (prefix) => `${prefix}_${randomBytes(8).toString('hex')}`
 
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
 
@@ -142,7 +142,7 @@ export function createDefaultAwaiting(kind, createdBy) {
 
 // Mirrors journal.js's user_seq counter idiom: one statement, atomic even
 // under concurrent callers on the same connection.
-function nextNum(db, userId) {
+export function nextNum(db, userId) {
   return db.prepare(
     'INSERT INTO item_counters(user_id, next_num) VALUES(?, 2) ON CONFLICT(user_id) DO UPDATE SET next_num = next_num + 1 RETURNING next_num - 1 AS num'
   ).get(userId).num

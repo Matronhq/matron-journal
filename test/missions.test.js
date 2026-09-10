@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import { openDb } from '../src/db.js'
+import { nextNum, newId } from '../src/items.js'
 
 test('schema: missions and milestones exist with the expected columns; mission_id on conversations and items', () => {
   const db = openDb(':memory:')
@@ -68,4 +69,14 @@ test('schema: opening an existing pre-missions database adds the guarded columns
     fs.rmSync(`${dbPath}-wal`, { force: true })
     fs.rmSync(`${dbPath}-shm`, { force: true })
   }
+})
+
+test('numbers: items, missions and milestones share one per-user counter', () => {
+  const db = openDb(':memory:')
+  db.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+  assert.equal(nextNum(db, 1), 1)
+  assert.equal(nextNum(db, 1), 2)
+  assert.equal(nextNum(db, 1), 3)
+  assert.match(newId('ms'), /^ms_[0-9a-f]{16}$/)
+  assert.match(newId('ml'), /^ml_[0-9a-f]{16}$/)
 })
