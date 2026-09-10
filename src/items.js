@@ -17,7 +17,7 @@ export const ATTACHMENTS_MAX = 20
 export const RANK_GAP = 1024
 export const RANK_EPSILON = 1e-6
 
-const newId = (prefix) => `${prefix}_${randomBytes(8).toString('hex')}`
+export const newId = (prefix) => `${prefix}_${randomBytes(8).toString('hex')}`
 
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
 
@@ -142,7 +142,7 @@ export function createDefaultAwaiting(kind, createdBy) {
 
 // Mirrors journal.js's user_seq counter idiom: one statement, atomic even
 // under concurrent callers on the same connection.
-function nextNum(db, userId) {
+export function nextNum(db, userId) {
   return db.prepare(
     'INSERT INTO item_counters(user_id, next_num) VALUES(?, 2) ON CONFLICT(user_id) DO UPDATE SET next_num = next_num + 1 RETURNING next_num - 1 AS num'
   ).get(userId).num
@@ -234,12 +234,13 @@ export function createItem(db, {
     const id = newId('it')
     const num = nextNum(db, userId)
     const aw = awaiting === undefined ? createDefaultAwaiting(kind, createdBy) : awaiting
+    const missionId = db.prepare('SELECT mission_id FROM conversations WHERE id=?').get(originConvoId)?.mission_id ?? null
     try {
       db.prepare(`INSERT INTO items(id,user_id,num,kind,state,resolution,awaiting,rank,title,body,labels,links,supersedes,
-        origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at)
-        VALUES(?,?,?,?,'open',NULL,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at,mission_id)
+        VALUES(?,?,?,?,'open',NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(id, userId, num, kind, aw, rank, title, body, JSON.stringify(labels), JSON.stringify(links), supersedes,
-          originConvoId, originDeviceId, createdBy, idemKey, now, now)
+          originConvoId, originDeviceId, createdBy, idemKey, now, now, missionId)
     } catch (err) {
       // A racing writer on another connection committed the same
       // (user_id, idem_key) between our lookup above and this INSERT. That
@@ -271,7 +272,8 @@ const DECORATE = `
   (SELECT COUNT(*) FROM item_comments c WHERE c.item_id = i.id AND c.kind='comment') AS comment_count,
   (SELECT MAX(created_at) FROM item_comments c WHERE c.item_id = i.id AND c.kind='comment') AS last_comment_at,
   (SELECT COALESCE(attachments,'[]') FROM item_comments c WHERE c.item_id = i.id AND c.kind='status' AND c.meta LIKE '%"role":"body"%' LIMIT 1) AS attachments,
-  EXISTS(SELECT 1 FROM item_comments c WHERE c.item_id = i.id AND c.attachments LIKE '%"mime":"image/%') AS has_image
+  EXISTS(SELECT 1 FROM item_comments c WHERE c.item_id = i.id AND c.attachments LIKE '%"mime":"image/%') AS has_image,
+  (SELECT num FROM missions m WHERE m.id = i.mission_id) AS mission_num
 `
 
 export function getItem(db, userId, idOrNum) {
@@ -414,12 +416,18 @@ export function reopenItem(db, { userId, itemId, author, deviceId, comment = '',
   })()
 }
 
-export function updateItem(db, { userId, itemId, fields, now = Date.now() }) {
+// `missionId` (undefined = leave it alone, null = detach) rides along with
+// the ordinary fields so PATCH /items/:id {title, mission} is ONE transaction
+// and ONE `updated_at` bump — see items-http.js's handlePatch. It is an
+// explicit move or detach only; never inferred from an agent's tool
+// arguments (spec 2026-09-10: Items follow their conversation).
+export function updateItem(db, { userId, itemId, fields, missionId, now = Date.now() }) {
   return db.transaction(() => {
     const row = ownedRow(db, userId, itemId)
     if (!row) return null
     const sets = ['updated_at=?']
     const args = [now]
+    if (missionId !== undefined) { sets.push('mission_id=?'); args.push(missionId) }
     if (fields.title !== undefined) { sets.push('title=?'); args.push(fields.title) }
     if (fields.body !== undefined) { sets.push('body=?'); args.push(fields.body) }
     if (fields.labels !== undefined) { sets.push('labels=?'); args.push(JSON.stringify(fields.labels)) }
@@ -453,3 +461,4 @@ export function rerankItem(db, { userId, itemId, position, after, before, now = 
     return getItem(db, userId, itemId)
   })()
 }
+

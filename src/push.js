@@ -65,6 +65,8 @@ export function classify(type, payload, sender, prevState) {
       && (p.action === 'created' || p.action === 'commented' || p.action === 'reopened')
     return needsUser ? { priority: 10, coalesce: false, kind: 'attention' } : null
   }
+  // Missions and milestones are navigation, never a push (spec: Marker events).
+  if (type === 'milestone' || type === 'mission') return null
   // Routine content: text/tool_output/diff/prompt_reply/file/image/etc. —
   // batched so a busy session is one updating notification, not hundreds.
   return { priority: 5, coalesce: true, kind: 'activity' }

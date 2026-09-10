@@ -7,17 +7,19 @@ import { isPrivateDevice } from './db.js'
 import { authorizeAgentWrite } from './auth.js'
 import { wakeConvoAgent } from './wake.js'
 import { json, readBody } from './http-body.js'
+import { idemKeyOf, senderOf, badRequest, notFound, conflict } from './http-who.js'
 import {
   ITEM_KINDS, AWAITING, RESOLUTIONS, BODY_MAX, validateItemFields, createItem, getItem, listItems, listComments,
   updateItem, addComment, setAttachmentTranscript, closeItem, reopenItem, rerankItem,
 } from './items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE, ITEM_ACTIONS, itemFallbackText, FALLBACK_ACTIONS } from './items-marker.js'
+import { visibleMission } from './missions-http.js'
+import { filteredAgent, privateOwnedConvo } from './privacy.js'
 
 const SORTS = ['rank', 'updated']
 const STATES = ['open', 'closed']
 const POSITIONS = ['top', 'bottom']
 const ID_MAX = 128
-const IDEM_KEY_MAX = 128
 // The item transitions in items.js signal their one recoverable failure by
 // throwing a tagged Error; each maps to exactly one of the existing error
 // shapes. Anything else is a bug and must reach http.js's 500.
@@ -26,43 +28,11 @@ const ERROR_STATUS = { bad_after_before: 400, bad_supersedes: 400, idem_key_conf
 // not something a sleeping box needs to be booted for.
 const WAKE_ACTIONS = new Set(['created', 'commented', 'closed', 'reopened'])
 
-const badRequest = (res) => { json(res, 400, { error: 'bad_request' }); return true }
-const notFound = (res) => { json(res, 404, { error: 'not_found' }); return true }
-const conflict = (res) => { json(res, 409, { error: 'conflict' }); return true }
-
 // Answers `true` when `err` is one of the known transition failures above.
 function answerKnownError(res, err) {
   const status = ERROR_STATUS[err && err.message]
   if (!status) return false
   return status === 409 ? conflict(res) : badRequest(res)
-}
-
-// null = header absent, undefined = header present but unusable (→ 400).
-// Never silently ignored: a client that believes its retry is being deduped
-// would otherwise create a second item and never know.
-const idemKeyOf = (req, who) => {
-  const k = req.headers['idempotency-key']
-  if (k === undefined) return null
-  if (typeof k !== 'string' || !k || k.length > IDEM_KEY_MAX) return undefined
-  // Scoped to the calling device: two devices replaying the same key are two
-  // different intents, and a key is only unique per (user_id, idem_key).
-  return `${who.deviceId}:${k}`
-}
-
-function senderOf(db, who) {
-  if (who.kind === 'agent') return `agent:${who.name}`
-  const row = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId)
-  // The `user:` prefix is load-bearing (push.js's own-event rule, journal.js's
-  // unread predicate), so it survives even the impossible missing-row case.
-  return `user:${row ? row.name : who.userId}`
-}
-
-// Ordinary-agent predicate shared with /roster, /search, /snapshot.
-const filteredAgent = (db, who) => who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
-
-const privateOwnedConvo = (db, convoId) => {
-  const owner = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id
-  return owner != null && isPrivateDevice(db, owner)
 }
 
 // Visible = owned by the caller's user and, for an ordinary agent, not born
@@ -236,16 +206,34 @@ async function handlePatch(ctx, req, res, who, item) {
     if (body.awaiting !== null && item.state === 'closed') return conflict(res)
     fields.awaiting = body.awaiting
   }
-  if (Object.keys(fields).length === 0) return badRequest(res)
-  const updated = updateItem(db, { userId: who.userId, itemId: item.id, fields })
+  // Missions (spec 2026-09-10): explicit move or detach. `mission` is a
+  // mission id, "#num", a bare number, or null. Never inferred. Gated by
+  // the same visibility sieve as GET /missions/:id — a mission an ordinary
+  // agent can't see must not be reachable as a move target either (it would
+  // both let the agent attach an item to hidden content and act as an
+  // existence oracle for private missions).
+  let missionTarget
+  if (body.mission !== undefined) {
+    if (body.mission === null) missionTarget = null
+    else {
+      const target = visibleMission(db, who, body.mission)
+      if (!target) return notFound(res)
+      missionTarget = target.id
+    }
+  }
+  if (Object.keys(fields).length === 0 && body.mission === undefined) return badRequest(res)
+  // Fields and the mission move are ONE write with ONE `updated_at` (final
+  // review minor): they used to be two statements in two transactions, so a
+  // `{title, mission}` patch could half-apply and stamped two timestamps.
+  const result = updateItem(db, { userId: who.userId, itemId: item.id, fields, missionId: missionTarget })
   // Only reachable if the item vanished between the read and the write.
-  if (!updated) return notFound(res)
+  if (!result) return notFound(res)
   // Every mutating route appends a marker, this one included: a retitle or a
   // hand-moved `awaiting` is a change connected clients must see without
   // re-polling. It is a quiet action though — no wake, no push (see
   // ITEM_ACTIONS in items-marker.js).
-  emitMarker(ctx, who, { item: updated, action: 'updated' })
-  json(res, 200, { item: updated })
+  emitMarker(ctx, who, { item: result, action: 'updated' })
+  json(res, 200, { item: result })
   return true
 }
 

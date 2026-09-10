@@ -159,6 +159,51 @@ CREATE TABLE IF NOT EXISTS item_counters(
   user_id  INTEGER PRIMARY KEY,
   next_num INTEGER NOT NULL
 );
+-- Missions & milestones (spec: 2026-09-10 missions-milestones). Tables are
+-- the source of truth; the conversation log carries 'mission' and
+-- 'milestone' marker events written only by src/missions-http.js. Numbers
+-- come from item_counters, the same counter as items (#61 names one thing).
+CREATE TABLE IF NOT EXISTS missions(
+  id                     TEXT PRIMARY KEY,
+  user_id                INTEGER NOT NULL REFERENCES users(id),
+  num                    INTEGER NOT NULL,
+  state                  TEXT NOT NULL CHECK(state IN ('open','closed')),
+  title                  TEXT NOT NULL,
+  body                   TEXT NOT NULL DEFAULT '',
+  close_summary          TEXT,
+  closed_by              TEXT CHECK(closed_by IN ('user','agent')),
+  closed_over_open_items INTEGER NOT NULL DEFAULT 0,
+  origin_convo_id        TEXT NOT NULL,
+  origin_device_id       INTEGER NOT NULL,
+  created_by             TEXT NOT NULL CHECK(created_by IN ('user','agent')),
+  idem_key               TEXT,
+  created_at             INTEGER NOT NULL,
+  updated_at             INTEGER NOT NULL,
+  last_milestone_at      INTEGER,
+  closed_at              INTEGER,
+  UNIQUE(user_id, num),
+  UNIQUE(user_id, idem_key)
+);
+CREATE INDEX IF NOT EXISTS idx_missions_user_state ON missions(user_id, state, last_milestone_at);
+CREATE TABLE IF NOT EXISTS milestones(
+  id          TEXT PRIMARY KEY,
+  mission_id  TEXT NOT NULL REFERENCES missions(id),
+  user_id     INTEGER NOT NULL REFERENCES users(id),
+  num         INTEGER NOT NULL,
+  kind        TEXT NOT NULL CHECK(kind IN ('user_input','progress')),
+  title       TEXT NOT NULL,
+  body        TEXT NOT NULL DEFAULT '',
+  convo_id    TEXT NOT NULL,
+  seq         INTEGER NOT NULL,
+  device_id   INTEGER NOT NULL,
+  created_by  TEXT NOT NULL CHECK(created_by IN ('user','agent')),
+  idem_key    TEXT,
+  created_at  INTEGER NOT NULL,
+  UNIQUE(user_id, num),
+  UNIQUE(user_id, idem_key)
+);
+CREATE INDEX IF NOT EXISTS idx_milestones_mission ON milestones(mission_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_milestones_convo ON milestones(convo_id, seq);
 -- Search index (spec: agent journal search). Deliberately INSERT-trigger
 -- only: \`events\` is append-only — plain INSERT in journal.js append(), no
 -- DELETE anywhere, and the only paths that rewrite an event's payload are
@@ -231,7 +276,8 @@ export function openDb(path) {
   // the user's own client devices, which see everything unchanged. Enforced
   // at: GET /roster, GET /search, around_seq context reads, room ops (via
   // loadRoom) and invite targeting, read_marker, convo_upsert's
-  // private-owner takeover guard, GET /snapshot, and GET /metrics — see
+  // private-owner takeover guard, GET /snapshot, GET /metrics, and
+  // GET /missions, GET /missions/:id, GET /milestones — see
   // docs/protocol.md "Device privacy" for the full enumeration.
   // `private_pinned=1` records that
   // matron-admin owns the flag: the bridge's per-hello assertion is ignored
@@ -414,6 +460,22 @@ export function openDb(path) {
   if (!spawnCols.some((c) => c.name === 'model')) {
     db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN model TEXT')
   }
+  // Missions (spec 2026-09-10): a conversation belongs to at most one
+  // mission, set once and never changed; an item follows its origin
+  // conversation but can be moved (PATCH /items/:id {mission}). Both are
+  // NULL for every row predating the column. Placed here, after every
+  // table-rebuild block, so a rebuild can never drop them. Not foreign
+  // keys — same stance as parent_convo_id.
+  const missionConvoCols = db.prepare('PRAGMA table_info(conversations)').all()
+  if (!missionConvoCols.some((c) => c.name === 'mission_id')) {
+    db.exec('ALTER TABLE conversations ADD COLUMN mission_id TEXT')
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_conversations_mission ON conversations(mission_id)')
+  const itemMissionCols = db.prepare('PRAGMA table_info(items)').all()
+  if (!itemMissionCols.some((c) => c.name === 'mission_id')) {
+    db.exec('ALTER TABLE items ADD COLUMN mission_id TEXT')
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_items_mission ON items(mission_id, state, awaiting)')
   // Standing agent-chat consent ("always allow A -> B") is gone: every ask
   // parks for the user now. Dropped rather than left in place, because a
   // table of grants that nothing consults still reads like a live security
