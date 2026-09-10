@@ -6,6 +6,9 @@ import path from 'node:path'
 import Database from 'better-sqlite3'
 import { openDb } from '../src/db.js'
 import { nextNum, newId } from '../src/items.js'
+import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE, MISSION_ACTIONS, milestoneMarkerPayload, missionMarkerPayload } from '../src/missions-marker.js'
+import { snippetOf } from '../src/journal.js'
+import { classify } from '../src/push.js'
 
 test('schema: missions and milestones exist with the expected columns; mission_id on conversations and items', () => {
   const db = openDb(':memory:')
@@ -79,4 +82,28 @@ test('numbers: items, missions and milestones share one per-user counter', () =>
   assert.equal(nextNum(db, 1), 3)
   assert.match(newId('ms'), /^ms_[0-9a-f]{16}$/)
   assert.match(newId('ml'), /^ml_[0-9a-f]{16}$/)
+})
+
+test('marker payloads carry exactly the documented fields', () => {
+  const mission = { id: 'ms_1', num: 61, title: 'Missions & milestones' }
+  const milestone = { id: 'ml_1', num: 63, kind: 'user_input', title: 'Wired the migration', body: 'b' }
+  assert.deepEqual(milestoneMarkerPayload({ milestone, mission, by: 'agent' }), {
+    milestone_id: 'ml_1', num: 63, kind: 'user_input', title: 'Wired the migration', body: 'b',
+    mission_id: 'ms_1', mission_num: 61, mission_title: 'Missions & milestones', by: 'agent',
+  })
+  assert.deepEqual(missionMarkerPayload({ mission, action: 'created', by: 'agent' }),
+    { mission_id: 'ms_1', num: 61, title: 'Missions & milestones', action: 'created', by: 'agent' })
+  assert.deepEqual(missionMarkerPayload({ mission, action: 'closed', by: 'user', openItemNums: [64, 70] }),
+    { mission_id: 'ms_1', num: 61, title: 'Missions & milestones', action: 'closed', by: 'user', open_item_nums: [64, 70] })
+  assert.equal(MISSION_EVENT_TYPE, 'mission'); assert.equal(MILESTONE_EVENT_TYPE, 'milestone')
+  assert.deepEqual(MISSION_ACTIONS, ['created', 'joined', 'updated', 'closed'])
+})
+
+test('snippetOf renders both markers; classify never pushes them', () => {
+  assert.equal(snippetOf('milestone', { num: 63, kind: 'user_input', title: 'T' }), '🚩 #63 T')
+  assert.equal(snippetOf('milestone', { num: 64, kind: 'progress', title: 'P' }), '🏁 #64 P')
+  assert.equal(snippetOf('mission', { num: 61, title: 'M', action: 'closed' }), '🏁 Mission #61 closed')
+  assert.equal(snippetOf('mission', { num: 61, title: 'M', action: 'created' }), '🏁 Mission #61 started: M')
+  assert.equal(classify('milestone', { num: 63 }, 'agent:dev-2'), null)
+  assert.equal(classify('mission', { num: 61, action: 'closed' }, 'user:dan'), null)
 })

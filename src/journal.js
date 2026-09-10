@@ -68,6 +68,17 @@ export function snippetOf(type, payload) {
     const glyph = p.kind === 'question' ? '❓' : p.kind === 'decision' ? '⚖' : '☐'
     return `${glyph} #${Number(p.num) || 0} ${String(p.title || '')}`.slice(0, 120)
   }
+  if (type === 'milestone') {
+    const glyph = p.kind === 'user_input' ? '🚩' : '🏁'
+    return `${glyph} #${Number(p.num) || 0} ${String(p.title || '')}`.slice(0, 120)
+  }
+  if (type === 'mission') {
+    const n = Number(p.num) || 0
+    if (p.action === 'closed') return `🏁 Mission #${n} closed`
+    if (p.action === 'created') return `🏁 Mission #${n} started: ${String(p.title || '')}`.slice(0, 120)
+    if (p.action === 'joined') return `🏁 Joined mission #${n}`
+    return `🏁 Mission #${n} updated`
+  }
   if (p.snippet) return String(p.snippet).slice(0, 120)
   if (type === 'tool_output' && p.command) return `$ ${String(p.command)}`.slice(0, 120)
   // Matches the relay's fixed 'done'-category alert (see relay.js
