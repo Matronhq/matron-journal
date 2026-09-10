@@ -1,6 +1,6 @@
 {
   "name": "missions: agent starts a mission, posts a milestone whose marker seq is the anchor, closes it; markers land in the right conversations",
-  "description": "Exercises POST /missions, POST /milestones (201 then a 409 no_mission on a second conversation), GET /missions/:id, POST /missions/:id/close, and the 'mission'/'milestone' marker events a client sees on the HTTP read. Numbers are shared with items: the mission is #1, the milestone #2.",
+  "description": "Exercises POST /missions, POST /milestones (201 then a 409 no_mission on a second conversation), POST /missions/:id/close, and the 'mission'/'milestone' marker events a client sees on the HTTP read. Numbers are shared with items: the mission is #1, the milestone #2.",
   "server": { "tmpDb": true },
   "seed": {
     "users": [ { "as": "dan", "name": "dan", "password": "fixture-pw-16" } ],
