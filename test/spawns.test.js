@@ -384,8 +384,15 @@ test('the target side gains its tag once the child bridge publishes a title (at 
   upsertConversation(db, { id: 'child-2', ownerUserId: dan.id, title: '🐣 [ef] do the thing', sessionState: 'running', agentDeviceId: target.deviceId })
   assert.equal(refreshSpawnRoomTitle(db, hub, 'child-2'), true)
   assert.equal(db.prepare('SELECT title FROM conversations WHERE id=?').get('room-late').title, 'D:ab ↔️ E:ef — thing')
-  // Idempotent: a second refresh with nothing new writes nothing.
+  // Frozen: a second refresh writes nothing, and a later child rename with
+  // a DIFFERENT short (or none) never moves the room off the first one.
   assert.equal(refreshSpawnRoomTitle(db, hub, 'child-2'), false)
+  assert.equal(getSpawn(db, 's-late').child_short, 'ef')
+  upsertConversation(db, { id: 'child-2', ownerUserId: dan.id, title: '🐣 [zz] renamed', sessionState: 'waiting', agentDeviceId: target.deviceId })
+  assert.equal(refreshSpawnRoomTitle(db, hub, 'child-2'), false)
+  upsertConversation(db, { id: 'child-2', ownerUserId: dan.id, title: 'renamed from the app', sessionState: 'waiting', agentDeviceId: target.deviceId })
+  assert.equal(refreshSpawnRoomTitle(db, hub, 'child-2'), false)
+  assert.equal(db.prepare('SELECT title FROM conversations WHERE id=?').get('room-late').title, 'D:ab ↔️ E:ef — thing')
   // The retitle fanned a convo_meta into the room carrying the new title.
   const metas = messagesBefore(db, dan.id, 'room-late', {}).filter((m) => m.type === 'convo_meta')
   assert.ok(metas.some((m) => m.payload.title === 'D:ab ↔️ E:ef — thing'))

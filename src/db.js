@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS agent_spawn_requests(
   topic             TEXT NOT NULL DEFAULT '',
   model             TEXT,
   link              INTEGER NOT NULL DEFAULT 1,
+  child_short       TEXT,
   state             TEXT NOT NULL CHECK(state IN
                       ('awaiting_user','approved','started',
                        'denied','expired','failed')),
@@ -471,6 +472,13 @@ export function openDb(path) {
   // speaks for those pre-migration rows.
   if (!spawnCols.some((c) => c.name === 'link')) {
     db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN link INTEGER NOT NULL DEFAULT 1')
+  }
+  // The child's session short as first learned from its published title —
+  // frozen there so the linked room's title never follows a later child
+  // rename (bridge rooms freeze the peer short at creation the same way).
+  // NULL until the child's bridge publishes a title with a short.
+  if (!spawnCols.some((c) => c.name === 'child_short')) {
+    db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN child_short TEXT')
   }
   // refreshSpawnRoomTitle (spawns.js) looks a started row up by its child
   // on every titled convo_upsert; keep that a point lookup.

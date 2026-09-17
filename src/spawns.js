@@ -156,11 +156,12 @@ export function countPendingAsks(db, fromDeviceId) {
 // session short the owning bridge baked into that session's title. A side
 // whose title has not earned a short yet — the child before its bridge
 // publishes one, always the case at creation — falls back to the device
-// name, exactly as chatStart's peer side does. The roster the letters are
-// struck against is the one the PARENT can see (private boxes stay
+// name, exactly as chatStart's peer side does. `childShort` is the frozen
+// child_short (see refreshSpawnRoomTitle), '' at creation. The roster the
+// letters are struck against is the one the PARENT can see (private boxes stay
 // invisible to an ordinary agent's room title as they are to its roster),
 // with the pair's own names added should either be missing from it.
-function spawnRoomTitle(db, row, childConvoId = null) {
+function spawnRoomTitle(db, row, childShort = '') {
   const excludePrivate = !isPrivateDevice(db, row.from_device_id)
   const agents = db.prepare(
     `SELECT id, name, tag_char FROM devices WHERE user_id=? AND kind='agent'${excludePrivate ? ' AND private=0' : ''} ORDER BY id`
@@ -170,33 +171,41 @@ function spawnRoomTitle(db, row, childConvoId = null) {
   const parent = agentFor(row.from_device_id)
   const target = agentFor(row.target_device_id)
   const names = [...new Set([...agents.map((a) => a.name), parent?.name, target?.name].filter((n) => typeof n === 'string' && n))]
-  const titleOf = (convoId) => (convoId ? db.prepare('SELECT title FROM conversations WHERE id=?').get(convoId)?.title : null)
-  const side = (agent, deviceId, convoId) => sideTag({
+  const side = (agent, deviceId, short) => sideTag({
     name: agent?.name || null,
-    short: sessionShortFromTitle(titleOf(convoId)),
+    short,
     names,
     override: agent?.tag_char ?? null,
     label: agent?.name || `device ${deviceId}`,
   })
-  return roomTitle(side(parent, row.from_device_id, row.from_convo_id), side(target, row.target_device_id, childConvoId), row.topic || '')
+  const parentShort = sessionShortFromTitle(db.prepare('SELECT title FROM conversations WHERE id=?').get(row.from_convo_id)?.title)
+  return roomTitle(side(parent, row.from_device_id, parentShort), side(target, row.target_device_id, childShort), row.topic || '')
 }
 
-// Bring a started spawn room's title up to date with what its child's
-// bridge has published — called from ws.js on every titled convo_upsert,
+// Bring a started spawn room's title up to date once its child's bridge has
+// published a title — called from ws.js on every titled convo_upsert,
 // because the child's seed title normally lands AFTER the start reply (a
 // bridge publishes it with its first state-transition upsert, not at spawn).
-// Cheap when the convo is nobody's child (one indexed point lookup) and a
-// no-op when the computed title already matches, so a child's later
-// renames cost one comparison and write nothing. Returns whether a retitle
-// happened. Best-effort by contract: callers log and carry on.
+// The short is learned ONCE and frozen on the row (child_short): bridge
+// rooms freeze the peer short at creation, and a room title that followed
+// every later child rename would flap — to a different short after a
+// resume, or back to the bare device name after an app-side rename that
+// dropped the prefix. So: cheap when the convo is nobody's child (one
+// indexed point lookup), a no-op once the short is known or while the
+// child's title still carries none, and exactly one retitle otherwise.
+// Returns whether a retitle happened. Best-effort by contract: callers log
+// and carry on.
 export function refreshSpawnRoomTitle(db, hub, childConvoId) {
   const row = db.prepare(
     "SELECT * FROM agent_spawn_requests WHERE child_convo_id=? AND room_id IS NOT NULL AND state='started'"
   ).get(childConvoId)
-  if (!row) return false
+  if (!row || row.child_short) return false
+  const short = sessionShortFromTitle(db.prepare('SELECT title FROM conversations WHERE id=?').get(childConvoId)?.title)
+  if (!short) return false
   const room = db.prepare('SELECT owner_user_id, title FROM conversations WHERE id=?').get(row.room_id)
   if (!room) return false
-  const title = spawnRoomTitle(db, row, childConvoId)
+  db.prepare('UPDATE agent_spawn_requests SET child_short=? WHERE id=?').run(short, row.id)
+  const title = spawnRoomTitle(db, row, short)
   if (title === room.title) return false
   upsertConversation(db, { id: row.room_id, ownerUserId: room.owner_user_id, title })
   appendAndBroadcast(db, hub, { userId: row.user_id, convoId: row.room_id, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null, participants: participantIds(db, row.room_id) } })

@@ -933,11 +933,14 @@ test('a linked spawn room is titled like a bridge room and gains the child tag w
   const retitled = await client.waitFor((f) => f.kind === 'journal' && f.type === 'convo_meta' && f.convo_id === roomId && f.payload.title === 'D:ab ↔️ E:cd — job')
   assert.ok(retitled)
   assert.equal(s.db.prepare('SELECT title FROM conversations WHERE id=?').get(roomId).title, 'D:ab ↔️ E:cd — job')
-  // A later child rename changes nothing about the room.
+  // A later child rename — even one carrying a different short — changes
+  // nothing about the room: the first short is frozen on the row.
   client.frames.length = 0
-  target.send({ op: 'convo_upsert', convo_id: 'child-t', title: '🐣 [cd] renamed', session_state: 'waiting' })
+  target.send({ op: 'convo_upsert', convo_id: 'child-t', title: '🐣 [zz] renamed', session_state: 'waiting' })
   await client.waitFor((f) => f.kind === 'journal' && f.type === 'convo_meta' && f.convo_id === 'child-t')
   await new Promise((r) => setTimeout(r, 100))
   assert.equal(client.frames.find((f) => f.type === 'convo_meta' && f.convo_id === roomId), undefined)
+  assert.equal(s.db.prepare('SELECT title FROM conversations WHERE id=?').get(roomId).title, 'D:ab ↔️ E:cd — job')
+  assert.equal(getSpawn(s.db, ack.spawn_id).child_short, 'cd')
   assert.equal(dan.id > 0, true)
 })
