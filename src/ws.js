@@ -6,7 +6,7 @@ import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, 
 import { joinedAgentIds, participantIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
-import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, emitSpawnOutcome } from './spawns.js'
+import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared } from './wake.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
@@ -867,6 +867,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // sanitisation the way workdir/task are — a model that sieves down to
         // nothing means "no model named", which is a legal ask, not a bad one.
         if (msg.model != null && (typeof msg.model !== 'string' || msg.model.length > SPAWN_MODEL_MAX_CHARS)) return fail('bad_request', 'bad model')
+        // Optional: whether approval also opens a chat room between parent
+        // and child. Absent means no room (a spawn is a clean break by
+        // default); anything but a boolean is a bad ask, not a coerced one.
+        if (msg.link != null && typeof msg.link !== 'boolean') return fail('bad_request', 'bad link')
+        const link = msg.link === true
         if (!Number.isInteger(msg.target_device_id)) return fail('bad_request', 'bad target_device_id')
         // Spawning on the caller's own box is allowed: the start rpc lands on
         // the same bridge, which already runs several sessions side by side
@@ -912,7 +917,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         createSpawnRequest(db, {
           id: spawnId, userId: conn.userId, fromDeviceId: conn.deviceId,
           fromConvoId: msg.from_convo_id, targetDeviceId: msg.target_device_id,
-          workdir, task, topic, model,
+          workdir, task, topic, model, link,
         })
         // Client-only card (isClientOnlyEvent covers kind:'agent_spawn'),
         // published into the PARENT's own conversation — where the user is
@@ -940,6 +945,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           // topic's): a client renders this as a "will run on <model>" chip,
           // and an empty one would read as a model named "".
           ...(model ? { model } : {}),
+          // Same omit-when-absent stance: a linked ask says so, a detached
+          // one says nothing about a room — the common case stays the
+          // card shape every client already renders.
+          ...(link ? { link: true } : {}),
         }
         let cardAppend
         try {
@@ -1441,6 +1450,19 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           sessionOutcome: msg.session_outcome ?? null,
           summary: msg.summary ?? null,
         })
+        // A spawned child's first published title carries the session short
+        // its spawn room's title has been waiting for (the room is minted
+        // before the child exists). One indexed lookup for every titled
+        // upsert; a retitle only when this convo is a started spawn's child
+        // and the computed title actually changed. Best-effort: the child's
+        // own upsert must land whatever happens to the room.
+        if (msg.title != null) {
+          try {
+            refreshSpawnRoomTitle(db, hub, msg.convo_id)
+          } catch (err) {
+            console.error('convo_upsert: spawn room retitle failed', err)
+          }
+        }
         if (msg.session_state) {
           // prevSessionState is upsertConversation's read of the row BEFORE
           // this update — an in-memory hint only, so push.js can tell a

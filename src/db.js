@@ -99,6 +99,8 @@ CREATE TABLE IF NOT EXISTS agent_spawn_requests(
   task              TEXT NOT NULL,
   topic             TEXT NOT NULL DEFAULT '',
   model             TEXT,
+  link              INTEGER NOT NULL DEFAULT 1,
+  child_short       TEXT,
   state             TEXT NOT NULL CHECK(state IN
                       ('awaiting_user','approved','started',
                        'denied','expired','failed')),
@@ -460,6 +462,27 @@ export function openDb(path) {
   if (!spawnCols.some((c) => c.name === 'model')) {
     db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN model TEXT')
   }
+  // Whether the approved spawn opens a chat room between parent and child
+  // (2026-09-17: rooms are opt-in — a spawn is normally a clean break, and
+  // an automatic room made the child narrate its progress back to a parent
+  // that then relayed it on). DEFAULT 1, not 0: a row parked before the
+  // column existed was asked under the always-linked contract, and the
+  // card the user is about to tap promised a room. New rows always write
+  // the value explicitly (createSpawnRequest), so the default only ever
+  // speaks for those pre-migration rows.
+  if (!spawnCols.some((c) => c.name === 'link')) {
+    db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN link INTEGER NOT NULL DEFAULT 1')
+  }
+  // The child's session short as first learned from its published title —
+  // frozen there so the linked room's title never follows a later child
+  // rename (bridge rooms freeze the peer short at creation the same way).
+  // NULL until the child's bridge publishes a title with a short.
+  if (!spawnCols.some((c) => c.name === 'child_short')) {
+    db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN child_short TEXT')
+  }
+  // refreshSpawnRoomTitle (spawns.js) looks a started row up by its child
+  // on every titled convo_upsert; keep that a point lookup.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_spawn_child ON agent_spawn_requests(child_convo_id)')
   // Missions (spec 2026-09-10): a conversation belongs to at most one
   // mission, set once and never changed; an item follows its origin
   // conversation but can be moved (PATCH /items/:id {mission}). Both are
