@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS agent_spawn_requests(
   task              TEXT NOT NULL,
   topic             TEXT NOT NULL DEFAULT '',
   model             TEXT,
+  link              INTEGER NOT NULL DEFAULT 1,
   state             TEXT NOT NULL CHECK(state IN
                       ('awaiting_user','approved','started',
                        'denied','expired','failed')),
@@ -460,6 +461,20 @@ export function openDb(path) {
   if (!spawnCols.some((c) => c.name === 'model')) {
     db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN model TEXT')
   }
+  // Whether the approved spawn opens a chat room between parent and child
+  // (2026-09-17: rooms are opt-in — a spawn is normally a clean break, and
+  // an automatic room made the child narrate its progress back to a parent
+  // that then relayed it on). DEFAULT 1, not 0: a row parked before the
+  // column existed was asked under the always-linked contract, and the
+  // card the user is about to tap promised a room. New rows always write
+  // the value explicitly (createSpawnRequest), so the default only ever
+  // speaks for those pre-migration rows.
+  if (!spawnCols.some((c) => c.name === 'link')) {
+    db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN link INTEGER NOT NULL DEFAULT 1')
+  }
+  // refreshSpawnRoomTitle (spawns.js) looks a started row up by its child
+  // on every titled convo_upsert; keep that a point lookup.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_spawn_child ON agent_spawn_requests(child_convo_id)')
   // Missions (spec 2026-09-10): a conversation belongs to at most one
   // mission, set once and never changed; an item follows its origin
   // conversation but can be moved (PATCH /items/:id {mission}). Both are

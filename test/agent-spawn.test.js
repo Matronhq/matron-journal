@@ -242,7 +242,7 @@ test('spawn_targets: the caller answers its own recent_folders rpc, so the self 
 
 test('spawn on self: the card names the same box both ways, approve sends the start rpc to the caller, the room has the caller as owner and only participant', async (t) => {
   const { s, parentDev, clientToken, parent, client } = await spawnFleet(t, { connectTarget: false })
-  parent.send({ op: 'spawn_request', request_id: 'rs', from_convo_id: 'parent-convo', target_device_id: parentDev.deviceId, workdir: '/w', task: 'carry on here' })
+  parent.send({ op: 'spawn_request', request_id: 'rs', from_convo_id: 'parent-convo', target_device_id: parentDev.deviceId, workdir: '/w', task: 'carry on here', link: true })
   const card = await client.waitFor((f) => f.kind === 'journal' && f.type === 'permission_request' && f.payload?.kind === 'agent_spawn')
   assert.equal(card.payload.from_device_id, parentDev.deviceId)
   assert.equal(card.payload.target_device_id, parentDev.deviceId)
@@ -340,6 +340,9 @@ async function parkedSpawn(t, opts = {}) {
   parent.send({
     op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo',
     target_device_id: targetDev.deviceId, workdir: '/w', task: 'do it', topic: 'job',
+    // Linked by default here: most of the suite is about the room. The
+    // detached (default-on-the-wire) shape has its own tests below.
+    link: opts.link ?? true,
   })
   const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
   await client.waitFor(isSpawnCard)
@@ -535,7 +538,7 @@ test('approveSpawn: a throw before the room exists still notifies the parent exa
   createSpawnRequest(s.db, {
     id: spawnId, userId: bogusUserId, fromDeviceId: parentDev.deviceId,
     fromConvoId: 'parent-convo', targetDeviceId: targetDev.deviceId,
-    workdir: '/w', task: 'x',
+    workdir: '/w', task: 'x', link: true,
   })
   assert.ok(claimApprove(s.db, spawnId))
   const sent = []
@@ -602,7 +605,7 @@ test('restart after the room exists: the sweep finds the persisted linkage and w
   createSpawnRequest(s.db, {
     id: spawnId, userId: dan.id, fromDeviceId: parentDev.deviceId,
     fromConvoId: 'parent-convo', targetDeviceId: targetDev.deviceId,
-    workdir: '/w', task: 'do it', topic: 'job',
+    workdir: '/w', task: 'do it', topic: 'job', link: true,
   })
   assert.ok(claimApprove(s.db, spawnId))
   // An orchestration that dies mid-flight: room created, start rpc issued,
@@ -857,4 +860,84 @@ test('spawn_targets is single-flight per connection: a concurrent second ask is 
   parent.send({ op: 'spawn_targets', request_id: 'sf-3' })
   const third = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets' && f.request_id === 'sf-3', 5000)
   assert.ok(third)
+})
+
+// ---- link flag: the room is opt-in ---------------------------------------
+
+test('spawn_request without link: the card carries no link key and approve spawns with no room at all', async (t) => {
+  const { s, clientToken, parent, target, client, spawnId } = await parkedSpawn(t, { link: false })
+  const parkedRow = getSpawn(s.db, spawnId)
+  assert.equal(parkedRow.link, 0)
+  // Replay the card to check its shape (parkedSpawn drained the live one).
+  const card = JSON.parse(s.db.prepare("SELECT payload FROM events WHERE type='permission_request' AND convo_id='parent-convo'").get().payload)
+  assert.ok(!('link' in card), 'a detached ask says nothing about a room')
+  const bridgeTurn = target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start').then((req) => {
+    assert.equal(req.request.params.prompt, 'do it')
+    assert.equal(req.request.params.from_name, 'dev-6')
+    assert.ok(!('room_id' in req.request.params), 'no room_id on a detached start')
+    target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { convo_id: 'child-detached' } })
+  })
+  const r = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } })
+  assert.equal(r.status, 200)
+  await bridgeTurn
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
+  assert.equal(out.outcome, 'started')
+  assert.ok(!('room_id' in out))
+  assert.equal(out.child_convo_id, 'child-detached')
+  const evt = await client.waitFor((f) => isOutcomeEvent(f, spawnId))
+  assert.deepEqual(Object.keys(evt.payload).sort(), ['child_convo_id', 'outcome', 'request_id'])
+  const row = getSpawn(s.db, spawnId)
+  assert.equal(row.state, 'started')
+  assert.equal(row.room_id, null)
+  // The only conversation is the parent's own — nothing was minted.
+  assert.deepEqual(s.db.prepare('SELECT id FROM conversations ORDER BY id').all().map((c) => c.id), ['parent-convo'])
+})
+
+test('spawn_request with link: true carries link on the card; a non-boolean link is bad_request', async (t) => {
+  const { s, targetDev, parent, client } = await spawnFleet(t)
+  parent.send({ op: 'spawn_request', request_id: 'bad', from_convo_id: 'parent-convo', target_device_id: targetDev.deviceId, workdir: '/w', task: 'x', link: 'yes' })
+  const err = await parent.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.ref === 'spawn_request')
+  assert.equal(err.code, 'bad_request')
+  parent.send({ op: 'spawn_request', request_id: 'ok', from_convo_id: 'parent-convo', target_device_id: targetDev.deviceId, workdir: '/w', task: 'x', link: true })
+  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending' && f.request_id === 'ok')
+  assert.equal(getSpawn(s.db, ack.spawn_id).link, 1)
+  const card = await client.waitFor(isSpawnCard)
+  assert.equal(card.payload.link, true)
+})
+
+test('a linked spawn room is titled like a bridge room and gains the child tag when the child publishes its title', async (t) => {
+  const { s, dan, parentDev, targetDev, clientToken, parent, target, client } = await spawnFleet(t)
+  // The parent's bridge baked a short into its title, as every bridge does.
+  parent.send({ op: 'convo_upsert', convo_id: 'parent-convo', title: '[ab] parent session', session_state: 'running' })
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'convo_meta' && f.convo_id === 'parent-convo')
+  parent.send({ op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo', target_device_id: targetDev.deviceId, workdir: '/w', task: 'do it', topic: 'job', link: true })
+  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  await client.waitFor(isSpawnCard)
+  client.frames.length = 0
+  const bridgeTurn = target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start').then((req) => {
+    target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { convo_id: 'child-t' } })
+    return req.request.params.room_id
+  })
+  await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: ack.spawn_id, decision: 'approve' } })
+  const roomId = await bridgeTurn
+  await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
+  // At creation the child has no title yet, so its side is the device name.
+  assert.equal(s.db.prepare('SELECT title FROM conversations WHERE id=?').get(roomId).title, 'D:ab ↔️ eric — job')
+  const born = client.frames.find((f) => f.kind === 'journal' && f.type === 'convo_meta' && f.convo_id === roomId)
+  assert.equal(born.payload.title, 'D:ab ↔️ eric — job')
+  assert.deepEqual(born.payload.participants, [parentDev.deviceId, targetDev.deviceId].sort((a, b) => a - b))
+  // The child's bridge publishes its seed title — the room retitles and
+  // every live client hears it.
+  client.frames.length = 0
+  target.send({ op: 'convo_upsert', convo_id: 'child-t', title: '🐣 [cd] do it', session_state: 'running' })
+  const retitled = await client.waitFor((f) => f.kind === 'journal' && f.type === 'convo_meta' && f.convo_id === roomId && f.payload.title === 'D:ab ↔️ E:cd — job')
+  assert.ok(retitled)
+  assert.equal(s.db.prepare('SELECT title FROM conversations WHERE id=?').get(roomId).title, 'D:ab ↔️ E:cd — job')
+  // A later child rename changes nothing about the room.
+  client.frames.length = 0
+  target.send({ op: 'convo_upsert', convo_id: 'child-t', title: '🐣 [cd] renamed', session_state: 'waiting' })
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'convo_meta' && f.convo_id === 'child-t')
+  await new Promise((r) => setTimeout(r, 100))
+  assert.equal(client.frames.find((f) => f.type === 'convo_meta' && f.convo_id === roomId), undefined)
+  assert.equal(dan.id > 0, true)
 })
