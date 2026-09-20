@@ -443,13 +443,87 @@ export function setAttachmentTranscript(db, { userId, itemId, commentId, blobRef
     const c = db.prepare('SELECT * FROM item_comments WHERE id=? AND item_id=? AND user_id=?').get(commentId, itemId, userId)
     if (!c) return null
     const atts = parseJson(c.attachments, [])
-    const target = atts.find((a) => a.blob_ref === blobRef)
-    if (!target) return null
-    target.transcript = transcript
+    // Every attachment naming the blob: the same audio attached twice is the
+    // same words twice, and settling only the first would strand the other
+    // `pending` forever.
+    const targets = atts.filter((a) => a.blob_ref === blobRef)
+    if (!targets.length) return null
+    for (const target of targets) {
+      target.transcript = transcript
+      // The origin bridge beat the journal's own job to it (an older bridge
+      // transcribes without waiting): the words are in, so it is no longer
+      // pending. The job keeps this transcript when it lands (below).
+      if (target.transcript_status) target.transcript_status = 'done'
+    }
     db.prepare('UPDATE item_comments SET attachments=? WHERE id=?').run(JSON.stringify(atts), commentId)
     touch(db, itemId, now)
     return rowToComment(db.prepare('SELECT * FROM item_comments WHERE id=?').get(commentId))
   })()
+}
+
+// --- Journal-side transcription (src/items-transcribe.js) -------------------
+// `transcript_status` on an audio attachment: 'pending' while the journal's
+// own whisper job owns it, then 'done' or 'failed'. Absent = this journal
+// never took the job (transcription off, or a row from before it existed),
+// which is what tells a bridge to transcribe the note itself.
+export const isAudioAttachment = (a) => typeof a?.mime === 'string' && a.mime.startsWith('audio/')
+
+// Pure. Run on VALIDATED attachments only (validateAttachments drops any
+// client-sent status along with every other unknown key).
+export function markTranscriptsPending(attachments) {
+  return (attachments || []).map((a) => (isAudioAttachment(a) ? { ...a, transcript_status: 'pending' } : a))
+}
+
+// The job's write-back. `transcript` null/blank = the attempt failed. Never
+// overwrites words that are already there. `settled` is true once no
+// attachment on the comment is still pending — the moment the follow-up
+// marker may go out. `changed` is false when the attachment was not pending
+// (a replayed job), so the caller does not emit a second marker.
+export function finishAttachmentTranscript(db, { commentId, blobRef, transcript, now = Date.now() }) {
+  return db.transaction(() => {
+    const c = db.prepare('SELECT * FROM item_comments WHERE id=?').get(commentId)
+    if (!c) return null
+    const atts = parseJson(c.attachments, [])
+    // All of them, for the same reason as setAttachmentTranscript above.
+    const targets = atts.filter((a) => a.blob_ref === blobRef)
+    if (!targets.length) return null
+    const got = typeof transcript === 'string' && transcript.trim()
+    let changed = false
+    for (const target of targets) {
+      if (target.transcript_status !== 'pending') continue
+      changed = true
+      const have = typeof target.transcript === 'string' && target.transcript.trim()
+      if (!have && got) target.transcript = transcript.trim().slice(0, BODY_MAX)
+      target.transcript_status = have || got ? 'done' : 'failed'
+    }
+    if (changed) {
+      db.prepare('UPDATE item_comments SET attachments=? WHERE id=?').run(JSON.stringify(atts), commentId)
+      touch(db, c.item_id, now)
+    }
+    const settled = !atts.some((a) => a.transcript_status === 'pending')
+    const failed = atts.some((a) => a.transcript_status === 'failed')
+    return {
+      changed, settled, failed, userId: c.user_id, deviceId: c.device_id,
+      comment: rowToComment(db.prepare('SELECT * FROM item_comments WHERE id=?').get(commentId)),
+      item: getItem(db, c.user_id, c.item_id),
+    }
+  })()
+}
+
+// Boot recovery: comments a previous process left pending (crash or restart
+// mid-job). The LIKE is a cheap prefilter; the parsed check is the rule.
+export function listPendingTranscripts(db) {
+  const rows = db.prepare(`SELECT * FROM item_comments WHERE attachments LIKE '%"transcript_status":"pending"%' ORDER BY created_at`).all()
+  const out = []
+  for (const row of rows) {
+    const seen = new Set() // one job per blob, however often it is attached
+    for (const a of parseJson(row.attachments, [])) {
+      if (a.transcript_status !== 'pending' || seen.has(a.blob_ref)) continue
+      seen.add(a.blob_ref)
+      out.push({ commentId: row.id, userId: row.user_id, blobRef: a.blob_ref })
+    }
+  }
+  return out
 }
 
 export function rerankItem(db, { userId, itemId, position, after, before, now = Date.now() }) {

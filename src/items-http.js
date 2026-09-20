@@ -11,6 +11,7 @@ import { idemKeyOf, senderOf, badRequest, notFound, conflict } from './http-who.
 import {
   ITEM_KINDS, AWAITING, RESOLUTIONS, BODY_MAX, validateItemFields, createItem, getItem, listItems, listComments,
   updateItem, addComment, setAttachmentTranscript, closeItem, reopenItem, rerankItem,
+  markTranscriptsPending, isAudioAttachment,
 } from './items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE, ITEM_ACTIONS, itemFallbackText, FALLBACK_ACTIONS } from './items-marker.js'
 import { visibleMission } from './missions-http.js'
@@ -47,12 +48,12 @@ function visibleItem(db, who, idOrNum) {
 // The one place an 'item' marker is written. Called AFTER the item's own
 // transaction has committed — never inside it, so a broadcast can never
 // advertise a write that then rolls back.
-function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action, comment = null, by = null }) {
+function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action, comment = null, by = null, extra = null }) {
   // A typo'd action would ship a marker no client knows how to render;
   // that's a programmer error, not a request error, so it throws.
   if (!ITEM_ACTIONS.includes(action)) throw new Error(`unknown item action: ${action}`)
   const author = by == null ? (who.kind === 'agent' ? 'agent' : 'user') : by
-  const payload = itemMarkerPayload({ item, action, by: author, comment })
+  const payload = itemMarkerPayload({ item, action, by: author, comment, extra })
   const sender = senderOf(db, who)
   let r
   try {
@@ -95,6 +96,20 @@ function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action, comme
   // behalf of the user is already awake. Keyed off the MARKER only — the
   // fallback text never independently wakes anything.
   if (who.kind !== 'agent' && WAKE_ACTIONS.has(action)) wakeConvoAgent({ db, hub, waker }, who.userId, item.origin_convo_id)
+}
+
+// The journal's transcription job settled every voice note on a comment
+// (src/items-transcribe.js): re-announce the comment on a quiet `updated`
+// marker. Quiet on purpose — no wake (the `commented` marker already woke the
+// box), no push, no fallback text — but it is what an open item view refreshes
+// from, and what a bridge holding the agent's turn is waiting for. The sender
+// is rebuilt as the commenting user (only a user's comment is ever queued):
+// the bridge routes `user:` markers as input, and `by:'user'` keeps it honest.
+export function emitTranscriptionMarker(ctx, { item, comment, failed, userId, deviceId }) {
+  emitMarker(ctx, { kind: 'client', userId, deviceId }, {
+    item, action: 'updated', comment, by: 'user',
+    extra: { transcription: failed ? 'failed' : 'done', for_action: 'commented' },
+  })
 }
 
 // null = absent, undefined = present but not in `list` (i.e. reject).
@@ -302,7 +317,18 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     const v = validateItemFields({ body: body.body ?? '', attachments: body.attachments }, { partial: true })
     if (!v.ok) return badRequest(res)
     const text = v.value.body ?? ''
-    const attachments = v.value.attachments ?? []
+    // A user's voice note is transcribed here, on upload, when this journal
+    // has whisper (ctx.itemTranscription.enabled): stored and announced as
+    // pending so the origin bridge holds the turn for the words instead of
+    // transcribing the same audio itself. An agent's comment is never a turn,
+    // so nothing waits on it and it is left alone.
+    // admit() bounds the backlog: a comment it refuses is stored as if this
+    // journal had no whisper, and the bridge transcribes it instead.
+    const rawAttachments = v.value.attachments ?? []
+    const audioBlobs = [...new Set(rawAttachments.filter(isAudioAttachment).map((a) => a.blob_ref))]
+    const transcribeHere = who.kind !== 'agent' && audioBlobs.length > 0
+      && !!ctx.itemTranscription?.enabled && ctx.itemTranscription.admit(who.userId, audioBlobs.length)
+    const attachments = transcribeHere ? markTranscriptsPending(rawAttachments) : rawAttachments
     // A comment with neither words nor blobs is nothing at all — it would
     // still flip `awaiting` and wake the box, so it is a bad request.
     if (!text.trim() && attachments.length === 0) return badRequest(res)
@@ -316,7 +342,14 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     // Only reachable if the item vanished between the read and the write.
     if (!out) return notFound(res)
     // A replayed idempotency key must not fan a second marker out.
-    if (!out.duplicate) emitMarker(ctx, who, { item: out.item, action: 'commented', comment: out.comment })
+    if (!out.duplicate) {
+      emitMarker(ctx, who, { item: out.item, action: 'commented', comment: out.comment })
+      // Queued AFTER the marker so the follow-up can never precede it.
+      if (transcribeHere) {
+        // One job per blob: the same audio attached twice is one whisper run.
+        for (const blobRef of audioBlobs) ctx.itemTranscription.enqueue({ commentId: out.comment.id, userId: who.userId, blobRef })
+      }
+    }
     json(res, out.duplicate ? 200 : 201, { item: out.item, comment: out.comment })
     return true
   }
@@ -336,8 +369,13 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     // Unknown comment and unknown blob_ref answer the same 404.
     const c = setAttachmentTranscript(db, { userId: who.userId, itemId: item.id, commentId: subId, blobRef: body.blob_ref, transcript: body.transcript })
     if (!c) return notFound(res)
-    // No marker and no wake: filling in a transcript is not new traffic,
-    // it is the agent finishing a job the apps already know about.
+    // A QUIET marker, and no wake: filling in a transcript is not new traffic
+    // (no push, no fallback text, nothing a bridge turns into a turn — the
+    // sender is the agent), but without it an open item view never learned
+    // the words had arrived and showed a bare voice note until its next
+    // refetch. Same `updated` + `transcription` shape the journal's own job
+    // announces with (emitTranscriptionMarker).
+    emitMarker(ctx, who, { item: getItem(db, who.userId, item.id) ?? item, action: 'updated', comment: c, extra: { transcription: 'done', for_action: 'commented' } })
     json(res, 200, { comment: c })
     return true
   }
