@@ -46,14 +46,15 @@ export function makeTranscriber({
   return {
     // diskPath -> transcript string. Throws on any failure, including speech
     // whisper found no words in — the caller records that as 'failed'.
-    async transcribeFile(diskPath) {
+    // `signal` aborts the running child (journal shutdown).
+    async transcribeFile(diskPath, { signal } = {}) {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-'))
       const wavPath = path.join(tmpDir, 'audio.wav')
       try {
         // ffmpeg sniffs the container itself, so the blob's extensionless
         // path is fine as input.
-        await execFileAsync('ffmpeg', ['-nostdin', '-i', diskPath, '-vn', '-ar', '16000', '-ac', '1', '-f', 'wav', '-y', wavPath], { timeout: ffmpegTimeoutMs })
-        const { stdout } = await execFileAsync(cli, ['-m', modelPath, '-f', wavPath, '--no-timestamps', '-l', language], { timeout: whisperTimeoutMs })
+        await execFileAsync('ffmpeg', ['-nostdin', '-i', diskPath, '-vn', '-ar', '16000', '-ac', '1', '-f', 'wav', '-y', wavPath], { timeout: ffmpegTimeoutMs, signal })
+        const { stdout } = await execFileAsync(cli, ['-m', modelPath, '-f', wavPath, '--no-timestamps', '-l', language], { timeout: whisperTimeoutMs, signal })
         const text = cleanWhisperText(stdout)
         if (!text) throw new Error('empty transcription result')
         return text

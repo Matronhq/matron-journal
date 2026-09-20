@@ -387,14 +387,16 @@ export function startServer({
         searchBackfill,
         close: () => new Promise((r) => {
           closing = true
-          itemTranscription.close?.()
           if (retentionInterval) clearInterval(retentionInterval)
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
           wss.close()
           for (const c of wss.clients) c.terminate()
           pushPipeline.close()
           if (ownsApnsClient) resolvedApnsClient.close()
-          server.close(() => { searchBackfill.then(() => { db.close(); r() }) })
+          // The transcription queue touches the DB between awaits: abort its
+          // child and let it drain before the handle closes.
+          const transcriptionDone = itemTranscription.close()
+          server.close(() => { Promise.all([searchBackfill, transcriptionDone]).then(() => { db.close(); r() }) })
         }),
       })
     })

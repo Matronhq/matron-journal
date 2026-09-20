@@ -322,8 +322,13 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     // pending so the origin bridge holds the turn for the words instead of
     // transcribing the same audio itself. An agent's comment is never a turn,
     // so nothing waits on it and it is left alone.
-    const transcribeHere = !!ctx.itemTranscription?.enabled && who.kind !== 'agent'
-    const attachments = transcribeHere ? markTranscriptsPending(v.value.attachments ?? []) : (v.value.attachments ?? [])
+    // admit() bounds the backlog: a comment it refuses is stored as if this
+    // journal had no whisper, and the bridge transcribes it instead.
+    const rawAttachments = v.value.attachments ?? []
+    const audioBlobs = [...new Set(rawAttachments.filter(isAudioAttachment).map((a) => a.blob_ref))]
+    const transcribeHere = who.kind !== 'agent' && audioBlobs.length > 0
+      && !!ctx.itemTranscription?.enabled && ctx.itemTranscription.admit(who.userId, audioBlobs.length)
+    const attachments = transcribeHere ? markTranscriptsPending(rawAttachments) : rawAttachments
     // A comment with neither words nor blobs is nothing at all — it would
     // still flip `awaiting` and wake the box, so it is a bad request.
     if (!text.trim() && attachments.length === 0) return badRequest(res)
@@ -341,9 +346,8 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       emitMarker(ctx, who, { item: out.item, action: 'commented', comment: out.comment })
       // Queued AFTER the marker so the follow-up can never precede it.
       if (transcribeHere) {
-        for (const a of out.comment.attachments.filter(isAudioAttachment)) {
-          ctx.itemTranscription.enqueue({ commentId: out.comment.id, userId: who.userId, blobRef: a.blob_ref })
-        }
+        // One job per blob: the same audio attached twice is one whisper run.
+        for (const blobRef of audioBlobs) ctx.itemTranscription.enqueue({ commentId: out.comment.id, userId: who.userId, blobRef })
       }
     }
     json(res, out.duplicate ? 200 : 201, { item: out.item, comment: out.comment })

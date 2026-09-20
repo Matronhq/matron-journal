@@ -160,3 +160,37 @@ test('makeTranscriber: off without a model, off (loudly) when the model path is 
   assert.equal(errs.length, 1)
   assert.equal(cleanWhisperText(' [BLANK_AUDIO]\n Use option A.\n'), 'Use option A.')
 })
+
+test('the same blob attached twice is one whisper run and settles both attachments', async (t) => {
+  const tr = gatedTranscriber()
+  const { s, client, itemId } = await fleet(t, { transcriber: tr })
+  const r = await s.http(`/items/${itemId}/comments`, { method: 'POST', token: client, body: { attachments: [voice('b1'), voice('b1')] } })
+  tr.release('same words'); await s.itemTranscription.idle()
+  assert.equal(tr.calls.length, 1)
+  const atts = listComments(s.db, itemId).find((c) => c.id === r.json.comment.id).attachments
+  assert.deepEqual(atts.map((a) => [a.transcript, a.transcript_status]), [['same words', 'done'], ['same words', 'done']])
+  assert.deepEqual(listPendingTranscripts(s.db), [])
+})
+
+test('admission: past the per-user backlog a comment is stored un-pending (the bridge transcribes it)', async (t) => {
+  const { makeItemTranscription } = await import('../src/items-transcribe.js')
+  const tr = gatedTranscriber()
+  const q = makeItemTranscription({ db: { prepare: () => ({ all: () => [], get: () => null }) }, transcriber: tr, onSettled() {}, maxQueued: 3, maxQueuedPerUser: 2, log: { error() {}, log() {} } })
+  assert.equal(q.admit(1, 2), true); assert.equal(q.admit(1, 3), false)
+  q.enqueue({ commentId: 'a', userId: 1, blobRef: 'x' }); q.enqueue({ commentId: 'b', userId: 1, blobRef: 'y' })
+  assert.equal(q.admit(1, 1), false) // user 1 is full
+  assert.equal(q.admit(2, 1), true); assert.equal(q.admit(2, 2), false) // global cap of 3
+  await q.idle()
+  assert.equal(q.admit(1, 2), true) // drained
+})
+
+test('close(): aborts the running job, leaves it pending for the next boot, and resolves', async (t) => {
+  let seenSignal = null
+  const tr = { transcribeFile: (p, { signal }) => new Promise((_, reject) => { seenSignal = signal; signal.addEventListener('abort', () => reject(new Error('aborted'))) }) }
+  const { s, client, itemId } = await fleet(t, { transcriber: tr })
+  await s.http(`/items/${itemId}/comments`, { method: 'POST', token: client, body: { attachments: [voice('b1')] } })
+  await new Promise((r) => setTimeout(r, 20))
+  await s.itemTranscription.close()
+  assert.equal(seenSignal.aborted, true)
+  assert.equal(listPendingTranscripts(s.db).length, 1)
+})
