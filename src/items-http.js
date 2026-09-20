@@ -105,10 +105,10 @@ function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action, comme
 // from, and what a bridge holding the agent's turn is waiting for. The sender
 // is rebuilt as the commenting user (only a user's comment is ever queued):
 // the bridge routes `user:` markers as input, and `by:'user'` keeps it honest.
-export function emitTranscriptionMarker(ctx, { item, comment, failed, userId, deviceId }) {
+export function emitTranscriptionMarker(ctx, { item, comment, failed, userId, deviceId, isItemBody = false }) {
   emitMarker(ctx, { kind: 'client', userId, deviceId }, {
     item, action: 'updated', comment, by: 'user',
-    extra: { transcription: failed ? 'failed' : 'done', for_action: 'commented' },
+    extra: { transcription: failed ? 'failed' : 'done', for_action: isItemBody ? 'created' : 'commented' },
   })
 }
 
@@ -183,6 +183,14 @@ async function handleCreate(ctx, req, res, who) {
   if (who.kind === 'agent' && !authorizeAgentWrite(db, who.userId, who.deviceId, body.convo_id)) return notFound(res)
   if (filteredAgent(db, who) && convo.agent_device_id != null && isPrivateDevice(db, convo.agent_device_id)) return notFound(res)
   const createdBy = body.on_behalf_of === 'user' || who.kind !== 'agent' ? 'user' : 'agent'
+  // Voice notes on the item BODY get the same treatment as a comment's (see
+  // the comments route below): a user's are transcribed here, announced
+  // pending, and the `created` turn waits for the words. Keyed off the WRITER,
+  // like the wake: an agent filing on the user's behalf has no audio to send.
+  const bodyAudio = [...new Set((v.value.attachments ?? []).filter(isAudioAttachment).map((a) => a.blob_ref))]
+  const transcribeHere = who.kind !== 'agent' && bodyAudio.length > 0
+    && !!ctx.itemTranscription?.enabled && ctx.itemTranscription.admit(who.userId, bodyAudio.length)
+  if (transcribeHere) v.value.attachments = markTranscriptsPending(v.value.attachments)
   let out
   try {
     out = createItem(db, {
@@ -198,7 +206,14 @@ async function handleCreate(ctx, req, res, who) {
     throw err
   }
   // A replayed idempotency key must not fan a second marker out.
-  if (!out.duplicate) emitMarker(ctx, who, { item: out.item, action: 'created', by: createdBy })
+  if (!out.duplicate) {
+    // The body's attachments ride on the `created` marker only when there is
+    // a transcript to wait for — it is where a bridge reads `pending` from.
+    emitMarker(ctx, who, { item: out.item, action: 'created', by: createdBy, comment: transcribeHere ? out.bodyComment : null })
+    if (transcribeHere && out.bodyComment) {
+      for (const blobRef of bodyAudio) ctx.itemTranscription.enqueue({ commentId: out.bodyComment.id, userId: who.userId, blobRef })
+    }
+  }
   json(res, out.duplicate ? 200 : 201, { item: out.item })
   return true
 }
@@ -374,8 +389,9 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     // sender is the agent), but without it an open item view never learned
     // the words had arrived and showed a bare voice note until its next
     // refetch. Same `updated` + `transcription` shape the journal's own job
-    // announces with (emitTranscriptionMarker).
-    emitMarker(ctx, who, { item: getItem(db, who.userId, item.id) ?? item, action: 'updated', comment: c, extra: { transcription: 'done', for_action: 'commented' } })
+    // announces with (emitTranscriptionMarker) — including `for_action`: the
+    // item body's synthetic comment belongs to the `created` turn.
+    emitMarker(ctx, who, { item: getItem(db, who.userId, item.id) ?? item, action: 'updated', comment: c, extra: { transcription: 'done', for_action: c.meta?.role === 'body' ? 'created' : 'commented' } })
     json(res, 200, { comment: c })
     return true
   }

@@ -255,16 +255,22 @@ export function createItem(db, {
       }
       throw err
     }
+    let bodyCommentId = null
     if (attachments.length) {
       // Item-body attachments ride on a synthetic first comment of kind
       // 'status' with meta.role='body' so the thread has one place for
       // blob refs; rowToItem exposes them as item.attachments via listItems'
       // decoration query. Simpler than a fourth table.
+      bodyCommentId = newId('ic')
       db.prepare(`INSERT INTO item_comments(id,item_id,user_id,author,device_id,kind,body,attachments,meta,created_at)
         VALUES(?,?,?,?,?,'status','',?,?,?)`)
-        .run(newId('ic'), id, userId, createdBy, originDeviceId, JSON.stringify(attachments), JSON.stringify({ role: 'body' }), now)
+        .run(bodyCommentId, id, userId, createdBy, originDeviceId, JSON.stringify(attachments), JSON.stringify({ role: 'body' }), now)
     }
-    return { item: getItem(db, userId, id), duplicate: false }
+    // `bodyComment`: the synthetic row above, so the caller can queue its
+    // voice notes for transcription exactly like a comment's (null without
+    // attachments, and on a duplicate — a replay queues nothing).
+    const bodyComment = bodyCommentId ? rowToComment(db.prepare('SELECT * FROM item_comments WHERE id=?').get(bodyCommentId)) : null
+    return { item: getItem(db, userId, id), bodyComment, duplicate: false }
   })()
 }
 
@@ -504,6 +510,9 @@ export function finishAttachmentTranscript(db, { commentId, blobRef, transcript,
     const failed = atts.some((a) => a.transcript_status === 'failed')
     return {
       changed, settled, failed, userId: c.user_id, deviceId: c.device_id,
+      // The synthetic body row of createItem: its voice notes belong to the
+      // `created` turn, not to a reply.
+      isItemBody: parseJson(c.meta, null)?.role === 'body',
       comment: rowToComment(db.prepare('SELECT * FROM item_comments WHERE id=?').get(commentId)),
       item: getItem(db, c.user_id, c.item_id),
     }
