@@ -1340,6 +1340,12 @@ the whisper run — and ignores the `updated` marker like any other. Pending
 jobs left by a restart are re-queued at boot. With whisper unconfigured none
 of this happens: no status field, and the origin bridge does the job.
 
+A voice note on a new item's **body** (`POST /items` `attachments`, user
+callers only) is handled identically: the body's attachments live on a
+synthetic comment, so the `created` marker carries that comment (empty
+`body`, the attachments `pending`) — only in this case — and the follow-up is
+`for_action:'created'`. The item body is still fetched with `GET /items/:id`.
+
 The bridge's PATCH announces itself the same way: one quiet `updated` marker
 with `transcription:'done'` (sender = the agent, so no bridge routes it as
 input), so an open item view refreshes when the words land.

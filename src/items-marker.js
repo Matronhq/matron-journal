@@ -73,7 +73,10 @@ export function itemFallbackText(p, { actor = 'someone', body = null } = {}) {
   const needsUser = p.by === 'agent' && p.awaiting === 'user'
   const lines = []
   const c = p.comment && typeof p.comment === 'object' ? p.comment : null
-  const text = c ? c.body : (p.action === 'created' ? body : null)
+  // A `created` marker may carry the body's attachments as a comment (voice
+  // notes awaiting a transcript) whose own `body` is empty: the prose is still
+  // the item body.
+  const text = p.action === 'created' ? (body ?? c?.body ?? null) : (c ? c.body : null)
   if (typeof text === 'string' && text.trim()) lines.push(cut(text.trim(), 500))
   for (const a of Array.isArray(c?.attachments) ? c.attachments : []) {
     const name = oneLine(a?.name) || 'attachment'

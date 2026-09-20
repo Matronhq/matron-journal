@@ -194,3 +194,28 @@ test('close(): aborts the running job, leaves it pending for the next boot, and 
   assert.equal(seenSignal.aborted, true)
   assert.equal(listPendingTranscripts(s.db).length, 1)
 })
+
+test("a voice note on a new item's BODY: created marker carries it pending, follow-up is for_action:created", async (t) => {
+  const tr = gatedTranscriber()
+  const { s, agent, client } = await fleet(t, { transcriber: tr })
+  const ws = await makeWsClient(s.base, { token: agent.token, cursor: null })
+  await ws.waitFor((f) => f.op === 'hello_ok')
+  const r = await s.http('/items', { method: 'POST', token: client, body: { kind: 'task', title: 'Spoken task', body: 'see the note', convo_id: 'c1', attachments: [voice('b1')] } })
+  assert.equal(r.status, 201); assert.equal(r.json.item.attachments[0].transcript_status, 'pending')
+  const created = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'item' && f.payload.action === 'created' && f.payload.num === r.json.item.num)
+  assert.equal(created.payload.comment.attachments[0].transcript_status, 'pending')
+  // The old-client fallback text still leads with the item body, plus the note.
+  const fb = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'text' && f.payload.fallback_for === 'item' && f.payload.num === r.json.item.num)
+  assert.match(fb.payload.body, /see the note\n\[voice note b1\.m4a\]/)
+  tr.release('do the thing')
+  const up = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'item' && f.payload.action === 'updated' && f.payload.num === r.json.item.num)
+  assert.equal(up.payload.for_action, 'created'); assert.equal(up.payload.transcription, 'done')
+  assert.equal(up.payload.comment.id, created.payload.comment.id)
+  assert.equal(up.payload.comment.attachments[0].transcript, 'do the thing')
+  ws.close()
+  assert.equal((await s.http(`/items/${r.json.item.id}`, { token: client })).json.item.attachments[0].transcript, 'do the thing')
+  // An agent-filed item, and one with no audio, put no comment on the marker.
+  const plain = await s.http('/items', { method: 'POST', token: client, body: { kind: 'task', title: 'Plain', convo_id: 'c1', attachments: [{ blob_ref: 'img', mime: 'image/png', name: 'a.png', size: 1 }] } })
+  const pm = JSON.parse(s.db.prepare("SELECT payload FROM events WHERE type='item' ORDER BY seq DESC LIMIT 1").get().payload)
+  assert.equal(pm.num, plain.json.item.num); assert.equal(pm.comment, undefined)
+})
