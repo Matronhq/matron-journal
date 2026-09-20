@@ -18,6 +18,9 @@ import { runOffload, runExpireLogs, runReapMedia } from './retention.js'
 import { backfillSearchIndex } from './search.js'
 import { makeRpcBroker } from './rpc-broker.js'
 import { makeWaker } from './wake.js'
+import { makeTranscriber } from './transcribe.js'
+import { makeItemTranscription } from './items-transcribe.js'
+import { emitTranscriptionMarker } from './items-http.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
@@ -276,7 +279,7 @@ export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
   toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
-  mediaReapHighPct, mediaReapLowPct, waker,
+  mediaReapHighPct, mediaReapLowPct, waker, transcriber,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
@@ -324,11 +327,20 @@ export function startServer({
   })
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
   const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient })
+  // Voice notes on tracker items are transcribed here when whisper is
+  // configured (MATRON_WHISPER_MODEL; src/transcribe.js) — off otherwise, and
+  // then the origin bridge does it as before. `transcriber` is the test seam;
+  // `null` forces it off.
+  const itemTranscription = makeItemTranscription({
+    db,
+    transcriber: transcriber === undefined ? makeTranscriber() : transcriber,
+    onSettled: (out) => emitTranscriptionMarker({ db, hub, pushPipeline, waker: resolvedWaker }, out),
+  })
   const server = http.createServer(makeHttpHandler({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
-    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, waker: resolvedWaker,
+    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, waker: resolvedWaker, itemTranscription,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
@@ -352,6 +364,9 @@ export function startServer({
         mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
+      // Whatever a previous process left mid-transcription: a bridge is
+      // holding a turn for each, so finish them (or fail them) now.
+      itemTranscription.recover()
       // Fire-and-forget: search serves partial results until this finishes
       // (self-healing — spec). shouldStop lets close() end the walk cleanly
       // instead of racing a closed DB handle.
@@ -367,10 +382,12 @@ export function startServer({
         broker,
         toolStreams,
         pushPipeline,
+        itemTranscription,
         preapproveKey: resolvedPreapproveKey,
         searchBackfill,
         close: () => new Promise((r) => {
           closing = true
+          itemTranscription.close?.()
           if (retentionInterval) clearInterval(retentionInterval)
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
           wss.close()

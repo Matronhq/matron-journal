@@ -10,7 +10,18 @@ export const ITEM_EVENT_TYPE = 'item'
 // learns of the change without re-polling /items.
 export const ITEM_ACTIONS = ['created', 'commented', 'closed', 'reopened', 'reordered', 'updated']
 
-export function itemMarkerPayload({ item, action, by, comment = null }) {
+//
+// Journal-side transcription adds two optional things (src/items-transcribe.js).
+// An audio attachment the journal is transcribing carries
+// `transcript_status:'pending'` on the marker that announces it: a bridge that
+// knows the field holds the agent's turn instead of running its own whisper.
+// When the job settles, a second, quiet `updated` marker carries the comment
+// again with `transcription:'done'|'failed'` and `for_action` (the action the
+// held turn belongs to): apps refresh the transcript from it, the bridge
+// releases the turn. A bridge that predates the fields sees `transcript:null`
+// on the first marker and transcribes as it always did, and ignores the
+// `updated` one like any other.
+export function itemMarkerPayload({ item, action, by, comment = null, extra = null }) {
   const payload = {
     item_id: item.id,
     num: item.num,
@@ -27,9 +38,11 @@ export function itemMarkerPayload({ item, action, by, comment = null }) {
       body: comment.body,
       attachments: (comment.attachments || []).map((a) => ({
         blob_ref: a.blob_ref, mime: a.mime, name: a.name, size: a.size, transcript: a.transcript ?? null,
+        ...(a.transcript_status ? { transcript_status: a.transcript_status } : {}),
       })),
     }
   }
+  if (extra) Object.assign(payload, extra)
   return payload
 }
 

@@ -1297,7 +1297,7 @@ learn from `mission_num`). `attachments`
 here is the item **body**'s attachments (set at create only, v1) — a
 comment's own attachments live on the comment. Comment shape:
 `{id, item_id, author, device_id, kind:'comment'|'status', body,
-created_at, attachments[{blob_ref,mime,name,size,transcript?}], meta}`.
+created_at, attachments[{blob_ref,mime,name,size,transcript?,transcript_status?}], meta}`.
 `meta` is `null` for an ordinary comment and `{from:{state,
 resolution,awaiting}, to:{…}}` for the synthetic `status` comment a
 close/reopen writes. `idem_key` is an internal column on both and is never
@@ -1305,11 +1305,44 @@ returned (same stance as the event shape's `user_id`/`idem_key`/`blob_ref`
 strip); a comment omits `user_id` too — the caller is the owner by
 construction.
 
-An attachment's `transcript` is **agent-attested**: it is written only by
+An attachment's `transcript` is **never caller-authored**: it is written only
+by the journal's own transcription job (below) or by the origin bridge's
 `PATCH /items/:id/comments/:cid`, and one supplied by a client on a create
 or a comment is stripped before storage (not a 400 — the blob still lands,
 just without the forged words). It is the text the apps show in place of a
 voice note, so it must never be caller-authored.
+
+**Journal-side transcription.** When the journal host has whisper configured
+(`MATRON_WHISPER_MODEL` — path to a whisper.cpp `ggml-*.bin`; optional
+`MATRON_WHISPER_CLI`, default `<model dir>/../build/bin/whisper-cli`;
+`MATRON_WHISPER_LANGUAGE`, default `en`; `ffmpeg` on `PATH`), a **user's**
+comment with `audio/*` attachments is transcribed on upload, one job at a
+time:
+
+1. The comment is stored, and the `commented` marker announced, with
+   `transcript_status:'pending'` on each audio attachment (`transcript:null`).
+   Wake and push behave as for any comment, so a sleeping box boots while
+   whisper runs.
+2. Each job writes `transcript` and `transcript_status:'done'`, or
+   `'failed'` (whisper error, empty result, blob missing or not the user's).
+3. When the comment's **last** pending attachment settles, one quiet marker
+   follows: `action:'updated'`, the same `comment` (now with transcripts),
+   plus `transcription:'done'|'failed'` (`failed` if any attachment failed)
+   and `for_action:'commented'`. Sender and `by` are the commenting user's.
+   Quiet = no wake, no push, no fallback text.
+
+A bridge that knows the fields **holds the agent's turn** on a marker with a
+pending attachment and delivers it from the follow-up marker (falling back to
+its own whisper on `failed`, or if no follow-up arrives in time). A bridge
+that predates them sees `transcript:null`, transcribes as it always did and
+PATCHes the words in — which settles the status, so the journal's job skips
+the whisper run — and ignores the `updated` marker like any other. Pending
+jobs left by a restart are re-queued at boot. With whisper unconfigured none
+of this happens: no status field, and the origin bridge does the job.
+
+The bridge's PATCH announces itself the same way: one quiet `updated` marker
+with `transcription:'done'` (sender = the agent, so no bridge routes it as
+input), so an open item view refreshes when the words land.
 
 Rules: the `awaiting` default at creation depends on the kind **and on who
 filed it**. An agent-filed item takes the kind default — a `question`
