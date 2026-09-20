@@ -389,8 +389,9 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     // sender is the agent), but without it an open item view never learned
     // the words had arrived and showed a bare voice note until its next
     // refetch. Same `updated` + `transcription` shape the journal's own job
-    // announces with (emitTranscriptionMarker).
-    emitMarker(ctx, who, { item: getItem(db, who.userId, item.id) ?? item, action: 'updated', comment: c, extra: { transcription: 'done', for_action: 'commented' } })
+    // announces with (emitTranscriptionMarker) — including `for_action`: the
+    // item body's synthetic comment belongs to the `created` turn.
+    emitMarker(ctx, who, { item: getItem(db, who.userId, item.id) ?? item, action: 'updated', comment: c, extra: { transcription: 'done', for_action: c.meta?.role === 'body' ? 'created' : 'commented' } })
     json(res, 200, { comment: c })
     return true
   }

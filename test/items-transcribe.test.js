@@ -13,9 +13,12 @@ function gatedTranscriber() {
   const waiters = []
   return {
     calls,
-    transcribeFile(diskPath) {
+    transcribeFile(diskPath, { signal } = {}) {
       calls.push(diskPath)
-      return new Promise((resolve, reject) => waiters.push({ resolve, reject }))
+      return new Promise((resolve, reject) => {
+        waiters.push({ resolve, reject })
+        signal?.addEventListener('abort', () => reject(new Error('aborted'))) // as execFile does
+      })
     },
     release(text) { waiters.shift().resolve(text) },
     fail(msg = 'boom') { waiters.shift().reject(new Error(msg)) },
@@ -214,6 +217,12 @@ test("a voice note on a new item's BODY: created marker carries it pending, foll
   assert.equal(up.payload.comment.attachments[0].transcript, 'do the thing')
   ws.close()
   assert.equal((await s.http(`/items/${r.json.item.id}`, { token: client })).json.item.attachments[0].transcript, 'do the thing')
+  // The bridge's own PATCH onto the body row is labelled the same way.
+  const viaBridge = await s.http('/items', { method: 'POST', token: client, body: { kind: 'task', title: 'Second', convo_id: 'c1', attachments: [voice('b2')] } })
+  const bodyCid = JSON.parse(s.db.prepare("SELECT payload FROM events WHERE type='item' ORDER BY seq DESC LIMIT 1").get().payload).comment.id
+  assert.equal((await s.http(`/items/${viaBridge.json.item.id}/comments/${bodyCid}`, { method: 'PATCH', token: agent.token, body: { blob_ref: 'b2', transcript: 'bridge words' } })).status, 200)
+  const patched = JSON.parse(s.db.prepare("SELECT payload FROM events WHERE type='item' ORDER BY seq DESC LIMIT 1").get().payload)
+  assert.equal(patched.action, 'updated'); assert.equal(patched.for_action, 'created')
   // An agent-filed item, and one with no audio, put no comment on the marker.
   const plain = await s.http('/items', { method: 'POST', token: client, body: { kind: 'task', title: 'Plain', convo_id: 'c1', attachments: [{ blob_ref: 'img', mime: 'image/png', name: 'a.png', size: 1 }] } })
   const pm = JSON.parse(s.db.prepare("SELECT payload FROM events WHERE type='item' ORDER BY seq DESC LIMIT 1").get().payload)

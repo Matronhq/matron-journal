@@ -19,7 +19,7 @@ const DEFAULT_MAX_QUEUED_PER_USER = 10
 
 export function makeItemTranscription({
   db, transcriber, onSettled, log = console,
-  maxQueued = DEFAULT_MAX_QUEUED, maxQueuedPerUser = DEFAULT_MAX_QUEUED_PER_USER, retryDelayMs = 500,
+  maxQueued = DEFAULT_MAX_QUEUED, maxQueuedPerUser = DEFAULT_MAX_QUEUED_PER_USER, retryDelayMs = 500, closeTimeoutMs = 5000,
 }) {
   if (!transcriber) {
     return { enabled: false, admit: () => false, enqueue() {}, recover: () => 0, idle: () => Promise.resolve(), close: () => Promise.resolve() }
@@ -112,7 +112,9 @@ export function makeItemTranscription({
       closed = true
       abort.abort()
       let timer
-      const giveUp = new Promise((r) => { timer = setTimeout(r, 5000); timer.unref?.() })
+      // NOT unref'd: while a stuck job is all that is left, this timer is what
+      // keeps the loop alive long enough for shutdown to finish at all.
+      const giveUp = new Promise((r) => { timer = setTimeout(r, closeTimeoutMs) })
       return Promise.race([tail.catch(() => {}), giveUp]).finally(() => clearTimeout(timer))
     },
   }
