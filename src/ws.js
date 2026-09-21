@@ -26,6 +26,11 @@ const AGENT_PUBLISH_TYPES = new Set([
   'text', 'prompt', 'prompt_reply', 'tool_output', 'diff',
   'permission_request', 'file', 'image', 'edit', 'summary',
 ])
+// The subset of agent publishes that are a MESSAGE to the conversation's
+// other agents (an agent_chat_send into a room lands as one of these) and
+// so should start a joined peer whose box is asleep. Status, streams,
+// summaries and prompts are the publishing agent's own bookkeeping.
+const ROOM_WAKE_PUBLISH_TYPES = new Set(['text', 'file', 'image'])
 
 // activity op (typing/tool-use indicators, spec §6 ephemeral): the only
 // states a bridge may broadcast. Anything else is bad_request.
@@ -668,7 +673,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
   // Purely additive: every op keeps its existing answer. Shared with the
   // HTTP items routes — see src/wake.js for the full rationale.
   const wakeIfOffline = (agentDeviceId) => wakeIfOfflineShared({ db, hub, waker }, conn.userId, agentDeviceId)
-  const wakeConvoAgent = (convoId) => wakeConvoAgentShared({ db, hub, waker }, conn.userId, convoId)
+  const wakeConvoAgent = (convoId, opts) => wakeConvoAgentShared({ db, hub, waker }, conn.userId, convoId, opts)
   // Membership convo_meta fan (spec: multi-agent room tags): live clients
   // re-chip a room the moment its membership changes. Best-effort like every
   // other post-commit notification in the invite lifecycle — by the time
@@ -1532,6 +1537,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           blobRef: msg.blob_ref ?? null,
           idemKey: msg.idem_key ? `agent:${conn.deviceId}:${msg.idem_key}` : null,
         })
+        // After the append (which authorized the write): a message into a
+        // room should also start any joined peer whose box is asleep. The
+        // writer's own box is awake by definition. Additive, like the
+        // client `send` path above — the publish is already answered.
+        if (ROOM_WAKE_PUBLISH_TYPES.has(msg.type)) wakeConvoAgent(msg.convo_id, { exceptDeviceId: conn.deviceId })
         break
       }
       case 'stream': {

@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { joinedAgentIds } from './participants.js'
 
 // Wake-on-message for idle-stopped agent boxes (yearbook shared-2 design,
 // 2026-08-17). The infra host winds down dev VMs idle for 90 minutes; the
@@ -89,8 +90,21 @@ export function wakeIfOffline({ db, hub, waker }, userId, agentDeviceId) {
   waker.wake(dev.name)
 }
 
-export function wakeConvoAgent({ db, hub, waker }, userId, convoId) {
+// Every agent device a message into this conversation is FOR: the managing
+// agent, plus — when the conversation is an agent-chat room — each joined
+// participant (state 'joined' is exactly the set with delivery rights, see
+// participants.js). Until 2026-09-21 only the owner was woken, so a room
+// message for a guest whose box had idle-stopped sat unread until something
+// unrelated started that box. `exceptDeviceId` is the writer: an agent
+// posting into a room is awake by definition, and waking it would spend the
+// debounce window on a no-op.
+export function wakeConvoAgent({ db, hub, waker }, userId, convoId, { exceptDeviceId = null } = {}) {
   if (!waker || !waker.enabled) return
   const row = db.prepare('SELECT agent_device_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)
-  if (row && row.agent_device_id != null) wakeIfOffline({ db, hub, waker }, userId, row.agent_device_id)
+  if (!row) return
+  const targets = new Set(joinedAgentIds(db, convoId))
+  if (row.agent_device_id != null) targets.add(row.agent_device_id)
+  for (const id of targets) {
+    if (id !== exceptDeviceId) wakeIfOffline({ db, hub, waker }, userId, id)
+  }
 }
