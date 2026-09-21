@@ -84,7 +84,7 @@ test('spawn_request parks a row, publishes a client-only card into the parent co
   assert.equal(target.frames.find(isSpawnCard), undefined)
 })
 
-test('spawn_request against an offline box is refused before any card exists', async (t) => {
+test('spawn_request against an offline box with no wake command is refused before any card exists', async (t) => {
   const { s, targetDev, parent, client } = await spawnFleet(t, { connectTarget: false })
   parent.send({
     op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo',

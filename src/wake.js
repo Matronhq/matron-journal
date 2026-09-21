@@ -77,17 +77,24 @@ export function makeWaker({
   }
 }
 
-// Shared by ws.js (send / prompt_reply / agent_request / spawn_request) and
+// Shared by ws.js (send / prompt_reply / agent_request / spawn_request /
+// agent_invite / agent_join), http.js (spawn approval, invite approval) and
 // items-http.js (user-authored item markers): traffic for an agent device
 // with no live socket asks the infra layer to start its box. Same-user
 // scoping mirrors the anti-enumeration stance of every call site.
+//
+// Returns true when the box is now being woken (a wake command was fired,
+// or one is already in flight under the waker's debounce) — the signal
+// spawn_request and approveSpawn use to decide whether waiting for the box
+// can ever pay off. False when it is already online, when no waker is
+// configured, or when the device is not a wakeable agent box.
 export function wakeIfOffline({ db, hub, waker }, userId, agentDeviceId) {
-  if (!waker || !waker.enabled || !Number.isInteger(agentDeviceId)) return
+  if (!waker || !waker.enabled || !Number.isInteger(agentDeviceId)) return false
   const online = hub.connsOf(userId).some((c) => c.deviceId === agentDeviceId && c.ws.readyState === 1)
-  if (online) return
+  if (online) return false
   const dev = db.prepare('SELECT name, kind FROM devices WHERE id=? AND user_id=?').get(agentDeviceId, userId)
-  if (!dev || dev.kind !== 'agent') return
-  waker.wake(dev.name)
+  if (!dev || dev.kind !== 'agent') return false
+  return waker.wake(dev.name) === true
 }
 
 // Every agent device a message into this conversation is FOR: the managing
