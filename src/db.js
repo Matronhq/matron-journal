@@ -242,6 +242,13 @@ CREATE TABLE IF NOT EXISTS search_backfill_state(
   id INTEGER PRIMARY KEY CHECK(id=1),
   last_events_rowid INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS device_status(
+  device_id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  reported_at INTEGER NOT NULL,
+  status TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_device_status_user ON device_status(user_id);
 `
 
 export function openDb(path) {
@@ -646,6 +653,30 @@ export function listDevices(db, userId) {
   return db.prepare(
     'SELECT id AS device_id, kind, name, tag_char, created_at, cursor, last_seen_at, push_prefs FROM devices WHERE user_id=? ORDER BY id'
   ).all(userId).map((d) => ({ ...d, lag: headSeq - d.cursor, push_prefs: parsePushPrefs(d.push_prefs) }))
+}
+
+// Box status (spec: 2026-09-21 "usage and allowances live in the journal").
+// The last capacity report a bridge sent for its own box — activity,
+// limits, disk, account — persisted so every client sees every box's last
+// known state, including a box that is asleep and one this client has never
+// talked to. One row per device, latest wins; the JSON is already sanitised
+// (sanitizeBoxStatus in spawns.js) before it lands here.
+export function upsertDeviceStatus(db, { userId, deviceId, status, reportedAt = Date.now() }) {
+  db.prepare(
+    `INSERT INTO device_status(device_id, user_id, reported_at, status) VALUES (?,?,?,?)
+     ON CONFLICT(device_id) DO UPDATE SET user_id=excluded.user_id, reported_at=excluded.reported_at, status=excluded.status`
+  ).run(deviceId, userId, reportedAt, JSON.stringify(status))
+}
+
+// deviceId -> {reported_at, activity?, limits?, disk?, account?} for one
+// user. A row whose JSON no longer parses (never expected) is skipped rather
+// than failing the whole roster.
+export function deviceStatuses(db, userId) {
+  const out = new Map()
+  for (const r of db.prepare('SELECT device_id, reported_at, status FROM device_status WHERE user_id=?').all(userId)) {
+    try { out.set(r.device_id, { reported_at: r.reported_at, ...JSON.parse(r.status) }) } catch { /* skip */ }
+  }
+  return out
 }
 
 // The privacy flag, read side. False for unknown ids: a caller checking a

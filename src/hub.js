@@ -164,6 +164,16 @@ export function makeHub({ coalesceMs = 200 } = {}) {
     // what sendRpcResponse has always done (responses carry no side
     // effects; a mid-reconnect device briefly has two sockets and both may
     // hear). Also carries invite-lifecycle frames (agent chat phase 2).
+    // Every live CLIENT socket of one user — box-status fan-out: a box's
+    // capacity report is not about any conversation, so it rides neither
+    // the journal (nothing to replay) nor the per-convo ephemeral coalescer
+    // (keyed on convo_id). Agent sockets are skipped: they read box status
+    // through spawn_targets when they need it.
+    sendToClients(userId, frame) {
+      for (const c of byUser.get(userId) || []) {
+        if (c.kind === 'client' && c.ws.readyState === 1) c.ws.send(JSON.stringify(frame))
+      }
+    },
     sendToDevice(userId, deviceId, frame) {
       for (const c of byUser.get(userId) || []) {
         if (c.deviceId === deviceId && c.ws.readyState === 1) c.ws.send(JSON.stringify(frame))
