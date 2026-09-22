@@ -707,10 +707,16 @@ export function upsertDeviceStatus(db, { userId, deviceId, status, reportedAt = 
 // "gone". Read-then-write is atomic here: better-sqlite3 is synchronous and
 // nothing yields between the two statements.
 export function mergeDeviceStatus(db, { userId, deviceId, status, reportedAt = Date.now() }) {
-  const row = db.prepare('SELECT status FROM device_status WHERE device_id=? AND user_id=?').get(deviceId, userId)
-  let kept = {}
-  if (row) { try { kept = JSON.parse(row.status) } catch { /* unreadable: start over */ } }
+  const { reported_at: _, ...kept } = getDeviceStatus(db, userId, deviceId) || {}
   upsertDeviceStatus(db, { userId, deviceId, status: { ...kept, ...status }, reportedAt })
+}
+
+// One device's stored report, {reported_at, ...blocks}, or null when it has
+// never reported (or its JSON no longer parses — treated as never).
+export function getDeviceStatus(db, userId, deviceId) {
+  const row = db.prepare('SELECT reported_at, status FROM device_status WHERE device_id=? AND user_id=?').get(deviceId, userId)
+  if (!row) return null
+  try { return { reported_at: row.reported_at, ...JSON.parse(row.status) } } catch { return null }
 }
 
 // deviceId -> {reported_at, activity?, limits?, disk?, account?} for one

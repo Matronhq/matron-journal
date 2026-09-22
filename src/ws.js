@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
-import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, deviceStatuses } from './db.js'
+import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses } from './db.js'
 import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, CONVO_ID_MAX_CHARS } from './journal.js'
 import { joinedAgentIds, participantIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
@@ -1034,6 +1034,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             let disk = null
             let reportedAt = null
             if (online) {
+              const issuedAt = Date.now()
               const r = await broker.issue(hub, conn.userId, d.device_id, 'recent_folders', null, { timeoutMs: spawnFoldersTimeoutMs })
               if (r.ok && Array.isArray(r.result?.folders)) folders = r.result.folders
               if (r.ok) {
@@ -1051,8 +1052,20 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
                 // the full row.
                 const fresh = sanitizeBoxStatus(r.result)
                 if (fresh) {
-                  reportedAt = Date.now()
-                  try { mergeDeviceStatus(db, { userId: conn.userId, deviceId: d.device_id, status: fresh, reportedAt }) } catch (err) { console.error('spawn_targets: device_status merge failed', err) }
+                  // A box_status that landed while this RPC was in flight is
+                  // newer than the reply (the bridge composed it later):
+                  // list that row and leave it alone, rather than merging a
+                  // stale reply over it and stamping the listing reply-time.
+                  const current = getDeviceStatus(db, conn.userId, d.device_id)
+                  if (current && current.reported_at >= issuedAt) {
+                    activity = current.activity ?? null
+                    limits = current.limits ?? null
+                    disk = current.disk ?? null
+                    reportedAt = current.reported_at
+                  } else {
+                    reportedAt = Date.now()
+                    try { mergeDeviceStatus(db, { userId: conn.userId, deviceId: d.device_id, status: fresh, reportedAt }) } catch (err) { console.error('spawn_targets: device_status merge failed', err) }
+                  }
                 }
               }
             } else if (stored.has(d.device_id)) {

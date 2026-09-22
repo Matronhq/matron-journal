@@ -136,3 +136,28 @@ test('spawn_targets: a live reply refreshes the blocks it carries and keeps the 
   assert.deepEqual(row.status.account, { email: 'dan@example.com' })
   assert.deepEqual(row.status.limits, LIMITS)
 })
+
+test('spawn_targets: a box_status that lands while recent_folders is in flight wins over the delayed reply', async (t) => {
+  const { s, dan, agDev, agent } = await fleet(t)
+  const NEWER = { ...LIMITS, lines: [{ id: '5h', label: 'Current session', percent: 77, resets: 'in 1h' }] }
+  let reportedAt = null
+  const answer = agent.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders', 3000)
+    .then(async (req) => {
+      // RPC issued; the bridge's own report arrives before it answers.
+      agent.send({ op: 'box_status', limits: NEWER, account: { email: 'dan@example.com' } })
+      await new Promise((r) => setTimeout(r, 80))
+      reportedAt = deviceStatuses(s.db, dan.id).get(agDev.deviceId).reported_at
+      agent.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { folders: [], limits: LIMITS, disk: DISK } })
+    })
+  agent.send({ op: 'spawn_targets', request_id: 'q3' })
+  await answer
+  const reply = await agent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets', 5000)
+  const me = reply.boxes.find((b) => b.device_id === agDev.deviceId)
+  assert.deepEqual(me.limits, NEWER, 'the listing carries the newer report, not the stale reply')
+  assert.equal(me.reported_at, reportedAt)
+  assert.equal('disk' in me, false, 'the stale reply contributes nothing')
+  const stored = deviceStatuses(s.db, dan.id).get(agDev.deviceId)
+  assert.deepEqual(stored.limits, NEWER, 'the stale reply did not overwrite the row')
+  assert.deepEqual(stored.account, { email: 'dan@example.com' })
+  assert.equal(stored.reported_at, reportedAt)
+})
