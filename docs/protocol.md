@@ -1124,7 +1124,7 @@ A parent agent may ask a target agent to start a new session (child conversation
 
 `link` is opt-in because a spawn is normally a clean break: the child gets the task and its provenance in its opening turn, the parent gets the outcome, and an automatic room only made the child narrate progress back to a parent that relayed it on. A parent that later needs a channel opens one with an ordinary `agent_chat_start` against the child (it is on the roster like any session). With `link: true` the approval also mints a room — see "Answering" below.
 
-Acknowledgement: `{kind:'spawn', event:'pending', request_id, spawn_id}` — the spawn row is now parked in `awaiting_user` state, and a `permission_request` event has been appended to the parent's conversation with `payload.kind: 'agent_spawn'` (client-only).
+Acknowledgement: `{kind:'spawn', event:'pending', request_id, spawn_id}` — the spawn row is now parked in `awaiting_user` state, and a `permission_request` event has been appended to the parent's conversation with `payload.kind: 'agent_spawn'` (client-only). A `question` item mirroring the card has also been filed on the parent conversation — see "Tracker item" below.
 
 **Errors.** `forbidden` for a client connection (agent-only, same stance as the room ops); `not_ready` if sent before this connection's own hello replay completes (mid-replay it's invisible to the delivery scan an outcome frame would need). `bad_request` covers: a missing/non-string/oversized `request_id` (≤128 chars, `RPC_ID_MAX_CHARS`); an empty or oversized `workdir` (≤1024 chars, `SPAWN_WORKDIR_MAX_CHARS`) or `task` (≤2000 chars, `SPAWN_TASK_MAX_CHARS`) — and the same check re-run *after* peer-text sanitisation, so an all-control-character string that sanitises down to empty is rejected too; an oversized `topic` when present (≤200 chars, `INVITE_TOPIC_MAX_CHARS`); a non-string or oversized `model` when present (≤64 chars, `SPAWN_MODEL_MAX_CHARS`); a non-boolean `link` when present; a non-integer `target_device_id`; targeting **self** (`target_device_id === conn.deviceId`); and a missing/empty `from_convo_id`. `not_found` covers: an unknown `target_device_id`, one belonging to another user, a client-kind device, or a private device seen by a non-private caller — all indistinguishable, anti-enumeration, same stance as `agent_invite`'s `target_device_id`; and a `from_convo_id` that doesn't resolve to a top-level conversation this device owns (foreign, unknown, or a child conversation — `parent_convo_id` set), mirroring `agent_invite`'s `from_convo_id` check. `agent_unreachable` — the target box has no live registered connection right now; checked, and refused, **before** the consent card is published, so the user's tap is never spent on an ask that cannot work. `conflict` (`detail:'too many requests awaiting user approval'`) — the requesting device already has `MAX_AWAITING_PER_REQUESTER` (3) rows in `awaiting_user`, counted jointly with agent-chat's pending asks (see "Pending-ask cap" below).
 
@@ -1176,6 +1176,28 @@ Like agent-chat cards, this is a **client-only event** excluded from agent deliv
 **Model.** `model` is optional and names which Claude model the child session should run — an alias like `opus` or a full model id like `claude-opus-4-20250514`. The vocabulary is the **target bridge's**, not the journal's: this is a length bound (`SPAWN_MODEL_MAX_CHARS`, 64) and the usual peer-text sanitisation only, never an allowlist, so a bridge that learns a new alias keeps working against an older journal. It is stored on the spawn row and relayed to the target in the `start` RPC params **only when non-empty** — a request that names no model produces the exact params a pre-`model` journal sent, and the consent card omits the key rather than carrying an empty one. An unrecognised model is the target's business to reject (its `start` error surfaces as the usual `failed` outcome).
 
 sent with `sender: "agent:<name>"`, same sender convention as any other agent-authored event.
+
+### Tracker item
+
+(spec: `docs/superpowers/specs/2026-09-22-consent-items-design.md`.) The card sits in one conversation's timeline and is easy to lose; the Decisions list is where the user looks for things that need an answer. So the moment a card is journaled, the journal also files a **tracker item** on the parent conversation (`src/consent-items.js`, `fileSpawnConsentItem`) and the row remembers it (`agent_spawn_requests.item_id`):
+
+- `kind: 'question'`, `awaiting: 'user'`, `created_by: 'agent'`, origin = the parent conversation and device (so it inherits the parent's mission like any item filed there), placed at the **top** of the open list.
+- `title`: `Approve spawn on <target_name> — <topic, or the head of the task>`; `labels: ['consent']`; `links: [{url: 'matron://consent/spawn/<request_id>', title}]` — the link is how a client that learns to embed the card in item detail finds the ask; until then the item's origin chip is the way back to the conversation holding the card.
+- `body`: who asks, the box, the workdir, the model and the room flag when present, the task **verbatim**, and how to answer (open the named conversation, tap Approve or Decline on the card, 24 h expiry). Peer strings arrive already sanitised from the card; a backtick in a workdir is stripped rather than let close its code span.
+- Its `created` marker is written under the **asking agent's device** (same sender as the card), so no bridge treats it as user input, and it is **quiet**: no push (the card's own `permission_request` push already rang the pocket), no wake, and **no old-client fallback text** (`emitMarker`'s `fallback: false`) — a fallback `text` would overwrite the card's `🤝 Agent spawn request` snippet and count a second unread for one ask. Connected clients still learn of the item live from the marker.
+
+**The item is a mirror, never a second source of truth.** Answering happens on the card (`POST /agent-spawn/answer`); the row's state machine decides what the item says. `emitSpawnOutcome` — the one funnel every terminal transition passes through — closes it (`closeSpawnConsentItem`) between the durable `spawn_outcome` append and the ephemeral frame, so the tracker is settled by the time the parent hears:
+
+| outcome | resolution | closing note (status row) | attributed to |
+|---|---|---|---|
+| `started` | `decided` | `Approved — the session started on <target>.` (+ room sentence for a linked ask) | the user; the answering client device (`answeredByDeviceId`, threaded from the answer route through `approveSpawn`) |
+| `declined` | `decided` | `Declined.` | the user; the answering client device |
+| `expired` | `cancelled` | `Expired — no answer within 24 h.` | the asking agent's device |
+| `failed` | `cancelled` | `Approved, but the session could not be started (<error_code>).` | the asking agent's device |
+
+The `closed` marker is as quiet as the `created` one. An item the user already closed by hand is left exactly as they left it (`closeItem` answers null and the outcome proceeds); a row with no `item_id` — one parked before the mirror existed, or one whose filing failed — resolves with no item at all. Filing and closing are **best-effort by contract**: a tracker failure is logged and never costs the ask, the card, or the outcome frame.
+
+Because items are user-wide, the parent's task text is readable through `GET /items` by every non-private agent of the user while the ask is open — the same text the card withholds from agents (`isClientOnlyEvent`). That is the trade the design makes on purpose (the user asked for the task in the item), recorded in the spec; a stricter sieve is a follow-up, not an accident.
 
 ### Answering
 
@@ -1293,7 +1315,9 @@ mission_num}`. `mission_id`/`mission_num` are the mission this item belongs
 to — both `null` when it has none — set by `PATCH /items/:id {mission}` or
 inherited when the item's origin conversation joins a mission (see *Missions
 & milestones*, whose *Visibility* section covers what an ordinary agent may
-learn from `mission_num`). `attachments`
+learn from `mission_num`). `links[].url` must be `http(s)://` or the apps' own `matron://` (item
+links, consent asks — see *Agent-spawned sessions → Tracker item*); any
+other scheme is 400. `attachments`
 here is the item **body**'s attachments (set at create only, v1) — a
 comment's own attachments live on the comment. Comment shape:
 `{id, item_id, author, device_id, kind:'comment'|'status', body,
