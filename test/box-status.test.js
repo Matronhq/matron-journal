@@ -111,3 +111,28 @@ test('spawn_targets: a live recent_folders reply is stored as the box status; an
   assert.ok(Number.isInteger(asleep.reported_at))
   assert.deepEqual(asleep.folders, [])
 })
+
+test('spawn_targets: a live reply refreshes the blocks it carries and keeps the ones it omits (account never rides recent_folders)', async (t) => {
+  const { s, dan, agDev, clientToken, agent } = await fleet(t)
+  agent.send({ op: 'box_status', limits: LIMITS, disk: { free_bytes: 1, total_bytes: 100 }, account: { email: 'dan@example.com' } })
+  await new Promise((r) => setTimeout(r, 80))
+  const before = deviceStatuses(s.db, dan.id).get(agDev.deviceId)
+  assert.deepEqual(before.account, { email: 'dan@example.com' })
+  await new Promise((r) => setTimeout(r, 5))
+  // The recent_folders reply carries activity and a newer disk, no limits, no account.
+  const answer = agent.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders', 3000)
+    .then((req) => agent.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { folders: [], activity: ACTIVITY, disk: DISK } }))
+  agent.send({ op: 'spawn_targets', request_id: 'q2' })
+  await answer
+  await agent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets', 5000)
+  const after = deviceStatuses(s.db, dan.id).get(agDev.deviceId)
+  assert.deepEqual(after.activity, ACTIVITY, 'carried block refreshed')
+  assert.deepEqual(after.disk, DISK, 'carried block replaced, not merged inside')
+  assert.deepEqual(after.limits, LIMITS, 'omitted block kept')
+  assert.deepEqual(after.account, { email: 'dan@example.com' }, 'account kept: recent_folders never carries it')
+  assert.ok(after.reported_at > before.reported_at)
+  const devs = await s.http('/devices', { token: clientToken })
+  const row = devs.json.devices.find((d) => d.device_id === agDev.deviceId)
+  assert.deepEqual(row.status.account, { email: 'dan@example.com' })
+  assert.deepEqual(row.status.limits, LIMITS)
+})

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
-import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, deviceStatuses } from './db.js'
+import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, deviceStatuses } from './db.js'
 import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, CONVO_ID_MAX_CHARS } from './journal.js'
 import { joinedAgentIds, participantIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
@@ -1044,11 +1044,15 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
                 disk = sanitizeSpawnDisk(r.result?.disk)
                 // A live reply is also the freshest status this journal
                 // holds for the box: keep it, so the next reader (or the
-                // next time the box is asleep) sees these numbers.
+                // next time the box is asleep) sees these numbers. Merged,
+                // not replaced: this reply never carries account and may
+                // omit other blocks, and an omission here is "not in this
+                // RPC", not "gone" — the box's own box_status still owns
+                // the full row.
                 const fresh = sanitizeBoxStatus(r.result)
                 if (fresh) {
                   reportedAt = Date.now()
-                  try { upsertDeviceStatus(db, { userId: conn.userId, deviceId: d.device_id, status: fresh, reportedAt }) } catch (err) { console.error('spawn_targets: device_status upsert failed', err) }
+                  try { mergeDeviceStatus(db, { userId: conn.userId, deviceId: d.device_id, status: fresh, reportedAt }) } catch (err) { console.error('spawn_targets: device_status merge failed', err) }
                 }
               }
             } else if (stored.has(d.device_id)) {

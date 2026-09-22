@@ -243,7 +243,7 @@ CREATE TABLE IF NOT EXISTS search_backfill_state(
   last_events_rowid INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS device_status(
-  device_id INTEGER PRIMARY KEY,
+  device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
   user_id INTEGER NOT NULL,
   reported_at INTEGER NOT NULL,
   status TEXT NOT NULL
@@ -541,6 +541,36 @@ export function openDb(path) {
   // table of grants that nothing consults still reads like a live security
   // control to the next person who finds it.
   db.exec('DROP TABLE IF EXISTS agent_chat_allowances')
+  // Retrofit the device_status -> devices cascade onto a database that
+  // created the table before it carried one (the constraint cannot be added
+  // in place; same rebuild as convo_agents above). Without it a revoked box
+  // left its last report behind, and since devices.id is a plain rowid the
+  // next box to take that id inherited the old usage, paths and account on
+  // /devices and /roster until it reported. The copy skips rows whose device
+  // is already gone — with foreign_keys=ON the INSERT would refuse them.
+  const dsNow = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='device_status'").get()
+  if (dsNow && !dsNow.sql.includes('ON DELETE CASCADE')) {
+    const orphans = db.prepare(
+      'SELECT COUNT(*) n FROM device_status WHERE device_id NOT IN (SELECT id FROM devices)'
+    ).get().n
+    db.exec(`
+      CREATE TABLE device_status_fk(
+        device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL,
+        reported_at INTEGER NOT NULL,
+        status TEXT NOT NULL
+      );
+      INSERT INTO device_status_fk
+        SELECT device_id, user_id, reported_at, status FROM device_status
+         WHERE device_id IN (SELECT id FROM devices);
+      DROP TABLE device_status;
+      ALTER TABLE device_status_fk RENAME TO device_status;
+      CREATE INDEX IF NOT EXISTS idx_device_status_user ON device_status(user_id);
+    `)
+    if (orphans > 0) {
+      console.log(`device_status: dropped ${orphans} report(s) whose device was already revoked`)
+    }
+  }
   // One-time title cleanup (spec: agent box rename). Gated on user_version
   // inside, so this is a cheap pragma read on every subsequent open.
   healBakedTitles(db, { log: (m) => console.log(m) })
@@ -666,6 +696,21 @@ export function upsertDeviceStatus(db, { userId, deviceId, status, reportedAt = 
     `INSERT INTO device_status(device_id, user_id, reported_at, status) VALUES (?,?,?,?)
      ON CONFLICT(device_id) DO UPDATE SET user_id=excluded.user_id, reported_at=excluded.reported_at, status=excluded.status`
   ).run(deviceId, userId, reportedAt, JSON.stringify(status))
+}
+
+// The partial-report write: refresh the blocks `status` carries, keep the
+// stored blocks it omits. For a source that never speaks the whole report —
+// a recent_folders reply carries activity/limits/disk at most, never
+// account — so one live fan-out cannot erase what the box's own box_status
+// said. A bridge's box_status stays a full replacement (upsertDeviceStatus):
+// it always sends everything it knows, and omitting a block there means
+// "gone". Read-then-write is atomic here: better-sqlite3 is synchronous and
+// nothing yields between the two statements.
+export function mergeDeviceStatus(db, { userId, deviceId, status, reportedAt = Date.now() }) {
+  const row = db.prepare('SELECT status FROM device_status WHERE device_id=? AND user_id=?').get(deviceId, userId)
+  let kept = {}
+  if (row) { try { kept = JSON.parse(row.status) } catch { /* unreadable: start over */ } }
+  upsertDeviceStatus(db, { userId, deviceId, status: { ...kept, ...status }, reportedAt })
 }
 
 // deviceId -> {reported_at, activity?, limits?, disk?, account?} for one
