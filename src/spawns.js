@@ -98,7 +98,7 @@ export function emitSpawnOutcome(db, hub, { userId, fromDeviceId, fromConvoId, r
   } catch (err) {
     console.error('emitSpawnOutcome: durable outcome append failed', err)
   }
-  closeSpawnConsentItem({ db, hub }, getSpawn(db, requestId), { outcome, errorCode, roomId, answeredByDeviceId })
+  closeSpawnConsentItem({ db, hub }, requestId, { outcome, errorCode, roomId, answeredByDeviceId })
   hub.sendToDevice(userId, fromDeviceId, { kind: 'spawn', event: 'outcome', request_id: requestId, outcome, ...extras })
 }
 

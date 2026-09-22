@@ -1,6 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { spawnConsentItemFields, spawnConsentClosing, consentLink } from '../src/consent-items.js'
+import { spawnConsentItemFields, spawnConsentClosing, consentLink, fileSpawnConsentItem, closeSpawnConsentItem } from '../src/consent-items.js'
+import { openDb } from '../src/db.js'
+import { createUser, createAgent } from '../src/auth.js'
+import { upsertConversation } from '../src/journal.js'
 
 const card = {
   request_id: 'sp-1', from_name: 'dev-6', from_convo_title: 'parent session',
@@ -60,4 +63,41 @@ test('spawnConsentClosing: approve and decline are decided by the user; expiry a
   const failed = spawnConsentClosing({ outcome: 'failed', errorCode: 'agent_unreachable' }, { targetName: 'eric' })
   assert.equal(failed.resolution, 'cancelled'); assert.equal(failed.author, 'agent')
   assert.ok(failed.comment.includes('Approved') && failed.comment.includes('agent_unreachable'))
+})
+
+test('spawnConsentItemFields: the task is fenced, so markdown in it (images, links, emphasis) renders as text', () => {
+  const f = spawnConsentItemFields({ ...card, task: '![p](https://x/px.png) **bold** [go](https://phish)' })
+  assert.ok(f.body.includes('```\n![p](https://x/px.png) **bold** [go](https://phish)\n```'))
+  assert.ok(!f.body.includes('> !['))
+})
+
+test('spawnConsentItemFields: markup in device and conversation names is stripped, never rendered', () => {
+  const f = spawnConsentItemFields({ ...card, from_name: 'dev*6_[x]', target_name: 'er**ic', from_convo_title: 'ses"sion <b>' })
+  assert.ok(f.body.includes('**dev6x** asks'))
+  assert.ok(f.body.includes('on **eric**'))
+  assert.ok(f.body.includes('"session b"'))
+  assert.equal(f.title, 'Approve spawn on eric — flaky test')
+})
+
+test('spawnConsentClosing: an outcome this build does not know closes neutrally, never as an approval', () => {
+  const c = spawnConsentClosing({ outcome: 'weird' }, { targetName: 'eric' })
+  assert.equal(c.resolution, 'cancelled'); assert.equal(c.author, 'agent')
+  assert.ok(!c.comment.includes('Approved'))
+  assert.ok(c.comment.includes('weird'))
+})
+
+test('closeSpawnConsentItem never throws: a lookup that fails is a false, not an exception past the outcome frame', () => {
+  const broken = { prepare() { throw new Error('database connection is not open') } }
+  assert.equal(closeSpawnConsentItem({ db: broken, hub: null }, 'sp-1', { outcome: 'declined' }), false)
+})
+
+test('fileSpawnConsentItem against a spawn row that is gone files nothing: create and link are one transaction', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const agent = createAgent(db, dan.id, 'dev-6')
+  upsertConversation(db, { id: 'c1', ownerUserId: dan.id, title: 'C1', agentDeviceId: agent.deviceId })
+  const hub = { broadcast() {}, sendToDevice() {}, connsOf() { return [] } }
+  const item = fileSpawnConsentItem({ db, hub }, { userId: dan.id, fromDeviceId: agent.deviceId, fromName: 'dev-6', fromConvoId: 'c1', spawnId: 'no-such-row', card })
+  assert.equal(item, null)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM items').get().n, 0)
 })

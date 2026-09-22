@@ -1091,3 +1091,17 @@ test('a spawn row with no consent item (filed before the mirror existed) resolve
   const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
   assert.equal(out.outcome, 'declined')
 })
+
+test('a tracker failure never costs the ask: the card is published, pending is acked, the row simply has no item', async (t) => {
+  const { s, targetDev, parent, client } = await spawnFleet(t)
+  // Take the tracker away from under the ask.
+  s.db.exec('ALTER TABLE items RENAME TO items_gone')
+  t.after(() => { try { s.db.exec('ALTER TABLE items_gone RENAME TO items') } catch {} })
+  parent.send({ op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo', target_device_id: targetDev.deviceId, workdir: '/w', task: 'do it' })
+  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  await client.waitFor(isSpawnCard)
+  const row = getSpawn(s.db, ack.spawn_id)
+  assert.equal(row.state, 'awaiting_user')
+  assert.equal(row.item_id, null)
+  assert.equal(parent.frames.some((f) => f.kind === 'control' && f.op === 'error'), false)
+})

@@ -974,7 +974,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // outcome. After the card and before the ack: the card is the
         // commit point above; the item is best-effort and its own failure
         // never costs the ask (the row's item_id simply stays NULL).
-        fileSpawnConsentItem({ db, hub }, { userId: conn.userId, fromDeviceId: conn.deviceId, fromConvoId: msg.from_convo_id, spawnId, card: cardPayload })
+        fileSpawnConsentItem({ db, hub }, { userId: conn.userId, fromDeviceId: conn.deviceId, fromName: conn.name, fromConvoId: msg.from_convo_id, spawnId, card: cardPayload })
         conn.ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: rid, spawn_id: spawnId }))
         break
       }
