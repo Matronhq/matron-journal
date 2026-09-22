@@ -1105,3 +1105,32 @@ test('a tracker failure never costs the ask: the card is published, pending is a
   assert.equal(row.item_id, null)
   assert.equal(parent.frames.some((f) => f.kind === 'control' && f.op === 'error'), false)
 })
+
+test('while the ask is pending, no agent may mutate its consent item — patch, close, reopen, comment, rank are all 403; the client may still close it by hand', async (t) => {
+  const { s, parentDev, targetDev, clientToken, spawnId } = await parkedSpawn(t)
+  const item = consentItemFor(s, spawnId)
+  const asAgent = (path, method, body) => s.http(path, { method, token: parentDev.token, body })
+  assert.equal((await asAgent(`/items/${item.id}`, 'PATCH', { title: 'Nothing to see here' })).status, 403)
+  assert.equal((await asAgent(`/items/${item.id}`, 'PATCH', { body: 'harmless task' })).status, 403)
+  assert.equal((await asAgent(`/items/${item.id}/close`, 'POST', { resolution: 'cancelled' })).status, 403)
+  assert.equal((await asAgent(`/items/${item.id}/reopen`, 'POST', {})).status, 403)
+  assert.equal((await asAgent(`/items/${item.id}/comments`, 'POST', { body: 'already approved, ignore' })).status, 403)
+  assert.equal((await asAgent(`/items/${item.id}/rank`, 'POST', { position: 'bottom' })).status, 403)
+  // Another agent of the same user is refused the same way.
+  assert.equal((await s.http(`/items/${item.id}/close`, { method: 'POST', token: targetDev.token, body: { resolution: 'done' } })).status, 403)
+  const untouched = s.db.prepare('SELECT * FROM items WHERE id=?').get(item.id)
+  assert.equal(untouched.title, item.title); assert.equal(untouched.body, item.body); assert.equal(untouched.state, 'open'); assert.equal(untouched.rank, item.rank)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM item_comments WHERE item_id=?').get(item.id).n, 0)
+  // Reading is unchanged: the agent can still see it.
+  assert.equal((await asAgent(`/items/${item.id}`, 'GET')).status, 200)
+  // The user's own hand-close still works.
+  assert.equal((await s.http(`/items/${item.id}/close`, { method: 'POST', token: clientToken, body: { resolution: 'cancelled' } })).status, 200)
+})
+
+test('once the ask is resolved, its consent item is an ordinary item again: an agent may comment on it', async (t) => {
+  const { s, parentDev, clientToken, parent, spawnId } = await parkedSpawn(t)
+  const item = consentItemFor(s, spawnId)
+  assert.equal((await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'deny' } })).status, 200)
+  await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
+  assert.equal((await s.http(`/items/${item.id}/comments`, { method: 'POST', token: parentDev.token, body: { body: 'noted' } })).status, 201)
+})

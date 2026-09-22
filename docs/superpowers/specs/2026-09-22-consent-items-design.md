@@ -41,12 +41,22 @@ the answering client device), `expired`/`failed` → `cancelled` (the ask
 lapsed, attributed to the asking agent's device), each with a one-line
 closing note. Item #162's resolution mapping, kept verbatim.
 
+**Markdown-safe.** The body is the first place another agent's words meet
+a markdown renderer: the task sits in a fence longer than its longest
+backtick run (so it stays verbatim), names have markup stripped, a
+backtick in a workdir is dropped from its code span.
+
 **Quiet.** The item's markers are written under the asking agent's device
 (the card's sender): no bridge turns them into a session turn (bridges
 route only `user:*` markers), no push (the card already pushed), no wake,
 and no old-client fallback text — a fallback `text` is a message and would
 overwrite the card's snippet and double the unread. `emitMarker` gains a
 `fallback` flag for this.
+
+**Journal-owned while pending.** Any agent mutation of the item through
+the item routes is `403` until the ask resolves (the asking agent, if
+prompt-injected, must not rewrite what the user reads or close the item
+out of sight); reads and the user's own hand-close are unaffected.
 
 **Best-effort.** A tracker failure is logged and never costs the ask, the
 card, or the outcome frame. An item the user closed by hand stays as they

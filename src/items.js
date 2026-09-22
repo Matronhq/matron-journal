@@ -547,3 +547,16 @@ export function rerankItem(db, { userId, itemId, position, after, before, now = 
   })()
 }
 
+
+// Is this item the tracker mirror of a consent ask that is still parked?
+// (src/consent-items.js.) While it is, the item is journal-owned: what the
+// user reads there must stay what the journal wrote, and it must stay in
+// the open list until the ask itself resolves — so items-http.js refuses
+// every AGENT mutation of it (the asking agent, prompt-injected, could
+// otherwise rewrite the task it shows or close it out of sight). Clients
+// are not gated: a hand-close is the user's own call, and the outcome
+// leaves it as they left it. Queried here, not in consent-items.js, so
+// items-http.js does not import a module that imports it back.
+export function isPendingConsentMirror(db, itemId) {
+  return !!db.prepare("SELECT 1 FROM agent_spawn_requests WHERE item_id=? AND state='awaiting_user'").get(itemId)
+}

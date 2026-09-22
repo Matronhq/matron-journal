@@ -101,3 +101,10 @@ test('fileSpawnConsentItem against a spawn row that is gone files nothing: creat
   assert.equal(item, null)
   assert.equal(db.prepare('SELECT COUNT(*) n FROM items').get().n, 0)
 })
+
+test('spawnConsentItemFields: a task containing a backtick fence stays verbatim — the fence around it just grows', () => {
+  const task = 'run ``` then ```` and report'
+  const f = spawnConsentItemFields({ ...card, task })
+  assert.ok(f.body.includes(`\`\`\`\`\`\n${task}\n\`\`\`\`\``))
+  assert.ok(!f.body.includes(`\n\`\`\`\n${task}`))
+})

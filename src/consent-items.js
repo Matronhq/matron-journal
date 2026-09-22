@@ -29,10 +29,18 @@ const cut = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
 // close it; markup characters in a name would bold, link or image-load
 // from inside the sentence around it; and the task goes in a fence, whose
 // closing marker must start a line of its own — the task is single-line
-// (sanitizePeerText), so nothing in it can end the fence early.
+// (sanitizePeerText), so nothing in it can end the fence early. The task
+// itself is never altered (it is what the user approves and the child
+// runs): a task carrying backtick runs simply gets a longer fence than
+// its longest run, which is the CommonMark rule for keeping it inside.
 const codeSpan = (s) => `\`${String(s).replace(/`/g, '')}\``
 const plain = (s) => String(s ?? '').replace(/[*_`~[\]()<>!#|\\"]/g, '')
-const fenced = (s) => `\`\`\`\n${String(s).replace(/`{3,}/g, '')}\n\`\`\``
+const fenced = (s) => {
+  const text = String(s)
+  const longest = Math.max(0, ...(text.match(/`+/g) || []).map((run) => run.length))
+  const fence = '`'.repeat(Math.max(3, longest + 1))
+  return `${fence}\n${text}\n${fence}`
+}
 
 // The item's writable fields, from the consent card's payload (already
 // sanitised at the ws boundary: single-line, capped peer text).
