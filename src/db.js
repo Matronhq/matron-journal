@@ -446,6 +446,16 @@ export function openDb(path) {
       console.log(`convo_agents: dropped ${orphans} membership row(s) whose device was already revoked`)
     }
   }
+  // Consent items (spec 2026-09-22 consent-items): the tracker item that
+  // mirrors a parked chat ask, NULL for rows predating the mirror. After
+  // BOTH convo_agents rebuilds above for the reason target_convo_id is: a
+  // rebuild recreates the table from a fixed definition. A renewed row
+  // (a fresh ask after a deny/expiry) gets a fresh item, overwriting this.
+  const caCols = db.prepare('PRAGMA table_info(convo_agents)').all()
+  if (!caCols.some((c) => c.name === 'item_id')) {
+    db.exec('ALTER TABLE convo_agents ADD COLUMN item_id TEXT')
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_convo_agents_item ON convo_agents(item_id)')
   // Which Claude model the spawned session should run (spec: agent-spawned
   // sessions). An alias like 'opus' or a full model id — the target bridge's
   // vocabulary, not the journal's, so no CHECK: a bridge that learns a new
@@ -480,6 +490,15 @@ export function openDb(path) {
   if (!spawnCols.some((c) => c.name === 'child_short')) {
     db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN child_short TEXT')
   }
+  // Consent items (spec 2026-09-22 consent-items): the tracker item that
+  // mirrors this ask, NULL for rows predating the mirror (they resolve
+  // without one). Not a foreign key — same stance as mission_id.
+  if (!spawnCols.some((c) => c.name === 'item_id')) {
+    db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN item_id TEXT')
+  }
+  // items.js isConsentMirror / listItems' excludeConsent look items up by
+  // this column on every agent read; keep both point lookups.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_spawn_item ON agent_spawn_requests(item_id)')
   // refreshSpawnRoomTitle (spawns.js) looks a started row up by its child
   // on every titled convo_upsert; keep that a point lookup.
   db.exec('CREATE INDEX IF NOT EXISTS idx_spawn_child ON agent_spawn_requests(child_convo_id)')
@@ -499,6 +518,17 @@ export function openDb(path) {
     db.exec('ALTER TABLE items ADD COLUMN mission_id TEXT')
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_items_mission ON items(mission_id, state, awaiting)')
+  // Consent items (spec 2026-09-22 consent-items): 'spawn' | 'chat' on the
+  // tracker mirror of a consent card, NULL on every ordinary item. Carried
+  // on the ITEM, not derived from the spawn/convo_agents row that points at
+  // it: a renewed chat ask reuses its row and re-points item_id, and a
+  // device revoke cascades the row away — either would otherwise turn the
+  // old mirror, justification and all, into an ordinary agent-readable item.
+  const itemConsentCols = db.prepare('PRAGMA table_info(items)').all()
+  if (!itemConsentCols.some((c) => c.name === 'consent')) {
+    db.exec('ALTER TABLE items ADD COLUMN consent TEXT')
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_items_consent ON items(consent)')
   // Standing agent-chat consent ("always allow A -> B") is gone: every ask
   // parks for the user now. Dropped rather than left in place, because a
   // table of grants that nothing consults still reads like a live security

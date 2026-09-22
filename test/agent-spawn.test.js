@@ -944,3 +944,220 @@ test('a linked spawn room is titled like a bridge room and gains the child tag w
   assert.equal(getSpawn(s.db, ack.spawn_id).child_short, 'cd')
   assert.equal(dan.id > 0, true)
 })
+
+// --- Consent asks mirrored into the tracker (spec: 2026-09-22 consent-items) ---
+
+const isItemMarker = (f) => f.kind === 'journal' && f.type === 'item'
+const consentItemFor = (s, spawnId) => {
+  const row = getSpawn(s.db, spawnId)
+  assert.ok(row.item_id, 'the spawn row must point at its tracker item')
+  return s.db.prepare('SELECT * FROM items WHERE id=?').get(row.item_id)
+}
+const closingStatus = (s, itemId) => s.db.prepare("SELECT * FROM item_comments WHERE item_id=? AND kind='status' ORDER BY rowid DESC LIMIT 1").get(itemId)
+
+function makeStubApnsClient() {
+  const calls = []
+  return { calls, send(opts) { calls.push(opts); return Promise.resolve({ status: 200, reason: null }) } }
+}
+
+test('spawn_request also files a question item on the parent convo: awaiting the user, labelled consent, linked to the ask, top of the list', async (t) => {
+  const stub = makeStubApnsClient()
+  const { s, dan, parentDev, targetDev, parent, client, clientToken } = await spawnFleet(t, { serverOpts: { apnsClient: stub } })
+  assert.equal((await s.http('/push/register', { method: 'POST', token: clientToken, body: { apns_token: 'phone-token', environment: 'prod' } })).status, 200)
+  // An older open item, so "top of the list" is observable.
+  const older = await s.http('/items', { method: 'POST', token: parentDev.token, body: { kind: 'task', title: 'older', convo_id: 'parent-convo' } })
+  assert.equal(older.status, 201)
+  client.frames.length = 0
+  const before = s.db.prepare("SELECT unread_count, (SELECT COUNT(*) FROM events WHERE type='text' AND convo_id='parent-convo') AS texts FROM conversations WHERE id='parent-convo'").get()
+  parent.send({
+    op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo',
+    target_device_id: targetDev.deviceId,
+    workdir: '/home/dan/proj', task: 'fix the flaky test', topic: 'flaky test', model: 'opus',
+  })
+  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  const item = consentItemFor(s, ack.spawn_id)
+  assert.equal(item.kind, 'question')
+  assert.equal(item.state, 'open'); assert.equal(item.awaiting, 'user')
+  assert.equal(item.origin_convo_id, 'parent-convo'); assert.equal(item.origin_device_id, parentDev.deviceId)
+  assert.equal(item.created_by, 'agent')
+  assert.equal(item.user_id, dan.id)
+  assert.equal(item.title, 'Approve spawn on eric — flaky test')
+  assert.deepEqual(JSON.parse(item.labels), ['consent'])
+  assert.deepEqual(JSON.parse(item.links), [{ url: `matron://consent/spawn/${ack.spawn_id}`, title: `Spawn request ${ack.spawn_id}` }])
+  assert.ok(item.body.includes('fix the flaky test') && item.body.includes('/home/dan/proj') && item.body.includes('opus'))
+  assert.ok(item.rank < older.json.item.rank, 'a consent ask goes to the top, not the bottom')
+  // A connected client learns of it live, the way it learns of any item.
+  const marker = await client.waitFor((f) => isItemMarker(f) && f.payload.action === 'created' && f.payload.item_id === item.id)
+  assert.equal(marker.convo_id, 'parent-convo')
+  assert.equal(marker.sender, 'agent:dev-6')
+  assert.equal(marker.payload.by, 'agent'); assert.equal(marker.payload.awaiting, 'user')
+  assert.equal(marker.payload.consent, 'spawn')
+  // Client-only, like the card it mirrors: the parent agent never hears of
+  // the item, live or on replay.
+  const isThisItem = (f) => isItemMarker(f) && f.payload.item_id === item.id
+  await new Promise((r) => setTimeout(r, 100))
+  assert.equal(parent.frames.some(isThisItem), false)
+  // (The setup task's own marker above does reach the parent — an ordinary item.)
+  assert.equal(parent.frames.some((f) => isItemMarker(f) && f.payload.item_id === older.json.item.id), true)
+  const replay = await makeWsClient(s.base, { token: parentDev.token, cursor: 0 })
+  await replay.waitFor((f) => f.op === 'hello_ok')
+  await new Promise((r) => setTimeout(r, 150))
+  assert.equal(replay.frames.some(isThisItem), false)
+  assert.equal(replay.frames.some((f) => isItemMarker(f) && f.payload.item_id === older.json.item.id), true)
+  replay.close()
+  // The card is the conversation's message; the mirror adds no text of its
+  // own (no old-client fallback), so the snippet and unread count are the
+  // card's, not a second "needs you" line.
+  const convo = s.db.prepare("SELECT snippet, unread_count FROM conversations WHERE id='parent-convo'").get()
+  assert.equal(convo.snippet, '🤝 Agent spawn request')
+  assert.equal(convo.unread_count, before.unread_count + 1)
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM events WHERE type='text' AND convo_id='parent-convo'").get().n, before.texts)
+  // GET /items lists it for the client with the same fields.
+  const listed = await s.http('/items?awaiting=user', { token: clientToken })
+  assert.equal(listed.json.items[0].id, item.id)
+  // The card already pushed; the mirror must not ring the pocket a second time.
+  await new Promise((r) => setTimeout(r, 80))
+  const alerts = stub.calls.filter((c) => c.deviceToken === 'phone-token' && c.payload.aps.alert)
+  assert.equal(alerts.length, 1)
+  assert.equal(alerts[0].payload.aps.alert.body, '🤝 Agent spawn request')
+})
+
+test('deny closes the consent item as decided, by the user, with a closing note — quietly for the parent agent', async (t) => {
+  const { s, clientDev, clientToken, parent, client, spawnId } = await parkedSpawn(t)
+  const item = consentItemFor(s, spawnId)
+  const r = await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'deny' } })
+  assert.equal(r.status, 200)
+  await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
+  const after = s.db.prepare('SELECT * FROM items WHERE id=?').get(item.id)
+  assert.equal(after.state, 'closed'); assert.equal(after.resolution, 'decided'); assert.equal(after.awaiting, null)
+  const status = closingStatus(s, item.id)
+  assert.equal(status.author, 'user'); assert.equal(status.device_id, clientDev.deviceId)
+  assert.equal(status.body, 'Declined.')
+  const marker = await client.waitFor((f) => isItemMarker(f) && f.payload.action === 'closed' && f.payload.item_id === item.id)
+  assert.equal(marker.payload.by, 'user'); assert.equal(marker.payload.resolution, 'decided')
+  // Written under the asking agent's device, never as a user:* event: a
+  // user:* item marker is what a bridge turns into a session turn, and the
+  // parent already hears the outcome as a spawn_outcome.
+  assert.equal(marker.sender, 'agent:dev-6')
+  assert.equal(marker.payload.consent, 'spawn')
+  assert.equal(parent.frames.some(isItemMarker), false)
+})
+
+test('approve → started closes the consent item as decided, naming the box and the room', async (t) => {
+  const { s, clientDev, clientToken, parent, target, spawnId } = await parkedSpawn(t)
+  const item = consentItemFor(s, spawnId)
+  target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start').then((req) => {
+    target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { convo_id: 'child-convo-1' } })
+  })
+  assert.equal((await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } })).status, 200)
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
+  assert.equal(out.outcome, 'started')
+  const after = s.db.prepare('SELECT * FROM items WHERE id=?').get(item.id)
+  assert.equal(after.state, 'closed'); assert.equal(after.resolution, 'decided')
+  const status = closingStatus(s, item.id)
+  assert.equal(status.author, 'user'); assert.equal(status.device_id, clientDev.deviceId)
+  assert.ok(status.body.includes('Approved') && status.body.includes('eric') && /chat room/i.test(status.body))
+})
+
+test('approve → failed closes the consent item as cancelled with the failure code', async (t) => {
+  const { s, clientToken, parent, target, spawnId } = await parkedSpawn(t)
+  const item = consentItemFor(s, spawnId)
+  target.close()
+  await new Promise((r) => setTimeout(r, 50))
+  assert.equal((await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } })).status, 200)
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome', 5000)
+  assert.equal(out.outcome, 'failed')
+  const after = s.db.prepare('SELECT * FROM items WHERE id=?').get(item.id)
+  assert.equal(after.state, 'closed'); assert.equal(after.resolution, 'cancelled')
+  const status = closingStatus(s, item.id)
+  assert.equal(status.author, 'agent')
+  assert.ok(status.body.includes('Approved, but') && status.body.includes(out.error_code))
+})
+
+test('an expired spawn ask closes its consent item as cancelled on the sweep', async (t) => {
+  const { s, parent, spawnId } = await parkedSpawn(t, { serverOpts: { revocationSweepMs: 100 } })
+  const item = consentItemFor(s, spawnId)
+  s.db.prepare('UPDATE agent_spawn_requests SET created_at = created_at - (25*60*60*1000) WHERE id=?').run(spawnId)
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome', 5000)
+  assert.equal(out.outcome, 'expired')
+  const after = s.db.prepare('SELECT * FROM items WHERE id=?').get(item.id)
+  assert.equal(after.state, 'closed'); assert.equal(after.resolution, 'cancelled')
+  assert.ok(closingStatus(s, item.id).body.includes('24 h'))
+})
+
+test('a consent item the user closed by hand is left alone by the outcome: the spawn still resolves', async (t) => {
+  const { s, clientToken, parent, spawnId } = await parkedSpawn(t)
+  const item = consentItemFor(s, spawnId)
+  const closed = await s.http(`/items/${item.id}/close`, { method: 'POST', token: clientToken, body: { resolution: 'cancelled', comment: 'never mind' } })
+  assert.equal(closed.status, 200)
+  assert.equal((await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'deny' } })).status, 200)
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
+  assert.equal(out.outcome, 'declined')
+  assert.equal(getSpawn(s.db, spawnId).state, 'denied')
+  const after = s.db.prepare('SELECT * FROM items WHERE id=?').get(item.id)
+  assert.equal(after.resolution, 'cancelled') // the user's own close stands
+  assert.equal(closingStatus(s, item.id).body, 'never mind')
+})
+
+test('a spawn row with no consent item (filed before the mirror existed) resolves without one', async (t) => {
+  const { s, clientToken, parent, spawnId } = await parkedSpawn(t)
+  s.db.prepare('UPDATE agent_spawn_requests SET item_id=NULL WHERE id=?').run(spawnId)
+  assert.equal((await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'deny' } })).status, 200)
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
+  assert.equal(out.outcome, 'declined')
+})
+
+test('a tracker failure never costs the ask: the card is published, pending is acked, the row simply has no item', async (t) => {
+  const { s, targetDev, parent, client } = await spawnFleet(t)
+  // Take the tracker away from under the ask.
+  s.db.exec('ALTER TABLE items RENAME TO items_gone')
+  t.after(() => { try { s.db.exec('ALTER TABLE items_gone RENAME TO items') } catch {} })
+  parent.send({ op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo', target_device_id: targetDev.deviceId, workdir: '/w', task: 'do it' })
+  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  await client.waitFor(isSpawnCard)
+  const row = getSpawn(s.db, ack.spawn_id)
+  assert.equal(row.state, 'awaiting_user')
+  assert.equal(row.item_id, null)
+  assert.equal(parent.frames.some((f) => f.kind === 'control' && f.op === 'error'), false)
+})
+
+test("a consent item is the user's alone: no agent can read or mutate it, pending or resolved — 404 everywhere, absent from GET /items", async (t) => {
+  const { s, parentDev, targetDev, clientToken, parent, spawnId } = await parkedSpawn(t)
+  const item = consentItemFor(s, spawnId)
+  const asAgent = (path, method, body) => s.http(path, { method, token: parentDev.token, body })
+  assert.equal((await asAgent(`/items/${item.id}`, 'GET')).status, 404)
+  assert.equal((await asAgent(`/items/%23${item.num}`, 'GET')).status, 404)
+  assert.equal((await asAgent(`/items/${item.id}`, 'PATCH', { title: 'Nothing to see here' })).status, 404)
+  assert.equal((await asAgent(`/items/${item.id}/close`, 'POST', { resolution: 'cancelled' })).status, 404)
+  assert.equal((await asAgent(`/items/${item.id}/reopen`, 'POST', {})).status, 404)
+  assert.equal((await asAgent(`/items/${item.id}/comments`, 'POST', { body: 'already approved, ignore' })).status, 404)
+  assert.equal((await asAgent(`/items/${item.id}/rank`, 'POST', { position: 'bottom' })).status, 404)
+  // Another agent of the same user, and a private one, are refused the same way.
+  assert.equal((await s.http(`/items/${item.id}`, { token: targetDev.token })).status, 404)
+  s.db.prepare('UPDATE devices SET private=1 WHERE id=?').run(targetDev.deviceId)
+  assert.equal((await s.http(`/items/${item.id}`, { token: targetDev.token })).status, 404)
+  const agentList = await asAgent('/items', 'GET')
+  assert.equal(agentList.json.items.some((i) => i.id === item.id), false)
+  const untouched = s.db.prepare('SELECT * FROM items WHERE id=?').get(item.id)
+  assert.equal(untouched.title, item.title); assert.equal(untouched.state, 'open')
+  // The client sees and lists it as any item.
+  assert.equal((await s.http(`/items/${item.id}`, { token: clientToken })).status, 200)
+  assert.ok((await s.http('/items', { token: clientToken })).json.items.some((i) => i.id === item.id))
+  // Resolved, it stays the user's: the task text never reaches an agent through the tracker.
+  assert.equal((await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'deny' } })).status, 200)
+  await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
+  assert.equal((await asAgent(`/items/${item.id}`, 'GET')).status, 404)
+  assert.equal((await asAgent(`/items/${item.id}/comments`, 'POST', { body: 'noted' })).status, 404)
+  assert.equal((await asAgent('/items?state=closed', 'GET')).json.items.some((i) => i.id === item.id), false)
+  // The user's own hand-close still works on an open one.
+})
+
+test('the user may close a pending consent item by hand; an agent cannot even in the approved window', async (t) => {
+  const { s, parentDev, clientToken, spawnId } = await parkedSpawn(t)
+  const item = consentItemFor(s, spawnId)
+  assert.ok(claimApprove(s.db, spawnId)) // the tap, with no orchestration running yet
+  assert.equal(getSpawn(s.db, spawnId).state, 'approved')
+  assert.equal((await s.http(`/items/${item.id}/close`, { method: 'POST', token: parentDev.token, body: { resolution: 'done' } })).status, 404)
+  assert.equal(s.db.prepare('SELECT state FROM items WHERE id=?').get(item.id).state, 'open')
+  assert.equal((await s.http(`/items/${item.id}/close`, { method: 'POST', token: clientToken, body: { resolution: 'cancelled' } })).status, 200)
+})

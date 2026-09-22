@@ -11,6 +11,7 @@ import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
 import { serveHelp } from './help.js'
 import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
+import { closeChatConsentItem } from './consent-items.js'
 import { handleItemsRoute } from './items-http.js'
 import { handleMissionsRoute } from './missions-http.js'
 import { json, readBody } from './http-body.js'
@@ -391,6 +392,8 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         if (!row || row.state !== 'awaiting_user') return json(res, 409, { error: 'conflict' })
         if (decision === 'deny') {
           answerParkedInvite(db, { convoId: room_id, agentDeviceId: target_device_id, approve: false })
+          // The tracker mirror (spec: 2026-09-22 consent-items), best-effort.
+          closeChatConsentItem({ db, hub }, room_id, target_device_id, { outcome: 'denied', answeredByDeviceId: who.deviceId })
           // Indistinguishable from a peer refusal — reason 'refused', never
           // 'denied' (a requester must never learn the human said no).
           hub.sendToDevice(who.userId, row.initiator_device_id, {
@@ -399,6 +402,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           return json(res, 200, { ok: true })
         }
         answerParkedInvite(db, { convoId: room_id, agentDeviceId: target_device_id, approve: true })
+        closeChatConsentItem({ db, hub }, room_id, target_device_id, { outcome: 'approved', answeredByDeviceId: who.deviceId })
         // Join requests self-target (row.initiator_device_id ===
         // target_device_id, the joiner) — the recipient of THIS row's relay
         // (and, below, the directed-pair target) is the room owner, not the
@@ -435,7 +439,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           if (!denySpawn(db, request_id)) return json(res, 409, { error: 'conflict' })
           // Reported plainly (spec: no peer to hide behind) — 'declined',
           // never a fabricated box-side failure.
-          emitSpawnOutcome(db, hub, { userId: who.userId, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: request_id, outcome: 'declined' })
+          emitSpawnOutcome(db, hub, { userId: who.userId, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: request_id, outcome: 'declined', answeredByDeviceId: who.deviceId })
           return json(res, 200, { ok: true })
         }
         // The tap CLAIMS the row; a zero row-count means another tap already
@@ -446,7 +450,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // it runs off the request cycle — the app needs its 200 now, the
         // outcome reaches the parent as a turn. Errors are contained: the
         // broker timeout guarantees approveSpawn itself always settles.
-        approveSpawn({ db, hub, broker, startTimeoutMs: spawnStartTimeoutMs }, getSpawn(db, request_id))
+        approveSpawn({ db, hub, broker, startTimeoutMs: spawnStartTimeoutMs, answeredByDeviceId: who.deviceId }, getSpawn(db, request_id))
           .catch((err) => console.error('agent-spawn approve orchestration failed', err))
         return json(res, 200, { ok: true })
       }

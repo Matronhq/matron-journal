@@ -7,6 +7,7 @@ import { joinedAgentIds, participantIds, answerInvite, leaveConvo, leaveAllParti
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
+import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem } from './consent-items.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared } from './wake.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
@@ -260,6 +261,9 @@ export function attachWs({
       // decision must be indistinguishable from a deliberate no, or a peer
       // could infer "the user hasn't looked yet" and keep re-asking.
       for (const row of expireAwaiting(db, AWAITING_USER_TTL_MS)) {
+        // The tracker mirror closes as cancelled (spec: 2026-09-22
+        // consent-items); best-effort, before the frame like every close.
+        closeChatConsentItem({ db, hub }, row.convo_id, row.agent_device_id, { outcome: 'expired' })
         const convo = ownerLookup.get(row.convo_id)
         if (!convo) continue
         hub.sendToDevice(convo.owner_user_id, row.initiator_device_id, {
@@ -968,6 +972,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             console.error('spawn_request: card broadcast failed (card is journaled; clients catch up via snapshot)', err)
           }
         }
+        // The card's mirror in the tracker (spec: 2026-09-22 consent-items):
+        // a question item on the parent conversation, closed by the spawn's
+        // outcome. After the card and before the ack: the card is the
+        // commit point above; the item is best-effort and its own failure
+        // never costs the ask (the row's item_id simply stays NULL).
+        fileSpawnConsentItem({ db, hub }, { userId: conn.userId, fromDeviceId: conn.deviceId, fromName: conn.name, fromConvoId: msg.from_convo_id, spawnId, card: cardPayload })
         conn.ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: rid, spawn_id: spawnId }))
         break
       }
@@ -1121,9 +1131,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // Client-only card (isClientOnlyEvent in journal.js): appendAndFan's
         // own fan-out already excludes every agent device, including the
         // room's recorded owner, so this never reaches an agent socket.
-        appendAndFan({
-          userId: conn.userId, convoId: msg.room_id, sender: `agent:${conn.name}`, type: 'permission_request',
-          payload: {
+        const inviteCard = {
             kind: 'agent_chat', request: 'invite', room_id: msg.room_id,
             from_device_id: conn.deviceId, from_name: sanitizePeerText(conn.name, PEER_NAME_CAP),
             target_device_id: msg.target_device_id, topic, justification,
@@ -1145,8 +1153,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             to_name: sanitizePeerText(target.name, PEER_NAME_CAP),
             to_convo_id: targetConvoId ?? '',
             to_convo_title: toConvoTitle,
-          },
-        })
+        }
+        appendAndFan({ userId: conn.userId, convoId: msg.room_id, sender: `agent:${conn.name}`, type: 'permission_request', payload: inviteCard })
+        // The card's mirror in the tracker (spec: 2026-09-22 consent-items),
+        // best-effort — its failure never costs the ask.
+        fileChatConsentItem({ db, hub }, { userId: conn.userId, fromDeviceId: conn.deviceId, fromName: conn.name, roomId: msg.room_id, agentDeviceId: msg.target_device_id, card: inviteCard })
         // Same ack as a relayed request: to the bridge, delivered means
         // "accepted into the system" — its tool copy already says pending is
         // normal and the answer arrives as a later turn. A distinct 'parked'
@@ -1183,9 +1194,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         }
         const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId, initiatorDeviceId: conn.deviceId, justification, topic: '' })
         if (!r.ok) return fail('conflict', `already ${r.state}`)
-        appendAndFan({
-          userId: conn.userId, convoId: msg.room_id, sender: `agent:${conn.name}`, type: 'permission_request',
-          payload: {
+        const joinCard = {
             kind: 'agent_chat', request: 'join', room_id: msg.room_id,
             from_device_id: conn.deviceId, from_name: sanitizePeerText(conn.name, PEER_NAME_CAP),
             // The row this card asks about is keyed on the JOINER (parkInvite
@@ -1208,8 +1217,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             to_name: sanitizePeerText(ownerName, PEER_NAME_CAP),
             to_convo_id: '',
             to_convo_title: '',
-          },
-        })
+        }
+        appendAndFan({ userId: conn.userId, convoId: msg.room_id, sender: `agent:${conn.name}`, type: 'permission_request', payload: joinCard })
+        // Mirror in the tracker, keyed on the joiner like the row (spec:
+        // 2026-09-22 consent-items); best-effort.
+        fileChatConsentItem({ db, hub }, { userId: conn.userId, fromDeviceId: conn.deviceId, fromName: conn.name, roomId: msg.room_id, agentDeviceId: conn.deviceId, card: joinCard })
         conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: room.agent_device_id }))
         break
       }
@@ -1313,6 +1325,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           // decision — either way it is the one leaving, so no notification
           // is owed (and for the parked case the target never even knew).
           for (const row of pending) {
+            // A parked ask's tracker item closes as cancelled whoever
+            // initiated it (an owner-initiated parked invite has an item
+            // too); an already-answered row's item is closed and untouched.
+            closeChatConsentItem({ db, hub }, msg.room_id, row.agent_device_id, { outcome: 'left' })
             if (row.initiator_device_id === conn.deviceId) continue
             notify(row.initiator_device_id, {
               kind: 'invite', event: 'answer', room_id: msg.room_id,

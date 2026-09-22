@@ -11,7 +11,7 @@ import { idemKeyOf, senderOf, badRequest, notFound, conflict } from './http-who.
 import {
   ITEM_KINDS, AWAITING, RESOLUTIONS, BODY_MAX, validateItemFields, createItem, getItem, listItems, listComments,
   updateItem, addComment, setAttachmentTranscript, closeItem, reopenItem, rerankItem,
-  markTranscriptsPending, isAudioAttachment,
+  markTranscriptsPending, isAudioAttachment, isConsentMirror,
 } from './items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE, ITEM_ACTIONS, itemFallbackText, FALLBACK_ACTIONS } from './items-marker.js'
 import { visibleMission } from './missions-http.js'
@@ -38,17 +38,25 @@ function answerKnownError(res, err) {
 
 // Visible = owned by the caller's user and, for an ordinary agent, not born
 // in a private device's conversation. Same 404 for every failure.
+// A consent mirror (isConsentMirror, items.js) is invisible to EVERY agent,
+// private ones included — it is the user's card in item form.
 function visibleItem(db, who, idOrNum) {
   const item = getItem(db, who.userId, idOrNum)
   if (!item) return null
   if (filteredAgent(db, who) && privateOwnedConvo(db, item.origin_convo_id)) return null
+  if (who.kind === 'agent' && isConsentMirror(db, item.id)) return null
   return item
 }
 
 // The one place an 'item' marker is written. Called AFTER the item's own
 // transaction has committed — never inside it, so a broadcast can never
-// advertise a write that then rolls back.
-function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action, comment = null, by = null, extra = null }) {
+// advertise a write that then rolls back. Exported for the journal's own
+// item writes (src/consent-items.js), which pass a synthetic `who`.
+// `fallback: false` skips the old-client text below — for a marker that
+// mirrors something the conversation already shows as its own message (a
+// consent card, src/consent-items.js): the text would overwrite the card's
+// snippet and count a second unread for one ask.
+export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action, comment = null, by = null, extra = null, fallback = true }) {
   // A typo'd action would ship a marker no client knows how to render;
   // that's a programmer error, not a request error, so it throws.
   if (!ITEM_ACTIONS.includes(action)) throw new Error(`unknown item action: ${action}`)
@@ -75,7 +83,7 @@ function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action, comme
   // append/push failures are logged and swallowed exactly like the marker's
   // — this is a degrade path, never a reason to fail the request or the
   // marker that already landed.
-  if (FALLBACK_ACTIONS.has(action)) {
+  if (fallback && FALLBACK_ACTIONS.has(action)) {
     const actor = sender.slice(sender.indexOf(':') + 1)
     const text = itemFallbackText(payload, { actor, body: action === 'created' ? item.body : null })
     if (text != null) {
@@ -137,7 +145,7 @@ function handleList(db, res, url, who) {
   if (convoId != null && (!convoId || convoId.length > ID_MAX)) return badRequest(res)
   const r = listItems(db, who.userId, {
     convoId, kind, state, awaiting, label, sort, since,
-    limit, cursor: q.get('cursor'), excludePrivateOwned: filteredAgent(db, who),
+    limit, cursor: q.get('cursor'), excludePrivateOwned: filteredAgent(db, who), excludeConsent: who.kind === 'agent',
   })
   // An undecodable cursor is a malformed request, not an empty page.
   if (r.badCursor) return badRequest(res)

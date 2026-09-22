@@ -80,7 +80,9 @@ export function validateItemFields(fields, { partial = false, allowTranscript = 
     value.links = []
     for (const l of fields.links) {
       if (!isPlainObject(l) || typeof l.url !== 'string' || l.url.length > URL_MAX) return { ok: false }
-      if (!/^https?:\/\//i.test(l.url)) return { ok: false }
+      // matron:// is the apps' own scheme (item links, consent asks — spec
+      // 2026-09-22 consent-items); anything else is refused, javascript: above all.
+      if (!/^(https?|matron):\/\//i.test(l.url)) return { ok: false }
       const link = { url: l.url }
       if (l.title !== undefined) {
         if (typeof l.title !== 'string' || l.title.length > TITLE_MAX) return { ok: false }
@@ -219,7 +221,7 @@ export function resolveRank(db, userId, { position, after, before, excludeId = n
 
 export function createItem(db, {
   userId, kind, title, body = '', labels = [], links = [], attachments = [], awaiting, position, after, before,
-  originConvoId, originDeviceId, createdBy, supersedes = null, idemKey = null, now = Date.now(),
+  originConvoId, originDeviceId, createdBy, supersedes = null, idemKey = null, consent = null, now = Date.now(),
 }) {
   return db.transaction(() => {
     if (idemKey) {
@@ -237,10 +239,10 @@ export function createItem(db, {
     const missionId = db.prepare('SELECT mission_id FROM conversations WHERE id=?').get(originConvoId)?.mission_id ?? null
     try {
       db.prepare(`INSERT INTO items(id,user_id,num,kind,state,resolution,awaiting,rank,title,body,labels,links,supersedes,
-        origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at,mission_id)
-        VALUES(?,?,?,?,'open',NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at,mission_id,consent)
+        VALUES(?,?,?,?,'open',NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(id, userId, num, kind, aw, rank, title, body, JSON.stringify(labels), JSON.stringify(links), supersedes,
-          originConvoId, originDeviceId, createdBy, idemKey, now, now, missionId)
+          originConvoId, originDeviceId, createdBy, idemKey, now, now, missionId, consent)
     } catch (err) {
       // A racing writer on another connection committed the same
       // (user_id, idem_key) between our lookup above and this INSERT. That
@@ -309,7 +311,7 @@ const decCursor = (s) => { try { const v = JSON.parse(Buffer.from(String(s), 'ba
 
 export function listItems(db, userId, {
   convoId = null, kind = null, state = null, awaiting = null, label = null, sort = 'rank', since = null,
-  limit = 100, cursor = null, excludePrivateOwned = false,
+  limit = 100, cursor = null, excludePrivateOwned = false, excludeConsent = false,
 } = {}) {
   // Default 100, max 500 (spec: listItems). Coerce first — an unclamped
   // string limit went straight into a SQL LIMIT via bind param concatenation
@@ -331,6 +333,7 @@ export function listItems(db, userId, {
     where.push(`NOT EXISTS (SELECT 1 FROM conversations cv JOIN devices d ON d.id = cv.agent_device_id
       WHERE cv.id = i.origin_convo_id AND d.private = 1)`)
   }
+  if (excludeConsent) where.push('i.consent IS NULL') // the user's alone (isConsentMirror)
   const cur = cursor ? decCursor(cursor) : null
   if (cursor && !cur) return { badCursor: true }
   let order
@@ -545,3 +548,22 @@ export function rerankItem(db, { userId, itemId, position, after, before, now = 
   })()
 }
 
+
+// Is this item the tracker mirror of a consent ask — a spawn or agent-chat
+// card (src/consent-items.js, `items.consent` = 'spawn' | 'chat')? Such an
+// item is the USER's alone, in every state: while the ask is pending, what
+// the user reads there must stay what the journal wrote, and it must stay
+// in the open list (the asking agent, prompt-injected, could otherwise
+// rewrite the task or close it out of sight); and its body carries the
+// very text the card withholds from agents — a spawn's unapproved task, a
+// chat ask's justification — which the consent design keeps away from
+// every sibling agent, approved or not. So items-http.js treats it as
+// invisible to agent callers, exactly as the cards are (isClientOnlyEvent):
+// 404 on read and on every mutation, absent from GET /items
+// (excludeConsent). Clients are unaffected. The mark lives on the item
+// itself, never derived from the row that points at it: a renewed chat ask
+// re-points its row's item_id and a device revoke cascades the row away,
+// and neither may turn the old mirror into an ordinary item.
+export function isConsentMirror(db, itemId) {
+  return db.prepare('SELECT consent FROM items WHERE id=?').get(itemId)?.consent != null
+}
