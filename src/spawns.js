@@ -435,6 +435,32 @@ export function sanitizeSpawnDisk(raw) {
   return { free_bytes: raw.free_bytes, total_bytes: raw.total_bytes }
 }
 
+// A bridge's own box-status report (`box_status` op): the same optional
+// capacity blocks a recent_folders reply may carry, plus the account it
+// burns quota against. Each block is all-or-nothing on its own; a report
+// with no valid block at all is rejected (nothing to store).
+const ACCOUNT_EMAIL_CAP = 254
+
+export function sanitizeBoxStatus(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const activity = sanitizeSpawnActivity(raw.activity)
+  const limits = sanitizeSpawnLimits(raw.limits)
+  const disk = sanitizeSpawnDisk(raw.disk)
+  let account = null
+  if (raw.account && typeof raw.account === 'object' && !Array.isArray(raw.account)
+    && typeof raw.account.email === 'string' && raw.account.email.length <= ACCOUNT_EMAIL_CAP) {
+    const email = sanitizePeerText(raw.account.email, ACCOUNT_EMAIL_CAP)
+    if (email) account = { email }
+  }
+  if (!activity && !limits && !disk && !account) return null
+  return {
+    ...(activity ? { activity } : {}),
+    ...(limits ? { limits } : {}),
+    ...(disk ? { disk } : {}),
+    ...(account ? { account } : {}),
+  }
+}
+
 export function sanitizeSpawnLimits(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
   if (!Number.isInteger(raw.as_of) || raw.as_of <= 0 || raw.as_of > AS_OF_MAX_MS) return null

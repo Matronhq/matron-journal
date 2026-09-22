@@ -161,8 +161,13 @@ the machine-checkable version of this page.
   a private agent caller sees every device, unchanged.
 - `GET /devices` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`) -> `{devices: [{device_id, kind, name, created_at,
-  cursor, lag, last_seen_at, is_self, connected, push_prefs}]}`. The
+  cursor, lag, last_seen_at, is_self, connected, push_prefs, status?}]}`. The
   caller's own user's devices only; `is_self` marks the requesting device.
+  `status` (agent devices, omitted until the box has reported) is the box's
+  last capacity report — `{reported_at, activity?, limits?, disk?,
+  account?}`, see "Box status" under the spawn section — so a client sees a
+  box's usage and allowances without ever having talked to it, and while it
+  is asleep; `reported_at` says how old the numbers are.
   `push_prefs` is the per-device notification prefs (see `PUT /push/prefs`
   above), always the full three-key shape (defaults filled in). Overlaps `/metrics`'
   `user.devices` deliberately — metrics is observability (agents may read
@@ -174,7 +179,9 @@ the machine-checkable version of this page.
   now) and, when not connected and the journal has a wake command,
   `wakeable: true` — asleep, not gone: a message, invite or spawn aimed at
   it starts the box (see "Wake-before-spawn"; never set for a name the wake
-  command would refuse). Targeting surface for agent chat rooms (spec:
+  command would refuse) — and its last `status` report when it has one (same
+  shape as `GET /devices`'s `status`, see "Box status" under the spawn
+  section). Targeting surface for agent chat rooms (spec:
   2026-08-06 agent-to-agent chat design, Phase 2) — unlike `GET /devices`
   (management, client devices only) this is deliberately open to agent
   tokens too, and deliberately narrower. `agents`:
@@ -1148,7 +1155,9 @@ Acknowledgement: `{kind:'spawn', event:'pending', request_id, spawn_id, target_w
 
 Reply: `{kind:'spawn', event:'targets', request_id, boxes: [{device_id, name, online, wakeable?, folders: [{path, last_used}], activity?, limits?}]}`. Each box carries whether it is currently online and — if reachable — a list of recent working directories it has reported. `wakeable: true` (omitted when online, or when the journal has no `MATRON_WAKE_CMD`) marks an offline box as asleep rather than gone: a `spawn_request`, `agent_invite` or `agent_join` aimed at it starts the box; it is also omitted for a box whose name the wake command would refuse (device names are free text, the command takes an incus instance name — `isWakeableBoxName` in `src/wake.js`, the same rule `wakeIfOffline` applies), so the flag never promises a wake that cannot happen. Self (the requesting device) **is** listed, flagged `self: true` — the user may want the new session on the box they are already talking to; targeting self in `spawn_request` is allowed and goes through the same consent card. Private devices are hidden from non-private agents.
 
-Folder discovery rides the RPC broker: for each *online* box the journal itself issues a **journal-originated** `recent_folders` RPC (see "Journal-originated requests" under "Agent RPC" below — `from_device_id: 0`, answered with `to_device_id: 0`) and waits up to `spawnFoldersTimeoutMs` for the reply. A bridge that never learns to answer this method will simply time out to `folders: []` for every request rather than erroring; offline boxes are listed with no RPC attempted at all.
+Folder discovery rides the RPC broker: for each *online* box the journal itself issues a **journal-originated** `recent_folders` RPC (see "Journal-originated requests" under "Agent RPC" below — `from_device_id: 0`, answered with `to_device_id: 0`) and waits up to `spawnFoldersTimeoutMs` for the reply. A bridge that never learns to answer this method will simply time out to `folders: []` for every request rather than erroring; offline boxes are listed with no RPC attempted at all — but with their last stored `activity`/`limits`/`disk` blocks and a `reported_at` when the box has ever reported (see "Box status" below), so a sleeping box still shows its last known usage.
+
+**Box status (`box_status`).** The same capacity blocks, reported by a bridge about its *own* box — `{op:'box_status', activity?, limits?, disk?, account?: {email}}` (agent connections only; `forbidden` for a client, `bad_request` when no block validates). Validated with the same all-or-nothing sanitisers as below (`sanitizeBoxStatus` in `src/spawns.js`: a malformed block is dropped, the rest kept), then **persisted per device** (`device_status`, latest report wins) and fanned as `{kind:'box_status', device_id, reported_at, ...blocks}` to the user's live *client* sockets only — it is not a conversation event, nothing is appended or replayed. The stored report is what `GET /devices` and `GET /roster` serve as `status` and what `spawn_targets` lists an *offline* box with (its blocks plus `reported_at`), so usage, allowances and reset times are the journal's to answer for every box, including one that is asleep or that a given client has never fanned out to. A live `spawn_targets` reply that carries capacity blocks is *merged* into the stored report — the blocks it carries are refreshed, the ones it omits are kept, so a `recent_folders` reply (which never carries `account`) cannot erase what the box's own `box_status` said; only `box_status` itself replaces the whole row. A `box_status` that lands while a box's `recent_folders` RPC is in flight is the newer of the two: the listing carries that row and the delayed reply is not merged over it. The row goes with the device: revoking a box drops its report (`ON DELETE CASCADE`), so a later box that reuses the id starts with no `status`. Bridges send it on every `hello_ok`, after each usage-limits refresh, and on shutdown (a box's last numbers land before the host idle-stops it).
 
 **Capacity blocks (optional).** A bridge may additionally report its current load in the same `recent_folders` reply, as `activity: {live_sessions, last_hour: [{path, sessions}]}` (capped to 20 `last_hour` entries) and `limits: {as_of, lines: [{id, label, percent, resets?, resets_at?}]}` (capped to 12 `lines`; `resets`/`resets_at` are per-line and each independently optional). Both are validated all-or-nothing (`sanitizeSpawnActivity`/`sanitizeSpawnLimits` in `src/spawns.js`): any malformed entry drops the whole block from that box's reply, but never the box itself — a bridge that predates these fields, or whose reply fails validation, simply shows up with folders and no `activity`/`limits` keys (omitted, not null).
 

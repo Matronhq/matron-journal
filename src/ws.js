@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
-import { applyBridgePrivate, isPrivateDevice } from './db.js'
+import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses } from './db.js'
 import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, CONVO_ID_MAX_CHARS } from './journal.js'
 import { joinedAgentIds, participantIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
-import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
+import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem } from './consent-items.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableBoxName } from './wake.js'
 
@@ -1021,6 +1021,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // discovery rides it for free"). Offline boxes are listed with no
         // folders and no RPC; a box that fails or times out degrades to []
         // — discovery must never error because one box is sick.
+        // Last reported box status per device (box_status op / earlier
+        // spawn_targets replies): what an OFFLINE box is listed with, so a
+        // sleeping box still shows its last known usage instead of nothing.
+        const stored = deviceStatuses(db, conn.userId)
         try {
           const out = await Promise.all(boxes.map(async (d) => {
             const online = live.has(d.device_id)
@@ -1028,7 +1032,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             let activity = null
             let limits = null
             let disk = null
+            let reportedAt = null
             if (online) {
+              const issuedAt = Date.now()
               const r = await broker.issue(hub, conn.userId, d.device_id, 'recent_folders', null, { timeoutMs: spawnFoldersTimeoutMs })
               if (r.ok && Array.isArray(r.result?.folders)) folders = r.result.folders
               if (r.ok) {
@@ -1037,7 +1043,37 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
                 activity = sanitizeSpawnActivity(r.result?.activity)
                 limits = sanitizeSpawnLimits(r.result?.limits)
                 disk = sanitizeSpawnDisk(r.result?.disk)
+                // A live reply is also the freshest status this journal
+                // holds for the box: keep it, so the next reader (or the
+                // next time the box is asleep) sees these numbers. Merged,
+                // not replaced: this reply never carries account and may
+                // omit other blocks, and an omission here is "not in this
+                // RPC", not "gone" — the box's own box_status still owns
+                // the full row.
+                const fresh = sanitizeBoxStatus(r.result)
+                if (fresh) {
+                  // A box_status that landed while this RPC was in flight is
+                  // newer than the reply (the bridge composed it later):
+                  // list that row and leave it alone, rather than merging a
+                  // stale reply over it and stamping the listing reply-time.
+                  const current = getDeviceStatus(db, conn.userId, d.device_id)
+                  if (current && current.reported_at >= issuedAt) {
+                    activity = current.activity ?? null
+                    limits = current.limits ?? null
+                    disk = current.disk ?? null
+                    reportedAt = current.reported_at
+                  } else {
+                    reportedAt = Date.now()
+                    try { mergeDeviceStatus(db, { userId: conn.userId, deviceId: d.device_id, status: fresh, reportedAt }) } catch (err) { console.error('spawn_targets: device_status merge failed', err) }
+                  }
+                }
               }
+            } else if (stored.has(d.device_id)) {
+              const last = stored.get(d.device_id)
+              activity = last.activity ?? null
+              limits = last.limits ?? null
+              disk = last.disk ?? null
+              reportedAt = last.reported_at
             }
             // Sanitised like every other client-bound device name (roster,
             // consent cards) — the recipient here is an agent, not a client, so
@@ -1050,6 +1086,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
               // spawn or invite aimed at it starts the box (wake-before-
               // spawn). Omitted when online or when nothing could wake it.
               ...(!online && waker?.enabled && isWakeableBoxName(d.name) ? { wakeable: true } : {}),
+              // When the blocks below came from the journal's stored status
+              // rather than a live reply (offline box), say how old they are.
+              ...(reportedAt != null ? { reported_at: reportedAt } : {}),
               ...(activity ? { activity } : {}),
               ...(limits ? { limits } : {}),
               ...(disk ? { disk } : {}),
@@ -1641,6 +1680,24 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           kind: 'ephemeral', convo_id: msg.convo_id,
           activity: { state: msg.state, detail },
         })
+        break
+      }
+      case 'box_status': {
+        // A bridge's report about its OWN box (spec: 2026-09-21 "usage and
+        // allowances live in the journal"): activity, usage limits, disk,
+        // account. Persisted per device so every client — including one
+        // that has never talked to this box, and while the box is asleep —
+        // sees its last known state from /devices and /roster; fanned live
+        // to the user's client sockets so an open picker updates. Not a
+        // conversation event: nothing is appended or replayed. Same
+        // sanitisers as the recent_folders capacity blocks, so a bridge
+        // sends the one payload for both.
+        if (conn.kind !== 'agent') return fail('forbidden')
+        const status = sanitizeBoxStatus(msg)
+        if (!status) return fail('bad_request', 'no valid status block')
+        const reportedAt = Date.now()
+        upsertDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt })
+        hub.sendToClients(conn.userId, { kind: 'box_status', device_id: conn.deviceId, reported_at: reportedAt, ...status })
         break
       }
       case 'status': {

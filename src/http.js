@@ -2,7 +2,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
-import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice } from './db.js'
+import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice, deviceStatuses } from './db.js'
 import { receiveBlob } from './media.js'
 import { buildMetrics } from './metrics.js'
 import { listAwaiting, answerParkedInvite, getParticipant } from './participants.js'
@@ -317,8 +317,14 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // connected = has a live WS right now (hub scan, no persistence) —
         // the roster's "which agents can I start a session on" signal.
         const live = new Set(hub.connsOf(who.userId).filter((c) => c.ws.readyState === 1).map((c) => c.deviceId))
+        // status = the box's last capacity report (box_status op), the
+        // journal-resident answer to "what is this box's usage" for a client
+        // that has never talked to it or while it is asleep. Omitted (never
+        // null) for a device that has not reported.
+        const statuses = deviceStatuses(db, who.userId)
         const devices = listDevices(db, who.userId).map((d) => ({
           ...d, is_self: d.device_id === who.deviceId, connected: live.has(d.device_id),
+          ...(statuses.has(d.device_id) ? { status: statuses.get(d.device_id) } : {}),
         }))
         return json(res, 200, { devices })
       }
@@ -336,6 +342,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // agent is invisible, not blinded (one-directional, deliberately) —
         // which also resolves "can two private agents see each other" as yes.
         const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
+        const statuses = deviceStatuses(db, who.userId)
         const agents = db.prepare(
           `SELECT id AS device_id, name, created_at, last_seen_at FROM devices
            WHERE user_id=? AND kind='agent'${filtered ? ' AND private=0' : ''} ORDER BY id`
@@ -348,6 +355,8 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           // connected or unwakeable, so older readers see the shape they
           // always did.
           ...(!live.has(d.device_id) && waker?.enabled && isWakeableBoxName(d.name) ? { wakeable: true } : {}),
+          // Last capacity report (box_status), same shape as GET /devices.
+          ...(statuses.has(d.device_id) ? { status: statuses.get(d.device_id) } : {}),
         }))
         const conversations = db.prepare(
           `SELECT id, title, session_state, last_seq, summary, agent_device_id, created_at,
