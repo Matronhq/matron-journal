@@ -1,5 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import Database from 'better-sqlite3'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { getSpawn } from '../src/spawns.js'
@@ -121,6 +125,45 @@ test('approval of a spawn whose target never comes up fails with agent_unreachab
   assert.equal(getSpawn(s.db, ack.spawn_id).state, 'failed')
 })
 
+test('close() while an approval waits for a woken box releases the wait: the row is failed and nothing holds the process for the window', async (t) => {
+  // A file-backed DB so the row can be read back after close() has shut the
+  // journal's own handle.
+  const dir = mkdtempSync(join(tmpdir(), 'mj-wake-close-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const dbPath = join(dir, 'j.db')
+  const waker = fakeWaker()
+  const s = await startTestServer({ waker, dbPath, spawnWakeWaitMs: 600000, spawnStartTimeoutMs: 1000 })
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const parentDev = createAgent(s.db, dan.id, 'dev-6')
+  const targetDev = createAgent(s.db, dan.id, 'eric')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const parent = await makeWsClient(s.base, { token: parentDev.token, cursor: null })
+  const client = await makeWsClient(s.base, { token: login.json.token, cursor: null })
+  await parent.waitFor((f) => f.op === 'hello_ok')
+  await client.waitFor((f) => f.op === 'hello_ok')
+  parent.send({ op: 'convo_upsert', convo_id: 'parent-convo', title: 'parent session', session_state: 'running' })
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
+  sendSpawn(parent, targetDev)
+  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  await client.waitFor(isSpawnCard)
+  const r = await s.http('/agent-spawn/answer', { method: 'POST', token: login.json.token, body: { request_id: ack.spawn_id, decision: 'approve' } })
+  assert.equal(r.status, 200)
+  await new Promise((res) => setTimeout(res, 150))
+  assert.equal(getSpawn(s.db, ack.spawn_id).state, 'approved')
+  const t0 = Date.now()
+  await s.close()
+  assert.ok(Date.now() - t0 < 5000, 'close() did not wait out the wake window')
+  parent.close(); client.close()
+  // The orchestration settled its row on the way down instead of being
+  // abandoned with a ref'd timer: the durable outcome is there.
+  const db = new Database(dbPath, { readonly: true })
+  t.after(() => db.close())
+  assert.equal(getSpawn(db, ack.spawn_id).state, 'failed')
+  const outcome = db.prepare("SELECT payload FROM events WHERE convo_id='parent-convo' AND type='spawn_outcome'").get()
+  assert.ok(outcome, 'a spawn_outcome event was journaled')
+  assert.equal(JSON.parse(outcome.payload).error_code, 'agent_unreachable')
+})
+
 test('approval with no wake possible fails at once, as before', async (t) => {
   const { s, waker, targetDev, clientToken, parent, client } = await sleepyFleet(t, { serverOpts: { spawnWakeWaitMs: 5000 } })
   sendSpawn(parent, targetDev)
@@ -153,6 +196,30 @@ test('spawn_targets and /roster mark an asleep box wakeable, never an online one
   assert.equal(rEric.wakeable, true)
   const rMe = roster.json.agents.find((d) => d.device_id === parentDev.deviceId)
   assert.equal('wakeable' in rMe, false)
+})
+
+test('a box whose name the wake command would refuse is never wakeable, and a spawn at it is refused, not parked', async (t) => {
+  // Device names are free text (spaces, capitals, up to 40 chars); the wake
+  // command only takes an incus instance name. The flag must follow the
+  // same rule wakeIfOffline does, or a bridge would show "asleep" for a box
+  // nothing can start.
+  const { s, dan, waker, parentDev, parent, client } = await sleepyFleet(t)
+  const mac = createAgent(s.db, dan.id, 'Dan MacBook')
+  parent.send({ op: 'spawn_targets', request_id: 'q1' })
+  const reply = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'targets', 5000)
+  const box = reply.boxes.find((b) => b.device_id === mac.deviceId)
+  assert.equal(box.online, false)
+  assert.equal('wakeable' in box, false)
+  const roster = await s.http('/roster', { token: parentDev.token })
+  const rMac = roster.json.agents.find((d) => d.device_id === mac.deviceId)
+  assert.equal(rMac.connected, false)
+  assert.equal('wakeable' in rMac, false)
+  sendSpawn(parent, mac)
+  const err = await parent.waitFor((f) => f.kind === 'control' && f.op === 'error')
+  assert.equal(err.code, 'agent_unreachable')
+  assert.deepEqual(waker.calls, [], 'no wake was attempted for an unwakeable name')
+  await new Promise((r) => setTimeout(r, 100))
+  assert.equal(client.frames.find(isSpawnCard), undefined)
 })
 
 test('spawn_targets and /roster omit wakeable when no wake command is configured', async (t) => {

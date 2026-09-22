@@ -8,7 +8,7 @@ import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem } from './consent-items.js'
-import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared } from './wake.js'
+import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableBoxName } from './wake.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -1045,10 +1045,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             return {
               device_id: d.device_id, name: sanitizePeerText(d.name, PEER_NAME_CAP), online, folders,
               ...(d.device_id === conn.deviceId ? { self: true } : {}),
-              // Offline + a wake command configured = asleep, not gone: a
+              // Offline + a wake command configured + a name the command
+              // would take (wakeIfOffline's own rule) = asleep, not gone: a
               // spawn or invite aimed at it starts the box (wake-before-
               // spawn). Omitted when online or when nothing could wake it.
-              ...(!online && waker?.enabled ? { wakeable: true } : {}),
+              ...(!online && waker?.enabled && isWakeableBoxName(d.name) ? { wakeable: true } : {}),
               ...(activity ? { activity } : {}),
               ...(limits ? { limits } : {}),
               ...(disk ? { disk } : {}),

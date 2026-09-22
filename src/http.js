@@ -12,7 +12,7 @@ import { searchMessages, indexableBody } from './search.js'
 import { serveHelp } from './help.js'
 import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
 import { closeChatConsentItem } from './consent-items.js'
-import { wakeIfOffline } from './wake.js'
+import { wakeIfOffline, isWakeableBoxName } from './wake.js'
 import { handleItemsRoute } from './items-http.js'
 import { handleMissionsRoute } from './missions-http.js'
 import { json, readBody } from './http-body.js'
@@ -342,10 +342,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         ).all(who.userId).map((d) => ({
           ...d, connected: live.has(d.device_id),
           // A disconnected box is asleep, not gone, when this journal has a
-          // wake command: any message, invite or spawn aimed at it starts
-          // it again. Omitted (never false) when connected or unwakeable, so
-          // older readers see the shape they always did.
-          ...(!live.has(d.device_id) && waker?.enabled ? { wakeable: true } : {}),
+          // wake command AND the box's name is one the command would take
+          // (same rule wakeIfOffline applies): any message, invite or spawn
+          // aimed at it starts it again. Omitted (never false) when
+          // connected or unwakeable, so older readers see the shape they
+          // always did.
+          ...(!live.has(d.device_id) && waker?.enabled && isWakeableBoxName(d.name) ? { wakeable: true } : {}),
         }))
         const conversations = db.prepare(
           `SELECT id, title, session_state, last_seq, summary, agent_device_id, created_at,

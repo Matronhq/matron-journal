@@ -155,3 +155,17 @@ test('waitForDevice: true at once for a live socket, true on registration, false
   // Zero/negative wait never parks.
   assert.equal(await hub.waitForDevice(1, 10, 0), false)
 })
+
+test('close: every parked waiter is released with false at once, and its timer is gone', async () => {
+  const hub = makeHub()
+  const a = hub.waitForDevice(1, 7, 600000)
+  const b = hub.waitForDevice(2, 8, 600000)
+  const t0 = Date.now()
+  hub.close()
+  assert.deepEqual(await Promise.all([a, b]), [false, false])
+  assert.ok(Date.now() - t0 < 500, 'released by close(), not by the timers')
+  // A registration after close() finds nothing to release, and a fresh
+  // wait no longer parks (the hub is shut).
+  hub.register({ userId: 1, deviceId: 7, kind: 'agent', ws: { readyState: 1 } })
+  assert.equal(await hub.waitForDevice(1, 9, 600000), false)
+})

@@ -30,6 +30,7 @@ export function makeHub({ coalesceMs = 200 } = {}) {
   // socket lands. A waiter is a one-shot resolver; the timer is cleared on
   // release so a settled wait never fires twice.
   const deviceWaiters = new Set() // { userId, deviceId, release }
+  let closed = false
   return {
     register(conn) {
       if (!byUser.has(conn.userId)) byUser.set(conn.userId, new Set())
@@ -60,7 +61,7 @@ export function makeHub({ coalesceMs = 200 } = {}) {
       for (const c of byUser.get(userId) || []) {
         if (c.deviceId === deviceId && c.ws.readyState === 1) return Promise.resolve(true)
       }
-      if (!(timeoutMs > 0)) return Promise.resolve(false)
+      if (!(timeoutMs > 0) || closed) return Promise.resolve(false)
       return new Promise((resolve) => {
         const w = {
           userId, deviceId,
@@ -73,6 +74,14 @@ export function makeHub({ coalesceMs = 200 } = {}) {
         const timer = setTimeout(() => w.release(false), timeoutMs)
         deviceWaiters.add(w)
       })
+    },
+    // Shutdown: release every parked waiter with false so the orchestration
+    // awaiting it settles its row now (agent_unreachable, the box never
+    // attached) instead of a ref'd timer holding the process open for the
+    // whole wake window after startServer.close(). Later waits never park.
+    close() {
+      closed = true
+      for (const w of [...deviceWaiters]) w.release(false)
     },
     // Global connected-socket count across every user — a /metrics-only
     // aggregate (no per-user scoping concern: it's just a number, not

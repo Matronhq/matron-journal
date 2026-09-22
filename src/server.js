@@ -400,6 +400,10 @@ export function startServer({
           closing = true
           if (retentionInterval) clearInterval(retentionInterval)
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
+          // Wake-before-spawn waiters (hub.waitForDevice) hold ref'd timers
+          // of up to spawnWakeWaitMs; release them before the sockets go so
+          // each approveSpawn settles its row while the DB is still open.
+          hub.close()
           wss.close()
           for (const c of wss.clients) c.terminate()
           pushPipeline.close()
