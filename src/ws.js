@@ -7,6 +7,7 @@ import { joinedAgentIds, participantIds, answerInvite, leaveConvo, leaveAllParti
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
+import { fileSpawnConsentItem } from './consent-items.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared } from './wake.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
@@ -968,6 +969,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             console.error('spawn_request: card broadcast failed (card is journaled; clients catch up via snapshot)', err)
           }
         }
+        // The card's mirror in the tracker (spec: 2026-09-22 consent-items):
+        // a question item on the parent conversation, closed by the spawn's
+        // outcome. After the card and before the ack: the card is the
+        // commit point above; the item is best-effort and its own failure
+        // never costs the ask (the row's item_id simply stays NULL).
+        fileSpawnConsentItem({ db, hub }, { userId: conn.userId, fromDeviceId: conn.deviceId, fromConvoId: msg.from_convo_id, spawnId, card: cardPayload })
         conn.ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: rid, spawn_id: spawnId }))
         break
       }

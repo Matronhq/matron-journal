@@ -47,8 +47,13 @@ function visibleItem(db, who, idOrNum) {
 
 // The one place an 'item' marker is written. Called AFTER the item's own
 // transaction has committed — never inside it, so a broadcast can never
-// advertise a write that then rolls back.
-function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action, comment = null, by = null, extra = null }) {
+// advertise a write that then rolls back. Exported for the journal's own
+// item writes (src/consent-items.js), which pass a synthetic `who`.
+// `fallback: false` skips the old-client text below — for a marker that
+// mirrors something the conversation already shows as its own message (a
+// consent card, src/consent-items.js): the text would overwrite the card's
+// snippet and count a second unread for one ask.
+export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action, comment = null, by = null, extra = null, fallback = true }) {
   // A typo'd action would ship a marker no client knows how to render;
   // that's a programmer error, not a request error, so it throws.
   if (!ITEM_ACTIONS.includes(action)) throw new Error(`unknown item action: ${action}`)
@@ -75,7 +80,7 @@ function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action, comme
   // append/push failures are logged and swallowed exactly like the marker's
   // — this is a degrade path, never a reason to fail the request or the
   // marker that already landed.
-  if (FALLBACK_ACTIONS.has(action)) {
+  if (fallback && FALLBACK_ACTIONS.has(action)) {
     const actor = sender.slice(sender.indexOf(':') + 1)
     const text = itemFallbackText(payload, { actor, body: action === 'created' ? item.body : null })
     if (text != null) {

@@ -80,7 +80,9 @@ export function validateItemFields(fields, { partial = false, allowTranscript = 
     value.links = []
     for (const l of fields.links) {
       if (!isPlainObject(l) || typeof l.url !== 'string' || l.url.length > URL_MAX) return { ok: false }
-      if (!/^https?:\/\//i.test(l.url)) return { ok: false }
+      // matron:// is the apps' own scheme (item links, consent asks — spec
+      // 2026-09-22 consent-items); anything else is refused, javascript: above all.
+      if (!/^(https?|matron):\/\//i.test(l.url)) return { ok: false }
       const link = { url: l.url }
       if (l.title !== undefined) {
         if (typeof l.title !== 'string' || l.title.length > TITLE_MAX) return { ok: false }

@@ -435,7 +435,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           if (!denySpawn(db, request_id)) return json(res, 409, { error: 'conflict' })
           // Reported plainly (spec: no peer to hide behind) — 'declined',
           // never a fabricated box-side failure.
-          emitSpawnOutcome(db, hub, { userId: who.userId, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: request_id, outcome: 'declined' })
+          emitSpawnOutcome(db, hub, { userId: who.userId, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: request_id, outcome: 'declined', answeredByDeviceId: who.deviceId })
           return json(res, 200, { ok: true })
         }
         // The tap CLAIMS the row; a zero row-count means another tap already
@@ -446,7 +446,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // it runs off the request cycle — the app needs its 200 now, the
         // outcome reaches the parent as a turn. Errors are contained: the
         // broker timeout guarantees approveSpawn itself always settles.
-        approveSpawn({ db, hub, broker, startTimeoutMs: spawnStartTimeoutMs }, getSpawn(db, request_id))
+        approveSpawn({ db, hub, broker, startTimeoutMs: spawnStartTimeoutMs, answeredByDeviceId: who.deviceId }, getSpawn(db, request_id))
           .catch((err) => console.error('agent-spawn approve orchestration failed', err))
         return json(res, 200, { ok: true })
       }

@@ -480,6 +480,12 @@ export function openDb(path) {
   if (!spawnCols.some((c) => c.name === 'child_short')) {
     db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN child_short TEXT')
   }
+  // Consent items (spec 2026-09-22 consent-items): the tracker item that
+  // mirrors this ask, NULL for rows predating the mirror (they resolve
+  // without one). Not a foreign key — same stance as mission_id.
+  if (!spawnCols.some((c) => c.name === 'item_id')) {
+    db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN item_id TEXT')
+  }
   // refreshSpawnRoomTitle (spawns.js) looks a started row up by its child
   // on every titled convo_upsert; keep that a point lookup.
   db.exec('CREATE INDEX IF NOT EXISTS idx_spawn_child ON agent_spawn_requests(child_convo_id)')

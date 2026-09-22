@@ -12,6 +12,7 @@ import { recordJoined, participantIds } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { isPrivateDevice } from './db.js'
 import { sessionShortFromTitle, sideTag, roomTitle } from './room-title.js'
+import { closeSpawnConsentItem } from './consent-items.js'
 
 // `model` is the optional Claude model the child session should run — an
 // alias ('opus') or a full model id, defaulted to '' like topic so a caller
@@ -77,7 +78,13 @@ export function markFailed(db, id, now = Date.now()) {
 // purpose (not in isClientOnlyEvent): the parent owns from_convo_id, so
 // replay hands it the outcome durably — the fix for the at-most-once
 // delivery gap protocol.md used to document.
-export function emitSpawnOutcome(db, hub, { userId, fromDeviceId, fromConvoId, requestId, outcome, roomId, childConvoId, errorCode }) {
+//
+// The consent item (src/consent-items.js) is closed here too — between the
+// durable event and the frame, so the tracker is settled by the time the
+// parent hears — because this is the ONE funnel every terminal transition
+// passes through. `answeredByDeviceId` is the client that tapped, when a
+// tap is what resolved the row; it only names the closing note's device.
+export function emitSpawnOutcome(db, hub, { userId, fromDeviceId, fromConvoId, requestId, outcome, roomId, childConvoId, errorCode, answeredByDeviceId = null }) {
   const extras = {
     ...(roomId ? { room_id: roomId } : {}),
     ...(childConvoId ? { child_convo_id: childConvoId } : {}),
@@ -91,6 +98,7 @@ export function emitSpawnOutcome(db, hub, { userId, fromDeviceId, fromConvoId, r
   } catch (err) {
     console.error('emitSpawnOutcome: durable outcome append failed', err)
   }
+  closeSpawnConsentItem({ db, hub }, getSpawn(db, requestId), { outcome, errorCode, roomId, answeredByDeviceId })
   hub.sendToDevice(userId, fromDeviceId, { kind: 'spawn', event: 'outcome', request_id: requestId, outcome, ...extras })
 }
 
@@ -231,7 +239,7 @@ export function refreshSpawnRoomTitle(db, hub, childConvoId) {
 // `roomId` is a test seam (a caller-chosen id for a linked row); production
 // mints one. It is ignored for a detached row — the flag on the row is the
 // only thing that decides whether a room exists.
-export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: roomIdOverride = null }, row) {
+export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: roomIdOverride = null, answeredByDeviceId = null }, row) {
   const roomId = row.link ? (roomIdOverride || randomUUID()) : null
   // Exactly-once guard: markFailed is state-scoped (WHERE state='approved'),
   // so its changes-count tells us whether THIS call is the one resolving the
@@ -271,7 +279,7 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
         console.error('approveSpawn: epitaph write failed (room likely never created)', err)
       }
     }
-    emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'failed', errorCode: safeCode })
+    emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'failed', errorCode: safeCode, answeredByDeviceId })
     return 'failed'
   }
   try {
@@ -351,7 +359,7 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
       if (roomId) {
         try { refreshSpawnRoomTitle(db, hub, r.result.convo_id) } catch (err) { console.error('approveSpawn: room retitle failed', err) }
       }
-      emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'started', roomId, childConvoId: r.result.convo_id })
+      emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'started', roomId, childConvoId: r.result.convo_id, answeredByDeviceId })
       return 'started'
     }
     return fail(r.ok ? 'bad_start_reply' : (r.error?.code ?? 'unknown'))

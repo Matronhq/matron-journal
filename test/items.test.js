@@ -497,3 +497,8 @@ test('itemFallbackText: the six shapes', () => {
   const long = 'x'.repeat(130)
   assert.ok(itemFallbackText({ ...base, action: 'created', title: long, by: 'user', awaiting: 'agent' }, { actor: 'dan' }).startsWith('📌 New question #12: ' + 'x'.repeat(120) + '…'))
 })
+
+test('validateItemFields: a matron:// link is as valid as an https one (consent items carry them)', () => {
+  assert.equal(validateItemFields({ title: 't', links: [{ url: 'matron://consent/spawn/abc' }] }).value.links[0].url, 'matron://consent/spawn/abc')
+  assert.equal(validateItemFields({ title: 't', links: [{ url: 'matron:evil' }] }).ok, false)
+})
