@@ -1134,3 +1134,13 @@ test('once the ask is resolved, its consent item is an ordinary item again: an a
   await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
   assert.equal((await s.http(`/items/${item.id}/comments`, { method: 'POST', token: parentDev.token, body: { body: 'noted' } })).status, 201)
 })
+
+test('the consent lock holds through the approved window too: between the tap and the start reply an agent still cannot touch the item', async (t) => {
+  const { s, parentDev, spawnId } = await parkedSpawn(t)
+  const item = consentItemFor(s, spawnId)
+  assert.ok(claimApprove(s.db, spawnId)) // the tap, with no orchestration running yet
+  assert.equal(getSpawn(s.db, spawnId).state, 'approved')
+  assert.equal((await s.http(`/items/${item.id}/close`, { method: 'POST', token: parentDev.token, body: { resolution: 'done' } })).status, 403)
+  assert.equal((await s.http(`/items/${item.id}`, { method: 'PATCH', token: parentDev.token, body: { body: 'x' } })).status, 403)
+  assert.equal(s.db.prepare('SELECT state FROM items WHERE id=?').get(item.id).state, 'open')
+})
