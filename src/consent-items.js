@@ -130,7 +130,7 @@ export function fileSpawnConsentItem({ db, hub }, { userId, fromDeviceId, fromNa
         // A time-limited ask belongs at the top of the list, not under
         // everything the user has been putting off.
         position: 'top',
-        originConvoId: fromConvoId, originDeviceId: fromDeviceId, createdBy: 'agent',
+        originConvoId: fromConvoId, originDeviceId: fromDeviceId, createdBy: 'agent', consent: 'spawn',
         // Namespaced apart from HTTP idempotency keys, which are always
         // `<device id>:<key>` (http-who.js idemKeyOf).
         idemKey: `consent:spawn:${spawnId}`,
@@ -243,7 +243,7 @@ export function fileChatConsentItem({ db, hub }, { userId, fromDeviceId, fromNam
       if (!row) throw new Error(`no parked row for ${roomId}/${agentDeviceId}`)
       const { item } = createItem(db, {
         userId, kind: 'question', ...fields, awaiting: 'user', position: 'top',
-        originConvoId: roomId, originDeviceId: fromDeviceId, createdBy: 'agent',
+        originConvoId: roomId, originDeviceId: fromDeviceId, createdBy: 'agent', consent: 'chat',
         idemKey: `consent:chat:${roomId}:${agentDeviceId}:${row.created_at}`,
       })
       db.prepare("UPDATE convo_agents SET item_id=? WHERE convo_id=? AND agent_device_id=? AND state='awaiting_user'").run(item.id, roomId, agentDeviceId)

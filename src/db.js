@@ -518,6 +518,17 @@ export function openDb(path) {
     db.exec('ALTER TABLE items ADD COLUMN mission_id TEXT')
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_items_mission ON items(mission_id, state, awaiting)')
+  // Consent items (spec 2026-09-22 consent-items): 'spawn' | 'chat' on the
+  // tracker mirror of a consent card, NULL on every ordinary item. Carried
+  // on the ITEM, not derived from the spawn/convo_agents row that points at
+  // it: a renewed chat ask reuses its row and re-points item_id, and a
+  // device revoke cascades the row away — either would otherwise turn the
+  // old mirror, justification and all, into an ordinary agent-readable item.
+  const itemConsentCols = db.prepare('PRAGMA table_info(items)').all()
+  if (!itemConsentCols.some((c) => c.name === 'consent')) {
+    db.exec('ALTER TABLE items ADD COLUMN consent TEXT')
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_items_consent ON items(consent)')
   // Standing agent-chat consent ("always allow A -> B") is gone: every ask
   // parks for the user now. Dropped rather than left in place, because a
   // table of grants that nothing consults still reads like a live security

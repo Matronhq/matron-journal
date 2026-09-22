@@ -1001,3 +1001,25 @@ test('matron-admin approve/deny close the chat consent item too (no hub: closed 
   assert.equal(after.state, 'closed'); assert.equal(after.resolution, 'decided')
   assert.equal(closingStatus(s, item.id).body, 'Declined.')
 })
+
+test('a renewed chat ask does not expose the previous ask\'s item: consent items stay invisible to agents after the row moves on', async (t) => {
+  const { s, agB, clientToken, a } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'SECRET-FIRST' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  const first = chatItemFor(s, 'room', agB.deviceId)
+  assert.equal((await s.http('/agent-chat/answer', { method: 'POST', token: clientToken, body: { room_id: 'room', target_device_id: agB.deviceId, decision: 'deny' } })).status, 200)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, topic: 'ci', justification: 'second' })
+  await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered' && a.frames.filter((g) => g.kind === 'invite' && g.event === 'delivered').length === 2)
+  const second = chatItemFor(s, 'room', agB.deviceId)
+  assert.notEqual(second.id, first.id)
+  // The row now points at the second item; the first must still be nobody's but the user's.
+  for (const token of [agB.token, (await import('../src/auth.js')).createAgent(s.db, s.db.prepare("SELECT id FROM users WHERE name='dan'").get().id, 'dev-c').token]) {
+    assert.equal((await s.http(`/items/${first.id}`, { token })).status, 404)
+    assert.equal((await s.http(`/items/${second.id}`, { token })).status, 404)
+    const listed = await s.http('/items?state=closed', { token })
+    assert.equal(listed.json.items.some((i) => i.id === first.id), false)
+  }
+  const mine = await s.http(`/items/${first.id}`, { token: clientToken })
+  assert.equal(mine.status, 200)
+  assert.equal(mine.json.item.consent, 'chat')
+})

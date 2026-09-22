@@ -58,7 +58,9 @@ overwrite the card's snippet and double the unread. `emitMarker` gains a
 withholds from agents — a spawn's unapproved task, a chat ask's
 justification, which the consent design keeps from every sibling agent
 whether or not the user approves. So a consent mirror (`isConsentMirror`:
-any item a spawn or convo_agents row points at) is invisible to every
+`items.consent` = `'spawn'|'chat'`, a mark on the item itself — a renewed
+chat ask re-points its row and a device revoke cascades the row away, so
+the row pointer alone would unmask an old mirror) is invisible to every
 agent caller in every state: 404 on read and on every mutation route,
 absent from `GET /items`; and its markers carry `consent: 'spawn'|'chat'`,
 which makes them client-only like the cards. That also means the asking
