@@ -145,7 +145,7 @@ test('agent_request to an offline agent still fails agent_unreachable but wakes 
   assert.deepEqual(waker.calls, ['henry'])
 })
 
-test('spawn_request to an offline target wakes the box before refusing', async (t) => {
+test('spawn_request to an offline target wakes the box and parks the ask (wake-before-spawn)', async (t) => {
   const { s, dan, agent, client, waker } = await boot(t)
 
   const parent = createAgent(s.db, dan.id, 'eric')
@@ -159,8 +159,8 @@ test('spawn_request to an offline target wakes the box before refusing', async (
     op: 'spawn_request', request_id: 's1', target_device_id: agent.deviceId,
     from_convo_id: 'parent-1', workdir: '/home/danbarker', task: 'do the thing',
   })
-  const err = await p.waitFor((f) => f.kind === 'control' && f.op === 'error')
-  assert.equal(err.code, 'agent_unreachable')
+  const ack = await p.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  assert.equal(ack.target_waking, true)
   await until(() => waker.calls.length === 1)
   assert.deepEqual(waker.calls, ['henry'])
 })

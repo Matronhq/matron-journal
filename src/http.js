@@ -12,6 +12,7 @@ import { searchMessages, indexableBody } from './search.js'
 import { serveHelp } from './help.js'
 import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
 import { closeChatConsentItem } from './consent-items.js'
+import { wakeIfOffline, isWakeableBoxName } from './wake.js'
 import { handleItemsRoute } from './items-http.js'
 import { handleMissionsRoute } from './missions-http.js'
 import { json, readBody } from './http-body.js'
@@ -77,7 +78,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, waker = null, itemTranscription = null }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, itemTranscription = null }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -338,7 +339,16 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const agents = db.prepare(
           `SELECT id AS device_id, name, created_at, last_seen_at FROM devices
            WHERE user_id=? AND kind='agent'${filtered ? ' AND private=0' : ''} ORDER BY id`
-        ).all(who.userId).map((d) => ({ ...d, connected: live.has(d.device_id) }))
+        ).all(who.userId).map((d) => ({
+          ...d, connected: live.has(d.device_id),
+          // A disconnected box is asleep, not gone, when this journal has a
+          // wake command AND the box's name is one the command would take
+          // (same rule wakeIfOffline applies): any message, invite or spawn
+          // aimed at it starts it again. Omitted (never false) when
+          // connected or unwakeable, so older readers see the shape they
+          // always did.
+          ...(!live.has(d.device_id) && waker?.enabled && isWakeableBoxName(d.name) ? { wakeable: true } : {}),
+        }))
         const conversations = db.prepare(
           `SELECT id, title, session_state, last_seq, summary, agent_device_id, created_at,
                   (SELECT ts FROM events e WHERE e.convo_id = conversations.id
@@ -417,6 +427,11 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // exact.
         deliverPendingInvites(db, hub, { deviceId: isJoin ? room.agent_device_id : target_device_id })
         const delivered = getParticipant(db, room_id, target_device_id)?.delivered_at != null
+        // Undelivered means the recipient has no live socket — most often a
+        // box the host idle-stopped since the ask was parked. Wake it: the
+        // approved row is pumped again the moment its bridge says hello
+        // (deliverPendingInvites on register), so nothing is lost meanwhile.
+        if (!delivered) wakeIfOffline({ db, hub, waker }, who.userId, isJoin ? room.agent_device_id : target_device_id)
         return json(res, 200, { ok: true, delivered })
       }
       if (req.method === 'POST' && url.pathname === '/agent-spawn/answer') {
@@ -450,7 +465,14 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // it runs off the request cycle — the app needs its 200 now, the
         // outcome reaches the parent as a turn. Errors are contained: the
         // broker timeout guarantees approveSpawn itself always settles.
-        approveSpawn({ db, hub, broker, startTimeoutMs: spawnStartTimeoutMs, answeredByDeviceId: who.deviceId }, getSpawn(db, request_id))
+        // wake-before-spawn: a target that went to sleep between the card and
+        // the tap is woken and waited for (up to spawnWakeWaitMs) before the
+        // start RPC, instead of failing the user's approval on the spot.
+        approveSpawn({
+          db, hub, broker, startTimeoutMs: spawnStartTimeoutMs, answeredByDeviceId: who.deviceId,
+          wakeWaitMs: spawnWakeWaitMs,
+          wakeTarget: () => wakeIfOffline({ db, hub, waker }, who.userId, row.target_device_id),
+        }, getSpawn(db, request_id))
           .catch((err) => console.error('agent-spawn approve orchestration failed', err))
         return json(res, 200, { ok: true })
       }

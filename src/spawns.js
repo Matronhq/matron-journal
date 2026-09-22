@@ -239,7 +239,15 @@ export function refreshSpawnRoomTitle(db, hub, childConvoId) {
 // `roomId` is a test seam (a caller-chosen id for a linked row); production
 // mints one. It is ignored for a detached row — the flag on the row is the
 // only thing that decides whether a room exists.
-export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: roomIdOverride = null, answeredByDeviceId = null }, row) {
+// wakeTarget / wakeWaitMs (wake-before-spawn): a target box with no live
+// socket at approval time is usually asleep, not gone — the host idle-stops
+// dev VMs and a wake command starts them again. When the caller supplies
+// wakeTarget (which fires the wake and reports whether one is under way),
+// the orchestration waits up to wakeWaitMs for the box's socket to register
+// before issuing `start`, instead of failing on the spot. A box that never
+// comes up still fails with agent_unreachable from the broker; the orphan
+// sweep's TTL is derived to outlast wakeWaitMs + startTimeoutMs (ws.js).
+export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: roomIdOverride = null, answeredByDeviceId = null, wakeTarget = null, wakeWaitMs = 0 }, row) {
   const roomId = row.link ? (roomIdOverride || randomUUID()) : null
   // Exactly-once guard: markFailed is state-scoped (WHERE state='approved'),
   // so its changes-count tells us whether THIS call is the one resolving the
@@ -331,6 +339,14 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
     // Already sanitised and capped at the ws boundary before it was stored.
     // `room_id` likewise: absent means detached, and the target's opening
     // turn says so instead of naming a channel back.
+    // Wake-and-wait before the start RPC. Only when a wake is actually under
+    // way: a target that is offline with no wake possible fails fast below,
+    // exactly as before, rather than holding the row for the whole window.
+    if (wakeTarget && wakeWaitMs > 0) {
+      let waking = false
+      try { waking = wakeTarget() === true } catch (err) { console.error('approveSpawn: wake threw', err) }
+      if (waking) await hub.waitForDevice(row.user_id, row.target_device_id, wakeWaitMs)
+    }
     const r = await broker.issue(hub, row.user_id, row.target_device_id, 'start',
       { workdir: row.workdir, prompt: row.task, ...(roomId ? { room_id: roomId } : {}), ...(fromName ? { from_name: fromName } : {}), ...(row.model ? { model: row.model } : {}) },
       { timeoutMs: startTimeoutMs })

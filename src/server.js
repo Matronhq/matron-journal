@@ -279,6 +279,13 @@ export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
   toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
+  // How long an approved spawn waits for a woken target box to attach
+  // before issuing `start` (wake-before-spawn). Sized for a cold VM boot:
+  // incus start + bridge start + journal dial is ~3 minutes on the shared
+  // hosts (the infra's timer_wake_lead_minutes). Only ever waited when a
+  // wake is actually under way, so a journal without MATRON_WAKE_CMD never
+  // pays it.
+  spawnWakeWaitMs = resolveNumericEnv('MATRON_SPAWN_WAKE_WAIT_MS', process.env.MATRON_SPAWN_WAKE_WAIT_MS, 240000),
   mediaReapHighPct, mediaReapLowPct, waker, transcriber,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
@@ -319,6 +326,10 @@ export function startServer({
   // Wake-on-message for idle-stopped agent boxes (src/wake.js). Off unless
   // MATRON_WAKE_CMD is set (or a waker is injected by tests).
   const resolvedWaker = waker || makeWaker()
+  // A journal that cannot wake anything never waits for a wake — and its
+  // orphan sweep TTL (derived in attachWs from this value) stays what it
+  // always was, rather than growing by a window that can never be used.
+  const effectiveWakeWaitMs = resolvedWaker.enabled ? spawnWakeWaitMs : 0
   const toolStreams = makeToolStreamStore({
     maxBytes: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BYTES', process.env.MATRON_TOOL_STREAM_MAX_BYTES, 1048576),
     maxBuffers: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BUFFERS', process.env.MATRON_TOOL_STREAM_MAX_BUFFERS, 64),
@@ -340,7 +351,7 @@ export function startServer({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
-    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, waker: resolvedWaker, itemTranscription,
+    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
@@ -352,7 +363,7 @@ export function startServer({
     ...(inviteTtlMs !== undefined ? { inviteTtlMs } : {}),
     // spawnStartTimeoutMs rides along so the orphan sweep's TTL can never
     // undercut a configured start timeout (attachWs derives the TTL).
-    broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, waker: resolvedWaker,
+    broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker,
   })
   let retentionInterval = null
   let walCheckpointInterval = null
@@ -389,6 +400,10 @@ export function startServer({
           closing = true
           if (retentionInterval) clearInterval(retentionInterval)
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
+          // Wake-before-spawn waiters (hub.waitForDevice) hold ref'd timers
+          // of up to spawnWakeWaitMs; release them before the sockets go so
+          // each approveSpawn settles its row while the DB is still open.
+          hub.close()
           wss.close()
           for (const c of wss.clients) c.terminate()
           pushPipeline.close()

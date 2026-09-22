@@ -8,7 +8,7 @@ import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem } from './consent-items.js'
-import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared } from './wake.js'
+import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableBoxName } from './wake.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -195,11 +195,12 @@ export function attachWs({
   server, db, hub, pingMs = 55000, pushPipeline = noopPushPipeline,
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
   revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES, inviteTtlMs = 1800000,
-  broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, waker = null,
+  broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null,
 }) {
   // Derived, never raw: the orphan sweep must always outlast a live `start`
-  // RPC still in flight (see APPROVED_ORPHAN_TTL_FLOOR_MS's comment).
-  const approvedOrphanTtlMs = Math.max(APPROVED_ORPHAN_TTL_FLOOR_MS, spawnStartTimeoutMs * 2)
+  // RPC still in flight (see APPROVED_ORPHAN_TTL_FLOOR_MS's comment) — and,
+  // since wake-before-spawn, the wake wait that may precede it.
+  const approvedOrphanTtlMs = Math.max(APPROVED_ORPHAN_TTL_FLOOR_MS, (spawnStartTimeoutMs + spawnWakeWaitMs) * 2)
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES })
   const statusCache = makeStatusCache()
   // Prepared once, reused for the per-frame revocation recheck below — one
@@ -902,16 +903,16 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!fromConvo || fromConvo.owner_user_id !== conn.userId
           || fromConvo.agent_device_id !== conn.deviceId
           || fromConvo.parent_convo_id != null) return fail('not_found')
-        // An unreachable box is refused BEFORE any card is published — never
-        // spend the user's tap on something that cannot work. Same liveness
-        // rule as hub.sendRpcRequest without sending anything.
+        // A box with no live socket is asleep when this journal can wake it
+        // (wake-before-spawn): fire the wake now and park the ask as usual —
+        // the user's tap takes minutes anyway, and approveSpawn waits for the
+        // box to attach before issuing `start`. Only a box that cannot be
+        // woken (no MATRON_WAKE_CMD, or the wake refused) is still refused
+        // BEFORE any card is published, so the user's tap is never spent on
+        // an ask that cannot work. Same liveness rule as hub.sendRpcRequest.
         const online = hub.connsOf(conn.userId).some((c) => c.deviceId === msg.target_device_id && c.ws.readyState === 1)
-        if (!online) {
-          // Same shape as agent_request above: refuse now, boot the box so
-          // the parent's retry can succeed.
-          wakeIfOffline(msg.target_device_id)
-          return fail('agent_unreachable')
-        }
+        const targetWaking = !online && wakeIfOffline(msg.target_device_id)
+        if (!online && !targetWaking) return fail('agent_unreachable')
         const workdir = sanitizePeerText(msg.workdir, SPAWN_WORKDIR_MAX_CHARS)
         if (!workdir) return fail('bad_request', 'bad workdir')
         const task = sanitizePeerText(msg.task, SPAWN_TASK_MAX_CHARS)
@@ -983,7 +984,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // commit point above; the item is best-effort and its own failure
         // never costs the ask (the row's item_id simply stays NULL).
         fileSpawnConsentItem({ db, hub }, { userId: conn.userId, fromDeviceId: conn.deviceId, fromName: conn.name, fromConvoId: msg.from_convo_id, spawnId, card: cardPayload })
-        conn.ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: rid, spawn_id: spawnId }))
+        // target_waking: the box was asleep and is being started; the parent's
+        // tool copy can tell its user the session begins once the box is up
+        // AND the card is answered. Omitted (never false) when it was online.
+        conn.ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: rid, spawn_id: spawnId, ...(targetWaking ? { target_waking: true } : {}) }))
         break
       }
       case 'spawn_targets': {
@@ -1041,6 +1045,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             return {
               device_id: d.device_id, name: sanitizePeerText(d.name, PEER_NAME_CAP), online, folders,
               ...(d.device_id === conn.deviceId ? { self: true } : {}),
+              // Offline + a wake command configured + a name the command
+              // would take (wakeIfOffline's own rule) = asleep, not gone: a
+              // spawn or invite aimed at it starts the box (wake-before-
+              // spawn). Omitted when online or when nothing could wake it.
+              ...(!online && waker?.enabled && isWakeableBoxName(d.name) ? { wakeable: true } : {}),
               ...(activity ? { activity } : {}),
               ...(limits ? { limits } : {}),
               ...(disk ? { disk } : {}),
@@ -1133,6 +1142,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         }
         const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id, initiatorDeviceId: conn.deviceId, justification, topic, targetConvoId })
         if (!r.ok) return fail('conflict', `already ${r.state}`)
+        // An asleep target is started now, while the ask waits for the user:
+        // by the time they approve, the box is usually up to receive it, and
+        // if not, the approved row is pumped on its hello anyway
+        // (deliverPendingInvites). Fire-and-forget like every wake.
+        wakeIfOffline(msg.target_device_id)
         // Client-only card (isClientOnlyEvent in journal.js): appendAndFan's
         // own fan-out already excludes every agent device, including the
         // room's recorded owner, so this never reaches an agent socket.
@@ -1199,6 +1213,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         }
         const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId, initiatorDeviceId: conn.deviceId, justification, topic: '' })
         if (!r.ok) return fail('conflict', `already ${r.state}`)
+        // The recipient of a join is the room's owner box; start it if asleep
+        // (same stance as agent_invite above).
+        wakeIfOffline(room.agent_device_id)
         const joinCard = {
             kind: 'agent_chat', request: 'join', room_id: msg.room_id,
             from_device_id: conn.deviceId, from_name: sanitizePeerText(conn.name, PEER_NAME_CAP),
