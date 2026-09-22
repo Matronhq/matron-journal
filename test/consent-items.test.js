@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { spawnConsentItemFields, spawnConsentClosing, consentLink, fileSpawnConsentItem, closeSpawnConsentItem } from '../src/consent-items.js'
+import { spawnConsentItemFields, spawnConsentClosing, consentLink, fileSpawnConsentItem, closeSpawnConsentItem, chatConsentItemFields, chatConsentClosing } from '../src/consent-items.js'
 import { openDb } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
@@ -107,4 +107,35 @@ test('spawnConsentItemFields: a task containing a backtick fence stays verbatim 
   const f = spawnConsentItemFields({ ...card, task })
   assert.ok(f.body.includes(`\`\`\`\`\`\n${task}\n\`\`\`\`\``))
   assert.ok(!f.body.includes(`\n\`\`\`\n${task}`))
+})
+
+const chatCard = {
+  kind: 'agent_chat', request: 'invite', room_id: 'room-1', from_device_id: 7, from_name: 'dev-a', target_device_id: 12,
+  topic: 'ci logs', justification: 'need the failing job output', from_convo_id: 'c-a', from_convo_title: 'A:xy fixing ci',
+  to_name: 'dev-b', to_convo_id: 'c-b', to_convo_title: 'B:qq reviewing',
+}
+
+test('chatConsentItemFields (invite): title names both sides and the topic; body has both sessions, the justification fenced, and how to answer', () => {
+  const f = chatConsentItemFields(chatCard)
+  assert.equal(f.title, 'dev-a asks to chat with dev-b — ci logs')
+  assert.ok(f.body.includes('```\nneed the failing job output\n```'))
+  assert.ok(f.body.includes('A:xy fixing ci') && f.body.includes('B:qq reviewing'))
+  assert.ok(/Approve/.test(f.body) && /Decline/.test(f.body))
+  assert.deepEqual(f.labels, ['consent'])
+  assert.deepEqual(f.links, [{ url: 'matron://consent/chat/room-1/12', title: 'Agent chat request' }])
+})
+
+test('chatConsentItemFields (join): title says join, names the owner; blank session titles are left out, not rendered empty', () => {
+  const f = chatConsentItemFields({ ...chatCard, request: 'join', topic: '', from_convo_id: '', from_convo_title: '', to_convo_id: '', to_convo_title: '', target_device_id: 7 })
+  assert.equal(f.title, "dev-a asks to join dev-b's room")
+  assert.ok(!f.body.includes('""'))
+  assert.deepEqual(f.links, [{ url: 'matron://consent/chat/room-1/7', title: 'Agent chat request' }])
+})
+
+test('chatConsentClosing: approve and deny are decided by the user; expiry and a dissolved room are cancelled', () => {
+  assert.deepEqual(chatConsentClosing('approved'), { resolution: 'decided', author: 'user', comment: 'Approved — the invitation is on its way.' })
+  assert.deepEqual(chatConsentClosing('denied'), { resolution: 'decided', author: 'user', comment: 'Declined.' })
+  assert.deepEqual(chatConsentClosing('expired'), { resolution: 'cancelled', author: 'agent', comment: 'Expired — no answer within 24 h.' })
+  assert.deepEqual(chatConsentClosing('left'), { resolution: 'cancelled', author: 'agent', comment: 'The room was closed before you answered.' })
+  assert.equal(chatConsentClosing('weird').resolution, 'cancelled')
 })

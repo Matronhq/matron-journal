@@ -311,7 +311,7 @@ const decCursor = (s) => { try { const v = JSON.parse(Buffer.from(String(s), 'ba
 
 export function listItems(db, userId, {
   convoId = null, kind = null, state = null, awaiting = null, label = null, sort = 'rank', since = null,
-  limit = 100, cursor = null, excludePrivateOwned = false,
+  limit = 100, cursor = null, excludePrivateOwned = false, excludeConsent = false,
 } = {}) {
   // Default 100, max 500 (spec: listItems). Coerce first — an unclamped
   // string limit went straight into a SQL LIMIT via bind param concatenation
@@ -332,6 +332,11 @@ export function listItems(db, userId, {
     // never private-owned.
     where.push(`NOT EXISTS (SELECT 1 FROM conversations cv JOIN devices d ON d.id = cv.agent_device_id
       WHERE cv.id = i.origin_convo_id AND d.private = 1)`)
+  }
+  if (excludeConsent) {
+    // Consent mirrors are the user's alone (isConsentMirror above).
+    where.push(`NOT EXISTS (SELECT 1 FROM agent_spawn_requests r WHERE r.item_id = i.id)
+      AND NOT EXISTS (SELECT 1 FROM convo_agents ca WHERE ca.item_id = i.id)`)
   }
   const cur = cursor ? decCursor(cursor) : null
   if (cursor && !cur) return { badCursor: true }
@@ -548,19 +553,21 @@ export function rerankItem(db, { userId, itemId, position, after, before, now = 
 }
 
 
-// Is this item the tracker mirror of a consent ask that has not resolved?
-// (src/consent-items.js.) While it hasn't, the item is journal-owned: what
-// the user reads there must stay what the journal wrote, and it must stay
-// in the open list until the ask itself resolves — so items-http.js
-// refuses every AGENT mutation of it (the asking agent, prompt-injected,
-// could otherwise rewrite the task it shows or close it out of sight).
-// Both parked states count: 'approved' is the window between the tap and
-// the target's start reply (up to the start timeout, or the orphan TTL),
-// and the lock lifting there would be the same hole a few seconds later.
-// Clients are not gated: a hand-close is the user's own call, and the
-// outcome leaves it as they left it. Queried here, not in
-// consent-items.js, so items-http.js does not import a module that
+// Is this item the tracker mirror of a consent ask — a spawn or agent-chat
+// card (src/consent-items.js)? Such an item is the USER's alone, in every
+// state: while the ask is pending, what the user reads there must stay what
+// the journal wrote, and it must stay in the open list (the asking agent,
+// prompt-injected, could otherwise rewrite the task or close it out of
+// sight); and its body carries the very text the card withholds from
+// agents — a spawn's unapproved task, a chat ask's justification — which
+// the consent design keeps away from every sibling agent, approved or not.
+// So items-http.js treats it as invisible to agent callers, exactly as the
+// cards are (isClientOnlyEvent): 404 on read and on every mutation, absent
+// from GET /items (excludeConsent). Clients are unaffected. Queried here,
+// not in consent-items.js, so items-http.js does not import a module that
 // imports it back.
-export function isPendingConsentMirror(db, itemId) {
-  return !!db.prepare("SELECT 1 FROM agent_spawn_requests WHERE item_id=? AND state IN ('awaiting_user','approved')").get(itemId)
+export function isConsentMirror(db, itemId) {
+  return !!db.prepare(
+    'SELECT 1 FROM agent_spawn_requests WHERE item_id=? UNION ALL SELECT 1 FROM convo_agents WHERE item_id=? LIMIT 1'
+  ).get(itemId, itemId)
 }

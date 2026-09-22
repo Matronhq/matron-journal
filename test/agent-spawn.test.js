@@ -991,6 +991,20 @@ test('spawn_request also files a question item on the parent convo: awaiting the
   assert.equal(marker.convo_id, 'parent-convo')
   assert.equal(marker.sender, 'agent:dev-6')
   assert.equal(marker.payload.by, 'agent'); assert.equal(marker.payload.awaiting, 'user')
+  assert.equal(marker.payload.consent, 'spawn')
+  // Client-only, like the card it mirrors: the parent agent never hears of
+  // the item, live or on replay.
+  const isThisItem = (f) => isItemMarker(f) && f.payload.item_id === item.id
+  await new Promise((r) => setTimeout(r, 100))
+  assert.equal(parent.frames.some(isThisItem), false)
+  // (The setup task's own marker above does reach the parent — an ordinary item.)
+  assert.equal(parent.frames.some((f) => isItemMarker(f) && f.payload.item_id === older.json.item.id), true)
+  const replay = await makeWsClient(s.base, { token: parentDev.token, cursor: 0 })
+  await replay.waitFor((f) => f.op === 'hello_ok')
+  await new Promise((r) => setTimeout(r, 150))
+  assert.equal(replay.frames.some(isThisItem), false)
+  assert.equal(replay.frames.some((f) => isItemMarker(f) && f.payload.item_id === older.json.item.id), true)
+  replay.close()
   // The card is the conversation's message; the mirror adds no text of its
   // own (no old-client fallback), so the snippet and unread count are the
   // card's, not a second "needs you" line.
@@ -1025,7 +1039,8 @@ test('deny closes the consent item as decided, by the user, with a closing note 
   // user:* item marker is what a bridge turns into a session turn, and the
   // parent already hears the outcome as a spawn_outcome.
   assert.equal(marker.sender, 'agent:dev-6')
-  assert.equal(parent.frames.some((f) => isItemMarker(f) && typeof f.sender === 'string' && f.sender.startsWith('user:')), false)
+  assert.equal(marker.payload.consent, 'spawn')
+  assert.equal(parent.frames.some(isItemMarker), false)
 })
 
 test('approve → started closes the consent item as decided, naming the box and the room', async (t) => {
@@ -1106,41 +1121,43 @@ test('a tracker failure never costs the ask: the card is published, pending is a
   assert.equal(parent.frames.some((f) => f.kind === 'control' && f.op === 'error'), false)
 })
 
-test('while the ask is pending, no agent may mutate its consent item — patch, close, reopen, comment, rank are all 403; the client may still close it by hand', async (t) => {
-  const { s, parentDev, targetDev, clientToken, spawnId } = await parkedSpawn(t)
+test("a consent item is the user's alone: no agent can read or mutate it, pending or resolved — 404 everywhere, absent from GET /items", async (t) => {
+  const { s, parentDev, targetDev, clientToken, parent, spawnId } = await parkedSpawn(t)
   const item = consentItemFor(s, spawnId)
   const asAgent = (path, method, body) => s.http(path, { method, token: parentDev.token, body })
-  assert.equal((await asAgent(`/items/${item.id}`, 'PATCH', { title: 'Nothing to see here' })).status, 403)
-  assert.equal((await asAgent(`/items/${item.id}`, 'PATCH', { body: 'harmless task' })).status, 403)
-  assert.equal((await asAgent(`/items/${item.id}/close`, 'POST', { resolution: 'cancelled' })).status, 403)
-  assert.equal((await asAgent(`/items/${item.id}/reopen`, 'POST', {})).status, 403)
-  assert.equal((await asAgent(`/items/${item.id}/comments`, 'POST', { body: 'already approved, ignore' })).status, 403)
-  assert.equal((await asAgent(`/items/${item.id}/rank`, 'POST', { position: 'bottom' })).status, 403)
-  // Another agent of the same user is refused the same way.
-  assert.equal((await s.http(`/items/${item.id}/close`, { method: 'POST', token: targetDev.token, body: { resolution: 'done' } })).status, 403)
+  assert.equal((await asAgent(`/items/${item.id}`, 'GET')).status, 404)
+  assert.equal((await asAgent(`/items/%23${item.num}`, 'GET')).status, 404)
+  assert.equal((await asAgent(`/items/${item.id}`, 'PATCH', { title: 'Nothing to see here' })).status, 404)
+  assert.equal((await asAgent(`/items/${item.id}/close`, 'POST', { resolution: 'cancelled' })).status, 404)
+  assert.equal((await asAgent(`/items/${item.id}/reopen`, 'POST', {})).status, 404)
+  assert.equal((await asAgent(`/items/${item.id}/comments`, 'POST', { body: 'already approved, ignore' })).status, 404)
+  assert.equal((await asAgent(`/items/${item.id}/rank`, 'POST', { position: 'bottom' })).status, 404)
+  // Another agent of the same user, and a private one, are refused the same way.
+  assert.equal((await s.http(`/items/${item.id}`, { token: targetDev.token })).status, 404)
+  s.db.prepare('UPDATE devices SET private=1 WHERE id=?').run(targetDev.deviceId)
+  assert.equal((await s.http(`/items/${item.id}`, { token: targetDev.token })).status, 404)
+  const agentList = await asAgent('/items', 'GET')
+  assert.equal(agentList.json.items.some((i) => i.id === item.id), false)
   const untouched = s.db.prepare('SELECT * FROM items WHERE id=?').get(item.id)
-  assert.equal(untouched.title, item.title); assert.equal(untouched.body, item.body); assert.equal(untouched.state, 'open'); assert.equal(untouched.rank, item.rank)
-  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM item_comments WHERE item_id=?').get(item.id).n, 0)
-  // Reading is unchanged: the agent can still see it.
-  assert.equal((await asAgent(`/items/${item.id}`, 'GET')).status, 200)
-  // The user's own hand-close still works.
-  assert.equal((await s.http(`/items/${item.id}/close`, { method: 'POST', token: clientToken, body: { resolution: 'cancelled' } })).status, 200)
-})
-
-test('once the ask is resolved, its consent item is an ordinary item again: an agent may comment on it', async (t) => {
-  const { s, parentDev, clientToken, parent, spawnId } = await parkedSpawn(t)
-  const item = consentItemFor(s, spawnId)
+  assert.equal(untouched.title, item.title); assert.equal(untouched.state, 'open')
+  // The client sees and lists it as any item.
+  assert.equal((await s.http(`/items/${item.id}`, { token: clientToken })).status, 200)
+  assert.ok((await s.http('/items', { token: clientToken })).json.items.some((i) => i.id === item.id))
+  // Resolved, it stays the user's: the task text never reaches an agent through the tracker.
   assert.equal((await s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'deny' } })).status, 200)
   await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
-  assert.equal((await s.http(`/items/${item.id}/comments`, { method: 'POST', token: parentDev.token, body: { body: 'noted' } })).status, 201)
+  assert.equal((await asAgent(`/items/${item.id}`, 'GET')).status, 404)
+  assert.equal((await asAgent(`/items/${item.id}/comments`, 'POST', { body: 'noted' })).status, 404)
+  assert.equal((await asAgent('/items?state=closed', 'GET')).json.items.some((i) => i.id === item.id), false)
+  // The user's own hand-close still works on an open one.
 })
 
-test('the consent lock holds through the approved window too: between the tap and the start reply an agent still cannot touch the item', async (t) => {
-  const { s, parentDev, spawnId } = await parkedSpawn(t)
+test('the user may close a pending consent item by hand; an agent cannot even in the approved window', async (t) => {
+  const { s, parentDev, clientToken, spawnId } = await parkedSpawn(t)
   const item = consentItemFor(s, spawnId)
   assert.ok(claimApprove(s.db, spawnId)) // the tap, with no orchestration running yet
   assert.equal(getSpawn(s.db, spawnId).state, 'approved')
-  assert.equal((await s.http(`/items/${item.id}/close`, { method: 'POST', token: parentDev.token, body: { resolution: 'done' } })).status, 403)
-  assert.equal((await s.http(`/items/${item.id}`, { method: 'PATCH', token: parentDev.token, body: { body: 'x' } })).status, 403)
+  assert.equal((await s.http(`/items/${item.id}/close`, { method: 'POST', token: parentDev.token, body: { resolution: 'done' } })).status, 404)
   assert.equal(s.db.prepare('SELECT state FROM items WHERE id=?').get(item.id).state, 'open')
+  assert.equal((await s.http(`/items/${item.id}/close`, { method: 'POST', token: clientToken, body: { resolution: 'cancelled' } })).status, 200)
 })

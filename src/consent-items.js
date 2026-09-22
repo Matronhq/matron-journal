@@ -100,10 +100,12 @@ export function spawnConsentClosing({ outcome, errorCode, roomId }, { targetName
 
 // The item's markers never push and never wake: the consent card already
 // rang the pocket for the ask (permission_request is an attention push),
-// and the parent bridge already hears the resolution as a spawn_outcome.
-// They are written under the ASKING agent's device — the same sender as
-// the card — never as a user:* event, which is what a bridge turns into a
-// session turn. And never with the old-client fallback text: that is a
+// and the asking bridge already hears the resolution its own way (a
+// spawn_outcome, an invite answer frame). They are written under the
+// ASKING agent's device — the same sender as the card — and carry
+// `consent: 'spawn'|'chat'`, which makes them CLIENT-ONLY (isClientOnlyEvent,
+// journal.js) exactly like the card: no agent hears of the item, live or
+// on replay. And never with the old-client fallback text: that is a
 // `text` message, and would overwrite the card's snippet and count a
 // second unread for one ask.
 const quietPush = { onAppend() {} }
@@ -138,7 +140,7 @@ export function fileSpawnConsentItem({ db, hub }, { userId, fromDeviceId, fromNa
       return item
     })()
     const who = { kind: 'agent', userId, deviceId: fromDeviceId, name: fromName }
-    emitMarker({ db, hub, pushPipeline: quietPush, waker: null }, who, { item, action: 'created', by: 'agent', fallback: false })
+    emitMarker({ db, hub, pushPipeline: quietPush, waker: null }, who, { item, action: 'created', by: 'agent', fallback: false, extra: { consent: 'spawn' } })
     return item
   } catch (err) {
     console.error('consent item: filing failed (the card and the spawn row stand)', err)
@@ -171,11 +173,114 @@ export function closeSpawnConsentItem({ db, hub }, requestId, { outcome, errorCo
     // deleted since the ask still gets its item closed — only the live
     // marker is skipped (clients see the close at their next /items).
     const name = db.prepare('SELECT name FROM devices WHERE id=?').get(row.from_device_id)?.name
-    if (name) emitMarker({ db, hub, pushPipeline: quietPush, waker: null }, { kind: 'agent', userId: row.user_id, deviceId: row.from_device_id, name }, { item: out.item, action: 'closed', comment: out.comment, by: c.author, fallback: false })
+    if (name) emitMarker({ db, hub, pushPipeline: quietPush, waker: null }, { kind: 'agent', userId: row.user_id, deviceId: row.from_device_id, name }, { item: out.item, action: 'closed', comment: out.comment, by: c.author, fallback: false, extra: { consent: 'spawn' } })
     else console.error(`consent item: asking device ${row.from_device_id} is gone; item ${row.item_id} closed without a live marker`)
     return true
   } catch (err) {
     console.error('consent item: close failed (the spawn outcome stands)', err)
+    return false
+  }
+}
+
+// --- Agent-chat asks (agent_invite / agent_join) ---------------------------
+// Same mirror for the other consent card (spec: 2026-08-07 agent chat
+// consent). The row is convo_agents keyed (room, agent_device_id) — the
+// device the card's own target_device_id names (the invitee, or the joiner
+// itself) — so the link carries both. The item lives on the ROOM, where the
+// card is; the justification is another agent's words and goes in a fence
+// like a spawn's task.
+
+export function chatConsentItemFields(card) {
+  const from = plain(card.from_name)
+  const to = plain(card.to_name)
+  const join = card.request === 'join'
+  const topic = card.topic ? ` — ${card.topic}` : ''
+  const title = cut(join ? `${from} asks to join ${to}'s room` : `${from} asks to chat with ${to}${topic}`, TITLE_MAX)
+  const session = (t) => (t ? ` — session "${plain(t)}"` : '')
+  const lines = [
+    join ? `**${from}** asks to join **${to}**'s room.` : `**${from}** asks to open a chat with **${to}**.`,
+    '',
+    `- **From:** ${from}${session(card.from_convo_title)}`,
+    `- **To:** ${to}${session(card.to_convo_title)}`,
+    ...(card.topic ? [`- **Topic:** ${plain(card.topic)}`] : []),
+    '',
+    `**Why, in ${from}'s words:**`,
+    '',
+    fenced(card.justification),
+    '',
+    '**To answer:** open the room conversation this item belongs to and tap **Approve** or **Decline** on the chat request card (also listed under Settings → Agent Chats). Unanswered, the request expires 24 h after it was made.',
+  ]
+  return {
+    title,
+    body: lines.join('\n'),
+    labels: [CONSENT_LABEL],
+    links: [{ url: `${consentLink('chat', card.room_id)}/${card.target_device_id}`, title: 'Agent chat request' }],
+  }
+}
+
+// How each way a parked chat row leaves 'awaiting_user' closes the item.
+// 'left' is the owner dissolving the room under a parked join ask.
+export function chatConsentClosing(outcome) {
+  switch (outcome) {
+    case 'approved': return { resolution: 'decided', author: 'user', comment: 'Approved — the invitation is on its way.' }
+    case 'denied': return { resolution: 'decided', author: 'user', comment: 'Declined.' }
+    case 'expired': return { resolution: 'cancelled', author: 'agent', comment: 'Expired — no answer within 24 h.' }
+    case 'left': return { resolution: 'cancelled', author: 'agent', comment: 'The room was closed before you answered.' }
+    default: return { resolution: 'cancelled', author: 'agent', comment: `Closed — ${outcome}.` }
+  }
+}
+
+// File the mirror of a freshly parked chat ask; same best-effort contract
+// as fileSpawnConsentItem. `agentDeviceId` is the row's key (the card's
+// target_device_id). The idempotency key includes the row's created_at
+// because a renewed row (a fresh ask after a deny or expiry) reuses the
+// primary key and must get a fresh item, not the old closed one back.
+export function fileChatConsentItem({ db, hub }, { userId, fromDeviceId, fromName, roomId, agentDeviceId, card }) {
+  try {
+    const fields = chatConsentItemFields(card)
+    const item = db.transaction(() => {
+      const row = db.prepare("SELECT created_at FROM convo_agents WHERE convo_id=? AND agent_device_id=? AND state='awaiting_user'").get(roomId, agentDeviceId)
+      if (!row) throw new Error(`no parked row for ${roomId}/${agentDeviceId}`)
+      const { item } = createItem(db, {
+        userId, kind: 'question', ...fields, awaiting: 'user', position: 'top',
+        originConvoId: roomId, originDeviceId: fromDeviceId, createdBy: 'agent',
+        idemKey: `consent:chat:${roomId}:${agentDeviceId}:${row.created_at}`,
+      })
+      db.prepare("UPDATE convo_agents SET item_id=? WHERE convo_id=? AND agent_device_id=? AND state='awaiting_user'").run(item.id, roomId, agentDeviceId)
+      return item
+    })()
+    const who = { kind: 'agent', userId, deviceId: fromDeviceId, name: fromName }
+    emitMarker({ db, hub, pushPipeline: quietPush, waker: null }, who, { item, action: 'created', by: 'agent', fallback: false, extra: { consent: 'chat' } })
+    return item
+  } catch (err) {
+    console.error('consent item: chat filing failed (the card and the parked row stand)', err)
+    return null
+  }
+}
+
+// Close the mirror when a parked chat row leaves 'awaiting_user': the answer
+// route and matron-admin (approved/denied, with the answering client device
+// when there is one), the awaiting-TTL sweep (expired), an owner's dissolve
+// (left). `hub` may be null (the admin CLI has none): the table is closed
+// either way, only the live marker is skipped. Never throws.
+export function closeChatConsentItem({ db, hub }, roomId, agentDeviceId, { outcome, answeredByDeviceId = null }) {
+  try {
+    const row = db.prepare(`
+      SELECT ca.item_id, ca.initiator_device_id, c.owner_user_id
+      FROM convo_agents ca JOIN conversations c ON c.id = ca.convo_id
+      WHERE ca.convo_id=? AND ca.agent_device_id=?`).get(roomId, agentDeviceId)
+    if (!row || !row.item_id) return false
+    const c = chatConsentClosing(outcome)
+    const deviceId = c.author === 'user' && answeredByDeviceId != null ? answeredByDeviceId : row.initiator_device_id
+    const out = closeItem(db, { userId: row.owner_user_id, itemId: row.item_id, resolution: c.resolution, author: c.author, deviceId, comment: c.comment })
+    if (!out) return false
+    if (!hub) return true
+    const name = db.prepare('SELECT name FROM devices WHERE id=?').get(row.initiator_device_id)?.name
+    if (name) emitMarker({ db, hub, pushPipeline: quietPush, waker: null }, { kind: 'agent', userId: row.owner_user_id, deviceId: row.initiator_device_id, name }, { item: out.item, action: 'closed', comment: out.comment, by: c.author, fallback: false, extra: { consent: 'chat' } })
+    else console.error(`consent item: asking device ${row.initiator_device_id} is gone; item ${row.item_id} closed without a live marker`)
+    return true
+  } catch (err) {
+    console.error('consent item: chat close failed (the ask\'s own outcome stands)', err)
     return false
   }
 }

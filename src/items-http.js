@@ -11,7 +11,7 @@ import { idemKeyOf, senderOf, badRequest, notFound, conflict } from './http-who.
 import {
   ITEM_KINDS, AWAITING, RESOLUTIONS, BODY_MAX, validateItemFields, createItem, getItem, listItems, listComments,
   updateItem, addComment, setAttachmentTranscript, closeItem, reopenItem, rerankItem,
-  markTranscriptsPending, isAudioAttachment, isPendingConsentMirror,
+  markTranscriptsPending, isAudioAttachment, isConsentMirror,
 } from './items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE, ITEM_ACTIONS, itemFallbackText, FALLBACK_ACTIONS } from './items-marker.js'
 import { visibleMission } from './missions-http.js'
@@ -38,10 +38,13 @@ function answerKnownError(res, err) {
 
 // Visible = owned by the caller's user and, for an ordinary agent, not born
 // in a private device's conversation. Same 404 for every failure.
+// A consent mirror (isConsentMirror, items.js) is invisible to EVERY agent,
+// private ones included — it is the user's card in item form.
 function visibleItem(db, who, idOrNum) {
   const item = getItem(db, who.userId, idOrNum)
   if (!item) return null
   if (filteredAgent(db, who) && privateOwnedConvo(db, item.origin_convo_id)) return null
+  if (who.kind === 'agent' && isConsentMirror(db, item.id)) return null
   return item
 }
 
@@ -142,7 +145,7 @@ function handleList(db, res, url, who) {
   if (convoId != null && (!convoId || convoId.length > ID_MAX)) return badRequest(res)
   const r = listItems(db, who.userId, {
     convoId, kind, state, awaiting, label, sort, since,
-    limit, cursor: q.get('cursor'), excludePrivateOwned: filteredAgent(db, who),
+    limit, cursor: q.get('cursor'), excludePrivateOwned: filteredAgent(db, who), excludeConsent: who.kind === 'agent',
   })
   // An undecodable cursor is a malformed request, not an empty page.
   if (r.badCursor) return badRequest(res)
@@ -308,18 +311,6 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
   // the transcript PATCH below (handleItemSubRoute's comments/:cid branch)
   // is gated on the item's origin conversation because transcribing a
   // voice-note attachment is specifically the origin bridge's job.
-
-  // The one exception to "any box that can see it may change it": the
-  // mirror of a consent ask still awaiting the user (isPendingConsentMirror,
-  // items.js) is journal-owned until the ask resolves. An agent — the
-  // asking one above all, if prompt-injected — must not rewrite what the
-  // user reads there or close it out of the open list; reading is still
-  // fine, and a client's hand-close is still the user's own call. 403, not
-  // 404: the item is visible, the refusal is about what the caller is.
-  if (who.kind === 'agent' && req.method !== 'GET' && isPendingConsentMirror(db, item.id)) {
-    json(res, 403, { error: 'forbidden' })
-    return true
-  }
 
   if (!sub) {
     if (req.method === 'GET') { json(res, 200, { item, comments: listComments(db, item.id) }); return true }

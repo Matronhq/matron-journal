@@ -446,6 +446,16 @@ export function openDb(path) {
       console.log(`convo_agents: dropped ${orphans} membership row(s) whose device was already revoked`)
     }
   }
+  // Consent items (spec 2026-09-22 consent-items): the tracker item that
+  // mirrors a parked chat ask, NULL for rows predating the mirror. After
+  // BOTH convo_agents rebuilds above for the reason target_convo_id is: a
+  // rebuild recreates the table from a fixed definition. A renewed row
+  // (a fresh ask after a deny/expiry) gets a fresh item, overwriting this.
+  const caCols = db.prepare('PRAGMA table_info(convo_agents)').all()
+  if (!caCols.some((c) => c.name === 'item_id')) {
+    db.exec('ALTER TABLE convo_agents ADD COLUMN item_id TEXT')
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_convo_agents_item ON convo_agents(item_id)')
   // Which Claude model the spawned session should run (spec: agent-spawned
   // sessions). An alias like 'opus' or a full model id — the target bridge's
   // vocabulary, not the journal's, so no CHECK: a bridge that learns a new
@@ -486,6 +496,9 @@ export function openDb(path) {
   if (!spawnCols.some((c) => c.name === 'item_id')) {
     db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN item_id TEXT')
   }
+  // items.js isConsentMirror / listItems' excludeConsent look items up by
+  // this column on every agent read; keep both point lookups.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_spawn_item ON agent_spawn_requests(item_id)')
   // refreshSpawnRoomTitle (spawns.js) looks a started row up by its child
   // on every titled convo_upsert; keep that a point lookup.
   db.exec('CREATE INDEX IF NOT EXISTS idx_spawn_child ON agent_spawn_requests(child_convo_id)')

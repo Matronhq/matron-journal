@@ -2,7 +2,8 @@
 
 **Date:** 2026-09-22 · **Requested by:** Dan (2026-09-22, from the bev
 session: "I can never find the approval cards"; option A chosen on item
-#135 on 2026-09-10, detailed in item #162) · **Repos touched:**
+#135 on 2026-09-10, detailed in item #162; agent-chat asks confirmed on
+item #2317, 2026-09-22) · **Repos touched:**
 matron-journal (this spec). Apps embed the card in item detail as a
 follow-up (item #162, per platform).
 
@@ -22,7 +23,7 @@ That is bridge-side and reaches a box only through a fleet rollout. Spawn
 consent is brokered by the journal for every box, so mirroring it there
 covers the fleet in one deploy.
 
-## Design (spawn consent, this pass)
+## Design (spawn and agent-chat consent)
 
 **File.** When `spawn_request` has journaled the card (the commit point
 that decides row-vs-discard), `fileSpawnConsentItem` creates a `question`
@@ -53,10 +54,25 @@ and no old-client fallback text — a fallback `text` is a message and would
 overwrite the card's snippet and double the unread. `emitMarker` gains a
 `fallback` flag for this.
 
-**Journal-owned while pending.** Any agent mutation of the item through
-the item routes is `403` until the ask resolves (the asking agent, if
-prompt-injected, must not rewrite what the user reads or close the item
-out of sight); reads and the user's own hand-close are unaffected.
+**The user's alone.** The item's body carries the very text the card
+withholds from agents — a spawn's unapproved task, a chat ask's
+justification, which the consent design keeps from every sibling agent
+whether or not the user approves. So a consent mirror (`isConsentMirror`:
+any item a spawn or convo_agents row points at) is invisible to every
+agent caller in every state: 404 on read and on every mutation route,
+absent from `GET /items`; and its markers carry `consent: 'spawn'|'chat'`,
+which makes them client-only like the cards. That also means the asking
+agent, if prompt-injected, can neither rewrite what the user reads nor
+close the item out of sight. The user's own hand-close is unaffected.
+
+**Agent-chat asks.** `agent_invite`/`agent_join` file the same kind of
+item on the room conversation (`convo_agents.item_id`, refreshed on a
+renewed row), titled "‹from› asks to chat with ‹to› — ‹topic›" / "‹from›
+asks to join ‹to›'s room", linked `matron://consent/chat/‹room›/‹device›`,
+with both sessions, the topic and the justification fenced. Closed by
+whatever leaves `awaiting_user`: the answer route and the admin CLI
+(`decided`), the awaiting-TTL sweep (`cancelled`), an owner's dissolve
+(`cancelled`).
 
 **Best-effort.** A tracker failure is logged and never costs the ask, the
 card, or the outcome frame. An item the user closed by hand stays as they
@@ -73,18 +89,9 @@ closes itself with the outcome. When an app learns to render the card
 inside item detail (link scheme `matron://consent/spawn/<id>`, buttons on
 the existing answer API), the answer happens from the item too.
 
-## Trade recorded on purpose
+## Out of scope
 
-Items are user-wide. The task text is therefore readable via `GET /items`
-by every non-private agent of the user while the ask is open — the text
-the card itself withholds from agents. Dan asked for the task in the item
-body; the alternative (a consent-label sieve on agent reads) is a
-follow-up if wanted.
-
-## Out of scope (recommendation filed separately)
-
-Agent-chat asks (`agent_invite`/`agent_join`) use the same mechanism and
-are the obvious next pass. Tool-permission prompts are bridge-local,
-short-lived and answered in seconds; a per-prompt item would flood the
-tracker — see the recommendation item for the option of filing one only
-once a prompt has waited past a threshold.
+Tool-permission prompts are bridge-local, short-lived and answered in
+seconds; a per-prompt item would flood the tracker (item #2317: left out).
+Plan approvals (the bridge's ExitPlanMode card) wait indefinitely and are
+mirrored bridge-side in matron-bridge, not here.
