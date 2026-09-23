@@ -9,6 +9,7 @@ import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem } from './consent-items.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableBoxName } from './wake.js'
+import { coordinatorFor } from './coordinator.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -407,7 +408,13 @@ export function attachWs({
           // rooms (own-echo guard, roster self-exclusion, room titles); the
           // token is otherwise opaque to them. Reuses the row authToken already
           // resolved (`who`) — no extra lookup.
-          ws.send(JSON.stringify({ kind: 'control', op: 'hello_ok', seq: headSeq, device_id: who.deviceId, name: who.name }))
+          // coordinator_convo_id (spec 2026-09-23 coordinator redesign §1a):
+          // the user's Coordinator, so an app knows it on connect without a
+          // separate GET /coordinator. Sieved exactly like that route — an
+          // ordinary agent never learns a private-owned conversation's id.
+          // applyBridgePrivate ran above, so the flag is already current.
+          const coordinator = coordinatorFor(db, who.userId, { excludePrivateOwned: who.kind === 'agent' && !isPrivateDevice(db, who.deviceId) })
+          ws.send(JSON.stringify({ kind: 'control', op: 'hello_ok', seq: headSeq, device_id: who.deviceId, name: who.name, coordinator_convo_id: coordinator }))
           if (msg.cursor != null) {
             // snapshot_required valve (spec §6): a gap this large is not worth
             // replaying — tell the client to wipe, GET /snapshot, and reconnect

@@ -140,3 +140,30 @@ test('GET /coordinator hides a private-owned coordinator from an ordinary agent,
   assert.deepEqual((await s.http('/coordinator', { token: priv.token })).json, { convo_id: 's1' })
   assert.deepEqual((await s.http('/coordinator', { token: agent.token })).json, { convo_id: null })
 })
+
+const helloOf = async (s, token) => {
+  const c = await makeWsClient(s.base, { token, cursor: null })
+  const hello = await c.waitFor((f) => f.op === 'hello_ok')
+  c.close()
+  return hello
+}
+
+test('hello_ok and /snapshot carry coordinator_convo_id: null until set, then the id; sieved for an ordinary agent', async (t) => {
+  const { s, dan, agent, client } = await fleet(t)
+  assert.equal((await helloOf(s, client)).coordinator_convo_id, null)
+  const snap0 = (await s.http('/snapshot', { token: client })).json
+  assert.ok('coordinator_convo_id' in snap0); assert.equal(snap0.coordinator_convo_id, null)
+  await put(s, client, 'c1')
+  assert.equal((await helloOf(s, client)).coordinator_convo_id, 'c1')
+  assert.equal((await helloOf(s, agent.token)).coordinator_convo_id, 'c1')
+  assert.equal((await s.http('/snapshot', { token: client })).json.coordinator_convo_id, 'c1')
+
+  const priv = createAgent(s.db, dan.id, 'secret-box')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  upsertConversation(s.db, { id: 's1', ownerUserId: dan.id, title: 'S1', agentDeviceId: priv.deviceId })
+  await put(s, client, 's1')
+  assert.equal((await helloOf(s, agent.token)).coordinator_convo_id, null)
+  assert.equal((await s.http('/snapshot', { token: agent.token })).json.coordinator_convo_id, null)
+  assert.equal((await helloOf(s, priv.token)).coordinator_convo_id, 's1')
+  assert.equal((await helloOf(s, client)).coordinator_convo_id, 's1')
+})
