@@ -7,11 +7,11 @@ import { GithubError } from '../src/github.js'
 // A scripted stand-in for makeGithub(): poll/identity/exchange answers are
 // queues of thunks; an empty queue answers the default.
 function fakeGithub({ enabled = true, webFlow = false } = {}) {
-  const q = { poll: [], identity: [], exchange: [] }
+  const q = { poll: [], identity: [], exchange: [], start: [] }
   const next = (k, fallback) => (q[k].length ? q[k].shift() : fallback)()
   return {
     q, enabled, webFlow, host: 'github.com',
-    startDeviceFlow: async () => ({ device_code: 'dc', user_code: 'ABCD-1234', verification_uri: 'https://github.com/login/device', interval: 5, expires_in: 900 }),
+    startDeviceFlow: async () => next('start', () => ({ device_code: 'dc', user_code: 'ABCD-1234', verification_uri: 'https://github.com/login/device', interval: 5, expires_in: 900 })),
     pollDeviceFlow: async () => next('poll', () => ({ status: 'pending' })),
     authorizeUrl: (state) => `https://github.com/login/oauth/authorize?client_id=abc&scope=read%3Aorg&state=${state}`,
     exchangeCode: async () => next('exchange', () => ({ token: 'tok' })),
@@ -129,4 +129,23 @@ test('not configured: every linking route is 404 not_configured; /me says so', a
   assert.deepEqual((await s.http('/me', { token: danTok })).json.github_linking, { enabled: false, web_flow: false })
   const r = await s.http('/github/link', { method: 'POST', token: danTok, body: { flow: 'device' } })
   assert.equal(r.status, 404); assert.equal(r.json.error, 'not_configured')
+})
+
+test('device flow start caps the row TTL and the returned expires_in at LINK_FLOW_TTL_MS (10 min)', async (t) => {
+  const gh = fakeGithub()
+  const { s, danTok } = await fleet(t, gh)
+  // GitHub's default expires_in (900s = 15min) exceeds the spec's 10-minute
+  // link-flow limit, so both the stored row and the value handed back to
+  // the client must be capped at 600s/600000ms.
+  const start = await s.http('/github/link', { method: 'POST', token: danTok, body: { flow: 'device' } })
+  assert.equal(start.json.expires_in, 600)
+  const row = s.db.prepare('SELECT expires_at, created_at FROM github_link_flows WHERE id=?').get(start.json.flow_id)
+  assert.equal(row.expires_at - row.created_at, 600000)
+
+  // A shorter GitHub-provided expires_in is left untouched.
+  gh.q.start.push(() => ({ device_code: 'dc2', user_code: 'WXYZ-5678', verification_uri: 'https://github.com/login/device', interval: 5, expires_in: 300 }))
+  const start2 = await s.http('/github/link', { method: 'POST', token: danTok, body: { flow: 'device' } })
+  assert.equal(start2.json.expires_in, 300)
+  const row2 = s.db.prepare('SELECT expires_at, created_at FROM github_link_flows WHERE id=?').get(start2.json.flow_id)
+  assert.equal(row2.expires_at - row2.created_at, 300000)
 })

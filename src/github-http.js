@@ -9,7 +9,7 @@ import { badRequest, notFound, conflict } from './http-who.js'
 import { GithubError } from './github.js'
 import {
   githubAccountView, saveGithubIdentity, markGithubStale, deleteGithubAccount,
-  createLinkFlow, takeLinkFlow,
+  createLinkFlow, takeLinkFlow, LINK_FLOW_TTL_MS,
 } from './github-accounts.js'
 
 const FLOWS = ['device', 'web']
@@ -65,8 +65,13 @@ export async function handleGithubRoute(ctx, req, res, url, who) {
     }
     let start
     try { start = await github.startDeviceFlow() } catch (err) { if (err instanceof GithubError) return upstream(res); throw err }
-    const flow = createLinkFlow(db, { userId: who.userId, deviceId: who.deviceId, flow: 'device', deviceCode: start.device_code, ttlMs: start.expires_in * 1000 })
-    json(res, 200, { flow_id: flow.id, user_code: start.user_code, verification_uri: start.verification_uri, interval: start.interval, expires_in: start.expires_in })
+    // GitHub's expires_in has no upper bound; the spec caps every link flow
+    // at LINK_FLOW_TTL_MS (10 min), so the row and the value we hand back
+    // to the client must agree, or the client would keep polling a row that
+    // has already been swept.
+    const ttlMs = Math.min(start.expires_in * 1000, LINK_FLOW_TTL_MS)
+    const flow = createLinkFlow(db, { userId: who.userId, deviceId: who.deviceId, flow: 'device', deviceCode: start.device_code, ttlMs })
+    json(res, 200, { flow_id: flow.id, user_code: start.user_code, verification_uri: start.verification_uri, interval: start.interval, expires_in: Math.floor(ttlMs / 1000) })
     return true
   }
 
