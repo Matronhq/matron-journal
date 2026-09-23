@@ -753,3 +753,69 @@ test('missions scope=shared and foreign detail follow the conversation rule; wri
   assert.equal((await s.http(`/missions/${m.json.mission.id}`, { token: patClient })).status, 404)
   assert.equal((await s.http('/milestones?convo=c1', { token: patClient })).status, 404)
 })
+
+test('shared mission counts and last_milestone follow the shared rule per-conversation, not just device privacy: a joined convo pat cannot read is invisible in counts', async (t) => {
+  const { s, dan, pat, agent } = await fleet(t)
+  const link = (u, gid) => saveGithubIdentity(s.db, { userId: u.id, host: 'github.com', identity: { github_id: gid, login: u.name, scopes: ['github.com/matronhq'] }, token: `t${gid}`, now: 1 })
+  link(dan, 1); link(pat, 2)
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id, agentDeviceId: agent.deviceId, repo: 'github.com/matronhq/journal' })
+  const patClient = (await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'mac' } })).json.token
+  const m = (await s.http('/missions', { method: 'POST', token: agent.token, body: { convo_id: 'c1', title: 'Shared', body: 'g' } })).json.mission
+  const c1ms = await s.http('/milestones', { method: 'POST', token: agent.token, body: { convo_id: 'c1', kind: 'progress', title: 'C1 step' } })
+  assert.equal(c1ms.status, 201)
+  // c2 (from fleet) has no repo: not shared. Join it to the mission and post
+  // a milestone there — it must not count for, or leak its title to, pat.
+  const joined = await s.http(`/missions/${m.id}/join`, { method: 'POST', token: agent.token, body: { convo_id: 'c2' } })
+  assert.equal(joined.status, 200)
+  const c2ms = await s.http('/milestones', { method: 'POST', token: agent.token, body: { convo_id: 'c2', kind: 'progress', title: 'C2 step' } })
+  assert.equal(c2ms.status, 201)
+  const list = await s.http('/missions?scope=shared', { token: patClient })
+  const row = list.json.missions.find((x) => x.id === m.id)
+  assert.equal(row.milestones, 1)
+  assert.equal(row.conversations, 1)
+  assert.equal(row.last_milestone.title, 'C1 step')
+  const detail = await s.http(`/missions/${m.id}`, { token: patClient })
+  assert.equal(detail.status, 200)
+  assert.equal(detail.json.milestones.length, detail.json.mission.milestones)
+  assert.deepEqual(detail.json.milestones.map((x) => x.title), ['C1 step'])
+  assert.deepEqual(detail.json.conversations.map((x) => x.id), ['c1'])
+})
+
+test('a mission born on a private-owned conversation stays invisible to a colleague even after a shared conversation joins it', async (t) => {
+  const { s, dan, pat, agent, client } = await fleet(t)
+  const link = (u, gid) => saveGithubIdentity(s.db, { userId: u.id, host: 'github.com', identity: { github_id: gid, login: u.name, scopes: ['github.com/matronhq'] }, token: `t${gid}`, now: 1 })
+  link(dan, 1); link(pat, 2)
+  const priv = createAgent(s.db, dan.id, 'private-box')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  upsertConversation(s.db, { id: 'secret1', ownerUserId: dan.id, title: 'Secret', agentDeviceId: priv.deviceId })
+  const patClient = (await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'mac' } })).json.token
+  const m = (await s.http('/missions', { method: 'POST', token: priv.token, body: { convo_id: 'secret1', title: 'Private-born', body: 'g' } })).json.mission
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id, agentDeviceId: agent.deviceId, repo: 'github.com/matronhq/journal' })
+  // dan's own USER token joins across devices (an ordinary agent device is
+  // gated by authorizeAgentWrite and cannot write on a conversation owned by
+  // a different device unless it's joined via convo_agents).
+  const joined = await s.http(`/missions/${m.id}/join`, { method: 'POST', token: client, body: { convo_id: 'c1' } })
+  assert.equal(joined.status, 200)
+  assert.equal((await s.http(`/missions/${m.id}`, { token: patClient })).status, 404)
+  const list = await s.http('/missions?scope=shared', { token: patClient })
+  assert.equal(list.json.missions.find((x) => x.id === m.id), undefined)
+})
+
+test('a mission born on a non-shared conversation becomes visible via a later shared join (second EXISTS clause), with counts covering only the shared convo', async (t) => {
+  const { s, dan, pat, agent } = await fleet(t)
+  const link = (u, gid) => saveGithubIdentity(s.db, { userId: u.id, host: 'github.com', identity: { github_id: gid, login: u.name, scopes: ['github.com/matronhq'] }, token: `t${gid}`, now: 1 })
+  link(dan, 1); link(pat, 2)
+  const patClient = (await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'mac' } })).json.token
+  // c2 (from fleet) has no repo: a mission born here is not shared via clause 1.
+  const m = (await s.http('/missions', { method: 'POST', token: agent.token, body: { convo_id: 'c2', title: 'Born elsewhere', body: 'g' } })).json.mission
+  assert.equal((await s.http(`/missions/${m.id}`, { token: patClient })).status, 404)
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id, agentDeviceId: agent.deviceId, repo: 'github.com/matronhq/journal' })
+  const joined = await s.http(`/missions/${m.id}/join`, { method: 'POST', token: agent.token, body: { convo_id: 'c1' } })
+  assert.equal(joined.status, 200)
+  const list = await s.http('/missions?scope=shared', { token: patClient })
+  assert.deepEqual(list.json.missions.map((x) => x.id), [m.id])
+  const detail = await s.http(`/missions/${m.id}`, { token: patClient })
+  assert.equal(detail.status, 200)
+  assert.deepEqual(detail.json.conversations.map((x) => x.id), ['c1'])
+  assert.equal(detail.json.mission.conversations, 1)
+})

@@ -330,16 +330,52 @@ export function listMilestones(db, userId, { convoId, excludePrivateOwned = fals
 }
 
 // Cross-user reads (spec 2026-09-23 tracker web/teams). A mission is shared
-// with @viewer when its origin conversation, or any conversation carrying
-// its mission_id, passes the shared rule; its detail lists only those
-// conversations' milestones and items. countsSql(true) applies the private
-// sieve to the counts, which is the honest count for a foreign viewer.
+// with @viewer when its origin conversation is not private-owned (ORIGIN_SIEVE
+// — otherwise a colleague who later joins a shared public conversation to a
+// private-born mission would see its title/body, review round 2, Finding 2)
+// AND its origin conversation, or any conversation carrying its mission_id,
+// passes the shared rule; its detail lists only those conversations'
+// milestones and items.
 const MISSION_SHARED = `(
-  EXISTS (SELECT 1 FROM conversations cv WHERE cv.id = m.origin_convo_id AND ${sharedConvoSql('cv')})
-  OR EXISTS (SELECT 1 FROM conversations cv WHERE cv.mission_id = m.id AND ${sharedConvoSql('cv')})
+  ${ORIGIN_SIEVE}
+  AND (
+    EXISTS (SELECT 1 FROM conversations cv WHERE cv.id = m.origin_convo_id AND ${sharedConvoSql('cv')})
+    OR EXISTS (SELECT 1 FROM conversations cv WHERE cv.mission_id = m.id AND ${sharedConvoSql('cv')})
+  )
 )`
 const OWNER_JSON = `json_object('user_id', u.id, 'name', u.name, 'github_login', ga.login) AS owner_json`
 const OWNER_FROM = `JOIN users u ON u.id = m.user_id LEFT JOIN github_accounts ga ON ga.user_id = m.user_id`
+
+// Review round 2, Finding 1: countsSql(true) only sieves private-DEVICE
+// conversations — it still counts (and takes last_milestone from) a
+// conversation that carries this mission's id but fails the SHARED rule for
+// THIS viewer (no repo, or a repo whose org this viewer isn't in). That let
+// a foreign viewer's summary/detail counts disagree with what
+// sharedMissionDetail actually lists, and leaked a milestone TITLE from a
+// conversation the viewer cannot otherwise read. Every subquery here is
+// sieved by sharedConvoSql for @viewer instead — the same predicate
+// sharedMissionDetail's own three queries use — so the counts, the ordering
+// key (sieved_last_milestone_at) and the detail arrays can never disagree.
+// Items also exclude consent mirrors (i.consent IS NULL), matching
+// sharedMissionDetail's own items query — a consent ask is the mission
+// owner's alone and must never surface to a colleague, not even as a count.
+function sharedCountsSql() {
+  return `
+    (SELECT COUNT(*) FROM items i JOIN conversations ic ON ic.id = i.origin_convo_id
+       WHERE i.mission_id = m.id AND i.state='open' AND i.consent IS NULL AND ${sharedConvoSql('ic')}) AS open_items,
+    (SELECT COUNT(*) FROM items i JOIN conversations ic ON ic.id = i.origin_convo_id
+       WHERE i.mission_id = m.id AND i.state='open' AND i.awaiting='user' AND i.consent IS NULL AND ${sharedConvoSql('ic')}) AS needs_you,
+    (SELECT COUNT(*) FROM conversations cc WHERE cc.mission_id = m.id AND ${sharedConvoSql('cc')}) AS conversations,
+    (SELECT COUNT(*) FROM milestones l JOIN conversations mc ON mc.id = l.convo_id
+       WHERE l.mission_id = m.id AND ${sharedConvoSql('mc')}) AS milestones,
+    (SELECT json_object('num', l.num, 'title', l.title, 'kind', l.kind, 'created_at', l.created_at)
+       FROM milestones l JOIN conversations mc ON mc.id = l.convo_id
+       WHERE l.mission_id = m.id AND ${sharedConvoSql('mc')} ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS last_milestone_json,
+    (SELECT l.created_at FROM milestones l JOIN conversations mc ON mc.id = l.convo_id
+       WHERE l.mission_id = m.id AND ${sharedConvoSql('mc')}
+       ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS sieved_last_milestone_at
+  `
+}
 
 function sharedMissionRow(row) {
   if (!row) return null
@@ -350,14 +386,15 @@ function sharedMissionRow(row) {
 }
 
 export function listSharedMissions(db, viewerUserId) {
-  return db.prepare(`SELECT m.*, ${countsSql(true)}, ${OWNER_JSON} FROM missions m ${OWNER_FROM}
-    WHERE ${MISSION_SHARED} ORDER BY (m.last_milestone_at IS NULL), m.last_milestone_at DESC, m.created_at DESC`)
+  return db.prepare(`SELECT m.*, ${sharedCountsSql()}, ${OWNER_JSON} FROM missions m ${OWNER_FROM}
+    WHERE ${MISSION_SHARED}
+    ORDER BY (sieved_last_milestone_at IS NULL), sieved_last_milestone_at DESC, m.created_at DESC`)
     .all({ viewer: viewerUserId }).map(sharedMissionRow)
 }
 
 export function getSharedMission(db, viewerUserId, missionId) {
   if (typeof missionId !== 'string' || !missionId.startsWith('ms_')) return null
-  return sharedMissionRow(db.prepare(`SELECT m.*, ${countsSql(true)}, ${OWNER_JSON} FROM missions m ${OWNER_FROM}
+  return sharedMissionRow(db.prepare(`SELECT m.*, ${sharedCountsSql()}, ${OWNER_JSON} FROM missions m ${OWNER_FROM}
     WHERE m.id = @id AND ${MISSION_SHARED}`).get({ viewer: viewerUserId, id: missionId }))
 }
 
