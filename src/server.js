@@ -21,6 +21,7 @@ import { makeWaker } from './wake.js'
 import { makeTranscriber } from './transcribe.js'
 import { makeItemTranscription } from './items-transcribe.js'
 import { emitTranscriptionMarker } from './items-http.js'
+import { makeGithub, DEFAULT_GITHUB_CLIENT_ID } from './github.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
@@ -286,7 +287,7 @@ export function startServer({
   // wake is actually under way, so a journal without MATRON_WAKE_CMD never
   // pays it.
   spawnWakeWaitMs = resolveNumericEnv('MATRON_SPAWN_WAKE_WAIT_MS', process.env.MATRON_SPAWN_WAKE_WAIT_MS, 240000),
-  mediaReapHighPct, mediaReapLowPct, waker, transcriber,
+  mediaReapHighPct, mediaReapLowPct, waker, transcriber, github,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
@@ -347,11 +348,19 @@ export function startServer({
     transcriber: transcriber === undefined ? makeTranscriber() : transcriber,
     onSettled: (out) => emitTranscriptionMarker({ db, hub, pushPipeline, waker: resolvedWaker }, out),
   })
+  // GitHub account linking (spec 2026-09-23 tracker web/teams). `github` is
+  // the test seam; env otherwise. An empty client id disables the routes.
+  const resolvedGithub = github !== undefined ? github : makeGithub({
+    clientId: process.env.MATRON_GITHUB_CLIENT_ID ?? DEFAULT_GITHUB_CLIENT_ID,
+    clientSecret: process.env.MATRON_GITHUB_CLIENT_SECRET || null,
+    host: process.env.MATRON_GITHUB_HOST || 'github.com',
+  })
   const server = http.createServer(makeHttpHandler({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription,
+    github: resolvedGithub,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
@@ -396,6 +405,7 @@ export function startServer({
         itemTranscription,
         preapproveKey: resolvedPreapproveKey,
         searchBackfill,
+        github: resolvedGithub,
         close: () => new Promise((r) => {
           closing = true
           if (retentionInterval) clearInterval(retentionInterval)
