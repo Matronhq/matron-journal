@@ -57,6 +57,9 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_DB` | `./matron.db` | Path to the SQLite database file |
 | `MATRON_PORT` | `9810` | Listen port |
 | `MATRON_BIND` | `127.0.0.1` | Bind address (put a TLS-terminating proxy in front for `wss://`) |
+| `MATRON_GITHUB_CLIENT_ID` | Matron's published OAuth App | GitHub OAuth App client id for account linking (device flow). Empty disables linking |
+| `MATRON_GITHUB_CLIENT_SECRET` | unset | Client secret of an OAuth App registered for this journal (callback `https://<journal>/github/callback`). Enables the one-click web flow |
+| `MATRON_GITHUB_HOST` | `github.com` | GitHub Enterprise host, if any |
 | `MATRON_MEDIA_DIR` | `<db dir>/media` | Blob storage root |
 | `MATRON_MEDIA_MAX_BYTES` | 50 MiB (`52428800`) | Upload size limit |
 | `MATRON_WHISPER_MODEL` | unset (off) | Path to a whisper.cpp model (`…/whisper.cpp/models/ggml-base.bin`). Set it and voice notes on tracker items are transcribed here on upload instead of waiting for the origin box; needs `ffmpeg` on `PATH`. Under the shipped systemd unit install whisper.cpp outside `/home` (e.g. `/opt/whisper.cpp`) — `ProtectHome=yes` hides it otherwise |
