@@ -10,6 +10,7 @@ import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem } from './consent-items.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableBoxName } from './wake.js'
 import { coordinatorFor } from './coordinator.js'
+import { getMission } from './missions.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -910,6 +911,28 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!fromConvo || fromConvo.owner_user_id !== conn.userId
           || fromConvo.agent_device_id !== conn.deviceId
           || fromConvo.parent_convo_id != null) return fail('not_found')
+        // Optional mission the child joins as soon as it exists (spec
+        // 2026-09-23 coordinator redesign §1c). Checked BEFORE the wake below
+        // so a doomed ask never starts a box, and before the card so the
+        // user is never asked about it. Resolved through the visibility sieve
+        // of BOTH ends: a mission the asker cannot see is no oracle
+        // (no_mission, same as unknown), and one the child could never read
+        // must not become its mission either. Unfiltered only when both are
+        // private devices.
+        let missionNum = null
+        let missionTitle = ''
+        if (msg.mission_num != null) {
+          if (!Number.isInteger(msg.mission_num) || msg.mission_num < 1) return fail('bad_request', 'bad mission_num')
+          const excludePrivateOwned = !isPrivateDevice(db, conn.deviceId) || !isPrivateDevice(db, msg.target_device_id)
+          const mission = getMission(db, conn.userId, msg.mission_num, { excludePrivateOwned })
+          if (!mission) return fail('no_mission', `mission #${msg.mission_num} not found`)
+          if (mission.state !== 'open') return fail('mission_closed', `mission #${msg.mission_num} is closed`)
+          missionNum = mission.num
+          // Shown on the client-only card (agents never receive it), so the
+          // user sees the mission they are sending the child to. Sieved like
+          // from_convo_title.
+          missionTitle = sanitizePeerText(mission.title, CARD_TITLE_MAX_CHARS)
+        }
         // A box with no live socket is asleep when this journal can wake it
         // (wake-before-spawn): fire the wake now and park the ask as usual —
         // the user's tap takes minutes anyway, and approveSpawn waits for the
@@ -934,7 +957,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         createSpawnRequest(db, {
           id: spawnId, userId: conn.userId, fromDeviceId: conn.deviceId,
           fromConvoId: msg.from_convo_id, targetDeviceId: msg.target_device_id,
-          workdir, task, topic, model, link,
+          workdir, task, topic, model, link, missionNum,
         })
         // Client-only card (isClientOnlyEvent covers kind:'agent_spawn'),
         // published into the PARENT's own conversation — where the user is
@@ -966,6 +989,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           // one says nothing about a room — the common case stays the
           // card shape every client already renders.
           ...(link ? { link: true } : {}),
+          // Same omit-when-absent stance: the card says "joins mission #N"
+          // only for an ask that named one.
+          ...(missionNum ? { mission_num: missionNum } : {}),
+          ...(missionNum && missionTitle ? { mission_title: missionTitle } : {}),
         }
         let cardAppend
         try {

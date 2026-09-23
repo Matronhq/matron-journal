@@ -25,12 +25,12 @@ import { closeSpawnConsentItem } from './consent-items.js'
 // is normally a clean break, and the parent can open a room later with an
 // ordinary agent_chat_start if it turns out to need one. Stored 0/1 (SQLite
 // has no boolean); read back with a truthiness test like model.
-export function createSpawnRequest(db, { id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic = '', model = '', link = false, now = Date.now() }) {
+export function createSpawnRequest(db, { id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic = '', model = '', link = false, missionNum = null, now = Date.now() }) {
   db.prepare(`
     INSERT INTO agent_spawn_requests(id, user_id, from_device_id, from_convo_id, target_device_id,
-      workdir, task, topic, model, link, state, created_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,'awaiting_user',?)
-  `).run(id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic, model, link ? 1 : 0, now)
+      workdir, task, topic, model, link, mission_num, state, created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,'awaiting_user',?)
+  `).run(id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic, model, link ? 1 : 0, missionNum, now)
   return { id }
 }
 
