@@ -16,6 +16,7 @@ import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
 import { runOffload, runExpireLogs, runReapMedia } from './retention.js'
 import { backfillSearchIndex } from './search.js'
+import { scheduleGithubRefresh } from './github-refresh.js'
 import { makeRpcBroker } from './rpc-broker.js'
 import { makeWaker } from './wake.js'
 import { makeTranscriber } from './transcribe.js'
@@ -287,7 +288,7 @@ export function startServer({
   // wake is actually under way, so a journal without MATRON_WAKE_CMD never
   // pays it.
   spawnWakeWaitMs = resolveNumericEnv('MATRON_SPAWN_WAKE_WAIT_MS', process.env.MATRON_SPAWN_WAKE_WAIT_MS, 240000),
-  mediaReapHighPct, mediaReapLowPct, waker, transcriber, github,
+  mediaReapHighPct, mediaReapLowPct, waker, transcriber, github, githubRefreshIntervalMs,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
@@ -376,6 +377,7 @@ export function startServer({
   })
   let retentionInterval = null
   let walCheckpointInterval = null
+  let githubRefreshInterval = null
   let closing = false
   return new Promise((resolve) => {
     server.listen(port, bind, () => {
@@ -384,6 +386,7 @@ export function startServer({
         mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
+      githubRefreshInterval = scheduleGithubRefresh(db, resolvedGithub, { intervalMs: githubRefreshIntervalMs })
       // Whatever a previous process left mid-transcription: a bridge is
       // holding a turn for each, so finish them (or fail them) now.
       itemTranscription.recover()
@@ -410,6 +413,7 @@ export function startServer({
           closing = true
           if (retentionInterval) clearInterval(retentionInterval)
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
+          if (githubRefreshInterval) clearInterval(githubRefreshInterval)
           // Wake-before-spawn waiters (hub.waitForDevice) hold ref'd timers
           // of up to spawnWakeWaitMs; release them before the sockets go so
           // each approveSpawn settles its row while the DB is still open.
