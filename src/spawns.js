@@ -13,6 +13,9 @@ import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { isPrivateDevice } from './db.js'
 import { sessionShortFromTitle, sideTag, roomTitle } from './room-title.js'
 import { closeSpawnConsentItem } from './consent-items.js'
+import { getMission, joinMission } from './missions.js'
+import { MISSION_EVENT_TYPE, missionMarkerPayload } from './missions-marker.js'
+import { markerTitleAllowed } from './privacy.js'
 
 // `model` is the optional Claude model the child session should run — an
 // alias ('opus') or a full model id, defaulted to '' like topic so a caller
@@ -220,6 +223,45 @@ export function refreshSpawnRoomTitle(db, hub, childConvoId) {
   return true
 }
 
+// Spec 2026-09-23 coordinator redesign §1c: a spawn that named a mission
+// puts its child on it the moment the child's conversation id is known —
+// the `start` reply — and before the parent hears `started`. The target
+// bridge injects the opening turn just before it answers `start`, so the
+// journal cannot order the join ahead of that write. What it can guarantee:
+// the join commits synchronously on the reply, ahead of any journal traffic
+// the child produces, and the bridge already knows the number from `start`'s
+// mission_num param. The child's row may not exist yet — its bridge
+// publishes convo_upsert on its own schedule — so it is created here, owned
+// by the target box. The bridge's later upsert then updates it in place
+// (same owner, so no takeover gate trips). Visibility is judged from the
+// CHILD's side, the rule inheritableMission (journal.js) applies: an
+// ordinary box is never handed a mission it cannot read. Best-effort: the
+// session is already running, so a failure (the mission closed in the last
+// few milliseconds, the 200-conversation cap) is logged and the spawn still
+// reports started.
+export function joinSpawnMission(db, hub, row, childConvoId) {
+  if (!row.mission_num) return null
+  try {
+    const excludePrivateOwned = !isPrivateDevice(db, row.target_device_id)
+    const mission = getMission(db, row.user_id, row.mission_num, { excludePrivateOwned })
+    if (!mission || mission.state !== 'open') {
+      console.error(`approveSpawn: mission #${row.mission_num} not joinable at start (${mission ? mission.state : 'not visible'}) — child runs unattached`)
+      return null
+    }
+    const exists = db.prepare('SELECT 1 FROM conversations WHERE id=? AND owner_user_id=?').get(childConvoId, row.user_id)
+    if (!exists) upsertConversation(db, { id: childConvoId, ownerUserId: row.user_id, sessionState: 'running', agentDeviceId: row.target_device_id })
+    const joined = joinMission(db, { userId: row.user_id, missionId: mission.id, convoId: childConvoId, excludePrivateOwned })
+    appendAndBroadcast(db, hub, {
+      userId: row.user_id, convoId: childConvoId, sender: 'journal', type: MISSION_EVENT_TYPE,
+      payload: missionMarkerPayload({ mission: joined, action: 'joined', by: 'agent', withTitle: markerTitleAllowed(db, joined.origin_convo_id, childConvoId) }),
+    })
+    return joined
+  } catch (err) {
+    console.error('approveSpawn: mission join failed (session already started)', err)
+    return null
+  }
+}
+
 // Spec step 4/5 — everything after the user's tap. Ordering is load-bearing
 // for a LINKED row: room first, then spawn. Spawning first would, on a
 // room-creation failure, leave a live agent on another box with no channel
@@ -291,6 +333,19 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
     return 'failed'
   }
   try {
+    // The mission was open when the ask was parked; the tap can come hours
+    // later. Re-checked through the ASKER's sieve (as at request time)
+    // before anything is created or started: a mission closed or gone in
+    // the meantime fails the spawn with a readable code instead of starting
+    // an unattached session. For a linked row the room does not exist yet,
+    // so fail()'s epitaph write fails and is logged, as its own comment
+    // allows.
+    if (row.mission_num) {
+      const excludePrivateOwned = !isPrivateDevice(db, row.from_device_id) || !isPrivateDevice(db, row.target_device_id)
+      const mission = getMission(db, row.user_id, row.mission_num, { excludePrivateOwned })
+      if (!mission) return fail('no_mission')
+      if (mission.state !== 'open') return fail('mission_closed')
+    }
     if (roomId) {
       // Titled the way the bridge titles its own agent-chat rooms, so a
       // spawn room reads like every other room in the chat list. The child
@@ -348,7 +403,12 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
       if (waking) await hub.waitForDevice(row.user_id, row.target_device_id, wakeWaitMs)
     }
     const r = await broker.issue(hub, row.user_id, row.target_device_id, 'start',
-      { workdir: row.workdir, prompt: row.task, ...(roomId ? { room_id: roomId } : {}), ...(fromName ? { from_name: fromName } : {}), ...(row.model ? { model: row.model } : {}) },
+      {
+        workdir: row.workdir, prompt: row.task, ...(roomId ? { room_id: roomId } : {}), ...(fromName ? { from_name: fromName } : {}), ...(row.model ? { model: row.model } : {}),
+        // Omit-when-absent like model: a bridge predating the field never
+        // sees the key; one that knows it names the mission in the opening turn.
+        ...(row.mission_num ? { mission_num: row.mission_num } : {}),
+      },
       { timeoutMs: startTimeoutMs })
     // Bridge-returned convo_id, capped the same as every other externally-
     // supplied convo id (CONVO_ID_MAX_CHARS) — an oversized or non-string
@@ -369,6 +429,9 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
         console.error('approveSpawn: start reply arrived after the row was already resolved — outcome frame suppressed')
         return 'failed'
       }
+      // Before the room retitle and the outcome: the parent (and every app)
+      // must never hear `started` for a child that is not yet on its mission.
+      joinSpawnMission(db, hub, row, r.result.convo_id)
       // The child's bridge may already have published its title (it does
       // when it flushes the seed before answering); if so the room can
       // carry the child's tag from the start. Best-effort like every fan.

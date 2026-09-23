@@ -1212,3 +1212,62 @@ test('spawn_request with an open mission parks mission_num on the row, the card 
   const body = s.db.prepare('SELECT i.body FROM items i JOIN agent_spawn_requests r ON r.item_id = i.id WHERE r.id=?').get(ack.spawn_id).body
   assert.ok(body.includes(`- **Joins mission #${m.num}** — Spawned work`), body)
 })
+
+async function missionSpawn(t) {
+  const fleet = await spawnFleet(t)
+  const { s, parentDev, targetDev, parent, client } = fleet
+  const mission = await missionFor(s, parentDev.token)
+  parent.send({
+    op: 'spawn_request', request_id: 'qm', from_convo_id: 'parent-convo',
+    target_device_id: targetDev.deviceId, workdir: '/w', task: 'do the mission work', mission_num: mission.num,
+  })
+  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  await client.waitFor(isSpawnCard)
+  parent.frames.length = 0
+  client.frames.length = 0
+  return { ...fleet, mission, spawnId: ack.spawn_id }
+}
+const approve = (s, clientToken, spawnId) => s.http('/agent-spawn/answer', { method: 'POST', token: clientToken, body: { request_id: spawnId, decision: 'approve' } })
+
+test('approve with a mission: start carries mission_num; the child is a mission member before the parent hears started; its bridge upsert lands on the row', async (t) => {
+  const { s, targetDev, clientToken, parent, target, client, spawnId, mission } = await missionSpawn(t)
+  const bridgeTurn = target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start').then((req) => {
+    assert.equal(req.request.params.mission_num, mission.num)
+    target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { convo_id: 'child-m1' } })
+  })
+  assert.equal((await approve(s, clientToken, spawnId)).status, 200)
+  await bridgeTurn
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
+  assert.equal(out.outcome, 'started'); assert.equal(out.child_convo_id, 'child-m1')
+
+  const child = s.db.prepare('SELECT mission_id, agent_device_id FROM conversations WHERE id=?').get('child-m1')
+  assert.equal(child.mission_id, mission.id)
+  assert.equal(child.agent_device_id, targetDev.deviceId, 'the pre-created row belongs to the target box')
+  const seq = (type, convo) => s.db.prepare('SELECT seq FROM events WHERE type=? AND convo_id=?').get(type, convo).seq
+  assert.ok(seq('mission', 'child-m1') < seq('spawn_outcome', 'parent-convo'), 'joined before the outcome was journaled')
+  const joined = await target.waitFor((f) => f.kind === 'journal' && f.type === 'mission' && f.convo_id === 'child-m1')
+  assert.equal(joined.payload.action, 'joined'); assert.equal(joined.payload.num, mission.num)
+  const detail = await s.http(`/missions/${mission.num}`, { token: clientToken })
+  assert.deepEqual(detail.json.conversations.map((c) => c.id), ['child-m1'])
+  assert.equal(detail.json.mission.conversations, 1, 'no longer unassigned')
+
+  // The child's bridge publishes its conversation on its own schedule —
+  // after the journal already created the row. It must land in place.
+  target.send({ op: 'convo_upsert', convo_id: 'child-m1', title: 'child session', session_state: 'running' })
+  const meta = await client.waitFor((f) => f.kind === 'journal' && f.type === 'convo_meta' && f.convo_id === 'child-m1')
+  assert.equal(meta.payload.title, 'child session')
+  assert.equal(s.db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('child-m1').mission_id, mission.id)
+})
+
+test('approve after the mission closed: failed with mission_closed, no start rpc, nothing joined', async (t) => {
+  const { s, clientToken, parent, target, spawnId, mission } = await missionSpawn(t)
+  assert.equal((await s.http(`/missions/${mission.id}/close`, { method: 'POST', token: clientToken, body: { summary: 'called off' } })).status, 200)
+  target.frames.length = 0
+  assert.equal((await approve(s, clientToken, spawnId)).status, 200)
+  const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome')
+  assert.equal(out.outcome, 'failed'); assert.equal(out.error_code, 'mission_closed')
+  await new Promise((r) => setTimeout(r, 150))
+  assert.equal(target.frames.find((f) => f.kind === 'rpc' && f.request?.method === 'start'), undefined, 'nothing spawned')
+  assert.equal(getSpawn(s.db, spawnId).state, 'failed')
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE mission_id=?').get(mission.id).n, 0)
+})

@@ -321,6 +321,7 @@ test('approveSpawn on a detached row: no room, no room_id on the wire, started o
   claimApprove(db, 's-detached')
   assert.equal(await approveSpawn({ db, hub, broker: okBroker(params), startTimeoutMs: 50 }, getSpawn(db, 's-detached')), 'started')
   assert.ok(!('room_id' in params[0]), 'a detached spawn must not hand the child a room')
+  assert.ok(!('mission_num' in params[0]), 'a spawn that named no mission sends none')
   assert.equal(params[0].prompt, 'do the thing')
   assert.equal(params[0].from_name, 'dev-6')
   assert.deepEqual(roomRows(db), [], 'no conversation row was minted')
