@@ -5,6 +5,7 @@
 import { nextNum, newId, BODY_MAX } from './items.js'
 import { milestoneMarkerPayload } from './missions-marker.js'
 import { markerTitleAllowed } from './privacy.js'
+import { sharedConvoSql } from './visibility.js'
 
 export const MILESTONE_KINDS = ['user_input', 'progress']
 export const TITLE_MAX = 200
@@ -326,4 +327,56 @@ export function listMilestones(db, userId, { convoId, excludePrivateOwned = fals
   const sieve = excludePrivateOwned ? `AND NOT ${PRIVATE_CONVO}` : ''
   return db.prepare(`SELECT l.* FROM milestones l JOIN conversations c ON c.id = l.convo_id
     WHERE l.user_id=? AND l.convo_id=? ${sieve} ORDER BY l.created_at DESC, l.seq DESC`).all(userId, convoId).map(milestoneRow)
+}
+
+// Cross-user reads (spec 2026-09-23 tracker web/teams). A mission is shared
+// with @viewer when its origin conversation, or any conversation carrying
+// its mission_id, passes the shared rule; its detail lists only those
+// conversations' milestones and items. countsSql(true) applies the private
+// sieve to the counts, which is the honest count for a foreign viewer.
+const MISSION_SHARED = `(
+  EXISTS (SELECT 1 FROM conversations cv WHERE cv.id = m.origin_convo_id AND ${sharedConvoSql('cv')})
+  OR EXISTS (SELECT 1 FROM conversations cv WHERE cv.mission_id = m.id AND ${sharedConvoSql('cv')})
+)`
+const OWNER_JSON = `json_object('user_id', u.id, 'name', u.name, 'github_login', ga.login) AS owner_json`
+const OWNER_FROM = `JOIN users u ON u.id = m.user_id LEFT JOIN github_accounts ga ON ga.user_id = m.user_id`
+
+function sharedMissionRow(row) {
+  if (!row) return null
+  const { owner_json: ownerJson, ...rest } = row
+  const mission = missionRow(rest)
+  mission.owner = JSON.parse(ownerJson)
+  return mission
+}
+
+export function listSharedMissions(db, viewerUserId) {
+  return db.prepare(`SELECT m.*, ${countsSql(true)}, ${OWNER_JSON} FROM missions m ${OWNER_FROM}
+    WHERE ${MISSION_SHARED} ORDER BY (m.last_milestone_at IS NULL), m.last_milestone_at DESC, m.created_at DESC`)
+    .all({ viewer: viewerUserId }).map(sharedMissionRow)
+}
+
+export function getSharedMission(db, viewerUserId, missionId) {
+  if (typeof missionId !== 'string' || !missionId.startsWith('ms_')) return null
+  return sharedMissionRow(db.prepare(`SELECT m.*, ${countsSql(true)}, ${OWNER_JSON} FROM missions m ${OWNER_FROM}
+    WHERE m.id = @id AND ${MISSION_SHARED}`).get({ viewer: viewerUserId, id: missionId }))
+}
+
+export function sharedMissionDetail(db, viewerUserId, mission) {
+  const args = { viewer: viewerUserId, mid: mission.id }
+  const milestones = db.prepare(`SELECT l.* FROM milestones l JOIN conversations cv ON cv.id = l.convo_id
+    WHERE l.mission_id = @mid AND ${sharedConvoSql('cv')} ORDER BY l.created_at DESC, l.seq DESC`).all(args).map(milestoneRow)
+  const items = db.prepare(`SELECT i.id, i.num, i.kind, i.state, i.awaiting, i.title, i.origin_convo_id, i.updated_at
+    FROM items i JOIN conversations cv ON cv.id = i.origin_convo_id
+    WHERE i.mission_id = @mid AND i.state='open' AND i.consent IS NULL AND ${sharedConvoSql('cv')}
+    ORDER BY (i.awaiting = 'user') DESC, i.updated_at DESC`).all(args)
+  const conversations = db.prepare(`SELECT cv.id, cv.title, cv.session_state AS state, cv.repo, d.name AS box
+    FROM conversations cv LEFT JOIN devices d ON d.id = cv.agent_device_id
+    WHERE cv.mission_id = @mid AND ${sharedConvoSql('cv')} ORDER BY cv.created_at`).all(args)
+  return { mission, milestones, items, conversations }
+}
+
+export function listSharedMilestones(db, viewerUserId, convoId) {
+  return db.prepare(`SELECT l.* FROM milestones l JOIN conversations cv ON cv.id = l.convo_id
+    WHERE l.convo_id = @cid AND ${sharedConvoSql('cv')} ORDER BY l.created_at DESC, l.seq DESC`)
+    .all({ viewer: viewerUserId, cid: convoId }).map(milestoneRow)
 }

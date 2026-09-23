@@ -4,6 +4,7 @@ import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import { pinDevicePrivate } from '../src/db.js'
+import { saveGithubIdentity } from '../src/github-accounts.js'
 import { visibleMission } from '../src/missions-http.js'
 import { CONVOS_MAX } from '../src/missions.js'
 
@@ -18,7 +19,7 @@ async function fleet(t) {
   upsertConversation(s.db, { id: 'c2', ownerUserId: dan.id, title: 'C2', agentDeviceId: agent.deviceId })
   upsertConversation(s.db, { id: 'p1', ownerUserId: pat.id, title: 'P1', agentDeviceId: patAgent.deviceId })
   const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
-  return { s, dan, agent, patAgent, client: login.json.token }
+  return { s, dan, pat, agent, patAgent, client: login.json.token }
 }
 const start = (s, token, body, headers = {}) => s.http('/missions', { method: 'POST', token, body: { title: 'Missions', body: 'goal', convo_id: 'c1', ...body }, headers })
 const post = (s, token, body, headers = {}) => s.http('/milestones', { method: 'POST', token, body: { convo_id: 'c1', kind: 'progress', title: 'step', ...body }, headers })
@@ -719,4 +720,36 @@ test('GET /missions: list order follows the SIEVED last-milestone timestamp for 
   const asClient = await s.http('/missions', { token: client })
   assert.deepEqual(asClient.json.missions.map((x) => x.id), [older.id, newer.id])
   assert.equal(asClient.json.missions.find((x) => x.id === older.id).last_milestone.title, 'hidden step')
+})
+
+test('missions scope=shared and foreign detail follow the conversation rule; writes are 403', async (t) => {
+  const { s, dan, pat, agent, client } = await fleet(t)
+  const link = (u, gid) => saveGithubIdentity(s.db, { userId: u.id, host: 'github.com', identity: { github_id: gid, login: u.name, scopes: ['github.com/matronhq'] }, token: `t${gid}`, now: 1 })
+  link(dan, 1); link(pat, 2)
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id, agentDeviceId: agent.deviceId, repo: 'github.com/matronhq/journal' })
+  const patClient = (await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'mac' } })).json.token
+  const m = await s.http('/missions', { method: 'POST', token: agent.token, body: { convo_id: 'c1', title: 'Shared mission', body: 'goal' } })
+  assert.equal(m.status, 201)
+  const ms = await s.http('/milestones', { method: 'POST', token: agent.token, body: { convo_id: 'c1', kind: 'progress', title: 'Step 1' } })
+  assert.equal(ms.status, 201)
+  const list = await s.http('/missions?scope=shared', { token: patClient })
+  assert.equal(list.status, 200)
+  assert.deepEqual(list.json.missions.map((x) => x.title), ['Shared mission'])
+  assert.equal(list.json.missions[0].owner.name, 'dan')
+  assert.equal((await s.http('/missions?scope=shared', { token: client })).json.missions.length, 0)
+  assert.equal((await s.http('/missions?scope=shared&state=open', { token: patClient })).status, 400)
+  const detail = await s.http(`/missions/${m.json.mission.id}`, { token: patClient })
+  assert.equal(detail.status, 200); assert.equal(detail.json.mission.owner.name, 'dan')
+  assert.deepEqual(detail.json.milestones.map((x) => x.title), ['Step 1'])
+  assert.deepEqual(detail.json.conversations.map((x) => x.id), ['c1'])
+  assert.equal((await s.http(`/missions/${m.json.mission.id}`, { method: 'PATCH', token: patClient, body: { title: 'x' } })).status, 403)
+  assert.equal((await s.http(`/missions/${m.json.mission.id}/close`, { method: 'POST', token: patClient, body: { summary: 'x' } })).status, 403)
+  assert.equal((await s.http(`/missions/${m.json.mission.id}/join`, { method: 'POST', token: patClient, body: { convo_id: 'p1' } })).status, 403)
+  const mil = await s.http('/milestones?convo=c1', { token: patClient })
+  assert.equal(mil.status, 200); assert.equal(mil.json.milestones.length, 1)
+  assert.equal((await s.http('/milestones?convo=c2', { token: patClient })).status, 404, 'c2 has no repo')
+  // Drop the repo: the mission disappears for pat.
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id, agentDeviceId: agent.deviceId, repo: null })
+  assert.equal((await s.http(`/missions/${m.json.mission.id}`, { token: patClient })).status, 404)
+  assert.equal((await s.http('/milestones?convo=c1', { token: patClient })).status, 404)
 })
