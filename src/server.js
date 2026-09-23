@@ -354,7 +354,7 @@ export function startServer({
   const resolvedGithub = github !== undefined ? github : makeGithub({
     clientId: process.env.MATRON_GITHUB_CLIENT_ID ?? DEFAULT_GITHUB_CLIENT_ID,
     clientSecret: process.env.MATRON_GITHUB_CLIENT_SECRET || null,
-    host: process.env.MATRON_GITHUB_HOST || 'github.com',
+    host: (process.env.MATRON_GITHUB_HOST || 'github.com').toLowerCase(),
   })
   const server = http.createServer(makeHttpHandler({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,

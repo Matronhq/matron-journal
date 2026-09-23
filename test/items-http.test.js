@@ -5,7 +5,7 @@ import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import { pinDevicePrivate } from '../src/db.js'
 import { recordJoined } from '../src/participants.js'
-import { closeItem } from '../src/items.js'
+import { closeItem, createItem } from '../src/items.js'
 import { saveGithubIdentity } from '../src/github-accounts.js'
 
 // Fleet: dan (client 'mac' + agent dev-2 managing c1), pat (own agent, own convo).
@@ -673,4 +673,40 @@ test('visibility follows the conversation\'s CURRENT repo (review focus 2)', asy
   assert.equal((await s.http(`/items/${it.json.item.id}`, { token: patClient })).status, 200)
   upsertConversation(s.db, { id: 'c2', ownerUserId: dan.id, agentDeviceId: agent.deviceId, repo: 'github.com/danbarker/personal' })
   assert.equal((await s.http(`/items/${it.json.item.id}`, { token: patClient })).status, 404)
+})
+
+test('a consent mirror on a shared conversation never crosses the user boundary', async (t) => {
+  const { s, dan, agent, client, patClient } = await sharedFleet(t)
+  const m = await s.http('/missions', { method: 'POST', token: agent.token, body: { convo_id: 'c1', title: 'Shared mission', body: 'goal' } })
+  assert.equal(m.status, 201)
+  const ordinary = await mkItem(s, agent.token, { title: 'Ordinary ask', awaiting: 'user' })
+  assert.equal(ordinary.status, 201)
+  const { item: consentItem } = createItem(s.db, {
+    userId: dan.id, kind: 'question', title: 'Spawn consent ask', body: '', labels: ['consent'],
+    awaiting: 'user', originConvoId: 'c1', originDeviceId: agent.deviceId, createdBy: 'agent', consent: 'spawn',
+  })
+  // Sanity: the owner's own CLIENT still sees it (consent mirrors are
+  // invisible to every agent, owner's own included — items-http.js
+  // visibleItem — but this is the user's own card, not this fix's concern).
+  assert.equal((await s.http(`/items/${consentItem.id}`, { token: client })).status, 200)
+
+  const list = await s.http('/items?scope=shared', { token: patClient })
+  assert.equal(list.status, 200)
+  assert.deepEqual(list.json.items.map((i) => i.title).sort(), ['Ordinary ask'])
+
+  assert.equal((await s.http(`/items/${consentItem.id}`, { token: patClient })).status, 404)
+
+  const detail = await s.http(`/missions/${m.json.mission.id}`, { token: patClient })
+  assert.equal(detail.status, 200)
+  assert.equal(detail.json.mission.open_items, 1, 'the consent mirror is not counted')
+  assert.equal(detail.json.mission.needs_you, 1, 'the consent mirror is not counted')
+  assert.deepEqual(detail.json.items.map((i) => i.title), ['Ordinary ask'], 'the consent mirror is absent from foreign detail')
+
+  const sharedList = await s.http('/missions?scope=shared', { token: patClient })
+  const row = sharedList.json.missions.find((x) => x.id === m.json.mission.id)
+  assert.equal(row.open_items, 1)
+  assert.equal(row.needs_you, 1)
+
+  assert.equal((await s.http(`/lookup?user=dan&num=${consentItem.num}`, { token: patClient })).status, 404)
+  assert.equal((await s.http(`/lookup?user=dan&num=${consentItem.num}`, { token: client })).status, 200, 'the owner\'s own client can still resolve their own consent item')
 })

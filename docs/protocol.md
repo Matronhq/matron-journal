@@ -1730,7 +1730,7 @@ and is the only copy.
 Client devices only (an agent never links). Configuration:
 `MATRON_GITHUB_CLIENT_ID` (default empty → linking disabled, every route
 below is `404 not_configured`; will default to Matron's published OAuth
-App id once one is registered — not configured at HEAD),
+App id once one is registered — not configured in this release),
 `MATRON_GITHUB_CLIENT_SECRET` (optional; enables the web flow),
 `MATRON_GITHUB_HOST` (default `github.com`). The token scope is `read:org`.
 

@@ -817,7 +817,7 @@ test('a mission born on a private-owned conversation stays invisible to a collea
   assert.equal(list.json.missions.find((x) => x.id === m.id), undefined)
 })
 
-test('a mission born on a non-shared conversation becomes visible via a later shared join (second EXISTS clause), with counts covering only the shared convo', async (t) => {
+test('a mission born on a non-shared conversation becomes visible via a later shared join (MISSION_SHARED via a joined conversation), with counts covering only the shared convo', async (t) => {
   const { s, dan, pat, agent } = await fleet(t)
   const link = (u, gid) => saveGithubIdentity(s.db, { userId: u.id, host: 'github.com', identity: { github_id: gid, login: u.name, scopes: ['github.com/matronhq'] }, token: `t${gid}`, now: 1 })
   link(dan, 1); link(pat, 2)
