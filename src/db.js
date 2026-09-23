@@ -249,6 +249,15 @@ CREATE TABLE IF NOT EXISTS device_status(
   status TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_device_status_user ON device_status(user_id);
+-- Per-user settings (spec 2026-09-23 coordinator redesign §1a). A table, not
+-- a users column, so later per-user settings have a home. No row = every
+-- setting at its default. coordinator_convo_id is not a foreign key — same
+-- stance as conversations.mission_id; ownership is checked on write.
+CREATE TABLE IF NOT EXISTS user_settings(
+  user_id INTEGER PRIMARY KEY REFERENCES users(id),
+  coordinator_convo_id TEXT,
+  updated_at INTEGER NOT NULL
+);
 `
 
 export function openDb(path) {
