@@ -4,6 +4,8 @@ import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
 import { inviteParticipant, answerInvite } from '../src/participants.js'
+import { saveGithubIdentity } from '../src/github-accounts.js'
+import { pinDevicePrivate } from '../src/db.js'
 
 test('login → snapshot → pagination over HTTP', async (t) => {
   const s = await startTestServer()
@@ -562,4 +564,39 @@ test('GET /snapshot exposes each convo agent_device_id and the agents id->name l
   s.db.prepare('UPDATE devices SET tag_char=? WHERE id=?').run('y', agent.deviceId)
   const tagged = await s.http('/snapshot', { token: login.json.token })
   assert.deepEqual(tagged.json.agents, [{ device_id: agent.deviceId, name: 'dev-y', tag_char: 'y' }])
+})
+
+test('GET /convo/:id/messages?around_seq on a colleague\'s shared conversation: prose only, clamped, logged; private-owned stays 404 unlogged (review focus 5)', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const logs = []
+  const origLog = console.log
+  console.log = (...a) => { logs.push(a.join(' ')); origLog(...a) }
+  t.after(() => { console.log = origLog })
+  const dan = await createUser(s.db, 'dan', 'pw'); const pat = await createUser(s.db, 'pat', 'pw')
+  const box = createAgent(s.db, dan.id, 'dan-box'); const priv = createAgent(s.db, dan.id, 'dan-private')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  for (const [u, gid] of [[dan, 1], [pat, 2]]) saveGithubIdentity(s.db, { userId: u.id, host: 'github.com', identity: { github_id: gid, login: u.name, scopes: ['github.com/matronhq'] }, token: `t${gid}`, now: 1 })
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id, title: 'C1', agentDeviceId: box.deviceId, repo: 'github.com/matronhq/x' })
+  upsertConversation(s.db, { id: 'pv', ownerUserId: dan.id, title: 'PV', agentDeviceId: priv.deviceId, repo: 'github.com/matronhq/x' })
+  for (let i = 0; i < 40; i++) {
+    append(s.db, { userId: dan.id, convoId: 'c1', sender: 'user:dan', type: 'text', payload: { body: `m${i}` } })
+    append(s.db, { userId: dan.id, convoId: 'c1', sender: 'agent:dan-box', type: 'tool_output', payload: { text: 'SECRET' } })
+  }
+  append(s.db, { userId: dan.id, convoId: 'pv', sender: 'user:dan', type: 'text', payload: { body: 'private words' } })
+  const patTok = (await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'mac' } })).json.token
+  const r = await s.http('/convo/c1/messages?around_seq=40&limit=200', { token: patTok })
+  assert.equal(r.status, 200)
+  assert.ok(r.json.events.length <= 30 && r.json.events.length > 0)
+  assert.ok(r.json.events.every((e) => e.type === 'text'))
+  assert.ok(!JSON.stringify(r.json).includes('SECRET'))
+  assert.ok(logs.some((l) => /shared context read convo=c1 viewer=/.test(l)))
+  assert.equal((await s.http('/convo/c1/messages?before_seq=40', { token: patTok })).status, 404, 'paging stays owner-only')
+  const before = logs.length
+  const pv = await s.http('/convo/pv/messages?around_seq=1', { token: patTok })
+  assert.equal(pv.status, 404)
+  assert.equal(logs.filter((l) => /context read convo=pv/.test(l)).length, 0, 'a refused read is never logged as a read')
+  assert.equal(logs.length, before)
+  const patAgent = createAgent(s.db, pat.id, 'pat-box')
+  assert.equal((await s.http('/convo/c1/messages?around_seq=40', { token: patAgent.token })).status, 200, 'an agent reads with its user\'s visibility')
 })

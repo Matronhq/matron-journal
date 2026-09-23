@@ -9,6 +9,7 @@ import { listAwaiting, answerParkedInvite, getParticipant } from './participants
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
+import { canReadConvo } from './visibility.js'
 import { serveHelp } from './help.js'
 import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
 import { closeChatConsentItem } from './consent-items.js'
@@ -695,6 +696,20 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const rawLimit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : 50
         if (!Number.isInteger(rawLimit) || rawLimit < 1) return json(res, 400, { error: 'bad_request' })
         const limit = Math.min(rawLimit, 200)
+        // Shared conversations (spec 2026-09-23 tracker web/teams): a
+        // colleague's conversation under the org rule is readable as a
+        // context window only — the same prose-only, clamped, logged
+        // regime as a foreign agent's search-hit read below, with the
+        // owner's user id driving the query. canReadConvo runs the private
+        // sieve inside the rule, so a refused read never reaches the log.
+        const ownerRow = db.prepare('SELECT owner_user_id FROM conversations WHERE id=?').get(convoId)
+        if (ownerRow && ownerRow.owner_user_id !== who.userId) {
+          if (aroundSeq == null || !canReadConvo(db, who.userId, convoId)) return json(res, 404, { error: 'not_found' })
+          const events = messagesAroundIndexed(db, ownerRow.owner_user_id, convoId, { aroundSeq, limit: Math.min(limit, 30) })
+            .filter((e) => indexableBody(e.type, e.payload) != null)
+          console.log(`journal: shared context read convo=${convoId} viewer=${who.userId} device=${who.deviceId} anchor=${aroundSeq}`)
+          return json(res, 200, { events: events.map(toEventShape) })
+        }
         // Two agent read regimes (locked decision, search spec fold-in):
         //  - before_seq (and default) paging keeps the Phase-2 gate: an agent
         //    reads full transcripts only for conversations it manages or has
