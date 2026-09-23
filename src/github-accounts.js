@@ -29,8 +29,32 @@ export function saveGithubIdentity(db, { userId, host, identity, token, now = Da
   })()
 }
 
-export function markGithubStale(db, userId, now = Date.now()) {
-  db.prepare("UPDATE github_accounts SET state='stale', checked_at=? WHERE user_id=?").run(now, userId)
+// Refresh-path write: only touches the row that still holds the token the
+// refresh was started with, so an unlink or re-link that landed while
+// GitHub was being asked is never undone. Returns the view, or null when
+// nothing matched.
+export function updateGithubIdentity(db, { userId, token, identity, now = Date.now() }) {
+  return db.transaction(() => {
+    const r = db.prepare(`UPDATE github_accounts SET github_id=?, login=?, state='ok', checked_at=?
+      WHERE user_id=? AND token=?`).run(identity.github_id, identity.login, now, userId, token)
+    if (r.changes === 0) return null
+    db.prepare('DELETE FROM github_orgs WHERE user_id=?').run(userId)
+    const ins = db.prepare('INSERT INTO github_orgs(user_id, scope) VALUES(?,?)')
+    for (const scope of new Set(identity.scopes)) ins.run(userId, scope)
+    return githubAccountView(db, userId)
+  })()
+}
+
+// `token`, when given, scopes the write to the row that still holds the
+// token the caller started its refresh/check with — the same "only touch
+// the row we asked about" guard as updateGithubIdentity, so a stale-mark
+// racing an unlink or re-link never lands on the wrong row.
+export function markGithubStale(db, userId, { token = null, now = Date.now() } = {}) {
+  if (token != null) {
+    db.prepare("UPDATE github_accounts SET state='stale', checked_at=? WHERE user_id=? AND token=?").run(now, userId, token)
+  } else {
+    db.prepare("UPDATE github_accounts SET state='stale', checked_at=? WHERE user_id=?").run(now, userId)
+  }
 }
 
 export function deleteGithubAccount(db, userId) {

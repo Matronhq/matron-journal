@@ -45,11 +45,11 @@ test('canReadConvo: table of viewer × conversation', async () => {
 
 test('canReadConvo: a stale link on either side ends sharing (review focus 1)', async () => {
   const { db, dan, pat } = await world()
-  markGithubStale(db, pat.id, 2)
+  markGithubStale(db, pat.id, { now: 2 })
   assert.equal(canReadConvo(db, pat.id, 'org'), false, 'viewer stale')
   assert.equal(canReadConvo(db, dan.id, 'org'), true, 'owner unaffected')
   const { db: db2, dan: dan2, pat: pat2 } = await world()
-  markGithubStale(db2, dan2.id, 2)
+  markGithubStale(db2, dan2.id, { now: 2 })
   assert.equal(canReadConvo(db2, pat2.id, 'org'), false, 'owner stale')
   db.close(); db2.close()
 })

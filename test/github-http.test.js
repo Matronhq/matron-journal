@@ -3,6 +3,9 @@ import assert from 'node:assert/strict'
 import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { GithubError } from '../src/github.js'
+import { openDb } from '../src/db.js'
+import { saveGithubIdentity, deleteGithubAccount, githubAccountView } from '../src/github-accounts.js'
+import { refreshGithubAccount } from '../src/github-http.js'
 
 // A scripted stand-in for makeGithub(): poll/identity/exchange answers are
 // queues of thunks; an empty queue answers the default.
@@ -122,6 +125,41 @@ test('refresh: ok updates orgs; unauthorized marks stale; unreachable leaves eve
   assert.equal((await s.http('/me', { token: danTok })).json.github, null)
   assert.equal((await s.http('/github/link', { method: 'DELETE', token: danTok })).status, 404)
   assert.equal((await s.http('/github/refresh', { method: 'POST', token: danTok })).status, 404, 'nothing to refresh')
+})
+
+test('refreshGithubAccount: a concurrent unlink is never resurrected once GitHub answers', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  saveGithubIdentity(db, { userId: dan.id, host: 'github.com', identity: { github_id: 1, login: 'dan', scopes: ['github.com/matronhq'] }, token: 't1', now: 1 })
+  let resolveIdentity
+  const github = { host: 'github.com', fetchIdentity: () => new Promise((resolve) => { resolveIdentity = resolve }) }
+  const p = refreshGithubAccount(db, github, dan.id, 5)
+  assert.equal(deleteGithubAccount(db, dan.id), true, 'unlink lands while the refresh is in flight')
+  resolveIdentity({ github_id: 1, login: 'dan', scopes: ['github.com/matronhq', 'github.com/yearbooks'] })
+  const r = await p
+  assert.equal(r.outcome, 'unchanged')
+  assert.equal(githubAccountView(db, dan.id), null, 'unlink was not undone')
+  assert.deepEqual(db.prepare('SELECT * FROM github_orgs WHERE user_id=?').all(dan.id), [], 'no orgs resurrected for the deleted account')
+  db.close()
+})
+
+test('refreshGithubAccount: a concurrent re-link is never clobbered by the old token going unauthorized', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  saveGithubIdentity(db, { userId: dan.id, host: 'github.com', identity: { github_id: 1, login: 'dan', scopes: ['github.com/matronhq'] }, token: 't1', now: 1 })
+  let rejectIdentity
+  const github = { host: 'github.com', fetchIdentity: () => new Promise((_resolve, reject) => { rejectIdentity = reject }) }
+  const p = refreshGithubAccount(db, github, dan.id, 5)
+  // A brand new link (new token, new GitHub identity) lands while the old
+  // token's refresh is still in flight.
+  saveGithubIdentity(db, { userId: dan.id, host: 'github.com', identity: { github_id: 2, login: 'dan2', scopes: ['github.com/yearbooks'] }, token: 't2', now: 10 })
+  rejectIdentity(new GithubError('unauthorized'))
+  const r = await p
+  assert.equal(r.outcome, 'stale', 'reports the OLD token it was refreshing')
+  const view = githubAccountView(db, dan.id)
+  assert.equal(view.state, 'ok', 'the new link is untouched by the old token\'s unauthorized')
+  assert.equal(view.login, 'dan2')
+  db.close()
 })
 
 test('not configured: every linking route is 404 not_configured; /me says so', async (t) => {

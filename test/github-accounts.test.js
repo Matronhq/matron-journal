@@ -29,7 +29,7 @@ test('stale and delete', async () => {
   const db = openDb(':memory:')
   const dan = await createUser(db, 'dan', 'pw')
   saveGithubIdentity(db, { userId: dan.id, host: 'github.com', identity, token: 't', now: 1 })
-  markGithubStale(db, dan.id, 5)
+  markGithubStale(db, dan.id, { now: 5 })
   assert.equal(githubAccountView(db, dan.id).state, 'stale')
   assert.deepEqual(githubAccountView(db, dan.id).orgs, ['github.com/matronhq'], 'orgs are kept while stale')
   assert.equal(deleteGithubAccount(db, dan.id), true)

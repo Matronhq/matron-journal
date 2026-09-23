@@ -8,7 +8,7 @@ import { json, readBody } from './http-body.js'
 import { badRequest, notFound, conflict } from './http-who.js'
 import { GithubError } from './github.js'
 import {
-  githubAccountView, saveGithubIdentity, markGithubStale, deleteGithubAccount,
+  githubAccountView, saveGithubIdentity, updateGithubIdentity, markGithubStale, deleteGithubAccount,
   createLinkFlow, takeLinkFlow, LINK_FLOW_TTL_MS,
 } from './github-accounts.js'
 
@@ -26,16 +26,22 @@ export async function finishLink(db, github, { userId, token, now = Date.now() }
 
 // Re-reads memberships with the stored token. 'stale' = GitHub refused the
 // token (fail closed: the predicate ignores stale rows); 'unchanged' =
-// GitHub was unreachable or answered junk, previous list kept.
+// GitHub was unreachable or answered junk, previous list kept, and also the
+// outcome when the refresh's own row is gone (unlinked) or has moved on to
+// a different token (re-linked) by the time GitHub answers — the update is
+// scoped to that exact token so a stale write can never resurrect or
+// clobber the row that replaced it (final review, revoke/re-link race).
 export async function refreshGithubAccount(db, github, userId, now = Date.now()) {
   const row = db.prepare('SELECT token FROM github_accounts WHERE user_id=?').get(userId)
   if (!row) return null
   try {
     const identity = await github.fetchIdentity(row.token)
-    return { view: saveGithubIdentity(db, { userId, host: github.host, identity, token: row.token, now }), outcome: 'ok' }
+    const view = updateGithubIdentity(db, { userId, token: row.token, identity, now })
+    if (!view) return { view: githubAccountView(db, userId), outcome: 'unchanged' }
+    return { view, outcome: 'ok' }
   } catch (err) {
     if (err instanceof GithubError && err.code === 'unauthorized') {
-      markGithubStale(db, userId, now)
+      markGithubStale(db, userId, { token: row.token, now })
       return { view: githubAccountView(db, userId), outcome: 'stale' }
     }
     if (err instanceof GithubError) return { view: githubAccountView(db, userId), outcome: 'unchanged', error: err }
