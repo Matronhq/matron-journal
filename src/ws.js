@@ -3,6 +3,7 @@ import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses } from './db.js'
 import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, CONVO_ID_MAX_CHARS } from './journal.js'
+import { parseRepo, REPO_MAX } from './repo-identity.js'
 import { joinedAgentIds, participantIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
@@ -1482,6 +1483,15 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (msg.summary != null && (typeof msg.summary !== 'string' || msg.summary.length > SUMMARY_MAX_CHARS)) {
           return fail('bad_request', 'bad summary')
         }
+        // repo (spec 2026-09-23 tracker web/teams): absent = unchanged,
+        // null = clear, string = canonical host/org/name from the bridge's
+        // remote normalisation. Shape-checked here; upsertConversation
+        // re-validates and would throw, so a bad string never reaches SQL.
+        if (msg.repo !== undefined && msg.repo !== null && (
+          typeof msg.repo !== 'string' || msg.repo.length > REPO_MAX || !parseRepo(msg.repo)
+        )) {
+          return fail('bad_request', 'bad repo')
+        }
         // Room-upsert ownership gate (fix: convo_upsert takeover bypass). A
         // conversation with at least one convo_agents row (any state) is a
         // "room" — once participants have been drawn into its lifecycle,
@@ -1526,6 +1536,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           parentConvoId: msg.parent_convo_id ?? null,
           sessionOutcome: msg.session_outcome ?? null,
           summary: msg.summary ?? null,
+          repo: msg.repo,
         })
         // A spawned child's first published title carries the session short
         // its spawn room's title has been waiting for (the room is minted
@@ -1577,6 +1588,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
               title: convo.title,
               parent_convo_id: convo.parent_convo_id ?? null,
               agent_device_id: conn.deviceId,
+              repo: convo.repo ?? null,
             },
           })
         }

@@ -406,7 +406,7 @@ an agent token, selected by which query parameter is present:
   user or device. Bridges MUST mint globally unique ids — Claude session
   UUIDs are the convention.
 - `convo_upsert` appends a `convo_meta` journal event
-  (`payload:{title, parent_convo_id, agent_device_id}`, sender = the agent device, e.g.
+  (`payload:{title, parent_convo_id, agent_device_id, repo}`, sender = the agent device, e.g.
   `agent:dev-2`) whenever it changes an existing conversation's title, sets
   a non-empty title at creation, or creates a child (`parent_convo_id` set,
   even titleless — the linkage must ride the journal, or a live client would
@@ -417,6 +417,15 @@ an agent token, selected by which query parameter is present:
   connection's own device — the same id `convo_upsert` records on the row —
   so a live client can attribute a brand-new conversation to its box without
   waiting for the next `/snapshot`.
+- `convo_upsert` accepts an optional `repo`: the canonical `host/org/name`
+  of the session's git remote (lower-cased host and org, e.g.
+  `github.com/matronhq/matron-journal`; regex
+  `^[a-z0-9.-]+/[a-z0-9_.-]+/[A-Za-z0-9_.-]+$`, ≤ 256 chars). Absent leaves
+  the stored value alone, `null` clears it, anything else is `bad_request`.
+  A change appends a `convo_meta` carrying the new `repo`; `/snapshot`
+  conversations carry `repo` too (`null` when unknown). The journal derives
+  `repo_scope` (`host/org`) from it — the unit shared visibility is decided
+  on (see "Shared visibility").
 - Room membership changes append a server-authored `convo_meta` (sender
   `journal`) whose payload is just `{participants}` — the same
   owner-plus-joined array `/snapshot` carries — so live clients re-chip a
