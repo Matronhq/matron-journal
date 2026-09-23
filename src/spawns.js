@@ -248,7 +248,22 @@ export function joinSpawnMission(db, hub, row, childConvoId) {
       console.error(`approveSpawn: mission #${row.mission_num} not joinable at start (${mission ? mission.state : 'not visible'}) — child runs unattached`)
       return null
     }
-    const exists = db.prepare('SELECT 1 FROM conversations WHERE id=? AND owner_user_id=?').get(childConvoId, row.user_id)
+    // Final review finding 1: the bridge-reported childConvoId can already
+    // name a conversation the user owns — normally its own earlier
+    // convo_upsert, but a buggy/hostile target bridge could just as well
+    // hand back the id of some OTHER conversation the user owns (the
+    // Coordinator, or a private-owned one). owner_user_id alone is not
+    // enough: convo_upsert's own takeover gate (ws.js ~1552) additionally
+    // requires the row be unowned or owned by the caller's own device, and
+    // this path — which writes the mission join and marker directly,
+    // bypassing that gate — must honour the same rule. A row owned by a
+    // different device is left untouched; the spawn still reports started
+    // (this join is best-effort, same as every other failure branch here).
+    const exists = db.prepare('SELECT agent_device_id FROM conversations WHERE id=? AND owner_user_id=?').get(childConvoId, row.user_id)
+    if (exists && exists.agent_device_id != null && exists.agent_device_id !== row.target_device_id) {
+      console.error(`approveSpawn: mission #${row.mission_num} join skipped — child convo ${childConvoId} is owned by a different device — child runs unattached`)
+      return null
+    }
     if (!exists) upsertConversation(db, { id: childConvoId, ownerUserId: row.user_id, sessionState: 'running', agentDeviceId: row.target_device_id })
     const joined = joinMission(db, { userId: row.user_id, missionId: mission.id, convoId: childConvoId, excludePrivateOwned })
     appendAndBroadcast(db, hub, {

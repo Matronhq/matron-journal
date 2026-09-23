@@ -1213,6 +1213,38 @@ test('spawn_request with an open mission parks mission_num on the row, the card 
   assert.ok(body.includes(`- **Joins mission #${m.num}** — Spawned work`), body)
 })
 
+// Test gap (final review finding 2) — spawn_request's mission sieve
+// (ws.js ~917-930): excludePrivateOwned = !isPrivateDevice(asker) ||
+// !isPrivateDevice(target). A mission born in a private device's
+// conversation stays unfiltered ONLY when both the asker and the target
+// are private; if either is ordinary, the sieve applies and the mission is
+// no more visible than if it didn't exist.
+test('spawn_request mission sieve: a private-origin mission is invisible unless BOTH the asking and target devices are private', async (t) => {
+  const { s, parentDev, targetDev, parent } = await spawnFleet(t)
+  s.db.prepare('UPDATE devices SET private=1 WHERE id=?').run(parentDev.deviceId)
+  const mission = await missionFor(s, parentDev.token) // origin_convo_id = 'parent-convo', now owned by a private device
+
+  // Private asker, ORDINARY target: excludePrivateOwned=true — the mission
+  // is sieved out, same no_mission an unknown number gets.
+  parent.send({
+    op: 'spawn_request', request_id: 'q-ord-target', from_convo_id: 'parent-convo',
+    target_device_id: targetDev.deviceId, workdir: '/w', task: 'x', mission_num: mission.num,
+  })
+  assert.equal((await parent.waitFor(isError)).code, 'no_mission')
+  assert.equal(s.db.prepare('SELECT COUNT(*) c FROM agent_spawn_requests').get().c, 0)
+  parent.frames.length = 0
+
+  // Private asker AND private target: unfiltered — the request is accepted
+  // and the mission is parked on the row exactly like an ordinary mission.
+  s.db.prepare('UPDATE devices SET private=1 WHERE id=?').run(targetDev.deviceId)
+  parent.send({
+    op: 'spawn_request', request_id: 'q-priv-target', from_convo_id: 'parent-convo',
+    target_device_id: targetDev.deviceId, workdir: '/w', task: 'x', mission_num: mission.num,
+  })
+  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  assert.equal(getSpawn(s.db, ack.spawn_id).mission_num, mission.num)
+})
+
 async function missionSpawn(t) {
   const fleet = await spawnFleet(t)
   const { s, parentDev, targetDev, parent, client } = fleet
