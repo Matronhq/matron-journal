@@ -1,8 +1,8 @@
-# Tracker web app, teams and shareable item links — design
+# Tracker web app, GitHub-verified visibility and shareable item links — design
 
-Date: 2026-09-23. Status: draft for review.
-Decided with Dan in tracker items #2769, #2771, #2772, #2773 and recorded
-as decisions #2784 and #2788.
+Date: 2026-09-23. Status: draft for review (revision 2).
+Decided with Dan in the Matron tracker (items #2769, #2771, #2772, #2773,
+#2791; decisions #2784, #2788).
 
 ## Problem
 
@@ -20,21 +20,22 @@ decided, but they only exist inside Matron and only for one user.
   (`item_counters`). Dan's #12 and a colleague's #12 are different rows, so
   no bare number can ever identify an item to someone else.
 - Cross-user visibility was a v1 non-goal of the tracker. A journal has
-  `users` but no team, and a colleague cannot see which decisions were made
-  in a repo they share.
+  `users` and nothing that says who works with whom, so a colleague cannot
+  see which decisions were made in a repo they share.
 
 ## Goals
 
-1. Agents never leak tracker numbers onto GitHub. Ships first and
-   independently (bounded change to matron-bridge).
+1. Agents never leak tracker numbers onto GitHub. Shipped (matron-bridge
+   branch `feat/no-tracker-numbers-on-github`).
 2. Every item, mission and milestone has one **https link** that works in a
    browser anywhere, and opens the app when it is installed.
 3. A **tracker web app** where a signed-in user reads and works their own
-   tracker, reads their teammates', manages their account, and
-   administrators manage users and teams. No chat in v1.
-4. **Per-repo visibility**: an item is readable by the members of a team
-   whose GitHub org owns the repo the item was filed from. Personal repos
-   and conversations without a repo stay private.
+   tracker, reads their colleagues', manages their account, and
+   administrators manage users. No chat in v1.
+4. **Per-repo visibility, verified by GitHub**: an item is readable by
+   users who, like its owner, are verified members of the GitHub org that
+   owns the repo the item was filed from. Personal repos and conversations
+   without a repo stay private. No admin maintains a membership list.
 
 ## Non-goals (v1)
 
@@ -44,19 +45,23 @@ decided, but they only exist inside Matron and only for one user.
 - Per-item or per-mission sharing controls.
 - Comments, closes or reorders by anyone but the owner (and the owner's
   agents).
-- Multi-company tenancy. One journal is one installation; teams partition
-  visibility within it, they do not isolate billing or admin.
-- Repo hosts other than GitHub in the org mapping. The repo string is
-  host-agnostic so GitLab and friends can be added by mapping later.
+- Manually curated teams. Visibility is derived from GitHub org membership
+  only; repos on other hosts have no cross-user audience until a second
+  identity provider is added.
+- Signing in to the journal with GitHub instead of a password. Linking is
+  additive; the password stays. A natural follow-up.
+- Multi-company tenancy. One journal is one installation.
 
 ## Decisions taken during brainstorming
 
 | Question | Decision |
 |---|---|
-| Item refs on GitHub (#2769) | Never `#N` or `matron://`; say it in words; the https link once it exists. |
+| Item refs on GitHub (#2769) | Never `#N` or `matron://`; say it in words; the https link once it exists. Shipped. |
 | Link format (#2771) | https on the journal host is canonical. In-app opening via a registered `matron://` scheme; universal links optional per build. See "Why not universal links alone". |
 | Web access (#2772) | A new, focused web app on the journal HTTP API. Not matron-web. |
-| Visibility (#2773, #2784) | Per repo. Audience derived from the GitHub org in the remote, mapped by an admin to a journal team. |
+| Visibility (#2773, #2784) | Per repo, audience derived from the GitHub org in the remote. |
+| Membership (#2791) | Verified: each user links their GitHub account; the journal reads their org memberships. Replaces the manual teams of revision 1. |
+| OAuth flows (#2791) | Both. The web authorization flow when the installation registers its own OAuth App; the device flow always, with a default client id shipped by Matron. |
 | Chat in the web app (#2788) | Not in v1; the app is structured so a conversation view can be added. |
 
 ## Repo identity
@@ -64,21 +69,22 @@ decided, but they only exist inside Matron and only for one user.
 The bridge learns a session's repo and tells the journal. Nothing else
 in the design depends on local paths.
 
-- **Canonical repo string**: `host/owner/name`, lower-cased host and owner,
+- **Canonical repo string**: `host/org/name`, lower-cased host and org,
   name as-is minus a trailing `.git`. `git@github.com:Matronhq/matron-journal.git`,
   `https://github.com/Matronhq/matron-journal` and `ssh://git@github.com/Matronhq/matron-journal.git`
-  all become `github.com/matronhq/matron-journal`. Name case is preserved
-  so the display matches GitHub; comparisons in the journal are
-  case-insensitive on the whole string.
+  all become `github.com/matronhq/matron-journal`. `org` is whatever owns
+  the repo on the host: a GitHub organisation or a personal account.
+  Comparisons are case-insensitive on the whole string.
 - **Bridge** (`lib/repo-identity.js`, new): on session create, resume and
   `/workdir`, run `git -C <workdir> remote get-url origin` with a 2 s
   timeout via `spawnSync`. Best effort: no git, no remote, or a timeout
-  yields `null`. Never throws, never logs the workdir path to the journal.
+  yields `null`. Never throws, never sends the workdir path to the journal.
 - **Wire**: `convo_upsert` gains an optional `repo` field. Absent means
   unchanged; `null` clears; a string must match
   `^[a-z0-9.-]+/[a-z0-9_.-]+/[A-Za-z0-9_.-]+$` and be ≤ 256 chars, else
   `bad_request`. The `convo_meta` fan-out carries it so clients can show
-  the repo on a conversation.
+  the repo on a conversation. The handler ignores unknown fields today, so
+  an old journal simply drops `repo`.
 - **Journal**: `conversations.repo TEXT` (nullable), index on
   `lower(repo)`.
 
@@ -94,41 +100,110 @@ A conversation's repo can change (the user switches workdir). Visibility
 follows the current value; that is the rule that is cheapest and easiest
 to explain.
 
-## Teams (matron-journal)
+## GitHub account linking (matron-journal)
+
+### Why link accounts
+
+The org in a repo string says who owns the code, not who the journal user
+is. Without a link, membership would have to be typed in by an admin and
+the journal would verify nothing. With a link, GitHub is the source of
+truth: the journal asks GitHub, with the user's own token, which orgs the
+user belongs to, and keeps that list. Private org memberships are visible
+to the member's own token, so private orgs work without any org-level
+installation.
 
 ### Data model (`src/db.js`)
 
 ```
-CREATE TABLE IF NOT EXISTS teams(
-  id          TEXT PRIMARY KEY,           -- 'tm_' + 16 hex
-  name        TEXT NOT NULL UNIQUE,       -- ≤ 64 chars, shown in the UI
-  created_at  INTEGER NOT NULL
+CREATE TABLE IF NOT EXISTS github_accounts(
+  user_id        INTEGER PRIMARY KEY REFERENCES users(id),
+  host           TEXT NOT NULL DEFAULT 'github.com',  -- GHES support later
+  github_id      INTEGER NOT NULL,        -- stable numeric id
+  login          TEXT NOT NULL,           -- current login, display only
+  token          TEXT NOT NULL,           -- OAuth user token, scope read:org
+  orgs           TEXT NOT NULL DEFAULT '[]',  -- JSON, lower-cased org logins
+  state          TEXT NOT NULL CHECK(state IN ('ok','stale')),
+  checked_at     INTEGER,                 -- last successful membership read
+  linked_at      INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS team_members(
-  team_id   TEXT NOT NULL REFERENCES teams(id),
-  user_id   INTEGER NOT NULL REFERENCES users(id),
-  role      TEXT NOT NULL CHECK(role IN ('admin','member')),
-  added_at  INTEGER NOT NULL,
-  PRIMARY KEY(team_id, user_id)
-);
-CREATE TABLE IF NOT EXISTS team_orgs(
-  team_id   TEXT NOT NULL REFERENCES teams(id),
-  host      TEXT NOT NULL,                -- 'github.com'
-  owner     TEXT NOT NULL,                -- 'matronhq' (lower-cased)
-  added_at  INTEGER NOT NULL,
-  PRIMARY KEY(host, owner)                -- one org maps to one team
+CREATE UNIQUE INDEX IF NOT EXISTS idx_github_accounts_id ON github_accounts(host, github_id);
+CREATE TABLE IF NOT EXISTS github_link_flows(
+  id           TEXT PRIMARY KEY,          -- 'gl_' + 16 hex
+  user_id      INTEGER NOT NULL REFERENCES users(id),
+  device_id    INTEGER NOT NULL,
+  flow         TEXT NOT NULL CHECK(flow IN ('device','web')),
+  device_code  TEXT,                      -- device flow
+  state        TEXT,                      -- web flow CSRF state
+  expires_at   INTEGER NOT NULL,
+  created_at   INTEGER NOT NULL
 );
 ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0;
 ```
 
-Roles:
+One GitHub account per journal user and one journal user per GitHub
+account. Linking an account already held by another user is `409
+conflict`; the admin resolves it.
 
-- **Journal admin** (`users.is_admin`): creates users, teams, and org
-  mappings; adds the first admin to a team. Bootstrapped from the CLI:
-  `matron-admin user admin <name> on|off`. A journal with no admin behaves
-  exactly as today.
-- **Team admin**: adds and removes members and org mappings of their team.
-- **Member**: reads.
+**Token at rest.** The token is stored as-is. Its only scope is
+`read:org`, it is read-only, the user can revoke it from GitHub at any
+time, and the journal database already holds credentials of the same
+class (APNs key, password hashes). Encrypting this column under a
+journal-side key is a follow-up, noted here so it is not forgotten.
+
+### Configuration
+
+- `MATRON_GITHUB_CLIENT_ID`: defaults to Matron's published OAuth App
+  client id, the way the GitHub CLI ships one. Overridable.
+- `MATRON_GITHUB_CLIENT_SECRET`: optional. When set, the **web flow** is
+  offered; the installation has registered its own OAuth App with callback
+  `https://<journal>/github/callback`. When unset, only the device flow.
+- `MATRON_GITHUB_HOST`: optional, defaults to `github.com`. Repo strings
+  match on this host.
+
+Both flows need the OAuth App to have "Device flow" enabled in its
+GitHub settings. Matron's published app has it on; an installation's own
+app must turn it on to keep the device path as a fallback.
+
+A **GitHub App** (installed on the org by an org owner) was considered and
+rejected for v1: it can read membership without per-user tokens, but every
+org owner has to install it, and the per-user token already answers the
+one question the journal asks.
+
+### Flows
+
+**Web flow** (`MATRON_GITHUB_CLIENT_SECRET` set). The account page's
+"Link GitHub" button calls `POST /github/link {flow:'web'}` → `{url}`,
+a GitHub authorize URL with `scope=read:org` and a random `state` stored
+in `github_link_flows` for 10 minutes. GitHub redirects to
+`GET /github/callback?code&state`. The journal exchanges the code with the
+client secret, fetches `GET /user` and the org list, upserts
+`github_accounts`, deletes the flow row, and redirects to
+`/account?linked=1`. The callback is bound to the flow row's user, not to
+the browser's Bearer token, because the redirect arrives without one.
+
+**Device flow** (always). `POST /github/link {flow:'device'}` asks GitHub
+for a device code and returns `{flow_id, user_code, verification_uri,
+interval}`. The page shows the code and a link to github.com/login/device;
+it polls `POST /github/link/:flow_id/poll` at `interval`. The journal
+polls GitHub's token endpoint on each call and answers `{status:
+'pending'|'linked'|'expired'|'denied'}`, finishing exactly as the web flow
+does on `linked`. The apps can offer the same flow from their settings
+screens later; nothing in it needs a browser.
+
+**Membership read.** `GET /user/memberships/orgs?state=active` (paginated)
+with the user's token; store lower-cased `organization.login` values.
+This lists every org the user is an active member of, including private
+memberships, because it is the user's own token.
+
+**Refresh.** A daily journal job (`src/github-refresh.js`, same style as
+retention) re-reads memberships for every linked account. The web app
+also triggers `POST /github/refresh` on sign-in and from a button. A `401`
+or `403` from GitHub sets `state='stale'`, which **fails closed**: a stale
+account confers no cross-user visibility until the user re-links. Other
+errors keep the previous list and log.
+
+**Unlink.** `DELETE /github/link` removes the row; the web app tells the
+user to also revoke the app on GitHub if they want the token dead.
 
 ### Visibility rule
 
@@ -136,16 +211,17 @@ Roles:
 excerpt, where `owner` is the row's `user_id`:
 
 1. `viewer.userId === owner` → yes (unchanged from today).
-2. Otherwise the row's repo `R` must be non-null, and there must exist a
-   team `T` such that **both** viewer and owner are members of `T` and
-   `(host(R), owner(R))` is in `team_orgs` for `T`.
+2. Otherwise the row's repo `R` must be non-null, `host(R)` must equal the
+   configured GitHub host, and `org(R)` must be in **both** the viewer's and
+   the owner's `orgs` lists, each from a `github_accounts` row in state
+   `ok`.
 3. Rows whose origin conversation is owned by a **private device** are
-   never cross-user visible, regardless of team. The existing privacy sieve
-   (`src/privacy.js`) runs first.
+   never cross-user visible. The existing privacy sieve (`src/privacy.js`)
+   runs first.
 
-Requiring the owner to be a team member too is deliberate: a user who has
-a checkout of a team's repo but is not in the team neither sees the team's
-items nor exposes their own. A user in no team is fully private.
+Consequences: a repo under a personal login is in nobody's `orgs`, so it
+is private to its owner; a user with no linked account is fully private in
+both directions; leaving a GitHub org ends visibility at the next refresh.
 
 Agent callers get the read visibility of their owning user, so an agent
 can answer "what did Dan decide about X" from a colleague's items. Writes
@@ -156,14 +232,15 @@ copy: `/items*`, `/missions*`, `/milestones*`, `/lookup` and the excerpt
 read all call it, following the `privacy.js` precedent of a single shared
 sieve.
 
-### HTTP API changes (`src/http.js`, `src/items-http.js`, `src/missions-http.js`, new `src/teams-http.js`)
+## HTTP API changes (`src/http.js`, `src/items-http.js`, `src/missions-http.js`, new `src/github-http.js`, `src/users-http.js`)
 
 Reads that widen:
 
-- `GET /items?scope=mine|team` (default `mine`, today's behaviour).
-  `team` returns every item visible under the rule, with `owner: {user_id,
-  name}` on each row and `repo` where known. Existing filters apply.
-- `GET /missions?scope=mine|team`, same shape.
+- `GET /items?scope=mine|shared` (default `mine`, today's behaviour).
+  `shared` returns every item visible under the rule, with `owner:
+  {user_id, name, github_login}` on each row and `repo` where known.
+  Existing filters apply.
+- `GET /missions?scope=mine|shared`, same shape.
 - `GET /items/:id`, `GET /missions/:id`, `GET /missions/:id/milestones` on
   a visible foreign row return it with `owner` and `repo`. An invisible
   row is `404 not_found` (anti-enumeration, as today).
@@ -173,27 +250,26 @@ Reads that widen:
 - `GET /lookup?user=<name>&num=<n>` → `{kind: 'item'|'mission'|'milestone',
   id}` for a visible row, else `404`. Numbers come from the shared per-user
   counter, so one lookup resolves all three kinds.
-- `GET /convo/:id/messages?around_seq=&limit=` gains the same team rule for
-  a **foreign user's** conversation: allowed when the conversation's repo is
+- `GET /convo/:id/messages?around_seq=&limit=` gains the same rule for a
+  **foreign user's** conversation: allowed when the conversation's repo is
   visible to the viewer and the conversation is not private-owned. Prose
   only (`text`, `diff`), `limit` clamped to 30, logged server-side, exactly
   as the existing foreign-device read. This is what the milestone excerpt
   view uses.
-- `GET /me` → `{user: {id, name, is_admin}, teams: [{id, name, role, orgs:
-  [{host, owner}]}]}`.
+- `GET /me` → `{user: {id, name, is_admin}, github: {login, orgs, state,
+  checked_at} | null}`.
 
-Team administration (journal admin, or team admin for their own team):
+GitHub linking: `POST /github/link`, `POST /github/link/:id/poll`,
+`GET /github/callback`, `POST /github/refresh`, `DELETE /github/link`, as
+above. `POST /github/link` shares the `/login` per-IP limiter.
 
-- `GET /teams`, `POST /teams {name}`, `PATCH /teams/:id {name}`,
-  `DELETE /teams/:id` (admin only; refuses with `409` while members remain).
-- `PUT /teams/:id/members/:user_id {role}`, `DELETE /teams/:id/members/:user_id`.
-- `PUT /teams/:id/orgs {host, owner}`, `DELETE /teams/:id/orgs/:host/:owner`.
-  `409 conflict` if the org is already mapped to another team.
+User administration (journal admin, `users.is_admin`, bootstrapped by
+`matron-admin user admin <name> on|off`), mirroring `matron-admin`:
 
-User administration (journal admin), mirroring `matron-admin`:
-
-- `GET /users`, `POST /users {name, password}`, `POST /users/:id/password {password}`,
-  `PATCH /users/:id {is_admin}`.
+- `GET /users` (with each user's `github_login` and link state),
+  `POST /users {name, password}`, `POST /users/:id/password {password}`,
+  `PATCH /users/:id {is_admin}`, `DELETE /users/:id/github-link` (to
+  resolve a conflict).
 - `POST /users/:id/link-code {expires}` → the same payload `matron-admin
   link-code` produces, so the web app can show the pairing QR for a new
   colleague's phone.
@@ -202,8 +278,9 @@ Self-service (any user), reusing existing helpers where routes are
 missing: `GET /devices`, `DELETE /devices/:id`, `PATCH /devices/:id {name}`,
 `POST /me/password {old, new}`.
 
-All new routes follow `http-who.js` conventions, bear the existing
-Bearer auth, and reuse the `/login` rate limiter for password changes.
+All new routes follow `http-who.js` conventions and bear the existing
+Bearer auth, except `GET /github/callback`, which is authenticated by the
+flow row's `state`.
 
 ### Item links and the lookup URL
 
@@ -234,21 +311,13 @@ claiming `/u/*`. Unset → `404`. See "Why not universal links alone".
 
 Unchanged. Foreign rows are read through HTTP, never replayed into another
 user's journal; the WebSocket stays a per-user stream. The web app
-refreshes a team view on its own `item`/`mission` markers and on a 60 s
-poll when a team view is open.
+refreshes a shared view on its own `item`/`mission` markers and on a 60 s
+poll while a shared view is open.
 
 ## Bridge changes (matron-bridge)
 
-1. **Guidance** (`BRIDGE_CLAUDE.md`, `BRIDGE_CODEX.md`), the bounded change
-   from #2769, shipped ahead of everything else:
-
-   > Tracker item numbers are per-user and mean nothing outside Matron. In
-   > anything that leaves Matron (GitHub issues, PR titles and bodies,
-   > commit messages, code comments, external docs) never write a tracker
-   > item as `#N`, `item #N`, or a `matron://` link. Say what was decided in
-   > words. If a GitHub issue or PR exists for the same work, attach it to
-   > the item with `links` so the connection lives on the Matron side.
-
+1. **Guidance**: shipped on branch `feat/no-tracker-numbers-on-github`
+   (both prompt files, test `test/tracker-refs-outside-matron.test.js`).
    Once the journal serves links, the bridge appends the user's own link
    prefix to the instructions it renders (`Your shareable item link form is
    https://<journal>/u/<name>/<num>`), and the rule gains: "the https item
@@ -257,7 +326,7 @@ poll when a team view is open.
 2. **Repo reporting**: `lib/repo-identity.js` plus the `repo` field on
    `upsertConvo` in `lib/journal-publisher.js`, called from session create,
    resume and `/workdir` in `index.js`.
-3. **Tools**: `item_list` and `mission_get` accept `scope: 'team'`;
+3. **Tools**: `item_list` and `mission_get` accept `scope: 'shared'`;
    `item_get` and `item_comment` accept `dan#12` and a pasted https link as
    the id; list output shows the owner on foreign rows. In-chat references
    to a colleague's item render as `[dan#12](https://…/u/dan/12)`. Own
@@ -293,10 +362,6 @@ for installations that build their own apps. The web app's item page
 therefore shows an **Open in Matron** button that launches the scheme
 URL, and on iOS and Android tries it automatically once per page load.
 
-This corrects the closing note on #2771, which said the scheme would stay
-an in-app convention only. It has to be registered for the "opens the app"
-goal to hold on an arbitrary host.
-
 ## Web app (new repo)
 
 Proposed name `matron-tracker`; the name is Dan's call.
@@ -305,10 +370,9 @@ Proposed name `matron-tracker`; the name is Dan's call.
 
 TypeScript, React, Vite, no server of its own. Output is a static
 directory the journal serves (`MATRON_WEB_DIR`). React because matron-web
-is React, so nothing new to learn. No
-component framework beyond a small shared set; the design follows the
-apps' tracker panel (list, detail, thread) so the three surfaces read as
-one product.
+is React, so nothing new to learn. No component framework beyond a small
+shared set; the design follows the apps' tracker panel (list, detail,
+thread) so the three surfaces read as one product.
 
 Auth: `POST /login` with `device_name: 'web (<browser>)'`; the returned
 client-device token is kept in `localStorage` and sent as Bearer. Sign
@@ -320,15 +384,15 @@ Macs, so a forgotten browser can be revoked from anywhere.
 ```
 src/
   api/            JournalClient: HTTP + WebSocket, token, cursor replay
-  model/          items, missions, milestones, teams, conversations
+  model/          items, missions, milestones, conversations, github link
   features/
-    tracker/      my list, team list, item detail, thread, compose comment
+    tracker/      my list, shared list, item detail, thread, compose comment
     missions/     mission list, mission page, milestone list
     excerpt/      read-only conversation excerpt around a seq
-    account/      devices, password, pairing QR
-    admin/        users, teams, members, org mappings
+    account/      GitHub link, devices, password, pairing QR
+    admin/        users
     conversation/ RESERVED: route /c/:id, renders excerpt today
-  routes.tsx      /u/:user/:num, /items, /team, /missions/:id, /c/:id, /account, /admin
+  routes.tsx      /u/:user/:num, /items, /shared, /missions/:id, /c/:id, /account, /admin
 ```
 
 `JournalClient` speaks the same WebSocket `hello` the apps use, with a
@@ -343,12 +407,13 @@ event types, not a second data layer.
 - **My tracker.** Three groups, like the apps: awaiting me, awaiting
   agent (tasks in rank order), decisions in force. Closed items behind a
   toggle. Drag to reorder posts `rank`.
-- **Team.** Every visible item from teammates, grouped by repo then owner,
-  with kind/state/awaiting filters and a search box (client-side over the
-  loaded page; server search is a follow-up).
+- **Shared.** Every visible item from colleagues, grouped by org, repo,
+  then owner, with kind/state/awaiting filters and a search box
+  (client-side over the loaded page; server search is a follow-up). Empty
+  state explains that linking GitHub is what makes items appear here.
 - **Item.** Title, body, labels, links, thread with attachments inline,
   voice-note transcripts as text. Owner: comment, close with resolution,
-  reopen, edit. Teammate: read only, with a visible "owned by Dan" line.
+  reopen, edit. Colleague: read only, with a visible "owned by Dan" line.
   Origin: "filed from <conversation title>" linking to the excerpt.
 - **Mission.** Body, milestones newest first (each opens its excerpt),
   open items, conversations. Owner can close with a summary; refuses over
@@ -356,10 +421,12 @@ event types, not a second data layer.
 - **Excerpt.** The messages around a milestone's `seq`, prose only, with
   "Open full conversation in matron-web" when a matron-web URL is
   configured (`MATRON_WEB_CHAT_URL`, optional).
-- **Account.** Devices (rename, revoke), change password, "pair a phone"
-  QR via the link-code route.
-- **Admin.** Users (create, reset password, admin flag), teams (create,
-  members with roles, org mappings). Team admins see only their team.
+- **Account.** "Link GitHub" (web flow button when available, device
+  code otherwise), the linked login and org list with a refresh button
+  and last-checked time, unlink; devices (rename, revoke); change
+  password; "pair a phone" QR via the link-code route.
+- **Admin.** Users: create, reset password, admin flag, see and clear a
+  GitHub link. Journal admins only.
 
 ### Open in Matron
 
@@ -372,11 +439,15 @@ puts it on the clipboard.
 - Journal: every new route returns the existing shapes (`bad_request`,
   `not_found`, `forbidden`, `conflict`, `rate_limited`). Invisible rows are
   `404`, never `403`.
+- GitHub unreachable during a link: `502 upstream` with a retry hint; the
+  flow row stays until it expires. During a refresh: previous list kept,
+  logged, `checked_at` untouched.
 - Repo detection in the bridge never fails a session start: any error is
   `repo: null` and a debug log line.
 - Web app: `401` anywhere drops the token and returns to sign-in with the
   intended route preserved. `403` on a foreign row renders the read-only
-  view with the action bar hidden, never a dead end.
+  view with the action bar hidden, never a dead end. A `stale` link shows
+  a banner with a re-link button on every page.
 - Lookup of an unknown or invisible link shows "no such item, or you
   cannot see it", the same message for both.
 
@@ -384,10 +455,16 @@ puts it on the clipboard.
 
 - Anti-enumeration is preserved: invisible rows and unknown users answer
   `404` identically. `/lookup` rate-limits per device like `/search`.
-- Private devices stay private across teams. The sieve runs before the
-  team rule and a test pins the order.
+- Private devices stay private across orgs. The sieve runs before the
+  org rule and a test pins the order.
 - Foreign excerpt reads are prose-only, capped at 30 and logged with viewer
   and conversation ids, matching the existing foreign-device rule.
+- The GitHub token has one read-only scope, is never returned by any
+  route, never logged, and is deleted on unlink. `state` values and
+  device codes are single-use and expire in 10 minutes.
+- The web callback checks `state` against the flow row and ignores the
+  browser's session entirely, so a forged callback cannot link an account
+  to someone else.
 - The repo string is validated server-side; it is peer text like a title
   and passes the same control-character sanitiser.
 - Static serving is read-only, rejects path traversal, and serves nothing
@@ -398,35 +475,41 @@ puts it on the clipboard.
 ## Testing
 
 - **Journal**: schema migration on a populated DB; visibility predicate
-  table-driven (owner, teammate with org, teammate without org, non-member
-  with checkout, private-owned origin, no repo, mission with mixed repos);
-  route tests for scope=team, foreign read/write status codes, lookup,
-  foreign excerpt cap and logging, teams and users admin authorisation,
-  static fallback and traversal, well-known on/off.
+  table-driven (owner; colleague in the org; colleague not in the org;
+  owner with stale link; viewer with no link; private-owned origin; repo
+  under a personal login; no repo; mission with mixed repos); device and
+  web link flows against a fake GitHub (pending, linked, denied, expired,
+  bad state, account held by another user); refresh success, `401` →
+  stale, network error → unchanged; route tests for `scope=shared`,
+  foreign read/write status codes, lookup, foreign excerpt cap and
+  logging, users admin authorisation, static fallback and traversal,
+  well-known on/off.
 - **Bridge**: `repo-identity` normalisation table (ssh, https, ssh://,
   no `.git`, no remote, timeout); `convo_upsert` carries `repo` on create,
-  resume, `/workdir`; guidance text present in both prompt files; tool id
-  parsing for `dan#12` and links.
+  resume, `/workdir`; tool id parsing for `dan#12` and links.
 - **Web app**: unit tests on the client and models; component tests for
-  the item page in owner and teammate modes; one end-to-end run against a
-  journal started from `test/` fixtures (sign in, open a link, comment,
-  admin creates a team and a mapping, teammate sees the item).
+  the item page in owner and colleague modes and the account page in
+  both link flows; one end-to-end run against a journal started from
+  `test/` fixtures with a fake GitHub (sign in, link, open a link,
+  comment, a colleague in the same org sees the item).
 - **Apps**: link-handler unit tests for the scheme and https forms; the
   existing snapshot tests for item links extended with the https form.
 
 ## Rollout
 
 Each step below is its own implementation plan in its own repo; the
-steps share this spec, not a plan.
+steps share this spec, not a plan. A journal with no linked accounts and
+no `MATRON_WEB_DIR` behaves exactly as today after every step.
 
-1. **matron-bridge guidance** (#2769). Independent, ships now.
-2. **matron-journal**: `repo` on conversations, teams, visibility, lookup,
-   admin routes, static hosting, well-known. Behind nothing: a journal
-   with no teams and no `MATRON_WEB_DIR` is unchanged.
-3. **matron-bridge**: repo reporting, tool scopes, link prefix in the
-   instructions. Old journals ignore unknown `convo_upsert` fields, so
-   this can deploy before or after step 2.
-4. **matron-tracker** web app, deployed by setting `MATRON_WEB_DIR` on the
+1. **matron-bridge guidance**. Done, awaiting merge.
+2. **Matron's OAuth App**: register it under the Matronhq GitHub org with
+   device flow enabled; publish the client id as the journal default.
+3. **matron-journal**: `repo` on conversations, GitHub linking and
+   refresh, visibility, lookup, users admin, static hosting, well-known.
+4. **matron-bridge**: repo reporting, tool scopes, link prefix in the
+   instructions. Old journals drop the unknown field, so this can deploy
+   before or after step 3.
+5. **matron-tracker** web app, deployed by setting `MATRON_WEB_DIR` on the
    journal host.
-5. **Apps**: scheme registration and https link handling, then optional
+6. **Apps**: scheme registration and https link handling, then optional
    associated domains for installations that build their own.
