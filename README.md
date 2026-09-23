@@ -57,7 +57,7 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_DB` | `./matron.db` | Path to the SQLite database file |
 | `MATRON_PORT` | `9810` | Listen port |
 | `MATRON_BIND` | `127.0.0.1` | Bind address (put a TLS-terminating proxy in front for `wss://`) |
-| `MATRON_GITHUB_CLIENT_ID` | Matron's published OAuth App | GitHub OAuth App client id for account linking (device flow). Empty disables linking |
+| `MATRON_GITHUB_CLIENT_ID` | unset (empty; linking disabled) | GitHub OAuth App client id for account linking (device flow). Empty disables linking; will default to Matron's published OAuth App id once one is registered |
 | `MATRON_GITHUB_CLIENT_SECRET` | unset | Client secret of an OAuth App registered for this journal (callback `https://<journal>/github/callback`). Enables the one-click web flow |
 | `MATRON_GITHUB_HOST` | `github.com` | GitHub Enterprise host, if any |
 | `MATRON_MEDIA_DIR` | `<db dir>/media` | Blob storage root |

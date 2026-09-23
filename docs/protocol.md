@@ -1728,8 +1728,9 @@ and is the only copy.
 ### GitHub account linking
 
 Client devices only (an agent never links). Configuration:
-`MATRON_GITHUB_CLIENT_ID` (default: Matron's published OAuth App;
-empty = linking disabled → every route below is `404 not_configured`),
+`MATRON_GITHUB_CLIENT_ID` (default empty → linking disabled, every route
+below is `404 not_configured`; will default to Matron's published OAuth
+App id once one is registered — not configured at HEAD),
 `MATRON_GITHUB_CLIENT_SECRET` (optional; enables the web flow),
 `MATRON_GITHUB_HOST` (default `github.com`). The token scope is `read:org`.
 
@@ -1739,7 +1740,7 @@ empty = linking disabled → every route below is `404 not_configured`),
 | `POST /github/link` | `{flow:'web'}` (400 without a client secret) | `{url}` — send the browser there |
 | `POST /github/link/:flow_id/poll` | — | `{status:'pending', interval?}` \| `{status:'linked', github}` \| `{status:'denied'\|'expired'}`; 404 unknown/finished/another user's; 409 if the GitHub account is linked to another user; 502 `upstream` if GitHub is unreachable |
 | `GET /github/callback?code&state` | no Bearer; `state` is the single-use flow credential | 302 to `/account?linked=1` or `/account?link_error=<expired\|bad_request\|conflict\|upstream\|not_configured>` |
-| `POST /github/refresh` | — | `{github}`; marks the link `stale` on 401/403 from GitHub; 502 `upstream` if unreachable (nothing changes) |
+| `POST /github/refresh` | — | `{github}`; marks the link `stale` on 401/403 from GitHub; 502 `upstream` if unreachable (nothing changes); 404 if this user has no linked account |
 | `DELETE /github/link` | — | `{ok:true}`; 404 if not linked |
 | `GET /me` | — | `{user:{id,name}, github: {host, login, orgs, state, checked_at, linked_at} \| null, github_linking:{enabled, web_flow}}` |
 | `GET /lookup?user=<name>&num=<n>` | also `GET /u/<name>/<n>` with `Accept: application/json` | `{kind:'item'\|'mission'\|'milestone', id, owner:{user_id,name}}`; 404 unknown or invisible |

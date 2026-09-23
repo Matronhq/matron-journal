@@ -41,10 +41,10 @@ docs/protocol.md in the matron-journal repo ("Journal search" for the index).
 - \`GET /items?scope=shared\` and \`GET /missions?scope=shared\` — a
   colleague's items and missions you may read: filed from a conversation
   whose repo belongs to a GitHub org both of you are verified members of
-  (see "Shared visibility" in docs/protocol.md). Rows carry \`owner\` and
-  \`repo\`. \`GET /items/:id\` / \`GET /missions/:id\` read one such row;
-  every write to it is 403. \`GET /milestones?convo=<id>\` works on a
-  shared conversation.
+  (see "Shared visibility" in docs/protocol.md). Rows carry \`owner\`;
+  item rows also carry \`repo\`. \`GET /items/:id\` / \`GET /missions/:id\`
+  read one such row; every write to it is 403. \`GET /milestones?convo=<id>\`
+  works on a shared conversation.
 - \`GET /lookup?user=<name>&num=<n>\` — resolves a shareable link
   (\`https://<journal>/u/<name>/<n>\`) to \`{kind, id, owner}\`; 404 when
   unknown or not visible to you. \`GET /me\` — who you are and your
