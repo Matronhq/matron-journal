@@ -571,6 +571,53 @@ export function openDb(path) {
       console.log(`device_status: dropped ${orphans} report(s) whose device was already revoked`)
     }
   }
+  // Repo identity (spec 2026-09-23 tracker web/teams). `repo` is the
+  // bridge-reported canonical `host/org/name`; `repo_scope` is the derived
+  // `host/org`, the unit visibility is decided on. Both NULL for every row
+  // predating the column and every conversation with no git remote.
+  const repoCols = db.prepare('PRAGMA table_info(conversations)').all()
+  if (!repoCols.some((c) => c.name === 'repo')) {
+    db.exec('ALTER TABLE conversations ADD COLUMN repo TEXT')
+  }
+  if (!repoCols.some((c) => c.name === 'repo_scope')) {
+    db.exec('ALTER TABLE conversations ADD COLUMN repo_scope TEXT')
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_conversations_repo_scope ON conversations(repo_scope)')
+  // GitHub account linking. One GitHub identity per journal user and one
+  // journal user per GitHub identity (the unique index). `token` is the
+  // user's read:org OAuth token, stored as-is (spec: "Token at rest").
+  // `state='stale'` = GitHub refused the token on the last refresh; the
+  // orgs rows stay but confer nothing until the user re-links.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS github_accounts(
+      user_id    INTEGER PRIMARY KEY REFERENCES users(id),
+      host       TEXT NOT NULL DEFAULT 'github.com',
+      github_id  INTEGER NOT NULL,
+      login      TEXT NOT NULL,
+      token      TEXT NOT NULL,
+      state      TEXT NOT NULL CHECK(state IN ('ok','stale')),
+      checked_at INTEGER,
+      linked_at  INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_github_accounts_id ON github_accounts(host, github_id);
+    CREATE TABLE IF NOT EXISTS github_orgs(
+      user_id INTEGER NOT NULL REFERENCES github_accounts(user_id) ON DELETE CASCADE,
+      scope   TEXT NOT NULL,
+      PRIMARY KEY(user_id, scope)
+    );
+    CREATE INDEX IF NOT EXISTS idx_github_orgs_scope ON github_orgs(scope);
+    CREATE TABLE IF NOT EXISTS github_link_flows(
+      id          TEXT PRIMARY KEY,
+      user_id     INTEGER NOT NULL REFERENCES users(id),
+      device_id   INTEGER NOT NULL,
+      flow        TEXT NOT NULL CHECK(flow IN ('device','web')),
+      device_code TEXT,
+      state       TEXT,
+      expires_at  INTEGER NOT NULL,
+      created_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_github_link_flows_state ON github_link_flows(state);
+  `)
   // One-time title cleanup (spec: agent box rename). Gated on user_version
   // inside, so this is a cheap pragma read on every subsequent open.
   healBakedTitles(db, { log: (m) => console.log(m) })

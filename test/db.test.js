@@ -559,3 +559,19 @@ test('old-schema device_status (no cascade) is rebuilt in place: live rows kept,
 
   assert.doesNotThrow(() => openDb(dbPath).close())
 })
+
+test('schema: repo columns and github tables exist', () => {
+  const db = openDb(':memory:')
+  const cols = (t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name)
+  assert.ok(cols('conversations').includes('repo'))
+  assert.ok(cols('conversations').includes('repo_scope'))
+  assert.deepEqual(cols('github_accounts'), ['user_id', 'host', 'github_id', 'login', 'token', 'state', 'checked_at', 'linked_at'])
+  assert.deepEqual(cols('github_orgs'), ['user_id', 'scope'])
+  assert.deepEqual(cols('github_link_flows'), ['id', 'user_id', 'device_id', 'flow', 'device_code', 'state', 'expires_at', 'created_at'])
+  db.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+  db.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(2,'pat','x',0)").run()
+  const ins = db.prepare("INSERT INTO github_accounts(user_id, host, github_id, login, token, state, linked_at) VALUES(?, 'github.com', 7, 'dan', 't', 'ok', 0)")
+  ins.run(1)
+  assert.throws(() => ins.run(2), /UNIQUE/, 'one GitHub account binds to one user')
+  db.close()
+})
