@@ -54,6 +54,15 @@ test('canReadConvo: a stale link on either side ends sharing (review focus 1)', 
   db.close(); db2.close()
 })
 
+test('canReadConvo: private device revoked → not shared (fails closed)', async () => {
+  const { db, dan, pat } = await world()
+  assert.equal(canReadConvo(db, pat.id, 'org'), true, 'shared before revoke')
+  const { agent_device_id: deviceId } = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get('org')
+  db.prepare('DELETE FROM devices WHERE id=?').run(deviceId)
+  assert.equal(canReadConvo(db, pat.id, 'org'), false, 'revoked device fails closed, not open')
+  db.close()
+})
+
 test('sharedConvoSql: usable inside a query with @viewer', async () => {
   const { db, pat } = await world()
   const ids = db.prepare(`SELECT c.id FROM conversations c WHERE ${sharedConvoSql('c')} ORDER BY c.id`).all({ viewer: pat.id }).map((r) => r.id)

@@ -94,6 +94,11 @@ function countsSql(excludePrivateOwned) {
 const ORIGIN_SIEVE = `NOT EXISTS (SELECT 1 FROM conversations cv JOIN devices d ON d.id = cv.agent_device_id
   WHERE cv.id = m.origin_convo_id AND d.private = 1)`
 
+// Cross-user variant of ORIGIN_SIEVE: fails closed when the origin
+// conversation's device row is gone (revoked), matching sharedConvoSql.
+const ORIGIN_SHARED_SIEVE = `EXISTS (SELECT 1 FROM conversations cv LEFT JOIN devices d ON d.id = cv.agent_device_id
+  WHERE cv.id = m.origin_convo_id AND (cv.agent_device_id IS NULL OR d.private = 0))`
+
 export function getMission(db, userId, idOrNum, { excludePrivateOwned = false } = {}) {
   const counts = countsSql(excludePrivateOwned)
   const sieve = excludePrivateOwned ? `AND ${ORIGIN_SIEVE}` : ''
@@ -330,14 +335,16 @@ export function listMilestones(db, userId, { convoId, excludePrivateOwned = fals
 }
 
 // Cross-user reads (spec 2026-09-23 tracker web/teams). A mission is shared
-// with @viewer when its origin conversation is not private-owned (ORIGIN_SIEVE
-// — otherwise a colleague who later joins a shared public conversation to a
-// private-born mission would see its title/body, review round 2, Finding 2)
+// with @viewer when its origin conversation is not private-owned
+// (ORIGIN_SHARED_SIEVE — otherwise a colleague who later joins a shared
+// public conversation to a private-born mission would see its title/body,
+// review round 2, Finding 2; it fails closed on a revoked device, unlike
+// ORIGIN_SIEVE, which the owner's own private-owned filtering still uses)
 // AND its origin conversation, or any conversation carrying its mission_id,
 // passes the shared rule; its detail lists only those conversations'
 // milestones and items.
 const MISSION_SHARED = `(
-  ${ORIGIN_SIEVE}
+  ${ORIGIN_SHARED_SIEVE}
   AND (
     EXISTS (SELECT 1 FROM conversations cv WHERE cv.id = m.origin_convo_id AND ${sharedConvoSql('cv')})
     OR EXISTS (SELECT 1 FROM conversations cv WHERE cv.mission_id = m.id AND ${sharedConvoSql('cv')})

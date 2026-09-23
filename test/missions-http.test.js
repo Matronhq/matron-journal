@@ -754,6 +754,22 @@ test('missions scope=shared and foreign detail follow the conversation rule; wri
   assert.equal((await s.http('/milestones?convo=c1', { token: patClient })).status, 404)
 })
 
+test('a shared mission goes 404 on foreign detail and drops from scope=shared once its origin device is revoked', async (t) => {
+  const { s, dan, pat, agent, client } = await fleet(t)
+  const link = (u, gid) => saveGithubIdentity(s.db, { userId: u.id, host: 'github.com', identity: { github_id: gid, login: u.name, scopes: ['github.com/matronhq'] }, token: `t${gid}`, now: 1 })
+  link(dan, 1); link(pat, 2)
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id, agentDeviceId: agent.deviceId, repo: 'github.com/matronhq/journal' })
+  const patClient = (await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'mac' } })).json.token
+  const m = await s.http('/missions', { method: 'POST', token: agent.token, body: { convo_id: 'c1', title: 'Shared mission', body: 'goal' } })
+  assert.equal(m.status, 201)
+  assert.equal((await s.http(`/missions/${m.json.mission.id}`, { token: patClient })).status, 200, 'shared before revoke')
+  assert.equal((await s.http('/missions?scope=shared', { token: patClient })).json.missions.length, 1)
+  s.db.prepare('DELETE FROM devices WHERE id=?').run(agent.deviceId)
+  assert.equal((await s.http(`/missions/${m.json.mission.id}`, { token: patClient })).status, 404, 'origin device revoked: fails closed')
+  assert.equal((await s.http('/missions?scope=shared', { token: patClient })).json.missions.length, 0)
+  assert.equal((await s.http(`/missions/${m.json.mission.id}`, { token: client })).status, 200, 'owner unaffected')
+})
+
 test('shared mission counts and last_milestone follow the shared rule per-conversation, not just device privacy: a joined convo pat cannot read is invisible in counts', async (t) => {
   const { s, dan, pat, agent } = await fleet(t)
   const link = (u, gid) => saveGithubIdentity(s.db, { userId: u.id, host: 'github.com', identity: { github_id: gid, login: u.name, scopes: ['github.com/matronhq'] }, token: `t${gid}`, now: 1 })
