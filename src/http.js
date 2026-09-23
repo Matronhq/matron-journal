@@ -15,6 +15,7 @@ import { closeChatConsentItem } from './consent-items.js'
 import { wakeIfOffline, isWakeableBoxName } from './wake.js'
 import { handleItemsRoute } from './items-http.js'
 import { handleMissionsRoute } from './missions-http.js'
+import { handleCoordinatorRoute } from './coordinator-http.js'
 import { json, readBody } from './http-body.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
@@ -243,6 +244,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       // outer try/catch so readBody's 400/413 map like every other route's.
       if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription }, req, res, url, who)) return
       if (await handleMissionsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
+      if (await handleCoordinatorRoute({ db, hub }, req, res, url, who)) return
       if (req.method === 'GET' && url.pathname === '/help') {
         // API discovery for agent callers (see src/help.js). Behind auth like
         // the rest of the device surface: it describes the API, and the
