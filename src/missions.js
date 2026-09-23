@@ -121,7 +121,7 @@ function attachConversation(db, userId, convoId, missionId, ts) {
   repointItems(db, userId, convoId, missionId, ts)
 }
 
-export function createMission(db, { userId, deviceId, createdBy, convoId, title, body = '', idemKey = null, excludePrivateOwned = false }) {
+export function createMission(db, { userId, deviceId, createdBy, convoId, title, body = '', idemKey = null, excludePrivateOwned = false, attach = true }) {
   return db.transaction(() => {
     if (idemKey) {
       const dup = db.prepare('SELECT id FROM missions WHERE user_id=? AND idem_key=?').get(userId, idemKey)
@@ -129,7 +129,11 @@ export function createMission(db, { userId, deviceId, createdBy, convoId, title,
     }
     const convo = db.prepare('SELECT mission_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)
     if (!convo) throw new Error('no_convo')
-    if (convo.mission_id) return { mission: getMission(db, userId, convo.mission_id, { excludePrivateOwned }), duplicate: false, existing: true }
+    // attach:false (spec 2026-09-23 coordinator redesign §1b) creates an
+    // UNASSIGNED mission: the conversation is only its provenance
+    // (origin_convo_id), so whether it already belongs to a mission is
+    // irrelevant — no short-circuit, and nothing below attaches it.
+    if (attach && convo.mission_id) return { mission: getMission(db, userId, convo.mission_id, { excludePrivateOwned }), duplicate: false, existing: true }
     const id = newId('ms')
     const num = nextNum(db, userId)
     const ts = now()
@@ -143,7 +147,7 @@ export function createMission(db, { userId, deviceId, createdBy, convoId, title,
       }
       throw err
     }
-    attachConversation(db, userId, convoId, id, ts)
+    if (attach) attachConversation(db, userId, convoId, id, ts)
     return { mission: getMission(db, userId, id, { excludePrivateOwned }), duplicate: false, existing: false }
   })()
 }
