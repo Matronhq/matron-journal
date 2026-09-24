@@ -509,6 +509,8 @@ test('openDb adds agent_spawn_requests.link defaulting to 1 for pre-existing row
   const cols = db.prepare('PRAGMA table_info(agent_spawn_requests)').all().map((c) => c.name)
   assert.ok(cols.includes('link'), 'link column missing after migration')
   assert.ok(cols.includes('child_short'), 'child_short column missing after migration')
+  assert.ok(cols.includes('mission_num'), 'mission_num column missing after migration')
+  assert.equal(db.prepare('SELECT mission_num FROM agent_spawn_requests WHERE id=?').get('old').mission_num, null)
   assert.equal(db.prepare('SELECT link FROM agent_spawn_requests WHERE id=?').get('old').link, 1)
   db.close()
   assert.doesNotThrow(() => openDb(dbPath).close())

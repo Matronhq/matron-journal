@@ -117,12 +117,18 @@ same mission is a 200 no-op, a repeat close is 409 \`already_closed\`). The
 mutating routes append a \`mission\` or \`milestone\` marker event you cannot
 \`publish\` yourself.
 
-- \`POST /missions\` \`{title, body?, convo_id}\` → 201 \`{mission}\`
+- \`POST /missions\` \`{title, body?, convo_id, attach?}\` → 201 \`{mission}\`
   with the next \`#num\`; 200 \`{mission, existing: true}\` if that
   conversation already has one (nothing changes), or 404 if that existing
   mission is one you cannot see — same 404 as an unknown conversation, never
   an existence oracle. Attaches the conversation and repoints its unassigned
-  items.
+  items. With \`attach: false\` it creates a NEW, unassigned mission whose
+  origin is that conversation but touches neither the conversation nor its
+  items (no \`existing\` short-circuit). \`POST /missions/create\` is the
+  same route.
+- \`GET /coordinator\` → \`{convo_id}\` — the user's Coordinator
+  conversation, or null. Only the user sets it; you hear a change as a
+  \`coordinator\` event \`{role: 'assigned'|'released'}\` in the conversation.
 - \`GET /missions?state=open|closed&since=<ms>\` → \`{missions}\` with
   per-row \`open_items\`, \`needs_you\`, \`conversations\`,
   \`milestones\`, \`last_milestone\`; most recent activity first.

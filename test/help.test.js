@@ -34,7 +34,9 @@ test('GET /help serves the API digest to authenticated devices only', async (t) 
   for (const route of [
     'POST /missions', 'GET /missions?state=', 'GET /missions/:id', 'PATCH /missions/:id',
     'POST /missions/:id/join', 'POST /missions/:id/close', 'POST /milestones', 'GET /milestones?convo=',
+    'GET /coordinator',
   ]) assert.ok(body.includes(route), `/help must name ${route}`)
+  assert.match(body, /attach: false/)
   for (const field of ['mission_id', 'mission_num', 'mission: id|"#num"|null']) {
     assert.ok(body.includes(field), `/help must name ${field}`)
   }

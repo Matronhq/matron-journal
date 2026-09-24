@@ -19,7 +19,7 @@
         "token": { "$bind": "dan_token" }, "device_id": { "$type": "integer" }, "user_id": { "$ref": "dan.user_id" }
       } } },
     { "kind": "http", "method": "GET", "path": "/snapshot", "token": { "$ref": "dan_token" },
-      "expect": { "status": 200, "body": {
+      "expect": { "status": 200, "body": { "coordinator_convo_id": null,
         "seq": 2,
         "agents": [],
         "conversations": [

@@ -72,6 +72,9 @@ async function handleCreate(ctx, req, res, who) {
   const body = await readBody(req)
   const v = validateMissionFields(body)
   if (!v.ok) return badRequest(res)
+  // Optional, default true (today's behaviour). Anything but a boolean is a
+  // bad ask, never coerced — `"false"` must not quietly attach.
+  if (body.attach !== undefined && typeof body.attach !== 'boolean') return badRequest(res)
   const idemKey = idemKeyOf(req, who)
   if (idemKey === undefined) return badRequest(res)
   if (!writableConvo(db, who, body.convo_id)) return notFound(res)
@@ -79,7 +82,8 @@ async function handleCreate(ctx, req, res, who) {
   try {
     out = createMission(db, {
       userId: who.userId, deviceId: who.deviceId, createdBy: byOf(who), convoId: body.convo_id,
-      title: v.value.title, body: v.value.body ?? '', idemKey, excludePrivateOwned: filteredAgent(db, who),
+      title: v.value.title, body: v.value.body ?? '', idemKey, attach: body.attach !== false,
+      excludePrivateOwned: filteredAgent(db, who),
     })
   } catch (err) {
     // TOCTOU: writableConvo just confirmed the convo, but it can vanish
@@ -277,6 +281,12 @@ export async function handleMissionsRoute(ctx, req, res, url, who) {
     if (req.method === 'GET') return handleMilestoneList(ctx, res, url, who)
     return false
   }
+  // The cross-repo contract (coordinator redesign) names the create route
+  // POST /missions/create; the real one is POST /missions. Same handler.
+  // No mission id is ever 'create' (ids are ms_… or numbers), so this can
+  // never shadow a /missions/:id lookup. Any other method falls through to
+  // the ordinary 404.
+  if (path === '/missions/create') return req.method === 'POST' ? handleCreate(ctx, req, res, who) : false
   if (path !== '/missions' && !path.startsWith('/missions/')) return false
   if (path === '/missions') {
     if (req.method === 'POST') return handleCreate(ctx, req, res, who)
