@@ -1821,7 +1821,7 @@ App id once one is registered — not configured in this release),
 | `POST /github/link` | `{flow:'web'}` (400 without a client secret) | `{url}` — send the browser there |
 | `POST /github/link/:flow_id/poll` | — | `{status:'pending', interval?}` \| `{status:'linked', github}` \| `{status:'denied'\|'expired'}`; 404 unknown/finished/another user's; 409 if the GitHub account is linked to another user; 502 `upstream` if GitHub is unreachable |
 | `GET /github/callback?code&state` | no Bearer; `state` is the single-use flow credential | **200 HTML confirm page** naming the GitHub login and the journal user, with the token parked on a `github_link_confirms` row (10 min, single-use nonce) — nothing is linked yet; or 302 to `/app/account?link_error=<expired\|bad_request\|conflict\|upstream\|not_configured>` |
-| `POST /github/callback/confirm` | no Bearer; form or JSON `{nonce, decision:'link'\|'cancel'}` — the nonce is the credential | 302 to `/app/account?linked=1` (linked) or `/account?link_error=<denied\|expired\|bad_request\|conflict\|not_configured>`; the parked token is deleted either way |
+| `POST /github/callback/confirm` | no Bearer; form or JSON `{nonce, decision:'link'\|'cancel'}` — the nonce is the credential | 302 to `/app/account?linked=1` (linked) or `/app/account?link_error=<denied\|expired\|bad_request\|conflict\|not_configured>`; the parked token is deleted either way |
 | `POST /github/refresh` | — | `{github}`; marks the link `stale` on 401/403 from GitHub; 502 `upstream` if unreachable (nothing changes); 404 if this user has no linked account |
 | `DELETE /github/link` | — | `{ok:true}`; 404 if not linked |
 | `GET /me` | — | `{user:{id,name,is_admin}, github: {…} \| null, github_linking:{enabled, web_flow}}` |
@@ -1844,7 +1844,9 @@ them.
 The token is never returned by any route and never logged. With
 `MATRON_TOKEN_KEY` set (64 hex characters — `openssl rand -hex 32`) it is
 stored sealed with AES-256-GCM (`enc1:` prefix); a journal that gains the
-key seals its existing rows at the next start. Unset, it is stored as-is.
+key seals its existing rows at the next start (with `secure_delete` on, so
+the freed plaintext cells are zeroed, followed by a `TRUNCATE` checkpoint so
+no WAL frame still carries them). Unset, it is stored as-is.
 The refresh path recognises its own row by `token_hash` (SHA-256 of the
 plaintext), so sealing changes no behaviour. Starting without the key after
 rows were sealed marks nothing stale: refreshes answer `502 upstream`, the

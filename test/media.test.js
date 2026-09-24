@@ -371,10 +371,11 @@ test('media: a client that aborts mid-download never leaks the read stream or we
   t.after(() => s.close())
   const token = await loginToken(s, 'dan', 'pw')
 
+  const FULL = 8 * 1024 * 1024
   const up = await fetch(s.base + '/media', {
     method: 'POST',
     headers: { authorization: `Bearer ${token}` },
-    body: crypto.randomBytes(8 * 1024 * 1024),
+    body: crypto.randomBytes(FULL),
   })
   assert.equal(up.status, 200)
   const { media_id } = await up.json()
@@ -383,16 +384,35 @@ test('media: a client that aborts mid-download never leaks the read stream or we
   // over a raw socket (no keep-alive), then destroy the connection mid-body
   // — .pipe() alone leaves the read stream (and its fd) open because it
   // never forwards a destination error/close back to the source.
+  // Resolves only when a response chunk arrived and the response then closed
+  // short of the full body; anything else (no chunk, whole body, stall) rejects
+  // so the loop cannot pass without exercising the abort path.
   function abortMidBody() {
     return new Promise((resolve, reject) => {
-      const req = http.request(s.base + `/media/${media_id}`, {
+      let gotChunk = false
+      let received = 0
+      let req
+      const timer = setTimeout(() => { req.destroy(); reject(new Error('abort request stalled for 5s')) }, 5000)
+      req = http.request(s.base + `/media/${media_id}`, {
         method: 'GET', agent: false, headers: { authorization: `Bearer ${token}`, connection: 'close' },
       }, (res) => {
-        res.once('data', () => { req.destroy() })
-        res.on('error', () => {})
+        res.on('data', (chunk) => {
+          received += chunk.length
+          if (!gotChunk) { gotChunk = true; req.destroy() }
+        })
+        res.on('error', () => {}) // expected after destroy; 'close' decides the outcome
+        res.on('close', () => {
+          clearTimeout(timer)
+          if (!gotChunk) return reject(new Error('response closed before any chunk arrived'))
+          if (received >= FULL) return reject(new Error(`full body (${received} bytes) arrived; the abort did not cut the transfer`))
+          resolve()
+        })
       })
-      req.on('error', () => resolve())
-      req.on('close', resolve)
+      req.on('error', () => {}) // ECONNRESET/aborted after destroy is the expected path
+      req.on('close', () => {
+        clearTimeout(timer)
+        if (!gotChunk) reject(new Error('request closed before any response chunk arrived'))
+      })
       req.end()
     })
   }
@@ -408,7 +428,7 @@ test('media: a client that aborts mid-download never leaks the read stream or we
   const health = await fetch(s.base + `/media/${media_id}`, { headers: { authorization: `Bearer ${token}` } })
   assert.equal(health.status, 200)
   const buf = Buffer.from(await health.arrayBuffer())
-  assert.equal(buf.length, 8 * 1024 * 1024)
+  assert.equal(buf.length, FULL)
 
   if (fdsBefore !== null) {
     await new Promise((r) => setTimeout(r, 200)) // let already-destroyed handles finish unwinding

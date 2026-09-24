@@ -131,6 +131,25 @@ export function takeLinkConfirm(db, { nonce, now = Date.now(), box = PLAIN_BOX }
 // configured, and backfill token_hash for rows written before the column
 // existed. Idempotent; a key-less journal only backfills hashes.
 export function sealStoredTokens(db, box) {
+  // The plaintext must not linger on disk after sealing. secure_delete zeroes
+  // the cells the UPDATEs free instead of leaving the old bytes in the page,
+  // and a TRUNCATE checkpoint folds every WAL frame — including the ones that
+  // carried the original plaintext INSERTs — into the main file and empties
+  // the WAL. Both are no-ops on a :memory: database. Blocks freed at the
+  // filesystem level are outside SQLite's reach; that is the disk's job.
+  const prevSecureDelete = db.pragma('secure_delete', { simple: true })
+  db.pragma('secure_delete = ON')
+  let out
+  try {
+    out = sealInTransaction(db, box)
+  } finally {
+    db.pragma(`secure_delete = ${prevSecureDelete ? 'ON' : 'OFF'}`)
+  }
+  if (out.sealed > 0) db.pragma('wal_checkpoint(TRUNCATE)')
+  return out
+}
+
+function sealInTransaction(db, box) {
   return db.transaction(() => {
     const out = { sealed: 0, hashed: 0, unreadable: 0 }
     for (const r of db.prepare('SELECT user_id, token, token_hash FROM github_accounts').all()) {

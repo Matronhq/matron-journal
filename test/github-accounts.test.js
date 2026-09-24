@@ -1,5 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { openDb } from '../src/db.js'
 import { createUser } from '../src/auth.js'
 import {
@@ -90,6 +93,37 @@ test('sealed storage: save writes enc1 + token_hash; guards match on the hash; c
   db2.prepare("INSERT INTO github_accounts(user_id, host, github_id, login, token, state, checked_at, linked_at) VALUES(?,?,?,?,?,'ok',1,1)").run(sam.id, 'github.com', 3, 'sam', 'gho_sam')
   assert.deepEqual(sealStoredTokens(db2, PLAIN_BOX), { sealed: 0, hashed: 1, unreadable: 0 })
   assert.deepEqual(db2.prepare('SELECT token, token_hash FROM github_accounts').get(), { token: 'gho_sam', token_hash: tokenHash('gho_sam') })
+})
+
+test('sealStoredTokens: on a file-backed db the legacy plaintext is gone from the main file and the WAL, right after sealing and after close', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-seal-'))
+  const dbPath = path.join(dir, 'journal.db')
+  const db = openDb(dbPath)
+  const pat = await createUser(db, 'pat', 'pw')
+  const box = makeTokenBox('cc'.repeat(32))
+  const legacy = 'gho_LEGACYPLAINTEXTMARKER' + 'z'.repeat(20)
+  const parked = 'gho_PARKEDPLAINTEXTMARKER' + 'y'.repeat(20)
+  const onDisk = () => Buffer.concat([dbPath, dbPath + '-wal'].filter((f) => fs.existsSync(f)).map((f) => fs.readFileSync(f)))
+  // One row already checkpointed into the main file, one still only in the WAL:
+  // both places a pre-encryption deployment can hold a plaintext token.
+  db.prepare("INSERT INTO github_accounts(user_id, host, github_id, login, token, state, checked_at, linked_at) VALUES(?,?,?,?,?,'ok',1,1)").run(pat.id, 'github.com', 2, 'pat', legacy)
+  db.pragma('wal_checkpoint(TRUNCATE)')
+  db.prepare('INSERT INTO github_link_confirms(id, user_id, nonce, token, identity_json, expires_at, created_at) VALUES(?,?,?,?,?,?,?)').run('gc_x', pat.id, 'ff'.repeat(16), parked, '{}', 9e15, 1)
+  assert.ok(fs.readFileSync(dbPath).includes(legacy), 'precondition: legacy token sits in the main file')
+  assert.ok(fs.readFileSync(dbPath + '-wal').includes(parked), 'precondition: parked token sits in the WAL')
+
+  assert.deepEqual(sealStoredTokens(db, box), { sealed: 2, hashed: 1, unreadable: 0 })
+  let bytes = onDisk()
+  assert.ok(!bytes.includes(legacy), 'legacy plaintext must not survive sealing on disk')
+  assert.ok(!bytes.includes(parked), 'parked plaintext must not survive sealing on disk')
+  db.close()
+  bytes = onDisk()
+  assert.ok(!bytes.includes(legacy) && !bytes.includes(parked), 'still absent after close (final checkpoint)')
+  const db2 = openDb(dbPath)
+  assert.equal(box.open(db2.prepare('SELECT token FROM github_accounts WHERE user_id=?').get(pat.id).token), legacy, 'sealed value still opens')
+  assert.equal(box.open(db2.prepare("SELECT token FROM github_link_confirms WHERE id='gc_x'").get().token), parked)
+  db2.close()
+  fs.rmSync(dir, { recursive: true, force: true })
 })
 
 test('sealed storage: a token sealed under a key this box does not hold is counted unreadable, not resealed', async () => {
