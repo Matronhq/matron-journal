@@ -701,7 +701,7 @@ test('well-known: one platform configured leaves the other 404; malformed values
   assert.deepEqual(parseList(undefined), [])
   assert.throws(() => makeWellKnown({ appleAppIds: ['not-an-app-id'] }), /MATRON_APPLE_APP_IDS/)
   assert.throws(() => makeWellKnown({ androidPackage: 'be.yearbooks.matron' }), /MATRON_ANDROID_CERT_SHA256/)
-  assert.throws(() => makeWellKnown({ androidCertSha256: ['AA:BB'] }), /MATRON_ANDROID_PACKAGE/)
+  assert.throws(() => makeWellKnown({ androidCertSha256: ['aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99'] }), /MATRON_ANDROID_PACKAGE/)
   assert.throws(() => makeWellKnown({ androidPackage: 'be.yearbooks.matron', androidCertSha256: ['AA:BB'] }), /MATRON_ANDROID_CERT_SHA256/)
   assert.throws(() => makeWellKnown({ androidPackage: 'bad package', androidCertSha256: ['aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99'] }), /MATRON_ANDROID_PACKAGE/)
 })
