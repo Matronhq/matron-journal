@@ -27,6 +27,13 @@ export function isAdmin(db, who) {
   return !!(row && row.is_admin)
 }
 
+// Authorisation is checked again after the body await: a demotion or a
+// device revocation that lands while a slow body is still uploading must
+// not complete a mutation that started with admin rights.
+function stillAdmin(db, who) {
+  return !!db.prepare('SELECT 1 FROM devices WHERE id=?').get(who.deviceId) && isAdmin(db, who)
+}
+
 const USER_SQL = `SELECT u.id, u.name, u.is_admin, u.created_at,
     ga.login AS github_login, ga.state AS github_state, ga.host AS github_host
   FROM users u LEFT JOIN github_accounts ga ON ga.user_id = u.id`
@@ -48,11 +55,18 @@ export async function handleUsersRoute(ctx, req, res, url, who) {
   }
   if (path === '/users' && req.method === 'POST') {
     const { name, password, is_admin = false } = await readBody(req)
+    if (!stillAdmin(db, who)) return forbidden(res)
     if (typeof name !== 'string' || !USERNAME_RE.test(name)) return badRequest(res)
     if (typeof is_admin !== 'boolean') return badRequest(res)
     if (typeof password !== 'string' || password.length < PASSWORD_MIN) return weakPassword(res)
     if (db.prepare('SELECT 1 FROM users WHERE name=?').get(name)) return conflict(res)
-    const u = await createUser(db, name, password)
+    let u
+    try {
+      u = await createUser(db, name, password)
+    } catch (err) {
+      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') return conflict(res)
+      throw err
+    }
     if (is_admin) db.prepare('UPDATE users SET is_admin=1 WHERE id=?').run(u.id)
     json(res, 201, { user: shape(userRow(db, u.id)) })
     return true
@@ -66,21 +80,27 @@ export async function handleUsersRoute(ctx, req, res, url, who) {
 
   if (!sub && req.method === 'PATCH') {
     const { is_admin } = await readBody(req)
+    if (!stillAdmin(db, who)) return forbidden(res)
+    const fresh = userRow(db, target.id); if (!fresh) return notFound(res)
     if (typeof is_admin !== 'boolean') return badRequest(res)
     // The admin surface must never become unreachable from inside the app:
     // the last admin cannot demote themselves (or be demoted).
-    if (!is_admin && target.is_admin && db.prepare('SELECT COUNT(*) AS n FROM users WHERE is_admin=1').get().n === 1) {
-      return conflict(res, { reason: 'last_admin' })
+    if (!is_admin) {
+      const r = db.prepare(`UPDATE users SET is_admin=0 WHERE id=? AND (is_admin=0 OR (SELECT COUNT(*) FROM users WHERE is_admin=1 AND id<>?) > 0)`).run(fresh.id, fresh.id)
+      if (r.changes === 0) return conflict(res, { reason: 'last_admin' })
+    } else {
+      db.prepare('UPDATE users SET is_admin=1 WHERE id=?').run(fresh.id)
     }
-    db.prepare('UPDATE users SET is_admin=? WHERE id=?').run(is_admin ? 1 : 0, target.id)
-    json(res, 200, { user: shape(userRow(db, target.id)) })
+    json(res, 200, { user: shape(userRow(db, fresh.id)) })
     return true
   }
   if (sub === 'password' && req.method === 'POST') {
     const { password } = await readBody(req)
+    if (!stillAdmin(db, who)) return forbidden(res)
+    const fresh = userRow(db, target.id); if (!fresh) return notFound(res)
     if (typeof password !== 'string' || password.length < PASSWORD_MIN) return weakPassword(res)
     // Same semantics as `matron-admin user passwd`: device tokens stay valid.
-    await setPassword(db, target.name, password)
+    await setPassword(db, fresh.name, password)
     json(res, 200, { ok: true })
     return true
   }
@@ -91,10 +111,12 @@ export async function handleUsersRoute(ctx, req, res, url, who) {
   }
   if (sub === 'link-code' && req.method === 'POST') {
     const { ttl_seconds } = await readBody(req)
+    if (!stillAdmin(db, who)) return forbidden(res)
+    const fresh = userRow(db, target.id); if (!fresh) return notFound(res)
     if (ttl_seconds !== undefined && (!Number.isInteger(ttl_seconds) || ttl_seconds < TTL_MIN_S || ttl_seconds > TTL_MAX_S)) return badRequest(res)
     // The same pre-approved session POST /link/preapprove mints for the
     // CLI; the web app builds the matron://link URI from its own origin.
-    const l = links.startPreapproved(target.id, ttl_seconds !== undefined ? { ttlMs: ttl_seconds * 1000 } : {})
+    const l = links.startPreapproved(fresh.id, ttl_seconds !== undefined ? { ttlMs: ttl_seconds * 1000 } : {})
     if (!l) { json(res, 429, { error: 'rate_limited' }); return true }
     json(res, 200, { link_code: l.linkCode, expires_in: l.expiresIn })
     return true

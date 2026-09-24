@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import http from 'node:http'
 import { startTestServer } from './helpers.js'
 import { createUser, createAgent, login } from '../src/auth.js'
 import { saveGithubIdentity, githubAccountView } from '../src/github-accounts.js'
@@ -95,4 +96,62 @@ test('users admin: clearing a GitHub link and minting a link code', async (t) =>
     assert.equal((await s.http(`/users/${dan.id}/link-code`, { method: 'POST', token: rootTok, body: bad })).status, 400)
   }
   assert.equal((await s.http('/users/999/link-code', { method: 'POST', token: rootTok, body: {} })).status, 404)
+})
+
+// A slow POST /users body is a window: readBody() awaits the whole body
+// before the handler does anything else, so an admin's rights can be
+// revoked (demotion, or the device itself dropped) while bytes are still
+// arriving. The route must re-check after the await, not just before it.
+function slowPost(s, token, body, mutateMidBody) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(s.base + '/users', {
+      method: 'POST', agent: false,
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+      },
+    }, (res) => {
+      let data = ''
+      res.on('data', (c) => { data += c })
+      res.on('end', () => resolve({ status: res.statusCode, json: data ? JSON.parse(data) : null }))
+    })
+    req.on('error', reject)
+    const half = Math.floor(body.length / 2)
+    req.write(body.slice(0, half))
+    setTimeout(() => {
+      mutateMidBody()
+      req.end(body.slice(half))
+    }, 50)
+  })
+}
+
+test('users admin: a demotion during a slow body upload is honoured', async (t) => {
+  const { s, root, rootTok } = await fleet(t)
+  const body = JSON.stringify({ name: 'slowdemote', password: 'pw123456' })
+  const r = await slowPost(s, rootTok, body, () => {
+    s.db.prepare('UPDATE users SET is_admin=0 WHERE id=?').run(root.id)
+  })
+  assert.equal(r.status, 403)
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM users WHERE name=?').get('slowdemote').n, 0)
+})
+
+test('users admin: a device revocation during a slow body upload is honoured', async (t) => {
+  const { s, root, rootTok } = await fleet(t)
+  const before = s.db.prepare('SELECT COUNT(*) AS n FROM users').get().n
+  const deviceId = s.db.prepare("SELECT id FROM devices WHERE user_id=? AND kind='client'").get(root.id).id
+  const body = JSON.stringify({ name: 'slowrevoke', password: 'pw123456' })
+  const r = await slowPost(s, rootTok, body, () => {
+    s.db.prepare('DELETE FROM devices WHERE id=?').run(deviceId)
+  })
+  assert.ok(r.status === 403 || r.status === 401, `expected 403 or 401, got ${r.status}`)
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM users').get().n, before)
+})
+
+test('users admin: concurrent creates of one name: one 201, one 409', async (t) => {
+  const { s, rootTok } = await fleet(t)
+  const post = () => s.http('/users', { method: 'POST', token: rootTok, body: { name: 'race', password: 'pw123456' } })
+  const [r1, r2] = await Promise.all([post(), post()])
+  assert.deepEqual([r1.status, r2.status].sort(), [201, 409])
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM users WHERE name=?').get('race').n, 1)
 })
