@@ -20,7 +20,12 @@ export class GithubError extends Error {
 
 const form = (obj) => new URLSearchParams(obj).toString()
 
-export function makeGithub({ clientId, clientSecret = null, host = 'github.com', fetchImpl = globalThis.fetch } = {}) {
+// Every GitHub request is bounded (timeoutMs): a connection GitHub accepts
+// but never answers would otherwise hang the poll, the callback, and —
+// worst — the daily refresh, which walks accounts one after another and is
+// what shrinks memberships and marks refused tokens stale. An abort maps
+// to 'unreachable' so every caller keeps its existing handling.
+export function makeGithub({ clientId, clientSecret = null, host = 'github.com', fetchImpl = globalThis.fetch, timeoutMs = 10000 } = {}) {
   const enabled = typeof clientId === 'string' && clientId.length > 0
   const webFlow = enabled && typeof clientSecret === 'string' && clientSecret.length > 0
   const loginBase = `https://${host}`
@@ -32,7 +37,7 @@ export function makeGithub({ clientId, clientSecret = null, host = 'github.com',
     if (token) headers.authorization = `Bearer ${token}`
     let res
     try {
-      res = await fetchImpl(url, { method, headers, body: body == null ? undefined : body })
+      res = await fetchImpl(url, { method, headers, body: body == null ? undefined : body, signal: AbortSignal.timeout(timeoutMs) })
     } catch (err) {
       throw new GithubError('unreachable', `github ${method} ${new URL(url).pathname}: ${err.message}`)
     }

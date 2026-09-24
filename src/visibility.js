@@ -3,7 +3,9 @@
 // so the items, missions, milestones and prose excerpts hanging off it —
 // when the conversation has a repo whose `host/org` scope both the viewer
 // and the owner are verified members of (an `ok` GitHub link each), and
-// the conversation's agent device is known and not private — a revoked
+// the conversation's agent device is known, belongs to the conversation's
+// owner (devices.id is a reusable rowid: a revoked id later handed to
+// another user's public box must confer nothing), and is not private — a revoked
 // device fails closed. One SQL fragment, one function; every widened route
 // uses these and nothing else, the way privacy.js is the only copy of the
 // private-device sieve.
@@ -22,7 +24,8 @@ export const sharedConvoSql = (c) => `(
               JOIN github_accounts ao ON ao.user_id = go.user_id AND ao.state = 'ok'
               WHERE go.user_id = ${c}.owner_user_id AND go.scope = ${c}.repo_scope)
   AND (${c}.agent_device_id IS NULL
-       OR EXISTS (SELECT 1 FROM devices d WHERE d.id = ${c}.agent_device_id AND d.private = 0))
+       OR EXISTS (SELECT 1 FROM devices d WHERE d.id = ${c}.agent_device_id
+                  AND d.user_id = ${c}.owner_user_id AND d.private = 0))
 )`
 
 export function canReadConvo(db, viewerUserId, convoId) {

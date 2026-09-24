@@ -96,7 +96,8 @@ const ORIGIN_SIEVE = `NOT EXISTS (SELECT 1 FROM conversations cv JOIN devices d 
 
 // Cross-user variant of ORIGIN_SIEVE: fails closed when the origin
 // conversation's device row is gone (revoked), matching sharedConvoSql.
-const ORIGIN_SHARED_SIEVE = `EXISTS (SELECT 1 FROM conversations cv LEFT JOIN devices d ON d.id = cv.agent_device_id
+const ORIGIN_SHARED_SIEVE = `EXISTS (SELECT 1 FROM conversations cv LEFT JOIN devices d
+    ON d.id = cv.agent_device_id AND d.user_id = cv.owner_user_id
   WHERE cv.id = m.origin_convo_id AND (cv.agent_device_id IS NULL OR d.private = 0))`
 
 export function getMission(db, userId, idOrNum, { excludePrivateOwned = false } = {}) {

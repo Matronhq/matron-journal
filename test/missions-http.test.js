@@ -768,6 +768,11 @@ test('a shared mission goes 404 on foreign detail and drops from scope=shared on
   assert.equal((await s.http(`/missions/${m.json.mission.id}`, { token: patClient })).status, 404, 'origin device revoked: fails closed')
   assert.equal((await s.http('/missions?scope=shared', { token: patClient })).json.missions.length, 0)
   assert.equal((await s.http(`/missions/${m.json.mission.id}`, { token: client })).status, 200, 'owner unaffected')
+  // A public box of ANOTHER user landing on the freed device id confers nothing either.
+  const reused = createAgent(s.db, pat.id, 'pat-box')
+  s.db.prepare('UPDATE devices SET id=? WHERE id=?').run(agent.deviceId, reused.deviceId)
+  assert.equal((await s.http(`/missions/${m.json.mission.id}`, { token: patClient })).status, 404, 'reused id on a foreign box: still closed')
+  assert.equal((await s.http('/missions?scope=shared', { token: patClient })).json.missions.length, 0)
 })
 
 test('shared mission counts and last_milestone follow the shared rule per-conversation, not just device privacy: a joined convo pat cannot read is invisible in counts', async (t) => {

@@ -70,3 +70,23 @@ test('sharedConvoSql: usable inside a query with @viewer', async () => {
   assert.deepEqual(sharedOrgScopes(db, pat.id), ['github.com/matronhq'])
   db.close()
 })
+
+test('canReadConvo: a revoked device id reused by another user\'s public box does not re-share the old conversation', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw'); const pat = await createUser(db, 'pat', 'pw')
+  for (const [u, gid] of [[dan, 1], [pat, 2]]) saveGithubIdentity(db, { userId: u.id, host: 'github.com', identity: { github_id: gid, login: u.name, scopes: ['github.com/matronhq'] }, token: `t${gid}`, now: 1 })
+  const priv = createAgent(db, dan.id, 'dan-private')
+  pinDevicePrivate(db, priv.deviceId, true)
+  upsertConversation(db, { id: 'org', ownerUserId: dan.id, title: 'o', agentDeviceId: priv.deviceId, repo: 'github.com/matronhq/x' })
+  assert.equal(canReadConvo(db, pat.id, 'org'), false, 'private: not shared')
+  db.prepare('DELETE FROM devices WHERE id=?').run(priv.deviceId)
+  assert.equal(canReadConvo(db, pat.id, 'org'), false, 'revoked: fails closed')
+  // SQLite may hand the freed rowid to the next device; simulate that for a
+  // public box owned by someone else.
+  const reused = createAgent(db, pat.id, 'pat-box')
+  db.prepare('UPDATE devices SET id=? WHERE id=?').run(priv.deviceId, reused.deviceId)
+  assert.equal(canReadConvo(db, pat.id, 'org'), false, 'another user\'s public box on the reused id confers nothing')
+  // The same id back on a public box of the OWNER is the documented residual case: shared.
+  db.prepare('UPDATE devices SET user_id=? WHERE id=?').run(dan.id, priv.deviceId)
+  assert.equal(canReadConvo(db, pat.id, 'org'), true)
+})
