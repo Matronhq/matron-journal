@@ -31,11 +31,19 @@ export function itemMarkerPayload({ item, action, by, comment = null, extra = nu
     by,
     awaiting: item.awaiting ?? null,
     resolution: item.resolution ?? null,
+    // Action buttons (2026-09-24 item-actions contract): every marker carries
+    // the item's current offer and the user's latest tap, so a connected app
+    // — and a hello replay — renders the buttons without refetching.
+    actions: item.actions ?? [],
+    chosen_action: item.chosen_action ?? null,
   }
   if (comment && (comment.body || (comment.attachments && comment.attachments.length))) {
     payload.comment = {
       id: comment.id,
       body: comment.body,
+      // The tapped label when the comment is an action tap, else null — what
+      // a bridge reads to word the turn as "tapped" rather than "replied".
+      action: comment.action ?? null,
       attachments: (comment.attachments || []).map((a) => ({
         blob_ref: a.blob_ref, mime: a.mime, name: a.name, size: a.size, transcript: a.transcript ?? null,
         ...(a.transcript_status ? { transcript_status: a.transcript_status } : {}),

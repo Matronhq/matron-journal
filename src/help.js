@@ -76,11 +76,11 @@ transcribing is the origin bridge's job); those 404 on refusal.
   — one ranked list per user; \`{items, next_cursor}\`, limit ≤ 500.
 - \`GET /items/:id\` — \`{item, comments}\` (comments oldest first).
 - \`POST /items\` \`{kind, title, body?, labels?, links?, attachments?,
-  awaiting?, convo_id, supersedes?, on_behalf_of?:'user', and at most one of
+  actions?, awaiting?, convo_id, supersedes?, on_behalf_of?:'user', and at most one of
   position:'top'|'bottom' / after / before}\` → 201 \`{item}\`. Send
   \`on_behalf_of:'user'\` when the USER asked for the item, so it reads as
   theirs. Optional \`Idempotency-Key\` header (replay → 200, no second marker).
-- \`PATCH /items/:id\` \`{title?, body?, labels?, links?, awaiting?,
+- \`PATCH /items/:id\` \`{title?, body?, labels?, links?, awaiting?, actions?,
   mission?: id|"#num"|null}\` → 200 \`{item}\`; \`attachments\` is 400
   (create-only in v1), moving \`awaiting\` on a closed item is 409, and a
   \`mission\` that does not exist or that you cannot see is 404 (never 403).
@@ -90,6 +90,12 @@ transcribing is the origin bridge's job); those 404 on refusal.
 - \`POST /items/:id/comments\` \`{body?, attachments?}\` (at least one) → 201
   \`{item, comment}\`. A USER comment always flips \`awaiting\` to \`agent\`
   and reopens a closed item; yours as an agent never flips it.
+- \`actions\` (create/PATCH): up to 4 one-tap answer buttons the user sees on
+  the item, e.g. \`["Go"]\` or \`["Option A","Option B"]\` — each 1–40 chars,
+  one line, unique ignoring case (else 400 \`invalid_actions\`); \`[]\` clears.
+  A tap is a user comment whose body is the label, with \`comment.action\` set
+  to it and the item's \`chosen_action\` = the latest tap (changing
+  \`actions\` clears it). Only the user taps: \`action\` on your comment is 403.
 - \`PATCH /items/:id/comments/:cid\` \`{blob_ref, transcript}\` — agent-only
   write-back after transcribing a voice-note attachment; one sent on a
   create/comment is dropped. When the journal transcribes itself, a user's

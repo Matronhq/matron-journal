@@ -552,6 +552,17 @@ export function openDb(path) {
     db.exec('ALTER TABLE items ADD COLUMN consent TEXT')
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_items_consent ON items(consent)')
+  // Item action buttons (2026-09-24 item-actions contract): `actions` is the
+  // JSON array of one-tap answer labels an agent offered, `chosen_action` the
+  // label of the user's most recent tap (NULL until one, and again whenever
+  // the offered list changes). Every pre-existing row reads as [] / NULL.
+  const itemActionCols = db.prepare('PRAGMA table_info(items)').all()
+  if (!itemActionCols.some((c) => c.name === 'actions')) {
+    db.exec("ALTER TABLE items ADD COLUMN actions TEXT NOT NULL DEFAULT '[]'")
+  }
+  if (!itemActionCols.some((c) => c.name === 'chosen_action')) {
+    db.exec('ALTER TABLE items ADD COLUMN chosen_action TEXT')
+  }
   // Standing agent-chat consent ("always allow A -> B") is gone: every ask
   // parks for the user now. Dropped rather than left in place, because a
   // table of grants that nothing consults still reads like a live security
