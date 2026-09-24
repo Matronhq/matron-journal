@@ -716,9 +716,6 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
       console.error('participants meta fan failed (the membership change itself already committed)', err)
     }
   }
-  // Agent visibility for this op's convo, resolved lazily by hub.sendEphemeral
-  // only when an agent connection is viewing it (see hub.js).
-  const resolveAgentTargets = () => agentTargetsFor(db, msg.convo_id)
   try {
     switch (msg.op) {
       case 'viewing': {
@@ -759,27 +756,25 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // awaits mid-handler, so a message dispatched to that case can
         // interleave with other work between its awaits. Scoped to the conn's
         // own user; buffersFor enforces it too.
-        if (conn.kind === 'client') {
-          for (const convoId of next) {
-            if (!convoId || prev.has(convoId)) continue
-            for (const b of toolStreams.buffersFor(conn.userId, convoId)) {
-              conn.ws.send(JSON.stringify({
-                kind: 'ephemeral', convo_id: convoId, message_ref: b.ref,
-                tool_stream: {
-                  event: 'sync', meta: b.meta, offset: b.start,
-                  content: b.content, head_truncated: b.headTruncated,
-                },
-              }))
-            }
-            // Header catch-up: replay the last cached status (same direct-send
-            // reasoning as the tool-stream syncs above) so the header populates
-            // on open instead of waiting for the next turn end.
-            const cachedStatus = statusCache.get(conn.userId, convoId)
-            if (cachedStatus) {
-              conn.ws.send(JSON.stringify({
-                kind: 'ephemeral', convo_id: convoId, status: cachedStatus,
-              }))
-            }
+        for (const convoId of next) {
+          if (!convoId || prev.has(convoId)) continue
+          for (const b of toolStreams.buffersFor(conn.userId, convoId)) {
+            conn.ws.send(JSON.stringify({
+              kind: 'ephemeral', convo_id: convoId, message_ref: b.ref,
+              tool_stream: {
+                event: 'sync', meta: b.meta, offset: b.start,
+                content: b.content, head_truncated: b.headTruncated,
+              },
+            }))
+          }
+          // Header catch-up: replay the last cached status (same direct-send
+          // reasoning as the tool-stream syncs above) so the header populates
+          // on open instead of waiting for the next turn end.
+          const cachedStatus = statusCache.get(conn.userId, convoId)
+          if (cachedStatus) {
+            conn.ws.send(JSON.stringify({
+              kind: 'ephemeral', convo_id: convoId, status: cachedStatus,
+            }))
           }
         }
         break
@@ -1713,7 +1708,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id, message_ref: msg.message_ref,
           text: msg.text, replace_text: msg.replace_text,
-        }, resolveAgentTargets)
+        }, () => agentTargetsFor(db, msg.convo_id))
         break
       }
       case 'stream_append': {
@@ -1742,7 +1737,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id, message_ref: msg.message_ref,
           tool_stream: { event: 'append', offset: r.offset, chunk: r.accepted },
-        }, resolveAgentTargets)
+        }, () => agentTargetsFor(db, msg.convo_id))
         break
       }
       case 'activity': {
@@ -1758,7 +1753,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id,
           activity: { state: msg.state, detail },
-        }, resolveAgentTargets)
+        }, () => agentTargetsFor(db, msg.convo_id))
         break
       }
       case 'box_status': {
@@ -1796,7 +1791,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         statusCache.set(conn.userId, msg.convo_id, msg.status)
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id, status: msg.status,
-        }, resolveAgentTargets)
+        }, () => agentTargetsFor(db, msg.convo_id))
         break
       }
       case 'finalize': {
