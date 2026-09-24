@@ -18,6 +18,7 @@ import { handleItemsRoute } from './items-http.js'
 import { handleMissionsRoute } from './missions-http.js'
 import { handleGithubRoute, handleGithubCallback } from './github-http.js'
 import { handleLookupRoute } from './lookup-http.js'
+import { handleUsersRoute } from './users-http.js'
 import { githubAccountView } from './github-accounts.js'
 import { json, readBody } from './http-body.js'
 
@@ -250,6 +251,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       if (await handleMissionsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
       if (await handleGithubRoute({ db, github, rateLimiter }, req, res, url, who)) return
       if (handleLookupRoute({ db }, req, res, url, who)) return
+      if (await handleUsersRoute({ db, links }, req, res, url, who)) return
       if (req.method === 'GET' && url.pathname === '/me') {
         const user = db.prepare('SELECT id, name, is_admin FROM users WHERE id=?').get(who.userId)
         return json(res, 200, {
