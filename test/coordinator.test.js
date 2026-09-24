@@ -167,3 +167,38 @@ test('hello_ok and /snapshot carry coordinator_convo_id: null until set, then th
   assert.equal((await helloOf(s, priv.token)).coordinator_convo_id, 's1')
   assert.equal((await helloOf(s, client)).coordinator_convo_id, 's1')
 })
+
+// CodeRabbit (PR #230-era finding on coordinator-http.js): the setting write
+// and the released/assigned events must commit as one transaction. Before
+// the fix, emitRole ran the event append AFTER the setting had already
+// committed, so a failing assigned append left the setting switched with no
+// assigned row — a repeat PUT of the same value is then setCoordinatorConvoId's
+// own no-op, so the new owning bridge could miss `assigned` permanently.
+// Force the SECOND events INSERT (the assigned row, since released is
+// appended first) to fail and assert nothing survives: not the setting, not
+// the released row, not the assigned row — and the response is an error.
+test('PUT /coordinator: a failing assigned append during a switch rolls back the setting and the released row too', async (t) => {
+  const { s, dan, client } = await fleet(t)
+  const first = await put(s, client, 'c1')
+  assert.equal(first.status, 200)
+  assert.equal(roleEvents(s).length, 1, 'sanity: c1 assigned recorded')
+
+  const realPrepare = s.db.prepare.bind(s.db)
+  const EVENT_INSERT = 'INSERT INTO events(user_id, seq, convo_id, ts, sender, type, payload, blob_ref, idem_key) VALUES(?,?,?,?,?,?,?,?,?)'
+  let inserts = 0
+  s.db.prepare = (sql) => (sql === EVENT_INSERT
+    ? { run: (...args) => { inserts += 1; if (inserts === 1) return realPrepare(sql).run(...args); throw new Error('disk on fire') } }
+    : realPrepare(sql))
+  const mute = t.mock.method(console, 'error', () => {}) // the catch is expected to log; keep test output clean
+  let r
+  try { r = await put(s, client, 'c2') } finally { s.db.prepare = realPrepare }
+  assert.ok(r.status >= 500, `expected an error status, got ${r.status}`)
+  assert.equal(getCoordinatorConvoId(s.db, dan.id), 'c1', 'the switch never committed — setting stays at c1')
+  assert.deepEqual(roleEvents(s), [{ convo_id: 'c1', sender: 'user:dan', role: 'assigned' }], 'no released row for c1, no assigned row for c2')
+  void mute
+
+  // Next attempt, with the disk back, still works (nothing was wedged).
+  const recovered = await put(s, client, 'c2')
+  assert.equal(recovered.status, 200)
+  assert.deepEqual(recovered.json, { convo_id: 'c2' })
+})
