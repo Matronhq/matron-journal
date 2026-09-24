@@ -167,3 +167,24 @@ test('push suppression honours every convo in the set', async (t) => {
   await barrier(client)
   assert.equal(s.hub.isViewing(dan.id, deviceId, 'vc'), false)
 })
+
+test('convo_ids + convo_id: convo_id catches up again even when already viewed; others only if new', async (t) => {
+  const { agent, client } = await setup(t)
+  for (const id of ['va', 'vb']) {
+    agent.send({ op: 'status', convo_id: id, status: { model: `m-${id}` } })
+    agent.send({ op: 'stream_append', convo_id: id, message_ref: `tu-${id}`, offset: 0, chunk: 'x', meta: { tool: 'Bash', command: 'x' } })
+  }
+  await pause(100)
+  const count = (id, pred) => client.frames.filter((f) => f.kind === 'ephemeral' && f.convo_id === id && pred(f)).length
+  const isStatus = (f) => f.status
+  const isSync = (f) => f.tool_stream?.event === 'sync'
+
+  client.send({ op: 'viewing', convo_ids: ['va', 'vb'] })
+  await barrier(client)
+  client.send({ op: 'viewing', convo_ids: ['va', 'vb'], convo_id: 'va' })
+  await barrier(client)
+  assert.equal(count('va', isStatus), 2, 'convo_id forces a resync of an already-viewed convo')
+  assert.equal(count('va', isSync), 2)
+  assert.equal(count('vb', isStatus), 1, 'vb already viewed, not named: no catch-up')
+  assert.equal(count('vb', isSync), 1)
+})

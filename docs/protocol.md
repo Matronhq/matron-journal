@@ -406,12 +406,16 @@ an agent token, selected by which query parameter is present:
     non-string / empty / oversized id, more than 4) → `bad_request` with
     `ref: 'viewing'`, and the connection's set is left unchanged. The
     catch-up (tool-stream `sync` frames + cached `status`, see below) is
-    sent only for conversations newly added to the set.
+    sent only for conversations newly added to the set — plus `convo_id`
+    when it is sent alongside `convo_ids` and is in the set, even if it was
+    already viewed. Clients send `convo_id` (the chat just opened or needing
+    a resync) with the full `convo_ids` to force its resync without
+    dropping and re-adding it.
   - Without `convo_ids`, `convo_id` (string|null) sets the set to
     `{convo_id}` or `{}` — the original single-conversation form, unchanged.
     It still sends the catch-up on every `viewing`, even for the
     conversation already viewed: clients re-send it to force a resync.
-  `convo_ids` wins when both keys are present.
+  When both keys are present, `convo_ids` defines the set.
 - Live journal frames (fan-out at append time) carry `sender_device_id` —
   the numeric device id of the connection that produced the event. Device
   names have no unique constraint, so this is the only exact own-echo test

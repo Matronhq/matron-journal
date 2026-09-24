@@ -730,15 +730,17 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // the current set untouched.
         //
         // Catch-up (below) for the set form runs only for convos newly ADDED
-        // to the set. The single form keeps its old behaviour of catching up
-        // on every send, even for the convo already viewed: shipped clients
-        // re-send `viewing` for the same convo to force a tool-stream resync.
+        // to the set, plus `convo_id` when it is sent alongside `convo_ids`
+        // (and is in the set) — even if already viewed. The single form keeps
+        // its old behaviour of catching up on every send. Both exist because
+        // clients re-send `viewing` for a convo to force a tool-stream resync.
         let next
         let prev
         if (msg.convo_ids !== undefined) {
           next = parseViewingConvoIds(msg.convo_ids)
           if (!next) return fail('bad_request', `convo_ids must be an array of at most ${VIEWING_SET_MAX} non-empty convo id strings`)
-          prev = conn.viewingConvoIds
+          prev = new Set(conn.viewingConvoIds)
+          prev.delete(msg.convo_id)
         } else {
           next = new Set(msg.convo_id == null ? [] : [msg.convo_id])
           prev = new Set()
