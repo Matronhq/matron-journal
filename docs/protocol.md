@@ -1381,9 +1381,9 @@ degrade path for clients predating the tracker, not a second timeline.
 | `GET /items` | `convo, kind, state, awaiting, label, sort=rank\|updated, since, limit≤500, cursor, scope=mine\|shared (shared: kind/state/awaiting/limit/cursor only; rows carry owner{user_id,name,github_login} and repo)` | `{items:[…], next_cursor}` |
 | `GET /items/:id` | `:id` = `it_…` or `#num` (URL-encode `#`) | `{item, comments:[…]}` |
 | `GET /items/:id` (shared) | `:id` = `it_…` of a colleague's item visible under *Shared visibility* | `{item, comments}` with `item.owner`; any other method or sub-route on it is **403 `forbidden`** |
-| `POST /items` | `{kind, title, body?, labels?, links?, attachments?, awaiting?, position?, after?, before?, convo_id, supersedes?, on_behalf_of?:'user' (agent callers only)}` + optional `Idempotency-Key`; `position` is **exclusive** of `after`/`before` (given together is 400); `after`/`before` may be given alone or together (a midpoint between the two, consistent with `/rank`; none means bottom) | 201 `{item}` (200 on replay) |
-| `PATCH /items/:id` | `{title?, body?, labels?, links?, awaiting?, mission?: id \| "#num" \| null}` — `attachments` is **400** (create-only in v1; it used to be dropped silently, which told a client its blob had landed), and a patch carrying neither a field nor `mission` is **400**. `mission` moves the item to that mission, or detaches it when `null`; it is an explicit move only, never inferred. Fields and the move are one write with one `updated_at`. | `{item}`. **404** if `mission` names a mission that does not exist **or** is invisible to the caller — the same sieve `GET /missions/:id` applies (see *Missions & milestones → Visibility*), never a 403, so a hidden mission is not an existence oracle here either. **409** only for `awaiting` on a closed item (clearing it with `null` is fine); a **closed mission is not refused** as a move target in v1 — closing a mission blocks on open items precisely so they can be moved, and a finished mission must stay correctable. |
-| `POST /items/:id/comments` | `{body?, attachments?}` (one required) + optional `Idempotency-Key` | 201 `{item, comment}` (200 on replay) |
+| `POST /items` | `{kind, title, body?, labels?, links?, attachments?, actions?, awaiting?, position?, after?, before?, convo_id, supersedes?, on_behalf_of?:'user' (agent callers only)}` + optional `Idempotency-Key`; `position` is **exclusive** of `after`/`before` (given together is 400); `after`/`before` may be given alone or together (a midpoint between the two, consistent with `/rank`; none means bottom) | 201 `{item}` (200 on replay) |
+| `PATCH /items/:id` | `{title?, body?, labels?, links?, awaiting?, actions?, mission?: id \| "#num" \| null}` — `attachments` is **400** (create-only in v1; it used to be dropped silently, which told a client its blob had landed), and a patch carrying neither a field nor `mission` is **400**. `mission` moves the item to that mission, or detaches it when `null`; it is an explicit move only, never inferred. Fields and the move are one write with one `updated_at`. | `{item}`. **404** if `mission` names a mission that does not exist **or** is invisible to the caller — the same sieve `GET /missions/:id` applies (see *Missions & milestones → Visibility*), never a 403, so a hidden mission is not an existence oracle here either. **409** only for `awaiting` on a closed item (clearing it with `null` is fine); a **closed mission is not refused** as a move target in v1 — closing a mission blocks on open items precisely so they can be moved, and a finished mission must stay correctable. |
+| `POST /items/:id/comments` | `{body?, attachments?, action?}` (body or attachments required, unless `action` is given) + optional `Idempotency-Key` | 201 `{item, comment}` (200 on replay); `action` from an agent is **403 `forbidden`**, one not among the item's current `actions` is **400 `unknown_action`** — see *Action buttons* |
 | `PATCH /items/:id/comments/:cid` | `{blob_ref, transcript}` — agent only, else 403 | `{comment}` |
 | `POST /items/:id/close` | `{resolution, comment?}` | `{item, comment}`; 409 if already closed |
 | `POST /items/:id/reopen` | `{comment?}` | `{item, comment}`; 409 if already open |
@@ -1393,7 +1393,7 @@ Item shape: `{id, user_id, num, kind, state, resolution, awaiting, rank,
 title, body, labels[], links[{url,title?}], supersedes, origin_convo_id,
 origin_device_id, created_by, created_at, updated_at, closed_at,
 comment_count, last_comment_at, attachments[], has_image, mission_id,
-mission_num, consent}`. `consent` is `'spawn'` or `'chat'` on the journal's
+mission_num, consent, actions[], chosen_action}`. `consent` is `'spawn'` or `'chat'` on the journal's
 mirror of a consent card (see *Agent-spawned sessions → Tracker item*) and
 `null` on every other item; clients may use it to embed the card. `mission_id`/`mission_num` are the mission this item belongs
 to — both `null` when it has none — set by `PATCH /items/:id {mission}` or
@@ -1407,10 +1407,36 @@ spawn and agent-chat consent cards — are invisible to every agent caller
 here is the item **body**'s attachments (set at create only, v1) — a
 comment's own attachments live on the comment. Comment shape:
 `{id, item_id, author, device_id, kind:'comment'|'status', body,
-created_at, attachments[{blob_ref,mime,name,size,transcript?,transcript_status?}], meta}`.
-`meta` is `null` for an ordinary comment and `{from:{state,
+created_at, attachments[{blob_ref,mime,name,size,transcript?,transcript_status?}], meta, action}`.
+`meta` is `null` for an ordinary comment, `{action:"<label>"}` for an action
+tap, and `{from:{state,
 resolution,awaiting}, to:{…}}` for the synthetic `status` comment a
-close/reopen writes. `idem_key` is an internal column on both and is never
+close/reopen writes. `action` is `meta.action` lifted to the top level — the
+tapped label, `null` on every other comment.
+
+**Action buttons** (2026-09-24 item-actions contract). `actions` is up to
+four one-tap answers an agent offers on an item (`["Go"]`, `["Option A",
+"Option B"]`) — `[]` when none, on every item. Set on `POST /items` or
+`PATCH /items/:id` (by anyone who may PATCH the item; `[]` clears). Each
+label is trimmed, 1–40 characters, on one line (no control characters or
+line/paragraph separators), and the list is unique case-insensitively;
+anything else — including a non-array — is **400 `{"error":"invalid_actions"}`**
+(duplicates are refused, not folded). A user taps one by posting an ordinary
+comment with `action: "<label>"`: the label must match one of the item's
+**current** `actions` exactly after trimming (checked in the comment's own
+transaction) or it is **400 `{"error":"unknown_action"}`**; an empty `body`
+becomes the label. Only a client may send `action` (an agent is **403**);
+`action: null` is the same as leaving it out. The comment stores
+`meta.action`, and the item's `chosen_action` becomes that label in the same
+write — it is always the most recent tap's label, `null` before any tap.
+Everything else is the ordinary user comment: it flips `awaiting` to
+`agent`, reopens a closed item, emits the `commented` marker (and its
+fallback text, whose prose is the label), wakes the box and pushes as any
+user comment does. A `PATCH` that changes `actions` clears `chosen_action`
+(the old tap no longer answers the new offer); re-sending the same list
+leaves it. An idempotent replay of a tap answers with the original comment
+even if the offer has changed since. Old clients ignore the new fields and
+see an action tap as a plain comment whose body is the label. `idem_key` is an internal column on both and is never
 returned (same stance as the event shape's `user_id`/`idem_key`/`blob_ref`
 strip); a comment omits `user_id` too — the caller is the owner by
 construction.
@@ -1515,8 +1541,13 @@ is unique per `(user_id, idem_key)` in the schema, not per item.
   "payload": { "item_id": "it_…", "num": 12, "kind": "question", "title": "…",
     "action": "created|commented|closed|reopened|reordered|updated", "by": "user|agent",
     "awaiting": "user|agent|null", "resolution": "…|null",
-    "comment": { "id": "ic_…", "body": "…", "attachments": [ … ] } } }
+    "actions": ["Go"], "chosen_action": "Go|null",
+    "comment": { "id": "ic_…", "body": "…", "action": "Go|null", "attachments": [ … ] } } }
 ```
+
+`actions` and `chosen_action` are the item's action buttons at the moment of
+the marker (see *Action buttons*), on every marker; `comment.action` is the
+tapped label when the comment is an action tap, else `null`.
 
 Same envelope (`seq, convo_id, ts, sender, type, payload`) as every other
 journal event. `comment` is present only when the action carried comment
