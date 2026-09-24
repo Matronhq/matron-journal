@@ -1,5 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { GithubError } from '../src/github.js'
@@ -104,22 +107,22 @@ test('web flow: the callback shows a confirm page naming the GitHub login and th
   assert.match(html, /DanBarker/); assert.match(html, /\bdan\b/)
   assert.equal((await s.http('/me', { token: danTok })).json.github, null, 'nothing is linked until the person on the page says so')
   const replay = await fetch(`${s.base}/github/callback?code=c0de&state=${state}`, { redirect: 'manual' })
-  assert.equal(replay.status, 302); assert.equal(replay.headers.get('location'), '/account?link_error=expired')
+  assert.equal(replay.status, 302); assert.equal(replay.headers.get('location'), '/app/account?link_error=expired')
   const nonce = nonceOf(html)
   const linked = await confirm(s, { nonce, decision: 'link' })
-  assert.equal(linked.status, 302); assert.equal(linked.headers.get('location'), '/account?linked=1')
+  assert.equal(linked.status, 302); assert.equal(linked.headers.get('location'), '/app/account?linked=1')
   assert.equal((await s.http('/me', { token: danTok })).json.github.login, 'DanBarker')
-  assert.equal((await confirm(s, { nonce, decision: 'link' })).headers.get('location'), '/account?link_error=expired', 'a nonce is single-use')
-  assert.equal((await confirm(s, { decision: 'link' })).headers.get('location'), '/account?link_error=bad_request')
-  assert.equal((await confirm(s, { nonce: 'ff'.repeat(16), decision: 'link' })).headers.get('location'), '/account?link_error=expired')
+  assert.equal((await confirm(s, { nonce, decision: 'link' })).headers.get('location'), '/app/account?link_error=expired', 'a nonce is single-use')
+  assert.equal((await confirm(s, { decision: 'link' })).headers.get('location'), '/app/account?link_error=bad_request')
+  assert.equal((await confirm(s, { nonce: 'ff'.repeat(16), decision: 'link' })).headers.get('location'), '/app/account?link_error=expired')
   const junk = await fetch(`${s.base}/github/callback?code=c0de&state=nope`, { redirect: 'manual' })
-  assert.equal(junk.headers.get('location'), '/account?link_error=expired')
+  assert.equal(junk.headers.get('location'), '/app/account?link_error=expired')
   const start2 = await s.http('/github/link', { method: 'POST', token: danTok, body: { flow: 'web' } })
   const state2 = new URL(start2.json.url).searchParams.get('state')
   const missing = await fetch(`${s.base}/github/callback?state=${state2}`, { redirect: 'manual' })
-  assert.equal(missing.headers.get('location'), '/account?link_error=bad_request')
+  assert.equal(missing.headers.get('location'), '/app/account?link_error=bad_request')
   const again = await fetch(`${s.base}/github/callback?code=c0de&state=${state2}`, { redirect: 'manual' })
-  assert.equal(again.headers.get('location'), '/account?link_error=expired', 'a code-less callback still consumed the state')
+  assert.equal(again.headers.get('location'), '/app/account?link_error=expired', 'a code-less callback still consumed the state')
 })
 
 test('web flow: Cancel links nothing and drops the parked token; a conflict is refused before any page; the page escapes GitHub-supplied text; an expired nonce links nothing', async (t) => {
@@ -139,26 +142,26 @@ test('web flow: Cancel links nothing and drops the parked token; a conflict is r
   assert.ok(!html.includes('<b>evil</b>')); assert.ok(html.includes('&lt;b&gt;evil&lt;/b&gt;'))
   assert.equal(parked(), 1)
   const cancel = await confirm(s, { nonce: nonceOf(html), decision: 'cancel' })
-  assert.equal(cancel.status, 302); assert.equal(cancel.headers.get('location'), '/account?link_error=denied')
+  assert.equal(cancel.status, 302); assert.equal(cancel.headers.get('location'), '/app/account?link_error=denied')
   assert.equal((await s.http('/me', { token: danTok })).json.github, null)
   assert.equal(parked(), 0, 'cancel drops the parked token')
   // The identity is already bound to another journal user: refused at the callback, no page, nothing parked.
   saveGithubIdentity(s.db, { userId: pat.id, host: 'github.com', identity: { github_id: 42, login: 'DanBarker', scopes: [] }, token: 'tp', now: 1 })
   const conflict = await fetch(`${s.base}/github/callback?code=c0de&state=${await startWeb()}`, { redirect: 'manual' })
-  assert.equal(conflict.status, 302); assert.equal(conflict.headers.get('location'), '/account?link_error=conflict')
+  assert.equal(conflict.status, 302); assert.equal(conflict.headers.get('location'), '/app/account?link_error=conflict')
   assert.equal(parked(), 0)
   deleteGithubAccount(s.db, pat.id)
   // An expired confirm row answers expired and links nothing.
   const cb2 = await fetch(`${s.base}/github/callback?code=c0de&state=${await startWeb()}`, { redirect: 'manual' })
   const nonce2 = nonceOf(await cb2.text())
   s.db.prepare('UPDATE github_link_confirms SET expires_at = 1').run()
-  assert.equal((await confirm(s, { nonce: nonce2, decision: 'link' })).headers.get('location'), '/account?link_error=expired')
+  assert.equal((await confirm(s, { nonce: nonce2, decision: 'link' })).headers.get('location'), '/app/account?link_error=expired')
   assert.equal((await s.http('/me', { token: danTok })).json.github, null)
   assert.equal(parked(), 0, 'expired rows are swept')
   // Upstream failure on the exchange still redirects, nothing parked.
   gh.q.exchange.push(() => { throw new GithubError('upstream', 'boom') })
   const up = await fetch(`${s.base}/github/callback?code=c0de&state=${await startWeb()}`, { redirect: 'manual' })
-  assert.equal(up.headers.get('location'), '/account?link_error=upstream')
+  assert.equal(up.headers.get('location'), '/app/account?link_error=upstream')
   assert.equal(parked(), 0)
 })
 
@@ -243,4 +246,62 @@ test('device flow start caps the row TTL and the returned expires_in at LINK_FLO
   assert.equal(start2.json.expires_in, 300)
   const row2 = s.db.prepare('SELECT expires_at, created_at FROM github_link_flows WHERE id=?').get(start2.json.flow_id)
   assert.equal(row2.expires_at - row2.created_at, 300000)
+})
+
+test('GET /me reports is_admin', async (t) => {
+  const { s, dan, danTok, agent } = await fleet(t, fakeGithub())
+  assert.equal((await s.http('/me', { token: danTok })).json.user.is_admin, false)
+  s.db.prepare('UPDATE users SET is_admin=1 WHERE id=?').run(dan.id)
+  assert.deepEqual((await s.http('/me', { token: danTok })).json.user, { id: dan.id, name: 'dan', is_admin: true })
+  assert.equal((await s.http('/me', { token: agent.token })).json.user.is_admin, true, '/me describes the user, not the device')
+})
+
+test('with MATRON_TOKEN_KEY: link, refresh and unlink work; the plaintext token is nowhere in the database files; a restart without the key logs and leaves the link alone (review focus 5)', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-token-key-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'j.db')
+  const secret = 'gho_' + 'f00dcafe'.repeat(5)
+  const gh = fakeGithub()
+  gh.q.poll.push(() => ({ status: 'ok', token: secret }))
+  const s = await startTestServer({ dbPath, github: gh, tokenKey: 'ab'.repeat(32) })
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const danTok = (await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })).json.token
+  const start = await s.http('/github/link', { method: 'POST', token: danTok, body: { flow: 'device' } })
+  const linked = await s.http(`/github/link/${start.json.flow_id}/poll`, { method: 'POST', token: danTok })
+  assert.equal(linked.json.status, 'linked')
+  const row = s.db.prepare('SELECT token, token_hash FROM github_accounts WHERE user_id=?').get(dan.id)
+  assert.ok(row.token.startsWith('enc1:')); assert.ok(row.token_hash)
+  gh.q.identity.push(() => ({ github_id: 42, login: 'DanBarker', scopes: ['github.com/matronhq', 'github.com/second'] }))
+  const refreshed = await s.http('/github/refresh', { method: 'POST', token: danTok })
+  assert.equal(refreshed.status, 200); assert.deepEqual(refreshed.json.github.orgs, ['github.com/matronhq', 'github.com/second'])
+  await s.close()
+  const bytes = Buffer.concat(['', '-wal', '-shm'].map((sfx) => { try { return fs.readFileSync(dbPath + sfx) } catch { return Buffer.alloc(0) } }))
+  assert.ok(!bytes.includes(secret), 'the plaintext token must not be on disk')
+
+  // Restart without the key: the sealed row is unreadable, not stale.
+  const logs = []
+  const s2 = await startTestServer({ dbPath, github: gh, tokenKey: '', githubRefreshIntervalMs: 3600000 })
+  const origLog = console.log; console.log = (...a) => { logs.push(a.join(' ')); origLog(...a) }
+  t.after(() => { console.log = origLog })
+  const danTok2 = (await s2.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac2' } })).json.token
+  const r = await s2.http('/github/refresh', { method: 'POST', token: danTok2 })
+  assert.equal(r.status, 502)
+  assert.equal((await s2.http('/me', { token: danTok2 })).json.github.state, 'ok')
+  const { runGithubRefresh } = await import('../src/github-refresh.js')
+  const out = await runGithubRefresh(s2.db, gh, { log: (l) => logs.push(l) })
+  assert.deepEqual(out, { refreshed: 0, stale: 0, unchanged: 1 })
+  assert.ok(logs.some((l) => /token_sealed/.test(l)), 'the operator is told the key is missing')
+  assert.deepEqual((await s2.http('/github/link', { method: 'DELETE', token: danTok2 })).json, { ok: true })
+
+  // Unlinking an unreadable row must not leave the account stuck: a fresh
+  // link (this process has no key, so the new token is stored plain) works
+  // exactly as it would for a user who was never linked.
+  gh.q.poll.push(() => ({ status: 'ok', token: 'gho_replacement' }))
+  const relinkStart = await s2.http('/github/link', { method: 'POST', token: danTok2, body: { flow: 'device' } })
+  assert.equal(relinkStart.status, 200)
+  const relinkPoll = await s2.http(`/github/link/${relinkStart.json.flow_id}/poll`, { method: 'POST', token: danTok2 })
+  assert.equal(relinkPoll.status, 200); assert.equal(relinkPoll.json.status, 'linked')
+  const me2 = await s2.http('/me', { token: danTok2 })
+  assert.equal(me2.json.github.login, 'DanBarker'); assert.equal(me2.json.github.state, 'ok')
+  await s2.close()
 })

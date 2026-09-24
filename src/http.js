@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import { pipeline } from 'node:stream/promises'
 import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice, deviceStatuses } from './db.js'
@@ -18,6 +19,7 @@ import { handleItemsRoute } from './items-http.js'
 import { handleMissionsRoute } from './missions-http.js'
 import { handleGithubRoute, handleGithubCallback } from './github-http.js'
 import { handleLookupRoute } from './lookup-http.js'
+import { handleUsersRoute } from './users-http.js'
 import { githubAccountView } from './github-accounts.js'
 import { handleCoordinatorRoute } from './coordinator-http.js'
 import { coordinatorFor } from './coordinator.js'
@@ -84,10 +86,12 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, itemTranscription = null, github = null }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, itemTranscription = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
+      if (handleWellKnown(req, res, url)) return
+      if (await handleStatic(req, res, url)) return
       if (req.method === 'POST' && url.pathname === '/login') {
         // Behind the cloudflared tunnel, req.socket.remoteAddress is always 127.0.0.1
         // (the tunnel is the only route in, so this header is trustworthy here).
@@ -242,7 +246,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         if (!l) return json(res, 429, { error: 'rate_limited' })
         return json(res, 200, { link_code: l.linkCode, expires_in: l.expiresIn })
       }
-      if (await handleGithubCallback({ db, github }, req, res, url)) return
+      if (await handleGithubCallback({ db, github, tokenBox: tokenBox || undefined }, req, res, url)) return
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       // The tracker's own surface (src/items-http.js) — mounted first so
@@ -250,12 +254,13 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       // outer try/catch so readBody's 400/413 map like every other route's.
       if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription }, req, res, url, who)) return
       if (await handleMissionsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
-      if (await handleGithubRoute({ db, github, rateLimiter }, req, res, url, who)) return
+      if (await handleGithubRoute({ db, github, rateLimiter, tokenBox: tokenBox || undefined }, req, res, url, who)) return
       if (handleLookupRoute({ db }, req, res, url, who)) return
+      if (await handleUsersRoute({ db, links }, req, res, url, who)) return
       if (req.method === 'GET' && url.pathname === '/me') {
-        const user = db.prepare('SELECT id, name FROM users WHERE id=?').get(who.userId)
+        const user = db.prepare('SELECT id, name, is_admin FROM users WHERE id=?').get(who.userId)
         return json(res, 200, {
-          user: { id: user.id, name: user.name },
+          user: { id: user.id, name: user.name, is_admin: !!user.is_admin },
           github: githubAccountView(db, who.userId),
           github_linking: { enabled: !!(github && github.enabled), web_flow: !!(github && github.webFlow) },
         })
@@ -876,12 +881,11 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           'x-content-type-options': 'nosniff',
           'content-disposition': 'attachment',
         })
-        await new Promise((resolve) => {
-          const stream = fs.createReadStream(blob.disk_path)
-          stream.on('error', () => { res.destroy(); resolve() })
-          stream.on('close', resolve)
-          stream.pipe(res)
-        })
+        // pipeline (not .pipe()) so a client abort mid-body destroys the read
+        // stream promptly instead of leaking its fd (.pipe() never forwards a
+        // destination close/error back to the source) — same fix as
+        // static-http.js's file serving.
+        await pipeline(fs.createReadStream(blob.disk_path), res).catch(() => {})
         return
       }
       return json(res, 404, { error: 'not_found' })

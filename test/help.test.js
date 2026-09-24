@@ -26,6 +26,7 @@ test('GET /help serves the API digest to authenticated devices only', async (t) 
   assert.match(body, /around_seq/)
   assert.match(body, /GET \/items\?scope=shared/)
   assert.match(body, /GET \/lookup\?user=/)
+  assert.match(body, /GET \/me\b.*is_admin/)
 
   // Final review, I3: /help and docs/protocol.md must agree about missions.
   // A bridge session arrives with a token and no checkout, so every mission

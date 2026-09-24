@@ -567,7 +567,7 @@ test('schema: repo columns and github tables exist', () => {
   const cols = (t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name)
   assert.ok(cols('conversations').includes('repo'))
   assert.ok(cols('conversations').includes('repo_scope'))
-  assert.deepEqual(cols('github_accounts'), ['user_id', 'host', 'github_id', 'login', 'token', 'state', 'checked_at', 'linked_at'])
+  assert.deepEqual(cols('github_accounts'), ['user_id', 'host', 'github_id', 'login', 'token', 'state', 'checked_at', 'linked_at', 'token_hash'])
   assert.deepEqual(cols('github_orgs'), ['user_id', 'scope'])
   assert.deepEqual(cols('github_link_flows'), ['id', 'user_id', 'device_id', 'flow', 'device_code', 'state', 'expires_at', 'created_at'])
   db.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
@@ -622,6 +622,22 @@ test('openDb adds repo/repo_scope and the GitHub link tables to a pre-existing p
   db.close()
 
   // Re-opening (already migrated) is a no-op, not an error.
+  assert.doesNotThrow(() => openDb(dbPath).close())
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('openDb adds users.is_admin (default 0) to a pre-existing users table in place', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-migration-'))
+  const dbPath = path.join(dir, 'pre-admin.db')
+  const raw = new Database(dbPath)
+  raw.exec('CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL)')
+  raw.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+  raw.close()
+  const db = openDb(dbPath)
+  const cols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name)
+  assert.ok(cols.includes('is_admin'), 'is_admin column missing after migration')
+  assert.deepEqual(db.prepare('SELECT id, name, is_admin FROM users').all(), [{ id: 1, name: 'dan', is_admin: 0 }])
+  db.close()
   assert.doesNotThrow(() => openDb(dbPath).close())
   fs.rmSync(dir, { recursive: true, force: true })
 })
