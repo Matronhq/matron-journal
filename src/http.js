@@ -9,7 +9,7 @@ import { listAwaiting, answerParkedInvite, getParticipant } from './participants
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
-import { canReadConvo } from './visibility.js'
+import { canReadConvo, canReadBlob } from './visibility.js'
 import { serveHelp } from './help.js'
 import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
 import { closeChatConsentItem } from './consent-items.js'
@@ -833,7 +833,14 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // owner learns from a 403 that a 404 doesn't already hide just as well,
         // and callers can't probe for the existence of someone else's blob.
         const blob = getBlob(db, mm[1])
-        if (!blob || blob.owner_user_id !== who.userId) return json(res, 404, { error: 'not_found' })
+        if (!blob) return json(res, 404, { error: 'not_found' })
+        if (blob.owner_user_id !== who.userId) {
+          // Shared visibility (spec 2026-09-23 tracker web/teams): a
+          // colleague reaches a blob only through a shared row that
+          // references it; canReadBlob is the one copy of that rule.
+          if (!canReadBlob(db, who.userId, blob.id)) return json(res, 404, { error: 'not_found' })
+          console.log(`journal: shared media read blob=${blob.id} viewer=${who.userId} device=${who.deviceId}`)
+        }
         // Stat the file before ever committing to a 200: the DB row can
         // outlive/disagree with the file on disk (deleted out from under
         // it, truncated by a disk issue, etc). Catching that here means a

@@ -175,11 +175,20 @@ one question the journal asks.
 "Link GitHub" button calls `POST /github/link {flow:'web'}` → `{url}`,
 a GitHub authorize URL with `scope=read:org` and a random `state` stored
 in `github_link_flows` for 10 minutes. GitHub redirects to
-`GET /github/callback?code&state`. The journal exchanges the code with the
-client secret, fetches `GET /user` and the org list, upserts
-`github_accounts`, deletes the flow row, and redirects to
-`/account?linked=1`. The callback is bound to the flow row's user, not to
-the browser's Bearer token, because the redirect arrives without one.
+`GET /github/callback?code&state`. The journal consumes the flow row,
+exchanges the code with the client secret, fetches `GET /user` and the
+org list, and — instead of linking at once — parks the token and identity
+on a `github_link_confirms` row (10 minutes, single-use nonce) and
+renders a small confirm page: "You signed in to GitHub as **@login**. This
+will link that GitHub account to the Matron journal user **name**." Only
+the Link button (`POST /github/callback/confirm {nonce, decision:'link'}`)
+upserts `github_accounts` and redirects to `/account?linked=1`; Cancel
+discards the parked token and redirects to `/account?link_error=denied`.
+The callback is bound to the flow row's user, not to the browser's Bearer
+token, because the redirect arrives without one — and that is exactly why
+the page exists: an authorize URL can be handed to anyone, and the person
+who authorizes must see which journal account they are about to bind.
+GitHub's pages name the OAuth App, never the journal user.
 
 **Device flow** (always). `POST /github/link {flow:'device'}` asks GitHub
 for a device code and returns `{flow_id, user_code, verification_uri,
@@ -281,7 +290,8 @@ missing: `GET /devices`, `DELETE /devices/:id`, `PATCH /devices/:id {name}`,
 
 All new routes follow `http-who.js` conventions and bear the existing
 Bearer auth, except `GET /github/callback`, which is authenticated by the
-flow row's `state`.
+flow row's `state`, and `POST /github/callback/confirm`, which is
+authenticated by the confirm row's nonce.
 
 ### Item links and the lookup URL
 
@@ -457,6 +467,19 @@ puts it on the clipboard.
 - Anti-enumeration is preserved: invisible rows and unknown users answer
   `404` identically. Neither `/lookup` nor `/search` is rate limited; the
   identical 404 is the anti-enumeration guard.
+- Link phishing: the web flow's confirm page names the journal user before
+  anything is saved, so a victim handed someone else's authorize URL sees
+  the wrong name and cancels. The device flow has no such hook — the
+  authorizer only ever sees GitHub's device page — so a user_code handed
+  to a victim can bind the victim's identity to the attacker's journal
+  account. The residual guards are the `409 conflict` for an identity
+  already linked elsewhere and the admin's ability to clear a link (Plan
+  B). Installations that can register an OAuth App should prefer the web
+  flow.
+- Blobs follow the rule through the row that references them: a colleague
+  may `GET /media/:id` only when a prose event in a shared conversation or
+  an attachment on a shared, non-consent item names the blob and the row's
+  owner owns the blob. Same 404 otherwise; every foreign read is logged.
 - Private devices stay private across orgs. The sieve runs before the
   org rule and a test pins the order.
 - Foreign excerpt reads are prose-only, capped at 30 and logged with viewer

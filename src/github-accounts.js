@@ -49,6 +49,13 @@ export function updateGithubIdentity(db, { userId, token, identity, now = Date.n
 // token the caller started its refresh/check with — the same "only touch
 // the row we asked about" guard as updateGithubIdentity, so a stale-mark
 // racing an unlink or re-link never lands on the wrong row.
+// Is this GitHub identity already linked to a different journal user? The
+// web-flow callback asks before parking a token, so a doomed link never
+// shows a confirm page.
+export function githubIdentityBoundElsewhere(db, { host, githubId, userId }) {
+  return !!db.prepare('SELECT 1 FROM github_accounts WHERE host=? AND github_id=? AND user_id<>?').get(host, githubId, userId)
+}
+
 export function markGithubStale(db, userId, { token = null, now = Date.now() } = {}) {
   if (token != null) {
     db.prepare("UPDATE github_accounts SET state='stale', checked_at=? WHERE user_id=? AND token=?").run(now, userId, token)
@@ -83,5 +90,30 @@ export function takeLinkFlow(db, { id = null, state = null, now = Date.now() }) 
     if (!row) return null
     db.prepare('DELETE FROM github_link_flows WHERE id=?').run(row.id)
     return row
+  })()
+}
+
+// A web-flow result parked until the person on the confirm page says yes.
+// The nonce is the page's only credential: single-use, unguessable, and
+// swept with the same TTL as a flow. The token sits here for at most that
+// long and is deleted on link, cancel or expiry.
+export function createLinkConfirm(db, { userId, token, identity, ttlMs = LINK_FLOW_TTL_MS, now = Date.now() }) {
+  const id = `gc_${randomBytes(8).toString('hex')}`
+  const nonce = randomBytes(16).toString('hex')
+  db.prepare('INSERT INTO github_link_confirms(id, user_id, nonce, token, identity_json, expires_at, created_at) VALUES(?,?,?,?,?,?,?)')
+    .run(id, userId, nonce, token, JSON.stringify(identity), now + ttlMs, now)
+  return { id, nonce }
+}
+
+// Returns {user_id, token, identity} and deletes the row — a confirm is
+// finished by exactly one POST, link or cancel. Expired rows are swept on
+// read and answer null.
+export function takeLinkConfirm(db, { nonce, now = Date.now() }) {
+  return db.transaction(() => {
+    db.prepare('DELETE FROM github_link_confirms WHERE expires_at <= ?').run(now)
+    const row = db.prepare('SELECT user_id, token, identity_json FROM github_link_confirms WHERE nonce=?').get(nonce)
+    if (!row) return null
+    db.prepare('DELETE FROM github_link_confirms WHERE nonce=?').run(nonce)
+    return { user_id: row.user_id, token: row.token, identity: JSON.parse(row.identity_json) }
   })()
 }

@@ -4,12 +4,13 @@
 // Bearer auth; the callback is authenticated by the single-use `state` the
 // journal minted for the flow row, so the browser's session is ignored.
 import { randomBytes } from 'node:crypto'
-import { json, readBody } from './http-body.js'
+import { json, readBody, readRawBody } from './http-body.js'
 import { badRequest, notFound, conflict } from './http-who.js'
 import { GithubError } from './github.js'
 import {
   githubAccountView, saveGithubIdentity, updateGithubIdentity, markGithubStale, deleteGithubAccount,
   createLinkFlow, takeLinkFlow, LINK_FLOW_TTL_MS,
+  githubIdentityBoundElsewhere, createLinkConfirm, takeLinkConfirm,
 } from './github-accounts.js'
 
 const FLOWS = ['device', 'web']
@@ -119,16 +120,72 @@ export async function handleGithubRoute(ctx, req, res, url, who) {
   return false
 }
 
+const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+
+// The one HTML page the journal serves. The person who just authorized on
+// GitHub may not be the journal user who started the flow — an authorize
+// URL can be handed to anyone — so before anything is saved they are told
+// which journal account the identity would bind to, and only their click
+// on Link completes it. GitHub's own pages cannot show this: they name the
+// OAuth App, never the journal user.
+function confirmPage({ login, userName, nonce }) {
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Link GitHub account</title>
+<style>body{font:16px/1.5 system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;color:#222}
+button{font:inherit;padding:.5rem 1.25rem;margin-right:.5rem;border-radius:6px;cursor:pointer}
+.link{background:#1f6feb;color:#fff;border:0}.cancel{background:none;border:1px solid #999}</style></head>
+<body><h1>Link GitHub account</h1>
+<p>You signed in to GitHub as <strong>@${escapeHtml(login)}</strong>.</p>
+<p>This will link that GitHub account to the Matron journal user <strong>${escapeHtml(userName)}</strong>.
+If that is not your journal account, cancel.</p>
+<form method="post" action="/github/callback/confirm"><input type="hidden" name="nonce" value="${nonce}">
+<button class="link" name="decision" value="link">Link</button>
+<button class="cancel" name="decision" value="cancel">Cancel</button></form></body></html>
+`
+}
+
+// Parses the confirm page's form POST (JSON is accepted too, for
+// non-browser clients). Returns a plain object of string fields.
+async function readFormOrJson(req) {
+  const raw = await readRawBody(req)
+  if (!raw) return {}
+  if (/application\/json/.test(req.headers['content-type'] || '')) {
+    let v
+    try { v = JSON.parse(raw) } catch { return {} }
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : {}
+  }
+  return Object.fromEntries(new URLSearchParams(raw))
+}
+
 // GET /github/callback?code&state — the browser returning from GitHub's
 // authorize page. No Bearer: the flow row's `state` is the credential, and
-// it binds the resulting link to the row's user. Always redirects into the
-// web app's account page so a user never sees raw JSON here. The state is
-// consumed BEFORE the code is checked, so a malformed callback still burns
-// the state and a replay cannot complete it later.
+// it binds the resulting link to the row's user. The state is consumed
+// BEFORE the code is checked, so a malformed callback still burns the
+// state and a replay cannot complete it later. On success nothing is saved
+// yet: the token and identity are parked on a confirm row and the person
+// sees the confirm page. POST /github/callback/confirm {nonce, decision}
+// finishes it: 'link' saves, anything else discards. Every failure
+// redirects into the web app's account page so a user never sees raw JSON.
 export async function handleGithubCallback(ctx, req, res, url) {
-  if (url.pathname !== '/github/callback' || req.method !== 'GET') return false
   const { db, github } = ctx
   const redirect = (to) => { res.writeHead(302, { location: to }); res.end(); return true }
+  if (url.pathname === '/github/callback/confirm' && req.method === 'POST') {
+    const body = await readFormOrJson(req)
+    if (typeof body.nonce !== 'string' || !/^[0-9a-f]{32}$/.test(body.nonce)) return redirect('/account?link_error=bad_request')
+    const parked = takeLinkConfirm(db, { nonce: body.nonce })
+    if (!parked) return redirect('/account?link_error=expired')
+    if (body.decision !== 'link') return redirect('/account?link_error=denied')
+    if (!github || !github.enabled) return redirect('/account?link_error=not_configured')
+    try {
+      saveGithubIdentity(db, { userId: parked.user_id, host: github.host, identity: parked.identity, token: parked.token })
+    } catch (err) {
+      if (err.message === 'github_conflict') return redirect('/account?link_error=conflict')
+      throw err
+    }
+    return redirect('/account?linked=1')
+  }
+  if (url.pathname !== '/github/callback' || req.method !== 'GET') return false
   const code = url.searchParams.get('code')
   const state = url.searchParams.get('state')
   if (!github || !github.enabled || !github.webFlow) return redirect('/account?link_error=not_configured')
@@ -136,13 +193,24 @@ export async function handleGithubCallback(ctx, req, res, url) {
   const row = takeLinkFlow(db, { state })
   if (!row) return redirect('/account?link_error=expired')
   if (typeof code !== 'string' || !code) return redirect('/account?link_error=bad_request')
+  let token, identity
   try {
-    const { token } = await github.exchangeCode(code)
-    await finishLink(db, github, { userId: row.user_id, token })
-    return redirect('/account?linked=1')
+    ;({ token } = await github.exchangeCode(code))
+    identity = await github.fetchIdentity(token)
   } catch (err) {
-    if (err.message === 'github_conflict') return redirect('/account?link_error=conflict')
     if (err instanceof GithubError) return redirect('/account?link_error=upstream')
     throw err
   }
+  if (githubIdentityBoundElsewhere(db, { host: github.host, githubId: identity.github_id, userId: row.user_id })) return redirect('/account?link_error=conflict')
+  const user = db.prepare('SELECT name FROM users WHERE id=?').get(row.user_id)
+  if (!user) return redirect('/account?link_error=expired')
+  const { nonce } = createLinkConfirm(db, { userId: row.user_id, token, identity })
+  res.writeHead(200, {
+    'content-type': 'text/html; charset=utf-8',
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+  })
+  res.end(confirmPage({ login: identity.login, userName: user.name, nonce }))
+  return true
 }

@@ -35,3 +35,25 @@ export function sharedOrgScopes(db, viewerUserId) {
   return db.prepare(`SELECT g.scope FROM github_orgs g JOIN github_accounts a ON a.user_id = g.user_id AND a.state='ok'
     WHERE g.user_id = ? ORDER BY g.scope`).all(viewerUserId).map((r) => r.scope)
 }
+
+// A colleague may fetch a blob only through a row they can already read:
+// a prose event (text/diff — the excerpt types) in a shared conversation,
+// or an attachment on a non-consent item filed from one. The referencing
+// row's owner must also own the blob, so attaching someone else's blob id
+// to your own item opens nothing. Anything else is the owner's alone.
+export function canReadBlob(db, viewerUserId, blobId) {
+  const row = db.prepare(`SELECT 1 AS ok WHERE EXISTS (
+      SELECT 1 FROM events e
+      JOIN blobs b ON b.id = e.blob_ref
+      JOIN conversations c ON c.id = e.convo_id
+      WHERE e.blob_ref = @id AND e.type IN ('text', 'diff') AND b.owner_user_id = e.user_id
+        AND ${sharedConvoSql('c')})
+    OR EXISTS (
+      SELECT 1 FROM item_comments ic
+      JOIN items i ON i.id = ic.item_id
+      JOIN blobs b ON b.id = @id
+      JOIN conversations c ON c.id = i.origin_convo_id
+      WHERE ic.attachments LIKE '%"blob_ref":"' || @id || '"%' AND i.consent IS NULL AND b.owner_user_id = i.user_id
+        AND ${sharedConvoSql('c')})`).get({ viewer: viewerUserId, id: blobId })
+  return !!row
+}

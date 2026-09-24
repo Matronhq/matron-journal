@@ -82,7 +82,13 @@ test('conflict: the same GitHub identity cannot be linked to two users (review f
   assert.equal((await s.http('/me', { token: patTok })).json.github, null)
 })
 
-test('web flow: link returns the authorize URL; callback binds to the flow row, redirects, and a replayed state fails (review focus 4)', async (t) => {
+const nonceOf = (html) => html.match(/name="nonce" value="([0-9a-f]+)"/)[1]
+const confirm = (s, body) => fetch(`${s.base}/github/callback/confirm`, {
+  method: 'POST', redirect: 'manual',
+  headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(body).toString(),
+})
+
+test('web flow: the callback shows a confirm page naming the GitHub login and the journal user; only Link saves; state and nonce are single-use (review focus 4)', async (t) => {
   const gh = fakeGithub({ webFlow: true })
   const { s, danTok } = await fleet(t, gh)
   const start = await s.http('/github/link', { method: 'POST', token: danTok, body: { flow: 'web' } })
@@ -91,10 +97,21 @@ test('web flow: link returns the authorize URL; callback binds to the flow row, 
   assert.match(state, /^[0-9a-f]{32}$/)
   // No Bearer on the callback: it is the browser coming back from GitHub.
   const cb = await fetch(`${s.base}/github/callback?code=c0de&state=${state}`, { redirect: 'manual' })
-  assert.equal(cb.status, 302); assert.equal(cb.headers.get('location'), '/account?linked=1')
-  assert.equal((await s.http('/me', { token: danTok })).json.github.login, 'DanBarker')
+  assert.equal(cb.status, 200)
+  assert.match(cb.headers.get('content-type'), /^text\/html/)
+  assert.equal(cb.headers.get('cache-control'), 'no-store')
+  const html = await cb.text()
+  assert.match(html, /DanBarker/); assert.match(html, /\bdan\b/)
+  assert.equal((await s.http('/me', { token: danTok })).json.github, null, 'nothing is linked until the person on the page says so')
   const replay = await fetch(`${s.base}/github/callback?code=c0de&state=${state}`, { redirect: 'manual' })
   assert.equal(replay.status, 302); assert.equal(replay.headers.get('location'), '/account?link_error=expired')
+  const nonce = nonceOf(html)
+  const linked = await confirm(s, { nonce, decision: 'link' })
+  assert.equal(linked.status, 302); assert.equal(linked.headers.get('location'), '/account?linked=1')
+  assert.equal((await s.http('/me', { token: danTok })).json.github.login, 'DanBarker')
+  assert.equal((await confirm(s, { nonce, decision: 'link' })).headers.get('location'), '/account?link_error=expired', 'a nonce is single-use')
+  assert.equal((await confirm(s, { decision: 'link' })).headers.get('location'), '/account?link_error=bad_request')
+  assert.equal((await confirm(s, { nonce: 'ff'.repeat(16), decision: 'link' })).headers.get('location'), '/account?link_error=expired')
   const junk = await fetch(`${s.base}/github/callback?code=c0de&state=nope`, { redirect: 'manual' })
   assert.equal(junk.headers.get('location'), '/account?link_error=expired')
   const start2 = await s.http('/github/link', { method: 'POST', token: danTok, body: { flow: 'web' } })
@@ -103,6 +120,46 @@ test('web flow: link returns the authorize URL; callback binds to the flow row, 
   assert.equal(missing.headers.get('location'), '/account?link_error=bad_request')
   const again = await fetch(`${s.base}/github/callback?code=c0de&state=${state2}`, { redirect: 'manual' })
   assert.equal(again.headers.get('location'), '/account?link_error=expired', 'a code-less callback still consumed the state')
+})
+
+test('web flow: Cancel links nothing and drops the parked token; a conflict is refused before any page; the page escapes GitHub-supplied text; an expired nonce links nothing', async (t) => {
+  const gh = fakeGithub({ webFlow: true })
+  const { s, pat, danTok } = await fleet(t, gh)
+  // Each start from its own address: /github/link shares /login's 5-per-minute per-IP limiter.
+  let ip = 0
+  const startWeb = async () => {
+    const r = await s.http('/github/link', { method: 'POST', token: danTok, body: { flow: 'web' }, headers: { 'cf-connecting-ip': `10.9.0.${++ip}` } })
+    assert.equal(r.status, 200)
+    return new URL(r.json.url).searchParams.get('state')
+  }
+  const parked = () => s.db.prepare('SELECT COUNT(*) AS n FROM github_link_confirms').get().n
+  gh.q.identity.push(() => ({ github_id: 7, login: '<b>evil</b>', scopes: [] }))
+  const cb = await fetch(`${s.base}/github/callback?code=c0de&state=${await startWeb()}`, { redirect: 'manual' })
+  const html = await cb.text()
+  assert.ok(!html.includes('<b>evil</b>')); assert.ok(html.includes('&lt;b&gt;evil&lt;/b&gt;'))
+  assert.equal(parked(), 1)
+  const cancel = await confirm(s, { nonce: nonceOf(html), decision: 'cancel' })
+  assert.equal(cancel.status, 302); assert.equal(cancel.headers.get('location'), '/account?link_error=denied')
+  assert.equal((await s.http('/me', { token: danTok })).json.github, null)
+  assert.equal(parked(), 0, 'cancel drops the parked token')
+  // The identity is already bound to another journal user: refused at the callback, no page, nothing parked.
+  saveGithubIdentity(s.db, { userId: pat.id, host: 'github.com', identity: { github_id: 42, login: 'DanBarker', scopes: [] }, token: 'tp', now: 1 })
+  const conflict = await fetch(`${s.base}/github/callback?code=c0de&state=${await startWeb()}`, { redirect: 'manual' })
+  assert.equal(conflict.status, 302); assert.equal(conflict.headers.get('location'), '/account?link_error=conflict')
+  assert.equal(parked(), 0)
+  deleteGithubAccount(s.db, pat.id)
+  // An expired confirm row answers expired and links nothing.
+  const cb2 = await fetch(`${s.base}/github/callback?code=c0de&state=${await startWeb()}`, { redirect: 'manual' })
+  const nonce2 = nonceOf(await cb2.text())
+  s.db.prepare('UPDATE github_link_confirms SET expires_at = 1').run()
+  assert.equal((await confirm(s, { nonce: nonce2, decision: 'link' })).headers.get('location'), '/account?link_error=expired')
+  assert.equal((await s.http('/me', { token: danTok })).json.github, null)
+  assert.equal(parked(), 0, 'expired rows are swept')
+  // Upstream failure on the exchange still redirects, nothing parked.
+  gh.q.exchange.push(() => { throw new GithubError('upstream', 'boom') })
+  const up = await fetch(`${s.base}/github/callback?code=c0de&state=${await startWeb()}`, { redirect: 'manual' })
+  assert.equal(up.headers.get('location'), '/account?link_error=upstream')
+  assert.equal(parked(), 0)
 })
 
 test('refresh: ok updates orgs; unauthorized marks stale; unreachable leaves everything; unlink deletes', async (t) => {

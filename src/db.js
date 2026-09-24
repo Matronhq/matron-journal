@@ -617,6 +617,15 @@ export function openDb(path) {
       created_at  INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_github_link_flows_state ON github_link_flows(state);
+    CREATE TABLE IF NOT EXISTS github_link_confirms(
+      id            TEXT PRIMARY KEY,
+      user_id       INTEGER NOT NULL REFERENCES users(id),
+      nonce         TEXT NOT NULL UNIQUE,
+      token         TEXT NOT NULL,
+      identity_json TEXT NOT NULL,
+      expires_at    INTEGER NOT NULL,
+      created_at    INTEGER NOT NULL
+    );
   `)
   // One-time title cleanup (spec: agent box rename). Gated on user_version
   // inside, so this is a cheap pragma read on every subsequent open.
