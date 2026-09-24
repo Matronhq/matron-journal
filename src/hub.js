@@ -100,11 +100,12 @@ export function makeHub({ coalesceMs = 200 } = {}) {
       return out
     },
     // Per-device "is this device connected AND looking at this convo right
-    // now" — the push pipeline's suppression rule. conn.deviceId is already
-    // carried on every registered connection (see ws.js hello handling).
+    // now" — the push pipeline's suppression rule. A connection views a SET
+    // of convos (conn.viewingConvoIds, set by the `viewing` op). conn.deviceId
+    // is already carried on every registered connection (see ws.js hello).
     isViewing(userId, deviceId, convoId) {
       for (const c of byUser.get(userId) || []) {
-        if (c.deviceId === deviceId && c.viewingConvoId === convoId && c.ws.readyState === 1) return true
+        if (c.deviceId === deviceId && c.viewingConvoIds?.has(convoId) && c.ws.readyState === 1) return true
       }
       return false
     },
@@ -123,7 +124,7 @@ export function makeHub({ coalesceMs = 200 } = {}) {
     },
     sendEphemeral(userId, convoId, frame) {
       for (const c of byUser.get(userId) || []) {
-        if (c.viewingConvoId !== convoId || c.ws.readyState !== 1) continue
+        if (!c.viewingConvoIds?.has(convoId) || c.ws.readyState !== 1) continue
         // One pending slot per (convo, message_ref, frame family): activity,
         // status, and text/tool-stream overlays are distinct families that
         // must not clobber each other inside one coalesce window — the

@@ -9,6 +9,8 @@ import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem } from './consent-items.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableBoxName } from './wake.js'
+import { coordinatorFor } from './coordinator.js'
+import { getMission } from './missions.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -53,6 +55,22 @@ const STATUS_CACHE_MAX = 2048
 const RPC_MAX_BYTES = 16384
 const RPC_ID_MAX_CHARS = 128
 const RPC_NAME_MAX_CHARS = 64 // method and error.code
+// `viewing {convo_ids}`: at most VIEWING_SET_MAX distinct conversations per
+// connection (the Coordinator shows two; headroom, not a use case). Returns
+// the de-duplicated Set, or null when the value is not an array of non-empty
+// strings each ≤ CONVO_ID_MAX_CHARS, or has more than the cap after de-dup.
+const VIEWING_SET_MAX = 4
+function parseViewingConvoIds(value) {
+  if (!Array.isArray(value)) return null
+  const out = new Set()
+  for (const id of value) {
+    if (typeof id !== 'string' || !id || id.length > CONVO_ID_MAX_CHARS) return null
+    out.add(id)
+    if (out.size > VIEWING_SET_MAX) return null
+  }
+  return out
+}
+
 // CONVO_ID_MAX_CHARS (128, imported above) caps a parent_convo_id sent by a
 // bridge — see its doc comment in journal.js for why it lives there.
 // Cap for a session_outcome sent by a bridge. Shape-only, like the
@@ -398,7 +416,7 @@ export function attachWs({
           // for every op handled today: any journal append it triggers gets a seq greater
           // than the in-flight cursor, so it's picked up by a later replay batch rather
           // than lost. Revisit this assumption if a future op has other side effects.
-          conn = { ws, ...who, viewingConvoId: null }
+          conn = { ws, ...who, viewingConvoIds: new Set() }
           conn.username = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId).name
           const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(who.userId)
           const headSeq = head ? head.seq : 0
@@ -407,7 +425,13 @@ export function attachWs({
           // rooms (own-echo guard, roster self-exclusion, room titles); the
           // token is otherwise opaque to them. Reuses the row authToken already
           // resolved (`who`) — no extra lookup.
-          ws.send(JSON.stringify({ kind: 'control', op: 'hello_ok', seq: headSeq, device_id: who.deviceId, name: who.name }))
+          // coordinator_convo_id (spec 2026-09-23 coordinator redesign §1a):
+          // the user's Coordinator, so an app knows it on connect without a
+          // separate GET /coordinator. Sieved exactly like that route — an
+          // ordinary agent never learns a private-owned conversation's id.
+          // applyBridgePrivate ran above, so the flag is already current.
+          const coordinator = coordinatorFor(db, who.userId, { excludePrivateOwned: who.kind === 'agent' && !isPrivateDevice(db, who.deviceId) })
+          ws.send(JSON.stringify({ kind: 'control', op: 'hello_ok', seq: headSeq, device_id: who.deviceId, name: who.name, coordinator_convo_id: coordinator }))
           if (msg.cursor != null) {
             // snapshot_required valve (spec §6): a gap this large is not worth
             // replaying — tell the client to wipe, GET /snapshot, and reconnect
@@ -699,7 +723,29 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
   try {
     switch (msg.op) {
       case 'viewing': {
-        conn.viewingConvoId = msg.convo_id ?? null
+        // `convo_ids` (optional) is the FULL set of conversations this
+        // connection is looking at — the Coordinator puts two live chats on
+        // screen at once. Without it, `convo_id` (string|null) means {convo_id}
+        // or {} exactly as before. A bad `convo_ids` is rejected and leaves
+        // the current set untouched.
+        //
+        // Catch-up (below) for the set form runs only for convos newly ADDED
+        // to the set, plus `convo_id` when it is sent alongside `convo_ids`
+        // (and is in the set) — even if already viewed. The single form keeps
+        // its old behaviour of catching up on every send. Both exist because
+        // clients re-send `viewing` for a convo to force a tool-stream resync.
+        let next
+        let prev
+        if (msg.convo_ids !== undefined) {
+          next = parseViewingConvoIds(msg.convo_ids)
+          if (!next) return fail('bad_request', `convo_ids must be an array of at most ${VIEWING_SET_MAX} non-empty convo id strings`)
+          prev = new Set(conn.viewingConvoIds)
+          prev.delete(msg.convo_id)
+        } else {
+          next = new Set(msg.convo_id == null ? [] : [msg.convo_id])
+          prev = new Set()
+        }
+        conn.viewingConvoIds = next
         // Catch-up for live tool-output streams: whoever just started viewing
         // gets full scrollback-so-far, one sync frame per active buffer, sent
         // directly (not via hub coalescing) and synchronously — no append can
@@ -709,24 +755,27 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // awaits mid-handler, so a message dispatched to that case can
         // interleave with other work between its awaits. Scoped to the conn's
         // own user; buffersFor enforces it too.
-        if (conn.viewingConvoId && conn.kind === 'client') {
-          for (const b of toolStreams.buffersFor(conn.userId, conn.viewingConvoId)) {
-            conn.ws.send(JSON.stringify({
-              kind: 'ephemeral', convo_id: conn.viewingConvoId, message_ref: b.ref,
-              tool_stream: {
-                event: 'sync', meta: b.meta, offset: b.start,
-                content: b.content, head_truncated: b.headTruncated,
-              },
-            }))
-          }
-          // Header catch-up: replay the last cached status (same direct-send
-          // reasoning as the tool-stream syncs above) so the header populates
-          // on open instead of waiting for the next turn end.
-          const cachedStatus = statusCache.get(conn.userId, conn.viewingConvoId)
-          if (cachedStatus) {
-            conn.ws.send(JSON.stringify({
-              kind: 'ephemeral', convo_id: conn.viewingConvoId, status: cachedStatus,
-            }))
+        if (conn.kind === 'client') {
+          for (const convoId of next) {
+            if (!convoId || prev.has(convoId)) continue
+            for (const b of toolStreams.buffersFor(conn.userId, convoId)) {
+              conn.ws.send(JSON.stringify({
+                kind: 'ephemeral', convo_id: convoId, message_ref: b.ref,
+                tool_stream: {
+                  event: 'sync', meta: b.meta, offset: b.start,
+                  content: b.content, head_truncated: b.headTruncated,
+                },
+              }))
+            }
+            // Header catch-up: replay the last cached status (same direct-send
+            // reasoning as the tool-stream syncs above) so the header populates
+            // on open instead of waiting for the next turn end.
+            const cachedStatus = statusCache.get(conn.userId, convoId)
+            if (cachedStatus) {
+              conn.ws.send(JSON.stringify({
+                kind: 'ephemeral', convo_id: convoId, status: cachedStatus,
+              }))
+            }
           }
         }
         break
@@ -903,6 +952,28 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!fromConvo || fromConvo.owner_user_id !== conn.userId
           || fromConvo.agent_device_id !== conn.deviceId
           || fromConvo.parent_convo_id != null) return fail('not_found')
+        // Optional mission the child joins as soon as it exists (spec
+        // 2026-09-23 coordinator redesign §1c). Checked BEFORE the wake below
+        // so a doomed ask never starts a box, and before the card so the
+        // user is never asked about it. Resolved through the visibility sieve
+        // of BOTH ends: a mission the asker cannot see is no oracle
+        // (no_mission, same as unknown), and one the child could never read
+        // must not become its mission either. Unfiltered only when both are
+        // private devices.
+        let missionNum = null
+        let missionTitle = ''
+        if (msg.mission_num != null) {
+          if (!Number.isInteger(msg.mission_num) || msg.mission_num < 1) return fail('bad_request', 'bad mission_num')
+          const excludePrivateOwned = !isPrivateDevice(db, conn.deviceId) || !isPrivateDevice(db, msg.target_device_id)
+          const mission = getMission(db, conn.userId, msg.mission_num, { excludePrivateOwned })
+          if (!mission) return fail('no_mission', `mission #${msg.mission_num} not found`)
+          if (mission.state !== 'open') return fail('mission_closed', `mission #${msg.mission_num} is closed`)
+          missionNum = mission.num
+          // Shown on the client-only card (agents never receive it), so the
+          // user sees the mission they are sending the child to. Sieved like
+          // from_convo_title.
+          missionTitle = sanitizePeerText(mission.title, CARD_TITLE_MAX_CHARS)
+        }
         // A box with no live socket is asleep when this journal can wake it
         // (wake-before-spawn): fire the wake now and park the ask as usual —
         // the user's tap takes minutes anyway, and approveSpawn waits for the
@@ -927,7 +998,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         createSpawnRequest(db, {
           id: spawnId, userId: conn.userId, fromDeviceId: conn.deviceId,
           fromConvoId: msg.from_convo_id, targetDeviceId: msg.target_device_id,
-          workdir, task, topic, model, link,
+          workdir, task, topic, model, link, missionNum,
         })
         // Client-only card (isClientOnlyEvent covers kind:'agent_spawn'),
         // published into the PARENT's own conversation — where the user is
@@ -959,6 +1030,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           // one says nothing about a room — the common case stays the
           // card shape every client already renders.
           ...(link ? { link: true } : {}),
+          // Same omit-when-absent stance: the card says "joins mission #N"
+          // only for an ask that named one.
+          ...(missionNum ? { mission_num: missionNum } : {}),
+          ...(missionNum && missionTitle ? { mission_title: missionTitle } : {}),
         }
         let cardAppend
         try {

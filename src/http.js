@@ -15,6 +15,8 @@ import { closeChatConsentItem } from './consent-items.js'
 import { wakeIfOffline, isWakeableBoxName } from './wake.js'
 import { handleItemsRoute } from './items-http.js'
 import { handleMissionsRoute } from './missions-http.js'
+import { handleCoordinatorRoute } from './coordinator-http.js'
+import { coordinatorFor } from './coordinator.js'
 import { json, readBody } from './http-body.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
@@ -243,6 +245,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       // outer try/catch so readBody's 400/413 map like every other route's.
       if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription }, req, res, url, who)) return
       if (await handleMissionsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
+      if (await handleCoordinatorRoute({ db, hub }, req, res, url, who)) return
       if (req.method === 'GET' && url.pathname === '/help') {
         // API discovery for agent callers (see src/help.js). Behind auth like
         // the rest of the device surface: it describes the API, and the
@@ -260,7 +263,10 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         //     agent only — same one-caller-rule predicate as /roster and
         //     /search, so /snapshot can't be used as an end-run around them.
         const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
-        return json(res, 200, snapshot(db, who.userId, { omitSnippet: who.kind === 'agent', excludePrivateOwned: filtered }))
+        return json(res, 200, {
+          ...snapshot(db, who.userId, { omitSnippet: who.kind === 'agent', excludePrivateOwned: filtered }),
+          coordinator_convo_id: coordinatorFor(db, who.userId, { excludePrivateOwned: filtered }),
+        })
       }
       if (req.method === 'GET' && url.pathname === '/metrics') {
         // Any valid device (client or agent) — no admin-only concept in v1.
