@@ -1,5 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { GithubError } from '../src/github.js'
@@ -251,4 +254,43 @@ test('GET /me reports is_admin', async (t) => {
   s.db.prepare('UPDATE users SET is_admin=1 WHERE id=?').run(dan.id)
   assert.deepEqual((await s.http('/me', { token: danTok })).json.user, { id: dan.id, name: 'dan', is_admin: true })
   assert.equal((await s.http('/me', { token: agent.token })).json.user.is_admin, true, '/me describes the user, not the device')
+})
+
+test('with MATRON_TOKEN_KEY: link, refresh and unlink work; the plaintext token is nowhere in the database files; a restart without the key logs and leaves the link alone (review focus 5)', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-token-key-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'j.db')
+  const secret = 'gho_' + 'f00dcafe'.repeat(5)
+  const gh = fakeGithub()
+  gh.q.poll.push(() => ({ status: 'ok', token: secret }))
+  const s = await startTestServer({ dbPath, github: gh, tokenKey: 'ab'.repeat(32) })
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const danTok = (await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })).json.token
+  const start = await s.http('/github/link', { method: 'POST', token: danTok, body: { flow: 'device' } })
+  const linked = await s.http(`/github/link/${start.json.flow_id}/poll`, { method: 'POST', token: danTok })
+  assert.equal(linked.json.status, 'linked')
+  const row = s.db.prepare('SELECT token, token_hash FROM github_accounts WHERE user_id=?').get(dan.id)
+  assert.ok(row.token.startsWith('enc1:')); assert.ok(row.token_hash)
+  gh.q.identity.push(() => ({ github_id: 42, login: 'DanBarker', scopes: ['github.com/matronhq', 'github.com/second'] }))
+  const refreshed = await s.http('/github/refresh', { method: 'POST', token: danTok })
+  assert.equal(refreshed.status, 200); assert.deepEqual(refreshed.json.github.orgs, ['github.com/matronhq', 'github.com/second'])
+  await s.close()
+  const bytes = Buffer.concat(['', '-wal', '-shm'].map((sfx) => { try { return fs.readFileSync(dbPath + sfx) } catch { return Buffer.alloc(0) } }))
+  assert.ok(!bytes.includes(secret), 'the plaintext token must not be on disk')
+
+  // Restart without the key: the sealed row is unreadable, not stale.
+  const logs = []
+  const s2 = await startTestServer({ dbPath, github: gh, tokenKey: '', githubRefreshIntervalMs: 3600000 })
+  const origLog = console.log; console.log = (...a) => { logs.push(a.join(' ')); origLog(...a) }
+  t.after(() => { console.log = origLog })
+  const danTok2 = (await s2.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac2' } })).json.token
+  const r = await s2.http('/github/refresh', { method: 'POST', token: danTok2 })
+  assert.equal(r.status, 502)
+  assert.equal((await s2.http('/me', { token: danTok2 })).json.github.state, 'ok')
+  const { runGithubRefresh } = await import('../src/github-refresh.js')
+  const out = await runGithubRefresh(s2.db, gh, { log: (l) => logs.push(l) })
+  assert.deepEqual(out, { refreshed: 0, stale: 0, unchanged: 1 })
+  assert.ok(logs.some((l) => /token_sealed/.test(l)), 'the operator is told the key is missing')
+  assert.deepEqual((await s2.http('/github/link', { method: 'DELETE', token: danTok2 })).json, { ok: true })
+  await s2.close()
 })

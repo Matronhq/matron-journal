@@ -3,6 +3,7 @@
 // refresh job call these. The token column is written here and read by
 // listGithubAccounts (the refresh job) — no view ever returns it.
 import { randomBytes } from 'node:crypto'
+import { PLAIN_BOX, isSealed, tokenHash } from './token-box.js'
 
 export const LINK_FLOW_TTL_MS = 10 * 60 * 1000
 
@@ -14,14 +15,15 @@ export function githubAccountView(db, userId) {
 }
 
 // One GitHub identity per journal user, one journal user per identity.
-export function saveGithubIdentity(db, { userId, host, identity, token, now = Date.now() }) {
+export function saveGithubIdentity(db, { userId, host, identity, token, now = Date.now(), box = PLAIN_BOX }) {
   return db.transaction(() => {
     const other = db.prepare('SELECT user_id FROM github_accounts WHERE host=? AND github_id=? AND user_id<>?').get(host, identity.github_id, userId)
     if (other) throw new Error('github_conflict')
-    db.prepare(`INSERT INTO github_accounts(user_id, host, github_id, login, token, state, checked_at, linked_at)
-      VALUES(?,?,?,?,?,'ok',?,?)
+    db.prepare(`INSERT INTO github_accounts(user_id, host, github_id, login, token, token_hash, state, checked_at, linked_at)
+      VALUES(?,?,?,?,?,?,'ok',?,?)
       ON CONFLICT(user_id) DO UPDATE SET host=excluded.host, github_id=excluded.github_id, login=excluded.login,
-        token=excluded.token, state='ok', checked_at=excluded.checked_at`).run(userId, host, identity.github_id, identity.login, token, now, now)
+        token=excluded.token, token_hash=excluded.token_hash, state='ok', checked_at=excluded.checked_at`)
+      .run(userId, host, identity.github_id, identity.login, box.seal(token), tokenHash(token), now, now)
     db.prepare('DELETE FROM github_orgs WHERE user_id=?').run(userId)
     const ins = db.prepare('INSERT INTO github_orgs(user_id, scope) VALUES(?,?)')
     for (const scope of new Set(identity.scopes)) ins.run(userId, scope)
@@ -33,10 +35,10 @@ export function saveGithubIdentity(db, { userId, host, identity, token, now = Da
 // refresh was started with, so an unlink or re-link that landed while
 // GitHub was being asked is never undone. Returns the view, or null when
 // nothing matched.
-export function updateGithubIdentity(db, { userId, token, identity, now = Date.now() }) {
+export function updateGithubIdentity(db, { userId, tokenHash: hash, identity, now = Date.now() }) {
   return db.transaction(() => {
     const r = db.prepare(`UPDATE github_accounts SET github_id=?, login=?, state='ok', checked_at=?
-      WHERE user_id=? AND token=?`).run(identity.github_id, identity.login, now, userId, token)
+      WHERE user_id=? AND token_hash=?`).run(identity.github_id, identity.login, now, userId, hash)
     if (r.changes === 0) return null
     db.prepare('DELETE FROM github_orgs WHERE user_id=?').run(userId)
     const ins = db.prepare('INSERT INTO github_orgs(user_id, scope) VALUES(?,?)')
@@ -56,9 +58,9 @@ export function githubIdentityBoundElsewhere(db, { host, githubId, userId }) {
   return !!db.prepare('SELECT 1 FROM github_accounts WHERE host=? AND github_id=? AND user_id<>?').get(host, githubId, userId)
 }
 
-export function markGithubStale(db, userId, { token = null, now = Date.now() } = {}) {
-  if (token != null) {
-    db.prepare("UPDATE github_accounts SET state='stale', checked_at=? WHERE user_id=? AND token=?").run(now, userId, token)
+export function markGithubStale(db, userId, { tokenHash: hash = null, now = Date.now() } = {}) {
+  if (hash != null) {
+    db.prepare("UPDATE github_accounts SET state='stale', checked_at=? WHERE user_id=? AND token_hash=?").run(now, userId, hash)
   } else {
     db.prepare("UPDATE github_accounts SET state='stale', checked_at=? WHERE user_id=?").run(now, userId)
   }
@@ -69,7 +71,7 @@ export function deleteGithubAccount(db, userId) {
 }
 
 export function listGithubAccounts(db) {
-  return db.prepare('SELECT user_id, host, token FROM github_accounts ORDER BY user_id').all()
+  return db.prepare('SELECT user_id, host, token, token_hash FROM github_accounts ORDER BY user_id').all()
 }
 
 export function createLinkFlow(db, { userId, deviceId, flow, deviceCode = null, state = null, ttlMs = LINK_FLOW_TTL_MS, now = Date.now() }) {
@@ -97,23 +99,48 @@ export function takeLinkFlow(db, { id = null, state = null, now = Date.now() }) 
 // The nonce is the page's only credential: single-use, unguessable, and
 // swept with the same TTL as a flow. The token sits here for at most that
 // long and is deleted on link, cancel or expiry.
-export function createLinkConfirm(db, { userId, token, identity, ttlMs = LINK_FLOW_TTL_MS, now = Date.now() }) {
+export function createLinkConfirm(db, { userId, token, identity, ttlMs = LINK_FLOW_TTL_MS, now = Date.now(), box = PLAIN_BOX }) {
   const id = `gc_${randomBytes(8).toString('hex')}`
   const nonce = randomBytes(16).toString('hex')
   db.prepare('INSERT INTO github_link_confirms(id, user_id, nonce, token, identity_json, expires_at, created_at) VALUES(?,?,?,?,?,?,?)')
-    .run(id, userId, nonce, token, JSON.stringify(identity), now + ttlMs, now)
+    .run(id, userId, nonce, box.seal(token), JSON.stringify(identity), now + ttlMs, now)
   return { id, nonce }
 }
 
 // Returns {user_id, token, identity} and deletes the row — a confirm is
 // finished by exactly one POST, link or cancel. Expired rows are swept on
 // read and answer null.
-export function takeLinkConfirm(db, { nonce, now = Date.now() }) {
+export function takeLinkConfirm(db, { nonce, now = Date.now(), box = PLAIN_BOX }) {
   return db.transaction(() => {
     db.prepare('DELETE FROM github_link_confirms WHERE expires_at <= ?').run(now)
     const row = db.prepare('SELECT user_id, token, identity_json FROM github_link_confirms WHERE nonce=?').get(nonce)
     if (!row) return null
     db.prepare('DELETE FROM github_link_confirms WHERE nonce=?').run(nonce)
-    return { user_id: row.user_id, token: row.token, identity: JSON.parse(row.identity_json) }
+    return { user_id: row.user_id, token: box.open(row.token), identity: JSON.parse(row.identity_json) }
+  })()
+}
+
+// Boot-time upgrade (server.js): seal every plaintext token when a key is
+// configured, and backfill token_hash for rows written before the column
+// existed. Idempotent; a key-less journal only backfills hashes.
+export function sealStoredTokens(db, box) {
+  return db.transaction(() => {
+    const out = { sealed: 0, hashed: 0 }
+    for (const r of db.prepare('SELECT user_id, token, token_hash FROM github_accounts').all()) {
+      if (isSealed(r.token)) continue
+      const hash = r.token_hash ?? tokenHash(r.token)
+      if (r.token_hash == null) out.hashed++
+      const stored = box.seal(r.token)
+      if (stored !== r.token) out.sealed++
+      db.prepare('UPDATE github_accounts SET token=?, token_hash=? WHERE user_id=?').run(stored, hash, r.user_id)
+    }
+    for (const r of db.prepare('SELECT id, token FROM github_link_confirms').all()) {
+      if (isSealed(r.token)) continue
+      const stored = box.seal(r.token)
+      if (stored === r.token) continue
+      out.sealed++
+      db.prepare('UPDATE github_link_confirms SET token=? WHERE id=?').run(stored, r.id)
+    }
+    return out
   })()
 }

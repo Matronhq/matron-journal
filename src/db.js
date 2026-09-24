@@ -627,6 +627,13 @@ export function openDb(path) {
       created_at    INTEGER NOT NULL
     );
   `)
+  // SHA-256 of the plaintext token: the refresh path's "only touch the row
+  // I read" guard compares this, so the token column itself can be sealed
+  // (src/token-box.js). NULL only until sealStoredTokens runs at boot.
+  const ghCols = db.prepare('PRAGMA table_info(github_accounts)').all()
+  if (!ghCols.some((c) => c.name === 'token_hash')) {
+    db.exec('ALTER TABLE github_accounts ADD COLUMN token_hash TEXT')
+  }
   // Journal admins (spec 2026-09-23 tracker web/teams, "User
   // administration"). Bootstrapped from the shell with
   // `matron-admin user admin <name> on`; the users admin routes need at

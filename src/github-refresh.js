@@ -4,15 +4,16 @@
 // and never throws out of the tick.
 import { listGithubAccounts } from './github-accounts.js'
 import { refreshGithubAccount } from './github-http.js'
+import { PLAIN_BOX } from './token-box.js'
 
 export const GITHUB_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000
 
-export async function runGithubRefresh(db, github, { now = Date.now(), log = console.log } = {}) {
+export async function runGithubRefresh(db, github, { now = Date.now(), log = console.log, box = PLAIN_BOX } = {}) {
   const out = { refreshed: 0, stale: 0, unchanged: 0 }
   for (const acct of listGithubAccounts(db)) {
     let r
     try {
-      r = await refreshGithubAccount(db, github, acct.user_id, now)
+      r = await refreshGithubAccount(db, github, acct.user_id, now, { box })
     } catch (err) {
       log(`github-refresh: user=${acct.user_id} failed: ${err.message}`)
       out.unchanged++
@@ -26,9 +27,9 @@ export async function runGithubRefresh(db, github, { now = Date.now(), log = con
   return out
 }
 
-export function scheduleGithubRefresh(db, github, { intervalMs = GITHUB_REFRESH_INTERVAL_MS, log = console.log } = {}) {
+export function scheduleGithubRefresh(db, github, { intervalMs = GITHUB_REFRESH_INTERVAL_MS, log = console.log, box = PLAIN_BOX } = {}) {
   if (!github || !github.enabled) return null
-  const run = () => { runGithubRefresh(db, github, { log }).catch((err) => console.error('github-refresh: run failed', err)) }
+  const run = () => { runGithubRefresh(db, github, { log, box }).catch((err) => console.error('github-refresh: run failed', err)) }
   run()
   const interval = setInterval(run, intervalMs)
   interval.unref()

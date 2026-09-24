@@ -12,6 +12,7 @@ import {
   createLinkFlow, takeLinkFlow, LINK_FLOW_TTL_MS,
   githubIdentityBoundElsewhere, createLinkConfirm, takeLinkConfirm,
 } from './github-accounts.js'
+import { PLAIN_BOX, tokenHash } from './token-box.js'
 
 const FLOWS = ['device', 'web']
 const notConfigured = (res) => { json(res, 404, { error: 'not_configured' }); return true }
@@ -20,9 +21,9 @@ const forbidden = (res) => { json(res, 403, { error: 'forbidden' }); return true
 
 // Turns a fresh token into a stored link. Shared by the poll and the
 // callback so the two flows cannot drift.
-export async function finishLink(db, github, { userId, token, now = Date.now() }) {
+export async function finishLink(db, github, { userId, token, now = Date.now(), box = PLAIN_BOX }) {
   const identity = await github.fetchIdentity(token)
-  return saveGithubIdentity(db, { userId, host: github.host, identity, token, now })
+  return saveGithubIdentity(db, { userId, host: github.host, identity, token, now, box })
 }
 
 // Re-reads memberships with the stored token. 'stale' = GitHub refused the
@@ -32,17 +33,26 @@ export async function finishLink(db, github, { userId, token, now = Date.now() }
 // a different token (re-linked) by the time GitHub answers — the update is
 // scoped to that exact token so a stale write can never resurrect or
 // clobber the row that replaced it (final review, revoke/re-link race).
-export async function refreshGithubAccount(db, github, userId, now = Date.now()) {
-  const row = db.prepare('SELECT token FROM github_accounts WHERE user_id=?').get(userId)
+export async function refreshGithubAccount(db, github, userId, now = Date.now(), { box = PLAIN_BOX } = {}) {
+  const row = db.prepare('SELECT token, token_hash FROM github_accounts WHERE user_id=?').get(userId)
   if (!row) return null
+  let token
   try {
-    const identity = await github.fetchIdentity(row.token)
-    const view = updateGithubIdentity(db, { userId, token: row.token, identity, now })
+    token = box.open(row.token)
+  } catch (err) {
+    // Sealed under a key this process does not have (or a corrupted row):
+    // say so and keep everything — never stale, never a crash.
+    return { view: githubAccountView(db, userId), outcome: 'unchanged', error: { code: err.message } }
+  }
+  const hash = row.token_hash ?? tokenHash(token)
+  try {
+    const identity = await github.fetchIdentity(token)
+    const view = updateGithubIdentity(db, { userId, tokenHash: hash, identity, now })
     if (!view) return { view: githubAccountView(db, userId), outcome: 'unchanged' }
     return { view, outcome: 'ok' }
   } catch (err) {
     if (err instanceof GithubError && err.code === 'unauthorized') {
-      markGithubStale(db, userId, { token: row.token, now })
+      markGithubStale(db, userId, { tokenHash: hash, now })
       return { view: githubAccountView(db, userId), outcome: 'stale' }
     }
     if (err instanceof GithubError) return { view: githubAccountView(db, userId), outcome: 'unchanged', error: err }
@@ -51,7 +61,7 @@ export async function refreshGithubAccount(db, github, userId, now = Date.now())
 }
 
 export async function handleGithubRoute(ctx, req, res, url, who) {
-  const { db, github, rateLimiter } = ctx
+  const { db, github, rateLimiter, tokenBox = PLAIN_BOX } = ctx
   const path = url.pathname
   if (path !== '/github/link' && path !== '/github/refresh' && !path.startsWith('/github/link/')) return false
   if (who.kind !== 'client') return forbidden(res)
@@ -94,7 +104,7 @@ export async function handleGithubRoute(ctx, req, res, url, who) {
     takeLinkFlow(db, { id: row.id })
     if (poll.status !== 'ok') { json(res, 200, { status: poll.status }); return true }
     try {
-      const view = await finishLink(db, github, { userId: who.userId, token: poll.token })
+      const view = await finishLink(db, github, { userId: who.userId, token: poll.token, box: tokenBox })
       json(res, 200, { status: 'linked', github: view })
     } catch (err) {
       if (err.message === 'github_conflict') return conflict(res)
@@ -111,7 +121,7 @@ export async function handleGithubRoute(ctx, req, res, url, who) {
   }
 
   if (path === '/github/refresh' && req.method === 'POST') {
-    const r = await refreshGithubAccount(db, github, who.userId)
+    const r = await refreshGithubAccount(db, github, who.userId, Date.now(), { box: tokenBox })
     if (!r) return notFound(res)
     if (r.outcome === 'unchanged') return upstream(res)
     json(res, 200, { github: r.view })
@@ -168,17 +178,22 @@ async function readFormOrJson(req) {
 // finishes it: 'link' saves, anything else discards. Every failure
 // redirects into the web app's account page so a user never sees raw JSON.
 export async function handleGithubCallback(ctx, req, res, url) {
-  const { db, github } = ctx
+  const { db, github, tokenBox = PLAIN_BOX } = ctx
   const redirect = (to) => { res.writeHead(302, { location: to }); res.end(); return true }
   if (url.pathname === '/github/callback/confirm' && req.method === 'POST') {
     const body = await readFormOrJson(req)
     if (typeof body.nonce !== 'string' || !/^[0-9a-f]{32}$/.test(body.nonce)) return redirect('/account?link_error=bad_request')
-    const parked = takeLinkConfirm(db, { nonce: body.nonce })
+    let parked
+    try {
+      parked = takeLinkConfirm(db, { nonce: body.nonce, box: tokenBox })
+    } catch {
+      return redirect('/account?link_error=expired')
+    }
     if (!parked) return redirect('/account?link_error=expired')
     if (body.decision !== 'link') return redirect('/account?link_error=denied')
     if (!github || !github.enabled) return redirect('/account?link_error=not_configured')
     try {
-      saveGithubIdentity(db, { userId: parked.user_id, host: github.host, identity: parked.identity, token: parked.token })
+      saveGithubIdentity(db, { userId: parked.user_id, host: github.host, identity: parked.identity, token: parked.token, box: tokenBox })
     } catch (err) {
       if (err.message === 'github_conflict') return redirect('/account?link_error=conflict')
       throw err
@@ -204,7 +219,7 @@ export async function handleGithubCallback(ctx, req, res, url) {
   if (githubIdentityBoundElsewhere(db, { host: github.host, githubId: identity.github_id, userId: row.user_id })) return redirect('/account?link_error=conflict')
   const user = db.prepare('SELECT name FROM users WHERE id=?').get(row.user_id)
   if (!user) return redirect('/account?link_error=expired')
-  const { nonce } = createLinkConfirm(db, { userId: row.user_id, token, identity })
+  const { nonce } = createLinkConfirm(db, { userId: row.user_id, token, identity, box: tokenBox })
   res.writeHead(200, {
     'content-type': 'text/html; charset=utf-8',
     'cache-control': 'no-store',

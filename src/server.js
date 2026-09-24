@@ -25,6 +25,8 @@ import { makeTranscriber } from './transcribe.js'
 import { makeItemTranscription } from './items-transcribe.js'
 import { emitTranscriptionMarker } from './items-http.js'
 import { makeGithub, DEFAULT_GITHUB_CLIENT_ID } from './github.js'
+import { makeTokenBox } from './token-box.js'
+import { sealStoredTokens } from './github-accounts.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
@@ -291,11 +293,17 @@ export function startServer({
   // pays it.
   spawnWakeWaitMs = resolveNumericEnv('MATRON_SPAWN_WAKE_WAIT_MS', process.env.MATRON_SPAWN_WAKE_WAIT_MS, 240000),
   mediaReapHighPct, mediaReapLowPct, waker, transcriber, github, githubRefreshIntervalMs, webDir,
-  appleAppIds, androidPackage, androidCertSha256,
+  appleAppIds, androidPackage, androidCertSha256, tokenKey,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
   const db = openDb(resolvedDbPath)
+  // Token encryption at rest (spec 2026-09-23 tracker web/teams). The
+  // option is the test seam; env otherwise. A key that appears after rows
+  // exist seals them here, once.
+  const tokenBox = makeTokenBox(tokenKey !== undefined ? tokenKey : process.env.MATRON_TOKEN_KEY)
+  const sealed = sealStoredTokens(db, tokenBox)
+  if (sealed.sealed) console.log(`github: sealed ${sealed.sealed} stored token(s) under MATRON_TOKEN_KEY`)
   // WAL-checkpoint tail mitigation, server half (docs/wal-checkpoint-profile.md;
   // journal_size_limit lives in openDb). With synchronous=NORMAL the
   // auto-checkpoint is the only steady-state fsync and it runs INLINE in
@@ -375,7 +383,7 @@ export function startServer({
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription,
-    github: resolvedGithub, handleWellKnown, handleStatic,
+    github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
@@ -400,7 +408,7 @@ export function startServer({
         mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
-      githubRefreshInterval = scheduleGithubRefresh(db, resolvedGithub, { intervalMs: githubRefreshIntervalMs })
+      githubRefreshInterval = scheduleGithubRefresh(db, resolvedGithub, { intervalMs: githubRefreshIntervalMs, box: tokenBox })
       // Whatever a previous process left mid-transcription: a bridge is
       // holding a turn for each, so finish them (or fail them) now.
       itemTranscription.recover()

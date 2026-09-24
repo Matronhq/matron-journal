@@ -565,7 +565,7 @@ test('schema: repo columns and github tables exist', () => {
   const cols = (t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name)
   assert.ok(cols('conversations').includes('repo'))
   assert.ok(cols('conversations').includes('repo_scope'))
-  assert.deepEqual(cols('github_accounts'), ['user_id', 'host', 'github_id', 'login', 'token', 'state', 'checked_at', 'linked_at'])
+  assert.deepEqual(cols('github_accounts'), ['user_id', 'host', 'github_id', 'login', 'token', 'state', 'checked_at', 'linked_at', 'token_hash'])
   assert.deepEqual(cols('github_orgs'), ['user_id', 'scope'])
   assert.deepEqual(cols('github_link_flows'), ['id', 'user_id', 'device_id', 'flow', 'device_code', 'state', 'expires_at', 'created_at'])
   db.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()

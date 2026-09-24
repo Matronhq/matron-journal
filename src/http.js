@@ -83,7 +83,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, itemTranscription = null, github = null, handleWellKnown = () => false, handleStatic = async () => false }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, itemTranscription = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -243,7 +243,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         if (!l) return json(res, 429, { error: 'rate_limited' })
         return json(res, 200, { link_code: l.linkCode, expires_in: l.expiresIn })
       }
-      if (await handleGithubCallback({ db, github }, req, res, url)) return
+      if (await handleGithubCallback({ db, github, tokenBox: tokenBox || undefined }, req, res, url)) return
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       // The tracker's own surface (src/items-http.js) — mounted first so
@@ -251,7 +251,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       // outer try/catch so readBody's 400/413 map like every other route's.
       if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription }, req, res, url, who)) return
       if (await handleMissionsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
-      if (await handleGithubRoute({ db, github, rateLimiter }, req, res, url, who)) return
+      if (await handleGithubRoute({ db, github, rateLimiter, tokenBox: tokenBox || undefined }, req, res, url, who)) return
       if (handleLookupRoute({ db }, req, res, url, who)) return
       if (await handleUsersRoute({ db, links }, req, res, url, who)) return
       if (req.method === 'GET' && url.pathname === '/me') {
