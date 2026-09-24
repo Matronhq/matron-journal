@@ -55,6 +55,22 @@ const STATUS_CACHE_MAX = 2048
 const RPC_MAX_BYTES = 16384
 const RPC_ID_MAX_CHARS = 128
 const RPC_NAME_MAX_CHARS = 64 // method and error.code
+// `viewing {convo_ids}`: at most VIEWING_SET_MAX distinct conversations per
+// connection (the Coordinator shows two; headroom, not a use case). Returns
+// the de-duplicated Set, or null when the value is not an array of non-empty
+// strings each ≤ CONVO_ID_MAX_CHARS, or has more than the cap after de-dup.
+const VIEWING_SET_MAX = 4
+function parseViewingConvoIds(value) {
+  if (!Array.isArray(value)) return null
+  const out = new Set()
+  for (const id of value) {
+    if (typeof id !== 'string' || !id || id.length > CONVO_ID_MAX_CHARS) return null
+    out.add(id)
+    if (out.size > VIEWING_SET_MAX) return null
+  }
+  return out
+}
+
 // CONVO_ID_MAX_CHARS (128, imported above) caps a parent_convo_id sent by a
 // bridge — see its doc comment in journal.js for why it lives there.
 // Cap for a session_outcome sent by a bridge. Shape-only, like the
@@ -400,7 +416,7 @@ export function attachWs({
           // for every op handled today: any journal append it triggers gets a seq greater
           // than the in-flight cursor, so it's picked up by a later replay batch rather
           // than lost. Revisit this assumption if a future op has other side effects.
-          conn = { ws, ...who, viewingConvoId: null }
+          conn = { ws, ...who, viewingConvoIds: new Set() }
           conn.username = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId).name
           const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(who.userId)
           const headSeq = head ? head.seq : 0
@@ -707,7 +723,27 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
   try {
     switch (msg.op) {
       case 'viewing': {
-        conn.viewingConvoId = msg.convo_id ?? null
+        // `convo_ids` (optional) is the FULL set of conversations this
+        // connection is looking at — the Coordinator puts two live chats on
+        // screen at once. Without it, `convo_id` (string|null) means {convo_id}
+        // or {} exactly as before. A bad `convo_ids` is rejected and leaves
+        // the current set untouched.
+        //
+        // Catch-up (below) for the set form runs only for convos newly ADDED
+        // to the set. The single form keeps its old behaviour of catching up
+        // on every send, even for the convo already viewed: shipped clients
+        // re-send `viewing` for the same convo to force a tool-stream resync.
+        let next
+        let prev
+        if (msg.convo_ids !== undefined) {
+          next = parseViewingConvoIds(msg.convo_ids)
+          if (!next) return fail('bad_request', `convo_ids must be an array of at most ${VIEWING_SET_MAX} non-empty convo id strings`)
+          prev = conn.viewingConvoIds
+        } else {
+          next = new Set(msg.convo_id == null ? [] : [msg.convo_id])
+          prev = new Set()
+        }
+        conn.viewingConvoIds = next
         // Catch-up for live tool-output streams: whoever just started viewing
         // gets full scrollback-so-far, one sync frame per active buffer, sent
         // directly (not via hub coalescing) and synchronously — no append can
@@ -717,24 +753,27 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // awaits mid-handler, so a message dispatched to that case can
         // interleave with other work between its awaits. Scoped to the conn's
         // own user; buffersFor enforces it too.
-        if (conn.viewingConvoId && conn.kind === 'client') {
-          for (const b of toolStreams.buffersFor(conn.userId, conn.viewingConvoId)) {
-            conn.ws.send(JSON.stringify({
-              kind: 'ephemeral', convo_id: conn.viewingConvoId, message_ref: b.ref,
-              tool_stream: {
-                event: 'sync', meta: b.meta, offset: b.start,
-                content: b.content, head_truncated: b.headTruncated,
-              },
-            }))
-          }
-          // Header catch-up: replay the last cached status (same direct-send
-          // reasoning as the tool-stream syncs above) so the header populates
-          // on open instead of waiting for the next turn end.
-          const cachedStatus = statusCache.get(conn.userId, conn.viewingConvoId)
-          if (cachedStatus) {
-            conn.ws.send(JSON.stringify({
-              kind: 'ephemeral', convo_id: conn.viewingConvoId, status: cachedStatus,
-            }))
+        if (conn.kind === 'client') {
+          for (const convoId of next) {
+            if (!convoId || prev.has(convoId)) continue
+            for (const b of toolStreams.buffersFor(conn.userId, convoId)) {
+              conn.ws.send(JSON.stringify({
+                kind: 'ephemeral', convo_id: convoId, message_ref: b.ref,
+                tool_stream: {
+                  event: 'sync', meta: b.meta, offset: b.start,
+                  content: b.content, head_truncated: b.headTruncated,
+                },
+              }))
+            }
+            // Header catch-up: replay the last cached status (same direct-send
+            // reasoning as the tool-stream syncs above) so the header populates
+            // on open instead of waiting for the next turn end.
+            const cachedStatus = statusCache.get(conn.userId, convoId)
+            if (cachedStatus) {
+              conn.ws.send(JSON.stringify({
+                kind: 'ephemeral', convo_id: convoId, status: cachedStatus,
+              }))
+            }
           }
         }
         break

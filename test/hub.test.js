@@ -35,7 +35,7 @@ test('mergeEphemeral: end/sync/legacy/non-contiguous fall back to latest-wins', 
 test('sendEphemeral flush delivers concatenated appends; text overlays still latest-wins', async () => {
   const hub = makeHub({ coalesceMs: 20 })
   const sent = []
-  const conn = { userId: 1, deviceId: 7, kind: 'client', viewingConvoId: 'c1', ws: { readyState: 1, send: (d) => sent.push(JSON.parse(d)) } }
+  const conn = { userId: 1, deviceId: 7, kind: 'client', viewingConvoIds: new Set(['c1']), ws: { readyState: 1, send: (d) => sent.push(JSON.parse(d)) } }
   hub.register(conn)
   hub.sendEphemeral(1, 'c1', ts({ event: 'append', offset: 0, chunk: 'ab' }))
   hub.sendEphemeral(1, 'c1', ts({ event: 'append', offset: 2, chunk: 'cd' }))

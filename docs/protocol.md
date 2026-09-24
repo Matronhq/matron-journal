@@ -394,6 +394,24 @@ an agent token, selected by which query parameter is present:
   `up_to_seq: null` resolves server-side to the conversation's current
   `last_seq` at processing time, so a fire-and-forget publisher never needs
   to learn the seq it was assigned; explicit integers keep working as before.
+- `viewing {convo_id}` / `viewing {convo_ids}` tells the server which
+  conversations this connection has on screen; viewing-scoped ephemerals
+  (`stream`, `stream_append`, `activity`, `status`) go only to connections
+  viewing that conversation, and a device viewing it gets no push for it.
+  Each connection views a SET of conversations:
+  - `convo_ids: string[]` (optional) is the full set — e.g. the Coordinator
+    panel beside a chat, or a chat sheet over another chat. Each id a
+    non-empty string ≤ 128 chars; duplicates are collapsed; at most 4
+    distinct ids; `[]` views nothing. Anything else (not an array, a
+    non-string / empty / oversized id, more than 4) → `bad_request` with
+    `ref: 'viewing'`, and the connection's set is left unchanged. The
+    catch-up (tool-stream `sync` frames + cached `status`, see below) is
+    sent only for conversations newly added to the set.
+  - Without `convo_ids`, `convo_id` (string|null) sets the set to
+    `{convo_id}` or `{}` — the original single-conversation form, unchanged.
+    It still sends the catch-up on every `viewing`, even for the
+    conversation already viewed: clients re-send it to force a resync.
+  `convo_ids` wins when both keys are present.
 - Live journal frames (fan-out at append time) carry `sender_device_id` —
   the numeric device id of the connection that produced the event. Device
   names have no unique constraint, so this is the only exact own-echo test
@@ -2199,7 +2217,7 @@ considers each of that user's *client* devices with a registered token
 (agent devices are never pushed to):
 
 - skipped when that device is connected and actively `viewing` the event's
-  conversation, or when its acked cursor already covers the event's `seq`,
+  conversation (any conversation in a connection's viewed set counts), or when its acked cursor already covers the event's `seq`,
   or when its `push_prefs` (see `PUT /push/prefs`) explicitly disable the
   event's category — `wake` background pushes are never prefs-filtered.
 - `prompt` / `permission_request` push immediately at priority 10
