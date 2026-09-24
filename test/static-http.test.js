@@ -9,8 +9,13 @@ import { startTestServer } from './helpers.js'
 import { createUser } from '../src/auth.js'
 import { resolveWebDir } from '../src/static-http.js'
 
+// The web dir and the file it must never leak (outside.txt) live inside a
+// single self-contained parent tmpdir, so a test that removes its fixture
+// removes everything it created and nothing lingers under os.tmpdir().
 function webDir() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-web-'))
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-web-'))
+  const dir = path.join(parent, 'web')
+  fs.mkdirSync(dir)
   fs.writeFileSync(path.join(dir, 'index.html'), '<!doctype html><title>Matron</title>')
   fs.mkdirSync(path.join(dir, 'assets'))
   fs.writeFileSync(path.join(dir, 'assets', 'app-abc123.js'), 'console.log(1)')
@@ -18,13 +23,29 @@ function webDir() {
   fs.mkdirSync(path.join(dir, '.git'))
   fs.writeFileSync(path.join(dir, '.git', 'config'), '[core]')
   fs.writeFileSync(path.join(dir, '.env'), 'SECRET=1')
-  fs.writeFileSync(path.join(path.dirname(dir), 'outside.txt'), 'outside')
-  return dir
+  fs.writeFileSync(path.join(parent, 'outside.txt'), 'outside')
+  return { dir, parent }
+}
+
+// A raw socket request whose path is sent to the server exactly as given —
+// unlike fetch()/undici, which normalise `..` segments in the URL before
+// the request ever leaves the client, so a traversal attempt never reaches
+// the server's own path handling in the first place.
+function rawGet(base, reqPath) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(base, { method: 'GET', path: reqPath, agent: false }, (res) => {
+      let data = ''
+      res.on('data', (c) => { data += c })
+      res.on('end', () => resolve({ status: res.statusCode, body: data }))
+    })
+    req.on('error', reject)
+    req.end()
+  })
 }
 
 test('static: files, index fallback for /u/* and /app/*, root redirect, HEAD, cache headers', async (t) => {
-  const dir = webDir()
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const { dir, parent } = webDir()
+  t.after(() => fs.rmSync(parent, { recursive: true, force: true }))
   const s = await startTestServer({ webDir: dir })
   t.after(() => s.close())
   const get = (p, headers = {}, method = 'GET') => fetch(s.base + p, { method, headers, redirect: 'manual' })
@@ -58,8 +79,8 @@ test('static: files, index fallback for /u/* and /app/*, root redirect, HEAD, ca
 })
 
 test('static: traversal, dot-segments, backslashes and NUL never serve; JSON Accept on /u/* reaches the lookup route (review focus 3, 4)', async (t) => {
-  const dir = webDir()
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const { dir, parent } = webDir()
+  t.after(() => fs.rmSync(parent, { recursive: true, force: true }))
   const s = await startTestServer({ webDir: dir })
   t.after(() => s.close())
   const get = (p, headers = {}) => fetch(s.base + p, { headers, redirect: 'manual' })
@@ -74,6 +95,15 @@ test('static: traversal, dot-segments, backslashes and NUL never serve; JSON Acc
   const r = await get('/u/dan/1', { authorization: `Bearer ${tok}`, accept: 'application/json' })
   assert.equal(r.status, 404, 'the JSON lookup answered (404: dan has no item 1), not index.html')
   assert.deepEqual(await r.json(), { error: 'not_found' })
+
+  // fetch() would normalise these two before the request ever left the
+  // client, so the traversal check above never actually reached the
+  // server with these bytes on the wire. A raw socket sends them as-is.
+  for (const p of ['/../outside.txt', '/..%2f..%2foutside.txt']) {
+    const raw = await rawGet(s.base, p)
+    assert.equal(raw.status, 401, `${p} (raw socket) fell through to the API (unauthenticated)`)
+    assert.ok(!raw.body.includes('outside'), `${p} (raw socket) leaked a file outside the web dir`)
+  }
 })
 
 test('static: unset MATRON_WEB_DIR changes nothing; a missing index.html makes the fallbacks fall through; a bad dir fails at boot', async (t) => {
@@ -94,8 +124,8 @@ test('static: unset MATRON_WEB_DIR changes nothing; a missing index.html makes t
 })
 
 test('static: a client that aborts mid-body never leaks the read stream or wedges the server (review fix round 1)', async (t) => {
-  const dir = webDir()
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const { dir, parent } = webDir()
+  t.after(() => fs.rmSync(parent, { recursive: true, force: true }))
   fs.writeFileSync(path.join(dir, 'assets', 'big-abc.bin'), crypto.randomBytes(8 * 1024 * 1024))
   const s = await startTestServer({ webDir: dir })
   t.after(() => s.close())

@@ -292,5 +292,16 @@ test('with MATRON_TOKEN_KEY: link, refresh and unlink work; the plaintext token 
   assert.deepEqual(out, { refreshed: 0, stale: 0, unchanged: 1 })
   assert.ok(logs.some((l) => /token_sealed/.test(l)), 'the operator is told the key is missing')
   assert.deepEqual((await s2.http('/github/link', { method: 'DELETE', token: danTok2 })).json, { ok: true })
+
+  // Unlinking an unreadable row must not leave the account stuck: a fresh
+  // link (this process has no key, so the new token is stored plain) works
+  // exactly as it would for a user who was never linked.
+  gh.q.poll.push(() => ({ status: 'ok', token: 'gho_replacement' }))
+  const relinkStart = await s2.http('/github/link', { method: 'POST', token: danTok2, body: { flow: 'device' } })
+  assert.equal(relinkStart.status, 200)
+  const relinkPoll = await s2.http(`/github/link/${relinkStart.json.flow_id}/poll`, { method: 'POST', token: danTok2 })
+  assert.equal(relinkPoll.status, 200); assert.equal(relinkPoll.json.status, 'linked')
+  const me2 = await s2.http('/me', { token: danTok2 })
+  assert.equal(me2.json.github.login, 'DanBarker'); assert.equal(me2.json.github.state, 'ok')
   await s2.close()
 })
