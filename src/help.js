@@ -47,8 +47,11 @@ docs/protocol.md in the matron-journal repo ("Journal search" for the index).
   works on a shared conversation.
 - \`GET /lookup?user=<name>&num=<n>\` — resolves a shareable link
   (\`https://<journal>/u/<name>/<n>\`) to \`{kind, id, owner}\`; 404 when
-  unknown or not visible to you. \`GET /me\` — who you are and your
-  GitHub link state.
+  unknown or not visible to you.
+- \`GET /me\` — \`{user:{id, name, is_admin}, github, github_linking}\`: who
+  you are, whether your user is a journal admin, and your GitHub link
+  state. The users admin routes themselves are for the web app's client
+  session, never for an agent.
 - \`GET /convo/:id/messages?around_seq=<seq>&limit=<n>\` on a colleague's
   shared conversation returns the prose window around \`seq\` (\`text\`
   and \`diff\` only, \`limit\` clamped to 30, logged).

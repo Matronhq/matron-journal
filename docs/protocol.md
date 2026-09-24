@@ -1752,7 +1752,7 @@ App id once one is registered — not configured in this release),
 | `POST /github/callback/confirm` | no Bearer; form or JSON `{nonce, decision:'link'\|'cancel'}` — the nonce is the credential | 302 to `/account?linked=1` (linked) or `/account?link_error=<denied\|expired\|bad_request\|conflict\|not_configured>`; the parked token is deleted either way |
 | `POST /github/refresh` | — | `{github}`; marks the link `stale` on 401/403 from GitHub; 502 `upstream` if unreachable (nothing changes); 404 if this user has no linked account |
 | `DELETE /github/link` | — | `{ok:true}`; 404 if not linked |
-| `GET /me` | — | `{user:{id,name}, github: {host, login, orgs, state, checked_at, linked_at} \| null, github_linking:{enabled, web_flow}}` |
+| `GET /me` | — | `{user:{id,name,is_admin}, github: {…} \| null, github_linking:{enabled, web_flow}}` |
 | `GET /lookup?user=<name>&num=<n>` | also `GET /u/<name>/<n>` with `Accept: application/json` | `{kind:'item'\|'mission'\|'milestone', id, owner:{user_id,name}}`; 404 unknown or invisible |
 
 Why the confirm page: an authorize URL can be handed to anyone, and GitHub's
@@ -1767,8 +1767,68 @@ link. Prefer the web flow where an OAuth App can be registered.
 The journal re-reads every linked user's memberships daily
 (`src/github-refresh.js`) and on `POST /github/refresh`. Flows expire
 after 10 minutes and are consumed by the poll or callback that finishes
-them. The token is stored in the journal DB, never returned by any route
-and never logged.
+them.
+
+The token is never returned by any route and never logged. With
+`MATRON_TOKEN_KEY` set (64 hex characters — `openssl rand -hex 32`) it is
+stored sealed with AES-256-GCM (`enc1:` prefix); a journal that gains the
+key seals its existing rows at the next start. Unset, it is stored as-is.
+The refresh path recognises its own row by `token_hash` (SHA-256 of the
+plaintext), so sealing changes no behaviour. Starting without the key after
+rows were sealed marks nothing stale: refreshes answer `502 upstream`, the
+daily job logs `token_sealed`, and unlink/re-link work as usual. Losing the
+key means every user re-links.
+
+## User administration
+
+Journal admins are users with `users.is_admin = 1`, bootstrapped from the
+shell: `matron-admin user admin <name> on|off`. Every route below is for a
+**client** device of an admin; any other caller — a non-admin, or an
+agent whatever its user's flag — gets `403 forbidden` for every verb,
+before any id is looked up. Mirrors `matron-admin` so the web app's admin
+page needs no shell.
+
+| Route | Body | Response |
+|---|---|---|
+| `GET /users` | — | `{users:[{id, name, is_admin, created_at, github:{login, state, host} \| null}]}` (no token, no hash) |
+| `POST /users` | `{name, password, is_admin?}` — name `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, password ≥ 8 | `201 {user}`; `400 bad_request` \| `400 weak_password`; `409 conflict` if the name is taken |
+| `PATCH /users/:id` | `{is_admin: boolean}` | `{user}`; `409 conflict {reason:'last_admin'}` when it would demote the only admin |
+| `POST /users/:id/password` | `{password}` ≥ 8 | `{ok:true}`; device tokens stay valid (same as `matron-admin user passwd`) |
+| `DELETE /users/:id/github-link` | — | `{ok:true}`; `404` if nothing linked. Resolves a `409 conflict` at link time |
+| `POST /users/:id/link-code` | `{ttl_seconds?}` (60–86400, default 600) | `{link_code, expires_in}` — the same pre-approved pairing code `matron-admin link-code` mints; the app builds `matron://link?v=1&server=<origin>&code=<link_code>` |
+
+Unknown `:id` is `404 not_found`. Self-service stays on the existing
+routes: `GET /devices`, `POST /devices/:id/revoke`, `POST /devices/:id/rename`,
+`POST /password`.
+
+## Static hosting and app links
+
+`MATRON_WEB_DIR` (unset by default — nothing changes) names a directory the
+journal serves read-only, before Bearer auth, for `GET`/`HEAD` only:
+
+- an existing regular file under it is served with its extension's
+  content type, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`
+  on HTML, and `Cache-Control: public, max-age=31536000, immutable` under
+  `/assets/` (Vite's hashed names) or `no-cache` elsewhere;
+- `/u/*`, `/app` and `/app/*` serve the directory's `index.html` (history
+  fallback) unless the request's `Accept` names `application/json`, which
+  is the JSON link lookup and reaches the API;
+- `/` redirects to `/app/`;
+- a path with a dot-segment (`..`, `.git`, `.env`), a backslash, a NUL, a
+  path resolving outside the directory, a directory, or no matching file
+  falls through to the API, which answers as it always has (`401`/`404`).
+  Do not place files named like API routes (`items`, `login`) in the
+  directory: an existing file wins.
+
+The app-link files are served unauthenticated from env and are
+`404 not_found` when unset:
+
+| Route | Env | Body |
+|---|---|---|
+| `GET /.well-known/apple-app-site-association` | `MATRON_APPLE_APP_IDS` (comma-separated `TEAMID.bundle.id`) | `{applinks:{details:[{appIDs, components:[{"/":"/u/*", comment:"Matron tracker links"}]}]}}` |
+| `GET /.well-known/assetlinks.json` | `MATRON_ANDROID_PACKAGE` and `MATRON_ANDROID_CERT_SHA256` (comma-separated colon-hex fingerprints; both required together) | `[{relation:["delegate_permission/common.handle_all_urls"], target:{namespace:"android_app", package_name, sha256_cert_fingerprints}}]` |
+
+Malformed values refuse to start the journal, naming the variable.
 
 ## Device privacy
 

@@ -144,11 +144,13 @@ One GitHub account per journal user and one journal user per GitHub
 account. Linking an account already held by another user is `409
 conflict`; the admin resolves it.
 
-**Token at rest.** The token is stored as-is. Its only scope is
-`read:org`, it is read-only, the user can revoke it from GitHub at any
-time, and the journal database already holds credentials of the same
-class (APNs key, password hashes). Encrypting this column under a
-journal-side key is a follow-up, noted here so it is not forgotten.
+**Token at rest.** With `MATRON_TOKEN_KEY` (64 hex chars) set, the token
+is sealed with AES-256-GCM before it is stored (`enc1:` prefix) and
+existing rows are sealed at the next start; unset keeps plaintext, which
+is acceptable because the scope is `read:org`, the user can revoke it on
+GitHub, and the database already holds credentials of the same class.
+`github_accounts.token_hash` (SHA-256 of the plaintext) is what the
+refresh path matches on, so guards never compare ciphertext.
 
 ### Configuration
 
@@ -280,7 +282,7 @@ User administration (journal admin, `users.is_admin`, bootstrapped by
   `POST /users {name, password}`, `POST /users/:id/password {password}`,
   `PATCH /users/:id {is_admin}`, `DELETE /users/:id/github-link` (to
   resolve a conflict).
-- `POST /users/:id/link-code {expires}` → the same payload `matron-admin
+- `POST /users/:id/link-code {ttl_seconds}` → the same payload `matron-admin
   link-code` produces, so the web app can show the pairing QR for a new
   colleague's phone.
 
