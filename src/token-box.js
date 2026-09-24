@@ -37,7 +37,7 @@ export function makeTokenBox(keyHex) {
       if (!isSealed(stored)) return stored
       try {
         const buf = Buffer.from(stored.slice(PREFIX.length), 'base64')
-        const decipher = crypto.createDecipheriv('aes-256-gcm', key, buf.subarray(0, IV_LEN))
+        const decipher = crypto.createDecipheriv('aes-256-gcm', key, buf.subarray(0, IV_LEN), { authTagLength: TAG_LEN })
         decipher.setAuthTag(buf.subarray(IV_LEN, IV_LEN + TAG_LEN))
         return Buffer.concat([decipher.update(buf.subarray(IV_LEN + TAG_LEN)), decipher.final()]).toString('utf8')
       } catch {

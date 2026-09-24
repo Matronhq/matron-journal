@@ -47,10 +47,6 @@ export function updateGithubIdentity(db, { userId, tokenHash: hash, identity, no
   })()
 }
 
-// `token`, when given, scopes the write to the row that still holds the
-// token the caller started its refresh/check with — the same "only touch
-// the row we asked about" guard as updateGithubIdentity, so a stale-mark
-// racing an unlink or re-link never lands on the wrong row.
 // Is this GitHub identity already linked to a different journal user? The
 // web-flow callback asks before parking a token, so a doomed link never
 // shows a confirm page.
@@ -58,6 +54,10 @@ export function githubIdentityBoundElsewhere(db, { host, githubId, userId }) {
   return !!db.prepare('SELECT 1 FROM github_accounts WHERE host=? AND github_id=? AND user_id<>?').get(host, githubId, userId)
 }
 
+// `tokenHash`, when given, scopes the write to the row that still holds the
+// token the caller started its refresh/check with — the same "only touch
+// the row we asked about" guard as updateGithubIdentity, so a stale-mark
+// racing an unlink or re-link never lands on the wrong row.
 export function markGithubStale(db, userId, { tokenHash: hash = null, now = Date.now() } = {}) {
   if (hash != null) {
     db.prepare("UPDATE github_accounts SET state='stale', checked_at=? WHERE user_id=? AND token_hash=?").run(now, userId, hash)
@@ -111,13 +111,20 @@ export function createLinkConfirm(db, { userId, token, identity, ttlMs = LINK_FL
 // finished by exactly one POST, link or cancel. Expired rows are swept on
 // read and answer null.
 export function takeLinkConfirm(db, { nonce, now = Date.now(), box = PLAIN_BOX }) {
-  return db.transaction(() => {
+  // The sweep, SELECT and DELETE all happen inside the transaction, but
+  // box.open runs after it returns: a row sealed under a key this process
+  // does not hold must still be consumed (deleted) rather than leave the
+  // DELETE rolled back and the row retriable against a token nobody can
+  // read anyway.
+  const row = db.transaction(() => {
     db.prepare('DELETE FROM github_link_confirms WHERE expires_at <= ?').run(now)
-    const row = db.prepare('SELECT user_id, token, identity_json FROM github_link_confirms WHERE nonce=?').get(nonce)
-    if (!row) return null
+    const r = db.prepare('SELECT user_id, token, identity_json FROM github_link_confirms WHERE nonce=?').get(nonce)
+    if (!r) return null
     db.prepare('DELETE FROM github_link_confirms WHERE nonce=?').run(nonce)
-    return { user_id: row.user_id, token: box.open(row.token), identity: JSON.parse(row.identity_json) }
+    return r
   })()
+  if (!row) return null
+  return { user_id: row.user_id, token: box.open(row.token), identity: JSON.parse(row.identity_json) }
 }
 
 // Boot-time upgrade (server.js): seal every plaintext token when a key is

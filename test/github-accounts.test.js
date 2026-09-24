@@ -103,3 +103,13 @@ test('sealed storage: a token sealed under a key this box does not hold is count
   // Untouched: still sealed under A, not silently resealed or corrupted.
   assert.equal(db.prepare('SELECT token FROM github_accounts WHERE user_id=?').get(dan.id).token, sealedUnderA)
 })
+
+test('takeLinkConfirm: a row sealed under a key this box does not hold throws token_unreadable, and the row is still consumed', async () => {
+  const db = openDb(':memory:')
+  const pat = await createUser(db, 'pat', 'pw')
+  const boxA = makeTokenBox('aa'.repeat(32))
+  const boxB = makeTokenBox('bb'.repeat(32))
+  const { nonce } = createLinkConfirm(db, { userId: pat.id, token: 'gho_pat', identity: { github_id: 2, login: 'pat', scopes: [] }, now: 1, box: boxA })
+  assert.throws(() => takeLinkConfirm(db, { nonce, now: 2, box: boxB }), /token_unreadable/)
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM github_link_confirms').get().n, 0, 'the row is gone even though open() failed')
+})
