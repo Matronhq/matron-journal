@@ -83,10 +83,11 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, itemTranscription = null, github = null, handleStatic = async () => false }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, itemTranscription = null, github = null, handleWellKnown = () => false, handleStatic = async () => false }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
+      if (handleWellKnown(req, res, url)) return
       if (await handleStatic(req, res, url)) return
       if (req.method === 'POST' && url.pathname === '/login') {
         // Behind the cloudflared tunnel, req.socket.remoteAddress is always 127.0.0.1

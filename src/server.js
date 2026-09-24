@@ -19,6 +19,7 @@ import { backfillSearchIndex } from './search.js'
 import { scheduleGithubRefresh } from './github-refresh.js'
 import { makeRpcBroker } from './rpc-broker.js'
 import { resolveWebDir, makeStaticHandler } from './static-http.js'
+import { makeWellKnown, parseList } from './well-known.js'
 import { makeWaker } from './wake.js'
 import { makeTranscriber } from './transcribe.js'
 import { makeItemTranscription } from './items-transcribe.js'
@@ -290,6 +291,7 @@ export function startServer({
   // pays it.
   spawnWakeWaitMs = resolveNumericEnv('MATRON_SPAWN_WAKE_WAIT_MS', process.env.MATRON_SPAWN_WAKE_WAIT_MS, 240000),
   mediaReapHighPct, mediaReapLowPct, waker, transcriber, github, githubRefreshIntervalMs, webDir,
+  appleAppIds, androidPackage, androidCertSha256,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
@@ -361,12 +363,19 @@ export function startServer({
   // option is the test seam; env otherwise; unset serves nothing.
   const resolvedWebDir = resolveWebDir(webDir !== undefined ? webDir : process.env.MATRON_WEB_DIR)
   const handleStatic = makeStaticHandler({ webDir: resolvedWebDir })
+  // App-link well-known files (spec 2026-09-23 tracker web/teams). The
+  // options are the test seam; env otherwise; unset claims nothing (404).
+  const handleWellKnown = makeWellKnown({
+    appleAppIds: appleAppIds !== undefined ? appleAppIds : parseList(process.env.MATRON_APPLE_APP_IDS),
+    androidPackage: androidPackage !== undefined ? androidPackage : (process.env.MATRON_ANDROID_PACKAGE || null),
+    androidCertSha256: androidCertSha256 !== undefined ? androidCertSha256 : parseList(process.env.MATRON_ANDROID_CERT_SHA256),
+  })
   const server = http.createServer(makeHttpHandler({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription,
-    github: resolvedGithub, handleStatic,
+    github: resolvedGithub, handleWellKnown, handleStatic,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
