@@ -1777,7 +1777,9 @@ The refresh path recognises its own row by `token_hash` (SHA-256 of the
 plaintext), so sealing changes no behaviour. Starting without the key after
 rows were sealed marks nothing stale: refreshes answer `502 upstream`, the
 daily job logs `token_sealed`, and unlink/re-link work as usual. Losing the
-key means every user re-links.
+key means every user re-links. A key that is *changed* rather than removed
+behaves the same way, and the journal logs a warning at start naming how
+many tokens it can no longer read.
 
 ## User administration
 

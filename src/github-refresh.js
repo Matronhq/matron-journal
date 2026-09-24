@@ -22,7 +22,13 @@ export async function runGithubRefresh(db, github, { now = Date.now(), log = con
     if (!r) continue
     if (r.outcome === 'ok') out.refreshed++
     else if (r.outcome === 'stale') { out.stale++; log(`github-refresh: user=${acct.user_id} token refused, link marked stale`) }
-    else { out.unchanged++; log(`github-refresh: user=${acct.user_id} unreachable (${r.error && r.error.code}), memberships kept`) }
+    else if (r.error && (r.error.code === 'token_sealed' || r.error.code === 'token_unreadable')) {
+      // A box-open failure, not a network failure: the token itself is
+      // encrypted under a key this process does not hold. Say so distinctly
+      // so it reads as "re-link this user", not "GitHub is unreachable".
+      out.unchanged++
+      log(`github-refresh: user=${acct.user_id} token unreadable (${r.error.code}), memberships kept`)
+    } else { out.unchanged++; log(`github-refresh: user=${acct.user_id} unreachable (${r.error && r.error.code}), memberships kept`) }
   }
   return out
 }

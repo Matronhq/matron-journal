@@ -304,6 +304,7 @@ export function startServer({
   const tokenBox = makeTokenBox(tokenKey !== undefined ? tokenKey : process.env.MATRON_TOKEN_KEY)
   const sealed = sealStoredTokens(db, tokenBox)
   if (sealed.sealed) console.log(`github: sealed ${sealed.sealed} stored token(s) under MATRON_TOKEN_KEY`)
+  if (sealed.unreadable) console.warn(`github: ${sealed.unreadable} stored token(s) are sealed under a different or missing MATRON_TOKEN_KEY; those users must re-link`)
   // WAL-checkpoint tail mitigation, server half (docs/wal-checkpoint-profile.md;
   // journal_size_limit lives in openDb). With synchronous=NORMAL the
   // auto-checkpoint is the only steady-state fsync and it runs INLINE in

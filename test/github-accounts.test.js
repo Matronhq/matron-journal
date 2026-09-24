@@ -80,14 +80,26 @@ test('sealed storage: save writes enc1 + token_hash; guards match on the hash; c
   db.prepare("INSERT INTO github_accounts(user_id, host, github_id, login, token, state, checked_at, linked_at) VALUES(?,?,?,?,?,'ok',1,1)").run(pat.id, 'github.com', 2, 'pat', 'gho_legacy')
   db.prepare('INSERT INTO github_link_confirms(id, user_id, nonce, token, identity_json, expires_at, created_at) VALUES(?,?,?,?,?,?,?)').run('gc_x', pat.id, 'ff'.repeat(16), 'gho_parked', '{}', 9e15, 1)
   const out = sealStoredTokens(db, box)
-  assert.deepEqual(out, { sealed: 2, hashed: 1 })
+  assert.deepEqual(out, { sealed: 2, hashed: 1, unreadable: 0 })
   const legacy = db.prepare('SELECT token, token_hash FROM github_accounts WHERE user_id=?').get(pat.id)
   assert.ok(isSealed(legacy.token)); assert.equal(box.open(legacy.token), 'gho_legacy'); assert.equal(legacy.token_hash, tokenHash('gho_legacy'))
   assert.equal(box.open(db.prepare("SELECT token FROM github_link_confirms WHERE id='gc_x'").get().token), 'gho_parked')
-  assert.deepEqual(sealStoredTokens(db, box), { sealed: 0, hashed: 0 }, 'idempotent')
+  assert.deepEqual(sealStoredTokens(db, box), { sealed: 0, hashed: 0, unreadable: 0 }, 'idempotent')
   // Without a key, boot sealing only backfills hashes.
   const db2 = openDb(':memory:'); const sam = await createUser(db2, 'sam', 'pw')
   db2.prepare("INSERT INTO github_accounts(user_id, host, github_id, login, token, state, checked_at, linked_at) VALUES(?,?,?,?,?,'ok',1,1)").run(sam.id, 'github.com', 3, 'sam', 'gho_sam')
-  assert.deepEqual(sealStoredTokens(db2, PLAIN_BOX), { sealed: 0, hashed: 1 })
+  assert.deepEqual(sealStoredTokens(db2, PLAIN_BOX), { sealed: 0, hashed: 1, unreadable: 0 })
   assert.deepEqual(db2.prepare('SELECT token, token_hash FROM github_accounts').get(), { token: 'gho_sam', token_hash: tokenHash('gho_sam') })
+})
+
+test('sealed storage: a token sealed under a key this box does not hold is counted unreadable, not resealed', async () => {
+  const db = openDb(':memory:')
+  const dan = await createUser(db, 'dan', 'pw')
+  const boxA = makeTokenBox('aa'.repeat(32))
+  const boxB = makeTokenBox('bb'.repeat(32))
+  saveGithubIdentity(db, { userId: dan.id, host: 'github.com', identity, token: 'gho_dan', now: 1, box: boxA })
+  const sealedUnderA = db.prepare('SELECT token FROM github_accounts WHERE user_id=?').get(dan.id).token
+  assert.deepEqual(sealStoredTokens(db, boxB), { sealed: 0, hashed: 0, unreadable: 1 })
+  // Untouched: still sealed under A, not silently resealed or corrupted.
+  assert.equal(db.prepare('SELECT token FROM github_accounts WHERE user_id=?').get(dan.id).token, sealedUnderA)
 })

@@ -125,9 +125,15 @@ export function takeLinkConfirm(db, { nonce, now = Date.now(), box = PLAIN_BOX }
 // existed. Idempotent; a key-less journal only backfills hashes.
 export function sealStoredTokens(db, box) {
   return db.transaction(() => {
-    const out = { sealed: 0, hashed: 0 }
+    const out = { sealed: 0, hashed: 0, unreadable: 0 }
     for (const r of db.prepare('SELECT user_id, token, token_hash FROM github_accounts').all()) {
-      if (isSealed(r.token)) continue
+      if (isSealed(r.token)) {
+        // Already sealed — but possibly under a key this box no longer
+        // holds (rotated or removed MATRON_TOKEN_KEY). Never log the
+        // value; just note it needs a re-link.
+        try { box.open(r.token) } catch { out.unreadable++ }
+        continue
+      }
       const hash = r.token_hash ?? tokenHash(r.token)
       if (r.token_hash == null) out.hashed++
       const stored = box.seal(r.token)
@@ -135,7 +141,10 @@ export function sealStoredTokens(db, box) {
       db.prepare('UPDATE github_accounts SET token=?, token_hash=? WHERE user_id=?').run(stored, hash, r.user_id)
     }
     for (const r of db.prepare('SELECT id, token FROM github_link_confirms').all()) {
-      if (isSealed(r.token)) continue
+      if (isSealed(r.token)) {
+        try { box.open(r.token) } catch { out.unreadable++ }
+        continue
+      }
       const stored = box.seal(r.token)
       if (stored === r.token) continue
       out.sealed++
