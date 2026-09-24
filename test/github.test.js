@@ -100,3 +100,21 @@ test('GHES host: login and api URLs follow the configured host', async () => {
   assert.deepEqual((await g.fetchIdentity('t')).scopes, [])
   assert.ok(calls.some((c) => c.key.startsWith('GET https://ghe.example.com/api/v3/user')))
 })
+
+test('every request carries a bounded abort signal; a hung GitHub maps to unreachable', async () => {
+  let seen = null
+  const hung = (url, opts) => new Promise((_resolve, reject) => {
+    seen = opts.signal
+    opts.signal.addEventListener('abort', () => reject(opts.signal.reason))
+  })
+  const gh = makeGithub({ clientId: 'abc', fetchImpl: hung, timeoutMs: 25 })
+  // AbortSignal.timeout's timer is unref'd; a live server always has other
+  // handles, but this test needs one so the loop stays open for the abort.
+  const keepAlive = setTimeout(() => {}, 2000)
+  const t0 = Date.now()
+  try {
+    await assert.rejects(gh.fetchIdentity('tok'), (err) => err instanceof GithubError && err.code === 'unreachable')
+  } finally { clearTimeout(keepAlive) }
+  assert.ok(seen instanceof AbortSignal, 'the fetch was given a signal')
+  assert.ok(Date.now() - t0 < 2000, 'aborted by the timeout, not by anything slower')
+})

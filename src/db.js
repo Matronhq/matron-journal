@@ -249,6 +249,15 @@ CREATE TABLE IF NOT EXISTS device_status(
   status TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_device_status_user ON device_status(user_id);
+-- Per-user settings (spec 2026-09-23 coordinator redesign §1a). A table, not
+-- a users column, so later per-user settings have a home. No row = every
+-- setting at its default. coordinator_convo_id is not a foreign key — same
+-- stance as conversations.mission_id; ownership is checked on write.
+CREATE TABLE IF NOT EXISTS user_settings(
+  user_id INTEGER PRIMARY KEY REFERENCES users(id),
+  coordinator_convo_id TEXT,
+  updated_at INTEGER NOT NULL
+);
 `
 
 export function openDb(path) {
@@ -496,6 +505,13 @@ export function openDb(path) {
   // NULL until the child's bridge publishes a title with a short.
   if (!spawnCols.some((c) => c.name === 'child_short')) {
     db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN child_short TEXT')
+  }
+  // Spawning onto a mission (spec 2026-09-23 coordinator redesign §1c): the
+  // per-user mission #num the child joins as soon as its conversation is
+  // known. NULL = no mission (every row predating the column). A number,
+  // not an id — it is what the asking agent named and what the card shows.
+  if (!spawnCols.some((c) => c.name === 'mission_num')) {
+    db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN mission_num INTEGER')
   }
   // Consent items (spec 2026-09-22 consent-items): the tracker item that
   // mirrors this ask, NULL for rows predating the mirror (they resolve

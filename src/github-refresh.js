@@ -35,7 +35,15 @@ export async function runGithubRefresh(db, github, { now = Date.now(), log = con
 
 export function scheduleGithubRefresh(db, github, { intervalMs = GITHUB_REFRESH_INTERVAL_MS, log = console.log, box = PLAIN_BOX } = {}) {
   if (!github || !github.enabled) return null
-  const run = () => { runGithubRefresh(db, github, { log, box }).catch((err) => console.error('github-refresh: run failed', err)) }
+  // Single flight: a run that is still walking accounts (slow GitHub, many
+  // users) is never overlapped by the next tick; the tick is skipped and
+  // logged instead of piling up concurrent walks over the same rows.
+  let running = false
+  const run = async () => {
+    if (running) { log('github-refresh: previous run still in progress, skipping this tick'); return }
+    running = true
+    try { await runGithubRefresh(db, github, { log, box }) } catch (err) { console.error('github-refresh: run failed', err) } finally { running = false }
+  }
   run()
   const interval = setInterval(run, intervalMs)
   interval.unref()

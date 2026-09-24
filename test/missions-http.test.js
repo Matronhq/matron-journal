@@ -768,6 +768,11 @@ test('a shared mission goes 404 on foreign detail and drops from scope=shared on
   assert.equal((await s.http(`/missions/${m.json.mission.id}`, { token: patClient })).status, 404, 'origin device revoked: fails closed')
   assert.equal((await s.http('/missions?scope=shared', { token: patClient })).json.missions.length, 0)
   assert.equal((await s.http(`/missions/${m.json.mission.id}`, { token: client })).status, 200, 'owner unaffected')
+  // A public box of ANOTHER user landing on the freed device id confers nothing either.
+  const reused = createAgent(s.db, pat.id, 'pat-box')
+  s.db.prepare('UPDATE devices SET id=? WHERE id=?').run(agent.deviceId, reused.deviceId)
+  assert.equal((await s.http(`/missions/${m.json.mission.id}`, { token: patClient })).status, 404, 'reused id on a foreign box: still closed')
+  assert.equal((await s.http('/missions?scope=shared', { token: patClient })).json.missions.length, 0)
 })
 
 test('shared mission counts and last_milestone follow the shared rule per-conversation, not just device privacy: a joined convo pat cannot read is invisible in counts', async (t) => {
@@ -834,4 +839,52 @@ test('a mission born on a non-shared conversation becomes visible via a later sh
   assert.equal(detail.status, 200)
   assert.deepEqual(detail.json.conversations.map((x) => x.id), ['c1'])
   assert.equal(detail.json.mission.conversations, 1)
+})
+
+test('POST /missions attach:false: a new unassigned mission even when the convo already has one; convo and items untouched; replay; /missions/create alias; default still attaches', async (t) => {
+  const { s, agent, client } = await fleet(t)
+  const a = (await start(s, agent.token, {})).json.mission
+  const t2 = (await item(s, agent.token, { convo_id: 'c2', kind: 'task', title: 'T2' })).json.item
+  const ws = await makeWsClient(s.base, { token: client, cursor: null })
+  await ws.waitFor((f) => f.op === 'hello_ok')
+
+  const b = await start(s, agent.token, { title: 'Unassigned B', attach: false }, { 'idempotency-key': 'u1' })
+  assert.equal(b.status, 201); assert.equal(b.json.existing, undefined)
+  assert.notEqual(b.json.mission.id, a.id)
+  assert.equal(b.json.mission.origin_convo_id, 'c1'); assert.equal(b.json.mission.state, 'open'); assert.equal(b.json.mission.conversations, 0)
+  assert.equal(s.db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('c1').mission_id, a.id, 'c1 keeps its mission')
+  const marker = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'mission' && f.payload.num === b.json.mission.num)
+  assert.equal(marker.convo_id, 'c1'); assert.equal(marker.payload.action, 'created')
+  ws.close()
+
+  const c = await s.http('/missions', { method: 'POST', token: agent.token, body: { title: 'C', convo_id: 'c2', attach: false } })
+  assert.equal(c.status, 201)
+  assert.equal(s.db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('c2').mission_id, null, 'attach:false never attaches')
+  assert.equal((await s.http(`/items/${t2.id}`, { token: client })).json.item.mission_id, null, 'attach:false never moves items')
+
+  const replay = await start(s, agent.token, { title: 'Unassigned B', attach: false }, { 'idempotency-key': 'u1' })
+  assert.equal(replay.status, 200); assert.equal(replay.json.mission.id, b.json.mission.id)
+  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='mission' AND json_extract(payload,'$.num')=?").get(b.json.mission.num).n, 1, 'no second marker on replay')
+
+  const listed = (await s.http('/missions?state=open', { token: client })).json.missions.find((m) => m.id === b.json.mission.id)
+  assert.equal(listed.conversations, 0, 'unassigned = open with no conversations')
+
+  const alias = await s.http('/missions/create', { method: 'POST', token: agent.token, body: { title: 'D', convo_id: 'c1', attach: false } })
+  assert.equal(alias.status, 201); assert.equal(alias.json.mission.conversations, 0)
+  assert.equal((await s.http('/missions/create', { token: agent.token })).status, 404, 'GET on the alias is not a mission lookup')
+
+  const e = await s.http('/missions', { method: 'POST', token: agent.token, body: { title: 'E', convo_id: 'c2' } })
+  assert.equal(e.status, 201)
+  assert.equal(s.db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('c2').mission_id, e.json.mission.id)
+  assert.equal((await s.http(`/items/${t2.id}`, { token: client })).json.item.mission_id, e.json.mission.id)
+})
+
+test('POST /missions: a non-boolean attach is 400 and writes nothing', async (t) => {
+  const { s, agent } = await fleet(t)
+  for (const attach of ['false', 0, null]) {
+    const r = await start(s, agent.token, { attach })
+    assert.equal(r.status, 400, `attach: ${JSON.stringify(attach)}`)
+  }
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM missions').get().n, 0)
+  assert.equal(s.db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('c1').mission_id, null)
 })

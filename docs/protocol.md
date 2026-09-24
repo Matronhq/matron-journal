@@ -376,10 +376,13 @@ an agent token, selected by which query parameter is present:
 ## WebSocket
 
 - `WS /ws`: first frame `{op:'hello', token, cursor}` (cursor null = live-only).
-  Server: `hello_ok {seq, device_id, name}`, then journal frames `> cursor`,
+  Server: `hello_ok {seq, device_id, name, coordinator_convo_id}`, then journal frames `> cursor`,
   then live. `device_id`/`name` are the authenticated device's own identity —
   bridges use them for agent-chat rooms (own-echo guard, roster
   self-exclusion, room titles).
+  `coordinator_convo_id` is the user's Coordinator (see *Coordinator*), or
+  null — null too for an ordinary agent when that conversation is
+  private-owned. `GET /snapshot` carries the same key.
   If the replay gap (`head_seq - cursor`) exceeds `MATRON_MAX_REPLAY`
   (default 50000), the server sends `{kind:'control', op:'snapshot_required'}`
   instead of replaying and closes the socket with code `4009` — the client
@@ -398,6 +401,28 @@ an agent token, selected by which query parameter is present:
   `up_to_seq: null` resolves server-side to the conversation's current
   `last_seq` at processing time, so a fire-and-forget publisher never needs
   to learn the seq it was assigned; explicit integers keep working as before.
+- `viewing {convo_id}` / `viewing {convo_ids}` tells the server which
+  conversations this connection has on screen; viewing-scoped ephemerals
+  (`stream`, `stream_append`, `activity`, `status`) go only to connections
+  viewing that conversation, and a device viewing it gets no push for it.
+  Each connection views a SET of conversations:
+  - `convo_ids: string[]` (optional) is the full set — e.g. the Coordinator
+    panel beside a chat, or a chat sheet over another chat. Each id a
+    non-empty string ≤ 128 chars; duplicates are collapsed; at most 4
+    distinct ids; `[]` views nothing. Anything else (not an array, a
+    non-string / empty / oversized id, more than 4) → `bad_request` with
+    `ref: 'viewing'`, and the connection's set is left unchanged. The
+    catch-up (tool-stream `sync` frames + cached `status`, see below) is
+    sent only for conversations newly added to the set — plus `convo_id`
+    when it is sent alongside `convo_ids` and is in the set, even if it was
+    already viewed. Clients send `convo_id` (the chat just opened or needing
+    a resync) with the full `convo_ids` to force its resync without
+    dropping and re-adding it.
+  - Without `convo_ids`, `convo_id` (string|null) sets the set to
+    `{convo_id}` or `{}` — the original single-conversation form, unchanged.
+    It still sends the catch-up on every `viewing`, even for the
+    conversation already viewed: clients re-send it to force a resync.
+  When both keys are present, `convo_ids` defines the set.
 - Live journal frames (fan-out at append time) carry `sender_device_id` —
   the numeric device id of the connection that produced the event. Device
   names have no unique constraint, so this is the only exact own-echo test
@@ -1150,7 +1175,8 @@ A parent agent may ask a target agent to start a new session (child conversation
   "task": "string (the child's seed prompt, capped at 2000 chars)",
   "topic": "string (optional, title fragment for the card, capped at 200 chars)",
   "model": "string (optional, the Claude model the child should run, capped at 64 chars)",
-  "link": "boolean (optional, default false — also open a chat room between the parent and the child)"
+  "link": "boolean (optional, default false — also open a chat room between the parent and the child)",
+  "mission_num": "integer (optional — the child joins this mission as soon as its conversation exists)"
 }
 ```
 
@@ -1158,7 +1184,7 @@ A parent agent may ask a target agent to start a new session (child conversation
 
 Acknowledgement: `{kind:'spawn', event:'pending', request_id, spawn_id, target_waking?}` — the spawn row is now parked in `awaiting_user` state, and a `permission_request` event has been appended to the parent's conversation with `payload.kind: 'agent_spawn'` (client-only). A `question` item mirroring the card has also been filed on the parent conversation — see "Tracker item" below. `target_waking: true` (omitted otherwise) says the target box had no live connection and the journal has asked the infra layer to start it (**wake-before-spawn**, below): the session starts once the user approves *and* the box is up, which is a few minutes for a cold VM.
 
-**Errors.** `forbidden` for a client connection (agent-only, same stance as the room ops); `not_ready` if sent before this connection's own hello replay completes (mid-replay it's invisible to the delivery scan an outcome frame would need). `bad_request` covers: a missing/non-string/oversized `request_id` (≤128 chars, `RPC_ID_MAX_CHARS`); an empty or oversized `workdir` (≤1024 chars, `SPAWN_WORKDIR_MAX_CHARS`) or `task` (≤2000 chars, `SPAWN_TASK_MAX_CHARS`) — and the same check re-run *after* peer-text sanitisation, so an all-control-character string that sanitises down to empty is rejected too; an oversized `topic` when present (≤200 chars, `INVITE_TOPIC_MAX_CHARS`); a non-string or oversized `model` when present (≤64 chars, `SPAWN_MODEL_MAX_CHARS`); a non-boolean `link` when present; a non-integer `target_device_id`; and a missing/empty `from_convo_id`. `not_found` covers: an unknown `target_device_id`, one belonging to another user, a client-kind device, or a private device seen by a non-private caller — all indistinguishable, anti-enumeration, same stance as `agent_invite`'s `target_device_id`; and a `from_convo_id` that doesn't resolve to a top-level conversation this device owns (foreign, unknown, or a child conversation — `parent_convo_id` set), mirroring `agent_invite`'s `from_convo_id` check. `agent_unreachable` — the target box has no live registered connection right now **and cannot be woken** (no `MATRON_WAKE_CMD`, or the wake command refused the box); checked, and refused, **before** the consent card is published, so the user's tap is never spent on an ask that cannot work. When a wake *is* possible the ask is not refused: see "Wake-before-spawn" below. `conflict` (`detail:'too many requests awaiting user approval'`) — the requesting device already has `MAX_AWAITING_PER_REQUESTER` (3) rows in `awaiting_user`, counted jointly with agent-chat's pending asks (see "Pending-ask cap" below).
+**Errors.** `forbidden` for a client connection (agent-only, same stance as the room ops); `not_ready` if sent before this connection's own hello replay completes (mid-replay it's invisible to the delivery scan an outcome frame would need). `bad_request` covers: a missing/non-string/oversized `request_id` (≤128 chars, `RPC_ID_MAX_CHARS`); an empty or oversized `workdir` (≤1024 chars, `SPAWN_WORKDIR_MAX_CHARS`) or `task` (≤2000 chars, `SPAWN_TASK_MAX_CHARS`) — and the same check re-run *after* peer-text sanitisation, so an all-control-character string that sanitises down to empty is rejected too; an oversized `topic` when present (≤200 chars, `INVITE_TOPIC_MAX_CHARS`); a non-string or oversized `model` when present (≤64 chars, `SPAWN_MODEL_MAX_CHARS`); a non-boolean `link` when present; a non-integer `target_device_id`; and a missing/empty `from_convo_id`. `not_found` covers: an unknown `target_device_id`, one belonging to another user, a client-kind device, or a private device seen by a non-private caller — all indistinguishable, anti-enumeration, same stance as `agent_invite`'s `target_device_id`; and a `from_convo_id` that doesn't resolve to a top-level conversation this device owns (foreign, unknown, or a child conversation — `parent_convo_id` set), mirroring `agent_invite`'s `from_convo_id` check. `agent_unreachable` — the target box has no live registered connection right now **and cannot be woken** (no `MATRON_WAKE_CMD`, or the wake command refused the box); checked, and refused, **before** the consent card is published, so the user's tap is never spent on an ask that cannot work. When a wake *is* possible the ask is not refused: see "Wake-before-spawn" below. `conflict` (`detail:'too many requests awaiting user approval'`) — the requesting device already has `MAX_AWAITING_PER_REQUESTER` (3) rows in `awaiting_user`, counted jointly with agent-chat's pending asks (see "Pending-ask cap" below). With `mission_num`: `bad_request` (`detail:'bad mission_num'`) unless it is a positive integer; `no_mission` when no mission with that number is visible to both the asker and the target box (unknown and hidden are indistinguishable); `mission_closed` when it is closed. All three are checked before the wake and before the card, so nothing is parked or woken for them. The card payload carries `mission_num` and `mission_title` (both omitted when absent) and the consent item says "Joins mission #N — <title>".
 
 **`spawn_targets`:** A parent agent queries what other agent boxes are available for spawning.
 
@@ -1283,6 +1309,23 @@ The four outcomes flow from: `started` (approval granted and target answered), `
 **Wake-before-spawn.** A target with no live connection is usually a box the host idle-stopped, not a dead one. With a wake command configured (`MATRON_WAKE_CMD`, see `src/wake.js`): `spawn_request` fires the wake and parks the ask as usual instead of refusing it (the ack carries `target_waking: true`); `/agent-spawn/answer` approve fires it again if the box is still down and the orchestration then waits up to `spawnWakeWaitMs` (`MATRON_SPAWN_WAKE_WAIT_MS`, default 240000 — sized for a cold VM boot on the shared hosts) for the box's socket to register before issuing `start`; only then does the ordinary `agent_unreachable` failure apply. The wait is only ever paid when a wake is actually under way (`wakeIfOffline` returned true): a journal without a wake command behaves exactly as before, and its orphan TTL is unchanged. The same wake fires when an `agent_invite`/`agent_join` is parked against an asleep box and when its approval finds the recipient still down — approved invites are already pumped on the recipient's next hello (`deliverPendingInvites`), so the wake is what turns "sits until someone starts the box" into "arrives in a few minutes".
 
 **Journal-originated RPC:** When the journal issues the `start` RPC itself (during approval orchestration), it sets `from_device_id: 0` — a reserved value signifying the journal is the originator, not a peer agent. The target's bridge uses this to seed the new session without a peer device context.
+
+### Spawning onto a mission
+
+(spec 2026-09-23 coordinator redesign §1c.) A row with `mission_num` is
+re-checked at approval, before any room or `start`: a mission closed or
+gone since the ask fails the spawn (`error_code` `mission_closed` /
+`no_mission`) and nothing is started. `start` carries `mission_num`
+(omitted when absent). On the `start` reply the journal creates the child's
+conversation row if its bridge has not published it yet (owned by the
+target box), runs `joinMission` for it, and appends a `mission` marker
+`joined` (`sender: journal`, `by: agent`) into it — all before the
+`started` outcome. The bridge injects the opening turn just before it
+answers `start`, so the order is: opening turn written, `start` answered,
+join committed, parent told; the bridge knows the mission from the `start`
+param. A join that fails at that point (the mission closed in the gap, the
+200-conversation cap, a mission the target box cannot see) is logged and
+the child runs unattached; the spawn still reports `started`.
 
 ### Expiry
 
@@ -1500,6 +1543,28 @@ unread-badge or conversation-preview-snippet effect — but the push body
 text still runs the event's payload through `snippetOf`, which formats an
 `❓`/`⚖`/`☐` glyph + `#num title` for the alert.
 
+## Coordinator
+
+Spec: matron-apple `docs/superpowers/specs/2026-09-23-coordinator-redesign-design.md` §1a.
+
+One conversation per user is the **Coordinator**, stored in `user_settings`
+(`src/coordinator.js`, `src/coordinator-http.js`) so every device and every
+bridge agrees which one it is.
+
+| Route | Who | Body | Returns |
+|---|---|---|---|
+| `GET /coordinator` | client or agent | | 200 `{convo_id: string\|null}`. An ordinary agent reads `null` when the Coordinator is a private-owned conversation. |
+| `PUT /coordinator` | client only (agent → **403** `forbidden`) | `{convo_id: string\|null}` | 200 `{convo_id}`. **404** for a conversation the user does not own; **400** when `convo_id` is absent, not a string/null, empty or over the id cap. `null` clears. An unchanged value is a 200 no-op. |
+
+On a change the journal appends a `coordinator` event — payload
+`{role: "assigned"}` into the conversation that gained the role,
+`{role: "released"}` into the one that lost it — through the ordinary
+append+broadcast path, `sender` `user:<name>`. Released is written first.
+Clearing emits only `released`; an unchanged `PUT` emits nothing. Agents
+cannot `publish` this type. It is not a `MESSAGE_TYPE` (no unread, no
+snippet) and never pushes. `hello_ok` and `/snapshot` carry
+`coordinator_convo_id` so an app knows the Coordinator on connect.
+
 ## Missions & milestones
 
 Spec: `docs/superpowers/specs/2026-09-10-missions-milestones-design.md`.
@@ -1519,8 +1584,10 @@ mission is refused — `409 {"error":"conflict","blocked_by":"no_mission"}`
 — rather than minting one implicitly. `mission_start` (`POST /missions`)
 is the only way in.
 
-A conversation gains a mission in exactly three ways: `POST /missions`
-(which attaches its origin), `POST /missions/:id/join`, and **inheritance**
+A conversation gains a mission in exactly four ways: `POST /missions`
+(which attaches its origin unless `attach: false`), `POST /missions/:id/join`,
+a spawn that named the mission (`spawn_request` `mission_num`, see
+*Agent-spawned sessions*), and **inheritance**
 — a spawned conversation takes its parent's mission at creation, and never
 afterwards (like `parent_convo_id`, it is immutable once the row exists).
 Inheritance is a way *into* a mission, so `join`'s gates apply to it
@@ -1535,11 +1602,16 @@ one would hand the child a `mission_id` it can never read, join or post a
 milestone to. A child that fails any gate simply starts with no mission;
 its agent can `mission_start` its own.
 
+A mission is **unassigned** while it is `open` and has no conversations
+(`conversations: 0` on the list and detail rows) — typically one the
+Coordinator created with `attach: false`. Clients derive it; there is no
+column.
+
 ### Routes (Bearer, either device kind)
 
 | Route | Body / query | Returns |
 |---|---|---|
-| `POST /missions` | `{title, body?, convo_id}` + optional `Idempotency-Key` | 201 `{mission}`. If `convo_id` already has a mission: 200 that mission with `existing: true`, nothing changed — or **404** if that mission is invisible to the caller (see *Visibility*). Attaches the conversation, repoints its unassigned items (each repointed item's own `updated_at` is bumped too, so `GET /items?since=` learns it gained a mission). |
+| `POST /missions` | `{title, body?, convo_id, attach?: boolean}` + optional `Idempotency-Key` (also served at `POST /missions/create`) | 201 `{mission}`. If `convo_id` already has a mission: 200 that mission with `existing: true`, nothing changed — or **404** if that mission is invisible to the caller (see *Visibility*). Attaches the conversation, repoints its unassigned items (each repointed item's own `updated_at` is bumped too, so `GET /items?since=` learns it gained a mission). With `attach: false`: always a new mission (201; a replay 200), `origin_convo_id` = `convo_id`, and neither the conversation nor its items are touched — no `existing` short-circuit. Either way, on a genuine 201 the `created` mission marker is still appended into `convo_id` — provenance of where the mission was born, independent of whether it was ever attached there. A non-boolean `attach` is 400. |
 | `GET /missions` | `?state=open\|closed` (omit = both), `?since=<ms>`, `?scope=mine\|shared` (shared: neither `state` nor `since`; rows carry `owner`) | `{missions:[…]}` with per-row counts: `open_items`, `needs_you` (open and awaiting user), `conversations`, `milestones`, `last_milestone` `{num,title,kind,created_at}`. Sorted `last_milestone_at DESC NULLS LAST`, then `created_at DESC` — for a filtered (ordinary agent) caller this is the SIEVED last-milestone timestamp (the same sieved subquery the `last_milestone` field itself uses), so the order never disagrees with the row shown; an owner or private agent sorts on the stored column, which is the same thing. |
 | `GET /missions/:id` | | `{mission, milestones:[…] newest first, items:[open items], conversations:[{id,title,box,state}]}` |
 | `GET /missions/:id` (shared) | `:id` must be `ms_…` (a colleague's number is not resolvable) of a mission visible under *Shared visibility* | mission detail with `owner`; `PATCH`, `join`, and `close` on it are all **403 `forbidden`** |
@@ -2294,7 +2366,7 @@ considers each of that user's *client* devices with a registered token
 (agent devices are never pushed to):
 
 - skipped when that device is connected and actively `viewing` the event's
-  conversation, or when its acked cursor already covers the event's `seq`,
+  conversation (any conversation in a connection's viewed set counts), or when its acked cursor already covers the event's `seq`,
   or when its `push_prefs` (see `PUT /push/prefs`) explicitly disable the
   event's category — `wake` background pushes are never prefs-filtered.
 - `prompt` / `permission_request` push immediately at priority 10
