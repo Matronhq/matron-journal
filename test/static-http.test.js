@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import http from 'node:http'
+import crypto from 'node:crypto'
 import { startTestServer } from './helpers.js'
 import { createUser } from '../src/auth.js'
 import { resolveWebDir } from '../src/static-http.js'
@@ -89,4 +91,58 @@ test('static: unset MATRON_WEB_DIR changes nothing; a missing index.html makes t
   assert.throws(() => resolveWebDir(path.join(bare, 'missing')), /MATRON_WEB_DIR/)
   fs.writeFileSync(path.join(bare, 'a-file.txt'), '')
   assert.throws(() => resolveWebDir(path.join(bare, 'a-file.txt')), /MATRON_WEB_DIR/)
+})
+
+test('static: a client that aborts mid-body never leaks the read stream or wedges the server (review fix round 1)', async (t) => {
+  const dir = webDir()
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  fs.writeFileSync(path.join(dir, 'assets', 'big-abc.bin'), crypto.randomBytes(8 * 1024 * 1024))
+  const s = await startTestServer({ webDir: dir })
+  t.after(() => s.close())
+
+  // Fetch the first chunk of a large asset over a raw socket (no
+  // keep-alive, so each rep is an independent connection/fd), then destroy
+  // the connection mid-body — the scenario .pipe() alone handles badly:
+  // `.pipe()` does not forward a destination error/close back to the
+  // source, so the read stream (and its fd) is left open and the handler's
+  // promise never settles. Repeated 50x so a per-request leak of even one
+  // fd or one dangling handler shows up as a clear, non-noise-sized delta.
+  function abortMidBody() {
+    return new Promise((resolve, reject) => {
+      const req = http.request(s.base + '/assets/big-abc.bin', {
+        method: 'GET', agent: false, headers: { connection: 'close' },
+      }, (res) => {
+        res.once('data', () => { req.destroy() })
+        res.on('error', () => {})
+      })
+      req.on('error', () => resolve())
+      req.on('close', resolve)
+      req.end()
+    })
+  }
+
+  // /proc/self/fd is Linux-only (fine here — this box and CI both are);
+  // count open descriptors immediately before and after so a leaked
+  // fs.ReadStream fd per abort is caught directly, not just inferred from
+  // timing. Allow a small constant slack (unrelated sockets/handles
+  // settling), but 50 leaked fds would blow well past it.
+  const countFds = () => { try { return fs.readdirSync('/proc/self/fd').length } catch { return null } }
+  const fdsBefore = countFds()
+
+  const start = Date.now()
+  for (let i = 0; i < 50; i++) await abortMidBody()
+  assert.ok(Date.now() - start < 5000, `50 aborts should complete quickly, took ${Date.now() - start}ms`)
+
+  // The server must still be healthy and responsive right after — a leaked
+  // read stream/fd per abort would eventually wedge or exhaust the process,
+  // not just this one request.
+  const health = await fetch(s.base + '/favicon.svg')
+  assert.equal(health.status, 200)
+  assert.equal(await health.text(), '<svg/>')
+
+  if (fdsBefore !== null) {
+    await new Promise((r) => setTimeout(r, 200)) // let already-destroyed handles finish unwinding
+    const fdsAfter = countFds()
+    assert.ok(fdsAfter - fdsBefore < 20, `expected no per-abort fd leak, went from ${fdsBefore} to ${fdsAfter} open fds`)
+  }
 })

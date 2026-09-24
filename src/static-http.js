@@ -8,6 +8,7 @@
 // anything it does not own falls through to the API's own 401/404.
 import fs from 'node:fs'
 import path from 'node:path'
+import { pipeline } from 'node:stream/promises'
 
 const TYPES = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8',
@@ -44,12 +45,10 @@ export function makeStaticHandler({ webDir }) {
     if (ext === '.html') headers['x-frame-options'] = 'DENY'
     res.writeHead(200, headers)
     if (req.method === 'HEAD') { res.end(); return true }
-    await new Promise((resolve) => {
-      const stream = fs.createReadStream(file)
-      stream.on('error', () => { res.destroy(); resolve() })
-      stream.on('close', resolve)
-      stream.pipe(res)
-    })
+    // pipeline (not .pipe()) so a client abort mid-body destroys the read
+    // stream too — .pipe() alone leaves the source fd open forever when the
+    // destination closes first, and this handler runs unauthenticated.
+    await pipeline(fs.createReadStream(file), res).catch(() => {})
     return true
   }
 
