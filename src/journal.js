@@ -286,11 +286,19 @@ export function appendAndBroadcast(db, hub, { userId, convoId, sender, type, pay
 // anchor) and broadcast only after it commits. Same targeting rules.
 export function broadcastAppended(db, hub, { userId, convoId, seq, ts, sender, type, payload }) {
   const frame = { kind: 'journal', ...toEventShape({ seq, convo_id: convoId, ts, sender, type, payload }) }
-  const ownerId = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id ?? null
-  const targets = isClientOnlyEvent(type, payload)
-    ? new Set()
-    : (ownerId == null ? null : new Set([ownerId, ...joinedAgentIds(db, convoId)]))
+  const targets = isClientOnlyEvent(type, payload) ? new Set() : agentTargetsFor(db, convoId)
   hub.broadcastJournal(userId, frame, targets)
+}
+
+// The agent devices allowed to see a conversation's traffic — hub's
+// agentTargets (spec: agent chat phase 2 room fan-out): the recorded owner
+// plus joined participants. null = no recorded owner (legacy row), which
+// the hub treats as broadcast-to-every-agent. A private box's convos and an
+// unjoined room therefore never reach another agent. Shared by live journal
+// fan-out, hello replay, and ephemeral delivery so the rule lives once.
+export function agentTargetsFor(db, convoId) {
+  const ownerId = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id ?? null
+  return ownerId == null ? null : new Set([ownerId, ...joinedAgentIds(db, convoId)])
 }
 
 const parseRow = (r) => ({ ...r, payload: JSON.parse(r.payload) })
