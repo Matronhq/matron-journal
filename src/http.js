@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import { pipeline } from 'node:stream/promises'
 import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice, deviceStatuses } from './db.js'
@@ -874,12 +875,11 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           'x-content-type-options': 'nosniff',
           'content-disposition': 'attachment',
         })
-        await new Promise((resolve) => {
-          const stream = fs.createReadStream(blob.disk_path)
-          stream.on('error', () => { res.destroy(); resolve() })
-          stream.on('close', resolve)
-          stream.pipe(res)
-        })
+        // pipeline (not .pipe()) so a client abort mid-body destroys the read
+        // stream promptly instead of leaking its fd (.pipe() never forwards a
+        // destination close/error back to the source) — same fix as
+        // static-http.js's file serving.
+        await pipeline(fs.createReadStream(blob.disk_path), res).catch(() => {})
         return
       }
       return json(res, 404, { error: 'not_found' })

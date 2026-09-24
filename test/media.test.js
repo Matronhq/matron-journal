@@ -5,6 +5,7 @@ import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
 import net from 'node:net'
+import http from 'node:http'
 import { startTestServer } from './helpers.js'
 import { createUser } from '../src/auth.js'
 
@@ -363,6 +364,57 @@ test('GET /media/:id: a DB row whose file is missing or size-mismatched on disk 
   assert.deepEqual(await missing.json(), { error: 'internal' })
 
   assert.ok(mute.mock.callCount() >= 2, 'both failure modes should be logged server-side')
+})
+
+test('media: a client that aborts mid-download never leaks the read stream or wedges the server', async (t) => {
+  const s = await startTestServer({ dbPath: tmpDbPath() })
+  t.after(() => s.close())
+  const token = await loginToken(s, 'dan', 'pw')
+
+  const up = await fetch(s.base + '/media', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${token}` },
+    body: crypto.randomBytes(8 * 1024 * 1024),
+  })
+  assert.equal(up.status, 200)
+  const { media_id } = await up.json()
+
+  // Same shape as static-http.test.js's abort test: fetch the first chunk
+  // over a raw socket (no keep-alive), then destroy the connection mid-body
+  // — .pipe() alone leaves the read stream (and its fd) open because it
+  // never forwards a destination error/close back to the source.
+  function abortMidBody() {
+    return new Promise((resolve, reject) => {
+      const req = http.request(s.base + `/media/${media_id}`, {
+        method: 'GET', agent: false, headers: { authorization: `Bearer ${token}`, connection: 'close' },
+      }, (res) => {
+        res.once('data', () => { req.destroy() })
+        res.on('error', () => {})
+      })
+      req.on('error', () => resolve())
+      req.on('close', resolve)
+      req.end()
+    })
+  }
+
+  const countFds = () => { try { return fs.readdirSync('/proc/self/fd').length } catch { return null } }
+  const fdsBefore = countFds()
+
+  const start = Date.now()
+  for (let i = 0; i < 50; i++) await abortMidBody()
+  assert.ok(Date.now() - start < 5000, `50 aborts should complete quickly, took ${Date.now() - start}ms`)
+
+  // The server must still be healthy and responsive right after.
+  const health = await fetch(s.base + `/media/${media_id}`, { headers: { authorization: `Bearer ${token}` } })
+  assert.equal(health.status, 200)
+  const buf = Buffer.from(await health.arrayBuffer())
+  assert.equal(buf.length, 8 * 1024 * 1024)
+
+  if (fdsBefore !== null) {
+    await new Promise((r) => setTimeout(r, 200)) // let already-destroyed handles finish unwinding
+    const fdsAfter = countFds()
+    assert.ok(fdsAfter - fdsBefore < 20, `expected no per-abort fd leak, went from ${fdsBefore} to ${fdsAfter} open fds`)
+  }
 })
 
 test('an agent-kind device can also upload media (not just client devices)', async (t) => {
