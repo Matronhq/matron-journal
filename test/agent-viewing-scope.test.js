@@ -18,6 +18,18 @@ import { pinDevicePrivate } from '../src/db.js'
 const settle = (ms = 300) => new Promise((r) => setTimeout(r, ms))
 const ephemeralsFor = (c, convoId) => c.frames.filter((f) => f.kind === 'ephemeral' && f.convo_id === convoId)
 
+// Waits until the server has recorded a client connection viewing every id —
+// a fixed delay doesn't prove the `viewing` frame was processed (CodeRabbit).
+async function untilClientViewing(s, convoIds) {
+  const deadline = Date.now() + 3000
+  while (Date.now() < deadline) {
+    const viewing = s.hub.allConns().some((c) => c.kind === 'client' && convoIds.every((id) => c.viewingConvoIds?.has(id)))
+    if (viewing) return
+    await settle(10)
+  }
+  assert.fail(`client never recorded viewing ${convoIds.join(', ')}`)
+}
+
 async function fixture(t) {
   const s = await startTestServer()
   t.after(() => s.close())
@@ -69,11 +81,11 @@ test('an agent sending `viewing` is refused as forbidden (single and set forms)'
 
 // Proves the op refusal: kit's `viewing` never takes effect.
 test('an agent viewing a private box\'s convo receives none of its ephemerals; the client still does', async (t) => {
-  const { kit, ghost, client } = await fixture(t)
+  const { s, kit, ghost, client } = await fixture(t)
   kit.send({ op: 'viewing', convo_id: 'ghost-work' })
   kit.send({ op: 'viewing', convo_ids: ['ghost-work'] })
   client.send({ op: 'viewing', convo_id: 'ghost-work' })
-  await settle(100)
+  await untilClientViewing(s, ['ghost-work'])
   produceEphemerals(ghost, 'ghost-work')
   await client.waitFor((f) => f.kind === 'ephemeral' && f.convo_id === 'ghost-work' && f.tool_stream)
   await client.waitFor((f) => f.kind === 'ephemeral' && f.convo_id === 'ghost-work' && f.activity)
@@ -85,10 +97,10 @@ test('an agent viewing a private box\'s convo receives none of its ephemerals; t
 
 // Proves the op refusal for the set form against an unjoined room.
 test('an agent viewing a room it has not joined receives none of its ephemerals', async (t) => {
-  const { kit, owner, client } = await fixture(t)
+  const { s, kit, owner, client } = await fixture(t)
   kit.send({ op: 'viewing', convo_ids: ['room-1'] })
   client.send({ op: 'viewing', convo_ids: ['room-1'] })
-  await settle(100)
+  await untilClientViewing(s, ['room-1'])
   produceEphemerals(owner, 'room-1')
   await client.waitFor((f) => f.kind === 'ephemeral' && f.convo_id === 'room-1' && f.activity)
   await settle()
@@ -123,7 +135,7 @@ test('hub scoping: a viewing non-member agent receives nothing from a private bo
   const { s, ids, kit, ghost, owner, client } = await fixture(t)
   plantViewing(s, ids.kit, ['ghost-work', 'room-1'])
   client.send({ op: 'viewing', convo_ids: ['ghost-work', 'room-1'] })
-  await settle(100)
+  await untilClientViewing(s, ['ghost-work', 'room-1'])
   produceEphemerals(ghost, 'ghost-work')
   produceEphemerals(owner, 'room-1')
   await client.waitFor(() => hasAllFamilies(client, 'ghost-work') && hasAllFamilies(client, 'room-1'))
