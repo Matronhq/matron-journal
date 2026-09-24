@@ -182,43 +182,43 @@ export async function handleGithubCallback(ctx, req, res, url) {
   const redirect = (to) => { res.writeHead(302, { location: to }); res.end(); return true }
   if (url.pathname === '/github/callback/confirm' && req.method === 'POST') {
     const body = await readFormOrJson(req)
-    if (typeof body.nonce !== 'string' || !/^[0-9a-f]{32}$/.test(body.nonce)) return redirect('/account?link_error=bad_request')
+    if (typeof body.nonce !== 'string' || !/^[0-9a-f]{32}$/.test(body.nonce)) return redirect('/app/account?link_error=bad_request')
     let parked
     try {
       parked = takeLinkConfirm(db, { nonce: body.nonce, box: tokenBox })
     } catch {
-      return redirect('/account?link_error=expired')
+      return redirect('/app/account?link_error=expired')
     }
-    if (!parked) return redirect('/account?link_error=expired')
-    if (body.decision !== 'link') return redirect('/account?link_error=denied')
-    if (!github || !github.enabled) return redirect('/account?link_error=not_configured')
+    if (!parked) return redirect('/app/account?link_error=expired')
+    if (body.decision !== 'link') return redirect('/app/account?link_error=denied')
+    if (!github || !github.enabled) return redirect('/app/account?link_error=not_configured')
     try {
       saveGithubIdentity(db, { userId: parked.user_id, host: github.host, identity: parked.identity, token: parked.token, box: tokenBox })
     } catch (err) {
-      if (err.message === 'github_conflict') return redirect('/account?link_error=conflict')
+      if (err.message === 'github_conflict') return redirect('/app/account?link_error=conflict')
       throw err
     }
-    return redirect('/account?linked=1')
+    return redirect('/app/account?linked=1')
   }
   if (url.pathname !== '/github/callback' || req.method !== 'GET') return false
   const code = url.searchParams.get('code')
   const state = url.searchParams.get('state')
-  if (!github || !github.enabled || !github.webFlow) return redirect('/account?link_error=not_configured')
-  if (typeof state !== 'string' || !state) return redirect('/account?link_error=bad_request')
+  if (!github || !github.enabled || !github.webFlow) return redirect('/app/account?link_error=not_configured')
+  if (typeof state !== 'string' || !state) return redirect('/app/account?link_error=bad_request')
   const row = takeLinkFlow(db, { state })
-  if (!row) return redirect('/account?link_error=expired')
-  if (typeof code !== 'string' || !code) return redirect('/account?link_error=bad_request')
+  if (!row) return redirect('/app/account?link_error=expired')
+  if (typeof code !== 'string' || !code) return redirect('/app/account?link_error=bad_request')
   let token, identity
   try {
     ;({ token } = await github.exchangeCode(code))
     identity = await github.fetchIdentity(token)
   } catch (err) {
-    if (err instanceof GithubError) return redirect('/account?link_error=upstream')
+    if (err instanceof GithubError) return redirect('/app/account?link_error=upstream')
     throw err
   }
-  if (githubIdentityBoundElsewhere(db, { host: github.host, githubId: identity.github_id, userId: row.user_id })) return redirect('/account?link_error=conflict')
+  if (githubIdentityBoundElsewhere(db, { host: github.host, githubId: identity.github_id, userId: row.user_id })) return redirect('/app/account?link_error=conflict')
   const user = db.prepare('SELECT name FROM users WHERE id=?').get(row.user_id)
-  if (!user) return redirect('/account?link_error=expired')
+  if (!user) return redirect('/app/account?link_error=expired')
   const { nonce } = createLinkConfirm(db, { userId: row.user_id, token, identity, box: tokenBox })
   res.writeHead(200, {
     'content-type': 'text/html; charset=utf-8',

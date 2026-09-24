@@ -57,7 +57,7 @@ test('static: files, index fallback for /u/* and /app/*, root redirect, HEAD, ca
   assert.equal(idx.headers.get('x-frame-options'), 'DENY')
   assert.equal(idx.headers.get('x-content-type-options'), 'nosniff')
   assert.match(await idx.text(), /Matron/)
-  for (const p of ['/app', '/app/', '/app/items/it_1', '/u/dan/1?x=1']) assert.equal((await get(p)).status, 200, p)
+  for (const p of ['/app', '/app/', '/app/items/it_1', '/u/dan/1?x=1', '/app/account?linked=1', '/app/account?link_error=denied']) assert.equal((await get(p)).status, 200, p)
 
   const asset = await get('/assets/app-abc123.js')
   assert.equal(asset.status, 200)

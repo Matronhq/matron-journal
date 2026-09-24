@@ -184,8 +184,8 @@ on a `github_link_confirms` row (10 minutes, single-use nonce) and
 renders a small confirm page: "You signed in to GitHub as **@login**. This
 will link that GitHub account to the Matron journal user **name**." Only
 the Link button (`POST /github/callback/confirm {nonce, decision:'link'}`)
-upserts `github_accounts` and redirects to `/account?linked=1`; Cancel
-discards the parked token and redirects to `/account?link_error=denied`.
+upserts `github_accounts` and redirects to `/app/account?linked=1`; Cancel
+discards the parked token and redirects to `/app/account?link_error=denied`.
 The callback is bound to the flow row's user, not to the browser's Bearer
 token, because the redirect arrives without one — and that is exactly why
 the page exists: an authorize URL can be handed to anyone, and the person
