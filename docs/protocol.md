@@ -57,7 +57,10 @@ the machine-checkable version of this page.
   conversation just yields a shorter window, never an error. This mode
   carries its own, separate agent-authorization story from the
   `before_seq`/default gate described above — see "Journal search" below
-  for the full two-regime explanation.
+  for the full two-regime explanation. On another user's conversation that
+  passes *Shared visibility*, `around_seq` reads return the prose window
+  (`text`, `diff`), `limit` clamped to 30, logged as `journal: shared
+  context read …`; `before_seq` paging on it stays 404.
 - `GET /search?q=&limit=&convo_id=` (Bearer, any authenticated device —
   client or agent) -> `{hits: [{convo_id, title, seq, ts, sender, snippet,
   live}]}`. Full-text search over the prose the journal has indexed (see
@@ -100,8 +103,12 @@ the machine-checkable version of this page.
   Content-Length and a long-lived `Cache-Control` (ids are immutable random
   handles), plus `X-Content-Type-Options: nosniff` and
   `Content-Disposition: attachment` so an uploader-chosen content-type can never
-  render as active content on the API origin. Owner-only; missing or not-owned
-  are indistinguishable, both 404 `{error:'not_found'}`.
+  render as active content on the API origin. Owner-only, with one exception:
+  a colleague under *Shared visibility* may fetch a blob that a prose event in
+  a shared conversation, or an attachment on a shared non-consent item, names
+  — provided the referencing row's owner owns the blob. Such reads are logged
+  (`journal: shared media read blob=… viewer=… device=…`). Missing, not-owned
+  and not-shared are indistinguishable, all 404 `{error:'not_found'}`.
   A blob may also disappear later via the quota-pressure reaper: once a user's
   total blob bytes reach `MATRON_MEDIA_REAP_HIGH_PCT` (default 90%) of the
   quota, the retention scheduler deletes their oldest `file`/`image`
@@ -431,7 +438,7 @@ an agent token, selected by which query parameter is present:
   user or device. Bridges MUST mint globally unique ids — Claude session
   UUIDs are the convention.
 - `convo_upsert` appends a `convo_meta` journal event
-  (`payload:{title, parent_convo_id, agent_device_id}`, sender = the agent device, e.g.
+  (`payload:{title, parent_convo_id, agent_device_id, repo}`, sender = the agent device, e.g.
   `agent:dev-2`) whenever it changes an existing conversation's title, sets
   a non-empty title at creation, or creates a child (`parent_convo_id` set,
   even titleless — the linkage must ride the journal, or a live client would
@@ -442,6 +449,15 @@ an agent token, selected by which query parameter is present:
   connection's own device — the same id `convo_upsert` records on the row —
   so a live client can attribute a brand-new conversation to its box without
   waiting for the next `/snapshot`.
+- `convo_upsert` accepts an optional `repo`: the canonical `host/org/name`
+  of the session's git remote (lower-cased host and org, e.g.
+  `github.com/matronhq/matron-journal`; regex
+  `^[a-z0-9.-]+/[a-z0-9_.-]+/[A-Za-z0-9_.-]+$`, ≤ 256 chars). Absent leaves
+  the stored value alone, `null` clears it, anything else is `bad_request`.
+  A change appends a `convo_meta` carrying the new `repo`; `/snapshot`
+  conversations carry `repo` too (`null` when unknown). The journal derives
+  `repo_scope` (`host/org`) from it — the unit shared visibility is decided
+  on (see "Shared visibility").
 - Room membership changes append a server-authored `convo_meta` (sender
   `journal`) whose payload is just `{participants}` — the same
   owner-plus-joined array `/snapshot` carries — so live clients re-chip a
@@ -1362,8 +1378,9 @@ degrade path for clients predating the tracker, not a second timeline.
 
 | Route | Body / query | Response |
 |---|---|---|
-| `GET /items` | `convo, kind, state, awaiting, label, sort=rank\|updated, since, limit≤500, cursor` | `{items:[…], next_cursor}` |
+| `GET /items` | `convo, kind, state, awaiting, label, sort=rank\|updated, since, limit≤500, cursor, scope=mine\|shared (shared: kind/state/awaiting/limit/cursor only; rows carry owner{user_id,name,github_login} and repo)` | `{items:[…], next_cursor}` |
 | `GET /items/:id` | `:id` = `it_…` or `#num` (URL-encode `#`) | `{item, comments:[…]}` |
+| `GET /items/:id` (shared) | `:id` = `it_…` of a colleague's item visible under *Shared visibility* | `{item, comments}` with `item.owner`; any other method or sub-route on it is **403 `forbidden`** |
 | `POST /items` | `{kind, title, body?, labels?, links?, attachments?, awaiting?, position?, after?, before?, convo_id, supersedes?, on_behalf_of?:'user' (agent callers only)}` + optional `Idempotency-Key`; `position` is **exclusive** of `after`/`before` (given together is 400); `after`/`before` may be given alone or together (a midpoint between the two, consistent with `/rank`; none means bottom) | 201 `{item}` (200 on replay) |
 | `PATCH /items/:id` | `{title?, body?, labels?, links?, awaiting?, mission?: id \| "#num" \| null}` — `attachments` is **400** (create-only in v1; it used to be dropped silently, which told a client its blob had landed), and a patch carrying neither a field nor `mission` is **400**. `mission` moves the item to that mission, or detaches it when `null`; it is an explicit move only, never inferred. Fields and the move are one write with one `updated_at`. | `{item}`. **404** if `mission` names a mission that does not exist **or** is invisible to the caller — the same sieve `GET /missions/:id` applies (see *Missions & milestones → Visibility*), never a 403, so a hidden mission is not an existence oracle here either. **409** only for `awaiting` on a closed item (clearing it with `null` is fine); a **closed mission is not refused** as a move target in v1 — closing a mission blocks on open items precisely so they can be moved, and a finished mission must stay correctable. |
 | `POST /items/:id/comments` | `{body?, attachments?}` (one required) + optional `Idempotency-Key` | 201 `{item, comment}` (200 on replay) |
@@ -1595,13 +1612,14 @@ column.
 | Route | Body / query | Returns |
 |---|---|---|
 | `POST /missions` | `{title, body?, convo_id, attach?: boolean}` + optional `Idempotency-Key` (also served at `POST /missions/create`) | 201 `{mission}`. If `convo_id` already has a mission: 200 that mission with `existing: true`, nothing changed — or **404** if that mission is invisible to the caller (see *Visibility*). Attaches the conversation, repoints its unassigned items (each repointed item's own `updated_at` is bumped too, so `GET /items?since=` learns it gained a mission). With `attach: false`: always a new mission (201; a replay 200), `origin_convo_id` = `convo_id`, and neither the conversation nor its items are touched — no `existing` short-circuit. Either way, on a genuine 201 the `created` mission marker is still appended into `convo_id` — provenance of where the mission was born, independent of whether it was ever attached there. A non-boolean `attach` is 400. |
-| `GET /missions` | `?state=open\|closed` (omit = both), `?since=<ms>` | `{missions:[…]}` with per-row counts: `open_items`, `needs_you` (open and awaiting user), `conversations`, `milestones`, `last_milestone` `{num,title,kind,created_at}`. Sorted `last_milestone_at DESC NULLS LAST`, then `created_at DESC` — for a filtered (ordinary agent) caller this is the SIEVED last-milestone timestamp (the same sieved subquery the `last_milestone` field itself uses), so the order never disagrees with the row shown; an owner or private agent sorts on the stored column, which is the same thing. |
+| `GET /missions` | `?state=open\|closed` (omit = both), `?since=<ms>`, `?scope=mine\|shared` (shared: neither `state` nor `since`; rows carry `owner`) | `{missions:[…]}` with per-row counts: `open_items`, `needs_you` (open and awaiting user), `conversations`, `milestones`, `last_milestone` `{num,title,kind,created_at}`. Sorted `last_milestone_at DESC NULLS LAST`, then `created_at DESC` — for a filtered (ordinary agent) caller this is the SIEVED last-milestone timestamp (the same sieved subquery the `last_milestone` field itself uses), so the order never disagrees with the row shown; an owner or private agent sorts on the stored column, which is the same thing. |
 | `GET /missions/:id` | | `{mission, milestones:[…] newest first, items:[open items], conversations:[{id,title,box,state}]}` |
+| `GET /missions/:id` (shared) | `:id` must be `ms_…` (a colleague's number is not resolvable) of a mission visible under *Shared visibility* | mission detail with `owner`; `PATCH`, `join`, and `close` on it are all **403 `forbidden`** |
 | `PATCH /missions/:id` | `{title?, body?}` | 200 `{mission}`; 409 `{blocked_by:'closed'}` |
 | `POST /missions/:id/join` | `{convo_id}` | 200 `{mission}`; 409 `{blocked_by:'other_mission'}` if the conversation already has a different mission, 409 `{blocked_by:'closed'}` if this one is closed, 400 `{error:'bad_request'}` once the mission already has 200 conversations. Repeat-joining the same mission is a no-op 200, not a conflict. Repoints the conversation's unassigned items (same `updated_at` bump as `POST /missions`). |
 | `POST /missions/:id/close` | `{summary}` | 200 `{mission}`, or 409 as in *Closing*, below. |
 | `POST /milestones` | `{convo_id, kind:'user_input'\|'progress', title, body?}` + optional `Idempotency-Key` | 201 `{milestone, mission}`; 409 `{blocked_by:'no_mission'}` if the conversation has none — or if its mission is invisible to the caller (see *Visibility*), 409 `{blocked_by:'closed'}` if its mission is closed; 502 `{error:'marker_append_failed'}` if the anchor marker couldn't be written (the milestone row is not created either — see "Marker events" below). |
-| `GET /milestones?convo=<id>` | | `{milestones:[…]}` newest first — the per-conversation view. 400 without `convo`; 404 for an unknown conversation, another user's, or (for an ordinary agent) a private-owned one. |
+| `GET /milestones?convo=<id>` | | `{milestones:[…]}` newest first — the per-conversation view. 400 without `convo`; 404 for an unknown conversation, another user's, or (for an ordinary agent) a private-owned one. Also works on a colleague's conversation visible under *Shared visibility*. |
 | `PATCH /items/:id` | gains `mission: id \| "#num" \| null` | existing route (see "Items" above); moves or detaches the item, gated by the same visibility rule as `GET /missions/:id` — a mission an ordinary agent can't see is never a reachable move target, and is **404**, not 403. A closed mission is still a legal target (see the Items table). Emits the item marker `updated`. |
 
 Errors follow the items routes: 400 on shape/limits, 404 on unknown or
@@ -1758,6 +1776,71 @@ The marker itself is never suppressed — the user's timeline still needs the
 event, and a missing event would be its own signal. Markers written into
 the origin conversation, or into another private-owned conversation, are
 unchanged: nothing crossed.
+
+## Shared visibility (GitHub-verified, per repo)
+
+Spec: `docs/superpowers/specs/2026-09-23-tracker-web-teams-and-item-links-design.md`.
+
+A user may read another user's conversation-scoped rows — items, missions,
+milestones, and a prose excerpt of the conversation — when **all** hold:
+
+1. the conversation has a `repo` (see `convo_upsert`) whose `repo_scope`
+   (`host/org`) is one the viewer is a verified member of;
+2. the conversation's owner is a verified member of the same scope;
+3. the conversation is not owned by a private device (the device-privacy
+   sieve is part of the rule and is never overridden by an org match).
+
+"Verified member" = the user has linked a GitHub account (below) whose
+link is in state `ok` and whose active org memberships include the scope.
+A stale link (GitHub refused the token on the last refresh) confers
+nothing until a later refresh succeeds (the daily job retries stale rows)
+or the user re-links. A repo under a personal login is in no
+one's org list, so it is private to its owner. Agent devices read with
+their owning user's visibility; writes stay owner-only.
+
+Attachments on shared rows are fetchable through `GET /media/:id` under the
+same rule (see the media routes above); consent-mirror items and non-prose
+events open nothing.
+
+Invisible rows answer `404 not_found`; a visible foreign row refused for
+writing answers `403 forbidden`. The rule lives in `src/visibility.js`
+and is the only copy.
+
+### GitHub account linking
+
+Client devices only (an agent never links). Configuration:
+`MATRON_GITHUB_CLIENT_ID` (default empty → linking disabled, every route
+below is `404 not_configured`; will default to Matron's published OAuth
+App id once one is registered — not configured in this release),
+`MATRON_GITHUB_CLIENT_SECRET` (optional; enables the web flow),
+`MATRON_GITHUB_HOST` (default `github.com`). The token scope is `read:org`.
+
+| Route | Body / query | Response |
+|---|---|---|
+| `POST /github/link` | `{flow:'device'}` | `{flow_id, user_code, verification_uri, interval, expires_in}` |
+| `POST /github/link` | `{flow:'web'}` (400 without a client secret) | `{url}` — send the browser there |
+| `POST /github/link/:flow_id/poll` | — | `{status:'pending', interval?}` \| `{status:'linked', github}` \| `{status:'denied'\|'expired'}`; 404 unknown/finished/another user's; 409 if the GitHub account is linked to another user; 502 `upstream` if GitHub is unreachable |
+| `GET /github/callback?code&state` | no Bearer; `state` is the single-use flow credential | **200 HTML confirm page** naming the GitHub login and the journal user, with the token parked on a `github_link_confirms` row (10 min, single-use nonce) — nothing is linked yet; or 302 to `/account?link_error=<expired\|bad_request\|conflict\|upstream\|not_configured>` |
+| `POST /github/callback/confirm` | no Bearer; form or JSON `{nonce, decision:'link'\|'cancel'}` — the nonce is the credential | 302 to `/account?linked=1` (linked) or `/account?link_error=<denied\|expired\|bad_request\|conflict\|not_configured>`; the parked token is deleted either way |
+| `POST /github/refresh` | — | `{github}`; marks the link `stale` on 401/403 from GitHub; 502 `upstream` if unreachable (nothing changes); 404 if this user has no linked account |
+| `DELETE /github/link` | — | `{ok:true}`; 404 if not linked |
+| `GET /me` | — | `{user:{id,name}, github: {host, login, orgs, state, checked_at, linked_at} \| null, github_linking:{enabled, web_flow}}` |
+| `GET /lookup?user=<name>&num=<n>` | also `GET /u/<name>/<n>` with `Accept: application/json` | `{kind:'item'\|'mission'\|'milestone', id, owner:{user_id,name}}`; 404 unknown or invisible |
+
+Why the confirm page: an authorize URL can be handed to anyone, and GitHub's
+own pages name the OAuth App, never the journal user — so the person who
+authorizes is shown which journal account they are binding before anything
+is saved. The device flow has no equivalent hook (the authorizer only sees
+GitHub's device page), so a `user_code` handed to a victim can bind their
+identity to the attacker's journal account; the guards there are the 409 on
+an identity already linked elsewhere and the admin's ability to clear a
+link. Prefer the web flow where an OAuth App can be registered.
+
+The journal re-reads every linked user's memberships daily
+(`src/github-refresh.js`) and on `POST /github/refresh`. Flows expire
+after 10 minutes and are consumed by the poll or callback that finishes
+them. The token is stored in the journal DB, never returned by any route
+and never logged.
 
 ## Device privacy
 

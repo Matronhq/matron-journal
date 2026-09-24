@@ -1,0 +1,119 @@
+// Storage for GitHub account links (spec 2026-09-23 tracker web/teams,
+// "GitHub account linking"). Pure DB functions; the HTTP layer and the
+// refresh job call these. The token column is written here and read by
+// listGithubAccounts (the refresh job) — no view ever returns it.
+import { randomBytes } from 'node:crypto'
+
+export const LINK_FLOW_TTL_MS = 10 * 60 * 1000
+
+export function githubAccountView(db, userId) {
+  const row = db.prepare('SELECT host, login, state, checked_at, linked_at FROM github_accounts WHERE user_id=?').get(userId)
+  if (!row) return null
+  const orgs = db.prepare('SELECT scope FROM github_orgs WHERE user_id=? ORDER BY scope').all(userId).map((r) => r.scope)
+  return { host: row.host, login: row.login, orgs, state: row.state, checked_at: row.checked_at, linked_at: row.linked_at }
+}
+
+// One GitHub identity per journal user, one journal user per identity.
+export function saveGithubIdentity(db, { userId, host, identity, token, now = Date.now() }) {
+  return db.transaction(() => {
+    const other = db.prepare('SELECT user_id FROM github_accounts WHERE host=? AND github_id=? AND user_id<>?').get(host, identity.github_id, userId)
+    if (other) throw new Error('github_conflict')
+    db.prepare(`INSERT INTO github_accounts(user_id, host, github_id, login, token, state, checked_at, linked_at)
+      VALUES(?,?,?,?,?,'ok',?,?)
+      ON CONFLICT(user_id) DO UPDATE SET host=excluded.host, github_id=excluded.github_id, login=excluded.login,
+        token=excluded.token, state='ok', checked_at=excluded.checked_at`).run(userId, host, identity.github_id, identity.login, token, now, now)
+    db.prepare('DELETE FROM github_orgs WHERE user_id=?').run(userId)
+    const ins = db.prepare('INSERT INTO github_orgs(user_id, scope) VALUES(?,?)')
+    for (const scope of new Set(identity.scopes)) ins.run(userId, scope)
+    return githubAccountView(db, userId)
+  })()
+}
+
+// Refresh-path write: only touches the row that still holds the token the
+// refresh was started with, so an unlink or re-link that landed while
+// GitHub was being asked is never undone. Returns the view, or null when
+// nothing matched.
+export function updateGithubIdentity(db, { userId, token, identity, now = Date.now() }) {
+  return db.transaction(() => {
+    const r = db.prepare(`UPDATE github_accounts SET github_id=?, login=?, state='ok', checked_at=?
+      WHERE user_id=? AND token=?`).run(identity.github_id, identity.login, now, userId, token)
+    if (r.changes === 0) return null
+    db.prepare('DELETE FROM github_orgs WHERE user_id=?').run(userId)
+    const ins = db.prepare('INSERT INTO github_orgs(user_id, scope) VALUES(?,?)')
+    for (const scope of new Set(identity.scopes)) ins.run(userId, scope)
+    return githubAccountView(db, userId)
+  })()
+}
+
+// `token`, when given, scopes the write to the row that still holds the
+// token the caller started its refresh/check with — the same "only touch
+// the row we asked about" guard as updateGithubIdentity, so a stale-mark
+// racing an unlink or re-link never lands on the wrong row.
+// Is this GitHub identity already linked to a different journal user? The
+// web-flow callback asks before parking a token, so a doomed link never
+// shows a confirm page.
+export function githubIdentityBoundElsewhere(db, { host, githubId, userId }) {
+  return !!db.prepare('SELECT 1 FROM github_accounts WHERE host=? AND github_id=? AND user_id<>?').get(host, githubId, userId)
+}
+
+export function markGithubStale(db, userId, { token = null, now = Date.now() } = {}) {
+  if (token != null) {
+    db.prepare("UPDATE github_accounts SET state='stale', checked_at=? WHERE user_id=? AND token=?").run(now, userId, token)
+  } else {
+    db.prepare("UPDATE github_accounts SET state='stale', checked_at=? WHERE user_id=?").run(now, userId)
+  }
+}
+
+export function deleteGithubAccount(db, userId) {
+  return db.prepare('DELETE FROM github_accounts WHERE user_id=?').run(userId).changes > 0
+}
+
+export function listGithubAccounts(db) {
+  return db.prepare('SELECT user_id, host, token FROM github_accounts ORDER BY user_id').all()
+}
+
+export function createLinkFlow(db, { userId, deviceId, flow, deviceCode = null, state = null, ttlMs = LINK_FLOW_TTL_MS, now = Date.now() }) {
+  const id = `gl_${randomBytes(8).toString('hex')}`
+  db.prepare('INSERT INTO github_link_flows(id, user_id, device_id, flow, device_code, state, expires_at, created_at) VALUES(?,?,?,?,?,?,?,?)')
+    .run(id, userId, deviceId, flow, deviceCode, state, now + ttlMs, now)
+  return db.prepare('SELECT * FROM github_link_flows WHERE id=?').get(id)
+}
+
+// Returns the row and deletes it — a flow is finished by exactly one poll
+// or one callback. Expired rows are swept on read and answer null.
+export function takeLinkFlow(db, { id = null, state = null, now = Date.now() }) {
+  return db.transaction(() => {
+    db.prepare('DELETE FROM github_link_flows WHERE expires_at <= ?').run(now)
+    const row = id != null
+      ? db.prepare('SELECT * FROM github_link_flows WHERE id=?').get(id)
+      : (state != null ? db.prepare("SELECT * FROM github_link_flows WHERE state=? AND flow='web'").get(state) : null)
+    if (!row) return null
+    db.prepare('DELETE FROM github_link_flows WHERE id=?').run(row.id)
+    return row
+  })()
+}
+
+// A web-flow result parked until the person on the confirm page says yes.
+// The nonce is the page's only credential: single-use, unguessable, and
+// swept with the same TTL as a flow. The token sits here for at most that
+// long and is deleted on link, cancel or expiry.
+export function createLinkConfirm(db, { userId, token, identity, ttlMs = LINK_FLOW_TTL_MS, now = Date.now() }) {
+  const id = `gc_${randomBytes(8).toString('hex')}`
+  const nonce = randomBytes(16).toString('hex')
+  db.prepare('INSERT INTO github_link_confirms(id, user_id, nonce, token, identity_json, expires_at, created_at) VALUES(?,?,?,?,?,?,?)')
+    .run(id, userId, nonce, token, JSON.stringify(identity), now + ttlMs, now)
+  return { id, nonce }
+}
+
+// Returns {user_id, token, identity} and deletes the row — a confirm is
+// finished by exactly one POST, link or cancel. Expired rows are swept on
+// read and answer null.
+export function takeLinkConfirm(db, { nonce, now = Date.now() }) {
+  return db.transaction(() => {
+    db.prepare('DELETE FROM github_link_confirms WHERE expires_at <= ?').run(now)
+    const row = db.prepare('SELECT user_id, token, identity_json FROM github_link_confirms WHERE nonce=?').get(nonce)
+    if (!row) return null
+    db.prepare('DELETE FROM github_link_confirms WHERE nonce=?').run(nonce)
+    return { user_id: row.user_id, token: row.token, identity: JSON.parse(row.identity_json) }
+  })()
+}

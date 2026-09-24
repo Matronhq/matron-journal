@@ -3,6 +3,7 @@
 // tests, and any future WS op share one set of rules. No hub, no push, no
 // wake: those are src/items-http.js's job.
 import { randomBytes } from 'node:crypto'
+import { sharedConvoSql } from './visibility.js'
 
 export const ITEM_KINDS = ['task', 'question', 'decision']
 export const RESOLUTIONS = ['done', 'answered', 'decided', 'reversed', 'cancelled']
@@ -352,6 +353,52 @@ export function listItems(db, userId, {
     ? encCursor([sort === 'updated' ? last.updated_at : last.rank, last.num])
     : null
   return { items: page, next_cursor }
+}
+
+// Cross-user read (spec 2026-09-23 tracker web/teams, "Reads that widen").
+// Rows whose origin conversation passes the shared rule for @viewer, never
+// the viewer's own. Ordered newest-updated first; the cursor is
+// [updated_at, id] — item ids are random, so unlike `num` they are unique
+// across users.
+const OWNER_DECORATE = `
+  cv.repo AS repo,
+  json_object('user_id', u.id, 'name', u.name, 'github_login', ga.login) AS owner_json`
+const SHARED_FROM = `FROM items i
+  JOIN conversations cv ON cv.id = i.origin_convo_id
+  JOIN users u ON u.id = i.user_id
+  LEFT JOIN github_accounts ga ON ga.user_id = i.user_id`
+
+function rowToSharedItem(row) {
+  if (!row) return null
+  const { owner_json: ownerJson, ...rest } = row
+  const item = rowToItem(rest)
+  item.owner = parseJson(ownerJson, null)
+  return item
+}
+
+export function listSharedItems(db, viewerUserId, { kind = null, state = null, awaiting = null, limit = 100, cursor = null } = {}) {
+  limit = Math.min(Math.max(Number(limit) || 100, 1), 500)
+  const where = [sharedConvoSql('cv'), 'i.consent IS NULL']
+  const args = { viewer: viewerUserId }
+  if (kind != null) { where.push('i.kind = @kind'); args.kind = kind }
+  if (state != null) { where.push('i.state = @state'); args.state = state }
+  if (awaiting != null) { where.push('i.awaiting = @awaiting'); args.awaiting = awaiting }
+  const cur = cursor ? decCursor(cursor) : null
+  if (cursor && !cur) return { badCursor: true }
+  if (cur) { where.push('(i.updated_at < @cu OR (i.updated_at = @cu AND i.id < @cid))'); args.cu = cur[0]; args.cid = cur[1] }
+  const rows = db.prepare(`SELECT i.*, ${DECORATE}, ${OWNER_DECORATE} ${SHARED_FROM}
+    WHERE ${where.join(' AND ')} ORDER BY i.updated_at DESC, i.id DESC LIMIT @lim`).all({ ...args, lim: limit + 1 })
+  const page = rows.slice(0, limit).map(rowToSharedItem)
+  const last = page[page.length - 1]
+  const next_cursor = rows.length > limit && last ? encCursor([last.updated_at, last.id]) : null
+  return { items: page, next_cursor }
+}
+
+export function getSharedItem(db, viewerUserId, itemId) {
+  if (typeof itemId !== 'string' || !itemId.startsWith('it_')) return null
+  const row = db.prepare(`SELECT i.*, ${DECORATE}, ${OWNER_DECORATE} ${SHARED_FROM}
+    WHERE i.id = @id AND i.consent IS NULL AND ${sharedConvoSql('cv')}`).get({ viewer: viewerUserId, id: itemId })
+  return rowToSharedItem(row)
 }
 
 function touch(db, itemId, now) {

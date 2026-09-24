@@ -5,6 +5,7 @@ import { CONVOS_MAX, getMission } from './missions.js'
 import { privateOwnedConvo } from './privacy.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { joinedAgentIds } from './participants.js'
+import { parseRepo } from './repo-identity.js'
 
 export const MESSAGE_TYPES = [
   'text', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image', 'spawn_outcome',
@@ -151,13 +152,22 @@ function inheritableMission(db, { parentConvoId, ownerUserId, agentDeviceId }) {
 // (undefined for a brand-new convo). Purely an in-memory hint for the push
 // pipeline's turn-finished detection (see push.js classify()) — never
 // stored or broadcast, so it carries no wire/protocol weight.
-export function upsertConversation(db, { id, ownerUserId, title, sessionState, agentDeviceId, parentConvoId, sessionOutcome, summary }) {
+export function upsertConversation(db, { id, ownerUserId, title, sessionState, agentDeviceId, parentConvoId, sessionOutcome, summary, repo }) {
+  // repo: undefined = unchanged, null = clear, string = canonical host/org/name.
+  let repoCols = null // { repo, scope } to write, or null to leave alone
+  if (repo === null) repoCols = { repo: null, scope: null }
+  else if (repo !== undefined) {
+    const p = parseRepo(repo)
+    if (!p) throw new Error('bad repo')
+    repoCols = { repo: p.repo, scope: p.scope }
+  }
   const existing = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
   const prevSessionState = existing ? existing.session_state : undefined
   let metaChanged = false
   if (existing) {
     if (existing.owner_user_id !== ownerUserId) throw new Error('not authorized: convo owned by another user')
     if (title != null && title !== existing.title) metaChanged = true
+    if (repoCols && (existing.repo ?? null) !== repoCols.repo) metaChanged = true
     // agent_device_id: last upsert wins — the device currently managing the
     // session owns delivery (see hub.js). An absent agentDeviceId leaves the
     // recorded owner untouched.
@@ -186,6 +196,7 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     db.prepare(
       'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id), session_outcome=COALESCE(?, session_outcome), summary=COALESCE(?, summary) WHERE id=?'
     ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), sessionOutcome ?? null, summary ?? null, id)
+    if (repoCols) db.prepare('UPDATE conversations SET repo=?, repo_scope=? WHERE id=?').run(repoCols.repo, repoCols.scope, id)
   } else {
     const initialTitle = title || ''
     // Missions (spec 2026-09-10): a spawned conversation inherits its
@@ -197,6 +208,10 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
       'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, mission_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)'
     ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', inheritedMission, Date.now())
     if (initialTitle || parentConvoId) metaChanged = true
+    if (repoCols && repoCols.repo) {
+      db.prepare('UPDATE conversations SET repo=?, repo_scope=? WHERE id=?').run(repoCols.repo, repoCols.scope, id)
+      metaChanged = true
+    }
   }
   const convo = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
   return { ...convo, metaChanged, prevSessionState }
@@ -335,7 +350,7 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   const conversations = db.prepare(
     `SELECT id, title, session_state, session_outcome, last_seq, unread_count,
             ${omitSnippet ? 'NULL' : 'snippet'} AS snippet,
-            parent_convo_id, summary, created_at, agent_device_id,
+            parent_convo_id, summary, repo, created_at, agent_device_id,
             (SELECT ts FROM events e WHERE e.convo_id = conversations.id
              AND e.type IN (${MESSAGE_TYPES_SQL})
              ORDER BY e.seq DESC LIMIT 1) AS last_ts

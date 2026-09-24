@@ -11,13 +11,14 @@ import { idemKeyOf, senderOf, badRequest, notFound, conflict } from './http-who.
 import {
   ITEM_KINDS, AWAITING, RESOLUTIONS, BODY_MAX, validateItemFields, createItem, getItem, listItems, listComments,
   updateItem, addComment, setAttachmentTranscript, closeItem, reopenItem, rerankItem,
-  markTranscriptsPending, isAudioAttachment, isConsentMirror,
+  markTranscriptsPending, isAudioAttachment, isConsentMirror, listSharedItems, getSharedItem,
 } from './items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE, ITEM_ACTIONS, itemFallbackText, FALLBACK_ACTIONS } from './items-marker.js'
 import { visibleMission } from './missions-http.js'
 import { filteredAgent, privateOwnedConvo } from './privacy.js'
 
 const SORTS = ['rank', 'updated']
+const SCOPES = ['mine', 'shared']
 const STATES = ['open', 'closed']
 const POSITIONS = ['top', 'bottom']
 const ID_MAX = 128
@@ -130,6 +131,19 @@ function handleList(db, res, url, who) {
   const awaiting = oneOf(q.get('awaiting'), AWAITING)
   const sort = q.has('sort') ? oneOf(q.get('sort'), SORTS) : 'rank'
   if (kind === undefined || state === undefined || awaiting === undefined || sort === undefined) return badRequest(res)
+  const scope = q.has('scope') ? oneOf(q.get('scope'), SCOPES) : 'mine'
+  if (scope === undefined) return badRequest(res)
+  if (scope === 'shared') {
+    // Own-list-only filters (convo, label, sort, since) are meaningless
+    // across users and are rejected rather than ignored.
+    for (const k of ['convo', 'label', 'sort', 'since']) if (q.has(k)) return badRequest(res)
+    const sharedLimit = q.has('limit') ? Number(q.get('limit')) : 100
+    if (!Number.isInteger(sharedLimit) || sharedLimit < 1) return badRequest(res)
+    const r = listSharedItems(db, who.userId, { kind, state, awaiting, limit: sharedLimit, cursor: q.get('cursor') })
+    if (r.badCursor) return badRequest(res)
+    json(res, 200, { items: r.items, next_cursor: r.next_cursor })
+    return true
+  }
   let since = null
   if (q.has('since')) {
     since = Number(q.get('since'))
@@ -299,7 +313,17 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
   // Unknown id, another user's id, and a private-owned one all answer the
   // same 404 — nothing here is an enumeration oracle.
   const item = visibleItem(db, who, idOrNum)
-  if (!item) return notFound(res)
+  if (!item) {
+    // Not mine: maybe a colleague's, readable under the shared rule. Read
+    // only — every other method on a shared row is 403 (visible, not
+    // yours), which is safe to distinguish from 404 because the caller can
+    // already read it.
+    const shared = getSharedItem(db, who.userId, idOrNum)
+    if (!shared) return notFound(res)
+    if (!sub && req.method === 'GET') { json(res, 200, { item: shared, comments: listComments(db, shared.id) }); return true }
+    json(res, 403, { error: 'forbidden' })
+    return true
+  }
 
   // No origin-conversation gate here: the tracker is scoped to the USER, not
   // to a conversation, so any of the user's boxes that can already see an

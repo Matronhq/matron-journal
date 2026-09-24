@@ -9,12 +9,16 @@ import { listAwaiting, answerParkedInvite, getParticipant } from './participants
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { searchMessages, indexableBody } from './search.js'
+import { canReadConvo, canReadBlob } from './visibility.js'
 import { serveHelp } from './help.js'
 import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
 import { closeChatConsentItem } from './consent-items.js'
 import { wakeIfOffline, isWakeableBoxName } from './wake.js'
 import { handleItemsRoute } from './items-http.js'
 import { handleMissionsRoute } from './missions-http.js'
+import { handleGithubRoute, handleGithubCallback } from './github-http.js'
+import { handleLookupRoute } from './lookup-http.js'
+import { githubAccountView } from './github-accounts.js'
 import { handleCoordinatorRoute } from './coordinator-http.js'
 import { coordinatorFor } from './coordinator.js'
 import { json, readBody } from './http-body.js'
@@ -80,7 +84,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, itemTranscription = null }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, itemTranscription = null, github = null }) {
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -238,6 +242,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         if (!l) return json(res, 429, { error: 'rate_limited' })
         return json(res, 200, { link_code: l.linkCode, expires_in: l.expiresIn })
       }
+      if (await handleGithubCallback({ db, github }, req, res, url)) return
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       // The tracker's own surface (src/items-http.js) — mounted first so
@@ -245,6 +250,16 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       // outer try/catch so readBody's 400/413 map like every other route's.
       if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription }, req, res, url, who)) return
       if (await handleMissionsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
+      if (await handleGithubRoute({ db, github, rateLimiter }, req, res, url, who)) return
+      if (handleLookupRoute({ db }, req, res, url, who)) return
+      if (req.method === 'GET' && url.pathname === '/me') {
+        const user = db.prepare('SELECT id, name FROM users WHERE id=?').get(who.userId)
+        return json(res, 200, {
+          user: { id: user.id, name: user.name },
+          github: githubAccountView(db, who.userId),
+          github_linking: { enabled: !!(github && github.enabled), web_flow: !!(github && github.webFlow) },
+        })
+      }
       if (await handleCoordinatorRoute({ db, hub }, req, res, url, who)) return
       if (req.method === 'GET' && url.pathname === '/help') {
         // API discovery for agent callers (see src/help.js). Behind auth like
@@ -687,6 +702,20 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const rawLimit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : 50
         if (!Number.isInteger(rawLimit) || rawLimit < 1) return json(res, 400, { error: 'bad_request' })
         const limit = Math.min(rawLimit, 200)
+        // Shared conversations (spec 2026-09-23 tracker web/teams): a
+        // colleague's conversation under the org rule is readable as a
+        // context window only — the same prose-only, clamped, logged
+        // regime as a foreign agent's search-hit read below, with the
+        // owner's user id driving the query. canReadConvo runs the private
+        // sieve inside the rule, so a refused read never reaches the log.
+        const ownerRow = db.prepare('SELECT owner_user_id FROM conversations WHERE id=?').get(convoId)
+        if (ownerRow && ownerRow.owner_user_id !== who.userId) {
+          if (aroundSeq == null || !canReadConvo(db, who.userId, convoId)) return json(res, 404, { error: 'not_found' })
+          const events = messagesAroundIndexed(db, ownerRow.owner_user_id, convoId, { aroundSeq, limit: Math.min(limit, 30) })
+            .filter((e) => indexableBody(e.type, e.payload) != null)
+          console.log(`journal: shared context read convo=${convoId} viewer=${who.userId} device=${who.deviceId} anchor=${aroundSeq}`)
+          return json(res, 200, { events: events.map(toEventShape) })
+        }
         // Two agent read regimes (locked decision, search spec fold-in):
         //  - before_seq (and default) paging keeps the Phase-2 gate: an agent
         //    reads full transcripts only for conversations it manages or has
@@ -810,7 +839,14 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // owner learns from a 403 that a 404 doesn't already hide just as well,
         // and callers can't probe for the existence of someone else's blob.
         const blob = getBlob(db, mm[1])
-        if (!blob || blob.owner_user_id !== who.userId) return json(res, 404, { error: 'not_found' })
+        if (!blob) return json(res, 404, { error: 'not_found' })
+        if (blob.owner_user_id !== who.userId) {
+          // Shared visibility (spec 2026-09-23 tracker web/teams): a
+          // colleague reaches a blob only through a shared row that
+          // references it; canReadBlob is the one copy of that rule.
+          if (!canReadBlob(db, who.userId, blob.id)) return json(res, 404, { error: 'not_found' })
+          console.log(`journal: shared media read blob=${blob.id} viewer=${who.userId} device=${who.deviceId}`)
+        }
         // Stat the file before ever committing to a 200: the DB row can
         // outlive/disagree with the file on disk (deleted out from under
         // it, truncated by a disk issue, etc). Catching that here means a
