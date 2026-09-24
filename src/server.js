@@ -18,6 +18,7 @@ import { runOffload, runExpireLogs, runReapMedia } from './retention.js'
 import { backfillSearchIndex } from './search.js'
 import { scheduleGithubRefresh } from './github-refresh.js'
 import { makeRpcBroker } from './rpc-broker.js'
+import { resolveWebDir, makeStaticHandler } from './static-http.js'
 import { makeWaker } from './wake.js'
 import { makeTranscriber } from './transcribe.js'
 import { makeItemTranscription } from './items-transcribe.js'
@@ -288,7 +289,7 @@ export function startServer({
   // wake is actually under way, so a journal without MATRON_WAKE_CMD never
   // pays it.
   spawnWakeWaitMs = resolveNumericEnv('MATRON_SPAWN_WAKE_WAIT_MS', process.env.MATRON_SPAWN_WAKE_WAIT_MS, 240000),
-  mediaReapHighPct, mediaReapLowPct, waker, transcriber, github, githubRefreshIntervalMs,
+  mediaReapHighPct, mediaReapLowPct, waker, transcriber, github, githubRefreshIntervalMs, webDir,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
@@ -356,12 +357,16 @@ export function startServer({
     clientSecret: process.env.MATRON_GITHUB_CLIENT_SECRET || null,
     host: (process.env.MATRON_GITHUB_HOST || 'github.com').toLowerCase(),
   })
+  // Static hosting of the web app (spec 2026-09-23 tracker web/teams). The
+  // option is the test seam; env otherwise; unset serves nothing.
+  const resolvedWebDir = resolveWebDir(webDir !== undefined ? webDir : process.env.MATRON_WEB_DIR)
+  const handleStatic = makeStaticHandler({ webDir: resolvedWebDir })
   const server = http.createServer(makeHttpHandler({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription,
-    github: resolvedGithub,
+    github: resolvedGithub, handleStatic,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
