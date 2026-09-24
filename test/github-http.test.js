@@ -244,3 +244,11 @@ test('device flow start caps the row TTL and the returned expires_in at LINK_FLO
   const row2 = s.db.prepare('SELECT expires_at, created_at FROM github_link_flows WHERE id=?').get(start2.json.flow_id)
   assert.equal(row2.expires_at - row2.created_at, 300000)
 })
+
+test('GET /me reports is_admin', async (t) => {
+  const { s, dan, danTok, agent } = await fleet(t, fakeGithub())
+  assert.equal((await s.http('/me', { token: danTok })).json.user.is_admin, false)
+  s.db.prepare('UPDATE users SET is_admin=1 WHERE id=?').run(dan.id)
+  assert.deepEqual((await s.http('/me', { token: danTok })).json.user, { id: dan.id, name: 'dan', is_admin: true })
+  assert.equal((await s.http('/me', { token: agent.token })).json.user.is_admin, true, '/me describes the user, not the device')
+})

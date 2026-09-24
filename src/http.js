@@ -251,9 +251,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       if (await handleGithubRoute({ db, github, rateLimiter }, req, res, url, who)) return
       if (handleLookupRoute({ db }, req, res, url, who)) return
       if (req.method === 'GET' && url.pathname === '/me') {
-        const user = db.prepare('SELECT id, name FROM users WHERE id=?').get(who.userId)
+        const user = db.prepare('SELECT id, name, is_admin FROM users WHERE id=?').get(who.userId)
         return json(res, 200, {
-          user: { id: user.id, name: user.name },
+          user: { id: user.id, name: user.name, is_admin: !!user.is_admin },
           github: githubAccountView(db, who.userId),
           github_linking: { enabled: !!(github && github.enabled), web_flow: !!(github && github.webFlow) },
         })

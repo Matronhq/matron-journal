@@ -627,6 +627,15 @@ export function openDb(path) {
       created_at    INTEGER NOT NULL
     );
   `)
+  // Journal admins (spec 2026-09-23 tracker web/teams, "User
+  // administration"). Bootstrapped from the shell with
+  // `matron-admin user admin <name> on`; the users admin routes need at
+  // least one. Default 0: an upgraded journal has no admin until someone
+  // with shell access says so.
+  const userCols = db.prepare('PRAGMA table_info(users)').all()
+  if (!userCols.some((c) => c.name === 'is_admin')) {
+    db.exec('ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0')
+  }
   // One-time title cleanup (spec: agent box rename). Gated on user_version
   // inside, so this is a cheap pragma read on every subsequent open.
   healBakedTitles(db, { log: (m) => console.log(m) })
