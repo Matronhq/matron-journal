@@ -199,7 +199,8 @@ memberships, because it is the user's own token.
 retention) re-reads memberships for every linked account. The web app
 also triggers `POST /github/refresh` on sign-in and from a button. A `401`
 or `403` from GitHub sets `state='stale'`, which **fails closed**: a stale
-account confers no cross-user visibility until the user re-links. Other
+account confers no cross-user visibility until a later refresh succeeds
+(the daily job retries stale rows) or the user re-links. Other
 errors keep the previous list and log.
 
 **Unlink.** `DELETE /github/link` removes the row; the web app tells the
@@ -454,7 +455,8 @@ puts it on the clipboard.
 ## Security notes
 
 - Anti-enumeration is preserved: invisible rows and unknown users answer
-  `404` identically. `/lookup` rate-limits per device like `/search`.
+  `404` identically. Neither `/lookup` nor `/search` is rate limited; the
+  identical 404 is the anti-enumeration guard.
 - Private devices stay private across orgs. The sieve runs before the
   org rule and a test pins the order.
 - Foreign excerpt reads are prose-only, capped at 30 and logged with viewer

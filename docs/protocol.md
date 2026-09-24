@@ -1717,7 +1717,8 @@ milestones, and a prose excerpt of the conversation — when **all** hold:
 "Verified member" = the user has linked a GitHub account (below) whose
 link is in state `ok` and whose active org memberships include the scope.
 A stale link (GitHub refused the token on the last refresh) confers
-nothing until the user re-links. A repo under a personal login is in no
+nothing until a later refresh succeeds (the daily job retries stale rows)
+or the user re-links. A repo under a personal login is in no
 one's org list, so it is private to its owner. Agent devices read with
 their owning user's visibility; writes stay owner-only.
 

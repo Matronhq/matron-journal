@@ -575,3 +575,51 @@ test('schema: repo columns and github tables exist', () => {
   assert.throws(() => ins.run(2), /UNIQUE/, 'one GitHub account binds to one user')
   db.close()
 })
+
+test('openDb adds repo/repo_scope and the GitHub link tables to a pre-existing populated database in place', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-repo-migration-'))
+  const dbPath = path.join(dir, 'pre-repo.db')
+
+  // A conversations table shaped like the one before the tracker
+  // visibility branch: no repo, no repo_scope, and no github_* tables.
+  const raw = new Database(dbPath)
+  raw.exec(`
+    CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL);
+    CREATE TABLE conversations(
+      id TEXT PRIMARY KEY,
+      owner_user_id INTEGER NOT NULL,
+      title TEXT NOT NULL DEFAULT '',
+      session_state TEXT NOT NULL DEFAULT 'running',
+      last_seq INTEGER NOT NULL DEFAULT 0,
+      unread_count INTEGER NOT NULL DEFAULT 0,
+      snippet TEXT NOT NULL DEFAULT '',
+      created_at INTEGER NOT NULL
+    );
+  `)
+  raw.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+  raw.prepare("INSERT INTO conversations(id, owner_user_id, title, created_at) VALUES('c1',1,'legacy',0)").run()
+  raw.prepare("INSERT INTO conversations(id, owner_user_id, title, created_at) VALUES('c2',1,'legacy two',0)").run()
+  raw.close()
+
+  const db = openDb(dbPath)
+  const cols = db.prepare('PRAGMA table_info(conversations)').all().map((c) => c.name)
+  assert.ok(cols.includes('repo'), 'repo column missing after migration')
+  assert.ok(cols.includes('repo_scope'), 'repo_scope column missing after migration')
+  const indexes = db.prepare('PRAGMA index_list(conversations)').all().map((i) => i.name)
+  assert.ok(indexes.includes('idx_conversations_repo_scope'), 'repo_scope index missing after migration')
+  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((t) => t.name)
+  for (const t of ['github_accounts', 'github_orgs', 'github_link_flows']) assert.ok(tables.includes(t), `${t} missing after migration`)
+  // Pre-existing rows survive untouched, with the new columns NULL — so a
+  // legacy conversation is never mistaken for one in some org's scope.
+  const rows = db.prepare('SELECT id, title, repo, repo_scope FROM conversations ORDER BY id').all()
+  assert.deepEqual(rows, [
+    { id: 'c1', title: 'legacy', repo: null, repo_scope: null },
+    { id: 'c2', title: 'legacy two', repo: null, repo_scope: null },
+  ])
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM github_accounts').get().n, 0)
+  db.close()
+
+  // Re-opening (already migrated) is a no-op, not an error.
+  assert.doesNotThrow(() => openDb(dbPath).close())
+  fs.rmSync(dir, { recursive: true, force: true })
+})
