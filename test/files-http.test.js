@@ -568,3 +568,27 @@ test('an unreadable configured write-root fails visibly while pinning', async ()
     (e) => e && e.reason === 'bad-workdir',
   )
 })
+
+test('server-owned state inside a read-root is never listed or served', async (t) => {
+  const root = fs.realpathSync(makeTmpDir('matron-state-'))
+  const dataDir = path.join(root, 'data')
+  fs.mkdirSync(dataDir)
+  fs.writeFileSync(path.join(root, 'notes.md'), 'hello\n')
+  const dbPath = path.join(dataDir, 'journal.db')
+  const s = await startTestServer({ dbPath, fileReadRoots: [root] })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+
+  for (const route of ['content', 'meta']) {
+    const r = await authGet(s, `/files/${route}?path=${encodeURIComponent(dbPath)}`, token)
+    assert.equal(r.status, 403, route)
+  }
+  const media = path.join(dataDir, 'media')
+  fs.mkdirSync(media, { recursive: true })
+  assert.equal((await authGet(s, `/files/list?path=${encodeURIComponent(media)}`, token)).status, 403)
+  const listed = await (await authGet(s, `/files/list?path=${encodeURIComponent(dataDir)}&all=1`, token)).json()
+  assert.deepEqual(listed.entries.map((e) => e.name).filter((n) => n.startsWith('journal.db') || n === 'media'), [])
+  // Ordinary files next to it are unaffected.
+  assert.equal((await authGet(s, `/files/content?path=${encodeURIComponent(path.join(root, 'notes.md'))}`, token)).status, 200)
+})
+

@@ -1383,7 +1383,7 @@ test('denialToStatus maps every write reason without falling back to 502', () =>
     sensitive: 403, 'outside-scope': 403, 'trash-protected': 403,
     'dest-exists': 409, 'dir-not-empty': 409, 'overwrite-conflict': 409,
     'cross-device-dir': 409, 'confirm-required': 409, 'source-changed': 409,
-    'idem-key-conflict': 409,
+    'idem-key-conflict': 409, 'subtree-too-large': 409, 'protected-path': 403,
     'too-large': 413,
     'trash-write-failed': 507, 'audit-fail-closed': 507,
     'not-a-file': 404, 'not-a-dir': 404, unreadable: 404, symlink: 404,

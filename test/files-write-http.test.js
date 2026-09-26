@@ -867,3 +867,29 @@ test('an over-long path component is rejected before any directory is created', 
   }
   assert.deepEqual(treeOf(f.writeRoot), before, 'not even the parent component is created')
 })
+
+test('a directory move or recursive delete refuses a subtree that holds credential material', async (t) => {
+  const f = makeFixture()
+  const project = path.join(f.writeRoot, 'project')
+  fs.mkdirSync(path.join(project, 'deep', '.ssh'), { recursive: true })
+  fs.writeFileSync(path.join(project, 'deep', '.ssh', 'id_ed25519'), 'key\n')
+  fs.writeFileSync(path.join(project, 'readme.md'), 'hi\n')
+  const s = await startWrites(f)
+  t.after(() => s.close())
+  const { token } = await clientToken(s)
+  const before = treeOf(f.root)
+
+  const del = await call(s, `/files?path=${encodeURIComponent(project)}&recursive=1&confirm=1`, { method: 'DELETE', token })
+  assert.equal(del.status, 403)
+  const mv = await call(s, '/files/move', { token, body: { from: project, to: path.join(f.writeRoot, 'moved') } })
+  assert.equal(mv.status, 403)
+  assert.deepEqual(treeOf(f.root), before)
+
+  // A symlink inside the tree is judged by its own name, never followed.
+  fs.rmSync(path.join(project, 'deep'), { recursive: true })
+  fs.symlinkSync(f.readOnly, path.join(project, 'link-out'))
+  const ok = await call(s, `/files?path=${encodeURIComponent(project)}&recursive=1&confirm=1`, { method: 'DELETE', token })
+  assert.equal(ok.status, 200)
+  assert.ok(fs.existsSync(path.join(f.readOnly, 'locked.txt')))
+})
+

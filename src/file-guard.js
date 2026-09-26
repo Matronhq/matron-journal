@@ -148,7 +148,8 @@ export function denialToStatus(reason) {
       || reason === 'cross-device-dir'
       || reason === 'confirm-required'
       || reason === 'source-changed'
-      || reason === 'idem-key-conflict') return 409;
+      || reason === 'idem-key-conflict'
+      || reason === 'subtree-too-large') return 409;
   if (reason === 'too-large') return 413;
   // A malformed request, not a policy refusal: the caller fixes it by sending
   // a shorter name, and no state on the server is in the way.
@@ -274,6 +275,14 @@ export function withProtectedPaths(pinnedRoots, protectedPaths) {
 // Rejects the protected path itself, anything inside it (a protected
 // directory's contents), and any ancestor of it (a recursive delete of a parent
 // would take the protected state with it).
+// Read side: the protected path itself and anything inside it. Unlike the
+// write check, an ANCESTOR is fine to read (listing the data directory's
+// parent shows the directory, it does not hand out its contents).
+function isInsideProtected(realPath, allowedRoots) {
+  const protectedPaths = allowedRoots?.protectedPaths || [];
+  return protectedPaths.some((protectedPath) => contains(protectedPath, realPath));
+}
+
 function assertNotProtected(canonicalTarget, protectedPaths) {
   for (const protectedPath of protectedPaths) {
     if (contains(protectedPath, canonicalTarget) || contains(canonicalTarget, protectedPath)) {
@@ -943,6 +952,36 @@ function copyRegularFileForMove(
   }
 }
 
+// A directory move or recursive delete relocates everything under it, so the
+// sensitive-path rule has to hold for the whole subtree, not just for the
+// name the caller passed: otherwise `DELETE /w/project?recursive=1` would
+// carry /w/project/.ssh along even though a direct request for it is denied.
+// The walk never follows symlinks (a link is judged by its own name and not
+// descended into) and is bounded, so a huge tree is refused rather than
+// scanned without limit. A descendant created after the scan is the same
+// concurrent-local-writer residual the rest of this module documents.
+export const MAX_SUBTREE_SCAN_ENTRIES = 100_000;
+export function assertSubtreeNotSensitive(dirPath, { maxEntries = MAX_SUBTREE_SCAN_ENTRIES } = {}) {
+  const pending = [dirPath];
+  let seen = 0;
+  while (pending.length) {
+    const dir = pending.pop();
+    let dirents;
+    try {
+      dirents = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      throw new FileLinkDenied('unreadable');
+    }
+    for (const de of dirents) {
+      seen += 1;
+      if (seen > maxEntries) throw new FileLinkDenied('subtree-too-large');
+      const full = path.join(dir, de.name);
+      if (isSensitivePath(full)) throw new FileLinkDenied('sensitive');
+      if (de.isDirectory()) pending.push(full);
+    }
+  }
+}
+
 export async function moveGuarded(fromPath, toPath, { writeRoots, dryRun = false } = {}) {
   const source = prepareWriteTarget(fromPath, writeRoots);
   let destination;
@@ -959,6 +998,7 @@ export async function moveGuarded(fromPath, toPath, { writeRoots, dryRun = false
       throw new FileLinkDenied('outside-scope');
     }
     if (destination.targetStat) throw new FileLinkDenied('dest-exists');
+    if (source.targetStat.isDirectory()) assertSubtreeNotSensitive(source.target);
     reverifyPrepared(source);
     reverifyPrepared(destination);
     assertTargetIdentity(source, source.targetStat);
@@ -1248,6 +1288,7 @@ export async function trashGuarded(targetPath, { writeRoots, recursive = false, 
     if (source.targetStat.isDirectory() && !recursive && fs.readdirSync(source.target).length > 0) {
       throw new FileLinkDenied('dir-not-empty');
     }
+    if (source.targetStat.isDirectory() && recursive) assertSubtreeNotSensitive(source.target);
     reverifyPrepared(source);
     assertTargetIdentity(source, source.targetStat);
     if (dryRun) return { path: source.target, trashed: null, already_missing: false };
@@ -1427,6 +1468,7 @@ export async function openGuarded(filePath, { allowedRoots } = {}) {
       }
     }
     if (isSensitivePath(realPath)) throw new FileLinkDenied('sensitive');
+    if (isInsideProtected(realPath, allowedRoots)) throw new FileLinkDenied('protected-path');
     handedOff = true;
     // The caller owns fd from here (streams then closes it).
     return { fd, size: stat.size, mtimeMs: stat.mtimeMs, realPath };
@@ -1465,6 +1507,7 @@ export async function metaGuarded(targetPath, { allowedRoots } = {}) {
       }
     }
     if (isSensitivePath(realPath)) throw new FileLinkDenied('sensitive');
+    if (isInsideProtected(realPath, allowedRoots)) throw new FileLinkDenied('protected-path');
     const kind = stat.isDirectory() ? 'dir' : 'file';
     return {
       realPath,
@@ -1502,6 +1545,7 @@ export function listDirGuarded(dirPath, { allowedRoots, maxEntries = MAX_LIST_EN
     }
   }
   if (isSensitivePath(realDir)) throw new FileLinkDenied('sensitive');
+  if (isInsideProtected(realDir, allowedRoots)) throw new FileLinkDenied('protected-path');
 
   let st;
   try {
@@ -1535,6 +1579,7 @@ export function listDirGuarded(dirPath, { allowedRoots, maxEntries = MAX_LIST_EN
     }
     if (pinnedRoots.length && !pinnedRoots.some((root) => contains(root.realPath, entryReal))) continue;
     if (isSensitivePath(entryReal)) continue;
+    if (isInsideProtected(entryReal, allowedRoots)) continue;
     let estat;
     try {
       estat = fs.statSync(full);

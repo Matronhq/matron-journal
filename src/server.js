@@ -468,6 +468,17 @@ export function startServer({
     resolvedMediaDir,
     resolvedFileAuditDir ? path.join(resolvedFileAuditDir, FILE_AUDIT_BASENAME) : null,
   ].filter(Boolean)
+  // Reads never reach server-owned state either: a read root broad enough to
+  // contain the data directory must not hand out the database (every user's
+  // conversations), the preapprove key, the media store or the audit log.
+  // Listings drop those entries; meta/content/list on them answer 403.
+  if (resolvedFileReadRoots) {
+    resolvedFileReadRoots = withProtectedPaths(resolvedFileReadRoots, serverStatePaths)
+    const readUserCount = db.prepare('SELECT COUNT(*) AS n FROM users').get()?.n ?? 0
+    if (readUserCount > 1) {
+      console.warn(`SECURITY: the file API is enabled on a journal with ${readUserCount} users. The read roots are GLOBAL, not scoped per user, so every user's client devices can browse and download anything inside them. Enable it only on a single-operator journal, or narrow MATRON_FILE_READ_ROOTS accordingly.`)
+    }
+  }
   let resolvedFileWriteRoots = null
   if (Array.isArray(writeRootsConfigured) && writeRootsConfigured.length > 0) {
     resolvedFileWriteRoots = pinAllowedRootsSync(writeRootsConfigured)
@@ -500,6 +511,17 @@ export function startServer({
       accessSync(resolvedFileAuditDir, fsConstants.W_OK)
     } catch (err) {
       throw new Error(`file writes: the audit directory ${resolvedFileAuditDir} is not writable, so ${FILE_AUDIT_BASENAME} cannot be kept: ${err.message}`)
+    }
+    // A write root the process cannot write (a read-only mount, or a
+    // sandboxed unit whose ReadWritePaths does not include it) would be
+    // advertised as writable and then fail every mutation at runtime. Refuse
+    // at boot instead. access(2) reports EROFS for a read-only mount.
+    for (const writeRoot of resolvedFileWriteRoots.roots) {
+      try {
+        accessSync(writeRoot.realPath, fsConstants.W_OK)
+      } catch (err) {
+        throw new Error(`file writes: the write-root ${writeRoot.realPath} is not writable by this process (${err.code || err.message}); under the shipped systemd unit, add it to ReadWritePaths`)
+      }
     }
     // The file API — read AND write — is scoped to server-owned roots, not to
     // the calling user: every client device sees the same tree. That is the

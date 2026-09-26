@@ -2442,15 +2442,17 @@ app. Off by default: the routes do not exist (plain 404) until
 `MATRON_FILE_ENABLE_WRITES=1` plus `MATRON_FILE_WRITE_ROOTS` (see README).
 Client devices only; an agent device gets 403 `forbidden`. Roots are
 server-owned and global: every client device of every user sees the same
-tree, so enable writes only on a single-operator journal (the server warns at
-boot when writes are on and more than one user exists).
+tree, so enable the API only on a single-operator journal (the server warns at
+boot when it is on and more than one user exists).
 
 Every path is absolute. The guard resolves it on the server, pins the open
 file descriptor, and re-checks the descriptor's identity through
 `/proc/self/fd` before use, so a symlink swapped in after validation cannot
 escape the roots. Credential and config material (`.ssh`, `.env*`, `.aws`,
 `.codex`, `.config`, key files, …) is refused on every route regardless of
-root breadth and never appears in a listing. Denials use one status mapping
+root breadth and never appears in a listing, and so is the journal's own
+state (database and WAL, preapprove key, media store, audit log) even when a
+read root contains it. Denials use one status mapping
 (`denialToStatus`): 403 `denied` for out-of-scope or sensitive paths, 404 for
 missing ones, 409 for state conflicts, 413 for size caps, 507 when the server
 could not make the change safe (audit or trash failure).
@@ -2472,6 +2474,11 @@ could not make the change safe (audit or trash failure).
 | `POST /files/move` | `{from, to}` (never clobbers) | `{from, to}` |
 | `POST /files/write` | `{path, content, overwrite?}` (UTF-8 text inside the JSON body) | `{path, bytes}` |
 | `DELETE /files` | `?path=&recursive=0\|1&confirm=1` (`confirm=1` required) | `{path, trashed, already_missing}` |
+
+A directory move or recursive delete is refused (403) when anything in its
+subtree is credential material, since the operation would carry it along;
+symlinks inside the tree are judged by name and never followed, and a subtree
+over 100,000 entries is refused (409) rather than scanned without bound.
 
 Nothing is ever unlinked: delete moves the entry into
 `<write-root>/.matron-trash/`, and an `overwrite` copies the previous content
