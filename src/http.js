@@ -100,8 +100,18 @@ const rejectEarly = (req, res, status, obj) => {
 // must not appear in an ordinary listing), not an accident of its spelling.
 const HIDDEN_LIST_NAMES = new Set(['.git', 'node_modules', 'dist', 'build', '.next', '.turbo', '.cache', 'coverage', '__pycache__', '.matron-trash'])
 const isHiddenListEntry = (name) => name.startsWith('.') || HIDDEN_LIST_NAMES.has(name)
-// Strip anything that could break a Content-Disposition header (quotes, CR/LF).
-const dispositionFilename = (name) => String(name).replace(/["\\\r\n]/g, '_')
+// Content-Disposition per RFC 6266: an ASCII-only `filename` fallback plus the
+// exact name as `filename*` (RFC 5987, UTF-8, percent-encoded). The raw
+// basename never reaches the header: Node rejects header characters above
+// U+00FF (ERR_INVALID_CHAR), and Latin-1 bytes would be mis-decoded anyway.
+const contentDisposition = (type, name) => {
+  // toWellFormed: encodeURIComponent throws on a lone surrogate.
+  const raw = String(name).toWellFormed()
+  const ascii = raw.replace(/[^\x20-\x7e]|["\\%]/g, '_')
+  const encoded = encodeURIComponent(raw)
+    .replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)
+  return `${type}; filename="${ascii}"; filename*=UTF-8''${encoded}`
+}
 
 export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, itemTranscription = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes }) {
   // Server-owned, built once at the trusted boundary rather than per request:
@@ -414,7 +424,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
             'cache-control': 'private',
             'x-content-type-options': 'nosniff',
             'accept-ranges': 'bytes',
-            'content-disposition': `${disposition}; filename="${dispositionFilename(path.basename(realPath))}"`,
+            'content-disposition': contentDisposition(disposition, path.basename(realPath)),
           }
           // Compute the Range window from `size` BEFORE reading — only the
           // selected interval is streamed (createReadStream end is inclusive).

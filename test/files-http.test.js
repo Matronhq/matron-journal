@@ -158,6 +158,33 @@ test('GET /files/content: text inline (text/plain + nosniff + inline), exact byt
   assert.equal(await r.text(), 'console.log(1)\n')
 })
 
+test('GET /files/content: non-Latin-1 and Latin-1 names are served, with an ASCII filename and an RFC 5987 filename*', async (t) => {
+  const { root } = makeFixture()
+  const cases = [
+    // above U+00FF: previously a raw header value, which Node refuses (500)
+    ['报告-📝.txt', 'report\n', 'inline'],
+    ['notes (draft)*.md', '# draft\n', 'attachment'],
+    // Latin-1: accepted by Node, but must still not go out as raw bytes
+    ['café "q" 100%.txt', 'latin\n', 'inline'],
+  ]
+  for (const [name, content] of cases) fs.writeFileSync(path.join(root, name), content)
+  const s = await startTestServer({ fileReadRoots: [root] })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+
+  for (const [name, content, disposition] of cases) {
+    const r = await authGet(s, `/files/content?path=${encodeURIComponent(path.join(root, name))}&disposition=${disposition}`, token)
+    assert.equal(r.status, 200, name)
+    assert.equal(await r.text(), content, name)
+    const header = r.headers.get('content-disposition')
+    const m = /^(inline|attachment); filename="([\x20-\x7e]*)"; filename\*=UTF-8''([A-Za-z0-9!#$&+\-.^_`|~%]+)$/.exec(header)
+    assert.ok(m, `well-formed header for ${name}: ${header}`)
+    assert.equal(m[1], disposition, name)
+    assert.ok(!/["\\%]/.test(m[2]), `the fallback carries no quote, backslash or percent: ${m[2]}`)
+    assert.equal(decodeURIComponent(m[3]), name, 'filename* round-trips to the exact name')
+  }
+})
+
 test('GET /files/content: binary streams exact bytes; Range -> 206 slice', async (t) => {
   const { root, binBytes } = makeFixture()
   const s = await startTestServer({ fileReadRoots: [root] })
