@@ -45,6 +45,56 @@ CREATE TABLE IF NOT EXISTS events(
 CREATE INDEX IF NOT EXISTS idx_events_convo ON events(convo_id, seq);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idem
   ON events(user_id, convo_id, idem_key) WHERE idem_key IS NOT NULL;
+-- Durable idempotency for the file write API (src/file-idem.js). The unit of
+-- replay is an HTTP outcome (status + body), and a row has to survive the
+-- process that created it: an in-memory store loses every reservation on
+-- restart, so a client retry crossing one would re-execute its
+-- move/delete/upload. The key column already carries the calling device
+-- (idemKeyOf prefixes it with the device id).
+CREATE TABLE IF NOT EXISTS file_idem(
+  key TEXT PRIMARY KEY,
+  -- The device INCARNATION that reserved this row, not just the id encoded in
+  -- the key. devices.id is a reusable rowid, so without this a revoked device's
+  -- rows are inherited by whichever replacement is handed the same number.
+  --
+  -- Revocation splits by state, because the two states fail in opposite
+  -- directions. A SETTLED row is a cached response: inherited, it answers a
+  -- replacement with the previous incarnation's result, so the trigger below
+  -- deletes it. A PENDING row is a live exclusion record, and its work may
+  -- still be running: cascading it away would let a retry execute a second
+  -- time, which for an upload or a move destroys data. So it is detached
+  -- (device_id -> NULL) and kept as a tombstone: unowned, charged to no one's
+  -- quota, swept at the orphan retention bound, and refusing its key until
+  -- then. A replacement colliding on that key is refused rather than served or
+  -- joined: the safe direction, and the collision needs both id reuse and the
+  -- same client-chosen key.
+  device_id INTEGER REFERENCES devices(id) ON DELETE SET NULL,
+  -- Identifies THIS reservation, not just its key. The key is chosen by the
+  -- client and the device id it embeds is reusable, so after a revoke the same
+  -- key can legitimately belong to a different reservation. Bookkeeping that
+  -- addressed rows by key alone could then let an in-flight operation from the
+  -- revoked incarnation settle, or delete, the replacement's row.
+  gen TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  -- Which server process reserved this row. A 'pending' row whose boot_id is
+  -- not ours crossed a restart: its outcome is UNKNOWN, never assumed.
+  boot_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('pending','done')),
+  -- JSON {op, path, to?, contentHash?}: what the row was reserved to do.
+  intent TEXT,
+  status INTEGER,
+  body TEXT,
+  content_hash TEXT,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_file_idem_expires ON file_idem(expires_at);
+CREATE INDEX IF NOT EXISTS idx_file_idem_device ON file_idem(device_id);
+-- Fires before the FK's SET NULL detaches the rest, so only reservations that
+-- have already answered are discarded with the device.
+CREATE TRIGGER IF NOT EXISTS file_idem_drop_settled_on_revoke BEFORE DELETE ON devices BEGIN
+  DELETE FROM file_idem WHERE device_id=OLD.id AND state='done';
+END;
 CREATE TABLE IF NOT EXISTS user_seq(
   user_id INTEGER PRIMARY KEY,
   seq INTEGER NOT NULL

@@ -2434,6 +2434,84 @@ Per-device `apns_env` (`'sandbox'|'prod'`) exists because Xcode dev builds
 register sandbox tokens, which prod APNs answers with 400 `BadDeviceToken` —
 environment has to travel with the token, never be assumed from the topic.
 
+## File Explorer (`/files/*`)
+
+Browse, preview and (optionally) edit files on the journal host from a client
+app. Off by default: the routes do not exist (plain 404) until
+`MATRON_FILE_READ_ROOTS` is set, and the write routes additionally need
+`MATRON_FILE_ENABLE_WRITES=1` plus `MATRON_FILE_WRITE_ROOTS` (see README).
+**Access is the journal admin's.** The roots are the host's filesystem, not
+any one user's data, so only client devices whose user has `users.is_admin`
+(the flag that gates `/users`; `matron-admin user admin <name> on`) may call
+these routes. Every other caller, including an agent device and a plain user's
+client, gets 403 `{error:'forbidden'}`; clients can treat that as "Files not
+available". It is checked on every request, and a write re-checks it after its
+body is read, so a demotion or a device revocation takes effect at once. The
+server warns at boot when the API is on but no user is an admin yet, and when
+more than one admin will share the roots.
+
+Every path is absolute. The guard resolves it on the server, pins the open
+file descriptor, and re-checks the descriptor's identity through
+`/proc/self/fd` before use, so a symlink swapped in after validation cannot
+escape the roots. Credential and config material (`.ssh`, `.env*`, `.aws`,
+`.codex`, `.config`, key files, …) is refused on every route regardless of
+root breadth and never appears in a listing, and so is the journal's own
+state (database and WAL, preapprove key, media store, audit log) even when a
+read root contains it. The credential denylist is a backstop for well-known
+locations, not a guarantee that nothing secret is reachable: choose roots as
+narrowly as the use allows. Denials use one status mapping
+(`denialToStatus`): 403 `denied` for out-of-scope or sensitive paths, 404 for
+missing ones, 409 for state conflicts, 413 for size caps, 507 when the server
+could not make the change safe (audit or trash failure).
+
+### Read routes (Bearer, admin client devices)
+
+| Route | Query | Response |
+|---|---|---|
+| `GET /files/list` | `path`, `all=1` (show dotfiles and dev noise such as `node_modules`, `.git`) | `{path, root, parent, entries:[{name, kind, size, mtime, …}], truncated, writable}`. Dirs first. `parent` is `null` at a root; `writable` is true only inside a write root while writes are live (not in dry-run) |
+| `GET /files/meta` | `path` | `{path, kind, size, mtime, mime, is_text}` |
+| `GET /files/content` | `path`, `disposition=inline\|attachment` | Streamed bytes, `Range` supported (206/416). Caps: 5 MiB inline, 100 MiB attachment (413 over). Text and code are served as `text/plain` with `nosniff`; anything script-capable is forced to `attachment` |
+
+### Write routes (Bearer, admin client devices, writes enabled)
+
+| Route | Body / query | Response |
+|---|---|---|
+| `POST /files/upload` | `?path=<target file>&overwrite=1`, raw body (streamed, 100 MiB cap) | `{path, bytes}` |
+| `POST /files/mkdir` | `{path}` (mkdir -p; an existing dir is 200) | `{path}` |
+| `POST /files/move` | `{from, to}` (never clobbers) | `{from, to}` |
+| `POST /files/write` | `{path, content, overwrite?}` (UTF-8 text inside the JSON body) | `{path, bytes}` |
+| `DELETE /files` | `?path=&recursive=0\|1&confirm=1` (`confirm=1` required) | `{path, trashed, already_missing}` |
+
+A directory move or recursive delete is refused (403) when anything in its
+subtree is credential material, since the operation would carry it along;
+symlinks inside the tree are judged by name and never followed, and a subtree
+over 100,000 entries is refused (409) rather than scanned without bound.
+
+Nothing is ever unlinked: delete moves the entry into
+`<write-root>/.matron-trash/`, and an `overwrite` first hard-links the
+previous file there (the original inode, so its mode and ownership survive;
+fsynced) before the replacement lands. A process that still holds the old file
+open keeps writing to that trashed inode. The trash is hidden from
+listings and cannot itself be written or deleted through the API. In dry-run
+every route validates and audits, then answers `{…, dry_run: true}` without
+touching the filesystem.
+
+**Audit.** Every write attempt, allowed or denied, is appended to
+`file-audit.jsonl` next to the database: an intent line, fsynced
+before the first irreversible filesystem call, then an outcome line. If the
+intent line cannot be written the operation is refused (507), so there is no
+unaudited mutation. The record is built from an allowlist (op, paths, byte
+count, device, result) and never contains file content.
+
+**Idempotency.** All write routes accept `Idempotency-Key`, scoped to the
+calling device and fingerprinted with the request (an upload also with its
+bytes), for 120 s. A retry replays the recorded outcome; the same key with a
+different request is 409. Reservations live in the database (`file_idem`), so
+a retry that crosses a server restart is not executed twice: an operation
+whose outcome was lost in the restart is answered 507
+`{error:'indeterminate', outcome:'unknown'}` instead of being re-run, except
+`mkdir`, which is safe to repeat.
+
 ## Retention (payload offload)
 
 A scheduled job (runs at boot, then every 6h) offloads `tool_output` event
