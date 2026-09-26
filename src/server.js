@@ -1,5 +1,5 @@
 import http from 'node:http'
-import { realpathSync } from 'node:fs'
+import { realpathSync, readlinkSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
 import { makeLoginGuard, makeRateLimiter } from './auth.js'
@@ -14,6 +14,7 @@ import { makeApnsClient } from './apns.js'
 import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
+import { pinAllowedRootsSync } from './file-guard.js'
 import { runOffload, runExpireLogs, runReapMedia } from './retention.js'
 import { backfillSearchIndex } from './search.js'
 import { scheduleGithubRefresh } from './github-refresh.js'
@@ -35,6 +36,11 @@ export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // busiest user's current footprint on dev-2 — generous headroom, not a squeeze.
 export const DEFAULT_MEDIA_USER_QUOTA_BYTES = 2147483648 // 2 GiB
 export const DEFAULT_MAX_REPLAY = 50000
+// File Explorer API. OPT-IN: there is no default read-root, so the feature is
+// OFF unless MATRON_FILE_READ_ROOTS is set at deploy (or fileReadRoots is
+// passed). The always-on secret denylist
+// (isSensitivePath) bounds read exposure regardless of root breadth.
+export const DEFAULT_FILE_LIST_MAX = 2000
 const DEFAULT_RETENTION_DAYS = 30
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
 const DEFAULT_TOOL_LOG_TTL_HOURS = 24
@@ -293,6 +299,7 @@ export function startServer({
   // pays it.
   spawnWakeWaitMs = resolveNumericEnv('MATRON_SPAWN_WAKE_WAIT_MS', process.env.MATRON_SPAWN_WAKE_WAIT_MS, 240000),
   mediaReapHighPct, mediaReapLowPct, waker, transcriber, github, githubRefreshIntervalMs, webDir,
+  fileReadRoots, fileListMax, procSelfFdAvailable,
   appleAppIds, androidPackage, androidCertSha256, tokenKey,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
@@ -335,6 +342,38 @@ export function startServer({
   const resolvedMediaMaxBytes = mediaMaxBytes ?? resolveNumericEnv('MATRON_MEDIA_MAX_BYTES', process.env.MATRON_MEDIA_MAX_BYTES, DEFAULT_MEDIA_MAX_BYTES)
   const resolvedMediaUserQuotaBytes = mediaUserQuotaBytes ?? resolveNumericEnv('MATRON_MEDIA_USER_QUOTA_BYTES', process.env.MATRON_MEDIA_USER_QUOTA_BYTES, DEFAULT_MEDIA_USER_QUOTA_BYTES)
   const resolvedMaxReplay = maxReplay ?? resolveNumericEnv('MATRON_MAX_REPLAY', process.env.MATRON_MAX_REPLAY, DEFAULT_MAX_REPLAY)
+  // File Explorer read API config. OPT-IN + fail-safe by design:
+  //  - No roots configured (fileReadRoots opt absent AND MATRON_FILE_READ_ROOTS
+  //    unset) -> feature DISABLED; handler gets null; /files/* -> 404; the rest
+  //    of the server starts normally. A deploy enables it via env.
+  //  - Configured but EMPTY (opt [] or MATRON_FILE_READ_ROOTS="") -> DISABLED
+  //    too (an empty root set must never fail open).
+  //  - Configured & non-empty but /proc/self/fd unavailable (non-Linux) ->
+  //    DISABLED: the fd-identity re-check needs procfs; refuse the racy
+  //    realpath fallback rather than serve with a TOCTOU hole.
+  //  - Configured & non-empty & procfs OK -> pin the roots ONCE, on the trusted
+  //    server side. pinAllowedRootsSync fails VISIBLE (throws, restart-loud) on
+  //    an unreadable/missing configured root: that is an explicit operator
+  //    misconfiguration, not a reason to silently disable.
+  const fileRootsConfigured = fileReadRoots !== undefined
+    ? fileReadRoots
+    : (process.env.MATRON_FILE_READ_ROOTS !== undefined
+        ? process.env.MATRON_FILE_READ_ROOTS.split(':').filter(Boolean)
+        : null)
+  const procFdOk = procSelfFdAvailable ?? (() => {
+    try { readlinkSync('/proc/self/fd/0'); return true } catch { return false }
+  })()
+  let resolvedFileReadRoots = null
+  if (Array.isArray(fileRootsConfigured) && fileRootsConfigured.length > 0) {
+    if (!procFdOk) {
+      console.warn('file API: disabled — /proc/self/fd unavailable; refusing the racy realpath fallback (set up on a Linux host to enable)')
+    } else {
+      resolvedFileReadRoots = pinAllowedRootsSync(fileRootsConfigured)
+    }
+  } else if (Array.isArray(fileRootsConfigured)) {
+    console.warn('file API: disabled — configured read-root list is empty')
+  }
+  const resolvedFileListMax = fileListMax ?? resolveNumericEnv('MATRON_FILE_LIST_MAX', process.env.MATRON_FILE_LIST_MAX, DEFAULT_FILE_LIST_MAX)
   const hub = makeHub()
   const broker = makeRpcBroker()
   // Wake-on-message for idle-stopped agent boxes (src/wake.js). Off unless
@@ -385,6 +424,7 @@ export function startServer({
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription,
     github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
+    fileReadRoots: resolvedFileReadRoots, fileListMax: resolvedFileListMax,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,

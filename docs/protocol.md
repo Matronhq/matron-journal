@@ -2434,6 +2434,31 @@ Per-device `apns_env` (`'sandbox'|'prod'`) exists because Xcode dev builds
 register sandbox tokens, which prod APNs answers with 400 `BadDeviceToken` —
 environment has to travel with the token, never be assumed from the topic.
 
+## File Explorer (`/files/*`)
+
+Browse and preview files on the journal host from a client
+app. Off by default: the routes do not exist (plain 404) until
+`MATRON_FILE_READ_ROOTS` is set (see README). Client devices only; an agent
+device gets 403 `forbidden`. Roots are server-owned and global: every client
+device of every user sees the same tree.
+
+Every path is absolute. The guard resolves it on the server, pins the open
+file descriptor, and re-checks the descriptor's identity through
+`/proc/self/fd` before use, so a symlink swapped in after validation cannot
+escape the roots. Credential and config material (`.ssh`, `.env*`, `.aws`,
+`.codex`, `.config`, key files, …) is refused on every route regardless of
+root breadth and never appears in a listing. Denials use one status mapping
+(`denialToStatus`): 403 `denied` for out-of-scope or sensitive paths, 404 for
+missing ones, 413 for size caps.
+
+### Read routes (Bearer, client devices)
+
+| Route | Query | Response |
+|---|---|---|
+| `GET /files/list` | `path`, `all=1` (show dotfiles and dev noise such as `node_modules`, `.git`) | `{path, root, parent, entries:[{name, kind, size, mtime, …}], truncated}`. Dirs first. `parent` is `null` at a root |
+| `GET /files/meta` | `path` | `{path, kind, size, mtime, mime, is_text}` |
+| `GET /files/content` | `path`, `disposition=inline\|attachment` | Streamed bytes, `Range` supported (206/416). Caps: 5 MiB inline, 100 MiB attachment (413 over). Text and code are served as `text/plain` with `nosniff`; anything script-capable is forced to `attachment` |
+
 ## Retention (payload offload)
 
 A scheduled job (runs at boot, then every 6h) offloads `tool_output` event

@@ -74,6 +74,8 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_MEDIA_USER_QUOTA_BYTES` | 2 GiB (`2147483648`) | Per-user media storage quota |
 | `MATRON_MEDIA_REAP_HIGH_PCT` | `90` | Reap a user's oldest attachments once their footprint hits this % of the quota. `0`, a non-integer, or a value over `100` disables the reaper |
 | `MATRON_MEDIA_REAP_LOW_PCT` | `70` | Reap down to this % of the quota; reaped events tombstone to `expired: true`. Must be lower than the high %, or the reaper is disabled (same invalid-value rules) |
+| `MATRON_FILE_READ_ROOTS` | unset (file API off) | Colon-separated directories the File Explorer API may browse and read (`/files/list`, `/files/meta`, `/files/content`). Unset or empty keeps every `/files/*` route a 404. Credential/config paths (`.ssh`, `.env*`, `.aws`, …) are always denied. Linux only (needs `/proc/self/fd`) |
+| `MATRON_FILE_LIST_MAX` | `2000` | Max entries per directory listing before it is marked `truncated` |
 | `MATRON_MAX_REPLAY` | `50000` | Replay gap above which clients are told to re-snapshot |
 | `MATRON_RETENTION_DAYS` | `30` | Offload `tool_output` payloads older than this (`0` disables) |
 | `MATRON_TOOL_LOG_TTL_HOURS` | `24` | Delete offloaded tool-log blobs older than this |
