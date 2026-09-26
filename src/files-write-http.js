@@ -137,7 +137,11 @@ async function audited(ctx, who, intent, run) {
     ctx.audit({ ...base, result: 'attempt' })
   } catch (err) {
     console.error('file writes: refusing — the audit intent line could not be written', err)
-    return { status: denialToStatus('audit-fail-closed'), body: denialBody('audit-fail-closed') }
+    // Thrown, not returned: nothing ran, so under an Idempotency-Key the
+    // reservation must be released rather than recorded as a `done` outcome a
+    // retry would replay after the audit sink recovers. settle/settleUpload
+    // map the denial to the same 507 {error:'denied'}.
+    throw new FileLinkDenied('audit-fail-closed')
   }
 
   // The outcome line is best-effort BY DESIGN: the intent line is already

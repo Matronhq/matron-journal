@@ -231,6 +231,33 @@ test('an audit append failure refuses with 507 and zero filesystem change', asyn
   assert.ok(error.mock.calls.length > 0, 'the refusal is loud server-side')
 })
 
+test('an audit failure under an Idempotency-Key is not recorded: a retry after the sink recovers runs', async (t) => {
+  const f = makeFixture()
+  const s = await startWrites(f)
+  t.after(() => s.close())
+  const { token } = await clientToken(s)
+  const error = t.mock.method(console, 'error', () => {})
+  const target = path.join(f.writeRoot, 'after-recovery.txt')
+  const key = crypto.randomUUID()
+  const send = () => call(s, '/files/write', {
+    token, body: { path: target, content: 'recovered' }, headers: { 'idempotency-key': key },
+  })
+
+  fs.rmSync(f.auditDir, { recursive: true, force: true })
+  const refused = await send()
+  assert.equal(refused.status, 507)
+  assert.deepEqual(await refused.json(), { error: 'denied' })
+  assert.equal(fs.existsSync(target), false)
+  assert.ok(error.mock.calls.length > 0)
+
+  // The sink comes back. The same key must now execute, not replay the 507.
+  fs.mkdirSync(f.auditDir)
+  const retried = await send()
+  assert.equal(retried.status, 200)
+  assert.equal(fs.readFileSync(target, 'utf8'), 'recovered')
+  assert.equal(auditLines(f).filter((r) => r.result === 'attempt').length, 1)
+})
+
 test('two concurrent retries of one Idempotency-Key perform one mutation', async (t) => {
   const f = makeFixture()
   const s = await startWrites(f)
