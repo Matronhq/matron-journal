@@ -2436,11 +2436,14 @@ environment has to travel with the token, never be assumed from the topic.
 
 ## File Explorer (`/files/*`)
 
-Browse and preview files on the journal host from a client
+Browse, preview and (optionally) edit files on the journal host from a client
 app. Off by default: the routes do not exist (plain 404) until
-`MATRON_FILE_READ_ROOTS` is set (see README). Client devices only; an agent
-device gets 403 `forbidden`. Roots are server-owned and global: every client
-device of every user sees the same tree.
+`MATRON_FILE_READ_ROOTS` is set, and the write routes additionally need
+`MATRON_FILE_ENABLE_WRITES=1` plus `MATRON_FILE_WRITE_ROOTS` (see README).
+Client devices only; an agent device gets 403 `forbidden`. Roots are
+server-owned and global: every client device of every user sees the same
+tree, so enable writes only on a single-operator journal (the server warns at
+boot when writes are on and more than one user exists).
 
 Every path is absolute. The guard resolves it on the server, pins the open
 file descriptor, and re-checks the descriptor's identity through
@@ -2449,15 +2452,49 @@ escape the roots. Credential and config material (`.ssh`, `.env*`, `.aws`,
 `.codex`, `.config`, key files, …) is refused on every route regardless of
 root breadth and never appears in a listing. Denials use one status mapping
 (`denialToStatus`): 403 `denied` for out-of-scope or sensitive paths, 404 for
-missing ones, 413 for size caps.
+missing ones, 409 for state conflicts, 413 for size caps, 507 when the server
+could not make the change safe (audit or trash failure).
 
 ### Read routes (Bearer, client devices)
 
 | Route | Query | Response |
 |---|---|---|
-| `GET /files/list` | `path`, `all=1` (show dotfiles and dev noise such as `node_modules`, `.git`) | `{path, root, parent, entries:[{name, kind, size, mtime, …}], truncated}`. Dirs first. `parent` is `null` at a root |
+| `GET /files/list` | `path`, `all=1` (show dotfiles and dev noise such as `node_modules`, `.git`) | `{path, root, parent, entries:[{name, kind, size, mtime, …}], truncated, writable}`. Dirs first. `parent` is `null` at a root; `writable` is true only inside a write root while writes are live (not in dry-run) |
 | `GET /files/meta` | `path` | `{path, kind, size, mtime, mime, is_text}` |
 | `GET /files/content` | `path`, `disposition=inline\|attachment` | Streamed bytes, `Range` supported (206/416). Caps: 5 MiB inline, 100 MiB attachment (413 over). Text and code are served as `text/plain` with `nosniff`; anything script-capable is forced to `attachment` |
+
+### Write routes (Bearer, client devices, writes enabled)
+
+| Route | Body / query | Response |
+|---|---|---|
+| `POST /files/upload` | `?path=<target file>&overwrite=1`, raw body (streamed, 100 MiB cap) | `{path, bytes}` |
+| `POST /files/mkdir` | `{path}` (mkdir -p; an existing dir is 200) | `{path}` |
+| `POST /files/move` | `{from, to}` (never clobbers) | `{from, to}` |
+| `POST /files/write` | `{path, content, overwrite?}` (UTF-8 text inside the JSON body) | `{path, bytes}` |
+| `DELETE /files` | `?path=&recursive=0\|1&confirm=1` (`confirm=1` required) | `{path, trashed, already_missing}` |
+
+Nothing is ever unlinked: delete moves the entry into
+`<write-root>/.matron-trash/`, and an `overwrite` copies the previous content
+there (fsynced) before the replacement lands. The trash is hidden from
+listings and cannot itself be written or deleted through the API. In dry-run
+every route validates and audits, then answers `{…, dry_run: true}` without
+touching the filesystem.
+
+**Audit.** Every write attempt, allowed or denied, is appended to
+`file-audit.jsonl` next to the database: an intent line, fsynced
+before the first irreversible filesystem call, then an outcome line. If the
+intent line cannot be written the operation is refused (507), so there is no
+unaudited mutation. The record is built from an allowlist (op, paths, byte
+count, device, result) and never contains file content.
+
+**Idempotency.** All write routes accept `Idempotency-Key`, scoped to the
+calling device and fingerprinted with the request (an upload also with its
+bytes), for 120 s. A retry replays the recorded outcome; the same key with a
+different request is 409. Reservations live in the database (`file_idem`), so
+a retry that crosses a server restart is not executed twice: an operation
+whose outcome was lost in the restart is answered 507
+`{error:'indeterminate', outcome:'unknown'}` instead of being re-run, except
+`mkdir`, which is safe to repeat.
 
 ## Retention (payload offload)
 

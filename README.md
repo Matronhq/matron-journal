@@ -76,6 +76,9 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_MEDIA_REAP_LOW_PCT` | `70` | Reap down to this % of the quota; reaped events tombstone to `expired: true`. Must be lower than the high %, or the reaper is disabled (same invalid-value rules) |
 | `MATRON_FILE_READ_ROOTS` | unset (file API off) | Colon-separated directories the File Explorer API may browse and read (`/files/list`, `/files/meta`, `/files/content`). Unset or empty keeps every `/files/*` route a 404. Credential/config paths (`.ssh`, `.env*`, `.aws`, …) are always denied. Linux only (needs `/proc/self/fd`) |
 | `MATRON_FILE_LIST_MAX` | `2000` | Max entries per directory listing before it is marked `truncated` |
+| `MATRON_FILE_ENABLE_WRITES` | unset (writes off) | `1` enables the write routes. Needs `MATRON_FILE_WRITE_ROOTS`; any other value keeps writes off |
+| `MATRON_FILE_WRITE_ROOTS` | unset | Colon-separated write roots. Each must sit inside a read root and may not overlap the database, preapprove key, media dir or audit log, or be a broad system directory (`/`, `/root`, `/home`, `/etc`, `/usr`, `/var`); a bad value fails the boot |
+| `MATRON_FILE_WRITES_DRYRUN` | unset | `1` validates and audits every write but changes nothing (rollout check) |
 | `MATRON_MAX_REPLAY` | `50000` | Replay gap above which clients are told to re-snapshot |
 | `MATRON_RETENTION_DAYS` | `30` | Offload `tool_output` payloads older than this (`0` disables) |
 | `MATRON_TOOL_LOG_TTL_HOURS` | `24` | Delete offloaded tool-log blobs older than this |

@@ -15,6 +15,9 @@ import { searchMessages, indexableBody } from './search.js'
 import { canReadConvo, canReadBlob } from './visibility.js'
 import { serveHelp } from './help.js'
 import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
+import { handleFilesWriteRoute, listingIsWritable } from './files-write-http.js'
+import { makeDurableIdemStore } from './file-idem.js'
+import { makeFileAudit } from './file-audit.js'
 import { closeChatConsentItem } from './consent-items.js'
 import { wakeIfOffline, isWakeableBoxName } from './wake.js'
 import { handleItemsRoute } from './items-http.js'
@@ -99,7 +102,20 @@ const isHiddenListEntry = (name) => name.startsWith('.') || HIDDEN_LIST_NAMES.ha
 // Strip anything that could break a Content-Disposition header (quotes, CR/LF).
 const dispositionFilename = (name) => String(name).replace(/["\\\r\n]/g, '_')
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, itemTranscription = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, fileReadRoots, fileListMax = 2000 }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, itemTranscription = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, fileReadRoots, fileListMax = 2000, fileWriteRoots, fileEnableWrites = false, fileWritesDryRun = false, fileAuditDir = null, fileWriteMaxBytes }) {
+  // Server-owned, built once at the trusted boundary rather than per request:
+  // the audit binds its directory here (a handler carries a function, never a
+  // path it could be talked into changing), and the idempotency reservations
+  // have to outlive a single request to be reservations at all.
+  const fileWriteCtx = {
+    fileWriteRoots, fileEnableWrites, fileWritesDryRun, fileWriteMaxBytes,
+    audit: makeFileAudit(fileAuditDir),
+    // Durable, not a Map: a reservation has to outlive the process that made
+    // it, or a retry crossing a restart re-executes its move/delete/upload.
+    // Built here for the same reason the audit is — at the
+    // trusted boundary, once, bound to the server's own database.
+    idem: makeDurableIdemStore({ db }),
+  }
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -269,7 +285,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       // everything else normally. Client devices only (operator
       // devices browse; agents do not). Every path is parsed/validated at the
       // boundary and jailed server-side to the pinned read-roots + always-on
-      // secret denylist. Read-only. denialToStatus keeps
+      // secret denylist. Writes live in files-write-http.js. denialToStatus keeps
       // rejection reasons uniform.
       if (fileReadRoots && req.method === 'GET' && url.pathname === '/files/list') {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
@@ -303,12 +319,16 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const parent = (containingRoot === null || listed.realDir === containingRoot)
           ? null
           : path.dirname(listed.realDir)
+        // `writable` (wire contract): the UI renders write affordances
+        // only when the server says this directory accepts writes right now.
+        // Absent or false => a strictly read-only browser.
         return json(res, 200, {
           path: listed.realDir,
           root: containingRoot,
           parent,
           entries: visible,
           truncated: listed.truncated,
+          writable: listingIsWritable(fileWriteCtx, listed.realDir),
         })
       }
       if (fileReadRoots && req.method === 'GET' && url.pathname === '/files/meta') {
@@ -447,6 +467,11 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           throw e
         }
       }
+      // Writes (src/files-write-http.js). Mounted with the read routes
+      // and inside the outer try/catch, so readBody's 400/413 map like every
+      // other route's; returns false when the kill switch is off, and the
+      // request falls through to the final 404.
+      if (await handleFilesWriteRoute(fileWriteCtx, req, res, url, who)) return
       // The tracker's own surface (src/items-http.js) — mounted first so
       // its /items* paths never collide with the chain below, and inside the
       // outer try/catch so readBody's 400/413 map like every other route's.
