@@ -2470,7 +2470,7 @@ could not make the change safe (audit or trash failure).
 |---|---|---|
 | `GET /files/list` | `path`, `all=1` (show dotfiles and dev noise such as `node_modules`, `.git`) | `{path, root, parent, entries:[{name, kind, size, mtime, …}], truncated, writable}`. Dirs first. `parent` is `null` at a root; `writable` is true only inside a write root while writes are live (not in dry-run) |
 | `GET /files/meta` | `path` | `{path, kind, size, mtime, mime, is_text}` |
-| `GET /files/content` | `path`, `disposition=inline\|attachment` | Streamed bytes, `Range` supported (206/416). Caps: 5 MiB inline, 100 MiB attachment (413 over). Text and code are served as `text/plain` with `nosniff`; anything script-capable is forced to `attachment` |
+| `GET /files/content` | `path`, `disposition=inline\|attachment` | Streamed bytes, `Range` supported (206/416). Caps: 5 MiB inline, 100 MiB attachment (413 over). Text and code, including script-capable HTML, SVG and JS, are served as `text/plain; charset=utf-8` with `nosniff`, so `inline` shows the source and never executes it; types the server does not recognise are always `attachment`. `Content-Disposition` carries an ASCII `filename` fallback plus the exact name as RFC 5987 `filename*` |
 
 ### Write routes (Bearer, admin client devices, writes enabled)
 
@@ -2492,7 +2492,8 @@ Nothing is ever unlinked: delete moves the entry into
 previous file there (the original inode, so its mode and ownership survive;
 fsynced) before the replacement lands. A process that still holds the old file
 open keeps writing to that trashed inode. The trash is hidden from
-listings and cannot itself be written or deleted through the API. In dry-run
+ordinary listings (`all=1` shows it, so a previous version can be found and
+downloaded) and cannot itself be written, moved or deleted through the API. In dry-run
 every route validates and audits, then answers `{…, dry_run: true}` without
 touching the filesystem.
 

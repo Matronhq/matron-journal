@@ -667,6 +667,14 @@ test('the trash itself is not deletable, and it stays out of ordinary listings',
 
   const listed = await (await call(s, `/files/list?path=${encodeURIComponent(f.writeRoot)}`, { method: 'GET', token })).json()
   assert.ok(!listed.entries.some((e) => e.name === TRASH))
+  // ?all=1 shows it, and a trashed version can be read back: recovery is by
+  // download, while every write into or out of the trash stays refused.
+  const all = await (await call(s, `/files/list?path=${encodeURIComponent(f.writeRoot)}&all=1`, { method: 'GET', token })).json()
+  assert.ok(all.entries.some((e) => e.name === TRASH && e.kind === 'dir'))
+  const saved = path.join(trashDir, trashEntries(f.writeRoot)[0])
+  const read = await call(s, `/files/content?path=${encodeURIComponent(saved)}`, { method: 'GET', token })
+  assert.equal(read.status, 200)
+  await read.arrayBuffer()
 })
 
 // --- the cross-endpoint sweep ---------------------------------------
