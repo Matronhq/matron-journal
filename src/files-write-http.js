@@ -293,6 +293,9 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
       }
       const canonical = await writeFileAtomic(target, counted(), {
         writeRoots, maxBytes: uploadMax, overwrite, dryRun,
+        // The body may have streamed for a long time: re-check the caller
+        // before the file is installed.
+        beforeCommit: () => ctx.authorize(who),
       })
       if (dryRun) return { status: 200, body: { path: canonical, bytes, dry_run: true } }
       return {
@@ -355,7 +358,7 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
       // Replacing an existing file needs overwrite:true, and the guard copies
       // the previous content into .matron-trash/ (fsynced) before the
       // replacement lands — so even a direct API client cannot lose data.
-      const canonical = await writeFileAtomic(target, content, { writeRoots, overwrite, dryRun })
+      const canonical = await writeFileAtomic(target, content, { writeRoots, overwrite, dryRun, beforeCommit: () => ctx.authorize(who) })
       if (dryRun) return { status: 200, body: { path: canonical, bytes: content.length, dry_run: true } }
       return {
         status: 200,

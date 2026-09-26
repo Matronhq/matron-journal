@@ -1710,3 +1710,48 @@ test('an overwrite that cannot preserve ownership refuses instead of re-homing t
     f.cleanup()
   }
 })
+
+test('an overwrite-allowed write to an absent target does not clobber a file created while it streamed', async () => {
+  const f = makeWriteFixture()
+  try {
+    const target = path.join(f.root, 'late.txt')
+    async function* body() {
+      yield Buffer.from('from the upload')
+      writeFileSync(target, 'created meanwhile')
+      yield Buffer.from(' ...')
+    }
+    assert.equal(
+      await writeDenied(() => writeFileAtomic(target, body(), { writeRoots: f.writeRoots, overwrite: true })),
+      'overwrite-conflict',
+    )
+    assert.equal(fs.readFileSync(target, 'utf8'), 'created meanwhile')
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('beforeCommit refusing after the body is written leaves the target untouched', async () => {
+  const f = makeWriteFixture()
+  try {
+    const target = path.join(f.root, 'kept.txt')
+    writeFileSync(target, 'original')
+    assert.equal(
+      await writeDenied(() => writeFileAtomic(target, Buffer.from('new'), {
+        writeRoots: f.writeRoots, overwrite: true, beforeCommit: () => false,
+      })),
+      'device-revoked',
+    )
+    assert.equal(fs.readFileSync(target, 'utf8'), 'original')
+    assert.deepEqual(fs.readdirSync(f.root).filter((n) => n !== 'kept.txt'), [])
+  } finally {
+    f.cleanup()
+  }
+})
+
+test('more credential files are sensitive: .pypirc, shell history, .git/config', () => {
+  for (const p of ['/w/.pypirc', '/w/.bash_history', '/w/.zsh_history', '/w/.python_history', '/w/repo/.git/config']) {
+    assert.equal(isSensitivePath(p), true, p)
+  }
+  assert.equal(isSensitivePath('/w/repo/.git/HEAD'), false)
+  assert.equal(isSensitivePath('/w/history.md'), false)
+})

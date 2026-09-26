@@ -47,6 +47,8 @@ const SENSITIVE_BASENAME_PATTERNS = [
   // Credential / secret files.
   /\.env(\..*)?$/i,
   /^\.envrc$/i,
+  /^\.pypirc$/i,
+  /^\.[a-z0-9]*_history$/i,
   /secrets?\.(json|ya?ml|toml|txt)$/i,
   /^secrets?$/i,
   /^credentials$/i,
@@ -66,6 +68,7 @@ const SENSITIVE_BASENAME_PATTERNS = [
 ];
 
 const SENSITIVE_PATH_PATTERNS = [
+  /\/\.git\/config$/i,
   /\/\.aws\//i,
   /\/\.docker\//i,
   /\/\.kube\//i,
@@ -579,7 +582,11 @@ function fixedBytes(value) {
 // NOT get its own reduced validation path: a rollout validator that approves
 // what the real call rejects is worse than no validator, and two code paths
 // drift the moment either is edited.
-export async function writeFileAtomic(targetPath, bytesOrStream, { writeRoots, maxBytes = Infinity, overwrite = false, dryRun = false } = {}) {
+// `beforeCommit` (optional) runs after the body has been fully written and
+// just before the new name is installed; returning false refuses the write
+// with 'device-revoked'. The HTTP layer uses it to re-check authorization
+// after a slow streamed upload.
+export async function writeFileAtomic(targetPath, bytesOrStream, { writeRoots, maxBytes = Infinity, overwrite = false, dryRun = false, beforeCommit = null } = {}) {
   if (!(maxBytes === Infinity || (Number.isSafeInteger(maxBytes) && maxBytes >= 0))) {
     throw new TypeError('maxBytes must be a non-negative safe integer or Infinity');
   }
@@ -656,17 +663,20 @@ export async function writeFileAtomic(targetPath, bytesOrStream, { writeRoots, m
     fs.fsyncSync(tmpFd);
     fs.closeSync(tmpFd);
     tmpFd = undefined;
+    if (beforeCommit && !beforeCommit()) throw new FileLinkDenied('device-revoked');
     reverifyPrepared(prepared);
     if (prepared.targetStat) overwriteBackup = preserveFileForOverwrite(prepared);
     reverifyPrepared(prepared);
     if (prepared.targetStat) assertTargetIdentity(prepared, prepared.targetStat);
     const targetThroughParent = childPathThroughParentFd(prepared, path.basename(prepared.target));
-    if (overwrite) {
+    if (overwrite && prepared.targetStat) {
       // Replacing is the point: rename is the atomic swap, and the previous
       // content is already preserved in the trash above.
       fs.renameSync(tmpPath, targetThroughParent);
     } else {
-      // A create must NOT clobber. rename() would silently replace a name a
+      // A create must NOT clobber, and that includes an overwrite-allowed
+      // write whose target was ABSENT at preparation: a name a racer created
+      // meanwhile has no backup, so replacing it would lose it. rename() would silently replace a name a
       // racer created while the body was streaming (and with no backup, since
       // the target was absent at preparation) — link() is the atomic
       // no-replace install Node does give us, so EEXIST becomes the conflict

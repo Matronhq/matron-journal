@@ -2457,7 +2457,9 @@ escape the roots. Credential and config material (`.ssh`, `.env*`, `.aws`,
 `.codex`, `.config`, key files, …) is refused on every route regardless of
 root breadth and never appears in a listing, and so is the journal's own
 state (database and WAL, preapprove key, media store, audit log) even when a
-read root contains it. Denials use one status mapping
+read root contains it. The credential denylist is a backstop for well-known
+locations, not a guarantee that nothing secret is reachable: choose roots as
+narrowly as the use allows. Denials use one status mapping
 (`denialToStatus`): 403 `denied` for out-of-scope or sensitive paths, 404 for
 missing ones, 409 for state conflicts, 413 for size caps, 507 when the server
 could not make the change safe (audit or trash failure).
