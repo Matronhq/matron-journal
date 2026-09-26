@@ -318,7 +318,7 @@ test('the tail check reads the very inode the line lands on, not the pathname', 
 test('a record that lands in a rotated-away inode refuses the operation', (t) => {
   const dir = tmpDir()
   const target = path.join(dir, FILE_AUDIT_BASENAME)
-  // Unlike R7 above, the original log is WELL FORMED — the tail check passes,
+  // Unlike the partial-tail case above, the original log is WELL FORMED — the tail check passes,
   // the line is written and fsynced. The defect is where it ends up.
   fs.writeFileSync(target, `${JSON.stringify({ ts: 1, op: 'write' })}\n`)
   const rotatedIn = path.join(dir, 'rotated-in.jsonl')

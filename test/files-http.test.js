@@ -1,7 +1,8 @@
-// Real-server harness for the File Explorer read API.
+// Real-server harness for the File Explorer read routes.
 // Mirrors media.test.js: startTestServer + fs.mkdtempSync fixtures, asserting
 // the path-jail, sensitive-drop, hidden-toggle, streaming/Range, caps, auth
-// gating, and uniform denials end-to-end over HTTP.
+// gating, and uniform denials end-to-end over HTTP. Boot-time configuration
+// and access control live in files-config.test.js.
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -11,84 +12,8 @@ import os from 'node:os'
 import crypto from 'node:crypto'
 import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { makeHttpHandler } from '../src/http.js'
-import { pinAllowedRootsSync } from '../src/file-guard.js'
-import { assertNoProhibitedFileWriteRoots, pinProhibitedFileWriteRootsSync } from '../src/server.js'
 import { makeTmpDir } from './tmp-dir.js'
-
-// Build a canonical read-root with a representative tree + adversarial entries.
-function makeFixture() {
-  const root = fs.realpathSync(makeTmpDir('matron-files-'))
-  const outside = fs.realpathSync(makeTmpDir('matron-files-outside-'))
-
-  fs.writeFileSync(path.join(root, 'README.md'), '# hello\n')
-  fs.writeFileSync(path.join(root, 'app.js'), 'console.log(1)\n')
-  fs.writeFileSync(path.join(root, '.env'), 'SECRET=1\n')            // sensitive — always dropped
-  fs.writeFileSync(path.join(root, '.hidden'), 'dot\n')             // hidden by default (dotfile)
-  fs.mkdirSync(path.join(root, 'src'))
-  fs.mkdirSync(path.join(root, 'node_modules'))                    // hidden by default
-  fs.mkdirSync(path.join(root, '.git'))                            // hidden by default
-  fs.writeFileSync(path.join(root, 'src', 'index.ts'), 'export {}\n')
-
-  // Non-UTF8 binary, so a string-based path would corrupt it.
-  const binBytes = Buffer.concat([Buffer.from([0xff, 0xfe, 0x00, 0x80, 0x81]), crypto.randomBytes(2048)])
-  fs.writeFileSync(path.join(root, 'blob.bin'), binBytes)
-
-  // Credential/config material reachable under a broad /root-style root.
-  // Each must be dropped from listings (even ?all=1) and 403 on content/meta.
-  fs.mkdirSync(path.join(root, '.codex'))
-  fs.writeFileSync(path.join(root, '.codex', 'auth.json'), '{"OPENAI_API_KEY":"sk-x"}\n')
-  fs.mkdirSync(path.join(root, '.config', 'gh'), { recursive: true })
-  fs.writeFileSync(path.join(root, '.config', 'gh', 'hosts.yml'), 'token: ghp_x\n')
-  fs.mkdirSync(path.join(root, '.claude'))
-  fs.writeFileSync(path.join(root, '.claude', 'settings.json'), '{"k":"v"}\n')
-  fs.writeFileSync(path.join(root, 'auth.json'), '{"token":"x"}\n')
-  fs.writeFileSync(path.join(root, '.git-credentials'), 'https://x:y@github.com\n')
-  fs.writeFileSync(path.join(root, '.pgpass'), 'localhost:5432:db:u:p\n')
-  fs.writeFileSync(path.join(root, '.claude.json'), '{"k":"v"}\n')
-
-  // Adversarial symlinks that must never be served / listed.
-  fs.writeFileSync(path.join(outside, 'target.txt'), 'ESCAPED SECRET\n')
-  fs.symlinkSync(path.join(outside, 'target.txt'), path.join(root, 'escape.txt'))     // symlink-out
-  fs.writeFileSync(path.join(outside, 'config.json'), '{"token":"x"}\n')
-  fs.symlinkSync(path.join(outside, 'config.json'), path.join(root, 'looksok.txt'))   // symlink-to-secret
-
-  return { root, outside, binBytes }
-}
-
-// Credential entries: (segment-relative path, secret substring that must
-// never appear in any response body).
-const F2_SENSITIVE = [
-  ['.codex/auth.json', 'sk-x'],
-  ['.config/gh/hosts.yml', 'ghp_x'],
-  ['.claude/settings.json', '"k":"v"'],
-  ['auth.json', '"token":"x"'],
-  ['.git-credentials', 'github.com'],
-  ['.pgpass', '5432'],
-  ['.claude.json', '"k":"v"'],
-]
-
-const makeAdmin = (db, id) => db.prepare('UPDATE users SET is_admin=1 WHERE id=?').run(id)
-
-async function clientToken(s, name = 'op', pw = 'pw', { admin = true } = {}) {
-  const user = await createUser(s.db, name, pw)
-  if (admin) makeAdmin(s.db, user.id)
-  const r = await s.http('/login', { method: 'POST', body: { username: name, password: pw, device_name: 'x' } })
-  return r.json.token
-}
-
-function authGet(s, pathAndQuery, token, headers = {}) {
-  return fetch(s.base + pathAndQuery, { headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...headers } })
-}
-
-function captureHttpHandlerOptions() {
-  const capture = { options: null }
-  capture.factory = (options) => {
-    capture.options = options
-    return makeHttpHandler(options)
-  }
-  return capture
-}
+import { makeFixture, CREDENTIAL_ENTRIES, clientToken, authGet } from './files-fixtures.js'
 
 test('GET /files/list: dirs-first, sensitive dropped, hidden default-hidden vs ?all=1', async (t) => {
   const { root } = makeFixture()
@@ -275,6 +200,8 @@ test('GET /files/content: inline cap (5MB) 413s; same file as attachment (100MB 
   const att = await authGet(s, `/files/content?path=${enc}&disposition=attachment`, token)
   assert.equal(att.status, 200)
   assert.equal(att.headers.get('content-length'), String(6 * 1024 * 1024))
+  // Drain it: an unread 6MB body holds the connection open and stalls close().
+  assert.equal((await att.arrayBuffer()).byteLength, 6 * 1024 * 1024)
 })
 
 test('GET /files/content: no isSensitivePath file is ever served, incl. via symlink-escape', async (t) => {
@@ -335,7 +262,7 @@ test('sensitive credential entries are dropped from listings and 403 on meta/con
     }
   }
   // Direct meta + content on each must be 403 and never leak the secret bytes.
-  for (const [rel, secret] of F2_SENSITIVE) {
+  for (const [rel, secret] of CREDENTIAL_ENTRIES) {
     const abs = encodeURIComponent(path.join(root, rel))
     const meta = await authGet(s, `/files/meta?path=${abs}`, token)
     assert.equal(meta.status, 403, `meta ${rel} must be 403`)
@@ -416,229 +343,3 @@ test('a client abort during /files/content open closes the fd (no leak) and sett
   ])
   assert.equal(closeCalled, true)
 })
-
-// --- opt-in + fail-safe disabling ---------------------------------
-test('with no roots configured, the server starts and /files/* is 404 (feature off)', async (t) => {
-  const s = await startTestServer() // no fileReadRoots, env unset
-  t.after(() => s.close())
-  const token = await clientToken(s)
-  // server is fully functional
-  assert.equal((await s.http('/snapshot', { token })).status, 200)
-  // file routes are simply not there
-  for (const url of ['/files/list?path=/tmp', '/files/meta?path=/etc/hosts', '/files/content?path=/etc/hosts']) {
-    const r = await authGet(s, url, token)
-    assert.equal(r.status, 404, `${url} should 404 when the file API is disabled`)
-  }
-})
-
-test('startServer fails visible on an unreadable configured read-root', async () => {
-  await assert.rejects(
-    startTestServer({ fileReadRoots: [path.join(os.tmpdir(), 'matron-does-not-exist-' + crypto.randomBytes(6).toString('hex'))] }),
-    (e) => e && e.reason === 'bad-workdir',
-  )
-})
-
-test('an empty configured root set disables the API (never fails open)', async (t) => {
-  const s = await startTestServer({ fileReadRoots: [] })
-  t.after(() => s.close())
-  const token = await clientToken(s)
-  assert.equal((await s.http('/snapshot', { token })).status, 200)
-  // Must NOT serve an arbitrary absolute file — the route is off entirely.
-  assert.equal((await authGet(s, '/files/content?path=/etc/hosts', token)).status, 404)
-  assert.equal((await authGet(s, '/files/list?path=/etc', token)).status, 404)
-})
-
-test('file API disabled (fail closed) when /proc/self/fd is unavailable', async (t) => {
-  const { root } = makeFixture()
-  // Roots ARE configured, but the fd-identity re-check platform is absent.
-  const s = await startTestServer({ fileReadRoots: [root], procSelfFdAvailable: false })
-  t.after(() => s.close())
-  const token = await clientToken(s)
-  assert.equal((await s.http('/snapshot', { token })).status, 200)
-  assert.equal((await authGet(s, `/files/list?path=${encodeURIComponent(root)}`, token)).status, 404)
-  assert.equal((await authGet(s, `/files/content?path=${encodeURIComponent(path.join(root, 'app.js'))}`, token)).status, 404)
-})
-
-// --- server-owned write configuration -----------------------
-test('writes are off by default even with a valid pinned write-root', async (t) => {
-  const { root } = makeFixture()
-  const writeRoot = path.join(root, 'src')
-  const capture = captureHttpHandlerOptions()
-  const s = await startTestServer({
-    fileReadRoots: [root], fileWriteRoots: [writeRoot], httpHandlerFactory: capture.factory,
-  })
-  t.after(() => s.close())
-
-  assert.deepEqual(capture.options.fileWriteRoots.roots.map((pinned) => pinned.realPath), [writeRoot])
-  assert.equal(capture.options.fileEnableWrites, false)
-  assert.equal(capture.options.fileWritesDryRun, false)
-})
-
-test('ENABLE_WRITES=1 without write-roots fails closed and logs why', async (t) => {
-  const { root } = makeFixture()
-  const warn = t.mock.method(console, 'warn', () => {})
-  const capture = captureHttpHandlerOptions()
-  const s = await startTestServer({
-    fileReadRoots: [root], fileEnableWrites: true, httpHandlerFactory: capture.factory,
-  })
-  t.after(() => s.close())
-
-  assert.ok(warn.mock.calls.some((c) => /MATRON_FILE_WRITE_ROOTS is unset or empty/.test(c.arguments[0])))
-  assert.equal(capture.options.fileWriteRoots, null)
-  assert.equal(capture.options.fileEnableWrites, false)
-})
-
-test('ENABLE_WRITES=1 with an empty write-root list also fails closed', async (t) => {
-  const { root } = makeFixture()
-  const warn = t.mock.method(console, 'warn', () => {})
-  const capture = captureHttpHandlerOptions()
-  const s = await startTestServer({
-    fileReadRoots: [root], fileWriteRoots: [], fileEnableWrites: true,
-    httpHandlerFactory: capture.factory,
-  })
-  t.after(() => s.close())
-
-  assert.ok(warn.mock.calls.some((c) => /MATRON_FILE_WRITE_ROOTS is unset or empty/.test(c.arguments[0])))
-  assert.equal(capture.options.fileWriteRoots, null)
-  assert.equal(capture.options.fileEnableWrites, false)
-})
-
-test('write-root, enable, and dry-run env config accepts colon-separated nested roots', async (t) => {
-  const { root } = makeFixture()
-  const envNames = ['MATRON_FILE_WRITE_ROOTS', 'MATRON_FILE_ENABLE_WRITES', 'MATRON_FILE_WRITES_DRYRUN']
-  const previous = new Map(envNames.map((name) => [name, process.env[name]]))
-  t.after(() => {
-    for (const [name, value] of previous) {
-      if (value === undefined) delete process.env[name]
-      else process.env[name] = value
-    }
-  })
-  process.env.MATRON_FILE_WRITE_ROOTS = `${path.join(root, 'src')}:${path.join(root, 'node_modules')}`
-  process.env.MATRON_FILE_ENABLE_WRITES = '1'
-  process.env.MATRON_FILE_WRITES_DRYRUN = '1'
-
-  const capture = captureHttpHandlerOptions()
-  const s = await startTestServer({
-    fileReadRoots: [root],
-    fileAuditDir: makeTmpDir('matron-files-audit-'),
-    httpHandlerFactory: capture.factory,
-  })
-  t.after(() => s.close())
-  assert.deepEqual(
-    capture.options.fileWriteRoots.roots.map((pinned) => pinned.realPath),
-    [path.join(root, 'src'), path.join(root, 'node_modules')],
-  )
-  assert.equal(capture.options.fileEnableWrites, true)
-  assert.equal(capture.options.fileWritesDryRun, true)
-})
-
-test('broad write-root identities reject synthetic bind-mount aliases', () => {
-  const { root, outside } = makeFixture()
-  const broadRoots = [root, path.join(root, 'src'), path.join(root, 'node_modules')]
-  const missingRoot = path.join(root, 'host-path-not-present')
-  const prohibitedRoots = pinProhibitedFileWriteRootsSync([...broadRoots, missingRoot])
-  assert.deepEqual(prohibitedRoots.roots.map((pinned) => pinned.realPath), broadRoots)
-
-  for (const [index, broadRoot] of broadRoots.entries()) {
-    const pinnedWriteRoots = pinAllowedRootsSync([broadRoot])
-    const aliasPath = path.join(outside, `synthetic-bind-alias-${index}`)
-    const aliasedWriteRoots = {
-      roots: pinnedWriteRoots.roots.map((pinned) => ({ ...pinned, realPath: aliasPath })),
-    }
-    assert.throws(
-      () => assertNoProhibitedFileWriteRoots(aliasedWriteRoots, prohibitedRoots),
-      (err) => err?.message === `file writes: configured write-root is prohibited because it is too broad: ${aliasPath}`,
-      aliasPath,
-    )
-  }
-})
-
-test('a write-root outside all read-roots fails visibly at boot', async () => {
-  const { root, outside } = makeFixture()
-  await assert.rejects(
-    startTestServer({ fileReadRoots: [root], fileWriteRoots: [outside] }),
-    /every configured write-root must be contained in a configured read-root/,
-  )
-})
-
-test('an unreadable configured write-root fails visibly while pinning', async () => {
-  const { root } = makeFixture()
-  await assert.rejects(
-    startTestServer({
-      fileReadRoots: [root],
-      fileWriteRoots: [path.join(root, 'missing-' + crypto.randomBytes(6).toString('hex'))],
-    }),
-    (e) => e && e.reason === 'bad-workdir',
-  )
-})
-
-test('server-owned state inside a read-root is never listed or served', async (t) => {
-  const root = fs.realpathSync(makeTmpDir('matron-state-'))
-  const dataDir = path.join(root, 'data')
-  fs.mkdirSync(dataDir)
-  fs.writeFileSync(path.join(root, 'notes.md'), 'hello\n')
-  const dbPath = path.join(dataDir, 'journal.db')
-  const s = await startTestServer({ dbPath, fileReadRoots: [root] })
-  t.after(() => s.close())
-  const token = await clientToken(s)
-
-  for (const route of ['content', 'meta']) {
-    const r = await authGet(s, `/files/${route}?path=${encodeURIComponent(dbPath)}`, token)
-    assert.equal(r.status, 403, route)
-  }
-  const media = path.join(dataDir, 'media')
-  fs.mkdirSync(media, { recursive: true })
-  assert.equal((await authGet(s, `/files/list?path=${encodeURIComponent(media)}`, token)).status, 403)
-  const listed = await (await authGet(s, `/files/list?path=${encodeURIComponent(dataDir)}&all=1`, token)).json()
-  assert.deepEqual(listed.entries.map((e) => e.name).filter((n) => n.startsWith('journal.db') || n === 'media'), [])
-  // Ordinary files next to it are unaffected.
-  assert.equal((await authGet(s, `/files/content?path=${encodeURIComponent(path.join(root, 'notes.md'))}`, token)).status, 200)
-})
-
-test('only a journal admin reaches the file API: other users get 403 forbidden, admins can be demoted live', async (t) => {
-  const { root } = makeFixture()
-  const s = await startTestServer({ fileReadRoots: [root] })
-  t.after(() => s.close())
-  const adminToken = await clientToken(s, 'admin', 'pw')
-  const plainToken = await clientToken(s, 'plain', 'pw', { admin: false })
-  const enc = encodeURIComponent(root)
-  const fileEnc = encodeURIComponent(path.join(root, 'app.js'))
-  const urls = [`/files/list?path=${enc}`, `/files/meta?path=${fileEnc}`, `/files/content?path=${fileEnc}`]
-  for (const url of urls) {
-    const r = await authGet(s, url, plainToken)
-    assert.equal(r.status, 403, url)
-    assert.deepEqual(await r.json(), { error: 'forbidden' }, url)
-    assert.equal((await authGet(s, url, adminToken)).status, 200, url)
-  }
-  s.db.prepare("UPDATE users SET is_admin=0 WHERE name='admin'").run()
-  for (const url of urls) {
-    const r = await authGet(s, url, adminToken)
-    assert.equal(r.status, 403, url)
-    assert.deepEqual(await r.json(), { error: 'forbidden' }, url)
-  }
-})
-
-test('.envrc is treated as credential material', async (t) => {
-  const { root } = makeFixture()
-  fs.writeFileSync(path.join(root, '.envrc'), 'export TOKEN=abc\n')
-  const s = await startTestServer({ fileReadRoots: [root] })
-  t.after(() => s.close())
-  const token = await clientToken(s)
-  const listed = await (await authGet(s, `/files/list?path=${encodeURIComponent(root)}&all=1`, token)).json()
-  assert.ok(!listed.entries.some((e) => e.name === '.envrc'))
-  const r = await authGet(s, `/files/content?path=${encodeURIComponent(path.join(root, '.envrc'))}`, token)
-  assert.equal(r.status, 403)
-})
-
-test('a listing stops examining entries at its scan budget and says it was truncated', async (t) => {
-  const root = fs.realpathSync(makeTmpDir('matron-scan-'))
-  // Mostly filtered entries: none would be returned, but each costs work.
-  for (let i = 0; i < 40; i++) fs.writeFileSync(path.join(root, `k${i}.pem`), 'x')
-  const s = await startTestServer({ fileReadRoots: [root], fileListMax: 2 })
-  t.after(() => s.close())
-  const token = await clientToken(s)
-  const listed = await (await authGet(s, `/files/list?path=${encodeURIComponent(root)}&all=1`, token)).json()
-  assert.deepEqual(listed.entries, [])
-  assert.equal(listed.truncated, true)
-})
-
