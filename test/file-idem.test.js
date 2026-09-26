@@ -640,6 +640,7 @@ test('a move retried across a real server restart executes exactly once', async 
   const first = await startTestServer(opts)
   const user = await createUser(first.db, 'op', 'pw')
   assert.ok(user)
+  first.db.prepare('UPDATE users SET is_admin=1 WHERE id=?').run(user.id)
   const login = await first.http('/login', {
     method: 'POST', body: { username: 'op', password: 'pw', device_name: 'x' },
   })
@@ -693,7 +694,9 @@ test('a move that committed but was never recorded answers 507 unknown, and neve
     fileAuditDir: auditDir,
   })
   t.after(() => server.close())
-  assert.ok(await createUser(server.db, 'op', 'pw'))
+  const opUser = await createUser(server.db, 'op', 'pw')
+  assert.ok(opUser)
+  server.db.prepare('UPDATE users SET is_admin=1 WHERE id=?').run(opUser.id)
   const login = await server.http('/login', {
     method: 'POST', body: { username: 'op', password: 'pw', device_name: 'x' },
   })

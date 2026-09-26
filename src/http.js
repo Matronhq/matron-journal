@@ -18,6 +18,7 @@ import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } fro
 import { handleFilesWriteRoute, listingIsWritable } from './files-write-http.js'
 import { makeDurableIdemStore } from './file-idem.js'
 import { makeFileAudit } from './file-audit.js'
+import { isAdmin } from './users-http.js'
 import { closeChatConsentItem } from './consent-items.js'
 import { wakeIfOffline, isWakeableBoxName } from './wake.js'
 import { handleItemsRoute } from './items-http.js'
@@ -107,7 +108,16 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
   // the audit binds its directory here (a handler carries a function, never a
   // path it could be talked into changing), and the idempotency reservations
   // have to outlive a single request to be reservations at all.
+  // Who may use the file API at all. The roots are the HOST's filesystem, not
+  // any one user's data, so access is the journal admin's (users.is_admin,
+  // the same flag that gates /users), on a client device that still exists.
+  // Checked per request, so a demotion or a revocation takes effect at once;
+  // the write funnel re-checks after the body is read. A refusal here is the
+  // account-level 403 {error:'forbidden'}; per-path refusals stay 'denied'.
+  const fileApiAuthorized = (who) => isAdmin(db, who)
+    && !!db.prepare('SELECT 1 FROM devices WHERE id=?').get(who.deviceId)
   const fileWriteCtx = {
+    authorize: fileApiAuthorized,
     fileWriteRoots, fileEnableWrites, fileWritesDryRun, fileWriteMaxBytes,
     audit: makeFileAudit(fileAuditDir),
     // Durable, not a Map: a reservation has to outlive the process that made
@@ -282,13 +292,13 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       // Opt-in: the routes exist only when read-roots were configured at boot
       // (fileReadRoots is a non-empty pinned set); otherwise `/files/*` falls
       // through to the final 404, so an un-configured/disabled deploy serves
-      // everything else normally. Client devices only (operator
-      // devices browse; agents do not). Every path is parsed/validated at the
+      // everything else normally. Journal admins' client devices only
+      // (fileApiAuthorized); agents never. Every path is parsed/validated at the
       // boundary and jailed server-side to the pinned read-roots + always-on
       // secret denylist. Writes live in files-write-http.js. denialToStatus keeps
       // rejection reasons uniform.
       if (fileReadRoots && req.method === 'GET' && url.pathname === '/files/list') {
-        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        if (!fileApiAuthorized(who)) return json(res, 403, { error: 'forbidden' })
         const p = url.searchParams.get('path')
         if (typeof p !== 'string' || !path.isAbsolute(p)) return json(res, 400, { error: 'bad_request' })
         const showAll = url.searchParams.get('all') === '1'
@@ -332,7 +342,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         })
       }
       if (fileReadRoots && req.method === 'GET' && url.pathname === '/files/meta') {
-        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        if (!fileApiAuthorized(who)) return json(res, 403, { error: 'forbidden' })
         const p = url.searchParams.get('path')
         if (typeof p !== 'string' || !path.isAbsolute(p)) return json(res, 400, { error: 'bad_request' })
         let meta
@@ -352,7 +362,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         })
       }
       if (fileReadRoots && req.method === 'GET' && url.pathname === '/files/content') {
-        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        if (!fileApiAuthorized(who)) return json(res, 403, { error: 'forbidden' })
         const p = url.searchParams.get('path')
         if (typeof p !== 'string' || !path.isAbsolute(p)) return json(res, 400, { error: 'bad_request' })
         const attachment = url.searchParams.get('disposition') === 'attachment'

@@ -474,9 +474,14 @@ export function startServer({
   // Listings drop those entries; meta/content/list on them answer 403.
   if (resolvedFileReadRoots) {
     resolvedFileReadRoots = withProtectedPaths(resolvedFileReadRoots, serverStatePaths)
-    const readUserCount = db.prepare('SELECT COUNT(*) AS n FROM users').get()?.n ?? 0
-    if (readUserCount > 1) {
-      console.warn(`SECURITY: the file API is enabled on a journal with ${readUserCount} users. The read roots are GLOBAL, not scoped per user, so every user's client devices can browse and download anything inside them. Enable it only on a single-operator journal, or narrow MATRON_FILE_READ_ROOTS accordingly.`)
+    // Access is the journal admins' (see fileApiAuthorized in http.js). An
+    // upgraded journal has no admin until one is set from the shell, and
+    // more than one admin means every one of them shares the host's files.
+    const adminCount = db.prepare('SELECT COUNT(*) AS n FROM users WHERE is_admin=1').get()?.n ?? 0
+    if (adminCount === 0) {
+      console.warn('file API: enabled, but no user is an admin yet, so every /files request is refused. Grant it with `matron-admin user admin <name> on`.')
+    } else if (adminCount > 1) {
+      console.warn(`SECURITY: the file API is enabled and ${adminCount} users are admins. The read roots are the host's, not scoped per user, so every admin's client devices can browse and download anything inside them.`)
     }
   }
   let resolvedFileWriteRoots = null
@@ -523,16 +528,12 @@ export function startServer({
         throw new Error(`file writes: the write-root ${writeRoot.realPath} is not writable by this process (${err.code || err.message}); under the shipped systemd unit, add it to ReadWritePaths`)
       }
     }
-    // The file API — read AND write — is scoped to server-owned roots, not to
-    // the calling user: every client device sees the same tree. That is the
-    // single-operator model the feature was designed for, and it is inherited
-    // unchanged from the read API. On a SHARED journal it means any
-    // user's client device can write anywhere in the write roots, which is
-    // very unlikely to be what the operator intended — so say so, loudly,
-    // rather than let a team deploy discover it later.
-    const userCount = db.prepare('SELECT COUNT(*) AS n FROM users').get()?.n ?? 0
-    if (userCount > 1) {
-      console.warn(`SECURITY: file writes are enabled on a journal with ${userCount} users. The write roots are GLOBAL — they are not scoped per user, so every user's client devices can overwrite, move and delete anything inside them. Enable writes only on a single-operator journal, or narrow MATRON_FILE_WRITE_ROOTS accordingly.`)
+    // The write roots are the host's, not any one user's: every admin's
+    // client devices can change anything inside them. Say so when that is
+    // more than one person.
+    const writeAdminCount = db.prepare('SELECT COUNT(*) AS n FROM users WHERE is_admin=1').get()?.n ?? 0
+    if (writeAdminCount > 1) {
+      console.warn(`SECURITY: file writes are enabled and ${writeAdminCount} users are admins. The write roots are not scoped per user, so every admin's client devices can overwrite, move and delete anything inside them.`)
     }
   }
   const resolvedFileListMax = fileListMax ?? resolveNumericEnv('MATRON_FILE_LIST_MAX', process.env.MATRON_FILE_LIST_MAX, DEFAULT_FILE_LIST_MAX)

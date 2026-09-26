@@ -10,7 +10,7 @@
 //     roots are pinned; otherwise the request falls through to http.js's 404,
 //     so a dormant deploy is indistinguishable from one that never had the
 //     feature;
-//   * client devices only — an agent never writes the operator's disk;
+//   * the journal admin's client devices only — an agent never writes the host;
 //   * write-ahead audit — the intent line is durable before the first
 //     irreversible fs call, and a failed append REFUSES (507) rather than
 //     mutating unlogged;
@@ -123,6 +123,9 @@ function answer(req, res, outcome, { bodyBearing = false } = {}) {
 // request has to answer on its OWN socket. A funnel that wrote the response
 // would leave the second caller hanging forever.
 async function audited(ctx, who, intent, run) {
+  // Re-checked here, after the body was read: a demotion or a device
+  // revocation that lands mid-upload must not complete the mutation.
+  if (ctx.authorize && !ctx.authorize(who)) return { status: 403, body: { error: 'forbidden' } }
   const base = { ts: Date.now(), deviceId: who.deviceId, op: intent.op, path: intent.path }
   if (intent.to !== undefined) base.to = intent.to
   if (intent.bytes !== undefined) base.bytes = intent.bytes
@@ -257,8 +260,8 @@ export async function handleFilesWriteRoute(ctx, req, res, url, who) {
     || is('POST', '/files/move') || is('POST', '/files/write')
     || is('DELETE', '/files')
   if (!matched) return false
-  // Operator devices browse and write; agents do not touch the operator's disk.
-  if (who.kind !== 'client') return forbidden(res)
+  // The journal admin's client devices only (ctx.authorize); agents never.
+  if (who.kind !== 'client' || !ctx.authorize?.(who)) return forbidden(res)
 
   const { fileWriteRoots: writeRoots, fileWritesDryRun: dryRun } = ctx
   const uploadMax = ctx.fileWriteMaxBytes ?? MAX_UPLOAD_BYTES

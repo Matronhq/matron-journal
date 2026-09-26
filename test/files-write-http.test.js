@@ -44,8 +44,11 @@ async function startWrites(f, extra = {}) {
   })
 }
 
-async function clientToken(s, name = 'op', pw = 'pw') {
+const makeAdmin = (db, id) => db.prepare('UPDATE users SET is_admin=1 WHERE id=?').run(id)
+
+async function clientToken(s, name = 'op', pw = 'pw', { admin = true } = {}) {
   const user = await createUser(s.db, name, pw)
+  if (admin) makeAdmin(s.db, user.id)
   const r = await s.http('/login', { method: 'POST', body: { username: name, password: pw, device_name: 'x' } })
   return { token: r.json.token, user }
 }
@@ -823,7 +826,7 @@ test('dry-run rejects exactly what the live request rejects', async (t) => {
 
 // --- Additional hardening -----------------------------------------------
 
-test('enabling writes on a multi-user journal warns that the roots are global', async (t) => {
+test('enabling writes with more than one admin warns that the roots are shared', async (t) => {
   const f = makeFixture()
   const warn = t.mock.method(console, 'warn', () => {})
   const dbPath = path.join(makeTmpDir('matron-w-db-'), 'matron.db')
@@ -832,20 +835,22 @@ test('enabling writes on a multi-user journal warns that the roots are global', 
   })
 
   const single = await boot({ fileEnableWrites: true })
-  await createUser(single.db, 'one', 'pw')
-  assert.ok(!warn.mock.calls.some((c) => /file writes are enabled on a journal with/.test(c.arguments[0])))
+  makeAdmin(single.db, (await createUser(single.db, 'one', 'pw')).id)
+  await createUser(single.db, 'plain', 'pw')
   single.close()
+  const again = await boot({ fileEnableWrites: true })
+  again.close()
+  assert.ok(!warn.mock.calls.some((c) => /file writes are enabled and/.test(c.arguments[0])))
 
-  // A second user makes the global scope a real exposure, and the operator is
-  // told before it bites. (Per-user write scoping is a product decision the
-  // read API does not make either: the single-operator model.)
+  // A second ADMIN makes the shared scope a real exposure (a plain user never
+  // reaches the file API at all), and the admins are told before it bites.
   const seeding = await boot()
-  await createUser(seeding.db, 'two', 'pw')
+  makeAdmin(seeding.db, (await createUser(seeding.db, 'two', 'pw')).id)
   seeding.close()
 
   const shared = await boot({ fileEnableWrites: true })
   t.after(() => shared.close())
-  assert.ok(warn.mock.calls.some((c) => /file writes are enabled on a journal with 2 users/.test(c.arguments[0])))
+  assert.ok(warn.mock.calls.some((c) => /file writes are enabled and 2 users are admins/.test(c.arguments[0])))
 })
 
 test('an over-long path component is rejected before any directory is created', async (t) => {
@@ -891,5 +896,20 @@ test('a directory move or recursive delete refuses a subtree that holds credenti
   const ok = await call(s, `/files?path=${encodeURIComponent(project)}&recursive=1&confirm=1`, { method: 'DELETE', token })
   assert.equal(ok.status, 200)
   assert.ok(fs.existsSync(path.join(f.readOnly, 'locked.txt')))
+})
+
+test('a user who is not a journal admin gets 403 forbidden from every write route, and nothing changes', async (t) => {
+  const f = makeFixture()
+  const s = await startWrites(f)
+  t.after(() => s.close())
+  const { token } = await clientToken(s, 'plain', 'pw', { admin: false })
+  const before = treeOf(f.root)
+  for (const [method, route, body, raw] of WRITE_ROUTES(f.writeRoot)) {
+    const r = await call(s, route, { method, token, body, raw })
+    assert.equal(r.status, 403, `${method} ${route}`)
+    assert.deepEqual(await r.json(), { error: 'forbidden' }, `${method} ${route}`)
+  }
+  assert.deepEqual(treeOf(f.root), before)
+  assert.deepEqual(auditLines(f), [])
 })
 

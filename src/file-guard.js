@@ -24,6 +24,8 @@ export const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 // Max entries returned per listing before the response is marked truncated
 // (no silent caps — the client is told the listing was cut).
 export const MAX_LIST_ENTRIES = 2000;
+// Total entries a listing may examine, as a multiple of its reply cap.
+export const LIST_SCAN_FACTOR = 10;
 
 // Basename patterns applied to EVERY path segment (a sensitively-named
 // directory denies its contents). The bridge's set, hardened to
@@ -44,6 +46,7 @@ const SENSITIVE_BASENAME_PATTERNS = [
   /^\.azure$/i,
   // Credential / secret files.
   /\.env(\..*)?$/i,
+  /^\.envrc$/i,
   /secrets?\.(json|ya?ml|toml|txt)$/i,
   /^secrets?$/i,
   /^credentials$/i,
@@ -1555,49 +1558,68 @@ export function listDirGuarded(dirPath, { allowedRoots, maxEntries = MAX_LIST_EN
   }
   if (!st.isDirectory()) throw new FileLinkDenied('not-a-dir');
 
-  let dirents;
+  // Iterate rather than materialize: the response cap has to bound the WORK,
+  // not just the reply, or a directory with millions of entries (or one
+  // whose entries are mostly filtered out) pins the event loop and memory.
+  // `scanBudget` caps how many entries are looked at in total; hitting it
+  // marks the listing truncated exactly like the entry cap does.
+  let dir;
   try {
-    dirents = fs.readdirSync(realDir, { withFileTypes: true });
+    dir = fs.opendirSync(realDir);
   } catch {
     throw new FileLinkDenied('unreadable');
   }
 
   const entries = [];
   let truncated = false;
-  for (const de of dirents) {
-    const full = path.join(realDir, de.name);
-    // Drop by listed name/path first (cheap; catches sensitively-named entries
-    // regardless of what they point at).
-    if (isSensitivePath(full)) continue;
-    // Resolve the entry's real path: drops broken symlinks (throws) and lets
-    // us enforce symlink-out + symlink-to-secret defenses.
-    let entryReal;
-    try {
-      entryReal = fs.realpathSync(full);
-    } catch {
-      continue;
+  let scanned = 0;
+  const scanBudget = maxEntries * LIST_SCAN_FACTOR;
+  try {
+    for (let de = dir.readSync(); de !== null; de = dir.readSync()) {
+      scanned += 1;
+      if (scanned > scanBudget) {
+        truncated = true;
+        break;
+      }
+      const full = path.join(realDir, de.name);
+      // Drop by listed name/path first (cheap; catches sensitively-named entries
+      // regardless of what they point at).
+      if (isSensitivePath(full)) continue;
+      // Resolve the entry's real path: drops broken symlinks (throws) and lets
+      // us enforce symlink-out + symlink-to-secret defenses.
+      let entryReal;
+      try {
+        entryReal = fs.realpathSync(full);
+      } catch {
+        continue;
+      }
+      if (pinnedRoots.length && !pinnedRoots.some((root) => contains(root.realPath, entryReal))) continue;
+      if (isSensitivePath(entryReal)) continue;
+      if (isInsideProtected(entryReal, allowedRoots)) continue;
+      let estat;
+      try {
+        estat = fs.statSync(full);
+      } catch {
+        continue;
+      }
+      if (entries.length >= maxEntries) {
+        truncated = true;
+        break;
+      }
+      const kind = estat.isDirectory() ? 'dir' : estat.isFile() ? 'file' : 'other';
+      entries.push({
+        name: de.name,
+        kind,
+        size: kind === 'file' ? estat.size : null,
+        mtime: estat.mtimeMs,
+        mime: kind === 'file' ? mimeForPath(entryReal) : null,
+      });
     }
-    if (pinnedRoots.length && !pinnedRoots.some((root) => contains(root.realPath, entryReal))) continue;
-    if (isSensitivePath(entryReal)) continue;
-    if (isInsideProtected(entryReal, allowedRoots)) continue;
-    let estat;
-    try {
-      estat = fs.statSync(full);
-    } catch {
-      continue;
-    }
-    if (entries.length >= maxEntries) {
-      truncated = true;
-      break;
-    }
-    const kind = estat.isDirectory() ? 'dir' : estat.isFile() ? 'file' : 'other';
-    entries.push({
-      name: de.name,
-      kind,
-      size: kind === 'file' ? estat.size : null,
-      mtime: estat.mtimeMs,
-      mime: kind === 'file' ? mimeForPath(entryReal) : null,
-    });
+  } catch (err) {
+    if (err instanceof FileLinkDenied) throw err;
+    throw new FileLinkDenied('unreadable');
+  } finally {
+    try { dir.closeSync(); } catch { /* already closed */ }
   }
   return { realDir, entries, truncated };
 }

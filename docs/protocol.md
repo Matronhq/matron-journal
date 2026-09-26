@@ -2440,10 +2440,15 @@ Browse, preview and (optionally) edit files on the journal host from a client
 app. Off by default: the routes do not exist (plain 404) until
 `MATRON_FILE_READ_ROOTS` is set, and the write routes additionally need
 `MATRON_FILE_ENABLE_WRITES=1` plus `MATRON_FILE_WRITE_ROOTS` (see README).
-Client devices only; an agent device gets 403 `forbidden`. Roots are
-server-owned and global: every client device of every user sees the same
-tree, so enable the API only on a single-operator journal (the server warns at
-boot when it is on and more than one user exists).
+**Access is the journal admin's.** The roots are the host's filesystem, not
+any one user's data, so only client devices whose user has `users.is_admin`
+(the flag that gates `/users`; `matron-admin user admin <name> on`) may call
+these routes. Every other caller, including an agent device and a plain user's
+client, gets 403 `{error:'forbidden'}`; clients can treat that as "Files not
+available". It is checked on every request, and a write re-checks it after its
+body is read, so a demotion or a device revocation takes effect at once. The
+server warns at boot when the API is on but no user is an admin yet, and when
+more than one admin will share the roots.
 
 Every path is absolute. The guard resolves it on the server, pins the open
 file descriptor, and re-checks the descriptor's identity through
@@ -2457,7 +2462,7 @@ read root contains it. Denials use one status mapping
 missing ones, 409 for state conflicts, 413 for size caps, 507 when the server
 could not make the change safe (audit or trash failure).
 
-### Read routes (Bearer, client devices)
+### Read routes (Bearer, admin client devices)
 
 | Route | Query | Response |
 |---|---|---|
@@ -2465,7 +2470,7 @@ could not make the change safe (audit or trash failure).
 | `GET /files/meta` | `path` | `{path, kind, size, mtime, mime, is_text}` |
 | `GET /files/content` | `path`, `disposition=inline\|attachment` | Streamed bytes, `Range` supported (206/416). Caps: 5 MiB inline, 100 MiB attachment (413 over). Text and code are served as `text/plain` with `nosniff`; anything script-capable is forced to `attachment` |
 
-### Write routes (Bearer, client devices, writes enabled)
+### Write routes (Bearer, admin client devices, writes enabled)
 
 | Route | Body / query | Response |
 |---|---|---|
@@ -2481,8 +2486,10 @@ symlinks inside the tree are judged by name and never followed, and a subtree
 over 100,000 entries is refused (409) rather than scanned without bound.
 
 Nothing is ever unlinked: delete moves the entry into
-`<write-root>/.matron-trash/`, and an `overwrite` copies the previous content
-there (fsynced) before the replacement lands. The trash is hidden from
+`<write-root>/.matron-trash/`, and an `overwrite` first hard-links the
+previous file there (the original inode, so its mode and ownership survive;
+fsynced) before the replacement lands. A process that still holds the old file
+open keeps writing to that trashed inode. The trash is hidden from
 listings and cannot itself be written or deleted through the API. In dry-run
 every route validates and audits, then answers `{…, dry_run: true}` without
 touching the filesystem.

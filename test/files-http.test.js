@@ -68,8 +68,11 @@ const F2_SENSITIVE = [
   ['.claude.json', '"k":"v"'],
 ]
 
-async function clientToken(s, name = 'op', pw = 'pw') {
-  await createUser(s.db, name, pw)
+const makeAdmin = (db, id) => db.prepare('UPDATE users SET is_admin=1 WHERE id=?').run(id)
+
+async function clientToken(s, name = 'op', pw = 'pw', { admin = true } = {}) {
+  const user = await createUser(s.db, name, pw)
+  if (admin) makeAdmin(s.db, user.id)
   const r = await s.http('/login', { method: 'POST', body: { username: name, password: pw, device_name: 'x' } })
   return r.json.token
 }
@@ -590,5 +593,52 @@ test('server-owned state inside a read-root is never listed or served', async (t
   assert.deepEqual(listed.entries.map((e) => e.name).filter((n) => n.startsWith('journal.db') || n === 'media'), [])
   // Ordinary files next to it are unaffected.
   assert.equal((await authGet(s, `/files/content?path=${encodeURIComponent(path.join(root, 'notes.md'))}`, token)).status, 200)
+})
+
+test('only a journal admin reaches the file API: other users get 403 forbidden, admins can be demoted live', async (t) => {
+  const { root } = makeFixture()
+  const s = await startTestServer({ fileReadRoots: [root] })
+  t.after(() => s.close())
+  const adminToken = await clientToken(s, 'admin', 'pw')
+  const plainToken = await clientToken(s, 'plain', 'pw', { admin: false })
+  const enc = encodeURIComponent(root)
+  const fileEnc = encodeURIComponent(path.join(root, 'app.js'))
+  const urls = [`/files/list?path=${enc}`, `/files/meta?path=${fileEnc}`, `/files/content?path=${fileEnc}`]
+  for (const url of urls) {
+    const r = await authGet(s, url, plainToken)
+    assert.equal(r.status, 403, url)
+    assert.deepEqual(await r.json(), { error: 'forbidden' }, url)
+    assert.equal((await authGet(s, url, adminToken)).status, 200, url)
+  }
+  s.db.prepare("UPDATE users SET is_admin=0 WHERE name='admin'").run()
+  for (const url of urls) {
+    const r = await authGet(s, url, adminToken)
+    assert.equal(r.status, 403, url)
+    assert.deepEqual(await r.json(), { error: 'forbidden' }, url)
+  }
+})
+
+test('.envrc is treated as credential material', async (t) => {
+  const { root } = makeFixture()
+  fs.writeFileSync(path.join(root, '.envrc'), 'export TOKEN=abc\n')
+  const s = await startTestServer({ fileReadRoots: [root] })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+  const listed = await (await authGet(s, `/files/list?path=${encodeURIComponent(root)}&all=1`, token)).json()
+  assert.ok(!listed.entries.some((e) => e.name === '.envrc'))
+  const r = await authGet(s, `/files/content?path=${encodeURIComponent(path.join(root, '.envrc'))}`, token)
+  assert.equal(r.status, 403)
+})
+
+test('a listing stops examining entries at its scan budget and says it was truncated', async (t) => {
+  const root = fs.realpathSync(makeTmpDir('matron-scan-'))
+  // Mostly filtered entries: none would be returned, but each costs work.
+  for (let i = 0; i < 40; i++) fs.writeFileSync(path.join(root, `k${i}.pem`), 'x')
+  const s = await startTestServer({ fileReadRoots: [root], fileListMax: 2 })
+  t.after(() => s.close())
+  const token = await clientToken(s)
+  const listed = await (await authGet(s, `/files/list?path=${encodeURIComponent(root)}&all=1`, token)).json()
+  assert.deepEqual(listed.entries, [])
+  assert.equal(listed.truncated, true)
 })
 
