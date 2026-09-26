@@ -1393,7 +1393,11 @@ Item shape: `{id, user_id, num, kind, state, resolution, awaiting, rank,
 title, body, labels[], links[{url,title?}], supersedes, origin_convo_id,
 origin_device_id, created_by, created_at, updated_at, closed_at,
 comment_count, last_comment_at, attachments[], has_image, mission_id,
-mission_num, consent, actions[], chosen_action}`. `consent` is `'spawn'` or `'chat'` on the journal's
+mission_num, consent, actions[], chosen_action, origin_convo_title}`.
+`origin_convo_title` is the title of the item's origin conversation (at most
+200 characters), so a client can say where an item was filed without a second
+fetch; `null` when that conversation is untitled, gone, or not owned by the
+item's user. `consent` is `'spawn'` or `'chat'` on the journal's
 mirror of a consent card (see *Agent-spawned sessions → Tracker item*) and
 `null` on every other item; clients may use it to embed the card. `mission_id`/`mission_num` are the mission this item belongs
 to — both `null` when it has none — set by `PATCH /items/:id {mission}` or
