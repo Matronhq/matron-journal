@@ -1397,7 +1397,11 @@ mission_num, consent, actions[], chosen_action, origin_convo_title}`.
 `origin_convo_title` is the title of the item's origin conversation (at most
 200 characters), so a client can say where an item was filed without a second
 fetch; `null` when that conversation is untitled, gone, or not owned by the
-item's user. `consent` is `'spawn'` or `'chat'` on the journal's
+item's user. It is read at request time and is not part of the item's own
+state: renaming the conversation does not bump the item's `updated_at`, so a
+`since` delta does not re-deliver the item. A client that also holds the
+conversation list should prefer that list's live title and use this field for
+origins it has not loaded. `consent` is `'spawn'` or `'chat'` on the journal's
 mirror of a consent card (see *Agent-spawned sessions → Tracker item*) and
 `null` on every other item; clients may use it to embed the card. `mission_id`/`mission_num` are the mission this item belongs
 to — both `null` when it has none — set by `PATCH /items/:id {mission}` or
