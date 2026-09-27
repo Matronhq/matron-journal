@@ -168,6 +168,44 @@ test('getItem accepts id, #num, num; other user 404s', async () => {
   assert.deepEqual(getItem(db, dan.id, a.id).labels, [])
 })
 
+test('item read shape exposes origin_convo_title for provenance labelling', async () => {
+  const { db, dan } = await seed() // c1 (title 'C1'), c2 (title 'C2')
+  const a = createItem(db, base({ userId: dan.id, originConvoId: 'c1' })).item
+  const b = createItem(db, base({ userId: dan.id, originConvoId: 'c2' })).item
+  assert.equal(getItem(db, dan.id, a.id).origin_convo_id, 'c1')
+  assert.equal(getItem(db, dan.id, a.id).origin_convo_title, 'C1')
+  assert.equal(getItem(db, dan.id, b.id).origin_convo_title, 'C2')
+  // listItems decorates identically
+  const byId = Object.fromEntries(listItems(db, dan.id, {}).items.map((it) => [it.id, it]))
+  assert.equal(byId[a.id].origin_convo_title, 'C1')
+  assert.equal(byId[b.id].origin_convo_title, 'C2')
+  // An untitled conversation ('' is the column default) reads as null, not ''.
+  db.prepare("UPDATE conversations SET title='' WHERE id=?").run('c2')
+  assert.equal(getItem(db, dan.id, b.id).origin_convo_title, null)
+  // A gone origin conversation degrades to a null title, never throws.
+  db.prepare('DELETE FROM conversations WHERE id=?').run('c1')
+  assert.equal(getItem(db, dan.id, a.id).origin_convo_id, 'c1')
+  assert.equal(getItem(db, dan.id, a.id).origin_convo_title, null)
+})
+
+test('origin_convo_title never discloses the title of another user\'s conversation', async () => {
+  const { db, dan, pat, agent } = await seed()
+  // Conversation ids are a global PK: if dan's item points at an id that pat
+  // now owns, the lookup must resolve through dan's ownership, not pat's row.
+  upsertConversation(db, { id: 'shared-id', ownerUserId: pat.id, title: "pat's private title", agentDeviceId: agent.deviceId })
+  const danItem = createItem(db, base({ userId: dan.id, originConvoId: 'shared-id' })).item
+  const seen = getItem(db, dan.id, danItem.id)
+  assert.equal(seen.origin_convo_id, 'shared-id')
+  assert.equal(seen.origin_convo_title, null)
+})
+
+test('origin_convo_title is length-bounded', async () => {
+  const { db, dan } = await seed()
+  db.prepare('UPDATE conversations SET title=? WHERE id=?').run('x'.repeat(5000), 'c1')
+  const it = createItem(db, base({ userId: dan.id, originConvoId: 'c1' })).item
+  assert.equal(getItem(db, dan.id, it.id).origin_convo_title.length, 200)
+})
+
 test('listItems filters, sorts, pages, and decorates', async () => {
   const { db, dan } = await seed()
   createItem(db, base({ userId: dan.id, now: 1 }))

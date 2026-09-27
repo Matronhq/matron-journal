@@ -321,7 +321,19 @@ const DECORATE = `
   (SELECT MAX(created_at) FROM item_comments c WHERE c.item_id = i.id AND c.kind='comment') AS last_comment_at,
   (SELECT COALESCE(attachments,'[]') FROM item_comments c WHERE c.item_id = i.id AND c.kind='status' AND c.meta LIKE '%"role":"body"%' LIMIT 1) AS attachments,
   EXISTS(SELECT 1 FROM item_comments c WHERE c.item_id = i.id AND c.attachments LIKE '%"mime":"image/%') AS has_image,
-  (SELECT num FROM missions m WHERE m.id = i.mission_id) AS mission_num
+  (SELECT num FROM missions m WHERE m.id = i.mission_id) AS mission_num,
+  -- Title of the origin conversation, so a client can label an item's
+  -- provenance ("this session" / "from <that conversation>") without a second
+  -- fetch. NULL when the conversation is untitled ('' is the column default)
+  -- or its row is gone, so clients have one "no title" sentinel.
+  --   owner_user_id = i.user_id: conversation ids are a global PK, so an
+  -- orphaned origin_convo_id reused by a different user must not disclose
+  -- that user's title.
+  --   substr(...,1,200): the title repeats on every row of a page (up to 500)
+  -- and on every item in an {item} response; bound it so one oversized title
+  -- can't amplify a response.
+  (SELECT NULLIF(substr(cv.title, 1, 200), '') FROM conversations cv
+     WHERE cv.id = i.origin_convo_id AND cv.owner_user_id = i.user_id) AS origin_convo_title
 `
 
 export function getItem(db, userId, idOrNum) {
