@@ -1848,10 +1848,14 @@ and is the only copy.
 ### GitHub account linking
 
 Client devices only (an agent never links). Configuration:
-`MATRON_GITHUB_CLIENT_ID` (default empty → linking disabled, every route
-below is `404 not_configured`; will default to Matron's published OAuth
-App id once one is registered — not configured in this release),
-`MATRON_GITHUB_CLIENT_SECRET` (optional; enables the web flow),
+`MATRON_GITHUB_CLIENT_ID` (default: Matron's published OAuth App id,
+`Ov23likaFmqoegaDMTtz`, so the device flow works out of the box; set it
+to the empty string to disable linking, in which case every route below
+is `404 not_configured`),
+`MATRON_GITHUB_CLIENT_SECRET` (optional; enables the web flow — it must
+belong to the same OAuth App as `MATRON_GITHUB_CLIENT_ID`, so a journal
+that sets a secret also sets its own app's client id; the default id has
+no secret to pair with),
 `MATRON_GITHUB_HOST` (default `github.com`). The token scope is `read:org`.
 
 | Route | Body / query | Response |
