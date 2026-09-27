@@ -21,7 +21,7 @@ const byOf = (who) => (who.kind === 'agent' ? 'agent' : 'user')
 function visibleMemory(db, who, key) {
   const m = getMemory(db, who.userId, key)
   if (!m) return null
-  if (filteredAgent(db, who) && privateOrigin(db, m)) return null
+  if (filteredAgent(db, who) && privateOrigin(m)) return null
   return m
 }
 
@@ -37,7 +37,7 @@ export function emitMemoryMarker({ db, hub }, who, { memory, action, created, wr
   const coord = getCoordinatorConvoId(db, who.userId)
   if (coord && !targets.includes(coord)) targets.push(coord)
   const sender = senderOf(db, who)
-  const hidden = privateOrigin(db, memory)
+  const hidden = privateOrigin(memory)
   for (const convoId of targets) {
     const withTitle = !hidden || privateOwnedConvo(db, convoId)
     const payload = {
@@ -81,7 +81,7 @@ async function handlePut(ctx, req, res, who, name) {
   // A name that exists but is hidden from this caller is a 404, not a second
   // row: UNIQUE(user_id, name) holds either way.
   const existing = getMemory(db, who.userId, name)
-  if (existing && filteredAgent(db, who) && privateOrigin(db, existing)) return notFound(res)
+  if (existing && filteredAgent(db, who) && privateOrigin(existing)) return notFound(res)
   let out
   try {
     out = upsertMemory(db, {

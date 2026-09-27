@@ -1617,9 +1617,10 @@ A memory is the user's shared agent memory: a standing rule or fact any of
 their agents may save and every one of them may read, shaped like a Claude
 Code memory file so an agent's own memory instructions apply to it. Per
 user (`memories` table, `src/memories.js`, `src/memories-http.js`), one row
-per `name`, overwritten in place; the Coordinator's bridge injects the
-index (name, type, description) into the Coordinator's instructions at
-spawn.
+per `name`, overwritten in place. A bridge with the memories update
+(matron-bridge, the `memory_*` tools) injects the index (name, type,
+description) into the Coordinator's instructions at spawn; against an
+older bridge the memories are stored and shown in the apps only.
 
 ```
 { id: "me_<16 hex>", name, type, description, body,
@@ -1635,8 +1636,10 @@ spawn.
 - `body`: markdown, at most 8192 UTF-8 bytes, may be empty.
 - `origin_convo_id` / `origin_device_id`: where the memory was first
   saved; set once. `origin_convo_id` is not a foreign key — deleting the
-  conversation does not delete the memory. `created_by` / `updated_by` are
-  `user` or `agent`.
+  conversation does not delete the memory. `origin_private` is the origin
+  device's privacy flag **snapshotted at save time** (a revoked device, or
+  a new device reusing its id, never changes who may read the memory).
+  `created_by` / `updated_by` are `user` or `agent`.
 - At most **200 memories per user**.
 
 ### Routes (Bearer, either device kind)

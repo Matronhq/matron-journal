@@ -262,7 +262,10 @@ CREATE TABLE IF NOT EXISTS user_settings(
 -- One row per name; PUT /memories/:name overwrites. origin_convo_id is
 -- deliberately not a foreign key — deleting the conversation a memory was
 -- saved from must not delete the memory (same stance as
--- user_settings.coordinator_convo_id).
+-- user_settings.coordinator_convo_id). origin_private is the origin device's
+-- privacy flag snapshotted at save time: the row outlives the device
+-- (revokeDevice deletes the row, and SQLite may hand the id to the next
+-- device), so a live join would flip visibility when the device goes.
 CREATE TABLE IF NOT EXISTS memories(
   id               TEXT PRIMARY KEY,
   user_id          INTEGER NOT NULL REFERENCES users(id),
@@ -272,6 +275,7 @@ CREATE TABLE IF NOT EXISTS memories(
   body             TEXT NOT NULL DEFAULT '',
   origin_convo_id  TEXT,
   origin_device_id INTEGER,
+  origin_private   INTEGER NOT NULL DEFAULT 0,
   created_by       TEXT NOT NULL CHECK(created_by IN ('user','agent')),
   updated_by       TEXT NOT NULL CHECK(updated_by IN ('user','agent')),
   created_at       INTEGER NOT NULL,

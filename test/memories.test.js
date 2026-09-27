@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { openDb, pinDevicePrivate } from '../src/db.js'
-import { createUser, createAgent } from '../src/auth.js'
+import { createUser, createAgent, revokeDevice } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import {
   validateMemoryFields, validName, upsertMemory, getMemory, listMemories, deleteMemory, privateOrigin, MEMORIES_MAX,
@@ -25,7 +25,7 @@ const save = (db, userId, over = {}) => upsertMemory(db, {
 test('schema: memories table has the spec columns', async () => {
   const { db } = await seed()
   const cols = db.prepare('PRAGMA table_info(memories)').all().map((c) => c.name)
-  assert.deepEqual(cols, ['id', 'user_id', 'name', 'type', 'description', 'body', 'origin_convo_id', 'origin_device_id', 'created_by', 'updated_by', 'created_at', 'updated_at'])
+  assert.deepEqual(cols, ['id', 'user_id', 'name', 'type', 'description', 'body', 'origin_convo_id', 'origin_device_id', 'origin_private', 'created_by', 'updated_by', 'created_at', 'updated_at'])
 })
 
 test('validName: kebab slugs only', () => {
@@ -86,8 +86,23 @@ test('getMemory by id or name; listMemories ordered by name with the privacy sie
   assert.equal(getMemory(db, 999, pub.id), null)
   assert.deepEqual(listMemories(db, dan.id).map((m) => m.name), ['a-private', 'b-public'])
   assert.deepEqual(listMemories(db, dan.id, { excludePrivateOwned: true }).map((m) => m.name), ['b-public'])
-  assert.equal(privateOrigin(db, hid), true); assert.equal(privateOrigin(db, pub), false)
-  assert.equal(privateOrigin(db, { origin_device_id: null }), false)
+  assert.equal(privateOrigin(hid), true); assert.equal(privateOrigin(pub), false)
+  assert.equal(hid.origin_private, true); assert.equal(pub.origin_private, false)
+  assert.equal(privateOrigin({ origin_device_id: null }), false)
+})
+
+test('privacy is snapshotted at save time: revoking the origin device (and reusing its id) changes nothing', async () => {
+  const { db, dan, priv, agent } = await seed()
+  const hid = save(db, dan.id, { name: 'secret', originDeviceId: priv.deviceId }).memory
+  const pub = save(db, dan.id, { name: 'open', originDeviceId: agent.deviceId }).memory
+  revokeDevice(db, priv.deviceId)
+  revokeDevice(db, agent.deviceId)
+  // A fresh device may land on a revoked id (INTEGER PRIMARY KEY reuse).
+  const again = createAgent(db, dan.id, 'again')
+  pinDevicePrivate(db, again.deviceId, true)
+  assert.deepEqual(listMemories(db, dan.id, { excludePrivateOwned: true }).map((m) => m.name), ['open'])
+  assert.equal(privateOrigin(getMemory(db, dan.id, hid.id)), true)
+  assert.equal(privateOrigin(getMemory(db, dan.id, pub.id)), false)
 })
 
 test('deleteMemory returns the row once, then null', async () => {

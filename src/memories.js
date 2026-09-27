@@ -39,7 +39,7 @@ export function validateMemoryFields(body) {
 
 const rowToMemory = (r) => (r ? {
   id: r.id, user_id: r.user_id, name: r.name, type: r.type, description: r.description, body: r.body,
-  origin_convo_id: r.origin_convo_id, origin_device_id: r.origin_device_id,
+  origin_convo_id: r.origin_convo_id, origin_device_id: r.origin_device_id, origin_private: !!r.origin_private,
   created_by: r.created_by, updated_by: r.updated_by, created_at: r.created_at, updated_at: r.updated_at,
 } : null)
 
@@ -51,20 +51,21 @@ export function getMemory(db, userId, key) {
 }
 
 export function listMemories(db, userId, { excludePrivateOwned = false } = {}) {
-  const sieve = excludePrivateOwned
-    ? 'AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.id = m.origin_device_id AND d.private = 1)'
-    : ''
+  const sieve = excludePrivateOwned ? 'AND m.origin_private = 0' : ''
   return db.prepare(`SELECT * FROM memories m WHERE m.user_id=? ${sieve} ORDER BY m.name`).all(userId).map(rowToMemory)
 }
 
 // Saved from a private device → hidden from an ordinary agent (the
-// privateOwnedConvo rule, applied to the memory's own origin device).
-export const privateOrigin = (db, memory) =>
-  memory.origin_device_id != null && isPrivateDevice(db, memory.origin_device_id)
+// privateOwnedConvo rule, applied to the memory's own origin device). Read
+// from the snapshot taken at save time, never a live devices join: the
+// device may be revoked (its row deleted, its id possibly reused) long
+// after the memory was saved, and that must not change who may read it.
+export const privateOrigin = (memory) => memory?.origin_private === true
 
 // Create or overwrite by name in one transaction. Throws Error('too_many')
 // when a CREATE would pass MEMORIES_MAX; an update is never refused.
 export function upsertMemory(db, { userId, name, description, body, type, originConvoId = null, originDeviceId = null, by, now = Date.now() }) {
+  const originPrivate = originDeviceId != null && isPrivateDevice(db, originDeviceId) ? 1 : 0
   return db.transaction(() => {
     const existing = db.prepare('SELECT * FROM memories WHERE user_id=? AND name=?').get(userId, name)
     if (existing) {
@@ -75,9 +76,9 @@ export function upsertMemory(db, { userId, name, description, body, type, origin
     const n = db.prepare('SELECT COUNT(*) AS n FROM memories WHERE user_id=?').get(userId).n
     if (n >= MEMORIES_MAX) throw new Error('too_many')
     const id = newId()
-    db.prepare(`INSERT INTO memories(id, user_id, name, type, description, body, origin_convo_id, origin_device_id, created_by, updated_by, created_at, updated_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(id, userId, name, type ?? DEFAULT_TYPE, description, body, originConvoId, originDeviceId, by, by, now, now)
+    db.prepare(`INSERT INTO memories(id, user_id, name, type, description, body, origin_convo_id, origin_device_id, origin_private, created_by, updated_by, created_at, updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(id, userId, name, type ?? DEFAULT_TYPE, description, body, originConvoId, originDeviceId, originPrivate, by, by, now, now)
     return { memory: getMemory(db, userId, id), created: true }
   })()
 }
