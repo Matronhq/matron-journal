@@ -22,6 +22,7 @@ import { handleLookupRoute } from './lookup-http.js'
 import { handleUsersRoute } from './users-http.js'
 import { githubAccountView } from './github-accounts.js'
 import { handleCoordinatorRoute } from './coordinator-http.js'
+import { handleMemoriesRoute } from './memories-http.js'
 import { coordinatorFor } from './coordinator.js'
 import { json, readBody } from './http-body.js'
 
@@ -254,6 +255,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       // outer try/catch so readBody's 400/413 map like every other route's.
       if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription }, req, res, url, who)) return
       if (await handleMissionsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
+      if (await handleMemoriesRoute({ db, hub }, req, res, url, who)) return
       if (await handleGithubRoute({ db, github, rateLimiter, tokenBox: tokenBox || undefined }, req, res, url, who)) return
       if (handleLookupRoute({ db }, req, res, url, who)) return
       if (await handleUsersRoute({ db, links }, req, res, url, who)) return
