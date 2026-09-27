@@ -789,9 +789,14 @@ malformed id is never echoed back. Other ops' error frames are unchanged.
   requester's own conversations** is doing the asking, so the consent card
   can say who is asking rather than just which device. Validated the same
   way and for the same reason — a top-level conversation this connection's
-  own device owns, else `not_found`. It is display-only: unlike
-  `target_convo_id` it is not persisted or relayed, only resolved to a title
-  for the card.
+  own device owns, else `not_found`. Resolved to a title for the card, and
+  also persisted on the `convo_agents` row (`initiator_convo_id`) and
+  relayed verbatim as `from_convo_id` on the `request` frame — omitted,
+  never null, when the caller sent none. The receiving bridge keys its
+  one-room-per-pair lookup on the peer device plus the peer's conversation,
+  so without it the invited side could only record the device, and a guest
+  later calling the inviter back opened a second room in the other
+  direction.
 
   Every ask parks: it creates/renews an `awaiting_user` row and the target
   agent is sent **nothing** — the justification never leaves the journal
