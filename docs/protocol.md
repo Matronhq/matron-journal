@@ -1813,7 +1813,10 @@ Client devices only (an agent never links). Configuration:
 `Ov23likaFmqoegaDMTtz`, so the device flow works out of the box; set it
 to the empty string to disable linking, in which case every route below
 is `404 not_configured`),
-`MATRON_GITHUB_CLIENT_SECRET` (optional; enables the web flow),
+`MATRON_GITHUB_CLIENT_SECRET` (optional; enables the web flow — it must
+belong to the same OAuth App as `MATRON_GITHUB_CLIENT_ID`, so a journal
+that sets a secret also sets its own app's client id; the default id has
+no secret to pair with),
 `MATRON_GITHUB_HOST` (default `github.com`). The token scope is `read:org`.
 
 | Route | Body / query | Response |
