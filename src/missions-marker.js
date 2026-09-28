@@ -32,7 +32,11 @@ export function milestoneMarkerPayload({ milestone, mission, by, withTitle = tru
 
 // Apps use this only as an invalidation signal plus a one-line notice.
 // open_item_nums is present only on a user-forced close over open items.
-export function missionMarkerPayload({ mission, action, by, openItemNums = null, withTitle = true }) {
+// status_changed (spec 2026-09-28 missions dashboard §1) is present only on
+// an `updated` whose PATCH carried `status` — a flag, never the text: the
+// marker is replayed verbatim to every agent on the origin conversation,
+// and the status may be one an ordinary agent must not read.
+export function missionMarkerPayload({ mission, action, by, openItemNums = null, withTitle = true, statusChanged = false }) {
   if (!MISSION_ACTIONS.includes(action)) throw new Error(`unknown mission action: ${action}`)
   const out = {
     mission_id: mission.id, num: mission.num,
@@ -40,5 +44,6 @@ export function missionMarkerPayload({ mission, action, by, openItemNums = null,
     action, by,
   }
   if (openItemNums && openItemNums.length) out.open_item_nums = openItemNums
+  if (statusChanged) out.status_changed = true
   return out
 }

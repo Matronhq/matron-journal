@@ -600,6 +600,22 @@ export function openDb(path) {
   if (!itemActionCols.some((c) => c.name === 'chosen_action')) {
     db.exec('ALTER TABLE items ADD COLUMN chosen_action TEXT')
   }
+  // Mission status (spec 2026-09-28 missions dashboard §1): one short
+  // markdown paragraph agents keep current — who wrote it (status_by), from
+  // which conversation (status_convo_id), and when. status_device_id is
+  // internal and never on the wire: the privacy sieve keys on the WRITING
+  // DEVICE as well as the conversation, so a private agent that names no
+  // conversation is still withheld from ordinary agents. No backfill —
+  // every existing row reads all NULL.
+  const missionStatusCols = db.prepare('PRAGMA table_info(missions)').all()
+  const addMissionCol = (name, ddl) => {
+    if (!missionStatusCols.some((c) => c.name === name)) db.exec(`ALTER TABLE missions ADD COLUMN ${ddl}`)
+  }
+  addMissionCol('status', 'status TEXT')
+  addMissionCol('status_by', "status_by TEXT CHECK(status_by IN ('user','agent'))")
+  addMissionCol('status_convo_id', 'status_convo_id TEXT')
+  addMissionCol('status_updated_at', 'status_updated_at INTEGER')
+  addMissionCol('status_device_id', 'status_device_id INTEGER')
   // Standing agent-chat consent ("always allow A -> B") is gone: every ask
   // parks for the user now. Dropped rather than left in place, because a
   // table of grants that nothing consults still reads like a live security

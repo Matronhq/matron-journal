@@ -1750,7 +1750,7 @@ column.
 | `GET /missions` | `?state=open\|closed` (omit = both), `?since=<ms>`, `?scope=mine\|shared` (shared: neither `state` nor `since`; rows carry `owner`) | `{missions:[…]}` with per-row counts: `open_items`, `needs_you` (open and awaiting user), `conversations`, `milestones`, `last_milestone` `{num,title,kind,created_at}`. Sorted `last_milestone_at DESC NULLS LAST`, then `created_at DESC` — for a filtered (ordinary agent) caller this is the SIEVED last-milestone timestamp (the same sieved subquery the `last_milestone` field itself uses), so the order never disagrees with the row shown; an owner or private agent sorts on the stored column, which is the same thing. |
 | `GET /missions/:id` | | `{mission, milestones:[…] newest first, items:[open items], conversations:[{id,title,box,state}]}` |
 | `GET /missions/:id` (shared) | `:id` must be `ms_…` (a colleague's number is not resolvable) of a mission visible under *Shared visibility* | mission detail with `owner`; `PATCH`, `join`, and `close` on it are all **403 `forbidden`** |
-| `PATCH /missions/:id` | `{title?, body?}` | 200 `{mission}`; 409 `{blocked_by:'closed'}` |
+| `PATCH /missions/:id` | `{title?, body?, status?: string\|null, convo_id?}` | 200 `{mission}`; 400 on a bad `status` (see *Status*); 409 `{blocked_by:'closed'}` |
 | `POST /missions/:id/join` | `{convo_id}` | 200 `{mission}`; 409 `{blocked_by:'other_mission'}` if the conversation already has a different mission, 409 `{blocked_by:'closed'}` if this one is closed, 400 `{error:'bad_request'}` once the mission already has 200 conversations. Repeat-joining the same mission is a no-op 200, not a conflict. Repoints the conversation's unassigned items (same `updated_at` bump as `POST /missions`). |
 | `POST /missions/:id/close` | `{summary}` | 200 `{mission}`, or 409 as in *Closing*, below. |
 | `POST /milestones` | `{convo_id, kind:'user_input'\|'progress', title, body?}` + optional `Idempotency-Key` | 201 `{milestone, mission}`; 409 `{blocked_by:'no_mission'}` if the conversation has none — or if its mission is invisible to the caller (see *Visibility*), 409 `{blocked_by:'closed'}` if its mission is closed; 502 `{error:'marker_append_failed'}` if the anchor marker couldn't be written (the milestone row is not created either — see "Marker events" below). |
@@ -1765,11 +1765,51 @@ fails.
 Row shapes: a mission is `{id, user_id, num, state, title, body,
 close_summary, closed_by, closed_over_open_items, origin_convo_id,
 origin_device_id, created_by, created_at, updated_at, last_milestone_at,
-closed_at}` plus the counts listed against `GET /missions` above; a
-milestone is `{id, mission_id, user_id, num, kind, title, body, convo_id,
-seq, device_id, created_by, created_at}`. `idem_key` is an internal column
-on both and is never returned — the same stance items take, and the only
-key either shape strips.
+closed_at, status, status_by, status_convo_id, status_updated_at}` plus the
+counts listed against `GET /missions` above; a milestone is `{id,
+mission_id, num, kind, title, body, convo_id, seq, device_id, created_by,
+created_at}`. Stored columns stripped from the wire: `idem_key` (both
+shapes), `status_device_id` (mission — the device that wrote the status,
+used only by the privacy sieve) and `user_id` (milestone — always the
+caller's own id, so no route reads it back). Query-computed columns such as
+`sieved_last_milestone_at` and `status_hidden` (the sort key and the
+per-caller status sieve verdict, both internal to `countsSql`/
+`sharedCountsSql`) are never returned either.
+
+### Status
+
+Spec: `docs/superpowers/specs/2026-09-28-missions-dashboard-design.md` §1.
+
+A mission carries one **status**: a short markdown paragraph saying where
+the work is, what's next and what is blocked — the headline on its card in
+the apps. It is overwritten, never appended; there is no history.
+
+- `PATCH /missions/:id {status: "…"}` sets it. The text is trimmed (CRLF
+  folded to LF first) and must then be 1–600 UTF-16 code units with no
+  control characters other than `\n` and `\t`, and no U+2028/U+2029 —
+  else 400 `bad_request` and nothing is written. It combines with `title`
+  / `body` in one PATCH. `status` on `POST /missions` is ignored.
+- `{status: null}` clears it.
+- The four fields are always written together: `status`, `status_by`
+  (`'user'` for a client, `'agent'` for an agent), `status_convo_id`,
+  `status_updated_at` (ms; the same instant as the new `updated_at`; null
+  when cleared).
+- `status_convo_id` comes from an optional `convo_id` in the same body. It
+  is recorded only when the caller is an agent, the conversation belongs to
+  the caller's user, and — for an ordinary agent — it is not private-owned.
+  Anything else (a client, another user's or an unknown conversation, a
+  non-string) records null: it is attribution, never a gate, never a 400.
+- A closed mission is 409 `{blocked_by:'closed'}` and a mission the caller
+  cannot see is 404 — the rules of every PATCH. An ordinary agent may set
+  the status of any mission it can see (the Coordinator refreshes missions
+  it is not on).
+- Like every PATCH it bumps `updated_at` (so `GET /missions?since=` sees
+  it) and appends the `updated` mission marker to the origin conversation,
+  carrying `status_changed: true` (see *Marker events*).
+
+Every mission row — `GET /missions`, `GET /missions/:id`, and the `mission`
+object in every other response — carries the four fields, null when unset
+or withheld (see *Visibility*).
 
 ### Idempotency
 
@@ -1821,7 +1861,8 @@ INSERT, so if the append fails, nothing (not even the number) survives.
   "payload": { "mission_id": "ms_…", "num": 61, "title": "…",
                "action": "created" | "joined" | "updated" | "closed",
                "by": "user" | "agent",
-               "open_item_nums": [64, 70] } }        // only on a user-forced close
+               "open_item_nums": [64, 70],          // only on a user-forced close
+               "status_changed": true } }           // only on an `updated` that wrote the status
 ```
 Appended to the conversation that performed the action (`created`/`joined`
 on that conversation; `updated`/`closed` on the origin conversation).
@@ -1831,6 +1872,13 @@ marker append that itself fails (e.g. the origin conversation vanished
 underneath it) is logged and swallowed; the mission write stands. Apps use
 it only as an invalidation signal; it renders as a small inline notice
 ("🏁 Mission #61 closed").
+
+`status_changed: true` is present on an `updated` marker whenever that
+PATCH carried `status` — set, re-set to the same text (its
+`status_updated_at` still moves) or cleared — and absent otherwise. It is a
+flag only: the marker never carries the status text, because the origin
+conversation's agents replay it verbatim. Clients may ignore it; the marker
+is already the refetch signal.
 
 `title` on the `mission` payload and `mission_title` on the `milestone`
 payload are **omitted** when the marker is written into a conversation that
@@ -1911,6 +1959,23 @@ The marker itself is never suppressed — the user's timeline still needs the
 event, and a missing event would be its own signal. Markers written into
 the origin conversation, or into another private-owned conversation, are
 unchanged: nothing crossed.
+
+**Status.** A status written from a private-owned conversation — or by a
+private device, whichever conversation it named, or none — reads as
+`status`, `status_by`, `status_convo_id` and `status_updated_at` all null
+for an ordinary agent: on the list, the detail, and every response carrying
+the mission, that agent's own PATCH responses included. The rest of the row
+is unchanged. Client devices and private agents always see it. The verdict
+is taken at read time against the device's current private flag, like every
+other sieve here. For a colleague (*Shared visibility*) the status shows
+only when it names a conversation that colleague can read under the shared
+rule, or when it was written by the owner's client with no conversation at
+all (a client write — shared like the title and body); an agent write that
+names no conversation is hidden from that colleague even when it isn't
+private, because a status is a synthesis across the mission's conversations,
+which may include ones the colleague can't read, so an unattributed agent
+write fails closed rather than being taken on faith. Otherwise the four
+fields are null.
 
 ## Shared visibility (GitHub-verified, per repo)
 
