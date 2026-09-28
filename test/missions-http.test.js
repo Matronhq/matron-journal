@@ -998,3 +998,62 @@ test('PATCH /missions/:id {status, convo_id}: convo_id is recorded only for an a
   assert.equal(await convoOf(agent.token, 'secret'), null, 'an ordinary agent never files its status under a private-owned conversation')
   assert.equal(await convoOf(priv.token, 'secret'), 'secret')
 })
+
+test("mission status sieve over HTTP: a private agent's status is null for an ordinary agent in list, detail and its own PATCH response; the client and the private agent see it", async (t) => {
+  const { s, dan, agent, client } = await fleet(t)
+  const priv = createAgent(s.db, dan.id, 'private-box')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  upsertConversation(s.db, { id: 'secret2', ownerUserId: dan.id, title: 'S2', agentDeviceId: priv.deviceId })
+  const pub = (await start(s, agent.token, {})).json.mission
+  assert.equal((await s.http(`/missions/${pub.id}/join`, { method: 'POST', token: priv.token, body: { convo_id: 'secret2' } })).status, 200)
+  const own = await patch(s, priv.token, pub.id, { status: 'Private plan: rotate the keys', convo_id: 'secret2' })
+  assert.equal(own.status, 200)
+  assert.equal(own.json.mission.status, 'Private plan: rotate the keys'); assert.equal(own.json.mission.status_convo_id, 'secret2')
+  const asAgent = async () => [
+    (await s.http('/missions', { token: agent.token })).json.missions.find((x) => x.id === pub.id),
+    (await s.http(`/missions/${pub.id}`, { token: agent.token })).json.mission,
+  ]
+  for (const row of await asAgent()) {
+    for (const k of STATUS_FIELDS) assert.equal(row[k], null, k)
+    assert.equal(row.title, 'Missions')
+  }
+  // The ordinary agent's own title PATCH hands back the sieved row too.
+  const renamed = await patch(s, agent.token, pub.id, { title: 'Renamed' })
+  assert.equal(renamed.status, 200); assert.equal(renamed.json.mission.status, null)
+  for (const token of [client, priv.token]) {
+    const row = (await s.http(`/missions/${pub.id}`, { token })).json.mission
+    assert.equal(row.status, 'Private plan: rotate the keys'); assert.equal(row.status_by, 'agent'); assert.equal(row.status_convo_id, 'secret2')
+  }
+  // No convo_id from the private device: still withheld (the device rule).
+  const bare = await patch(s, priv.token, pub.id, { status: 'Still private' })
+  assert.equal(bare.json.mission.status_convo_id, null)
+  for (const row of await asAgent()) assert.equal(row.status, null)
+  // The marker never carries the status text, so its replay crosses nothing.
+  for (const p of updatedMarkers(s)) assert.equal('status' in p, false)
+  // An ordinary agent overwriting it makes it visible again.
+  assert.equal((await patch(s, agent.token, pub.id, { status: 'Public again', convo_id: 'c1' })).status, 200)
+  for (const row of await asAgent()) assert.equal(row.status, 'Public again')
+})
+
+test("mission status for a colleague: shown when written by the owner's client or from a conversation the colleague can read, null otherwise", async (t) => {
+  const { s, dan, pat, agent, client } = await fleet(t)
+  const link = (u, gid) => saveGithubIdentity(s.db, { userId: u.id, host: 'github.com', identity: { github_id: gid, login: u.name, scopes: ['github.com/matronhq'] }, token: `t${gid}`, now: 1 })
+  link(dan, 1); link(pat, 2)
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id, agentDeviceId: agent.deviceId, repo: 'github.com/matronhq/journal' })
+  const patClient = (await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'mac' } })).json.token
+  const m = (await start(s, agent.token, { title: 'Shared mission' })).json.mission
+  const asPat = async () => [
+    (await s.http('/missions?scope=shared', { token: patClient })).json.missions.find((x) => x.id === m.id),
+    (await s.http(`/missions/${m.id}`, { token: patClient })).json.mission,
+  ]
+  assert.equal((await patch(s, agent.token, m.id, { status: 'From the shared convo', convo_id: 'c1' })).status, 200)
+  for (const row of await asPat()) { assert.equal(row.status, 'From the shared convo'); assert.equal(row.status_convo_id, 'c1') }
+  assert.equal((await patch(s, client, m.id, { status: 'From Dan' })).status, 200)
+  for (const row of await asPat()) { assert.equal(row.status, 'From Dan'); assert.equal(row.status_by, 'user') }
+  assert.equal((await patch(s, agent.token, m.id, { status: 'From an unshared convo', convo_id: 'c2' })).status, 200)
+  for (const row of await asPat()) {
+    for (const k of STATUS_FIELDS) assert.equal(row[k], null, k)
+    assert.equal(row.title, 'Shared mission')
+  }
+  assert.equal((await s.http(`/missions/${m.id}`, { token: client })).json.mission.status, 'From an unshared convo')
+})

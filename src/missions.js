@@ -17,6 +17,7 @@ export const STATUS_MAX = 600
 // paragraph needs. CRLF is folded to \n before this runs, so only a LONE
 // \r is refused.
 const STATUS_BAD_CHARS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029]/
+const STATUS_FIELDS = ['status', 'status_by', 'status_convo_id', 'status_updated_at']
 
 const now = () => Date.now()
 
@@ -24,16 +25,24 @@ const now = () => Date.now()
 // (fix round 3, B2) is a sort key countsSql computes for listMissions' ORDER
 // BY — never part of the wire shape. `status_device_id` (spec 2026-09-28
 // missions dashboard §1) is internal too: the device that wrote the status,
-// kept only so the privacy sieve can key on it.
+// kept only so the privacy sieve can key on it. `status_hidden` is the
+// per-caller sieve verdict countsSql/sharedCountsSql compute — never on the wire.
 export function missionRow(row) {
   if (!row) return null
-  const { idem_key: _idemKey, sieved_last_milestone_at: _sievedLastMilestoneAt, status_device_id: _statusDeviceId, ...rest } = row
+  const {
+    idem_key: _idemKey, sieved_last_milestone_at: _sievedLastMilestoneAt,
+    status_device_id: _statusDeviceId, status_hidden: statusHidden, ...rest
+  } = row
   const out = { ...rest, closed_over_open_items: Number(rest.closed_over_open_items || 0) }
   for (const k of ['open_items', 'needs_you', 'conversations', 'milestones']) if (k in out) out[k] = Number(out[k])
   if ('last_milestone_json' in out) {
     out.last_milestone = out.last_milestone_json ? JSON.parse(out.last_milestone_json) : null
     delete out.last_milestone_json
   }
+  // The sieve's verdict (STATUS_PRIVATE, below) — computed per caller by
+  // countsSql / sharedCountsSql. A withheld status reads as four nulls, the
+  // same shape as "never set", so its absence says nothing.
+  if (Number(statusHidden || 0)) for (const k of STATUS_FIELDS) out[k] = null
   return out
 }
 
@@ -74,6 +83,18 @@ export function validateMissionFields(body, { partial = false } = {}) {
   return { ok: true, value }
 }
 
+// Spec 2026-09-28 missions dashboard §1, privacy: a status written from a
+// private-owned conversation is withheld from an ordinary agent the way that
+// conversation's milestones are. Keyed on the writing DEVICE too: a private
+// agent that named no conversation (or a public one) wrote it all the same.
+// Evaluated at read time against the current private flag, like every other
+// private-owned sieve here.
+const STATUS_PRIVATE = `(
+  EXISTS (SELECT 1 FROM devices sd WHERE sd.id = m.status_device_id AND sd.private = 1)
+  OR EXISTS (SELECT 1 FROM conversations sc JOIN devices sd ON sd.id = sc.agent_device_id
+             WHERE sc.id = m.status_convo_id AND sd.private = 1)
+)`
+
 // Review fix (Task 7, Critical 1): every COUNTS subquery must apply the same
 // private-owned-conversation sieve the caller's OWN arrays get in
 // missionDetail — otherwise an ordinary agent that can't see a private
@@ -100,7 +121,8 @@ function countsSql(excludePrivateOwned) {
     (SELECT json_object('num', l.num, 'title', l.title, 'kind', l.kind, 'created_at', l.created_at)
        FROM milestones l WHERE l.mission_id = m.id ${milestoneSieve} ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS last_milestone_json,
     (SELECT l.created_at FROM milestones l WHERE l.mission_id = m.id ${milestoneSieve}
-       ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS sieved_last_milestone_at
+       ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS sieved_last_milestone_at,
+    ${excludePrivateOwned ? STATUS_PRIVATE : '0'} AS status_hidden
   `
 }
 
@@ -403,6 +425,9 @@ const OWNER_FROM = `JOIN users u ON u.id = m.user_id LEFT JOIN github_accounts g
 // Items also exclude consent mirrors (i.consent IS NULL), matching
 // sharedMissionDetail's own items query — a consent ask is the mission
 // owner's alone and must never surface to a colleague, not even as a count.
+// Status: hidden when privately written, or written from a conversation this
+// viewer cannot read; a client write with no conversation is shared like the
+// title and body.
 function sharedCountsSql() {
   return `
     (SELECT COUNT(*) FROM items i JOIN conversations ic ON ic.id = i.origin_convo_id
@@ -417,7 +442,10 @@ function sharedCountsSql() {
        WHERE l.mission_id = m.id AND ${sharedConvoSql('mc')} ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS last_milestone_json,
     (SELECT l.created_at FROM milestones l JOIN conversations mc ON mc.id = l.convo_id
        WHERE l.mission_id = m.id AND ${sharedConvoSql('mc')}
-       ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS sieved_last_milestone_at
+       ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS sieved_last_milestone_at,
+    (${STATUS_PRIVATE}
+      OR (m.status_convo_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM conversations sc WHERE sc.id = m.status_convo_id AND ${sharedConvoSql('sc')}))) AS status_hidden
   `
 }
 

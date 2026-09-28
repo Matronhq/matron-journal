@@ -701,3 +701,31 @@ test('missionMarkerPayload: status_changed appears only when statusChanged is tr
   assert.deepEqual(missionMarkerPayload({ mission, action: 'updated', by: 'user', statusChanged: true, withTitle: false }),
     { mission_id: 'ms_1', num: 61, action: 'updated', by: 'user', status_changed: true })
 })
+
+test('mission status sieve: withheld from a filtered reader when written from a private-owned conversation or by a private device; the unfiltered reader always sees it', () => {
+  const db = seeded()
+  db.prepare("INSERT INTO devices(id, user_id, kind, name, token_hash, created_at, private) VALUES(9,1,'agent','priv-box','h2',0,1)").run()
+  upsertConversation(db, { id: 'c3', ownerUserId: 1, title: 'C3', agentDeviceId: 9 })
+  const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'Pub' }).mission
+  const rows = (excludePrivateOwned) => [
+    getMission(db, 1, m.id, { excludePrivateOwned }),
+    listMissions(db, 1, { excludePrivateOwned }).find((x) => x.id === m.id),
+    missionDetail(db, 1, m.id, { excludePrivateOwned }).mission,
+  ]
+  for (const [convoId, deviceId, withheld] of [
+    ['c1', 7, false], [null, 7, false], ['c3', 9, true], [null, 9, true], ['c1', 9, true], ['c3', 7, true],
+  ]) {
+    const text = `by ${deviceId} in ${convoId}`
+    updateMission(db, { userId: 1, missionId: m.id, fields: { status: text }, statusWriter: { by: 'agent', convoId, deviceId } })
+    for (const row of rows(true)) {
+      if (withheld) for (const k of STATUS_FIELDS) assert.equal(row[k], null, `${text}: ${k}`)
+      else assert.equal(row.status, text)
+      assert.equal(row.title, 'Pub', 'only the status is withheld')
+      assert.equal('status_hidden' in row, false); assert.equal('status_device_id' in row, false)
+    }
+    for (const row of rows(false)) {
+      assert.equal(row.status, text); assert.equal(row.status_convo_id, convoId); assert.equal(row.status_by, 'agent')
+      assert.equal('status_hidden' in row, false)
+    }
+  }
+})
