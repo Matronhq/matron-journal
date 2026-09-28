@@ -12,7 +12,7 @@ import { markerTitleAllowed } from '../src/privacy.js'
 import { classify } from '../src/push.js'
 import {
   createMission, getMission, listMissions, missionDetail, updateMission, joinMission, closeMission, repointItems, validateMissionFields,
-  createMilestone, listMilestones, CONVOS_MAX,
+  createMilestone, listMilestones, CONVOS_MAX, STATUS_MAX,
 } from '../src/missions.js'
 import { createItem } from '../src/items.js'
 
@@ -22,6 +22,7 @@ test('schema: missions and milestones exist with the expected columns; mission_i
   assert.deepEqual(cols('missions'), [
     'id', 'user_id', 'num', 'state', 'title', 'body', 'close_summary', 'closed_by', 'closed_over_open_items',
     'origin_convo_id', 'origin_device_id', 'created_by', 'idem_key', 'created_at', 'updated_at', 'last_milestone_at', 'closed_at',
+    'status', 'status_by', 'status_convo_id', 'status_updated_at', 'status_device_id',
   ])
   assert.deepEqual(cols('milestones'), [
     'id', 'mission_id', 'user_id', 'num', 'kind', 'title', 'body', 'convo_id', 'seq', 'device_id', 'created_by', 'idem_key', 'created_at',
@@ -597,4 +598,96 @@ test('milestoneRow: create, replay and list all return the same key set, without
     assert.equal('user_id' in row, false)
     assert.equal('idem_key' in row, false)
   }
+})
+
+// Spec 2026-09-28 missions dashboard §1 — mission status.
+const STATUS_FIELDS = ['status', 'status_by', 'status_convo_id', 'status_updated_at']
+
+test('schema: an existing database gains the mission status columns once, all NULL on old rows', () => {
+  const dbPath = path.join(os.tmpdir(), `mission-status-migration-${process.pid}-${Date.now()}.sqlite`)
+  const cols = [...STATUS_FIELDS, 'status_device_id']
+  try {
+    const db1 = openDb(dbPath)
+    db1.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+    db1.prepare(`INSERT INTO missions(id,user_id,num,state,title,origin_convo_id,origin_device_id,created_by,created_at,updated_at)
+      VALUES('ms_old',1,1,'open','t','c1',1,'agent',0,0)`).run()
+    db1.close()
+    // Simulate the pre-status shape on a raw handle.
+    const raw = new Database(dbPath)
+    for (const c of cols) raw.exec(`ALTER TABLE missions DROP COLUMN ${c}`)
+    raw.close()
+
+    const db2 = openDb(dbPath)
+    const names = () => db2.prepare('PRAGMA table_info(missions)').all().map((c) => c.name)
+    for (const c of cols) assert.ok(names().includes(c), c)
+    const old = db2.prepare('SELECT * FROM missions WHERE id=?').get('ms_old')
+    for (const c of cols) assert.equal(old[c], null, c)
+    const after = names()
+    db2.close()
+
+    const db3 = openDb(dbPath)
+    assert.deepEqual(db3.prepare('PRAGMA table_info(missions)').all().map((c) => c.name), after)
+    assert.throws(() => db3.prepare("UPDATE missions SET status_by='robot' WHERE id='ms_old'").run(), /CHECK/)
+    db3.close()
+  } finally {
+    fs.rmSync(dbPath, { force: true })
+    fs.rmSync(`${dbPath}-wal`, { force: true })
+    fs.rmSync(`${dbPath}-shm`, { force: true })
+  }
+})
+
+test('validateMissionFields: status is PATCH-only, trimmed, 1–600 UTF-16 units, \\n and \\t allowed, other controls refused, null clears', () => {
+  const p = (status) => validateMissionFields({ status }, { partial: true })
+  assert.equal(STATUS_MAX, 600)
+  assert.deepEqual(p('  Blocked on review.  ').value, { status: 'Blocked on review.' })
+  assert.deepEqual(p(null).value, { status: null })
+  assert.deepEqual(p('Done:\n\t- migration').value, { status: 'Done:\n\t- migration' })
+  assert.deepEqual(p('one\r\ntwo').value, { status: 'one\ntwo' })
+  assert.equal(p('').ok, false)
+  assert.equal(p('   \n\t ').ok, false)
+  assert.equal(p('x'.repeat(600)).ok, true)
+  assert.equal(p('x'.repeat(601)).ok, false)
+  assert.equal(p(`  ${'x'.repeat(600)}  `).ok, true, 'the limit applies after trimming')
+  assert.equal(p('😀'.repeat(300)).ok, true, '600 UTF-16 code units')
+  assert.equal(p('😀'.repeat(300) + 'x').ok, false)
+  for (const bad of ['a\u0000b', 'a\u0007b', 'a\rb', 'a\u000bb', 'a\u001bb', 'a\u007fb', 'a\u0085b', 'a  b', 'a  b']) {
+    assert.equal(p(bad).ok, false, JSON.stringify(bad))
+  }
+  for (const bad of [42, true, {}, []]) assert.equal(p(bad).ok, false, JSON.stringify(bad))
+  assert.deepEqual(validateMissionFields({ title: ' T ', status: 'S' }, { partial: true }).value, { title: 'T', status: 'S' })
+  assert.equal('status' in validateMissionFields({ title: 'T', status: 'ignored on create' }).value, false)
+})
+
+test('updateMission: status sets, overwrites and clears all four columns together; title-only leaves it; a string needs a writer; closed refuses', () => {
+  const db = seeded()
+  const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'M' }).mission
+  for (const k of STATUS_FIELDS) assert.equal(m[k], null, k)
+  assert.equal('status_device_id' in m, false)
+
+  const set = updateMission(db, { userId: 1, missionId: m.id, fields: { status: 'Wiring the migration' }, statusWriter: { by: 'agent', convoId: 'c1', deviceId: 7 } })
+  assert.equal(set.status, 'Wiring the migration'); assert.equal(set.status_by, 'agent'); assert.equal(set.status_convo_id, 'c1')
+  assert.equal(typeof set.status_updated_at, 'number'); assert.equal(set.updated_at, set.status_updated_at)
+  assert.equal(set.title, 'M')
+  assert.equal('status_device_id' in set, false)
+  assert.equal(db.prepare('SELECT status_device_id FROM missions WHERE id=?').get(m.id).status_device_id, 7)
+
+  const over = updateMission(db, { userId: 1, missionId: m.id, fields: { status: 'Waiting on Dan' }, statusWriter: { by: 'user', convoId: null, deviceId: 7 } })
+  assert.equal(over.status, 'Waiting on Dan'); assert.equal(over.status_by, 'user'); assert.equal(over.status_convo_id, null)
+
+  const renamed = updateMission(db, { userId: 1, missionId: m.id, fields: { title: 'Renamed' } })
+  assert.equal(renamed.status, 'Waiting on Dan'); assert.equal(renamed.status_updated_at, over.status_updated_at)
+  assert.equal(getMission(db, 1, m.id).status, 'Waiting on Dan')
+  assert.equal(listMissions(db, 1).find((x) => x.id === m.id).status, 'Waiting on Dan')
+  assert.equal(missionDetail(db, 1, m.id).mission.status, 'Waiting on Dan')
+
+  assert.throws(() => updateMission(db, { userId: 1, missionId: m.id, fields: { status: 'no writer' } }), /status_writer_required/)
+  assert.equal(getMission(db, 1, m.id).status, 'Waiting on Dan')
+
+  const cleared = updateMission(db, { userId: 1, missionId: m.id, fields: { status: null } })
+  for (const k of STATUS_FIELDS) assert.equal(cleared[k], null, k)
+  assert.equal(db.prepare('SELECT status_device_id FROM missions WHERE id=?').get(m.id).status_device_id, null)
+
+  closeMission(db, { userId: 1, missionId: m.id, by: 'user', summary: 's' })
+  assert.throws(() => updateMission(db, { userId: 1, missionId: m.id, fields: { status: 'late' }, statusWriter: { by: 'user', convoId: null, deviceId: 7 } }), /closed/)
+  assert.equal(getMission(db, 1, m.id).status, null)
 })

@@ -10,15 +10,24 @@ import { sharedConvoSql } from './visibility.js'
 export const MILESTONE_KINDS = ['user_input', 'progress']
 export const TITLE_MAX = 200
 export const CONVOS_MAX = 200
+export const STATUS_MAX = 600
+// Status (spec 2026-09-28 missions dashboard §1) is markdown, so \n and \t
+// stay; every other C0/C1 control and U+2028/2029 is refused — the set
+// items' action labels refuse (ACTION_BAD_CHARS), minus the two a
+// paragraph needs. CRLF is folded to \n before this runs, so only a LONE
+// \r is refused.
+const STATUS_BAD_CHARS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029]/
 
 const now = () => Date.now()
 
 // idem_key is internal (same stance as rowToItem). `sieved_last_milestone_at`
 // (fix round 3, B2) is a sort key countsSql computes for listMissions' ORDER
-// BY — never part of the wire shape.
+// BY — never part of the wire shape. `status_device_id` (spec 2026-09-28
+// missions dashboard §1) is internal too: the device that wrote the status,
+// kept only so the privacy sieve can key on it.
 export function missionRow(row) {
   if (!row) return null
-  const { idem_key: _idemKey, sieved_last_milestone_at: _sievedLastMilestoneAt, ...rest } = row
+  const { idem_key: _idemKey, sieved_last_milestone_at: _sievedLastMilestoneAt, status_device_id: _statusDeviceId, ...rest } = row
   const out = { ...rest, closed_over_open_items: Number(rest.closed_over_open_items || 0) }
   for (const k of ['open_items', 'needs_you', 'conversations', 'milestones']) if (k in out) out[k] = Number(out[k])
   if ('last_milestone_json' in out) {
@@ -49,6 +58,18 @@ export function validateMissionFields(body, { partial = false } = {}) {
   if (body.body !== undefined) {
     if (typeof body.body !== 'string' || Buffer.byteLength(body.body, 'utf8') > BODY_MAX) return { ok: false }
     value.body = body.body
+  }
+  // PATCH only: POST /missions ignores a status rather than storing one.
+  // null is the explicit clear; a string is trimmed, then 1–STATUS_MAX
+  // UTF-16 code units (JS .length, like TITLE_MAX).
+  if (partial && body.status !== undefined) {
+    if (body.status === null) value.status = null
+    else {
+      if (typeof body.status !== 'string') return { ok: false }
+      const s = body.status.replace(/\r\n/g, '\n').trim()
+      if (!s || s.length > STATUS_MAX || STATUS_BAD_CHARS.test(s)) return { ok: false }
+      value.status = s
+    }
   }
   return { ok: true, value }
 }
@@ -202,15 +223,26 @@ export function missionDetail(db, userId, missionId, { excludePrivateOwned = fal
   return { mission, milestones, items, conversations }
 }
 
-export function updateMission(db, { userId, missionId, fields, excludePrivateOwned = false }) {
+// `statusWriter` {by, convoId, deviceId} (spec 2026-09-28 missions dashboard
+// §1) is required whenever fields.status is a string: the status columns are
+// always written as one set, never one of them alone, with the same `ts` as
+// updated_at. A null status clears all of them, status_device_id included.
+export function updateMission(db, { userId, missionId, fields, statusWriter = null, excludePrivateOwned = false }) {
   return db.transaction(() => {
     const cur = db.prepare('SELECT state FROM missions WHERE id=? AND user_id=?').get(missionId, userId)
     if (!cur) return null
     if (cur.state === 'closed') throw new Error('closed')
+    const ts = now()
     const sets = []; const args = []
     if (fields.title !== undefined) { sets.push('title=?'); args.push(fields.title) }
     if (fields.body !== undefined) { sets.push('body=?'); args.push(fields.body) }
-    sets.push('updated_at=?'); args.push(now())
+    if (fields.status !== undefined) {
+      if (fields.status !== null && !statusWriter) throw new Error('status_writer_required')
+      const w = fields.status === null ? { by: null, convoId: null, deviceId: null } : statusWriter
+      sets.push('status=?', 'status_by=?', 'status_convo_id=?', 'status_device_id=?', 'status_updated_at=?')
+      args.push(fields.status, w.by, w.convoId ?? null, w.deviceId ?? null, fields.status === null ? null : ts)
+    }
+    sets.push('updated_at=?'); args.push(ts)
     db.prepare(`UPDATE missions SET ${sets.join(', ')} WHERE id=? AND user_id=?`).run(...args, missionId, userId)
     return getMission(db, userId, missionId, { excludePrivateOwned })
   })()
