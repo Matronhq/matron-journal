@@ -425,9 +425,13 @@ const OWNER_FROM = `JOIN users u ON u.id = m.user_id LEFT JOIN github_accounts g
 // Items also exclude consent mirrors (i.consent IS NULL), matching
 // sharedMissionDetail's own items query — a consent ask is the mission
 // owner's alone and must never surface to a colleague, not even as a count.
-// Status: hidden when privately written, or written from a conversation this
-// viewer cannot read; a client write with no conversation is shared like the
-// title and body.
+// Status: hidden when privately written, written from a conversation this
+// viewer cannot read, or written by an agent that named NO conversation at
+// all — a status is a synthesis across the mission's conversations, which
+// may include ones this colleague can't read, so an unattributed agent
+// write fails closed rather than being taken on faith. A client write with
+// no conversation is still shared like the title and body: the owner's own
+// device vouches for it the way it vouches for everything else it writes.
 function sharedCountsSql() {
   return `
     (SELECT COUNT(*) FROM items i JOIN conversations ic ON ic.id = i.origin_convo_id
@@ -444,6 +448,7 @@ function sharedCountsSql() {
        WHERE l.mission_id = m.id AND ${sharedConvoSql('mc')}
        ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS sieved_last_milestone_at,
     (${STATUS_PRIVATE}
+      OR (m.status_by = 'agent' AND m.status_convo_id IS NULL)
       OR (m.status_convo_id IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM conversations sc WHERE sc.id = m.status_convo_id AND ${sharedConvoSql('sc')}))) AS status_hidden
   `

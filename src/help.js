@@ -161,8 +161,9 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   \`convo_id\` so the status is attributed to it. Every mission row carries
   \`status\`, \`status_by\` (user|agent), \`status_convo_id\` and
   \`status_updated_at\` — null when unset, or when it was written from a
-  private conversation you cannot see. The \`updated\` mission marker
-  carries \`status_changed: true\` when the PATCH wrote the status.
+  private conversation you cannot see, or by a private device. The
+  \`updated\` mission marker carries \`status_changed: true\` when the PATCH
+  wrote the status.
 - \`POST /missions/:id/join\` \`{convo_id}\` → 200 \`{mission}\`; 409
   \`other_mission\` if that conversation already has a different one, 409
   \`closed\`, 400 at 200 conversations. Re-joining the same mission is a

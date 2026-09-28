@@ -1050,6 +1050,18 @@ test("mission status for a colleague: shown when written by the owner's client o
   for (const row of await asPat()) { assert.equal(row.status, 'From the shared convo'); assert.equal(row.status_convo_id, 'c1') }
   assert.equal((await patch(s, client, m.id, { status: 'From Dan' })).status, 200)
   for (const row of await asPat()) { assert.equal(row.status, 'From Dan'); assert.equal(row.status_by, 'user') }
+  // Finding 1: an agent status naming NO conversation is a synthesis across
+  // the mission's conversations, which may include ones this colleague can't
+  // read, so it fails closed for the colleague even though it isn't
+  // private-owned — unlike a client write with no conversation, which is
+  // shared like the title and body (asserted just above).
+  assert.equal((await patch(s, agent.token, m.id, { status: 'From the agent, unnamed' })).status, 200)
+  for (const row of await asPat()) {
+    for (const k of STATUS_FIELDS) assert.equal(row[k], null, k)
+    assert.equal(row.title, 'Shared mission')
+  }
+  assert.equal((await s.http(`/missions/${m.id}`, { token: client })).json.mission.status, 'From the agent, unnamed',
+    'the owner still sees it')
   assert.equal((await patch(s, agent.token, m.id, { status: 'From an unshared convo', convo_id: 'c2' })).status, 200)
   for (const row of await asPat()) {
     for (const k of STATUS_FIELDS) assert.equal(row[k], null, k)

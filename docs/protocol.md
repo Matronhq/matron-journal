@@ -1968,10 +1968,14 @@ the mission, that agent's own PATCH responses included. The rest of the row
 is unchanged. Client devices and private agents always see it. The verdict
 is taken at read time against the device's current private flag, like every
 other sieve here. For a colleague (*Shared visibility*) the status shows
-only when it was written with no conversation by a non-private device (a
-client write — shared like the title and body) or from a conversation that
-colleague can read under the shared rule; otherwise the four fields are
-null.
+only when it names a conversation that colleague can read under the shared
+rule, or when it was written by the owner's client with no conversation at
+all (a client write — shared like the title and body); an agent write that
+names no conversation is hidden from that colleague even when it isn't
+private, because a status is a synthesis across the mission's conversations,
+which may include ones the colleague can't read, so an unattributed agent
+write fails closed rather than being taken on faith. Otherwise the four
+fields are null.
 
 ## Shared visibility (GitHub-verified, per repo)
 
