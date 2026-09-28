@@ -1767,12 +1767,14 @@ close_summary, closed_by, closed_over_open_items, origin_convo_id,
 origin_device_id, created_by, created_at, updated_at, last_milestone_at,
 closed_at, status, status_by, status_convo_id, status_updated_at}` plus the
 counts listed against `GET /missions` above; a milestone is `{id,
-mission_id, user_id, num, kind, title, body, convo_id, seq, device_id,
-created_by, created_at}`. `idem_key` is an internal column on both and is
-never returned — the same stance items take. The mission also stores
-`status_device_id` (the device that wrote the status, used only by the
-privacy sieve), likewise never returned; those are the only keys either
-shape strips.
+mission_id, num, kind, title, body, convo_id, seq, device_id, created_by,
+created_at}`. Stored columns stripped from the wire: `idem_key` (both
+shapes), `status_device_id` (mission — the device that wrote the status,
+used only by the privacy sieve) and `user_id` (milestone — always the
+caller's own id, so no route reads it back). Query-computed columns such as
+`sieved_last_milestone_at` and `status_hidden` (the sort key and the
+per-caller status sieve verdict, both internal to `countsSql`/
+`sharedCountsSql`) are never returned either.
 
 ### Status
 
