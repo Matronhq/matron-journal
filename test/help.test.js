@@ -38,6 +38,12 @@ test('GET /help serves the API digest to authenticated devices only', async (t) 
     'GET /coordinator', 'GET /memories', 'PUT /memories/:name', 'DELETE /memories/:name',
   ]) assert.ok(body.includes(route), `/help must name ${route}`)
   assert.match(body, /attach: false/)
+  // Mission status (spec 2026-09-28 missions dashboard §1): a bridge session
+  // learns the field, its clear, its attribution and the marker flag here.
+  assert.ok(body.includes('status?: string|null'), '/help must document PATCH /missions/:id {status}')
+  for (const field of ['status_by', 'status_convo_id', 'status_updated_at', 'status_changed']) {
+    assert.ok(body.includes(field), `/help must name ${field}`)
+  }
   for (const field of ['mission_id', 'mission_num', 'mission: id|"#num"|null']) {
     assert.ok(body.includes(field), `/help must name ${field}`)
   }
