@@ -55,9 +55,9 @@ function writableConvo(db, who, convoId) {
 // always target the origin conversation, so the predicate is a no-op for
 // them; it is applied uniformly anyway rather than per-action, so a future
 // action written elsewhere is covered by construction.
-function emitMissionMarker({ db, hub }, who, { mission, action, convoId, openItemNums = null }) {
+function emitMissionMarker({ db, hub }, who, { mission, action, convoId, openItemNums = null, statusChanged = false }) {
   const payload = missionMarkerPayload({
-    mission, action, by: byOf(who), openItemNums,
+    mission, action, by: byOf(who), openItemNums, statusChanged,
     withTitle: markerTitleAllowed(db, mission.origin_convo_id, convoId),
   })
   try {
@@ -126,17 +126,34 @@ function handleList(ctx, res, url, who) {
   return true
 }
 
+// Spec 2026-09-28 missions dashboard §1: `convo_id` on a status PATCH is
+// attribution — the writing agent's conversation — never a gate. Honoured
+// only for an agent, only for a conversation of the caller's own user, and
+// for an ordinary agent never a private-owned one (that would file its own
+// status behind the sieve, and confirm the id exists). Anything else —
+// a client, a foreign or unknown id, a non-string — records null; never a 400.
+function statusConvoOf(db, who, convoId) {
+  if (who.kind !== 'agent' || typeof convoId !== 'string' || !convoId) return null
+  const convo = db.prepare('SELECT owner_user_id FROM conversations WHERE id=?').get(convoId)
+  if (!convo || convo.owner_user_id !== who.userId) return null
+  if (filteredAgent(db, who) && privateOwnedConvo(db, convoId)) return null
+  return convoId
+}
+
 async function handlePatch(ctx, req, res, who, mission) {
   const { db } = ctx
   const body = await readBody(req)
   const v = validateMissionFields(body, { partial: true })
   if (!v.ok || Object.keys(v.value).length === 0) return badRequest(res)
+  const statusWriter = typeof v.value.status === 'string'
+    ? { by: byOf(who), convoId: statusConvoOf(db, who, body.convo_id), deviceId: who.deviceId }
+    : null
   let updated
   try {
-    updated = updateMission(db, { userId: who.userId, missionId: mission.id, fields: v.value, excludePrivateOwned: filteredAgent(db, who) })
+    updated = updateMission(db, { userId: who.userId, missionId: mission.id, fields: v.value, statusWriter, excludePrivateOwned: filteredAgent(db, who) })
   } catch (err) { if (err.message === 'closed') return conflict(res, { blocked_by: 'closed' }); throw err }
   if (!updated) return notFound(res)
-  emitMissionMarker(ctx, who, { mission: updated, action: 'updated', convoId: updated.origin_convo_id })
+  emitMissionMarker(ctx, who, { mission: updated, action: 'updated', convoId: updated.origin_convo_id, statusChanged: v.value.status !== undefined })
   json(res, 200, { mission: updated })
   return true
 }

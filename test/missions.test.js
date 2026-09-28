@@ -691,3 +691,13 @@ test('updateMission: status sets, overwrites and clears all four columns togethe
   assert.throws(() => updateMission(db, { userId: 1, missionId: m.id, fields: { status: 'late' }, statusWriter: { by: 'user', convoId: null, deviceId: 7 } }), /closed/)
   assert.equal(getMission(db, 1, m.id).status, null)
 })
+
+test('missionMarkerPayload: status_changed appears only when statusChanged is true, and never carries the status text', () => {
+  const mission = { id: 'ms_1', num: 61, title: 'M', status: 'secret words' }
+  assert.deepEqual(missionMarkerPayload({ mission, action: 'updated', by: 'agent', statusChanged: true }),
+    { mission_id: 'ms_1', num: 61, title: 'M', action: 'updated', by: 'agent', status_changed: true })
+  assert.equal('status_changed' in missionMarkerPayload({ mission, action: 'updated', by: 'agent' }), false)
+  assert.equal('status_changed' in missionMarkerPayload({ mission, action: 'updated', by: 'agent', statusChanged: false }), false)
+  assert.deepEqual(missionMarkerPayload({ mission, action: 'updated', by: 'user', statusChanged: true, withTitle: false }),
+    { mission_id: 'ms_1', num: 61, action: 'updated', by: 'user', status_changed: true })
+})
