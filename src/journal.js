@@ -48,6 +48,10 @@ export function isClientOnlyEvent(type, payload) {
   if (!payload || typeof payload !== 'object') return false
   if (type === 'permission_request') return payload.kind === 'agent_chat' || payload.kind === 'agent_spawn'
   if (type === 'item') return typeof payload.consent === 'string' && payload.consent !== ''
+  // The Coordinator's answer to a consent card (spec: 2026-09-29 coordinator
+  // consent): the apps' "approved by the Coordinator" badge, never an
+  // agent's business — least of all the requester's.
+  if (type === 'consent_decision') return true
   return false
 }
 

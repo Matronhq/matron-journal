@@ -1368,7 +1368,7 @@ Both paths use the same state-scoped `UPDATE ... WHERE state='approved'` (`markF
 
 ### Pending-ask cap
 
-Outstanding `awaiting_user` rows per *requesting* device are capped at `MAX_AWAITING_PER_REQUESTER` (3), shared with agent-chat invites and joins — the cap is what stops a re-ask loop, not TTL ambiguity or answer masking. Over the cap, `spawn_request` fails `{code:'conflict', detail:'too many requests awaiting user approval'}`.
+Outstanding `awaiting_user` rows per *requesting* device are capped at `MAX_AWAITING_PER_REQUESTER` (3), shared with agent-chat invites and joins — the cap is what stops a re-ask loop, not TTL ambiguity or answer masking. Over the cap, `spawn_request` fails `{code:'conflict', detail:'too many requests awaiting user approval'}`. The user's Coordinator may answer its own or any other agent's parked asks through *Coordinator → Consent approval*, which is how a Coordinator that hit this cap on its own spawns clears it.
 
 ## Items (task & decision tracker)
 
@@ -1616,8 +1616,8 @@ bridge agrees which one it is.
 
 | Route | Who | Body | Returns |
 |---|---|---|---|
-| `GET /coordinator` | client or agent | | 200 `{convo_id: string\|null}`. An ordinary agent reads `null` when the Coordinator is a private-owned conversation. |
-| `PUT /coordinator` | client only (agent → **403** `forbidden`) | `{convo_id: string\|null}` | 200 `{convo_id}`. **404** for a conversation the user does not own; **400** when `convo_id` is absent, not a string/null, empty or over the id cap. `null` clears. An unchanged value is a 200 no-op. |
+| `GET /coordinator` | client or agent | | 200 `{convo_id: string\|null, consent: boolean}`. An ordinary agent reads `null` when the Coordinator is a private-owned conversation. `consent` is the *Consent approval* switch below (default `true`). |
+| `PUT /coordinator` | client only (agent → **403** `forbidden`) | `{convo_id?: string\|null, consent?: boolean}` — at least one | 200 `{convo_id, consent}`. **404** for a conversation the user does not own; **400** when neither key is present, `convo_id` is not a string/null, empty or over the id cap, or `consent` is not a boolean. `convo_id: null` clears. An unchanged value is a 200 no-op. |
 
 On a change the journal appends a `coordinator` event — payload
 `{role: "assigned"}` into the conversation that gained the role,
@@ -1777,6 +1777,74 @@ private-owned — the payload carries `memory_id`, `action`, `created` and
 `AGENT_PUBLISH_TYPES` member (a bare publish is `bad_request`), never
 pushes, never wakes, and has no old-client text fallback: a client that
 predates it ignores the type.
+
+### Consent approval (`/consent/pending`, `/consent/answer`)
+
+Spec: matron-bridge `docs/superpowers/specs/2026-09-29-coordinator-consent-design.md`
+(Dan, 29 Sep 2026: approved as proposed). The Coordinator may answer the
+parked chat invites, join requests and spawn requests that otherwise wait
+for a tap — on the user's behalf and under guardrails the journal enforces.
+Tool permission prompts and secret requests never exist as journal asks,
+so nothing here can reach them.
+
+| Route | Who | Body / query | Returns |
+|---|---|---|---|
+| `GET /consent/pending` | agent, Coordinator only | `?convo_id=<the Coordinator conversation>` | 200 `{pending:[…]}`, oldest first. A spawn row: `{kind:'spawn', id: request_id, created_at, from_device_id, from_name, from_convo_id, from_convo_title, target_device_id, target_name, target_state, workdir, task, topic, model?, link?, mission_num?, item_num?}`. A chat row: `{kind:'chat', id: '<room_id>/<target_device_id>', request:'invite'\|'join', room_id, room_title, target_device_id, from_device_id, from_name, from_convo_id, from_convo_title, to_device_id, to_name, to_convo_id, to_convo_title, target_state, topic, justification, item_num?}` — `id` is the same pair the consent link `matron://consent/chat/<room>/<device>` carries, and `POST /agent-chat/answer` keys on. `target_state` is `online` (a live socket), `asleep` (no socket, but the box can be woken) or `offline`. |
+| `POST /consent/answer` | agent, Coordinator only | `{convo_id, kind:'chat'\|'spawn', id, decision:'approve'\|'decline', reason}` | 200 `{ok:true}` (`delivered` too for a chat approval, as `/agent-chat/answer`). |
+
+**Gate**, in order, every failure a bare error body: a client connection
+**403** `forbidden`; a bad shape **400**; `convo_id` not a top-level
+conversation this device owns **404**; not `user_settings.coordinator_convo_id`
+**403** `{detail:'not_coordinator'}`; the switch off **403**
+`{detail:'consent_disabled'}`. Then, for an answer: `reason` is required —
+1–200 characters after the usual peer-text sanitising — and is the audit
+line the user reads; the ask must exist (**404**, unknown and another
+user's indistinguishable) and still be `awaiting_user` (**409** `conflict`);
+an approval when the Coordinator's approvals in the last 24 h are at the
+**daily cap** (`MATRON_COORDINATOR_CONSENT_DAILY_CAP`, default 20) is
+**409** `{detail:'daily_cap', cap}` and the ask stays for the user —
+declines are never capped; a **spawn** approval into a target box that is
+`offline` (no socket and no wake possible) is **409**
+`{detail:'target_offline'}` — an `asleep` box is woken exactly as a tap
+would. Every refusal leaves the ask as it was.
+
+**What an answer does** is exactly what the tap does — one code path
+(`src/consent-answer.js`) behind `/agent-chat/answer`, `/agent-spawn/answer`
+and this route: the row flips, the consent item closes, the invite is
+pumped or the spawn orchestration starts off-cycle with wake-before-spawn,
+and a chat decline reaches the requester as the usual `refused`. On top of
+that, a Coordinator decision:
+
+- stamps the row `answered_by: 'coordinator'` + `answer_reason`
+  (`convo_agents`, `agent_spawn_requests`), and writes one row to
+  `consent_decisions` (the cap's counter and the audit record);
+- closes the consent item with "Approved by the Coordinator — <reason>. …"
+  or "Declined by the Coordinator — <reason>.", attributed to the
+  Coordinator's device as an agent, not to the user;
+- puts `decided_by: 'coordinator'` and `reason` on the spawn's
+  `spawn_outcome` event and `{kind:'spawn', event:'outcome'}` frame, and
+  `approved_by: 'coordinator'` on the `{kind:'invite', event:'request'\|'join_request'}`
+  frame relayed to the target — so both bridges can say who decided. The
+  requester's `answer` frame for a declined chat is unchanged (a requester
+  never learns who said no);
+- appends a **client-only** `consent_decision` event on the card's
+  conversation (the parent conversation for a spawn, the room for a chat):
+  `{kind, request_id | room_id + target_device_id, decision, by:'coordinator',
+  convo_id, reason}` — never fanned to an agent, never replayed to one,
+  never a push — which is what an app renders as the "approved by the
+  Coordinator" badge with its one-tap Stop session / Mute room.
+
+**Nudge.** When an ask parks and it is *not* the Coordinator's own (its
+conversation, or for a join its box), and the switch is on, the journal
+sends the Coordinator's box one ephemeral frame,
+`{kind:'consent', event:'pending', ask:{…}}` with the same row shape as
+`/consent/pending`, after the card and the item have been journaled — the
+user is never second to the Coordinator. A Coordinator box that is asleep
+learns about the ask from `/consent/pending` at its next sweep instead.
+
+**Off switch.** `user_settings.coordinator_consent` (`PUT /coordinator
+{consent:false}`, clients only; default on). Off, both routes answer
+`consent_disabled` and no nudge is sent; the cards and taps work as ever.
 
 ## Missions & milestones
 

@@ -73,10 +73,13 @@ export function recordJoined(db, { convoId, agentDeviceId, initiatorDeviceId }) 
 // terminal and stamps answered_at, same shape as answerInvite's refusal.
 // Scoped to state='awaiting_user' so answering twice, or answering a row
 // that was never parked, is a no-op false rather than a silent state stomp.
-export function answerParkedInvite(db, { convoId, agentDeviceId, approve, now = Date.now() }) {
+// `answeredBy` / `answerReason` (spec: 2026-09-29 coordinator consent) name
+// the Coordinator and its reason when it, not a tap, answered; null for a
+// tap, which is the pre-field row shape.
+export function answerParkedInvite(db, { convoId, agentDeviceId, approve, now = Date.now(), answeredBy = null, answerReason = null }) {
   const r = approve
-    ? db.prepare("UPDATE convo_agents SET state='invited', created_at=?, answered_at=NULL WHERE convo_id=? AND agent_device_id=? AND state='awaiting_user'").run(now, convoId, agentDeviceId)
-    : db.prepare("UPDATE convo_agents SET state='denied', answered_at=? WHERE convo_id=? AND agent_device_id=? AND state='awaiting_user'").run(now, convoId, agentDeviceId)
+    ? db.prepare("UPDATE convo_agents SET state='invited', created_at=?, answered_at=NULL, answered_by=?, answer_reason=? WHERE convo_id=? AND agent_device_id=? AND state='awaiting_user'").run(now, answeredBy, answerReason, convoId, agentDeviceId)
+    : db.prepare("UPDATE convo_agents SET state='denied', answered_at=?, answered_by=?, answer_reason=? WHERE convo_id=? AND agent_device_id=? AND state='awaiting_user'").run(now, answeredBy, answerReason, convoId, agentDeviceId)
   return r.changes === 1
 }
 
@@ -100,7 +103,7 @@ export function markDelivered(db, { convoId, agentDeviceId, now = Date.now() }) 
 // feeds).
 export function undeliveredInvites(db) {
   return db.prepare(`
-    SELECT ca.convo_id, ca.agent_device_id, ca.initiator_device_id, ca.justification, ca.topic, ca.target_convo_id, ca.initiator_convo_id,
+    SELECT ca.convo_id, ca.agent_device_id, ca.initiator_device_id, ca.justification, ca.topic, ca.target_convo_id, ca.initiator_convo_id, ca.answered_by,
            c.owner_user_id, c.agent_device_id AS room_agent_device_id
     FROM convo_agents ca JOIN conversations c ON c.id = ca.convo_id
     WHERE ca.state='invited' AND ca.delivered_at IS NULL
@@ -257,7 +260,7 @@ export function participantIds(db, convoId) {
 
 export function getParticipant(db, convoId, agentDeviceId) {
   return db.prepare(
-    'SELECT state, initiator_device_id, justification, topic, target_convo_id, initiator_convo_id, created_at, answered_at, delivered_at, item_id FROM convo_agents WHERE convo_id=? AND agent_device_id=?'
+    'SELECT state, initiator_device_id, justification, topic, target_convo_id, initiator_convo_id, created_at, answered_at, delivered_at, item_id, answered_by, answer_reason FROM convo_agents WHERE convo_id=? AND agent_device_id=?'
   ).get(convoId, agentDeviceId) ?? null
 }
 

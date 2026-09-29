@@ -294,6 +294,9 @@ export function startServer({
   // pays it.
   spawnWakeWaitMs = resolveNumericEnv('MATRON_SPAWN_WAKE_WAIT_MS', process.env.MATRON_SPAWN_WAKE_WAIT_MS, 240000),
   sessionControlTimeoutMs = resolveNumericEnv('MATRON_SESSION_CONTROL_TIMEOUT_MS', process.env.MATRON_SESSION_CONTROL_TIMEOUT_MS, 30000),
+  // Coordinator consent approvals per rolling 24 h (spec: 2026-09-29
+  // coordinator consent); beyond it the ask stays for the user.
+  consentDailyCap = resolveNumericEnv('MATRON_COORDINATOR_CONSENT_DAILY_CAP', process.env.MATRON_COORDINATOR_CONSENT_DAILY_CAP, 20),
   stallWakeIntervalMs = null,
   mediaReapHighPct, mediaReapLowPct, waker, transcriber, github, githubRefreshIntervalMs, webDir,
   appleAppIds, androidPackage, androidCertSha256, tokenKey,
@@ -390,7 +393,7 @@ export function startServer({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
-    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription,
+    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, consentDailyCap,
     github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
   }))
   const wss = attachWs({
