@@ -98,3 +98,37 @@ test('the status op persists its roster subset; a frame with nothing persistable
   await agent.waitFor((f) => f.op === 'error' && f.code === 'forbidden')
   assert.equal(convoStatus(s.db, 'w2'), null)
 })
+
+import { createMission, joinMission } from '../src/missions.js'
+
+test('roster and mission-detail conversation rows carry the persisted status; unreported rows have no key', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan3', 'pw')
+  const dev = createAgent(s.db, dan.id, 'gene')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan3', password: 'pw', device_name: 'mac' } })
+  const token = login.json.token
+  upsertConversation(s.db, { id: 'r1', ownerUserId: dan.id, title: 'A', sessionState: 'waiting', agentDeviceId: dev.deviceId })
+  upsertConversation(s.db, { id: 'r2', ownerUserId: dan.id, title: 'B', sessionState: 'waiting', agentDeviceId: dev.deviceId })
+  const status = { model: 'claude-opus-5-5', context: { tokens: 87000, window: 1000000, pct: 9 } }
+  upsertConvoStatus(s.db, { userId: dan.id, convoId: 'r1', status, reportedAt: 123 })
+  const roster = await s.http('/roster', { token })
+  const r1 = roster.json.conversations.find((c) => c.id === 'r1')
+  const r2 = roster.json.conversations.find((c) => c.id === 'r2')
+  assert.deepEqual(r1.status, { reported_at: 123, ...status })
+  assert.equal('status' in r2, false)
+  // An agent token reads the same block.
+  const asAgent = await s.http('/roster', { token: dev.token })
+  assert.deepEqual(asAgent.json.conversations.find((c) => c.id === 'r1').status, { reported_at: 123, ...status })
+  // Mission detail: the same block on its conversation rows, own-user view.
+  const m = createMission(s.db, { userId: dan.id, deviceId: dev.deviceId, createdBy: 'agent', convoId: 'r1', title: 'M' })
+  joinMission(s.db, { userId: dan.id, missionId: m.mission.id, convoId: 'r2' })
+  const detail = await s.http(`/missions/${m.mission.id}`, { token })
+  assert.equal(detail.status, 200)
+  const d1 = detail.json.conversations.find((c) => c.id === 'r1')
+  const d2 = detail.json.conversations.find((c) => c.id === 'r2')
+  assert.deepEqual(d1.status, { reported_at: 123, ...status })
+  assert.equal(d1.box, 'gene')
+  assert.equal('status' in d2, false)
+  assert.equal('status_json' in d1, false)
+})

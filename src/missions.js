@@ -229,6 +229,15 @@ export function listMissions(db, userId, { state = null, since = null, excludePr
 
 const PRIVATE_CONVO = `EXISTS (SELECT 1 FROM devices d WHERE d.id = c.agent_device_id AND d.private = 1)`
 
+// Fold the LEFT JOINed conversation_status columns into one `status` block
+// (omitted when the session never reported), the shape GET /roster serves
+// (spec 2026-09-29 coordinator session control §1). Own-user detail only:
+// sharedMissionDetail deliberately carries no session header.
+function withConvoStatus({ status_reported_at, status_json, ...row }) {
+  if (status_json == null) return row
+  try { return { ...row, status: { reported_at: status_reported_at, ...JSON.parse(status_json) } } } catch { return row }
+}
+
 export function missionDetail(db, userId, missionId, { excludePrivateOwned = false } = {}) {
   const mission = getMission(db, userId, missionId, { excludePrivateOwned })
   if (!mission) return null
@@ -239,9 +248,11 @@ export function missionDetail(db, userId, missionId, { excludePrivateOwned = fal
     FROM items i JOIN conversations c ON c.id = i.origin_convo_id
     WHERE i.mission_id=? AND i.state='open' ${sieve}
     ORDER BY (i.awaiting = 'user') DESC, i.updated_at DESC`).all(mission.id)
-  const conversations = db.prepare(`SELECT c.id, c.title, c.session_state AS state, d.name AS box
+  const conversations = db.prepare(`SELECT c.id, c.title, c.session_state AS state, d.name AS box,
+      s.reported_at AS status_reported_at, s.status AS status_json
     FROM conversations c LEFT JOIN devices d ON d.id = c.agent_device_id
-    WHERE c.mission_id=? ${sieve} ORDER BY c.created_at`).all(mission.id)
+    LEFT JOIN conversation_status s ON s.convo_id = c.id
+    WHERE c.mission_id=? ${sieve} ORDER BY c.created_at`).all(mission.id).map(withConvoStatus)
   return { mission, milestones, items, conversations }
 }
 
