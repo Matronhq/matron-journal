@@ -36,7 +36,11 @@ export function milestoneMarkerPayload({ milestone, mission, by, withTitle = tru
 // an `updated` whose PATCH carried `status` — a flag, never the text: the
 // marker is replayed verbatim to every agent on the origin conversation,
 // and the status may be one an ordinary agent must not read.
-export function missionMarkerPayload({ mission, action, by, openItemNums = null, withTitle = true, statusChanged = false }) {
+// by_convo_id is present only on a `closed` whose agent named the closing
+// conversation — the audit line behind "closed by the Coordinator" (a
+// closing conversation that is not on the mission is the Coordinator by
+// construction; the apps compare it with the Coordinator setting).
+export function missionMarkerPayload({ mission, action, by, openItemNums = null, withTitle = true, statusChanged = false, byConvoId = null }) {
   if (!MISSION_ACTIONS.includes(action)) throw new Error(`unknown mission action: ${action}`)
   const out = {
     mission_id: mission.id, num: mission.num,
@@ -45,5 +49,6 @@ export function missionMarkerPayload({ mission, action, by, openItemNums = null,
   }
   if (openItemNums && openItemNums.length) out.open_item_nums = openItemNums
   if (statusChanged) out.status_changed = true
+  if (byConvoId) out.by_convo_id = byConvoId
   return out
 }

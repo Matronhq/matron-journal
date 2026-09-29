@@ -307,7 +307,10 @@ export function joinMission(db, { userId, missionId, convoId, excludePrivateOwne
 // ordinary agent's 409 never names a private item or its title.
 // `by === 'agent'` covers both an ordinary and a private agent; only the
 // ordinary one passes excludePrivateOwned true.
-export function closeMission(db, { userId, missionId, by, summary, excludePrivateOwned = false }) {
+// `closedConvoId` is the conversation the closing agent named (validated by
+// the HTTP layer: on the mission, or the Coordinator) — stored for the
+// record and echoed on the marker; null when none was named.
+export function closeMission(db, { userId, missionId, by, summary, closedConvoId = null, excludePrivateOwned = false }) {
   return db.transaction(() => {
     const m = db.prepare('SELECT id, state FROM missions WHERE id=? AND user_id=?').get(missionId, userId)
     if (!m) throw new Error('no_mission')
@@ -325,8 +328,8 @@ export function closeMission(db, { userId, missionId, by, summary, excludePrivat
       if (open.length) { const e = new Error('agent_items'); e.items = open.filter(visible).map(({ num, title }) => ({ num, title })); throw e }
     }
     const ts = now()
-    db.prepare(`UPDATE missions SET state='closed', close_summary=?, closed_by=?, closed_over_open_items=?, closed_at=?, updated_at=?
-      WHERE id=?`).run(summary, by, open.length, ts, ts, m.id)
+    db.prepare(`UPDATE missions SET state='closed', close_summary=?, closed_by=?, closed_convo_id=?, closed_over_open_items=?, closed_at=?, updated_at=?
+      WHERE id=?`).run(summary, by, closedConvoId, open.length, ts, ts, m.id)
     return { mission: getMission(db, userId, m.id, { excludePrivateOwned }), openItemNums: open.map((i) => i.num) }
   })()
 }
