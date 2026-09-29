@@ -130,12 +130,19 @@ test('validateSessionControl: pure shape checks', () => {
 })
 
 test('session_control: at most 8 requests in flight per connection', async (t) => {
-  const { parent, target } = await fleet(t, { serverOpts: { sessionControlTimeoutMs: 300 } })
+  // Settlement is controlled here, not by a timer: the eight stay pending
+  // until c8 has been refused, then the target answers them one by one.
+  const { parent, target } = await fleet(t, { serverOpts: { sessionControlTimeoutMs: 10000 } })
   for (let i = 0; i < 9; i++) parent.send({ op: 'session_control', request_id: `c${i}`, from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'compact' })
   const e = await errorFrame(parent, 'c8'); assert.equal(e.code, 'conflict')
-  // the eight settle (timeout, nobody answers) and free the slots
-  await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'result' && f.request_id === 'c7', 3000)
+  for (let i = 0; i < 8; i++) await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'sent' && f.request_id === `c${i}`)
+  const reqs = []
+  await target.waitFor((f) => { if (f.kind === 'rpc' && f.request?.method === 'session_control' && !reqs.includes(f.request.request_id)) reqs.push(f.request.request_id); return reqs.length === 8 })
+  for (const rid of reqs) target.send({ op: 'agent_response', request_id: rid, to_device_id: 0, ok: true, result: { applied: 'now' } })
+  for (let i = 0; i < 8; i++) await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'result' && f.request_id === `c${i}`)
   parent.send({ op: 'session_control', request_id: 'c9', from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'compact' })
   await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'sent' && f.request_id === 'c9')
-  void target
+  const req9 = await target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'session_control' && !reqs.includes(f.request.request_id))
+  target.send({ op: 'agent_response', request_id: req9.request.request_id, to_device_id: 0, ok: true, result: { applied: 'now' } })
+  await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'result' && f.request_id === 'c9')
 })
