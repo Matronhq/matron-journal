@@ -1628,6 +1628,65 @@ cannot `publish` this type. It is not a `MESSAGE_TYPE` (no unread, no
 snippet) and never pushes. `hello_ok` and `/snapshot` carry
 `coordinator_convo_id` so an app knows the Coordinator on connect.
 
+### Session control (`session_control`)
+
+Spec: matron-bridge `docs/superpowers/specs/2026-09-29-coordinator-session-control-design.md`
+("Decisions"). The Coordinator asks the journal to have another session's
+bridge switch its model or backend, compact it, or tell it to carry on.
+The journal is the relay: it checks the caller **is** the Coordinator (the
+one route the role gates), resolves the target to its box, wakes it if
+asleep, issues a journal-originated RPC and hands the reply back. Nothing
+is journaled here; the target bridge writes the visible record (a notice)
+into the session's own chat.
+
+```json
+{ "op": "session_control", "request_id": "…",
+  "from_convo_id": "<the Coordinator conversation>", "target_convo_id": "<session>",
+  "action": "set_model" | "compact" | "carry_on",
+  "model": "sonnet", "agent": "claude" | "codex",      // set_model: at least one
+  "message": "…", "when": "now" | "after_limit_reset", // carry_on: message required
+  "reason": "context at 92%" }                          // optional, shown in the target chat
+```
+
+Checks, in order — every failure after the `request_id` check is a
+`{kind:'control', op:'error', code, ref:'session_control', request_id, detail?}`
+frame: agent connection (`forbidden`); registered (`not_ready`);
+`request_id` ≤ 128 chars (`bad_request`, no `request_id` echoed);
+`action` in the vocabulary, `model` ≤ 64, `agent` in `claude|codex`,
+`message` ≤ 2000 and non-empty after sanitising, `when` in the vocabulary,
+`reason` ≤ 200, `target_convo_id ≠ from_convo_id` (`bad_request`, with a
+`detail`); `from_convo_id` a top-level conversation this device owns
+(`not_found`) **and** the user's Coordinator (`forbidden`, detail
+`not_coordinator`); `target_convo_id` exists, same user, top-level, has an
+`agent_device_id`, and its box is not a private device hidden from an
+ordinary caller — all indistinguishable `not_found`. Then the target box:
+offline and unwakeable → `agent_unreachable`; otherwise the op is acked at
+once with `{kind:'session_control', event:'sent', request_id, target_waking?}`
+and, off the socket's message loop, the box is woken if needed and waited
+for (`MATRON_SPAWN_WAKE_WAIT_MS`), a journal-originated RPC
+`session_control {convo_id, action, model?, agent?, message?, when?, reason?,
+from_convo_id, from_name}` is issued (`MATRON_SESSION_CONTROL_TIMEOUT_MS`,
+default 30 s) and its reply delivered to every live socket of the caller's
+device as `{kind:'session_control', event:'result', request_id, ok,
+result?|error:{code, detail?}}` (`timeout` / `agent_unreachable` /
+`internal` when the bridge never answered). Strings in `params`
+(including `from_name`) and in the relayed error are peer-text sanitised.
+At most 8 ops may be in flight per connection (each holds a wake waiter
+and a broker entry); a ninth is `conflict`. The shape checks run before
+the ownership and role checks — a `bad_request` reveals nothing about any
+conversation. Not a room op, not counted against the pending-ask cap:
+nothing awaits the user.
+
+**Stall wake sweep.** Once a minute (`src/stall-wake.js`) the journal
+scans `conversation_status` for a `stall` whose `resets_at` has passed and
+wakes that conversation's box if it has no live socket (`wakeIfOffline`,
+debounced by the waker), so the bridge's automatic carry-on after a usage
+limit runs even when the box idle-stopped while stalled. The bridge's next
+status frame drops the stall, which ends the loop; a reset more than six
+hours old is treated as spent (its bridge is not coming back for it), so a
+stale row cannot wake a box for ever. One box's failing wake never costs
+the others theirs. No-op without a wake command.
+
 ## Memories
 
 Spec: `docs/superpowers/specs/2026-09-27-memories-design.md`.
@@ -2556,8 +2615,10 @@ typing text commands into the control conversation.
 
 **Journal-originated requests.** The journal itself can be the RPC caller —
 not just the relay between a client and an agent. Spawn approval's `start`
-call and spawn-target discovery's `recent_folders` call (see "Agent-spawned
-sessions" above) are both issued by the journal directly, over the same
+call, spawn-target discovery's `recent_folders` call (see "Agent-spawned
+sessions" above) and the Coordinator's `session_control` relay (see
+"Session control" under "Coordinator") are all issued by the journal
+directly, over the same
 single-consumer delivery path a client-relayed `agent_request` uses. These
 requests carry `from_device_id: 0` — a reserved value no real device row can
 ever have (SQLite `AUTOINCREMENT` starts at 1) — signalling that the journal,
