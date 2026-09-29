@@ -72,11 +72,32 @@ export function sanitizeConvoStatus(raw, reportedAt = Date.now()) {
   return Object.keys(out).length ? out : null
 }
 
+// Latest wins, with one exception: a frame that OMITS `context` or `limits`
+// keeps the stored ones. A bridge publishes a header at spawn and resume
+// before any turn has run (model and meters, no gauge — index.js
+// journalSpawnStatus), and a print-mode /model recreate does the same; a
+// plain replacement would wipe the gauge this table exists to keep across
+// exactly those events. `model` is always sent, and `stall` is deliberately
+// replace-semantics: the bridge clears it by omitting it, so an omitted
+// stall means "not stalled". Read-then-write is atomic (better-sqlite3 is
+// synchronous; nothing yields between the two statements).
 export function upsertConvoStatus(db, { userId, convoId, status, reportedAt = Date.now() }) {
+  const prev = db.prepare('SELECT status FROM conversation_status WHERE convo_id=? AND user_id=?').get(convoId, userId)
+  let merged = status
+  if (prev) {
+    try {
+      const old = JSON.parse(prev.status)
+      merged = {
+        ...(old.context && !status.context ? { context: old.context } : {}),
+        ...(old.limits && !status.limits ? { limits: old.limits } : {}),
+        ...status,
+      }
+    } catch { /* unreadable row: replace it */ }
+  }
   db.prepare(
     `INSERT INTO conversation_status(convo_id, user_id, reported_at, status) VALUES (?,?,?,?)
      ON CONFLICT(convo_id) DO UPDATE SET user_id=excluded.user_id, reported_at=excluded.reported_at, status=excluded.status`
-  ).run(convoId, userId, reportedAt, JSON.stringify(status))
+  ).run(convoId, userId, reportedAt, JSON.stringify(merged))
 }
 
 function parseRow(r) {

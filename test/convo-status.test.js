@@ -74,6 +74,14 @@ test('upsertConvoStatus is latest-wins per conversation and cascades with the co
   upsertConvoStatus(db, { userId: dan.id, convoId: 'c1', status: { model: 'b', context: { tokens: 1, window: 2, pct: 50 } }, reportedAt: 20 })
   upsertConvoStatus(db, { userId: dan.id, convoId: 'c2', status: { model: 'c' }, reportedAt: 30 })
   assert.deepEqual(convoStatus(db, dan.id, 'c1'), { reported_at: 20, model: 'b', context: { tokens: 1, window: 2, pct: 50 } })
+  // A spawn/resume frame carries model and meters but no gauge yet: the
+  // stored gauge survives it, while an omitted stall clears (replace).
+  upsertConvoStatus(db, { userId: dan.id, convoId: 'c1', status: { model: 'b', stall: { kind: 'usage_limit' } }, reportedAt: 21 })
+  assert.deepEqual(convoStatus(db, dan.id, 'c1'), { reported_at: 21, model: 'b', context: { tokens: 1, window: 2, pct: 50 }, stall: { kind: 'usage_limit' } })
+  upsertConvoStatus(db, { userId: dan.id, convoId: 'c1', status: { model: 'b', limits: { as_of: 22, lines: [] } }, reportedAt: 22 })
+  assert.deepEqual(convoStatus(db, dan.id, 'c1'), { reported_at: 22, model: 'b', context: { tokens: 1, window: 2, pct: 50 }, limits: { as_of: 22, lines: [] } })
+  upsertConvoStatus(db, { userId: dan.id, convoId: 'c1', status: { model: 'c', context: { tokens: 3, window: 4, pct: 75 } }, reportedAt: 23 })
+  assert.deepEqual(convoStatus(db, dan.id, 'c1'), { reported_at: 23, model: 'c', context: { tokens: 3, window: 4, pct: 75 }, limits: { as_of: 22, lines: [] } })
   assert.equal(convoStatus(db, dan.id + 1, 'c1'), null, 'scoped to the owner')
   assert.equal(convoStatus(db, dan.id, 'nope'), null)
   const all = convoStatuses(db, dan.id)

@@ -656,11 +656,14 @@ an agent token, selected by which query parameter is present:
   integers, `pct` 0–100), `stall {kind:'usage_limit', model?, resets_at?,
   since?}` and `limits` (the bare lines array a bridge sends, validated as
   `spawn_targets`'s `limits` block with `as_of` stamped server-side) — per
-  conversation (`conversation_status`: JSON per row, latest wins, cascades
-  with the conversation; `src/convo-status.js`). Each block is validated
-  all-or-nothing and unknown keys are dropped; a frame with nothing
-  persistable leaves the row unchanged, and a failed persist never fails the
-  op. This is what `GET /roster` and `GET /missions/:id` serve as a
+  conversation (`conversation_status`: JSON per row, cascades with the
+  conversation; `src/convo-status.js`). Latest wins, except that a frame
+  which omits `context` or `limits` keeps the stored ones — a bridge's
+  spawn/resume header carries no gauge yet, and must not wipe the one the
+  table exists to keep — while an omitted `stall` clears it (the bridge
+  clears a stall by leaving it out). Each block is validated all-or-nothing
+  and unknown keys are dropped; a frame with nothing persistable leaves the
+  row unchanged, and a failed persist never fails the op. This is what `GET /roster` and `GET /missions/:id` serve as a
   conversation's `status` (spec: matron-bridge
   `docs/superpowers/specs/2026-09-29-coordinator-session-control-design.md`
   §1), so a session's model and context gauge are readable for a sleeping
