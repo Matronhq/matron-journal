@@ -1069,3 +1069,87 @@ test("mission status for a colleague: shown when written by the owner's client o
   }
   assert.equal((await s.http(`/missions/${m.id}`, { token: client })).json.mission.status, 'From an unshared convo')
 })
+
+// Coordinator mission close (spec: matron-bridge
+// docs/superpowers/specs/2026-09-29-coordinator-session-control-design.md,
+// "Coordinator mission close"): an agent close that names its conversation
+// is allowed when that conversation is ON the mission, or when it is the
+// user's Coordinator — which may close any mission the user owns. Anyone
+// else is 403 not_coordinator. The two item tiers still block.
+test('close with convo_id: on-mission conversation closes; a stranger is 403 not_coordinator; the Coordinator closes another mission and is blocked by user items; junk convo_id is 404', async (t) => {
+  const { s, dan, agent, client } = await fleet(t)
+  const other = createAgent(s.db, dan.id, 'other-box')
+  upsertConversation(s.db, { id: 'coord', ownerUserId: dan.id, title: 'Coordinator', agentDeviceId: other.deviceId })
+  const m = (await start(s, agent.token, {})).json.mission
+  const close = (token, body) => s.http(`/missions/${m.id}/close`, { method: 'POST', token, body: { summary: 's', ...body } })
+  // A conversation this device does not own, a child, a stranger's, junk: 404.
+  assert.equal((await close(agent.token, { convo_id: 'coord' })).status, 404)
+  assert.equal((await close(agent.token, { convo_id: 'nope' })).status, 404)
+  assert.equal((await close(agent.token, { convo_id: 42 })).status, 400)
+  // Owned, top-level, but not on the mission and not the Coordinator: 403.
+  const stranger = await close(other.token, { convo_id: 'coord' })
+  assert.equal(stranger.status, 403); assert.equal(stranger.json.error, 'forbidden'); assert.equal(stranger.json.detail, 'not_coordinator')
+  assert.equal((await s.http(`/missions/${m.id}`, { token: client })).json.mission.state, 'open')
+  // Make 'coord' the Coordinator: user items block it exactly as any agent.
+  assert.equal((await s.http('/coordinator', { method: 'PUT', token: client, body: { convo_id: 'coord' } })).status, 200)
+  const q = (await item(s, agent.token, {})).json.item
+  let r = await close(other.token, { convo_id: 'coord' })
+  assert.equal(r.status, 409); assert.equal(r.json.blocked_by, 'user_items'); assert.deepEqual(r.json.items, [{ num: q.num, title: 'Q?' }])
+  await s.http(`/items/${q.id}/close`, { method: 'POST', token: client, body: { resolution: 'answered' } })
+  const ws = await makeWsClient(s.base, { token: agent.token, cursor: null })
+  await ws.waitFor((f) => f.op === 'hello_ok')
+  r = await close(other.token, { convo_id: 'coord' })
+  assert.equal(r.status, 200); assert.equal(r.json.mission.state, 'closed'); assert.equal(r.json.mission.closed_by, 'agent'); assert.equal(r.json.mission.closed_convo_id, 'coord')
+  const marker = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'mission' && f.payload.action === 'closed')
+  assert.equal(marker.convo_id, 'c1'); assert.equal(marker.payload.by, 'agent'); assert.equal(marker.payload.by_convo_id, 'coord')
+  ws.close()
+  assert.equal((await close(other.token, { convo_id: 'coord' })).json.blocked_by, 'closed')
+  // An on-mission conversation (the origin, or a child of it) closes its own
+  // mission with convo_id and no Coordinator role at all.
+  const m2 = (await s.http('/missions', { method: 'POST', token: agent.token, body: { title: 'Second', convo_id: 'c2' } })).json.mission
+  const own = await s.http(`/missions/${m2.id}/close`, { method: 'POST', token: agent.token, body: { summary: 's', convo_id: 'c2' } })
+  assert.equal(own.status, 200); assert.equal(own.json.mission.closed_convo_id, 'c2')
+  upsertConversation(s.db, { id: 'p', ownerUserId: dan.id, title: 'P', agentDeviceId: agent.deviceId })
+  const m3 = (await s.http('/missions', { method: 'POST', token: agent.token, body: { title: 'Third', convo_id: 'p' } })).json.mission
+  upsertConversation(s.db, { id: 'sub', ownerUserId: dan.id, title: 'Sub', agentDeviceId: agent.deviceId, parentConvoId: 'p' })
+  assert.equal(s.db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('sub').mission_id, m3.id)
+  const viaChild = await s.http(`/missions/${m3.id}/close`, { method: 'POST', token: agent.token, body: { summary: 's', convo_id: 'sub' } })
+  assert.equal(viaChild.status, 200); assert.equal(viaChild.json.mission.closed_convo_id, 'sub')
+  // A client close ignores convo_id (the apps never send one).
+  upsertConversation(s.db, { id: 'c4', ownerUserId: dan.id, title: 'C4', agentDeviceId: agent.deviceId })
+  const m4 = (await s.http('/missions', { method: 'POST', token: agent.token, body: { title: 'Fourth', convo_id: 'c4' } })).json.mission
+  assert.equal((await s.http(`/missions/${m4.id}/close`, { method: 'POST', token: client, body: { summary: 's', convo_id: 'nope' } })).status, 200)
+})
+
+test('close by a private Coordinator: closed_convo_id and the marker\'s by_convo_id stay behind the privacy boundary for an ordinary agent', async (t) => {
+  const { s, dan, agent, client } = await fleet(t)
+  const priv = createAgent(s.db, dan.id, 'private-box')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  upsertConversation(s.db, { id: 'pcoord', ownerUserId: dan.id, title: 'Private Coordinator', agentDeviceId: priv.deviceId })
+  assert.equal((await s.http('/coordinator', { method: 'PUT', token: client, body: { convo_id: 'pcoord' } })).status, 200)
+  // Public origin (c1, the ordinary agent's), closed by the private Coordinator.
+  const m = (await start(s, agent.token, {})).json.mission
+  const ws = await makeWsClient(s.base, { token: agent.token, cursor: null })
+  await ws.waitFor((f) => f.op === 'hello_ok')
+  const r = await s.http(`/missions/${m.id}/close`, { method: 'POST', token: priv.token, body: { summary: 's', convo_id: 'pcoord' } })
+  assert.equal(r.status, 200); assert.equal(r.json.mission.closed_convo_id, 'pcoord')
+  const marker = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'mission' && f.payload.action === 'closed')
+  assert.equal(marker.payload.by, 'agent'); assert.equal('by_convo_id' in marker.payload, false)
+  ws.close()
+  assert.equal((await s.http(`/missions/${m.id}`, { token: agent.token })).json.mission.closed_convo_id, null)
+  assert.equal((await s.http(`/missions/${m.id}`, { token: priv.token })).json.mission.closed_convo_id, 'pcoord')
+  assert.equal((await s.http(`/missions/${m.id}`, { token: client })).json.mission.closed_convo_id, 'pcoord')
+  const listed = (await s.http('/missions?state=closed', { token: agent.token })).json.missions.find((x) => x.id === m.id)
+  assert.equal(listed.closed_convo_id, null); assert.equal('closed_hidden' in listed, false)
+  // Private origin closed from the private side: the marker may carry the id
+  // (its readers are already behind the boundary).
+  upsertConversation(s.db, { id: 'porigin', ownerUserId: dan.id, title: 'PO', agentDeviceId: priv.deviceId })
+  const pm = (await s.http('/missions', { method: 'POST', token: priv.token, body: { title: 'Private', convo_id: 'porigin' } })).json.mission
+  const pws = await makeWsClient(s.base, { token: priv.token, cursor: null })
+  await pws.waitFor((f) => f.op === 'hello_ok')
+  assert.equal((await s.http(`/missions/${pm.id}/close`, { method: 'POST', token: priv.token, body: { summary: 's', convo_id: 'pcoord' } })).status, 200)
+  const pmarker = await pws.waitFor((f) => f.kind === 'journal' && f.type === 'mission' && f.payload.action === 'closed')
+  assert.equal(pmarker.payload.by_convo_id, 'pcoord')
+  pws.close()
+})
+

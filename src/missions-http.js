@@ -15,6 +15,7 @@ import {
 } from './missions.js'
 import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE, missionMarkerPayload, milestoneMarkerPayload } from './missions-marker.js'
 import { filteredAgent, privateOwnedConvo, markerTitleAllowed } from './privacy.js'
+import { getCoordinatorConvoId } from './coordinator.js'
 import { canReadConvo } from './visibility.js'
 
 const STATES = ['open', 'closed']
@@ -55,9 +56,9 @@ function writableConvo(db, who, convoId) {
 // always target the origin conversation, so the predicate is a no-op for
 // them; it is applied uniformly anyway rather than per-action, so a future
 // action written elsewhere is covered by construction.
-function emitMissionMarker({ db, hub }, who, { mission, action, convoId, openItemNums = null, statusChanged = false }) {
+function emitMissionMarker({ db, hub }, who, { mission, action, convoId, openItemNums = null, statusChanged = false, byConvoId = null }) {
   const payload = missionMarkerPayload({
-    mission, action, by: byOf(who), openItemNums, statusChanged,
+    mission, action, by: byOf(who), openItemNums, statusChanged, byConvoId,
     withTitle: markerTitleAllowed(db, mission.origin_convo_id, convoId),
   })
   try {
@@ -181,13 +182,36 @@ async function handleJoin(ctx, req, res, who, mission) {
   return true
 }
 
+// The conversation an agent close names (spec 2026-09-29 coordinator session
+// control, "Coordinator mission close"). Absent → the pre-field contract (any
+// agent of the user closes by id). Present → it must be a conversation this
+// device owns (404 otherwise, same stance as writableConvo), and either ON
+// the mission (its own close, a child of the origin included) or the user's
+// Coordinator, which may close any mission the user owns — the one mission
+// route the role gates. Anyone else: 403 not_coordinator, and nothing about
+// the mission is learned beyond what visibleMission already answered.
+// A client never names one; the apps' close is the user's own override.
+function closingConvo(db, who, mission, convoId) {
+  if (who.kind !== 'agent' || convoId === undefined) return { convoId: null }
+  if (typeof convoId !== 'string' || !convoId) return { status: 400 }
+  const convo = db.prepare('SELECT owner_user_id, agent_device_id, mission_id FROM conversations WHERE id=?').get(convoId)
+  if (!convo || convo.owner_user_id !== who.userId || convo.agent_device_id !== who.deviceId) return { status: 404 }
+  if (convo.mission_id === mission.id) return { convoId }
+  if (getCoordinatorConvoId(db, who.userId) !== convoId) return { status: 403 }
+  return { convoId }
+}
+
 async function handleClose(ctx, req, res, who, mission) {
   const { db } = ctx
   const body = await readBody(req)
   if (typeof body.summary !== 'string' || !body.summary.trim() || Buffer.byteLength(body.summary, 'utf8') > BODY_MAX) return badRequest(res)
+  const closer = closingConvo(db, who, mission, body.convo_id)
+  if (closer.status === 400) return badRequest(res)
+  if (closer.status === 404) return notFound(res)
+  if (closer.status === 403) { json(res, 403, { error: 'forbidden', detail: 'not_coordinator' }); return true }
   let out
   try {
-    out = closeMission(db, { userId: who.userId, missionId: mission.id, by: byOf(who), summary: body.summary, excludePrivateOwned: filteredAgent(db, who) })
+    out = closeMission(db, { userId: who.userId, missionId: mission.id, by: byOf(who), summary: body.summary, closedConvoId: closer.convoId, excludePrivateOwned: filteredAgent(db, who) })
   } catch (err) {
     if (err.message === 'closed') return conflict(res, { blocked_by: 'closed' })
     if (err.message === 'user_items' || err.message === 'agent_items') return conflict(res, { blocked_by: err.message, items: err.items })
@@ -198,6 +222,10 @@ async function handleClose(ctx, req, res, who, mission) {
   emitMissionMarker(ctx, who, {
     mission: out.mission, action: 'closed', convoId: out.mission.origin_convo_id,
     openItemNums: who.kind === 'agent' ? null : out.openItemNums,
+    // Across the privacy boundary the marker carries no conversation id
+    // either: a private Coordinator closing a mission with a public origin
+    // must not hand its own id to every ordinary agent replaying the origin.
+    byConvoId: closer.convoId && markerTitleAllowed(db, closer.convoId, out.mission.origin_convo_id) ? closer.convoId : null,
   })
   json(res, 200, { mission: out.mission })
   return true

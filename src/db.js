@@ -629,6 +629,11 @@ export function openDb(path) {
   addMissionCol('status_convo_id', 'status_convo_id TEXT')
   addMissionCol('status_updated_at', 'status_updated_at INTEGER')
   addMissionCol('status_device_id', 'status_device_id INTEGER')
+  // Which conversation closed the mission, when the closing agent named one
+  // (spec 2026-09-29 coordinator session control, "Coordinator mission
+  // close"): the audit line behind "closed by the Coordinator". NULL for a
+  // client close and for a bridge that predates the field.
+  addMissionCol('closed_convo_id', 'closed_convo_id TEXT')
   // Standing agent-chat consent ("always allow A -> B") is gone: every ask
   // parks for the user now. Dropped rather than left in place, because a
   // table of grants that nothing consults still reads like a live security

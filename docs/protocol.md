@@ -1830,7 +1830,7 @@ column.
 | `GET /missions/:id` (shared) | `:id` must be `ms_…` (a colleague's number is not resolvable) of a mission visible under *Shared visibility* | mission detail with `owner`; `PATCH`, `join`, and `close` on it are all **403 `forbidden`** |
 | `PATCH /missions/:id` | `{title?, body?, status?: string\|null, convo_id?}` | 200 `{mission}`; 400 on a bad `status` (see *Status*); 409 `{blocked_by:'closed'}` |
 | `POST /missions/:id/join` | `{convo_id}` | 200 `{mission}`; 409 `{blocked_by:'other_mission'}` if the conversation already has a different mission, 409 `{blocked_by:'closed'}` if this one is closed, 400 `{error:'bad_request'}` once the mission already has 200 conversations. Repeat-joining the same mission is a no-op 200, not a conflict. Repoints the conversation's unassigned items (same `updated_at` bump as `POST /missions`). |
-| `POST /missions/:id/close` | `{summary}` | 200 `{mission}`, or 409 as in *Closing*, below. |
+| `POST /missions/:id/close` | `{summary, convo_id?}` | 200 `{mission}`, or 409 as in *Closing*, below. `convo_id` (agents only; a client's is ignored) names the closing conversation: **404** unless this device owns it, **403** `{error:'forbidden', detail:'not_coordinator'}` when it is neither on the mission nor the user's Coordinator — see *Closing*. |
 | `POST /milestones` | `{convo_id, kind:'user_input'\|'progress', title, body?}` + optional `Idempotency-Key` | 201 `{milestone, mission}`; 409 `{blocked_by:'no_mission'}` if the conversation has none — or if its mission is invisible to the caller (see *Visibility*), 409 `{blocked_by:'closed'}` if its mission is closed; 502 `{error:'marker_append_failed'}` if the anchor marker couldn't be written (the milestone row is not created either — see "Marker events" below). |
 | `GET /milestones?convo=<id>` | | `{milestones:[…]}` newest first — the per-conversation view. 400 without `convo`; 404 for an unknown conversation, another user's, or (for an ordinary agent) a private-owned one. Also works on a colleague's conversation visible under *Shared visibility*. |
 | `PATCH /items/:id` | gains `mission: id \| "#num" \| null` | existing route (see "Items" above); moves or detaches the item, gated by the same visibility rule as `GET /missions/:id` — a mission an ordinary agent can't see is never a reachable move target, and is **404**, not 403. A closed mission is still a legal target (see the Items table). Emits the item marker `updated`. |
@@ -1843,8 +1843,11 @@ fails.
 Row shapes: a mission is `{id, user_id, num, state, title, body,
 close_summary, closed_by, closed_over_open_items, origin_convo_id,
 origin_device_id, created_by, created_at, updated_at, last_milestone_at,
-closed_at, status, status_by, status_convo_id, status_updated_at}` plus the
-counts listed against `GET /missions` above; a milestone is `{id,
+closed_at, status, status_by, status_convo_id, status_updated_at,
+closed_convo_id}` plus the counts listed against `GET /missions` above
+(`closed_convo_id` is null when no conversation was named and, for an
+ordinary agent, when the closing conversation is private-owned — the same
+sieve `status_convo_id` gets); a milestone is `{id,
 mission_id, num, kind, title, body, convo_id, seq, device_id, created_by,
 created_at}`. Stored columns stripped from the wire: `idem_key` (both
 shapes), `status_device_id` (mission — the device that wrote the status,
@@ -1917,6 +1920,28 @@ exists and is open, whether or not this caller can see it), but the
 so the response never names a private item or its title. Closing an
 already-closed mission is `409 {"blocked_by":"closed"}` regardless of
 caller kind.
+
+**Who may close (`convo_id`).** Without `convo_id` any agent of the user
+closes by id, as before. An agent that names its conversation (every
+current bridge does) is held to a rule: the conversation must be one this
+device owns (else **404**, same stance as `join`'s `convo_id`), and either
+**on the mission** — the origin conversation or any conversation attached
+to it, a child of the origin included — or the user's **Coordinator**
+(`user_settings.coordinator_convo_id`), which may close any mission the
+user owns: the one mission route the role gates (spec: matron-bridge
+2026-09-29 coordinator session control, "Coordinator mission close"). Any
+other conversation is **403** `{error:'forbidden', detail:'not_coordinator'}`
+and nothing is written. The Coordinator is held to the same two item tiers
+as any agent — it resolves or moves the open items first — so a mission
+never closes over an item that is awaiting the user. The row records the
+closing conversation as `closed_convo_id` (null for a client close and for
+a bridge that predates the field) and the `closed` marker carries it as
+`by_convo_id`, which is how an app can say "closed by the Coordinator"
+(compare it with the Coordinator setting) rather than only "by agent".
+Both stay behind the privacy boundary: an ordinary agent reads
+`closed_convo_id` as null when the closing conversation is private-owned,
+and the marker omits `by_convo_id` when the closing conversation is
+private-owned and the origin is not (the same rule as the marker's title).
 
 ### Marker events
 
