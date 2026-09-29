@@ -26,6 +26,7 @@ import { makeItemTranscription } from './items-transcribe.js'
 import { emitTranscriptionMarker } from './items-http.js'
 import { makeGithub, DEFAULT_GITHUB_CLIENT_ID } from './github.js'
 import { makeTokenBox } from './token-box.js'
+import { startStallWakeSweep } from './stall-wake.js'
 import { sealStoredTokens } from './github-accounts.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
@@ -293,6 +294,7 @@ export function startServer({
   // pays it.
   spawnWakeWaitMs = resolveNumericEnv('MATRON_SPAWN_WAKE_WAIT_MS', process.env.MATRON_SPAWN_WAKE_WAIT_MS, 240000),
   sessionControlTimeoutMs = resolveNumericEnv('MATRON_SESSION_CONTROL_TIMEOUT_MS', process.env.MATRON_SESSION_CONTROL_TIMEOUT_MS, 30000),
+  stallWakeIntervalMs = null,
   mediaReapHighPct, mediaReapLowPct, waker, transcriber, github, githubRefreshIntervalMs, webDir,
   appleAppIds, androidPackage, androidCertSha256, tokenKey,
 } = {}) {
@@ -345,6 +347,10 @@ export function startServer({
   // orphan sweep TTL (derived in attachWs from this value) stays what it
   // always was, rather than growing by a window that can never be used.
   const effectiveWakeWaitMs = resolvedWaker.enabled ? spawnWakeWaitMs : 0
+  // Stall wake sweep (src/stall-wake.js): a box whose stalled session's
+  // usage-limit reset has passed is woken so its bridge can carry on. No-op
+  // without a waker; stopped in close().
+  const stallWakeSweep = startStallWakeSweep({ db, hub, waker: resolvedWaker, ...(stallWakeIntervalMs ? { intervalMs: stallWakeIntervalMs } : {}) })
   const toolStreams = makeToolStreamStore({
     maxBytes: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BYTES', process.env.MATRON_TOOL_STREAM_MAX_BYTES, 1048576),
     maxBuffers: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BUFFERS', process.env.MATRON_TOOL_STREAM_MAX_BUFFERS, 64),
@@ -438,6 +444,7 @@ export function startServer({
           if (retentionInterval) clearInterval(retentionInterval)
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
           if (githubRefreshInterval) clearInterval(githubRefreshInterval)
+          stallWakeSweep.stop()
           // Wake-before-spawn waiters (hub.waitForDevice) hold ref'd timers
           // of up to spawnWakeWaitMs; release them before the sockets go so
           // each approveSpawn settles its row while the DB is still open.
