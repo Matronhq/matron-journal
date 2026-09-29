@@ -12,6 +12,12 @@
 import { wakeIfOffline } from './wake.js'
 
 export const STALL_WAKE_INTERVAL_MS = 60_000
+// A stall row is only ever cleared by the bridge's next status frame. One
+// whose bridge never comes back for that conversation (state gone, session
+// reaped before the reset, a bridge predating the automatic carry-on)
+// would otherwise wake its box on every sweep for ever: past this age the
+// reset is treated as spent.
+export const STALL_WAKE_MAX_AGE_MS = 6 * 60 * 60 * 1000
 
 // Boxes owed a wake: one row per (user, device) with at least one stalled
 // conversation whose resets_at is at or before `now`. Unparseable reset
@@ -26,7 +32,7 @@ export function dueStalledBoxes(db, now = Date.now()) {
   const out = []
   for (const r of rows) {
     const at = typeof r.resets_at === 'string' ? Date.parse(r.resets_at) : NaN
-    if (!Number.isFinite(at) || at > now) continue
+    if (!Number.isFinite(at) || at > now || at < now - STALL_WAKE_MAX_AGE_MS) continue
     const key = `${r.user_id}:${r.device_id}`
     if (seen.has(key)) continue
     seen.add(key)
@@ -39,12 +45,18 @@ export function startStallWakeSweep({ db, hub, waker, intervalMs = STALL_WAKE_IN
   if (!waker || !waker.enabled) return { stop() {}, run() { return 0 } }
   function run(now = Date.now()) {
     let woken = 0
-    try {
-      for (const { user_id: userId, device_id: deviceId } of dueStalledBoxes(db, now)) {
+    let due = []
+    try { due = dueStalledBoxes(db, now) } catch (err) {
+      try { log.error(`stall-wake: sweep query failed: ${err?.message || err}`) } catch { /* never throw from a timer */ }
+      return 0
+    }
+    for (const { user_id: userId, device_id: deviceId } of due) {
+      // One box's failure must not cost the others their wake.
+      try {
         if (wakeIfOffline({ db, hub, waker }, userId, deviceId)) woken += 1
+      } catch (err) {
+        try { log.error(`stall-wake: wake of device ${deviceId} failed: ${err?.message || err}`) } catch { /* never throw from a timer */ }
       }
-    } catch (err) {
-      try { log.warn(`stall-wake: sweep failed: ${err?.message || err}`) } catch { /* never throw from a timer */ }
     }
     return woken
   }

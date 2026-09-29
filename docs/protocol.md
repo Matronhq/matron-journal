@@ -1669,17 +1669,23 @@ from_convo_id, from_name}` is issued (`MATRON_SESSION_CONTROL_TIMEOUT_MS`,
 default 30 s) and its reply delivered to every live socket of the caller's
 device as `{kind:'session_control', event:'result', request_id, ok,
 result?|error:{code, detail?}}` (`timeout` / `agent_unreachable` /
-`internal` when the bridge never answered). Strings in `params` and in
-the relayed error are peer-text sanitised. Not a room op, not counted
-against the pending-ask cap: nothing awaits the user.
+`internal` when the bridge never answered). Strings in `params`
+(including `from_name`) and in the relayed error are peer-text sanitised.
+At most 8 ops may be in flight per connection (each holds a wake waiter
+and a broker entry); a ninth is `conflict`. The shape checks run before
+the ownership and role checks — a `bad_request` reveals nothing about any
+conversation. Not a room op, not counted against the pending-ask cap:
+nothing awaits the user.
 
 **Stall wake sweep.** Once a minute (`src/stall-wake.js`) the journal
 scans `conversation_status` for a `stall` whose `resets_at` has passed and
 wakes that conversation's box if it has no live socket (`wakeIfOffline`,
 debounced by the waker), so the bridge's automatic carry-on after a usage
 limit runs even when the box idle-stopped while stalled. The bridge's next
-status frame drops the stall, which ends the loop. No-op without a wake
-command.
+status frame drops the stall, which ends the loop; a reset more than six
+hours old is treated as spent (its bridge is not coming back for it), so a
+stale row cannot wake a box for ever. One box's failing wake never costs
+the others theirs. No-op without a wake command.
 
 ## Memories
 

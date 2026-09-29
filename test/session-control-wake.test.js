@@ -13,7 +13,7 @@ import { setCoordinatorConvoId } from '../src/coordinator.js'
 // parent = the Coordinator's bridge (dev-6, owns 'parent-convo');
 // target = the bridge running the session being controlled (eric, 'tgt').
 async function fleet(t, { connectTarget = true, serverOpts = {}, coordinator = true } = {}) {
-  const s = await startTestServer(serverOpts)
+  const s = await startTestServer({ sessionControlTimeoutMs: 2000, ...serverOpts })
   t.after(() => s.close())
   const dan = await createUser(s.db, 'dan', 'pw')
   const parentDev = createAgent(s.db, dan.id, 'dev-6')
@@ -65,3 +65,12 @@ test('session_control: an offline target that cannot be woken is agent_unreachab
   assert.deepEqual(res, { kind: 'session_control', event: 'result', request_id: 'u2', ok: false, error: { code: 'timeout' } })
 })
 
+
+test('session_control: a wake that never completes relays agent_unreachable as the result', async (t) => {
+  const waker = { enabled: true, wake: () => true }
+  const { parent } = await fleet(t, { connectTarget: false, serverOpts: { waker, spawnWakeWaitMs: 100 } })
+  parent.send({ op: 'session_control', request_id: 'w2', from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'compact' })
+  await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'sent' && f.request_id === 'w2')
+  const res = await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'result' && f.request_id === 'w2', 3000)
+  assert.deepEqual(res, { kind: 'session_control', event: 'result', request_id: 'w2', ok: false, error: { code: 'agent_unreachable' } })
+})

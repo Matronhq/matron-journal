@@ -50,6 +50,9 @@ const ACTIVITY_DETAIL_MAX_CHARS = 200
 // lib/session-status.js) but size-capped — it's held in server memory, so an
 // unbounded status would be an unbounded hold.
 const STATUS_MAX_BYTES = 4096
+// session_control ops in flight per connection (each holds a wake waiter
+// and a broker entry) before `conflict`.
+const SESSION_CONTROL_MAX_INFLIGHT = 8
 const STATUS_CACHE_MAX = 2048
 
 // Agent RPC (spec 2026-07-15-agent-rpc-design.md): opaque client->agent
@@ -1804,13 +1807,17 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const auth = authorizeSessionControl(db, conn, msg)
         if (auth.code) return failRpc(auth.code, auth.detail)
         const { target } = auth
+        // Each op parks a wake waiter (minutes) and a broker entry; bound
+        // them per connection so a looping Coordinator cannot stack them.
+        if ((conn._sessionControlInflight || 0) >= SESSION_CONTROL_MAX_INFLIGHT) return failRpc('conflict', 'too many session_control requests in flight')
         const online = hub.connsOf(conn.userId).some((c) => c.deviceId === target.device_id && c.ws.readyState === 1)
         const waking = !online && wakeIfOffline(target.device_id)
         if (!online && !waking) return failRpc('agent_unreachable')
         conn.ws.send(JSON.stringify({ kind: 'session_control', event: 'sent', request_id: v.rid, ...(waking ? { target_waking: true } : {}) }))
-        const fromName = db.prepare('SELECT name FROM devices WHERE id=?').get(conn.deviceId)?.name || 'coordinator'
+        const fromName = sanitizePeerText(db.prepare('SELECT name FROM devices WHERE id=?').get(conn.deviceId)?.name || '', PEER_NAME_CAP) || 'coordinator'
         const params = { ...v.params, from_convo_id: msg.from_convo_id, from_name: fromName }
         const rid = v.rid
+        conn._sessionControlInflight = (conn._sessionControlInflight || 0) + 1
         void (async () => {
           let frame
           try {
@@ -1818,8 +1825,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             const r = await broker.issue(hub, conn.userId, target.device_id, 'session_control', params, { timeoutMs: sessionControlTimeoutMs })
             frame = sessionControlResultFrame(rid, r)
           } catch (err) {
-            console.warn(`session_control: ${err?.message || err}`)
+            console.error(`session_control: ${err?.message || err}`)
             frame = sessionControlResultFrame(rid, { ok: false, error: { code: 'internal' } })
+          } finally {
+            conn._sessionControlInflight = Math.max(0, (conn._sessionControlInflight || 1) - 1)
           }
           hub.sendToDevice(conn.userId, conn.deviceId, frame)
         })()

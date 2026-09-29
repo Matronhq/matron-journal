@@ -14,7 +14,9 @@ import { validateSessionControl } from '../src/session-control.js'
 // parent = the Coordinator's bridge (dev-6, owns 'parent-convo');
 // target = the bridge running the session being controlled (eric, 'tgt').
 async function fleet(t, { connectTarget = true, serverOpts = {}, coordinator = true } = {}) {
-  const s = await startTestServer(serverOpts)
+  // A short relay timeout: an RPC a test leaves unanswered must not hold a
+  // ref'd 30 s broker timer past the file's own timeout.
+  const s = await startTestServer({ sessionControlTimeoutMs: 2000, ...serverOpts })
   t.after(() => s.close())
   const dan = await createUser(s.db, 'dan', 'pw')
   const parentDev = createAgent(s.db, dan.id, 'dev-6')
@@ -64,6 +66,8 @@ test('session_control: set_model carries model and agent; carry_on carries messa
   parent.send({ op: 'session_control', request_id: 'r3', from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'carry_on', message: '  carry on with the tests ', when: 'after_limit_reset' })
   req = await target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'session_control')
   assert.deepEqual(req.request.params, { convo_id: 'tgt', action: 'carry_on', message: 'carry on with the tests', when: 'after_limit_reset', from_convo_id: 'parent-convo', from_name: 'dev-6' })
+  target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { applied: 'scheduled' } })
+  await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'result' && f.request_id === 'r3')
 })
 
 test('session_control: refused for a non-Coordinator, a client, a foreign or private target, self, and bad params', async (t) => {
@@ -93,8 +97,14 @@ test('session_control: refused for a non-Coordinator, a client, a foreign or pri
   s.db.prepare('UPDATE devices SET private=1 WHERE id=?').run(parentDev.deviceId)
   parent.send({ ...base, request_id: 'n7' })
   await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'sent' && f.request_id === 'n7')
-  await target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'session_control')
+  const n7req = await target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'session_control')
+  target.send({ op: 'agent_response', request_id: n7req.request.request_id, to_device_id: 0, ok: true, result: { applied: 'now' } })
+  await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'result' && f.request_id === 'n7')
   s.db.prepare('UPDATE devices SET private=0 WHERE name IN (?, ?)').run('eric', 'dev-6')
+  // a sub-conversation cannot be the Coordinator's from_convo_id
+  s.db.prepare("INSERT INTO conversations(id, owner_user_id, title, session_state, last_seq, unread_count, snippet, created_at, agent_device_id, parent_convo_id) VALUES('sub', ?, 'sub', 'waiting', 0, 0, '', 1, ?, 'parent-convo')").run(dan.id, parentDev.deviceId)
+  parent.send({ ...base, request_id: 'n7b', from_convo_id: 'sub' })
+  e = await errorFrame(parent, 'n7b'); assert.equal(e.code, 'not_found')
   // self
   parent.send({ ...base, request_id: 'n8', target_convo_id: 'parent-convo' })
   e = await errorFrame(parent, 'n8'); assert.equal(e.code, 'bad_request')
@@ -117,4 +127,15 @@ test('validateSessionControl: pure shape checks', () => {
   assert.equal(validateSessionControl({ request_id: 'a', from_convo_id: 'c', target_convo_id: 't', action: 'set_model', agent: 'codex' }).params.agent, 'codex')
   assert.equal(validateSessionControl({}).code, 'bad_request')
   assert.equal(validateSessionControl({ request_id: 'a', from_convo_id: 'c', target_convo_id: 't', action: 'compact', reason: 5 }).code, 'bad_request')
+})
+
+test('session_control: at most 8 requests in flight per connection', async (t) => {
+  const { parent, target } = await fleet(t, { serverOpts: { sessionControlTimeoutMs: 300 } })
+  for (let i = 0; i < 9; i++) parent.send({ op: 'session_control', request_id: `c${i}`, from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'compact' })
+  const e = await errorFrame(parent, 'c8'); assert.equal(e.code, 'conflict')
+  // the eight settle (timeout, nobody answers) and free the slots
+  await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'result' && f.request_id === 'c7', 3000)
+  parent.send({ op: 'session_control', request_id: 'c9', from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'compact' })
+  await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'sent' && f.request_id === 'c9')
+  void target
 })
