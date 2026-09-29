@@ -1807,9 +1807,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // the op: the conversation can vanish between the ownership check
         // and this write (FK), and a failed persist must not cost the live
         // header fan-out below.
-        const persisted = sanitizeConvoStatus(msg.status, Date.now())
+        const reportedAt = Date.now()
+        const persisted = sanitizeConvoStatus(msg.status, reportedAt)
         if (persisted) {
-          try { upsertConvoStatus(db, { userId: conn.userId, convoId: msg.convo_id, status: persisted }) }
+          try { upsertConvoStatus(db, { userId: conn.userId, convoId: msg.convo_id, status: persisted, reportedAt }) }
           catch (e) { console.warn(`status: persist failed for ${msg.convo_id}: ${e.message}`) }
         }
         hub.sendEphemeral(conn.userId, msg.convo_id, {
