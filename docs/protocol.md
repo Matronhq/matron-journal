@@ -197,13 +197,15 @@ the machine-checkable version of this page.
   `push_prefs`); `connected` is the same live-WebSocket check `/devices`
   uses. `conversations`:
   `[{id, title, session_state, last_seq, summary, agent_device_id,
-  created_at, last_ts}]` — top-level conversations only
+  created_at, last_ts, status?}]` — top-level conversations only
   (`parent_convo_id IS NULL`; children are silenced sub-chats, never invite/
   chat targets), ordered by `last_seq DESC`; `last_ts` is the newest
   event's timestamp (`null` for an event-less conversation), same
-  derivation as `/snapshot`. Scoped to the caller's own user like every
-  other read. See "Agent chat rooms" below for what a room and `summary`
-  are.
+  derivation as `/snapshot`; `status` is the session's persisted header
+  `{reported_at, model?, context?, stall?, limits?}` (see the agent
+  `status` op), present only once the session has reported one. Scoped to
+  the caller's own user like every other read. See "Agent chat rooms" below
+  for what a room and `summary` are.
 - `POST /pair/start` (unauthenticated; shares /login's per-IP rate limit) ->
   `{pair_code, poll_token, expires_in}`. Pending pairs are in-memory only
   (10-minute TTL, 64 outstanding max — 429 `rate_limited` beyond either);
@@ -649,6 +651,23 @@ an agent token, selected by which query parameter is present:
   last status per conversation (in-memory, bounded) and replays it to a
   client immediately after it sends `viewing`, so headers populate on open
   instead of waiting for the next turn end.
+  The server also **persists** a sanitised subset of each accepted frame —
+  `model` (≤ 64 chars), `context {tokens, window, pct}` (non-negative
+  integers, `pct` 0–100), `stall {kind:'usage_limit', model?, resets_at?,
+  since?}` and `limits` (the bare lines array a bridge sends, validated as
+  `spawn_targets`'s `limits` block with `as_of` stamped server-side) — per
+  conversation (`conversation_status`: JSON per row, cascades with the
+  conversation; `src/convo-status.js`). Latest wins, except that a frame
+  which omits `context` or `limits` keeps the stored ones — a bridge's
+  spawn/resume header carries no gauge yet, and must not wipe the one the
+  table exists to keep — while an omitted `stall` clears it (the bridge
+  clears a stall by leaving it out). Each block is validated all-or-nothing
+  and unknown keys are dropped; a frame with nothing persistable leaves the
+  row unchanged, and a failed persist never fails the op. This is what `GET /roster` and `GET /missions/:id` serve as a
+  conversation's `status` (spec: matron-bridge
+  `docs/superpowers/specs/2026-09-29-coordinator-session-control-design.md`
+  §1), so a session's model and context gauge are readable for a sleeping
+  box and across a journal restart.
 - Agent `stream_append {convo_id, message_ref, offset, chunk, meta?}` streams
   live tool output (never journaled). `message_ref` is the tool_use_id;
   `offset` is the UTF-8 byte position of `chunk` in the command's output.
@@ -1748,7 +1767,7 @@ column.
 |---|---|---|
 | `POST /missions` | `{title, body?, convo_id, attach?: boolean}` + optional `Idempotency-Key` (also served at `POST /missions/create`) | 201 `{mission}`. If `convo_id` already has a mission: 200 that mission with `existing: true`, nothing changed — or **404** if that mission is invisible to the caller (see *Visibility*). Attaches the conversation, repoints its unassigned items (each repointed item's own `updated_at` is bumped too, so `GET /items?since=` learns it gained a mission). With `attach: false`: always a new mission (201; a replay 200), `origin_convo_id` = `convo_id`, and neither the conversation nor its items are touched — no `existing` short-circuit. Either way, on a genuine 201 the `created` mission marker is still appended into `convo_id` — provenance of where the mission was born, independent of whether it was ever attached there. A non-boolean `attach` is 400. |
 | `GET /missions` | `?state=open\|closed` (omit = both), `?since=<ms>`, `?scope=mine\|shared` (shared: neither `state` nor `since`; rows carry `owner`) | `{missions:[…]}` with per-row counts: `open_items`, `needs_you` (open and awaiting user), `conversations`, `milestones`, `last_milestone` `{num,title,kind,created_at}`. Sorted `last_milestone_at DESC NULLS LAST`, then `created_at DESC` — for a filtered (ordinary agent) caller this is the SIEVED last-milestone timestamp (the same sieved subquery the `last_milestone` field itself uses), so the order never disagrees with the row shown; an owner or private agent sorts on the stored column, which is the same thing. |
-| `GET /missions/:id` | | `{mission, milestones:[…] newest first, items:[open items], conversations:[{id,title,box,state}]}` |
+| `GET /missions/:id` | | `{mission, milestones:[…] newest first, items:[open items], conversations:[{id,title,box,state,status?}]}` — `status` is the session's persisted header (same block as `GET /roster`), own-user view only; the shared view below never carries it |
 | `GET /missions/:id` (shared) | `:id` must be `ms_…` (a colleague's number is not resolvable) of a mission visible under *Shared visibility* | mission detail with `owner`; `PATCH`, `join`, and `close` on it are all **403 `forbidden`** |
 | `PATCH /missions/:id` | `{title?, body?, status?: string\|null, convo_id?}` | 200 `{mission}`; 400 on a bad `status` (see *Status*); 409 `{blocked_by:'closed'}` |
 | `POST /missions/:id/join` | `{convo_id}` | 200 `{mission}`; 409 `{blocked_by:'other_mission'}` if the conversation already has a different mission, 409 `{blocked_by:'closed'}` if this one is closed, 400 `{error:'bad_request'}` once the mission already has 200 conversations. Repeat-joining the same mission is a no-op 200, not a conflict. Repoints the conversation's unassigned items (same `updated_at` bump as `POST /missions`). |

@@ -12,6 +12,7 @@ import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem } from 
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableBoxName } from './wake.js'
 import { coordinatorFor } from './coordinator.js'
 import { getMission } from './missions.js'
+import { sanitizeConvoStatus, upsertConvoStatus } from './convo-status.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -1801,6 +1802,17 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         try { encoded = JSON.stringify(msg.status) } catch { return fail('bad_request') }
         if (Buffer.byteLength(encoded, 'utf8') > STATUS_MAX_BYTES) return fail('bad_request', 'status too large')
         statusCache.set(conn.userId, msg.convo_id, msg.status)
+        // Persist the roster subset (spec 2026-09-29 coordinator session
+        // control §1, src/convo-status.js). Best effort and never fatal to
+        // the op: the conversation can vanish between the ownership check
+        // and this write (FK), and a failed persist must not cost the live
+        // header fan-out below.
+        const reportedAt = Date.now()
+        const persisted = sanitizeConvoStatus(msg.status, reportedAt)
+        if (persisted) {
+          try { upsertConvoStatus(db, { userId: conn.userId, convoId: msg.convo_id, status: persisted, reportedAt }) }
+          catch (e) { console.warn(`status: persist failed for ${msg.convo_id}: ${e.message}`) }
+        }
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id, status: msg.status,
         }, () => agentTargetsFor(db, msg.convo_id))

@@ -25,6 +25,7 @@ import { handleCoordinatorRoute } from './coordinator-http.js'
 import { handleMemoriesRoute } from './memories-http.js'
 import { coordinatorFor } from './coordinator.js'
 import { json, readBody } from './http-body.js'
+import { convoStatuses } from './convo-status.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
 // card's `from_name` gets. NULL stays null rather than collapsing to '' —
@@ -386,7 +387,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           // Last capacity report (box_status), same shape as GET /devices.
           ...(statuses.has(d.device_id) ? { status: statuses.get(d.device_id) } : {}),
         }))
-        const conversations = db.prepare(
+        const rows = db.prepare(
           `SELECT id, title, session_state, last_seq, summary, agent_device_id, created_at,
                   (SELECT ts FROM events e WHERE e.convo_id = conversations.id
                    AND e.type IN (${MESSAGE_TYPES_SQL})
@@ -397,6 +398,13 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
              : ''}
            ORDER BY last_seq DESC`
         ).all(who.userId)
+        // Persisted session header (spec 2026-09-29 coordinator session
+        // control §1): model, context gauge, stall and meters from the
+        // bridge's last status op. Omitted (never null) for a conversation
+        // that has not reported. Rides the already-filtered rows, so privacy
+        // needs no second check.
+        const headers = convoStatuses(db, who.userId)
+        const conversations = rows.map((c) => (headers.has(c.id) ? { ...c, status: headers.get(c.id) } : c))
         return json(res, 200, { agents, conversations })
       }
       if (req.method === 'GET' && url.pathname === '/agent-chat/pending') {
