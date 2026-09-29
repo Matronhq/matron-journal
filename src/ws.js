@@ -13,6 +13,7 @@ import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentS
 import { coordinatorFor } from './coordinator.js'
 import { getMission } from './missions.js'
 import { sanitizeConvoStatus, upsertConvoStatus } from './convo-status.js'
+import { validateSessionControl, authorizeSessionControl, sessionControlResultFrame } from './session-control.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -215,7 +216,7 @@ export function attachWs({
   server, db, hub, pingMs = 55000, pushPipeline = noopPushPipeline,
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
   revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES, inviteTtlMs = 1800000,
-  broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null,
+  broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null,
 }) {
   // Derived, never raw: the orphan sweep must always outlast a live `start`
   // RPC still in flight (see APPROVED_ORPHAN_TTL_FLOOR_MS's comment) — and,
@@ -541,7 +542,7 @@ export function attachWs({
         // reserialization, which JSON.parse's whitespace-stripping would
         // shrink. `data` is a Buffer here (ws delivers text frames as
         // Buffers), so .length is the byte count.
-        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, waker })
+        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -597,7 +598,7 @@ export function notifyStale(db, hub, entry, reason = 'stale') {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, waker = null }) {
+export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null }) {
   const fail = (code, detail) => {
     conn.ws.send(JSON.stringify({
       kind: 'control', op: 'error', code, ref: msg.op,
@@ -1785,6 +1786,43 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const reportedAt = Date.now()
         upsertDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt })
         hub.sendToClients(conn.userId, { kind: 'box_status', device_id: conn.deviceId, reported_at: reportedAt, ...status })
+        break
+      }
+      case 'session_control': {
+        // Coordinator session control (src/session-control.js): validate,
+        // prove the caller is the Coordinator, resolve the target's box,
+        // ack, then — off this socket's message loop, because a wake can
+        // take minutes — wake, issue the journal-originated RPC and relay
+        // the reply to every socket of the caller's device. Not a room op,
+        // not counted against the pending-ask cap: nothing awaits the user.
+        if (conn.kind !== 'agent') return fail('forbidden')
+        if (!conn.registered) return fail('not_ready')
+        const v = validateSessionControl(msg)
+        const failRpc = (code, detail) => conn.ws.send(JSON.stringify(
+          { kind: 'control', op: 'error', code, ref: msg.op, ...(v.rid ? { request_id: v.rid } : {}), ...(detail ? { detail } : {}) }))
+        if (!v.ok) return failRpc(v.code, v.detail)
+        const auth = authorizeSessionControl(db, conn, msg)
+        if (auth.code) return failRpc(auth.code, auth.detail)
+        const { target } = auth
+        const online = hub.connsOf(conn.userId).some((c) => c.deviceId === target.device_id && c.ws.readyState === 1)
+        const waking = !online && wakeIfOffline(target.device_id)
+        if (!online && !waking) return failRpc('agent_unreachable')
+        conn.ws.send(JSON.stringify({ kind: 'session_control', event: 'sent', request_id: v.rid, ...(waking ? { target_waking: true } : {}) }))
+        const fromName = db.prepare('SELECT name FROM devices WHERE id=?').get(conn.deviceId)?.name || 'coordinator'
+        const params = { ...v.params, from_convo_id: msg.from_convo_id, from_name: fromName }
+        const rid = v.rid
+        void (async () => {
+          let frame
+          try {
+            if (waking && spawnWakeWaitMs > 0) await hub.waitForDevice(conn.userId, target.device_id, spawnWakeWaitMs)
+            const r = await broker.issue(hub, conn.userId, target.device_id, 'session_control', params, { timeoutMs: sessionControlTimeoutMs })
+            frame = sessionControlResultFrame(rid, r)
+          } catch (err) {
+            console.warn(`session_control: ${err?.message || err}`)
+            frame = sessionControlResultFrame(rid, { ok: false, error: { code: 'internal' } })
+          }
+          hub.sendToDevice(conn.userId, conn.deviceId, frame)
+        })()
         break
       }
       case 'status': {
