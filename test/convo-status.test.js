@@ -65,3 +65,36 @@ test('upsertConvoStatus is latest-wins per conversation and cascades with the co
   assert.equal(convoStatus(db, 'c1'), null)
   assert.equal(convoStatuses(db, dan.id).size, 1)
 })
+
+import { startTestServer, makeWsClient } from './helpers.js'
+import { createUser } from '../src/auth.js'
+
+test('the status op persists its roster subset; a frame with nothing persistable leaves the row alone', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan2', 'pw')
+  const dev = createAgent(s.db, dan.id, 'gene')
+  const agent = await makeWsClient(s.base, { token: dev.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+  t.after(() => agent.close())
+  agent.send({ op: 'convo_upsert', convo_id: 'w1', title: 'Work', session_state: 'running' })
+  await agent.waitFor((f) => f.kind === 'journal' && f.type === 'session_status')
+  agent.send({ op: 'status', convo_id: 'w1', status: FRAME })
+  await new Promise((r) => setTimeout(r, 80))
+  const stored = convoStatus(s.db, 'w1')
+  assert.equal(stored.model, 'claude-opus-5-5')
+  assert.deepEqual(stored.context, { tokens: 87000, window: 1000000, pct: 9 })
+  assert.equal(stored.limits.lines[0].id, '5h')
+  assert.equal('effort' in stored, false)
+  assert.ok(Number.isInteger(stored.reported_at))
+  agent.send({ op: 'status', convo_id: 'w1', status: { effort: 'high' } })
+  await new Promise((r) => setTimeout(r, 80))
+  assert.equal(convoStatus(s.db, 'w1').model, 'claude-opus-5-5')
+  // Ownership still gates the write: a conversation this device may not
+  // write to is refused before anything is persisted.
+  const other = createAgent(s.db, dan.id, 'eric')
+  upsertConversation(s.db, { id: 'w2', ownerUserId: dan.id, title: 'Theirs', sessionState: 'running', agentDeviceId: other.deviceId })
+  agent.send({ op: 'status', convo_id: 'w2', status: FRAME })
+  await agent.waitFor((f) => f.op === 'error' && f.code === 'forbidden')
+  assert.equal(convoStatus(s.db, 'w2'), null)
+})
