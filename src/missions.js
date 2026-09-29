@@ -33,7 +33,12 @@ export function missionRow(row) {
     idem_key: _idemKey, sieved_last_milestone_at: _sievedLastMilestoneAt,
     status_device_id: _statusDeviceId, status_hidden: statusHidden, ...rest
   } = row
-  const out = { ...rest, closed_over_open_items: Number(rest.closed_over_open_items || 0) }
+  const { closed_hidden: closedHidden, ...bare } = rest
+  const out = { ...bare, closed_over_open_items: Number(bare.closed_over_open_items || 0) }
+  // Same sieve for the closing conversation (CLOSED_PRIVATE): a private
+  // Coordinator's conversation id must not reach an ordinary agent through
+  // the mission row it closed. Null reads exactly as "none named".
+  if (Number(closedHidden || 0) && 'closed_convo_id' in out) out.closed_convo_id = null
   for (const k of ['open_items', 'needs_you', 'conversations', 'milestones']) if (k in out) out[k] = Number(out[k])
   if ('last_milestone_json' in out) {
     out.last_milestone = out.last_milestone_json ? JSON.parse(out.last_milestone_json) : null
@@ -95,6 +100,11 @@ const STATUS_PRIVATE = `(
              WHERE sc.id = m.status_convo_id AND sd.private = 1)
 )`
 
+// The closing conversation (closed_convo_id) is withheld from an ordinary
+// agent when it is private-owned, as status_convo_id is above.
+const CLOSED_PRIVATE = `EXISTS (SELECT 1 FROM conversations cc JOIN devices cd ON cd.id = cc.agent_device_id
+             WHERE cc.id = m.closed_convo_id AND cd.private = 1)`
+
 // Review fix (Task 7, Critical 1): every COUNTS subquery must apply the same
 // private-owned-conversation sieve the caller's OWN arrays get in
 // missionDetail — otherwise an ordinary agent that can't see a private
@@ -122,7 +132,8 @@ function countsSql(excludePrivateOwned) {
        FROM milestones l WHERE l.mission_id = m.id ${milestoneSieve} ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS last_milestone_json,
     (SELECT l.created_at FROM milestones l WHERE l.mission_id = m.id ${milestoneSieve}
        ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS sieved_last_milestone_at,
-    ${excludePrivateOwned ? STATUS_PRIVATE : '0'} AS status_hidden
+    ${excludePrivateOwned ? STATUS_PRIVATE : '0'} AS status_hidden,
+    ${excludePrivateOwned ? CLOSED_PRIVATE : '0'} AS closed_hidden
   `
 }
 
@@ -464,7 +475,9 @@ function sharedCountsSql() {
     (${STATUS_PRIVATE}
       OR (m.status_by = 'agent' AND m.status_convo_id IS NULL)
       OR (m.status_convo_id IS NOT NULL
-          AND NOT EXISTS (SELECT 1 FROM conversations sc WHERE sc.id = m.status_convo_id AND ${sharedConvoSql('sc')}))) AS status_hidden
+          AND NOT EXISTS (SELECT 1 FROM conversations sc WHERE sc.id = m.status_convo_id AND ${sharedConvoSql('sc')}))) AS status_hidden,
+    (m.closed_convo_id IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM conversations cc WHERE cc.id = m.closed_convo_id AND ${sharedConvoSql('cc')})) AS closed_hidden
   `
 }
 

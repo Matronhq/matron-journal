@@ -1120,3 +1120,36 @@ test('close with convo_id: on-mission conversation closes; a stranger is 403 not
   const m4 = (await s.http('/missions', { method: 'POST', token: agent.token, body: { title: 'Fourth', convo_id: 'c4' } })).json.mission
   assert.equal((await s.http(`/missions/${m4.id}/close`, { method: 'POST', token: client, body: { summary: 's', convo_id: 'nope' } })).status, 200)
 })
+
+test('close by a private Coordinator: closed_convo_id and the marker\'s by_convo_id stay behind the privacy boundary for an ordinary agent', async (t) => {
+  const { s, dan, agent, client } = await fleet(t)
+  const priv = createAgent(s.db, dan.id, 'private-box')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  upsertConversation(s.db, { id: 'pcoord', ownerUserId: dan.id, title: 'Private Coordinator', agentDeviceId: priv.deviceId })
+  assert.equal((await s.http('/coordinator', { method: 'PUT', token: client, body: { convo_id: 'pcoord' } })).status, 200)
+  // Public origin (c1, the ordinary agent's), closed by the private Coordinator.
+  const m = (await start(s, agent.token, {})).json.mission
+  const ws = await makeWsClient(s.base, { token: agent.token, cursor: null })
+  await ws.waitFor((f) => f.op === 'hello_ok')
+  const r = await s.http(`/missions/${m.id}/close`, { method: 'POST', token: priv.token, body: { summary: 's', convo_id: 'pcoord' } })
+  assert.equal(r.status, 200); assert.equal(r.json.mission.closed_convo_id, 'pcoord')
+  const marker = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'mission' && f.payload.action === 'closed')
+  assert.equal(marker.payload.by, 'agent'); assert.equal('by_convo_id' in marker.payload, false)
+  ws.close()
+  assert.equal((await s.http(`/missions/${m.id}`, { token: agent.token })).json.mission.closed_convo_id, null)
+  assert.equal((await s.http(`/missions/${m.id}`, { token: priv.token })).json.mission.closed_convo_id, 'pcoord')
+  assert.equal((await s.http(`/missions/${m.id}`, { token: client })).json.mission.closed_convo_id, 'pcoord')
+  const listed = (await s.http('/missions?state=closed', { token: agent.token })).json.missions.find((x) => x.id === m.id)
+  assert.equal(listed.closed_convo_id, null); assert.equal('closed_hidden' in listed, false)
+  // Private origin closed from the private side: the marker may carry the id
+  // (its readers are already behind the boundary).
+  upsertConversation(s.db, { id: 'porigin', ownerUserId: dan.id, title: 'PO', agentDeviceId: priv.deviceId })
+  const pm = (await s.http('/missions', { method: 'POST', token: priv.token, body: { title: 'Private', convo_id: 'porigin' } })).json.mission
+  const pws = await makeWsClient(s.base, { token: priv.token, cursor: null })
+  await pws.waitFor((f) => f.op === 'hello_ok')
+  assert.equal((await s.http(`/missions/${pm.id}/close`, { method: 'POST', token: priv.token, body: { summary: 's', convo_id: 'pcoord' } })).status, 200)
+  const pmarker = await pws.waitFor((f) => f.kind === 'journal' && f.type === 'mission' && f.payload.action === 'closed')
+  assert.equal(pmarker.payload.by_convo_id, 'pcoord')
+  pws.close()
+})
+

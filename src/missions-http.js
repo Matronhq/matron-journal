@@ -222,7 +222,10 @@ async function handleClose(ctx, req, res, who, mission) {
   emitMissionMarker(ctx, who, {
     mission: out.mission, action: 'closed', convoId: out.mission.origin_convo_id,
     openItemNums: who.kind === 'agent' ? null : out.openItemNums,
-    byConvoId: closer.convoId,
+    // Across the privacy boundary the marker carries no conversation id
+    // either: a private Coordinator closing a mission with a public origin
+    // must not hand its own id to every ordinary agent replaying the origin.
+    byConvoId: closer.convoId && markerTitleAllowed(db, closer.convoId, out.mission.origin_convo_id) ? closer.convoId : null,
   })
   json(res, 200, { mission: out.mission })
   return true

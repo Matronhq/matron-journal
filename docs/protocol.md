@@ -1843,8 +1843,11 @@ fails.
 Row shapes: a mission is `{id, user_id, num, state, title, body,
 close_summary, closed_by, closed_over_open_items, origin_convo_id,
 origin_device_id, created_by, created_at, updated_at, last_milestone_at,
-closed_at, status, status_by, status_convo_id, status_updated_at}` plus the
-counts listed against `GET /missions` above; a milestone is `{id,
+closed_at, status, status_by, status_convo_id, status_updated_at,
+closed_convo_id}` plus the counts listed against `GET /missions` above
+(`closed_convo_id` is null when no conversation was named and, for an
+ordinary agent, when the closing conversation is private-owned — the same
+sieve `status_convo_id` gets); a milestone is `{id,
 mission_id, num, kind, title, body, convo_id, seq, device_id, created_by,
 created_at}`. Stored columns stripped from the wire: `idem_key` (both
 shapes), `status_device_id` (mission — the device that wrote the status,
@@ -1935,6 +1938,10 @@ closing conversation as `closed_convo_id` (null for a client close and for
 a bridge that predates the field) and the `closed` marker carries it as
 `by_convo_id`, which is how an app can say "closed by the Coordinator"
 (compare it with the Coordinator setting) rather than only "by agent".
+Both stay behind the privacy boundary: an ordinary agent reads
+`closed_convo_id` as null when the closing conversation is private-owned,
+and the marker omits `by_convo_id` when the closing conversation is
+private-owned and the origin is not (the same rule as the marker's title).
 
 ### Marker events
 
