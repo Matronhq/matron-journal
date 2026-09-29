@@ -60,6 +60,9 @@ test('daily cap: approvals in the last 24 h at the cap answer 409 daily_cap and 
     f.target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { convo_id: 'child' } })
   })
   assert.equal((await answer(f, f.coordDev.token, { kind: 'spawn', id: first, decision: 'approve', reason: 'ok' })).status, 200)
+  // Let the first approval's start RPC settle before the server is torn
+  // down, or the broker waits out its 30 s timeout on close.
+  assert.equal((await f.asker.waitFor((x) => x.kind === 'spawn' && x.event === 'outcome' && x.request_id === first)).outcome, 'started')
   const capped = await answer(f, f.coordDev.token, { kind: 'spawn', id: second, decision: 'approve', reason: 'ok' })
   assert.equal(capped.status, 409); assert.equal(capped.json.detail, 'daily_cap'); assert.equal(capped.json.cap, 1)
   assert.equal(getSpawn(f.s.db, second).state, 'awaiting_user')
