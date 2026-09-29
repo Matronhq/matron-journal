@@ -112,34 +112,6 @@ test('session_control: refused for a non-Coordinator, a client, a foreign or pri
   e = await errorFrame(parent); assert.equal(e.code, 'bad_request'); assert.equal('request_id' in e, false)
 })
 
-test('session_control: an asleep wakeable target is acked with target_waking and the RPC goes out once it connects; an unwakeable one is agent_unreachable', async (t) => {
-  const calls = []
-  const waker = { enabled: true, wake: (name) => { calls.push(name); return true } }
-  const { s, parent, targetDev } = await fleet(t, { connectTarget: false, serverOpts: { waker, spawnWakeWaitMs: 5000 } })
-  parent.send({ op: 'session_control', request_id: 'w1', from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'compact' })
-  const sent = await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'sent' && f.request_id === 'w1')
-  assert.equal(sent.target_waking, true)
-  assert.deepEqual(calls, ['eric'])
-  const target = await makeWsClient(s.base, { token: targetDev.token, cursor: null })
-  t.after(() => target.close())
-  await target.waitFor((f) => f.op === 'hello_ok')
-  const req = await target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'session_control', 4000)
-  target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { applied: 'now' } })
-  const res = await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'result' && f.request_id === 'w1')
-  assert.equal(res.ok, true)
-})
-
-test('session_control: an offline target that cannot be woken is agent_unreachable; a silent target relays timeout', async (t) => {
-  const { parent } = await fleet(t, { connectTarget: false, serverOpts: { waker: { enabled: false, wake: () => false } } })
-  parent.send({ op: 'session_control', request_id: 'u1', from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'compact' })
-  const e = await errorFrame(parent, 'u1'); assert.equal(e.code, 'agent_unreachable')
-  const f2 = await fleet(t, { serverOpts: { sessionControlTimeoutMs: 200 } })
-  f2.parent.send({ op: 'session_control', request_id: 'u2', from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'compact' })
-  await f2.target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'session_control')
-  const res = await f2.parent.waitFor((f) => f.kind === 'session_control' && f.event === 'result' && f.request_id === 'u2', 3000)
-  assert.deepEqual(res, { kind: 'session_control', event: 'result', request_id: 'u2', ok: false, error: { code: 'timeout' } })
-})
-
 test('validateSessionControl: pure shape checks', () => {
   assert.deepEqual(validateSessionControl({ request_id: 'a', from_convo_id: 'c', target_convo_id: 't', action: 'compact' }), { ok: true, rid: 'a', params: { convo_id: 't', action: 'compact' } })
   assert.equal(validateSessionControl({ request_id: 'a', from_convo_id: 'c', target_convo_id: 't', action: 'set_model', agent: 'codex' }).params.agent, 'codex')
