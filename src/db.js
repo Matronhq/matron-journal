@@ -249,6 +249,19 @@ CREATE TABLE IF NOT EXISTS device_status(
   status TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_device_status_user ON device_status(user_id);
+-- Per-conversation session header (spec 2026-09-29 coordinator session
+-- control §1): the persisted subset of the bridge's status op — model,
+-- context gauge, usage-limit stall, account meters — so the roster and a
+-- mission's conversations can answer "how full is that session" for a box
+-- that is asleep or a journal that has restarted. Same shape as
+-- device_status: JSON per row, latest wins, goes with the conversation.
+CREATE TABLE IF NOT EXISTS conversation_status(
+  convo_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL,
+  reported_at INTEGER NOT NULL,
+  status TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conversation_status_user ON conversation_status(user_id);
 -- Per-user settings (spec 2026-09-23 coordinator redesign §1a). A table, not
 -- a users column, so later per-user settings have a home. No row = every
 -- setting at its default. coordinator_convo_id is not a foreign key — same
