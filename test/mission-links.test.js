@@ -11,6 +11,7 @@ import { createItem } from '../src/items.js'
 import {
   createMission, joinMission, closeMission, leaveMission, createMilestone, CONVOS_MAX,
   missionDetail, conversationMissions, getMission, foldSubchats, OTHER_MISSIONS_MAX,
+  updateMission, activityOf, QUIET_MS,
 } from '../src/missions.js'
 import { append } from '../src/journal.js'
 
@@ -449,4 +450,55 @@ test('snapshot: rows carry the current mission_id and mission_count (every link,
   assert.deepEqual([row(sieved, 'c3').mission_id, row(sieved, 'c3').mission_count], [null, 0])
   assert.deepEqual([row(sieved, 'c1').mission_id, row(sieved, 'c1').mission_count], [b.id, 2])
   assert.equal(row(sieved, 'secret'), undefined)
+})
+
+test('activityOf: closed > running > waiting (a waiting session or needs-you) > quiet (≥ 7 days) > idle', () => {
+  const now = 100 * QUIET_MS
+  const base = { state: 'open', running: 0, waiting: 0, needsYou: 0, lastActivityAt: now }
+  assert.equal(QUIET_MS, 7 * 24 * 60 * 60 * 1000)
+  assert.equal(activityOf({ ...base, state: 'closed', running: 2 }, now), 'closed')
+  assert.equal(activityOf({ ...base, running: 1, waiting: 1, needsYou: 1 }, now), 'running')
+  assert.equal(activityOf({ ...base, waiting: 1, lastActivityAt: 0 }, now), 'waiting')
+  assert.equal(activityOf({ ...base, needsYou: 2, lastActivityAt: 0 }, now), 'waiting')
+  assert.equal(activityOf({ ...base, lastActivityAt: now - QUIET_MS }, now), 'quiet')
+  assert.equal(activityOf({ ...base, lastActivityAt: now - QUIET_MS + 1 }, now), 'idle')
+})
+
+test('mission rows: activity follows linked sessions, needs-you, messages and closing; last_activity_at; project fields present', () => {
+  const db = seeded()
+  const m = startOn(db, 'c1', 'A')
+  const row = () => getMission(db, 1, m.id)
+  assert.equal(row().activity, 'running')
+  assert.equal(row().project_id, null); assert.equal(row().project_num, null)
+  assert.ok(row().last_activity_at >= row().created_at)
+  db.prepare("UPDATE conversations SET session_state='waiting' WHERE id='c1'").run()
+  assert.equal(row().activity, 'waiting')
+  db.prepare("UPDATE conversations SET session_state='done' WHERE id='c1'").run()
+  assert.equal(row().activity, 'idle')
+  const old = Date.now() - 8 * 24 * 60 * 60 * 1000
+  db.prepare('UPDATE missions SET created_at=? WHERE id=?').run(old, m.id)
+  db.prepare('UPDATE mission_conversations SET joined_at=? WHERE mission_id=?').run(old, m.id)
+  assert.equal(row().activity, 'quiet'); assert.equal(row().last_activity_at, old)
+  append(db, { userId: 1, convoId: 'c1', sender: 'agent:dev-2', type: 'text', payload: { body: 'back' } })
+  assert.equal(row().activity, 'idle', 'a message in a linked conversation is activity')
+  createItem(db, { userId: 1, originDeviceId: 7, createdBy: 'agent', kind: 'question', title: 'Q?', originConvoId: 'c1' })
+  assert.equal(row().activity, 'waiting', 'needs-you')
+  closeMission(db, { userId: 1, missionId: m.id, by: 'user', summary: 'done' })
+  assert.equal(row().activity, 'closed')
+})
+
+test('activity is sieved: a private box\'s running session or a privately written status never makes a mission look live to an ordinary agent', () => {
+  const db = withPrivateBox()
+  const m = startOn(db, 'c1', 'A')
+  db.prepare("UPDATE conversations SET session_state='done' WHERE id='c1'").run()
+  join(db, m.id, 'secret')
+  assert.equal(getMission(db, 1, m.id).activity, 'running')
+  assert.equal(getMission(db, 1, m.id, { excludePrivateOwned: true }).activity, 'idle')
+  const old = Date.now() - 8 * 24 * 60 * 60 * 1000
+  db.prepare("UPDATE conversations SET session_state='done' WHERE id='secret'").run()
+  db.prepare('UPDATE missions SET created_at=? WHERE id=?').run(old, m.id)
+  db.prepare('UPDATE mission_conversations SET joined_at=? WHERE mission_id=?').run(old, m.id)
+  updateMission(db, { userId: 1, missionId: m.id, fields: { status: 'Private progress' }, statusWriter: { by: 'agent', convoId: 'secret', deviceId: 9 } })
+  assert.equal(getMission(db, 1, m.id).activity, 'idle', 'the fresh status counts for the owner')
+  assert.equal(getMission(db, 1, m.id, { excludePrivateOwned: true }).activity, 'quiet', 'but not through the sieve')
 })

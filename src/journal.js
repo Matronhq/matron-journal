@@ -7,16 +7,8 @@ import { privateOwnedConvo } from './privacy.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { joinedAgentIds } from './participants.js'
 import { parseRepo } from './repo-identity.js'
-
-export const MESSAGE_TYPES = [
-  'text', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image', 'spawn_outcome',
-]
-
-// SQL literal of MESSAGE_TYPES for the last_ts subqueries (snapshot here,
-// roster in http.js). Safe to inline — the list is a compile-time constant
-// of bare identifiers, and a placeholder spread inside a correlated
-// subquery would force every caller to append the same seven arguments.
-export const MESSAGE_TYPES_SQL = MESSAGE_TYPES.map((t) => `'${t}'`).join(',')
+import { MESSAGE_TYPES, MESSAGE_TYPES_SQL } from './message-types.js'
+export { MESSAGE_TYPES, MESSAGE_TYPES_SQL }
 
 // Cap for a convo id wherever one arrives from outside the process —
 // ws.js's parent_convo_id/room_id validation and spawns.js's approveSpawn

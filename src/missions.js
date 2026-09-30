@@ -6,6 +6,7 @@ import { nextNum, newId, BODY_MAX } from './items.js'
 import { milestoneMarkerPayload } from './missions-marker.js'
 import { markerTitleAllowed } from './privacy.js'
 import { sharedConvoSql } from './visibility.js'
+import { MESSAGE_TYPES_SQL } from './message-types.js'
 import { activateLink, endLink, hasActiveLink, linkRow, nextCurrent, topLevelActiveCount } from './mission-links.js'
 
 export const MILESTONE_KINDS = ['user_input', 'progress']
@@ -20,6 +21,39 @@ export const STATUS_MAX = 600
 const STATUS_BAD_CHARS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029]/
 const STATUS_FIELDS = ['status', 'status_by', 'status_convo_id', 'status_updated_at']
 
+// Spec 2026-09-30 §2/§4.2 activity. quiet = nothing for 7 days; the clock
+// is read at row-building time.
+export const QUIET_MS = 7 * 24 * 60 * 60 * 1000
+
+export function activityOf({ state, running, waiting, needsYou, lastActivityAt }, nowMs = Date.now()) {
+  if (state === 'closed') return 'closed'
+  if (running > 0) return 'running'
+  if (waiting > 0 || needsYou > 0) return 'waiting'
+  if (nowMs - lastActivityAt >= QUIET_MS) return 'quiet'
+  return 'idle'
+}
+
+// The three per-caller inputs activity needs, over ACTIVE links only.
+// `sieve` is the caller's conversation predicate on alias c (the same one
+// the counts use), so a hidden session is never "running" and a hidden
+// conversation's messages are never "activity". A conversation's activity
+// is its newest MESSAGE event (the /snapshot last_ts rule — session_status
+// and markers are not activity) or when it joined, whichever is later.
+// Indexes: the link scans ride mission_conversations' PRIMARY KEY
+// (mission_id, convo_id); c is a conversations PK lookup; the newest-message
+// probe walks idx_events_convo (convo_id, seq) backwards from the top.
+function activitySql(sieve) {
+  return `
+    (SELECT COUNT(*) FROM mission_conversations al JOIN conversations c ON c.id = al.convo_id
+       WHERE al.mission_id = m.id AND al.ended_at IS NULL AND c.session_state = 'running' ${sieve}) AS running_convos,
+    (SELECT COUNT(*) FROM mission_conversations al JOIN conversations c ON c.id = al.convo_id
+       WHERE al.mission_id = m.id AND al.ended_at IS NULL AND c.session_state = 'waiting' ${sieve}) AS waiting_convos,
+    (SELECT MAX(max(al.joined_at, COALESCE((SELECT e.ts FROM events e WHERE e.convo_id = c.id
+                 AND e.type IN (${MESSAGE_TYPES_SQL}) ORDER BY e.seq DESC LIMIT 1), 0)))
+       FROM mission_conversations al JOIN conversations c ON c.id = al.convo_id
+       WHERE al.mission_id = m.id AND al.ended_at IS NULL ${sieve}) AS convo_activity_at`
+}
+
 const now = () => Date.now()
 
 // idem_key is internal (same stance as rowToItem). `sieved_last_milestone_at`
@@ -28,11 +62,14 @@ const now = () => Date.now()
 // missions dashboard §1) is internal too: the device that wrote the status,
 // kept only so the privacy sieve can key on it. `status_hidden` is the
 // per-caller sieve verdict countsSql/sharedCountsSql compute — never on the wire.
+// `running_convos`, `waiting_convos` and `convo_activity_at` are activity
+// inputs, never on the wire.
 export function missionRow(row) {
   if (!row) return null
   const {
-    idem_key: _idemKey, sieved_last_milestone_at: _sievedLastMilestoneAt,
-    status_device_id: _statusDeviceId, status_hidden: statusHidden, ...rest
+    idem_key: _idemKey, sieved_last_milestone_at: sievedLastMilestoneAt,
+    status_device_id: _statusDeviceId, status_hidden: statusHidden,
+    running_convos: runningConvos, waiting_convos: waitingConvos, convo_activity_at: convoActivityAt, ...rest
   } = row
   const { closed_hidden: closedHidden, ...bare } = rest
   const out = { ...bare, closed_over_open_items: Number(bare.closed_over_open_items || 0) }
@@ -49,6 +86,18 @@ export function missionRow(row) {
   // countsSql / sharedCountsSql. A withheld status reads as four nulls, the
   // same shape as "never set", so its absence says nothing.
   if (Number(statusHidden || 0)) for (const k of STATUS_FIELDS) out[k] = null
+  // Spec 2026-09-30 §2 activity — computed after the status sieve, so a
+  // withheld status_updated_at never counts. Every input here is the
+  // caller's own sieved view (countsSql / sharedCountsSql). One argument
+  // only (rows are built with .map(missionRow)); the clock is read here.
+  if (runningConvos !== undefined) {
+    out.last_activity_at = Math.max(...[out.created_at, sievedLastMilestoneAt, out.status_updated_at, convoActivityAt]
+      .filter((v) => v != null).map(Number))
+    out.activity = activityOf({
+      state: out.state, running: Number(runningConvos), waiting: Number(waitingConvos),
+      needsYou: out.needs_you ?? 0, lastActivityAt: out.last_activity_at,
+    })
+  }
   return out
 }
 
@@ -136,6 +185,8 @@ function countsSql(excludePrivateOwned) {
        ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS sieved_last_milestone_at,
     ${excludePrivateOwned ? STATUS_PRIVATE : '0'} AS status_hidden,
     ${excludePrivateOwned ? CLOSED_PRIVATE : '0'} AS closed_hidden
+    ,${activitySql(convoSieve)},
+    (SELECT p.num FROM projects p WHERE p.id = m.project_id) AS project_num
   `
 }
 
@@ -216,11 +267,12 @@ export function createMission(db, { userId, deviceId, createdBy, convoId, title,
   })()
 }
 
-export function listMissions(db, userId, { state = null, since = null, excludePrivateOwned = false } = {}) {
+export function listMissions(db, userId, { state = null, since = null, projectId = null, excludePrivateOwned = false } = {}) {
   const where = ['m.user_id = ?']
   const args = [userId]
   if (state) { where.push('m.state = ?'); args.push(state) }
   if (since != null) { where.push('m.updated_at >= ?'); args.push(since) }
+  if (projectId) { where.push('m.project_id = ?'); args.push(projectId) }
   // Same shape as listItems' excludePrivateOwned: a mission born in a private
   // device's conversation is invisible to an ordinary agent. One predicate,
   // shared with getMission (see ORIGIN_SIEVE) so the list and the single-row
@@ -632,6 +684,8 @@ function sharedCountsSql() {
           AND NOT EXISTS (SELECT 1 FROM conversations sc WHERE sc.id = m.status_convo_id AND ${sharedConvoSql('sc')}))) AS status_hidden,
     (m.closed_convo_id IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM conversations cc WHERE cc.id = m.closed_convo_id AND ${sharedConvoSql('cc')})) AS closed_hidden
+    ,${activitySql(`AND ${sharedConvoSql('c')}`)},
+    NULL AS project_num
   `
 }
 
@@ -640,6 +694,8 @@ function sharedMissionRow(row) {
   const { owner_json: ownerJson, ...rest } = row
   const mission = missionRow(rest)
   mission.owner = JSON.parse(ownerJson)
+  // Projects are never shared with colleagues (spec 2026-09-30 §9).
+  mission.project_id = null
   return mission
 }
 
