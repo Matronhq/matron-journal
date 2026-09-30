@@ -13,6 +13,7 @@ import {
   updateMission, joinMission, leaveMission, closeMission, createMilestone, listMilestones, milestoneRow,
   listSharedMissions, getSharedMission, sharedMissionDetail, listSharedMilestones, conversationMissions,
 } from './missions.js'
+import { getProject } from './projects.js'
 import { hasActiveLink } from './mission-links.js'
 import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE, missionMarkerPayload, milestoneMarkerPayload } from './missions-marker.js'
 import { filteredAgent, privateOwnedConvo, markerTitleAllowed } from './privacy.js'
@@ -21,7 +22,7 @@ import { canReadConvo } from './visibility.js'
 
 const STATES = ['open', 'closed']
 
-const byOf = (who) => (who.kind === 'agent' ? 'agent' : 'user')
+export const byOf = (who) => (who.kind === 'agent' ? 'agent' : 'user')
 
 // Visible = owned by the caller's user and, for an ordinary agent, not born
 // in a private device's conversation. Same 404 for every failure. Exported
@@ -39,7 +40,7 @@ export const visibleMission = (db, who, idOrNum) =>
 
 // The conversation gate for the two routes that target a conversation
 // rather than an already-visible mission (create, milestone, join).
-function writableConvo(db, who, convoId) {
+export function writableConvo(db, who, convoId) {
   if (typeof convoId !== 'string' || !convoId) return false
   const convo = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(convoId)
   if (!convo || convo.owner_user_id !== who.userId) return false
@@ -57,9 +58,9 @@ function writableConvo(db, who, convoId) {
 // always target the origin conversation, so the predicate is a no-op for
 // them; it is applied uniformly anyway rather than per-action, so a future
 // action written elsewhere is covered by construction.
-function emitMissionMarker({ db, hub }, who, { mission, action, convoId, openItemNums = null, statusChanged = false, byConvoId = null }) {
+export function emitMissionMarker({ db, hub }, who, { mission, action, convoId, openItemNums = null, statusChanged = false, byConvoId = null, projectChanged = false }) {
   const payload = missionMarkerPayload({
-    mission, action, by: byOf(who), openItemNums, statusChanged, byConvoId,
+    mission, action, by: byOf(who), openItemNums, statusChanged, byConvoId, projectChanged,
     withTitle: markerTitleAllowed(db, mission.origin_convo_id, convoId),
   })
   try {
@@ -67,6 +68,44 @@ function emitMissionMarker({ db, hub }, who, { mission, action, convoId, openIte
   } catch (err) {
     console.error('missions: marker append failed (mission write already committed)', err)
   }
+}
+
+// `project` on POST /missions and PATCH /missions/:id (spec 2026-09-30
+// §4.2): id, "#n" or n — or null (take it out). Resolved through the
+// caller's own sieve, so a project it cannot read is the same 404 as one
+// that does not exist. Filing INTO a closed project is refused.
+export function projectRefOf(db, who, ref) {
+  if (ref === null) return { projectId: null }
+  if (typeof ref !== 'string' && typeof ref !== 'number') return { status: 400 }
+  const p = getProject(db, who.userId, ref, { excludePrivateOwned: filteredAgent(db, who) })
+  if (!p) return { status: 404 }
+  if (p.state === 'closed') return { status: 409 }
+  return { projectId: p.id }
+}
+
+// The one mapping every caller of projectRefOf uses. Returns true when it
+// answered (the caller returns), false when the reference resolved.
+function refusedProjectRef(res, ref) {
+  if (ref.status === 400) return badRequest(res)
+  if (ref.status === 404) return notFound(res)
+  if (ref.status === 409) return conflict(res, { blocked_by: 'project_closed' })
+  return false
+}
+
+// Controller ruling D5: `project` is validated only on the path that
+// actually INSERTs a new mission. Mirrors createMission's own two
+// short-circuits (an idem_key replay, or — under attach — a conversation
+// that already has a current mission) so `POST /missions {project}` on an
+// `existing: true` reply ignores `project` outright: no 404, no 409, even
+// for a bogus or closed one. Tolerates the same TOCTOU as writableConvo
+// above — createMission re-reads both under its own transaction.
+function createsNewMission(db, userId, { convoId, idemKey, attach }) {
+  if (idemKey && db.prepare('SELECT 1 FROM missions WHERE user_id=? AND idem_key=?').get(userId, idemKey)) return false
+  if (attach) {
+    const convo = db.prepare('SELECT mission_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)
+    if (convo && convo.mission_id) return false
+  }
+  return true
 }
 
 async function handleCreate(ctx, req, res, who) {
@@ -80,12 +119,19 @@ async function handleCreate(ctx, req, res, who) {
   const idemKey = idemKeyOf(req, who)
   if (idemKey === undefined) return badRequest(res)
   if (!writableConvo(db, who, body.convo_id)) return notFound(res)
+  const attach = body.attach !== false
+  let projectId = null
+  if (body.project != null && createsNewMission(db, who.userId, { convoId: body.convo_id, idemKey, attach })) {
+    const ref = projectRefOf(db, who, body.project)
+    if (refusedProjectRef(res, ref)) return true
+    projectId = ref.projectId
+  }
   let out
   try {
     out = createMission(db, {
       userId: who.userId, deviceId: who.deviceId, createdBy: byOf(who), convoId: body.convo_id,
-      title: v.value.title, body: v.value.body ?? '', idemKey, attach: body.attach !== false,
-      excludePrivateOwned: filteredAgent(db, who),
+      title: v.value.title, body: v.value.body ?? '', idemKey, attach,
+      excludePrivateOwned: filteredAgent(db, who), projectId,
     })
   } catch (err) {
     // TOCTOU: writableConvo just confirmed the convo, but it can vanish
@@ -134,7 +180,7 @@ function handleList(ctx, res, url, who) {
 // for an ordinary agent never a private-owned one (that would file its own
 // status behind the sieve, and confirm the id exists). Anything else —
 // a client, a foreign or unknown id, a non-string — records null; never a 400.
-function statusConvoOf(db, who, convoId) {
+export function statusConvoOf(db, who, convoId) {
   if (who.kind !== 'agent' || typeof convoId !== 'string' || !convoId) return null
   const convo = db.prepare('SELECT owner_user_id FROM conversations WHERE id=?').get(convoId)
   if (!convo || convo.owner_user_id !== who.userId) return null
@@ -146,16 +192,27 @@ async function handlePatch(ctx, req, res, who, mission) {
   const { db } = ctx
   const body = await readBody(req)
   const v = validateMissionFields(body, { partial: true })
-  if (!v.ok || Object.keys(v.value).length === 0) return badRequest(res)
-  const statusWriter = typeof v.value.status === 'string'
+  if (!v.ok) return badRequest(res)
+  const fields = { ...v.value }
+  if (body.project !== undefined) {
+    const ref = projectRefOf(db, who, body.project)
+    if (refusedProjectRef(res, ref)) return true
+    fields.projectId = ref.projectId
+  }
+  if (Object.keys(fields).length === 0) return badRequest(res)
+  const statusWriter = typeof fields.status === 'string'
     ? { by: byOf(who), convoId: statusConvoOf(db, who, body.convo_id), deviceId: who.deviceId }
     : null
   let updated
   try {
-    updated = updateMission(db, { userId: who.userId, missionId: mission.id, fields: v.value, statusWriter, excludePrivateOwned: filteredAgent(db, who) })
+    updated = updateMission(db, { userId: who.userId, missionId: mission.id, fields, statusWriter, excludePrivateOwned: filteredAgent(db, who) })
   } catch (err) { if (err.message === 'closed') return conflict(res, { blocked_by: 'closed' }); throw err }
   if (!updated) return notFound(res)
-  emitMissionMarker(ctx, who, { mission: updated, action: 'updated', convoId: updated.origin_convo_id, statusChanged: v.value.status !== undefined })
+  emitMissionMarker(ctx, who, {
+    mission: updated, action: 'updated', convoId: updated.origin_convo_id,
+    statusChanged: fields.status !== undefined,
+    projectChanged: fields.projectId !== undefined && fields.projectId !== mission.project_id,
+  })
   json(res, 200, { mission: updated })
   return true
 }

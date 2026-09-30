@@ -685,6 +685,8 @@ test('missionMarkerPayload: status_changed appears only when statusChanged is tr
   assert.equal('status_changed' in missionMarkerPayload({ mission, action: 'updated', by: 'agent', statusChanged: false }), false)
   assert.deepEqual(missionMarkerPayload({ mission, action: 'updated', by: 'user', statusChanged: true, withTitle: false }),
     { mission_id: 'ms_1', num: 61, action: 'updated', by: 'user', status_changed: true })
+  assert.equal(missionMarkerPayload({ mission: { id: 'ms_1', num: 1, title: 'T' }, action: 'updated', by: 'agent', projectChanged: true }).project_changed, true)
+  assert.equal('project_changed' in missionMarkerPayload({ mission: { id: 'ms_1', num: 1, title: 'T' }, action: 'updated', by: 'agent' }), false)
 })
 
 test('mission status sieve: withheld from a filtered reader when written from a private-owned conversation or by a private device; the unfiltered reader always sees it', () => {

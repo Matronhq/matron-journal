@@ -240,7 +240,7 @@ function attachConversation(db, userId, convoId, missionId, ts) {
   repointItems(db, userId, convoId, missionId, ts)
 }
 
-export function createMission(db, { userId, deviceId, createdBy, convoId, title, body = '', idemKey = null, excludePrivateOwned = false, attach = true }) {
+export function createMission(db, { userId, deviceId, createdBy, convoId, title, body = '', idemKey = null, excludePrivateOwned = false, attach = true, projectId = null }) {
   return db.transaction(() => {
     if (idemKey) {
       const dup = db.prepare('SELECT id FROM missions WHERE user_id=? AND idem_key=?').get(userId, idemKey)
@@ -257,8 +257,8 @@ export function createMission(db, { userId, deviceId, createdBy, convoId, title,
     const num = nextNum(db, userId)
     const ts = now()
     try {
-      db.prepare(`INSERT INTO missions(id,user_id,num,state,title,body,origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at)
-        VALUES(?,?,?,'open',?,?,?,?,?,?,?,?)`).run(id, userId, num, title, body, convoId, deviceId, createdBy, idemKey, ts, ts)
+      db.prepare(`INSERT INTO missions(id,user_id,num,state,title,body,origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at,project_id)
+        VALUES(?,?,?,'open',?,?,?,?,?,?,?,?,?)`).run(id, userId, num, title, body, convoId, deviceId, createdBy, idemKey, ts, ts, projectId)
     } catch (err) {
       if (idemKey && err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
         const dup = db.prepare('SELECT id FROM missions WHERE user_id=? AND idem_key=?').get(userId, idemKey)
@@ -432,7 +432,11 @@ export function updateMission(db, { userId, missionId, fields, statusWriter = nu
   return db.transaction(() => {
     const cur = db.prepare('SELECT state FROM missions WHERE id=? AND user_id=?').get(missionId, userId)
     if (!cur) return null
-    if (cur.state === 'closed') throw new Error('closed')
+    // Refiling (spec 2026-09-30 §4.2) stays legal on a closed mission — a
+    // finished mission must stay correctable, like an item's move target —
+    // but nothing else about it changes.
+    const onlyProject = Object.keys(fields).length > 0 && Object.keys(fields).every((k) => k === 'projectId')
+    if (cur.state === 'closed' && !onlyProject) throw new Error('closed')
     const ts = now()
     const sets = []; const args = []
     if (fields.title !== undefined) { sets.push('title=?'); args.push(fields.title) }
@@ -443,6 +447,7 @@ export function updateMission(db, { userId, missionId, fields, statusWriter = nu
       sets.push('status=?', 'status_by=?', 'status_convo_id=?', 'status_device_id=?', 'status_updated_at=?')
       args.push(fields.status, w.by, w.convoId ?? null, w.deviceId ?? null, fields.status === null ? null : ts)
     }
+    if (fields.projectId !== undefined) { sets.push('project_id=?'); args.push(fields.projectId) }
     sets.push('updated_at=?'); args.push(ts)
     db.prepare(`UPDATE missions SET ${sets.join(', ')} WHERE id=? AND user_id=?`).run(...args, missionId, userId)
     return getMission(db, userId, missionId, { excludePrivateOwned })
