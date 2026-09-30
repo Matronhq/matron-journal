@@ -277,12 +277,15 @@ export function createMission(db, { userId, deviceId, createdBy, convoId, title,
   })()
 }
 
-export function listMissions(db, userId, { state = null, since = null, projectId = null, excludePrivateOwned = false } = {}) {
+export function listMissions(db, userId, { state = null, since = null, projectId = null, filed = false, excludePrivateOwned = false } = {}) {
   const where = ['m.user_id = ?']
   const args = [userId]
   if (state) { where.push('m.state = ?'); args.push(state) }
   if (since != null) { where.push('m.updated_at >= ?'); args.push(since) }
   if (projectId) { where.push('m.project_id = ?'); args.push(projectId) }
+  // filed: only missions in SOME project — listProjects' rollups never need
+  // the (usually far larger) unfiled rest.
+  if (filed) where.push('m.project_id IS NOT NULL')
   // Same shape as listItems' excludePrivateOwned: a mission born in a private
   // device's conversation is invisible to an ordinary agent. One predicate,
   // shared with getMission (see ORIGIN_SIEVE) so the list and the single-row

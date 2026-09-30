@@ -192,7 +192,7 @@ export function listProjects(db, userId, { state = null, excludePrivateOwned = f
   if (state) { where.push('p.state = ?'); args.push(state) }
   if (excludePrivateOwned) where.push(PROJECT_ORIGIN_SIEVE)
   const rows = db.prepare(`${selectSql(excludePrivateOwned)} WHERE ${where.join(' AND ')}`).all(...args).map(projectRow)
-  const rollups = rollupsByProject(listMissions(db, userId, { excludePrivateOwned }))
+  const rollups = rollupsByProject(listMissions(db, userId, { filed: true, excludePrivateOwned }))
   return rows.map((p) => withRollup(p, rollups.get(p.id)))
     .sort((a, b) => (b.last_activity_at - a.last_activity_at) || (b.created_at - a.created_at))
 }

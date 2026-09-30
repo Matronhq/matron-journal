@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { openDb } from '../src/db.js'
 import { upsertConversation, append } from '../src/journal.js'
 import { createItem } from '../src/items.js'
-import { createMission, joinMission, closeMission, createMilestone } from '../src/missions.js'
+import { createMission, joinMission, closeMission, createMilestone, listMissions } from '../src/missions.js'
 import {
   createProject, getProject, resolveProject, updateProject, closeProject, mergeProject, listProjects, projectDetail, MERGE_HOPS_MAX,
 } from '../src/projects.js'
@@ -98,6 +98,15 @@ test('mergeProject: moves every mission (open and closed), closes the source as 
   assert.throws(() => mergeProject(db, { userId: 1, projectId: a.id, intoId: c.id, by: 'user' }), /closed/)
   const d = mk(db, { title: 'D' }).project
   assert.throws(() => mergeProject(db, { userId: 1, projectId: d.id, intoId: a.id, by: 'user' }), /into_closed/)
+})
+
+test('listMissions {filed}: only missions filed in some project (what listProjects rolls up)', () => {
+  const db = seeded()
+  const p = mk(db).project
+  const filed = mission(db, 'c1', 'Filed'); mission(db, 'c2', 'Loose')
+  file(db, filed.id, p.id)
+  assert.deepEqual(listMissions(db, 1, { filed: true }).map((m) => m.id), [filed.id])
+  assert.equal(listMissions(db, 1).length, 2)
 })
 
 test('listProjects: rollups count mission activity, sum needs_you/open_items, and take the latest activity; state filter; newest activity first', () => {
