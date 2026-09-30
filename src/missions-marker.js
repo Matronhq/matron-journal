@@ -13,7 +13,7 @@
 // every later WS replay all agree (ws.js replays payloads verbatim).
 export const MISSION_EVENT_TYPE = 'mission'
 export const MILESTONE_EVENT_TYPE = 'milestone'
-export const MISSION_ACTIONS = ['created', 'joined', 'updated', 'closed']
+export const MISSION_ACTIONS = ['created', 'joined', 'updated', 'closed', 'left', 'current_changed']
 
 // The milestone marker's own seq is the anchor the apps jump to; the
 // payload carries enough to render the inline card without a fetch.
@@ -40,7 +40,10 @@ export function milestoneMarkerPayload({ milestone, mission, by, withTitle = tru
 // conversation — the audit line behind "closed by the Coordinator" (a
 // closing conversation that is not on the mission is the Coordinator by
 // construction; the apps compare it with the Coordinator setting).
-export function missionMarkerPayload({ mission, action, by, openItemNums = null, withTitle = true, statusChanged = false, byConvoId = null }) {
+// project_changed (spec 2026-09-30 §4.2) is present only on an `updated`
+// that moved the mission into, out of or between projects — the apps' cue
+// to refresh GET /projects.
+export function missionMarkerPayload({ mission, action, by, openItemNums = null, withTitle = true, statusChanged = false, byConvoId = null, projectChanged = false }) {
   if (!MISSION_ACTIONS.includes(action)) throw new Error(`unknown mission action: ${action}`)
   const out = {
     mission_id: mission.id, num: mission.num,
@@ -50,5 +53,6 @@ export function missionMarkerPayload({ mission, action, by, openItemNums = null,
   if (openItemNums && openItemNums.length) out.open_item_nums = openItemNums
   if (statusChanged) out.status_changed = true
   if (byConvoId) out.by_convo_id = byConvoId
+  if (projectChanged) out.project_changed = true
   return out
 }

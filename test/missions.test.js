@@ -12,7 +12,7 @@ import { markerTitleAllowed } from '../src/privacy.js'
 import { classify } from '../src/push.js'
 import {
   createMission, getMission, listMissions, missionDetail, updateMission, joinMission, closeMission, repointItems, validateMissionFields,
-  createMilestone, listMilestones, CONVOS_MAX, STATUS_MAX,
+  createMilestone, listMilestones, STATUS_MAX,
 } from '../src/missions.js'
 import { createItem } from '../src/items.js'
 
@@ -22,7 +22,7 @@ test('schema: missions and milestones exist with the expected columns; mission_i
   assert.deepEqual(cols('missions'), [
     'id', 'user_id', 'num', 'state', 'title', 'body', 'close_summary', 'closed_by', 'closed_over_open_items',
     'origin_convo_id', 'origin_device_id', 'created_by', 'idem_key', 'created_at', 'updated_at', 'last_milestone_at', 'closed_at',
-    'status', 'status_by', 'status_convo_id', 'status_updated_at', 'status_device_id', 'closed_convo_id',
+    'status', 'status_by', 'status_convo_id', 'status_updated_at', 'status_device_id', 'closed_convo_id', 'project_id',
   ])
   assert.deepEqual(cols('milestones'), [
     'id', 'mission_id', 'user_id', 'num', 'kind', 'title', 'body', 'convo_id', 'seq', 'device_id', 'created_by', 'idem_key', 'created_at',
@@ -103,7 +103,7 @@ test('marker payloads carry exactly the documented fields', () => {
   assert.deepEqual(missionMarkerPayload({ mission, action: 'closed', by: 'user', openItemNums: [64, 70] }),
     { mission_id: 'ms_1', num: 61, title: 'Missions & milestones', action: 'closed', by: 'user', open_item_nums: [64, 70] })
   assert.equal(MISSION_EVENT_TYPE, 'mission'); assert.equal(MILESTONE_EVENT_TYPE, 'milestone')
-  assert.deepEqual(MISSION_ACTIONS, ['created', 'joined', 'updated', 'closed'])
+  assert.deepEqual(MISSION_ACTIONS, ['created', 'joined', 'updated', 'closed', 'left', 'current_changed'])
 })
 
 // Fix round 2, Critical: across the privacy boundary a marker carries
@@ -162,6 +162,8 @@ test('snippetOf renders both markers; classify never pushes them', () => {
   assert.equal(snippetOf('mission', { num: 61, action: 'created' }), '🏁 Mission #61 started')
   assert.equal(snippetOf('mission', { num: 61, action: 'joined' }), '🏁 Joined mission #61')
   assert.equal(snippetOf('mission', { num: 61, action: 'updated' }), '🏁 Mission #61 updated')
+  assert.equal(snippetOf('mission', { num: 61, action: 'left' }), '🏁 Left mission #61')
+  assert.equal(snippetOf('mission', { num: 61, action: 'current_changed' }), '🏁 Now on mission #61')
   assert.equal(snippetOf('mission', { num: 61, action: 'closed' }), '🏁 Mission #61 closed')
   assert.equal(classify('milestone', { num: 63 }, 'agent:dev-2'), null)
   assert.equal(classify('mission', { num: 61, action: 'closed' }, 'user:dan'), null)
@@ -218,7 +220,7 @@ test('validateMissionFields: title ≤200, body ≤32 KiB, partial allows either
   assert.equal(validateMissionFields({}).ok, false)
 })
 
-test('join: attaches a second conversation and repoints its items; refuses a convo with another mission or a closed mission', () => {
+test('join: attaches a second conversation and repoints its items; a conversation on another mission now joins it; a closed mission refuses', () => {
   const db = seeded()
   const a = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
   const { item } = createItem(db, { userId: 1, originDeviceId: 7, createdBy: 'agent', kind: 'task', title: 'T', originConvoId: 'c2' })
@@ -227,7 +229,9 @@ test('join: attaches a second conversation and repoints its items; refuses a con
   assert.equal(db.prepare('SELECT mission_id FROM items WHERE id=?').get(item.id).mission_id, a.id)
   upsertConversation(db, { id: 'c3', ownerUserId: 1, title: 'C3', agentDeviceId: 7 })
   const b = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c3', title: 'B' }).mission
-  assert.throws(() => joinMission(db, { userId: 1, missionId: b.id, convoId: 'c2' }), /other_mission/)
+  const moved = joinMission(db, { userId: 1, missionId: b.id, convoId: 'c2' })
+  assert.equal(moved.action, 'joined')
+  assert.equal(db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('c2').mission_id, b.id)
   closeMission(db, { userId: 1, missionId: b.id, by: 'agent', summary: 'done' })
   upsertConversation(db, { id: 'c4', ownerUserId: 1, title: 'C4', agentDeviceId: 7 })
   assert.throws(() => joinMission(db, { userId: 1, missionId: b.id, convoId: 'c4' }), /closed/)
@@ -520,34 +524,15 @@ test('createMilestone: a filtered caller on a conversation whose mission is hidd
 
 // ---------------------------------------------------------------------------
 // Final review, I1: inheritance is a way INTO a mission, so join's own gates
-// apply to it — an open mission, under the conversation cap, and never a
+// apply to it — an open mission (sub-chats never count toward the cap), never a
 // private-owned parent for an ordinary agent.
 // ---------------------------------------------------------------------------
-function packConvos(db, missionId, n, prefix) {
-  const ins = db.prepare("INSERT INTO conversations(id, owner_user_id, title, session_state, mission_id, created_at) VALUES(?,1,'x','running',?,0)")
-  for (let i = 0; i < n; i++) ins.run(`${prefix}${i}`, missionId)
-}
-
 test('inheritance gate: a closed parent mission is not inherited', () => {
   const db = seeded()
   const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
   closeMission(db, { userId: 1, missionId: m.id, by: 'agent', summary: 'done' })
   upsertConversation(db, { id: 'kid', ownerUserId: 1, title: 'k', agentDeviceId: 7, parentConvoId: 'c1' })
   assert.equal(missionOf(db, 'kid'), null)
-})
-
-test('inheritance gate: a parent mission already at CONVOS_MAX is not inherited (the cap is never exceeded)', () => {
-  const db = seeded()
-  const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
-  packConvos(db, m.id, CONVOS_MAX - 1, 'pad')  // c1 + 199 = 200
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE mission_id=?').get(m.id).n, CONVOS_MAX)
-  upsertConversation(db, { id: 'kid', ownerUserId: 1, title: 'k', agentDeviceId: 7, parentConvoId: 'c1' })
-  assert.equal(missionOf(db, 'kid'), null)
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE mission_id=?').get(m.id).n, CONVOS_MAX)
-  // One under the cap still inherits.
-  db.prepare('UPDATE conversations SET mission_id=NULL WHERE id=?').run('pad0')
-  upsertConversation(db, { id: 'kid2', ownerUserId: 1, title: 'k', agentDeviceId: 7, parentConvoId: 'c1' })
-  assert.equal(missionOf(db, 'kid2'), m.id)
 })
 
 test('inheritance gate: a private-owned parent is not inherited by an ordinary agent, but is by a private one', () => {
@@ -700,6 +685,8 @@ test('missionMarkerPayload: status_changed appears only when statusChanged is tr
   assert.equal('status_changed' in missionMarkerPayload({ mission, action: 'updated', by: 'agent', statusChanged: false }), false)
   assert.deepEqual(missionMarkerPayload({ mission, action: 'updated', by: 'user', statusChanged: true, withTitle: false }),
     { mission_id: 'ms_1', num: 61, action: 'updated', by: 'user', status_changed: true })
+  assert.equal(missionMarkerPayload({ mission: { id: 'ms_1', num: 1, title: 'T' }, action: 'updated', by: 'agent', projectChanged: true }).project_changed, true)
+  assert.equal('project_changed' in missionMarkerPayload({ mission: { id: 'ms_1', num: 1, title: 'T' }, action: 'updated', by: 'agent' }), false)
 })
 
 test('mission status sieve: withheld from a filtered reader when written from a private-owned conversation or by a private device; the unfiltered reader always sees it', () => {

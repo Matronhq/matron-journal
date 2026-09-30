@@ -275,11 +275,13 @@ export function joinSpawnMission(db, hub, row, childConvoId) {
       return null
     }
     if (!exists) upsertConversation(db, { id: childConvoId, ownerUserId: row.user_id, sessionState: 'running', agentDeviceId: row.target_device_id })
-    const joined = joinMission(db, { userId: row.user_id, missionId: mission.id, convoId: childConvoId, excludePrivateOwned })
-    appendAndBroadcast(db, hub, {
-      userId: row.user_id, convoId: childConvoId, sender: 'journal', type: MISSION_EVENT_TYPE,
-      payload: missionMarkerPayload({ mission: joined, action: 'joined', by: 'agent', withTitle: markerTitleAllowed(db, joined.origin_convo_id, childConvoId) }),
-    })
+    const { mission: joined, action } = joinMission(db, { userId: row.user_id, missionId: mission.id, convoId: childConvoId, how: 'spawned', excludePrivateOwned })
+    if (action) {
+      appendAndBroadcast(db, hub, {
+        userId: row.user_id, convoId: childConvoId, sender: 'journal', type: MISSION_EVENT_TYPE,
+        payload: missionMarkerPayload({ mission: joined, action, by: 'agent', withTitle: markerTitleAllowed(db, joined.origin_convo_id, childConvoId) }),
+      })
+    }
     return joined
   } catch (err) {
     console.error('approveSpawn: mission join failed (session already started)', err)

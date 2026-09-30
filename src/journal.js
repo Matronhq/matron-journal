@@ -1,21 +1,14 @@
 import { authorize } from './auth.js'
 import { isPrivateDevice } from './db.js'
 import { indexableBody } from './search.js'
-import { CONVOS_MAX, getMission } from './missions.js'
+import { getMission, ORIGIN_SIEVE } from './missions.js'
+import { activateLink } from './mission-links.js'
 import { privateOwnedConvo } from './privacy.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { joinedAgentIds } from './participants.js'
 import { parseRepo } from './repo-identity.js'
-
-export const MESSAGE_TYPES = [
-  'text', 'tool_output', 'diff', 'prompt', 'permission_request', 'file', 'image', 'spawn_outcome',
-]
-
-// SQL literal of MESSAGE_TYPES for the last_ts subqueries (snapshot here,
-// roster in http.js). Safe to inline — the list is a compile-time constant
-// of bare identifiers, and a placeholder spread inside a correlated
-// subquery would force every caller to append the same seven arguments.
-export const MESSAGE_TYPES_SQL = MESSAGE_TYPES.map((t) => `'${t}'`).join(',')
+import { MESSAGE_TYPES, MESSAGE_TYPES_SQL } from './message-types.js'
+export { MESSAGE_TYPES, MESSAGE_TYPES_SQL }
 
 // Cap for a convo id wherever one arrives from outside the process —
 // ws.js's parent_convo_id/room_id validation and spawns.js's approveSpawn
@@ -96,6 +89,8 @@ export function snippetOf(type, payload) {
     if (p.action === 'closed') return `🏁 Mission #${n} closed`
     if (p.action === 'created') return (p.title ? `🏁 Mission #${n} started: ${String(p.title)}` : `🏁 Mission #${n} started`).slice(0, 120)
     if (p.action === 'joined') return `🏁 Joined mission #${n}`
+    if (p.action === 'left') return `🏁 Left mission #${n}`
+    if (p.action === 'current_changed') return `🏁 Now on mission #${n}`
     return `🏁 Mission #${n} updated`
   }
   if (p.snippet) return String(p.snippet).slice(0, 120)
@@ -121,9 +116,10 @@ export function snippetOf(type, payload) {
 //      private-owned PARENT or through a public parent the user had joined
 //      to a private-ORIGIN mission (both are ways around the sieve, and
 //      the second is invisible from the parent row alone);
-//   2. the mission must be OPEN — a closed mission accepts no joins;
-//   3. it must hold fewer than CONVOS_MAX conversations — a spawn must
-//      never push a mission past a cap `join` refuses at.
+//   2. the mission must be OPEN — a closed mission accepts no joins.
+//
+// Sub-chats are never counted toward CONVOS_MAX (spec 2026-09-30 §3), so
+// there is no cap gate: a full mission still takes its sub-chats.
 //
 // A child that fails any gate simply starts with no mission. A creator with
 // no device id (an internal or test upsert) counts as unfiltered, like
@@ -136,10 +132,6 @@ function inheritableMission(db, { parentConvoId, ownerUserId, agentDeviceId }) {
   if (filtered && privateOwnedConvo(db, parentConvoId)) return null
   const mission = getMission(db, ownerUserId, missionId, { excludePrivateOwned: filtered })
   if (!mission || mission.state !== 'open') return null
-  // The RAW count, never the row's `conversations` — that one is sieved for
-  // a filtered caller, and the cap is a limit on the table, not on what
-  // this creator happens to be allowed to see.
-  if (db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE mission_id=?').get(missionId).n >= CONVOS_MAX) return null
   return missionId
 }
 
@@ -208,9 +200,15 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     // inheritableMission above. Set once here and never on the update path
     // — same immutability as parent_convo_id.
     const inheritedMission = parentConvoId ? inheritableMission(db, { parentConvoId, ownerUserId, agentDeviceId }) : null
-    db.prepare(
-      'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, mission_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)'
-    ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', inheritedMission, Date.now())
+    const createdAt = Date.now()
+    // The row and its inherited link are one write: the invariant "a
+    // non-null mission_id has an active link" must hold from birth.
+    db.transaction(() => {
+      db.prepare(
+        'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, mission_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)'
+      ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', inheritedMission, createdAt)
+      if (inheritedMission) activateLink(db, { missionId: inheritedMission, convoId: id, userId: ownerUserId, how: 'inherited', ts: createdAt })
+    })()
     if (initialTitle || parentConvoId) metaChanged = true
     if (repoCols && repoCols.repo) {
       db.prepare('UPDATE conversations SET repo=?, repo_scope=? WHERE id=?').run(repoCols.repo, repoCols.scope, id)
@@ -351,10 +349,19 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   // has no message events (just created, or history pruned by retention) —
   // clients fall back to created_at. The (convo_id, seq) index keeps the
   // subquery a backwards seek to the first message row.
+  // mission_id / mission_count (spec 2026-09-30 §3): the header chip without
+  // a fetch — the current mission and how many missions this conversation
+  // ever touched; a filtered caller never counts or names a private-origin
+  // mission.
   const conversations = db.prepare(
     `SELECT id, title, session_state, session_outcome, last_seq, unread_count,
             ${omitSnippet ? 'NULL' : 'snippet'} AS snippet,
             parent_convo_id, summary, repo, created_at, agent_device_id,
+            ${excludePrivateOwned
+              ? `(CASE WHEN EXISTS (SELECT 1 FROM missions m WHERE m.id = conversations.mission_id AND ${ORIGIN_SIEVE}) THEN conversations.mission_id END)`
+              : 'mission_id'} AS mission_id,
+            (SELECT COUNT(*) FROM mission_conversations l JOIN missions m ON m.id = l.mission_id
+              WHERE l.convo_id = conversations.id${excludePrivateOwned ? ` AND ${ORIGIN_SIEVE}` : ''}) AS mission_count,
             (SELECT ts FROM events e WHERE e.convo_id = conversations.id
              AND e.type IN (${MESSAGE_TYPES_SQL})
              ORDER BY e.seq DESC LIMIT 1) AS last_ts

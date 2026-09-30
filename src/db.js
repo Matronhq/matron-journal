@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3'
 import { healBakedTitles } from './heal-titles.js'
+import { backfillMissionLinks, healMissionLinks } from './mission-links.js'
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users(
@@ -311,6 +312,53 @@ CREATE TABLE IF NOT EXISTS memories(
   UNIQUE(user_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(user_id, updated_at);
+-- Conversation ↔ mission links (spec 2026-09-30 projects & mission links
+-- §3). One row per (mission, conversation) the conversation ever worked on:
+-- ended_at NULL = active ("on it now"), set = history ("earlier").
+-- conversations.mission_id stays as the CURRENT pointer — invariant: when it
+-- is non-null an active link exists for it. No foreign keys (same stance as
+-- conversations.mission_id); ownership is checked on write.
+CREATE TABLE IF NOT EXISTS mission_conversations(
+  mission_id TEXT NOT NULL,
+  convo_id   TEXT NOT NULL,
+  user_id    INTEGER NOT NULL,
+  how        TEXT NOT NULL CHECK(how IN ('origin','joined','spawned','inherited','backfill')),
+  joined_at  INTEGER NOT NULL,
+  ended_at   INTEGER,
+  PRIMARY KEY(mission_id, convo_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mc_convo ON mission_conversations(convo_id, ended_at);
+-- Projects (spec 2026-09-30 §4): groups of missions. Numbered from
+-- item_counters like items/missions/milestones. status_device_id and
+-- idem_key are internal (never on the wire). merged_into names the project a
+-- merge closed this one into.
+CREATE TABLE IF NOT EXISTS projects(
+  id                        TEXT PRIMARY KEY,
+  user_id                   INTEGER NOT NULL REFERENCES users(id),
+  num                       INTEGER NOT NULL,
+  state                     TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open','closed')),
+  title                     TEXT NOT NULL,
+  body                      TEXT NOT NULL DEFAULT '',
+  status                    TEXT,
+  status_by                 TEXT CHECK(status_by IN ('user','agent')),
+  status_convo_id           TEXT,
+  status_device_id          INTEGER,
+  status_updated_at         INTEGER,
+  close_summary             TEXT,
+  closed_by                 TEXT CHECK(closed_by IN ('user','agent')),
+  closed_over_open_missions INTEGER NOT NULL DEFAULT 0,
+  closed_at                 INTEGER,
+  merged_into               TEXT,
+  origin_convo_id           TEXT,
+  origin_device_id          INTEGER NOT NULL,
+  created_by                TEXT NOT NULL CHECK(created_by IN ('user','agent')),
+  idem_key                  TEXT,
+  created_at                INTEGER NOT NULL,
+  updated_at                INTEGER NOT NULL,
+  UNIQUE(user_id, num),
+  UNIQUE(user_id, idem_key)
+);
+CREATE INDEX IF NOT EXISTS idx_projects_user_state ON projects(user_id, state);
 `
 
 export function openDb(path) {
@@ -590,12 +638,13 @@ export function openDb(path) {
   // refreshSpawnRoomTitle (spawns.js) looks a started row up by its child
   // on every titled convo_upsert; keep that a point lookup.
   db.exec('CREATE INDEX IF NOT EXISTS idx_spawn_child ON agent_spawn_requests(child_convo_id)')
-  // Missions (spec 2026-09-10): a conversation belongs to at most one
-  // mission, set once and never changed; an item follows its origin
-  // conversation but can be moved (PATCH /items/:id {mission}). Both are
-  // NULL for every row predating the column. Placed here, after every
-  // table-rebuild block, so a rebuild can never drop them. Not foreign
-  // keys — same stance as parent_convo_id.
+  // Missions (spec 2026-09-10): conversations.mission_id is the
+  // conversation's CURRENT mission (spec 2026-09-30: see
+  // mission_conversations); an item follows its origin conversation but
+  // can be moved (PATCH /items/:id {mission}). Both are NULL for every row
+  // predating the column. Placed here, after every table-rebuild block, so
+  // a rebuild can never drop them. Not foreign keys — same stance as
+  // parent_convo_id.
   const missionConvoCols = db.prepare('PRAGMA table_info(conversations)').all()
   if (!missionConvoCols.some((c) => c.name === 'mission_id')) {
     db.exec('ALTER TABLE conversations ADD COLUMN mission_id TEXT')
@@ -649,6 +698,19 @@ export function openDb(path) {
   // close"): the audit line behind "closed by the Coordinator". NULL for a
   // client close and for a bridge that predates the field.
   addMissionCol('closed_convo_id', 'closed_convo_id TEXT')
+  // The project a mission is filed in (spec 2026-09-30 §4.1): at most one,
+  // NULL = unfiled. Not a foreign key. The index cannot live in SCHEMA: on an
+  // upgraded database SCHEMA runs before this ALTER adds the column.
+  addMissionCol('project_id', 'project_id TEXT')
+  db.exec('CREATE INDEX IF NOT EXISTS idx_missions_project ON missions(project_id, state)')
+  // Spec 2026-09-30 §3 backfill: once, while the link table is empty. After
+  // every mission/conversation/item column it reads has been added above.
+  const backfilled = backfillMissionLinks(db)
+  if (backfilled > 0) console.log(`mission_conversations: backfilled ${backfilled} link(s)`)
+  // And on EVERY open: a pointer written without a link (old code after a
+  // rollback) gets its active link back, so the invariant always holds.
+  const healed = healMissionLinks(db)
+  if (healed > 0) console.log(`mission_conversations: healed ${healed} link(s)`)
   // Coordinator consent approval (spec: matron-bridge 2026-09-29 coordinator
   // consent): the off switch (default ON, the choice Dan made), and on both
   // ask tables who answered a parked row and why — 'coordinator' + reason
