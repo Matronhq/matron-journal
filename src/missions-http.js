@@ -222,6 +222,11 @@ async function handleLeave(ctx, req, res, who, mission) {
 // route the role gates. Anyone else: 403 not_coordinator, and nothing about
 // the mission is learned beyond what visibleMission already answered.
 // A client never names one; the apps' close is the user's own override.
+// A close summary: a non-blank string of at most BODY_MAX UTF-8 bytes.
+// Shared with the project close route.
+export const validCloseSummary = (summary) =>
+  typeof summary === 'string' && !!summary.trim() && Buffer.byteLength(summary, 'utf8') <= BODY_MAX
+
 function closingConvo(db, who, mission, convoId) {
   if (who.kind !== 'agent' || convoId === undefined) return { convoId: null }
   if (typeof convoId !== 'string' || !convoId) return { status: 400 }
@@ -236,7 +241,7 @@ function closingConvo(db, who, mission, convoId) {
 async function handleClose(ctx, req, res, who, mission) {
   const { db } = ctx
   const body = await readBody(req)
-  if (typeof body.summary !== 'string' || !body.summary.trim() || Buffer.byteLength(body.summary, 'utf8') > BODY_MAX) return badRequest(res)
+  if (!validCloseSummary(body.summary)) return badRequest(res)
   const closer = closingConvo(db, who, mission, body.convo_id)
   if (closer.status === 400) return badRequest(res)
   if (closer.status === 404) return notFound(res)

@@ -19,7 +19,8 @@ export const STATUS_MAX = 600
 // paragraph needs. CRLF is folded to \n before this runs, so only a LONE
 // \r is refused.
 const STATUS_BAD_CHARS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029]/
-const STATUS_FIELDS = ['status', 'status_by', 'status_convo_id', 'status_updated_at']
+// Shared with projects.js: the four status columns a withheld status nulls.
+export const STATUS_FIELDS = ['status', 'status_by', 'status_convo_id', 'status_updated_at']
 
 // Spec 2026-09-30 §2/§4.2 activity. quiet = nothing for 7 days; the clock
 // is read at row-building time.
@@ -144,11 +145,14 @@ export function validateMissionFields(body, { partial = false } = {}) {
 // agent that named no conversation (or a public one) wrote it all the same.
 // Evaluated at read time against the current private flag, like every other
 // private-owned sieve here.
-const STATUS_PRIVATE = `(
-  EXISTS (SELECT 1 FROM devices sd WHERE sd.id = m.status_device_id AND sd.private = 1)
+// `alias` names the row's table alias, so projects.js applies the same
+// sieve to its own status columns (projects p).
+export const statusPrivateSql = (alias) => `(
+  EXISTS (SELECT 1 FROM devices sd WHERE sd.id = ${alias}.status_device_id AND sd.private = 1)
   OR EXISTS (SELECT 1 FROM conversations sc JOIN devices sd ON sd.id = sc.agent_device_id
-             WHERE sc.id = m.status_convo_id AND sd.private = 1)
+             WHERE sc.id = ${alias}.status_convo_id AND sd.private = 1)
 )`
+const STATUS_PRIVATE = statusPrivateSql('m')
 
 // The closing conversation (closed_convo_id) is withheld from an ordinary
 // agent when it is private-owned, as status_convo_id is above.
