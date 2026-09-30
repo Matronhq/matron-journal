@@ -269,8 +269,23 @@ CREATE INDEX IF NOT EXISTS idx_conversation_status_user ON conversation_status(u
 CREATE TABLE IF NOT EXISTS user_settings(
   user_id INTEGER PRIMARY KEY REFERENCES users(id),
   coordinator_convo_id TEXT,
+  coordinator_consent INTEGER NOT NULL DEFAULT 1,
   updated_at INTEGER NOT NULL
 );
+-- Coordinator consent decisions (spec: matron-bridge 2026-09-29 coordinator
+-- consent): one row per ask the Coordinator answered — the audit record and
+-- the rolling 24 h approval cap's counter. A user's own tap never writes one.
+CREATE TABLE IF NOT EXISTS consent_decisions(
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id    INTEGER NOT NULL REFERENCES users(id),
+  kind       TEXT NOT NULL CHECK(kind IN ('chat','spawn')),
+  ask_id     TEXT NOT NULL,
+  decision   TEXT NOT NULL CHECK(decision IN ('approve','decline')),
+  convo_id   TEXT NOT NULL,
+  reason     TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_consent_decisions_user ON consent_decisions(user_id, created_at);
 -- Memories (spec: 2026-09-27 memories): the user's shared agent memory.
 -- One row per name; PUT /memories/:name overwrites. origin_convo_id is
 -- deliberately not a foreign key — deleting the conversation a memory was
@@ -634,6 +649,19 @@ export function openDb(path) {
   // close"): the audit line behind "closed by the Coordinator". NULL for a
   // client close and for a bridge that predates the field.
   addMissionCol('closed_convo_id', 'closed_convo_id TEXT')
+  // Coordinator consent approval (spec: matron-bridge 2026-09-29 coordinator
+  // consent): the off switch (default ON, the choice Dan made), and on both
+  // ask tables who answered a parked row and why — 'coordinator' + reason
+  // when the Coordinator did, NULL for a tap or a sweep. No backfill.
+  const settingsCols = db.prepare('PRAGMA table_info(user_settings)').all()
+  if (!settingsCols.some((c) => c.name === 'coordinator_consent')) {
+    db.exec('ALTER TABLE user_settings ADD COLUMN coordinator_consent INTEGER NOT NULL DEFAULT 1')
+  }
+  for (const table of ['convo_agents', 'agent_spawn_requests']) {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all()
+    if (!cols.some((c) => c.name === 'answered_by')) db.exec(`ALTER TABLE ${table} ADD COLUMN answered_by TEXT`)
+    if (!cols.some((c) => c.name === 'answer_reason')) db.exec(`ALTER TABLE ${table} ADD COLUMN answer_reason TEXT`)
+  }
   // Standing agent-chat consent ("always allow A -> B") is gone: every ask
   // parks for the user now. Dropped rather than left in place, because a
   // table of grants that nothing consults still reads like a live security

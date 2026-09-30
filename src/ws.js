@@ -9,6 +9,7 @@ import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem } from './consent-items.js'
+import { nudgeCoordinator, chatAskId } from './consent.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableBoxName } from './wake.js'
 import { coordinatorFor } from './coordinator.js'
 import { getMission } from './missions.js'
@@ -1064,6 +1065,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // commit point above; the item is best-effort and its own failure
         // never costs the ask (the row's item_id simply stays NULL).
         fileSpawnConsentItem({ db, hub }, { userId: conn.userId, fromDeviceId: conn.deviceId, fromName: conn.name, fromConvoId: msg.from_convo_id, spawnId, card: cardPayload })
+        // Then the Coordinator's bridge (spec: 2026-09-29 coordinator
+        // consent) — after the card, so the user is never second to it.
+        nudgeCoordinator({ db, hub, waker }, conn.userId, { kind: 'spawn', id: spawnId }, { askerConvoId: msg.from_convo_id })
         // target_waking: the box was asleep and is being started; the parent's
         // tool copy can tell its user the session begins once the box is up
         // AND the card is answered. Omitted (never false) when it was online.
@@ -1296,6 +1300,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // The card's mirror in the tracker (spec: 2026-09-22 consent-items),
         // best-effort — its failure never costs the ask.
         fileChatConsentItem({ db, hub }, { userId: conn.userId, fromDeviceId: conn.deviceId, fromName: conn.name, roomId: msg.room_id, agentDeviceId: msg.target_device_id, card: inviteCard })
+        nudgeCoordinator({ db, hub, waker }, conn.userId, { kind: 'chat', id: chatAskId(msg.room_id, msg.target_device_id) }, { askerConvoId: msg.from_convo_id ?? null, askerDeviceId: conn.deviceId })
         // Same ack as a relayed request: to the bridge, delivered means
         // "accepted into the system" — its tool copy already says pending is
         // normal and the answer arrives as a later turn. A distinct 'parked'
@@ -1363,6 +1368,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // Mirror in the tracker, keyed on the joiner like the row (spec:
         // 2026-09-22 consent-items); best-effort.
         fileChatConsentItem({ db, hub }, { userId: conn.userId, fromDeviceId: conn.deviceId, fromName: conn.name, roomId: msg.room_id, agentDeviceId: conn.deviceId, card: joinCard })
+        nudgeCoordinator({ db, hub, waker }, conn.userId, { kind: 'chat', id: chatAskId(msg.room_id, conn.deviceId) }, { askerDeviceId: conn.deviceId })
         conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: room.agent_device_id }))
         break
       }

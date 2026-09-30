@@ -67,6 +67,9 @@ export function classify(type, payload, sender, prevState) {
   }
   // Missions and milestones are navigation, never a push (spec: Marker events).
   if (type === 'milestone' || type === 'mission') return null
+  // A Coordinator consent decision is a badge on a card the user already
+  // saw, not new attention.
+  if (type === 'consent_decision') return null
   // Routine content: text/tool_output/diff/prompt_reply/file/image/etc. —
   // batched so a busy session is one updating notification, not hundreds.
   return { priority: 5, coalesce: true, kind: 'activity' }

@@ -135,7 +135,9 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   origin is that conversation but touches neither the conversation nor its
   items (no \`existing\` short-circuit). \`POST /missions/create\` is the
   same route.
-- \`GET /coordinator\` → \`{convo_id}\` — the user's Coordinator
+- \`GET /coordinator\` → \`{convo_id, consent}\` — the user's Coordinator, and whether it may approve chats and spawns
+- \`GET /consent/pending?convo_id=<coordinator convo>\` → \`{pending:[…]}\` — parked chat invites, join requests and spawn requests (Coordinator only)
+- \`POST /consent/answer\` \`{convo_id, kind: chat|spawn, id, decision: approve|decline, reason}\` — answer one on the user's behalf (Coordinator only; see /help's protocol for the guardrails)
   conversation, or null. Only the user sets it; you hear a change as a
   \`coordinator\` event \`{role: 'assigned'|'released'}\` in the conversation.
 - \`GET /memories\` → \`{memories}\` — the user's shared agent memory:

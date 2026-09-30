@@ -43,19 +43,21 @@ export function getSpawn(db, id) {
 
 // The user's "no", reported to the parent plainly as 'declined' (spec: no
 // peer to hide behind here, unlike chat's 'refused' masking).
-export function denySpawn(db, id, now = Date.now()) {
+// `answeredBy` / `answerReason` (spec: 2026-09-29 coordinator consent):
+// 'coordinator' + its reason when the Coordinator answered, null for a tap.
+export function denySpawn(db, id, now = Date.now(), { answeredBy = null, answerReason = null } = {}) {
   return db.prepare(
-    "UPDATE agent_spawn_requests SET state='denied', answered_at=?, resolved_at=? WHERE id=? AND state='awaiting_user'"
-  ).run(now, now, id).changes > 0
+    "UPDATE agent_spawn_requests SET state='denied', answered_at=?, resolved_at=?, answered_by=?, answer_reason=? WHERE id=? AND state='awaiting_user'"
+  ).run(now, now, answeredBy, answerReason, id).changes > 0
 }
 
 // The approve tap CLAIMS the row — state-scoped so exactly one caller wins
 // and everything expensive (room, live agent on another box) starts at most
 // once. The loser's zero row-count is the 409 the failure table promises.
-export function claimApprove(db, id, now = Date.now()) {
+export function claimApprove(db, id, now = Date.now(), { answeredBy = null, answerReason = null } = {}) {
   return db.prepare(
-    "UPDATE agent_spawn_requests SET state='approved', answered_at=? WHERE id=? AND state='awaiting_user'"
-  ).run(now, id).changes > 0
+    "UPDATE agent_spawn_requests SET state='approved', answered_at=?, answered_by=?, answer_reason=? WHERE id=? AND state='awaiting_user'"
+  ).run(now, answeredBy, answerReason, id).changes > 0
 }
 
 export function markStarted(db, id, { roomId, childConvoId, now = Date.now() }) {
@@ -88,10 +90,18 @@ export function markFailed(db, id, now = Date.now()) {
 // passes through. `answeredByDeviceId` is the client that tapped, when a
 // tap is what resolved the row; it only names the closing note's device.
 export function emitSpawnOutcome(db, hub, { userId, fromDeviceId, fromConvoId, requestId, outcome, roomId, childConvoId, errorCode, answeredByDeviceId = null }) {
+  // decided_by / reason (spec: 2026-09-29 coordinator consent): the parent
+  // hears WHO answered its ask when it was the Coordinator, on the durable
+  // event and the frame alike. Omitted for a tap or a sweep.
+  const stamped = db.prepare('SELECT answered_by, answer_reason FROM agent_spawn_requests WHERE id=?').get(requestId)
+  const decidedBy = stamped?.answered_by === 'coordinator'
+    ? { decided_by: 'coordinator', ...(stamped.answer_reason ? { reason: stamped.answer_reason } : {}) }
+    : {}
   const extras = {
     ...(roomId ? { room_id: roomId } : {}),
     ...(childConvoId ? { child_convo_id: childConvoId } : {}),
     ...(errorCode ? { error_code: errorCode } : {}),
+    ...decidedBy,
   }
   try {
     appendAndBroadcast(db, hub, {
