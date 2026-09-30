@@ -1274,6 +1274,7 @@ test('approve with a mission: start carries mission_num; the child is a mission 
 
   const child = s.db.prepare('SELECT mission_id, agent_device_id FROM conversations WHERE id=?').get('child-m1')
   assert.equal(child.mission_id, mission.id)
+  assert.equal(s.db.prepare('SELECT how FROM mission_conversations WHERE mission_id=? AND convo_id=?').get(mission.id, 'child-m1').how, 'spawned')
   assert.equal(child.agent_device_id, targetDev.deviceId, 'the pre-created row belongs to the target box')
   const seq = (type, convo) => s.db.prepare('SELECT seq FROM events WHERE type=? AND convo_id=?').get(type, convo).seq
   assert.ok(seq('mission', 'child-m1') < seq('spawn_outcome', 'parent-convo'), 'joined before the outcome was journaled')

@@ -6,6 +6,7 @@ import { nextNum, newId, BODY_MAX } from './items.js'
 import { milestoneMarkerPayload } from './missions-marker.js'
 import { markerTitleAllowed } from './privacy.js'
 import { sharedConvoSql } from './visibility.js'
+import { activateLink, linkRow, topLevelActiveCount } from './mission-links.js'
 
 export const MILESTONE_KINDS = ['user_input', 'progress']
 export const TITLE_MAX = 200
@@ -178,7 +179,8 @@ export function repointItems(db, userId, convoId, missionId, ts) {
 }
 
 function attachConversation(db, userId, convoId, missionId, ts) {
-  db.prepare('UPDATE conversations SET mission_id=? WHERE id=? AND owner_user_id=? AND mission_id IS NULL').run(missionId, convoId, userId)
+  const r = db.prepare('UPDATE conversations SET mission_id=? WHERE id=? AND owner_user_id=? AND mission_id IS NULL').run(missionId, convoId, userId)
+  if (r.changes) activateLink(db, { missionId, convoId, userId, how: 'origin', ts })
   repointItems(db, userId, convoId, missionId, ts)
 }
 
@@ -292,22 +294,31 @@ export function updateMission(db, { userId, missionId, fields, statusWriter = nu
   })()
 }
 
-export function joinMission(db, { userId, missionId, convoId, excludePrivateOwned = false }) {
+// Spec 2026-09-30 §3: join adds (or reactivates) a link and makes it
+// CURRENT. The previous current mission stays active ("also on") — a
+// conversation on another mission is no longer refused. `action` tells the
+// HTTP layer which marker to write: 'joined' (a new or reactivated link),
+// 'current_changed' (an already-active link became current) or null (it
+// already was current: a no-op, no marker). The cap counts active
+// top-level links; a sub-chat never fills a mission.
+export function joinMission(db, { userId, missionId, convoId, how = 'joined', excludePrivateOwned = false }) {
   return db.transaction(() => {
     const m = db.prepare('SELECT id, state FROM missions WHERE id=? AND user_id=?').get(missionId, userId)
     if (!m) throw new Error('no_mission')
     if (m.state === 'closed') throw new Error('closed')
-    const convo = db.prepare('SELECT mission_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)
+    const convo = db.prepare('SELECT mission_id, parent_convo_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)
     if (!convo) throw new Error('no_convo')
-    if (convo.mission_id && convo.mission_id !== m.id) throw new Error('other_mission')
-    if (!convo.mission_id) {
-      const n = db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE mission_id=?').get(m.id).n
-      if (n >= CONVOS_MAX) throw new Error('too_many_convos')
-      const ts = now()
-      attachConversation(db, userId, convoId, m.id, ts)
-      db.prepare('UPDATE missions SET updated_at=? WHERE id=?').run(ts, m.id)
-    }
-    return getMission(db, userId, m.id, { excludePrivateOwned })
+    const link = linkRow(db, m.id, convoId)
+    const active = !!link && link.ended_at == null
+    if (active && convo.mission_id === m.id) return { mission: getMission(db, userId, m.id, { excludePrivateOwned }), action: null }
+    if (!active && convo.parent_convo_id == null && topLevelActiveCount(db, m.id) >= CONVOS_MAX) throw new Error('too_many_convos')
+    const ts = now()
+    activateLink(db, { missionId: m.id, convoId, userId, how, ts })
+    db.prepare('UPDATE conversations SET mission_id=? WHERE id=? AND owner_user_id=?').run(m.id, convoId, userId)
+    repointItems(db, userId, convoId, m.id, ts)
+    db.prepare('UPDATE missions SET updated_at=? WHERE id=?').run(ts, m.id)
+    if (convo.mission_id && convo.mission_id !== m.id) db.prepare('UPDATE missions SET updated_at=? WHERE id=?').run(ts, convo.mission_id)
+    return { mission: getMission(db, userId, m.id, { excludePrivateOwned }), action: active ? 'current_changed' : 'joined' }
   })()
 }
 

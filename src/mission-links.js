@@ -59,3 +59,45 @@ export function backfillMissionLinks(db) {
     return current + history
   })()
 }
+
+export function linkRow(db, missionId, convoId) {
+  return db.prepare('SELECT * FROM mission_conversations WHERE mission_id=? AND convo_id=?').get(missionId, convoId) ?? null
+}
+
+export function hasActiveLink(db, missionId, convoId) {
+  return !!db.prepare('SELECT 1 FROM mission_conversations WHERE mission_id=? AND convo_id=? AND ended_at IS NULL').get(missionId, convoId)
+}
+
+// Adds a link or reactivates an ended one, stamping joined_at = ts (the
+// leave fallback picks the most recently joined). A reactivated link keeps
+// the `how` it was made with, unless it was only a backfilled trace.
+export function activateLink(db, { missionId, convoId, userId, how, ts }) {
+  db.prepare(`INSERT INTO mission_conversations(mission_id, convo_id, user_id, how, joined_at, ended_at)
+    VALUES(?,?,?,?,?,NULL)
+    ON CONFLICT(mission_id, convo_id) DO UPDATE SET
+      ended_at = NULL,
+      joined_at = excluded.joined_at,
+      how = CASE WHEN mission_conversations.how = 'backfill' THEN excluded.how ELSE mission_conversations.how END`)
+    .run(missionId, convoId, userId, how, ts)
+}
+
+export function endLink(db, { missionId, convoId, ts }) {
+  return db.prepare('UPDATE mission_conversations SET ended_at=? WHERE mission_id=? AND convo_id=? AND ended_at IS NULL')
+    .run(ts, missionId, convoId).changes > 0
+}
+
+// CONVOS_MAX counts top-level conversations only (spec 2026-09-30 §3):
+// sub-chats are folded under their parent and never fill a mission.
+export function topLevelActiveCount(db, missionId) {
+  return db.prepare(`SELECT COUNT(*) AS n FROM mission_conversations l JOIN conversations c ON c.id = l.convo_id
+    WHERE l.mission_id = ? AND l.ended_at IS NULL AND c.parent_convo_id IS NULL`).get(missionId).n
+}
+
+// Where `current` goes when a conversation leaves its current mission: the
+// most recently joined remaining active link on an OPEN mission (a closed
+// one cannot take a milestone), else none.
+export function nextCurrent(db, convoId) {
+  return db.prepare(`SELECT l.mission_id FROM mission_conversations l JOIN missions m ON m.id = l.mission_id
+    WHERE l.convo_id = ? AND l.ended_at IS NULL AND m.state = 'open'
+    ORDER BY l.joined_at DESC, l.rowid DESC LIMIT 1`).get(convoId)?.mission_id ?? null
+}

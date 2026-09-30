@@ -163,12 +163,11 @@ async function handleJoin(ctx, req, res, who, mission) {
   const { db } = ctx
   const body = await readBody(req)
   if (!writableConvo(db, who, body.convo_id)) return notFound(res)
-  const already = db.prepare('SELECT mission_id FROM conversations WHERE id=?').get(body.convo_id)?.mission_id
-  let joined
+  let out
   try {
-    joined = joinMission(db, { userId: who.userId, missionId: mission.id, convoId: body.convo_id, excludePrivateOwned: filteredAgent(db, who) })
+    out = joinMission(db, { userId: who.userId, missionId: mission.id, convoId: body.convo_id, excludePrivateOwned: filteredAgent(db, who) })
   } catch (err) {
-    if (err.message === 'closed' || err.message === 'other_mission') return conflict(res, { blocked_by: err.message })
+    if (err.message === 'closed') return conflict(res, { blocked_by: 'closed' })
     if (err.message === 'too_many_convos') return badRequest(res)
     // TOCTOU: the mission/convo were confirmed a moment ago (visibleMission,
     // writableConvo) but either can vanish before this write.
@@ -176,9 +175,11 @@ async function handleJoin(ctx, req, res, who, mission) {
     throw err
   }
   // Only reachable if the mission vanished inside its own transaction.
-  if (!joined) return notFound(res)
-  if (already !== joined.id) emitMissionMarker(ctx, who, { mission: joined, action: 'joined', convoId: body.convo_id })
-  json(res, 200, { mission: joined })
+  if (!out.mission) return notFound(res)
+  // Spec 2026-09-30 §3: no more 409 other_mission — an old bridge simply sees
+  // its join succeed. The marker says what happened to this conversation.
+  if (out.action) emitMissionMarker(ctx, who, { mission: out.mission, action: out.action, convoId: body.convo_id })
+  json(res, 200, { mission: out.mission })
   return true
 }
 

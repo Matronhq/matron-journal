@@ -6,6 +6,9 @@ import path from 'node:path'
 import Database from 'better-sqlite3'
 import { openDb } from '../src/db.js'
 import { backfillMissionLinks } from '../src/mission-links.js'
+import { upsertConversation } from '../src/journal.js'
+import { createItem } from '../src/items.js'
+import { createMission, joinMission, closeMission, CONVOS_MAX } from '../src/missions.js'
 
 const cols = (db, t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name)
 const indexes = (db) => db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all().map((r) => r.name)
@@ -143,4 +146,94 @@ test('backfill: a malformed mission-marker payload never aborts openDb; the link
     })
     db2.close()
   } finally { rmDb(p) }
+})
+
+function seeded() {
+  const db = openDb(':memory:')
+  db.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+  db.prepare("INSERT INTO devices(id, user_id, kind, name, token_hash, created_at) VALUES(7,1,'agent','dev-2','h',0)").run()
+  for (const id of ['c1', 'c2', 'c3']) upsertConversation(db, { id, ownerUserId: 1, title: id.toUpperCase(), agentDeviceId: 7 })
+  return db
+}
+function withPrivateBox() {
+  const db = seeded()
+  db.prepare("INSERT INTO devices(id, user_id, kind, name, token_hash, created_at, private) VALUES(9,1,'agent','priv-box','h2',0,1)").run()
+  upsertConversation(db, { id: 'secret', ownerUserId: 1, title: 'S', agentDeviceId: 9 })
+  return db
+}
+const linksOf = (db, convoId) => db.prepare('SELECT mission_id, how, ended_at FROM mission_conversations WHERE convo_id=? ORDER BY rowid').all(convoId)
+const currentOf = (db, convoId) => db.prepare('SELECT mission_id FROM conversations WHERE id=?').get(convoId).mission_id
+const startOn = (db, convoId, title, extra = {}) => createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId, title, ...extra }).mission
+const join = (db, missionId, convoId, extra = {}) => joinMission(db, { userId: 1, missionId, convoId, ...extra })
+function packLinks(db, missionId, n, prefix) {
+  const conv = db.prepare("INSERT INTO conversations(id, owner_user_id, title, session_state, mission_id, created_at) VALUES(?,1,'x','running',?,0)")
+  const link = db.prepare("INSERT INTO mission_conversations(mission_id, convo_id, user_id, how, joined_at) VALUES(?,?,1,'joined',0)")
+  for (let i = 0; i < n; i++) { conv.run(`${prefix}${i}`, missionId); link.run(missionId, `${prefix}${i}`) }
+}
+
+test('createMission: the attached origin gets an active origin link; attach:false links nothing', () => {
+  const db = seeded()
+  const a = startOn(db, 'c1', 'A')
+  assert.deepEqual(linksOf(db, 'c1'), [{ mission_id: a.id, how: 'origin', ended_at: null }])
+  startOn(db, 'c2', 'Parked', { attach: false })
+  assert.deepEqual(linksOf(db, 'c2'), [])
+  assert.equal(currentOf(db, 'c2'), null)
+})
+
+test('joinMission: a second mission becomes current and the first stays active; re-joining current is a no-op; joining an also-on mission is current_changed; closed refuses', () => {
+  const db = seeded()
+  const a = startOn(db, 'c1', 'A')
+  const b = startOn(db, 'c2', 'B')
+  const { item } = createItem(db, { userId: 1, originDeviceId: 7, createdBy: 'agent', kind: 'task', title: 'T', originConvoId: 'c1' })
+  const j = join(db, b.id, 'c1')
+  assert.equal(j.action, 'joined'); assert.equal(j.mission.id, b.id)
+  assert.equal(currentOf(db, 'c1'), b.id)
+  assert.deepEqual(linksOf(db, 'c1'), [
+    { mission_id: a.id, how: 'origin', ended_at: null },
+    { mission_id: b.id, how: 'joined', ended_at: null },
+  ])
+  // An item already on a mission stays there; only unassigned items follow.
+  assert.equal(db.prepare('SELECT mission_id FROM items WHERE id=?').get(item.id).mission_id, a.id)
+  assert.equal(join(db, b.id, 'c1').action, null)
+  const back = join(db, a.id, 'c1')
+  assert.equal(back.action, 'current_changed'); assert.equal(currentOf(db, 'c1'), a.id)
+  assert.equal(linksOf(db, 'c1').length, 2)
+  closeMission(db, { userId: 1, missionId: b.id, by: 'user', summary: 'done' })
+  assert.throws(() => join(db, b.id, 'c1'), /closed/)
+})
+
+test('joinMission: records the how it is given; a reactivated backfill link takes the new how', () => {
+  const db = seeded()
+  const a = startOn(db, 'c1', 'A')
+  join(db, a.id, 'c2', { how: 'spawned' })
+  assert.equal(linksOf(db, 'c2')[0].how, 'spawned')
+  db.prepare("INSERT INTO mission_conversations(mission_id, convo_id, user_id, how, joined_at, ended_at) VALUES(?, 'c3', 1, 'backfill', 1, 2)").run(a.id)
+  assert.equal(join(db, a.id, 'c3').action, 'joined')
+  assert.deepEqual(linksOf(db, 'c3'), [{ mission_id: a.id, how: 'joined', ended_at: null }])
+})
+
+test('joinMission: the cap counts active top-level links only — a sub-chat always joins, an ended link frees a slot', () => {
+  const db = seeded()
+  const m = startOn(db, 'c1', 'A')
+  packLinks(db, m.id, CONVOS_MAX - 1, 'pad')   // c1 + 199 = 200 top-level
+  assert.throws(() => join(db, m.id, 'c2'), /too_many_convos/)
+  assert.equal(currentOf(db, 'c2'), null)
+  upsertConversation(db, { id: 'kid', ownerUserId: 1, title: 'k', agentDeviceId: 7, parentConvoId: 'c2' })
+  assert.equal(join(db, m.id, 'kid').action, 'joined')
+  db.prepare("UPDATE mission_conversations SET ended_at=1 WHERE convo_id='pad0'").run()
+  assert.equal(join(db, m.id, 'c2').action, 'joined')
+})
+
+test('inheritance: a sub-chat inherits its parent\'s CURRENT mission with an inherited link, even when that mission is at the top-level cap', () => {
+  const db = seeded()
+  startOn(db, 'c1', 'A')
+  const b = startOn(db, 'c2', 'B')
+  join(db, b.id, 'c1')
+  packLinks(db, b.id, CONVOS_MAX - 2, 'pad')   // c2 + c1 + 198 = 200 top-level
+  upsertConversation(db, { id: 'kid', ownerUserId: 1, title: 'k', agentDeviceId: 7, parentConvoId: 'c1' })
+  assert.equal(currentOf(db, 'kid'), b.id)
+  assert.deepEqual(linksOf(db, 'kid'), [{ mission_id: b.id, how: 'inherited', ended_at: null }])
+  // A later upsert never adds or changes a link.
+  upsertConversation(db, { id: 'kid', ownerUserId: 1, title: 'k2' })
+  assert.equal(linksOf(db, 'kid').length, 1)
 })

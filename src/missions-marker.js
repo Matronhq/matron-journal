@@ -13,7 +13,7 @@
 // every later WS replay all agree (ws.js replays payloads verbatim).
 export const MISSION_EVENT_TYPE = 'mission'
 export const MILESTONE_EVENT_TYPE = 'milestone'
-export const MISSION_ACTIONS = ['created', 'joined', 'updated', 'closed']
+export const MISSION_ACTIONS = ['created', 'joined', 'updated', 'closed', 'left', 'current_changed']
 
 // The milestone marker's own seq is the anchor the apps jump to; the
 // payload carries enough to render the inline card without a fetch.

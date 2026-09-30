@@ -128,7 +128,7 @@ test('close: a hidden open item on a private-owned conversation still blocks the
   assert.deepEqual(asPrivate.json.items, [{ num: hidden.num, title: 'Hidden task' }])
 })
 
-test('join: attaches c2 and repoints its items; refuses a second mission for a convo; PATCH updates and emits the marker on the origin', async (t) => {
+test('join: attaches c2 and repoints its items; a conversation on another mission joins it (200, was 409); PATCH updates and emits the marker on the origin', async (t) => {
   const { s, agent, client } = await fleet(t)
   const m = (await start(s, agent.token, {})).json.mission
   const it2 = (await item(s, agent.token, { convo_id: 'c2', kind: 'task', title: 'T2' })).json.item
@@ -139,8 +139,8 @@ test('join: attaches c2 and repoints its items; refuses a second mission for a c
   assert.equal(other.status, 200); assert.equal(other.json.existing, true); assert.equal(other.json.mission.id, m.id)
   upsertConversation(s.db, { id: 'c3', ownerUserId: 1, title: 'C3', agentDeviceId: agent.deviceId })
   const b = (await s.http('/missions', { method: 'POST', token: agent.token, body: { title: 'B', convo_id: 'c3' } })).json.mission
-  const bad = await s.http(`/missions/${b.id}/join`, { method: 'POST', token: agent.token, body: { convo_id: 'c2' } })
-  assert.equal(bad.status, 409); assert.equal(bad.json.blocked_by, 'other_mission')
+  const moved = await s.http(`/missions/${b.id}/join`, { method: 'POST', token: agent.token, body: { convo_id: 'c2' } })
+  assert.equal(moved.status, 200); assert.equal(moved.json.mission.id, b.id)
   const ws = await makeWsClient(s.base, { token: client, cursor: null })
   await ws.waitFor((f) => f.op === 'hello_ok')
   const p = await s.http(`/missions/${m.id}`, { method: 'PATCH', token: agent.token, body: { title: 'Renamed' } })
@@ -177,9 +177,8 @@ test('privacy sieve: an ordinary agent cannot see a mission born in a private co
   const priv = createAgent(s.db, dan.id, 'private-box')
   pinDevicePrivate(s.db, priv.deviceId, true)
   upsertConversation(s.db, { id: 'secret', ownerUserId: dan.id, title: 'S', agentDeviceId: priv.deviceId })
-  // A second private-owned convo, deliberately never given its own mission —
-  // 'secret' already owns 'm' below, so reusing it to join 'pub' would
-  // correctly 409 other_mission (a convo may join at most one mission).
+  // A second private-owned convo, deliberately never given its own mission,
+  // so joining it to 'pub' below is a plain first join, not a move off 'm'.
   upsertConversation(s.db, { id: 'secret2', ownerUserId: dan.id, title: 'S2', agentDeviceId: priv.deviceId })
   const m = (await s.http('/missions', { method: 'POST', token: priv.token, body: { title: 'Hidden', convo_id: 'secret' } })).json.mission
   assert.equal((await s.http('/missions', { token: agent.token })).json.missions.length, 0)
@@ -482,20 +481,23 @@ test('GET /milestones?convo=: 400 without a convo; 404 for unknown, another user
 
 // Final review, I4(b): the 200-conversation cap is a real 400, and seeding
 // the conversations straight into SQL keeps it a millisecond test.
-test('POST /missions/:id/join: 400 once the mission already holds CONVOS_MAX conversations', async (t) => {
+test('POST /missions/:id/join: 400 once the mission already holds CONVOS_MAX top-level conversations; sub-chats never count', async (t) => {
   const { s, agent } = await fleet(t)
   const m = (await start(s, agent.token, {})).json.mission
-  const ins = s.db.prepare("INSERT INTO conversations(id, owner_user_id, title, session_state, mission_id, created_at) VALUES(?,?,'pad','running',?,0)")
   const userId = s.db.prepare('SELECT owner_user_id FROM conversations WHERE id=?').get('c1').owner_user_id
-  for (let i = 0; i < CONVOS_MAX - 1; i++) ins.run(`pad${i}`, userId, m.id)
-  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE mission_id=?').get(m.id).n, CONVOS_MAX)
-  const full = await s.http(`/missions/${m.id}/join`, { method: 'POST', token: agent.token, body: { convo_id: 'c2' } })
+  const conv = s.db.prepare("INSERT INTO conversations(id, owner_user_id, title, session_state, mission_id, created_at) VALUES(?,?,'pad','running',?,0)")
+  const link = s.db.prepare("INSERT INTO mission_conversations(mission_id, convo_id, user_id, how, joined_at) VALUES(?,?,?,'joined',0)")
+  for (let i = 0; i < CONVOS_MAX - 1; i++) { conv.run(`pad${i}`, userId, m.id); link.run(m.id, `pad${i}`, userId) }
+  const joinC = (id) => s.http(`/missions/${m.id}/join`, { method: 'POST', token: agent.token, body: { convo_id: id } })
+  const full = await joinC('c2')
   assert.equal(full.status, 400)
   assert.deepEqual(full.json, { error: 'bad_request' })
   assert.equal(s.db.prepare('SELECT mission_id FROM conversations WHERE id=?').get('c2').mission_id, null)
-  // One slot back and the same call succeeds — the cap is the only reason.
-  s.db.prepare('UPDATE conversations SET mission_id=NULL WHERE id=?').run('pad0')
-  assert.equal((await s.http(`/missions/${m.id}/join`, { method: 'POST', token: agent.token, body: { convo_id: 'c2' } })).status, 200)
+  upsertConversation(s.db, { id: 'kid', ownerUserId: userId, title: 'k', agentDeviceId: agent.deviceId, parentConvoId: 'c2' })
+  assert.equal((await joinC('kid')).status, 200, 'a sub-chat is never counted')
+  // One slot back (an ended link) and the same call succeeds — the cap is the only reason.
+  s.db.prepare("UPDATE mission_conversations SET ended_at=1 WHERE convo_id='pad0'").run()
+  assert.equal((await joinC('c2')).status, 200)
 })
 
 // Final review, I4(c): the 502 path over real HTTP. The anchor marker is
