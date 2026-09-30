@@ -26,6 +26,7 @@ import { answerChatAsk, answerSpawnAsk } from './consent-answer.js'
 import { coordinatorFor } from './coordinator.js'
 import { json, readBody } from './http-body.js'
 import { convoStatuses } from './convo-status.js'
+import { makeAlertsHandler } from './alerts-http.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
 // card's `from_name` gets. NULL stays null rather than collapsing to '' —
@@ -88,7 +89,13 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, itemTranscription = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, itemTranscription = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null }) {
+  // Alertmanager webhook (src/alerts-http.js): built once so its in-flight
+  // bound is per process. Off (declines every request) without config.
+  const handleAlerts = makeAlertsHandler({
+    db, hub, broker, waker, rateLimiter, wakeWaitMs: spawnWakeWaitMs, timeoutMs: sessionControlTimeoutMs,
+    token: alertWebhook?.token ?? null, username: alertWebhook?.username ?? null,
+  })
   return async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
@@ -249,6 +256,10 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         return json(res, 200, { link_code: l.linkCode, expires_in: l.expiresIn })
       }
       if (await handleGithubCallback({ db, github, tokenBox: tokenBox || undefined }, req, res, url)) return
+      // Its own shared-secret Bearer, not a device token — so ahead of `who`.
+      // Disabled, it declines and the request meets the chain below exactly
+      // as an unknown path would.
+      if (await handleAlerts(req, res, url, { rejectEarly })) return
       const who = bearer(req) && authToken(db, bearer(req))
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       // The tracker's own surface (src/items-http.js) — mounted first so
