@@ -5,7 +5,7 @@ import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import { pinDevicePrivate } from '../src/db.js'
 import { saveGithubIdentity } from '../src/github-accounts.js'
-import { createProject, closeProject } from '../src/projects.js'
+import { createProject, closeProject, mergeProject } from '../src/projects.js'
 
 async function fleet(t) {
   const s = await startTestServer({})
@@ -21,15 +21,17 @@ async function fleet(t) {
   return { s, dan, pat, agent, priv, client: await tok('dan'), patClient: await tok('pat') }
 }
 const seedProject = (s, dan, deviceId, extra = {}) => createProject(s.db, { userId: dan.id, deviceId, createdBy: 'agent', title: 'Promo launch', ...extra }).project
-const startMission = (s, token, body) => s.http('/missions', { method: 'POST', token, body: { title: 'M', convo_id: 'c1', ...body } })
+const startMission = (s, token, body, headers = {}) => s.http('/missions', { method: 'POST', token, body: { title: 'M', convo_id: 'c1', ...body }, headers })
 
-test('POST /missions {project}: files the new mission; unknown/hidden 404, closed 409 project_closed, bad type 400; ignored on existing', async (t) => {
+test('POST /missions {project}: files the new mission; unknown/hidden 404, closed 409 project_closed, bad type 400; ignored on existing and on an idem_key replay', async (t) => {
   const { s, dan, agent, priv } = await fleet(t)
   const p = seedProject(s, dan, agent.deviceId)
   const r = await startMission(s, agent.token, { project: `#${p.num}` })
   assert.equal(r.status, 201); assert.equal(r.json.mission.project_id, p.id); assert.equal(r.json.mission.project_num, p.num)
-  const again = await startMission(s, agent.token, { project: null, title: 'other' })
-  assert.equal(again.json.existing, true); assert.equal(again.json.mission.project_id, p.id)
+  // D5: the `existing: true` short-circuit ignores `project` outright — a
+  // bogus reference here must NOT 404 (it would if the peek were removed).
+  const again = await startMission(s, agent.token, { project: '#999', title: 'other' })
+  assert.equal(again.status, 200); assert.equal(again.json.existing, true); assert.equal(again.json.mission.project_id, p.id)
   assert.equal((await startMission(s, agent.token, { convo_id: 'c2', project: '#999' })).status, 404)
   const hidden = seedProject(s, dan, priv.deviceId, { title: 'Hidden' })
   assert.equal((await startMission(s, agent.token, { convo_id: 'c2', project: hidden.id })).status, 404)
@@ -39,6 +41,13 @@ test('POST /missions {project}: files the new mission; unknown/hidden 404, close
   assert.equal(refused.status, 409); assert.equal(refused.json.blocked_by, 'project_closed')
   assert.equal((await startMission(s, agent.token, { convo_id: 'c2', project: { id: p.id } })).status, 400)
   assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM missions WHERE origin_convo_id='c2'").get().n, 0, 'nothing created on a refusal')
+  // D5: an idem_key replay is the OTHER short-circuit createsNewMission must
+  // catch — the second request names a closed project, and still gets back
+  // the original mission with its original (unrelated) project untouched.
+  const first = await startMission(s, agent.token, { convo_id: 'c3', project: p.id }, { 'idempotency-key': 'ik1' })
+  assert.equal(first.status, 201); assert.equal(first.json.mission.project_id, p.id)
+  const replay = await startMission(s, agent.token, { convo_id: 'c3', project: closed.id }, { 'idempotency-key': 'ik1' })
+  assert.equal(replay.status, 200); assert.equal(replay.json.mission.id, first.json.mission.id); assert.equal(replay.json.mission.project_id, p.id)
 })
 
 test('PATCH /missions/:id {project}: moves and detaches with a project_changed marker on the origin; a closed mission may be refiled but not edited; a colleague never sees project_id', async (t) => {
@@ -60,6 +69,12 @@ test('PATCH /missions/:id {project}: moves and detaches with a project_changed m
   assert.equal((await patch({ title: 'x' })).status, 409)
   assert.equal((await patch({ project: q.id, title: 'x' })).status, 409, 'a closed mission refiles with project alone')
   assert.equal((await patch({})).status, 400)
+  // A merged project is closed on its own row (§4.2 "writes address the row
+  // itself"); naming it directly is the same refusal as any other closed one.
+  const src = seedProject(s, dan, agent.deviceId, { title: 'Src' })
+  mergeProject(s.db, { userId: dan.id, projectId: src.id, intoId: q.id, by: 'user' })
+  const mergedRef = await patch({ project: src.id })
+  assert.equal(mergedRef.status, 409); assert.equal(mergedRef.json.blocked_by, 'project_closed')
   // A colleague reading the shared mission never learns which project it is in.
   for (const [u, gid] of [[dan, 1], [pat, 2]]) {
     saveGithubIdentity(s.db, { userId: u.id, host: 'github.com', identity: { github_id: gid, login: u.name, scopes: ['github.com/matronhq'] }, token: `t${gid}`, now: 1 })

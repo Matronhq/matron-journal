@@ -240,6 +240,12 @@ function attachConversation(db, userId, convoId, missionId, ts) {
   repointItems(db, userId, convoId, missionId, ts)
 }
 
+// D5 note: `projectId` only ever reaches the INSERT below — the idem_key
+// replay and the attach-existing short-circuits both return first, without
+// touching it. missions-http.js's handleCreate mirrors that same pair of
+// conditions (createsNewMission) so it can skip validating `project` before
+// either of those short-circuits fires; if either condition here changes,
+// that peek must change with it.
 export function createMission(db, { userId, deviceId, createdBy, convoId, title, body = '', idemKey = null, excludePrivateOwned = false, attach = true, projectId = null }) {
   return db.transaction(() => {
     if (idemKey) {
