@@ -191,3 +191,46 @@ test('runUnseenNudge: once per entry, hourly at most, only when the Coordinator 
   assert.equal(runUnseenNudge({ db, hub }, now + 2 * 3600000), 0) // already covered (or out of hours)
   assert.equal(frames.length, 1)
 })
+
+test('listUnseen: a button answer (prompt_reply) answers a prompt; a read_marker does not', async () => {
+  const { db, dan, say, later } = await world()
+  const q = say('c1', null, 'agent:ang', 'prompt', { question: 'Deploy?' })
+  append(db, { userId: dan.id, convoId: 'c1', sender: 'user:dan', type: 'read_marker', payload: { convo_id: 'c1', up_to_seq: q } })
+  assert.ok(listUnseen(db, dan.id, { now: later }).entries.some((e) => e.ref === `msg:c1:${q}`))
+  append(db, { userId: dan.id, convoId: 'c1', sender: 'user:dan', type: 'prompt_reply', payload: { target_seq: q, choice: 'yes' } })
+  assert.ok(!listUnseen(db, dan.id, { now: later, importance: 'all' }).entries.some((e) => e.ref === `msg:c1:${q}`))
+})
+
+test('listUnseen: "final" skips item fallback text; agent rooms are important only when the user is named', async () => {
+  const { db, dan, agent, say, later } = await world()
+  const last = say('c1', 'all done')
+  say('c1', null, 'agent:ang', 'text', { body: 'Q?', fallback_for: 'item' })
+  upsertConversation(db, { id: 'c1', ownerUserId: dan.id, sessionState: 'waiting' })
+  assert.deepEqual(listUnseen(db, dan.id, { now: later }).entries.find((e) => e.ref === `msg:c1:${last}`)?.reasons, ['final'])
+  upsertConversation(db, { id: 'room', ownerUserId: dan.id, title: 'A ↔ B', agentDeviceId: agent.deviceId, sessionState: 'waiting' })
+  db.prepare("INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, created_at) VALUES('room', ?, ?, 'joined', 0)").run(agent.deviceId, agent.deviceId)
+  const plain = say('room', 'over to you, bev')
+  const named = say('room', 'Dan should see this')
+  const important = listUnseen(db, dan.id, { now: later }).entries.filter((e) => e.convo_id === 'room')
+  assert.deepEqual(important.map((e) => [e.ref, e.reasons]), [[`msg:room:${named}`, ['mentions_user']]])
+  assert.ok(listUnseen(db, dan.id, { now: later, importance: 'all' }).entries.some((e) => e.ref === `msg:room:${plain}` && !e.important))
+})
+
+test('runUnseenNudge: an entry that becomes important after an earlier nudge is still nudged, once', async () => {
+  const { db, dan, agent, say } = await world()
+  setCoordinatorConvoId(db, dan.id, 'coord')
+  say('c1', 'first')
+  upsertConversation(db, { id: 'c1', ownerUserId: dan.id, sessionState: 'done' })
+  const { item } = createItem(db, { userId: dan.id, kind: 'task', title: 'Old task', awaiting: 'agent', originConvoId: 'c2', originDeviceId: agent.deviceId, createdBy: 'agent', now: Date.now() - 60000 })
+  const frames = []
+  const hub = { connsOf: () => [{ deviceId: agent.deviceId, ws: { readyState: 1 } }], sendToDevice: (u, d, f) => frames.push(f) }
+  let now = Date.now() + 3 * 3600000
+  while (!inNudgeHours(now) || !inNudgeHours(now + 2 * 3600000)) now += 3600000
+  assert.equal(runUnseenNudge({ db, hub }, now), 1)
+  // The older task now waits on the user: important, older than what was nudged.
+  db.prepare("UPDATE items SET awaiting='user' WHERE id=?").run(item.id)
+  assert.equal(runUnseenNudge({ db, hub }, now + 30 * 60000), 0) // within the hour
+  assert.equal(runUnseenNudge({ db, hub }, now + 2 * 3600000), 1)
+  assert.deepEqual(frames[1].entries.map((e) => e.kind), ['item'])
+  assert.equal(runUnseenNudge({ db, hub }, now + 3 * 3600000), 0) // nothing new (or out of hours)
+})

@@ -88,6 +88,8 @@ test('POST /unseen/flags: the Coordinator flags anything; an agent only its own 
   assert.equal((await post(ang.token, { convo_id: 'c1', refs: ['nonsense'] })).status, 400)
   assert.equal((await post(ang.token, { convo_id: 'c1', refs: [] })).status, 400)
   assert.equal((await post(ang.token, { convo_id: 'b1', refs: [`msg:b1:1`] })).status, 404)
+  // An ordinary Coordinator can't flag (or probe) private conversations.
+  assert.equal((await post(bev.token, { convo_id: 'coord', refs: ['msg:pc:1'] })).status, 404)
 })
 
 test('ws seen / item_seen: clients only; ranges stored; read_marker is the legacy fallback until then', async (t) => {

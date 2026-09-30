@@ -7,11 +7,11 @@
 //   - only between 07:00 and 22:00 UK time;
 //   - at most one nudge an hour;
 //   - only for important entries unseen for 2 h or more, not yet raised
-//     (unseen_flags) and newer than anything an earlier nudge covered — an
+//     (unseen_flags) and not named by an earlier nudge (unseen_nudged) — an
 //     entry is nudged about once, whatever the Coordinator then decides;
 //   - only when the Coordinator's bridge is connected; otherwise the next
-//     tick tries again (nothing is recorded as covered).
-// Also prunes raised-flags older than 30 days.
+//     tick tries again (nothing is recorded).
+// Also prunes raised-flags and nudge records older than 30 days.
 import { listUnseen, pruneFlags } from './seen.js'
 import { getCoordinatorConvoId } from './coordinator.js'
 import { isPrivateDevice } from './db.js'
@@ -42,7 +42,10 @@ const online = (hub, userId, deviceId) =>
 
 // One pass over every user. Returns the number of nudges sent.
 export function runUnseenNudge({ db, hub }, now = Date.now()) {
-  try { pruneFlags(db, FLAG_TTL_MS, now) } catch (err) { console.error('unseen-nudge: flag prune failed', err) }
+  try {
+    pruneFlags(db, FLAG_TTL_MS, now)
+    db.prepare('DELETE FROM unseen_nudged WHERE nudged_at<?').run(now - FLAG_TTL_MS)
+  } catch (err) { console.error('unseen-nudge: prune failed', err) }
   if (!inNudgeHours(now)) return 0
   let sent = 0
   const users = db.prepare('SELECT user_id FROM user_settings WHERE coordinator_convo_id IS NOT NULL').all()
@@ -50,13 +53,14 @@ export function runUnseenNudge({ db, hub }, now = Date.now()) {
     try {
       const coord = coordinatorOf(db, userId)
       if (!coord || !online(hub, userId, coord.deviceId)) continue
-      const prev = db.prepare('SELECT last_at, covered_ts FROM unseen_nudges WHERE user_id=?').get(userId)
+      const prev = db.prepare('SELECT last_at FROM unseen_nudges WHERE user_id=?').get(userId)
       if (prev && now - prev.last_at < NUDGE_GAP_MS) continue
       const { entries } = listUnseen(db, userId, {
         now, olderThanMs: UNSEEN_NUDGE_AFTER_MS, importance: 'important', limit: 200,
         excludePrivateOwned: !isPrivateDevice(db, coord.deviceId),
       })
-      const fresh = entries.filter((e) => e.ts > (prev?.covered_ts ?? 0))
+      const nudged = new Set(db.prepare('SELECT ref FROM unseen_nudged WHERE user_id=?').all(userId).map((r) => r.ref))
+      const fresh = entries.filter((e) => !nudged.has(e.ref))
       if (fresh.length === 0) continue
       hub.sendToDevice(userId, coord.deviceId, {
         kind: 'unseen', event: 'pending', convo_id: coord.convoId, count: fresh.length,
@@ -66,11 +70,16 @@ export function runUnseenNudge({ db, hub }, now = Date.now()) {
           ts: e.ts, reasons: e.reasons, snippet: e.snippet.slice(0, 160),
         })),
       })
-      const covered = Math.max(prev?.covered_ts ?? 0, ...entries.map((e) => e.ts))
-      db.prepare(
-        `INSERT INTO unseen_nudges(user_id, last_at, covered_ts) VALUES(?,?,?)
-         ON CONFLICT(user_id) DO UPDATE SET last_at=excluded.last_at, covered_ts=excluded.covered_ts`
-      ).run(userId, now, covered)
+      // Every fresh entry counts as nudged, not only the few in the frame:
+      // the frame's count told the Coordinator about all of them.
+      const mark = db.prepare('INSERT OR IGNORE INTO unseen_nudged(user_id, ref, nudged_at) VALUES(?,?,?)')
+      db.transaction(() => {
+        for (const e of fresh) mark.run(userId, e.ref, now)
+        db.prepare(
+          `INSERT INTO unseen_nudges(user_id, last_at) VALUES(?,?)
+           ON CONFLICT(user_id) DO UPDATE SET last_at=excluded.last_at`
+        ).run(userId, now)
+      })()
       sent += 1
     } catch (err) {
       // One user's failure must not cost the others their nudge.

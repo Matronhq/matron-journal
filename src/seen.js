@@ -18,6 +18,8 @@ const UNSEEN_TYPES_SQL = UNSEEN_TYPES.map((t) => `'${t}'`).join(',')
 export const SEEN_RANGES_MAX = 64
 export const REFS_MAX = 100
 export const UNSEEN_LIMIT_MAX = 200
+// Candidate rows read before filtering; hitting it sets `truncated`.
+const SCAN_MAX = 20000
 const SEQ_MAX = Number.MAX_SAFE_INTEGER
 const REF_MSG = /^msg:(.{1,128}):(\d{1,16})$/
 const REF_ITEM = /^item:([A-Za-z0-9_-]{1,64}):(\d{1,16})$/
@@ -59,10 +61,12 @@ export function markDeviceUsesRanges(db, deviceId, now = Date.now()) {
 // gap is other conversations' events (or the user's own messages).
 function gapIsEmpty(db, userId, convoId, afterSeq, beforeSeq) {
   if (beforeSeq <= afterSeq + 1) return true
+  // INDEXED BY: left to itself SQLite walks the (user_id, seq) primary key,
+  // i.e. every event the user has in the gap across all conversations.
   return !db.prepare(
-    `SELECT 1 FROM events WHERE user_id=? AND convo_id=? AND seq>? AND seq<?
+    `SELECT 1 FROM events INDEXED BY idx_events_convo WHERE convo_id=? AND seq>? AND seq<? AND user_id=?
        AND type IN (${UNSEEN_TYPES_SQL}) AND sender NOT LIKE 'user:%' LIMIT 1`
-  ).get(userId, convoId, afterSeq, beforeSeq)
+  ).get(convoId, afterSeq, beforeSeq, userId)
 }
 
 // Adds ranges for a conversation the user owns and coalesces the stored set.
@@ -203,17 +207,24 @@ export function listUnseen(db, userId, {
         ${where.join(' ')}
         AND NOT EXISTS(SELECT 1 FROM seen_ranges s WHERE s.user_id=e.user_id AND s.convo_id=e.convo_id
                         AND s.from_seq<=e.seq AND s.to_seq>=e.seq)
-      ORDER BY e.seq DESC LIMIT 5000`
+      ORDER BY e.seq DESC LIMIT ${SCAN_MAX}`
   ).all(...args)
+  const scanCapped = rows.length === SCAN_MAX
 
   // Per conversation in the window: the user's newest message (answers a
   // prompt) and the newest message from anyone else (the "final" one).
   const lastUser = new Map()
   const lastOther = new Map()
+  // A prompt_reply (a button answer) is an answer; a read_marker, though
+  // it carries the user's sender, is not. The "final" message ignores item
+  // fallback texts and consent cards, which are never listed themselves.
   for (const r of db.prepare(
     `SELECT convo_id, MAX(CASE WHEN sender LIKE 'user:%' THEN seq END) AS u,
-            MAX(CASE WHEN sender NOT LIKE 'user:%' THEN seq END) AS o
-       FROM events WHERE user_id=? AND seq>=? AND type IN (${UNSEEN_TYPES_SQL}) GROUP BY convo_id`
+            MAX(CASE WHEN sender NOT LIKE 'user:%'
+                      AND json_extract(payload, '$.fallback_for') IS NULL
+                      AND (type!='permission_request' OR COALESCE(json_extract(payload, '$.kind'), '') NOT IN ('agent_chat','agent_spawn'))
+                     THEN seq END) AS o
+       FROM events WHERE user_id=? AND seq>=? AND type IN (${UNSEEN_TYPES_SQL},'prompt_reply') GROUP BY convo_id`
   ).iterate(userId, lowSeq)) {
     lastUser.set(r.convo_id, r.u ?? 0)
     lastOther.set(r.convo_id, r.o ?? 0)
@@ -241,6 +252,10 @@ export function listUnseen(db, userId, {
     }
     if (r.type === 'spawn_outcome' && payload?.outcome === 'failed') reasons.push('failure')
     if ((r.session_state === 'done' || r.session_state === 'waiting') && lastOther.get(r.convo_id) === r.seq) reasons.push('final')
+    // An agent-to-agent room is the user's to skim: its prompts and last
+    // messages are addressed to the other agent. Only being named there
+    // makes a room message important.
+    if (r.is_room) reasons.length = 0
     if (r.is_room && r.type === 'text' && mentions && mentions.test(String(payload?.body ?? ''))) reasons.push('mentions_user')
     entries.push({
       ref: `msg:${r.convo_id}:${r.seq}`, kind: 'message',
@@ -303,5 +318,5 @@ export function listUnseen(db, userId, {
   }
   out.sort((a, b) => (b.important - a.important) || (b.ts - a.ts))
   const cap = Math.max(1, Math.min(limit, UNSEEN_LIMIT_MAX))
-  return { entries: out.slice(0, cap), truncated: out.length > cap }
+  return { entries: out.slice(0, cap), truncated: out.length > cap || scanCapped }
 }

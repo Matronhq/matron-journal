@@ -89,6 +89,16 @@ async function handleFlags(db, req, res, who) {
   const coordinator = getCoordinatorConvoId(db, who.userId) === body.convo_id
   const g = gate(db, who, body.convo_id, !coordinator)
   if (!g.role) return refuse(res, g)
+  if (g.role === 'coordinator' && filteredAgent(db, who)) {
+    // An ordinary Coordinator can't see private-device conversations, so it
+    // can't flag them either (nor probe whether they are flagged).
+    const itemOrigin = db.prepare('SELECT origin_convo_id FROM items WHERE id=? AND user_id=?')
+    for (const ref of refs) {
+      const p = parseRef(ref)
+      const convoId = p.kind === 'message' ? p.convoId : itemOrigin.get(p.itemId, who.userId)?.origin_convo_id
+      if (convoId && privateOwnedConvo(db, convoId)) return notFound(res)
+    }
+  }
   if (g.role === 'mine') {
     // An agent may only mark its own messages in this conversation as
     // raised (it restated them); everything else is the Coordinator's call.

@@ -2307,14 +2307,15 @@ counts.
     - `limit` (1–200, default 50)
   - An ordinary Coordinator never sees conversations owned by a private
     device, or items that came from one.
-- `GET /unseen?mine=1&convo_id=<a conversation this agent may write to>` → the
+- `GET /unseen?mine=1&convo_id=<a conversation this agent may write to, or a room it has joined>` → the
   same shape, restricted to messages whose sender is the caller, in that
   conversation. No items. Defaults are `importance=all` and
   `older_than_ms` 10 min. A conversation the caller may not write to gets 404.
 - `POST /unseen/flags {convo_id, refs[1..100]}` → `{flagged}`. Records that
   entries were raised with the user, so they are not listed again. The
   Coordinator may flag any ref; any other agent only refs to its own messages
-  in `convo_id` (else 403). Flags are pruned after 30 days.
+  in `convo_id` (else 403). An ordinary Coordinator gets 404 for a ref in a
+  private device's conversation. Flags are pruned after 30 days.
 
 **Entries.** Each entry has these fields:
 
@@ -2335,7 +2336,8 @@ when any of these is true:
 - the conversation is archived or a child conversation;
 - it is the Coordinator's own conversation (except with `mine=1`);
 - it is an item's fallback text or a consent card;
-- it is a prompt or permission request the user has written after.
+- it is a prompt or permission request the user has written or answered
+  (`prompt_reply`) after.
 
 An open, non-consent item is unseen while it has agent content (its creation,
 or an agent comment) newer than what `item_seen` covers, and the user hasn't
@@ -2353,6 +2355,11 @@ commented since.
 | `failure` | a failed `spawn_outcome` |
 | `mentions_user` | the user's name in an agent-to-agent room |
 
+In an agent-to-agent room only `mentions_user` applies: the room's prompts
+and last messages are addressed to the other agent. The `final` reason
+ignores item fallback texts and consent cards. A scan reads at most 20 000
+candidate messages; hitting that sets `truncated`.
+
 **Nudge.** Every 10 minutes the journal checks each user who has a
 Coordinator. When all of the following hold, it sends one ephemeral frame to
 the Coordinator's bridge:
@@ -2360,8 +2367,8 @@ the Coordinator's bridge:
 - UK time is between 07:00 and 22:00;
 - the last nudge was at least an hour ago;
 - the Coordinator's bridge is connected;
-- there are important, unflagged entries unseen for 2 h or more that are
-  newer than anything a previous nudge covered.
+- there are important, unflagged entries unseen for 2 h or more that no
+  earlier nudge named (the journal remembers each nudged ref for 30 days).
 
 The frame is `{kind:'unseen', event:'pending', convo_id, count,
 entries:[up to 5 of {ref, kind, convo_id, convo_title, item_num?, ts,

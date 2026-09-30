@@ -396,12 +396,18 @@ CREATE TABLE IF NOT EXISTS unseen_flags(
   flagged_in_convo_id TEXT NOT NULL,
   PRIMARY KEY(user_id, ref)
 );
--- The unseen nudge's memory: when the Coordinator was last nudged and the
--- newest entry that nudge covered, so an entry is nudged about once.
+-- The unseen nudge's memory: when the Coordinator was last nudged, and
+-- every entry a nudge has named, so an entry is nudged about once (even one
+-- that only becomes important after a later entry was nudged).
 CREATE TABLE IF NOT EXISTS unseen_nudges(
-  user_id    INTEGER PRIMARY KEY,
-  last_at    INTEGER NOT NULL,
-  covered_ts INTEGER NOT NULL
+  user_id INTEGER PRIMARY KEY,
+  last_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS unseen_nudged(
+  user_id  INTEGER NOT NULL,
+  ref      TEXT NOT NULL,
+  nudged_at INTEGER NOT NULL,
+  PRIMARY KEY(user_id, ref)
 );
 `
 

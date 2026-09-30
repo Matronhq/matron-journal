@@ -87,8 +87,10 @@ tables.
 - `item_seen(user_id, item_id, seen_through_comment_at, seen_at)`.
 - `unseen_flags(user_id, ref, flagged_at, flagged_in_convo_id)` implements the
   no-repeat rule.
-- `unseen_nudges(user_id, last_at, covered_ts)` records when the Coordinator
-  was last nudged and what that nudge covered.
+- `unseen_nudges(user_id, last_at)` and `unseen_nudged(user_id, ref,
+  nudged_at)` record when the Coordinator was last nudged and every entry a
+  nudge has named, so each entry is nudged about once. That includes an
+  entry that only becomes important later.
 
 The code lives in `src/seen.js` (store and query), `src/seen-http.js`
 (routes), `src/unseen-nudge.js` (the sweep) and the `seen` / `item_seen` ops
@@ -228,6 +230,28 @@ Default exclusions:
 
 `BRIDGE_COORDINATOR.md` gets a short section on this, with the no-repeat rule
 and "one line each, lead with why it matters".
+
+## 6a. As built: departures and v1 limits
+
+These came out of the pre-merge review.
+
+- **The Coordinator's own conversation is never listed.** Its messages are
+  how it tells the user things, so raising them back to it is circular. If
+  the user misses a raise, the entry stays flagged. The raise itself can be
+  restated by the Coordinator in its next status update.
+- **`failure` covers failed spawns only in v1.** Stalled sessions and bridge
+  error notices have no structured marker to key on yet.
+- **Agent-to-agent rooms are important only when they name the user.**
+  Their prompts and final messages are addressed to the other agent.
+- **Private devices follow the journal-wide `filteredAgent` rule.** A
+  Coordinator on any private device sees every private conversation. A
+  Coordinator on an ordinary device sees none.
+- **`mine=1` and agent flags identify the caller by its sender
+  (`agent:<device name>`),** the same convention as every other agent write.
+- **`unseen_flag` has no `note` parameter.** The Coordinator's own message
+  to the user is the record.
+- **Deploy the bridge before the journal.** An old bridge drops the
+  `unseen` frame, and those entries would count as already nudged.
 
 ## 7. Dan's decisions (30 Sep)
 
