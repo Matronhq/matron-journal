@@ -92,14 +92,18 @@ export function hasActiveLink(db, missionId, convoId) {
 
 // Adds a link or reactivates an ended one, stamping joined_at = ts (the
 // leave fallback picks the most recently joined). A reactivated link keeps
-// the `how` it was made with, unless it was only a backfilled trace.
+// the `how` it was made with, unless it was only a backfilled trace — or
+// was 'joined' and is now 'spawned' (the stronger account of the same
+// arrival). No other how is ever replaced.
 export function activateLink(db, { missionId, convoId, userId, how, ts }) {
   db.prepare(`INSERT INTO mission_conversations(mission_id, convo_id, user_id, how, joined_at, ended_at)
     VALUES(?,?,?,?,?,NULL)
     ON CONFLICT(mission_id, convo_id) DO UPDATE SET
       ended_at = NULL,
       joined_at = excluded.joined_at,
-      how = CASE WHEN mission_conversations.how = 'backfill' THEN excluded.how ELSE mission_conversations.how END`)
+      how = CASE WHEN mission_conversations.how = 'backfill' THEN excluded.how
+                 WHEN mission_conversations.how = 'joined' AND excluded.how = 'spawned' THEN 'spawned'
+                 ELSE mission_conversations.how END`)
     .run(missionId, convoId, userId, how, ts)
 }
 

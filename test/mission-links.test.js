@@ -276,6 +276,23 @@ test('joinMission: records the how it is given; a reactivated backfill link take
   assert.deepEqual(linksOf(db, 'c3'), [{ mission_id: a.id, how: 'joined', ended_at: null }])
 })
 
+test('activateLink: spawned replaces joined on a reactivation; nothing else upgrades or downgrades', () => {
+  const db = seeded()
+  const a = startOn(db, 'c1', 'A')
+  const b = startOn(db, 'c2', 'B')
+  join(db, a.id, 'c3')
+  leaveMission(db, { userId: 1, missionId: a.id, convoId: 'c3' })
+  join(db, a.id, 'c3', { how: 'spawned' })
+  assert.deepEqual(linksOf(db, 'c3'), [{ mission_id: a.id, how: 'spawned', ended_at: null }], 'joined → spawned')
+  leaveMission(db, { userId: 1, missionId: a.id, convoId: 'c3' })
+  join(db, a.id, 'c3')
+  assert.equal(linksOf(db, 'c3')[0].how, 'spawned', 'spawned is never downgraded to joined')
+  join(db, b.id, 'c1', { how: 'spawned' })
+  leaveMission(db, { userId: 1, missionId: a.id, convoId: 'c1' })
+  join(db, a.id, 'c1', { how: 'spawned' })
+  assert.equal(linksOf(db, 'c1').find((l) => l.mission_id === a.id).how, 'origin', 'origin is never replaced')
+})
+
 test('joinMission: the cap counts active top-level links only — a sub-chat always joins, an ended link frees a slot', () => {
   const db = seeded()
   const m = startOn(db, 'c1', 'A')
