@@ -2960,6 +2960,12 @@ dependencies). Disabled unless all four are set:
 Missing any of them logs one warn line at boot and the push pipeline is an
 inert no-op — everything else on the server works as normal.
 
+An alert payload carries the conversation as `aps.thread-id`. It also carries
+a top-level `seq`, the event the alert shows, so a tapped notification can
+report that one message as seen (read state, op `seen`). The push relay
+(`MATRON_PUSH_GATEWAY_URL`) forwards only content-free fields and omits
+`seq`. A client must treat a missing `seq` as "no tap receipt".
+
 After a journal event fans out to a user's connections, the push pipeline
 considers each of that user's *client* devices with a registered token
 (agent devices are never pushed to):

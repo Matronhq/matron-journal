@@ -240,7 +240,9 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
       if (hub.isViewing(userId, device.id, event.convo_id)) continue
       if (device.cursor >= event.seq) continue
       const buildOpts = () => ({
-        payload: { aps: { alert: { title, body }, 'thread-id': event.convo_id } },
+        // seq (read state): the message this alert shows, so a tapped
+        // notification can report that one message as seen.
+        payload: { aps: { alert: { title, body }, 'thread-id': event.convo_id }, seq: event.seq },
         priority: cls.priority,
         pushType: 'alert',
         collapseId: event.convo_id,
