@@ -6,7 +6,7 @@ import path from 'node:path'
 import Database from 'better-sqlite3'
 import { openDb } from '../src/db.js'
 import { backfillMissionLinks } from '../src/mission-links.js'
-import { upsertConversation } from '../src/journal.js'
+import { upsertConversation, snapshot } from '../src/journal.js'
 import { createItem } from '../src/items.js'
 import {
   createMission, joinMission, closeMission, leaveMission, createMilestone, CONVOS_MAX,
@@ -432,4 +432,21 @@ test('createMilestone: default posts to the current mission; mission names any A
   assert.equal(post({ missionRef: h.id }).mission.id, h.id, 'the unfiltered caller may')
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM milestones').get().n, before + 1)
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='milestone'").get().n, events + 1)
+})
+
+test('snapshot: rows carry the current mission_id and mission_count (every link, ended ones too); a filtered caller loses private-origin missions from both', () => {
+  const db = withPrivateBox()
+  const a = startOn(db, 'c1', 'A'); const b = startOn(db, 'c2', 'B')
+  join(db, b.id, 'c1'); leaveMission(db, { userId: 1, missionId: a.id, convoId: 'c1' })   // c1: B current, A ended
+  const h = createMission(db, { userId: 1, deviceId: 9, createdBy: 'agent', convoId: 'secret', title: 'Hidden' }).mission
+  join(db, h.id, 'c3')                                                                     // user put public c3 on a private-origin mission
+  const row = (snap, id) => snap.conversations.find((c) => c.id === id)
+  const full = snapshot(db, 1)
+  assert.deepEqual([row(full, 'c1').mission_id, row(full, 'c1').mission_count], [b.id, 2])
+  assert.deepEqual([row(full, 'c2').mission_id, row(full, 'c2').mission_count], [b.id, 1])
+  assert.deepEqual([row(full, 'c3').mission_id, row(full, 'c3').mission_count], [h.id, 1])
+  const sieved = snapshot(db, 1, { excludePrivateOwned: true })
+  assert.deepEqual([row(sieved, 'c3').mission_id, row(sieved, 'c3').mission_count], [null, 0])
+  assert.deepEqual([row(sieved, 'c1').mission_id, row(sieved, 'c1').mission_count], [b.id, 2])
+  assert.equal(row(sieved, 'secret'), undefined)
 })

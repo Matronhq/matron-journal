@@ -1,7 +1,7 @@
 import { authorize } from './auth.js'
 import { isPrivateDevice } from './db.js'
 import { indexableBody } from './search.js'
-import { getMission } from './missions.js'
+import { getMission, ORIGIN_SIEVE } from './missions.js'
 import { activateLink } from './mission-links.js'
 import { privateOwnedConvo } from './privacy.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
@@ -357,10 +357,19 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   // has no message events (just created, or history pruned by retention) —
   // clients fall back to created_at. The (convo_id, seq) index keeps the
   // subquery a backwards seek to the first message row.
+  // mission_id / mission_count (spec 2026-09-30 §3): the header chip without
+  // a fetch — the current mission and how many missions this conversation
+  // ever touched; a filtered caller never counts or names a private-origin
+  // mission.
   const conversations = db.prepare(
     `SELECT id, title, session_state, session_outcome, last_seq, unread_count,
             ${omitSnippet ? 'NULL' : 'snippet'} AS snippet,
             parent_convo_id, summary, repo, created_at, agent_device_id,
+            ${excludePrivateOwned
+              ? `(CASE WHEN EXISTS (SELECT 1 FROM missions m WHERE m.id = conversations.mission_id AND ${ORIGIN_SIEVE}) THEN mission_id END)`
+              : 'mission_id'} AS mission_id,
+            (SELECT COUNT(*) FROM mission_conversations l JOIN missions m ON m.id = l.mission_id
+              WHERE l.convo_id = conversations.id${excludePrivateOwned ? ` AND ${ORIGIN_SIEVE}` : ''}) AS mission_count,
             (SELECT ts FROM events e WHERE e.convo_id = conversations.id
              AND e.type IN (${MESSAGE_TYPES_SQL})
              ORDER BY e.seq DESC LIMIT 1) AS last_ts
