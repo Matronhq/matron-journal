@@ -98,7 +98,6 @@ test('mergeProject: moves every mission (open and closed), closes the source as 
   assert.throws(() => mergeProject(db, { userId: 1, projectId: a.id, intoId: c.id, by: 'user' }), /closed/)
   const d = mk(db, { title: 'D' }).project
   assert.throws(() => mergeProject(db, { userId: 1, projectId: d.id, intoId: a.id, by: 'user' }), /into_closed/)
-  assert.equal(MERGE_HOPS_MAX, 16)
 })
 
 test('listProjects: rollups count mission activity, sum needs_you/open_items, and take the latest activity; state filter; newest activity first', () => {
@@ -167,10 +166,27 @@ test('resolveProject: a 2-hop chain (A into B, B into C) resolves A to C through
   assert.equal(resolveProject(db, 1, 'pj_nope'), null)
 })
 
-test('resolveProject: follows at most MERGE_HOPS_MAX hops of a real merge chain', () => {
+test('mergeProject flattens: every project earlier merged into the source now points straight at the survivor', () => {
+  const db = seeded()
+  const a = mk(db, { title: 'A' }).project; const b = mk(db, { title: 'B' }).project; const c = mk(db, { title: 'C' }).project
+  const d = mk(db, { title: 'D' }).project
+  mergeProject(db, { userId: 1, projectId: a.id, intoId: b.id, by: 'user' })
+  mergeProject(db, { userId: 1, projectId: d.id, intoId: b.id, by: 'user' })
+  mergeProject(db, { userId: 1, projectId: b.id, intoId: c.id, by: 'user' })
+  const into = (p) => db.prepare('SELECT merged_into FROM projects WHERE id=?').get(p.id).merged_into
+  assert.deepEqual([into(a), into(d), into(b), into(c)], [c.id, c.id, c.id, null])
+  // The one-hop pointer is what "Merged into #N" reads now.
+  assert.equal(getProject(db, 1, a.id).merged_into_num, c.num)
+})
+
+// Flattening means mergeProject never writes a chain; the cap guards
+// chains it did not write (rows merged before flattening, hand edits).
+test('resolveProject: follows at most MERGE_HOPS_MAX hops of an unflattened chain', () => {
   const db = seeded()
   const chain = Array.from({ length: MERGE_HOPS_MAX + 2 }, (_, i) => mk(db, { title: `P${i}` }).project)
-  for (let i = 0; i < chain.length - 1; i++) mergeProject(db, { userId: 1, projectId: chain[i].id, intoId: chain[i + 1].id, by: 'user' })
+  for (let i = 0; i < chain.length - 1; i++) {
+    db.prepare("UPDATE projects SET state='closed', merged_into=? WHERE id=?").run(chain[i + 1].id, chain[i].id)
+  }
   // chain[0] is MERGE_HOPS_MAX + 1 hops from the survivor: the walk stops after 16.
   const capped = resolveProject(db, 1, chain[0].id)
   assert.equal(capped.project.id, chain[MERGE_HOPS_MAX].id)

@@ -129,7 +129,8 @@ export function closeProject(db, { userId, projectId, by, summary, excludePrivat
 }
 
 // §4.2 merge: every mission (any state) moves to `into`; the source closes
-// with "Merged into #N" and records merged_into. movedMissionIds lets the
+// with "Merged into #N" and records merged_into. Rows are read unsieved —
+// the HTTP layer resolves both ends through the caller's sieve first. movedMissionIds lets the
 // HTTP layer write one `updated` marker (project_changed) per mission.
 export function mergeProject(db, { userId, projectId, intoId, by, excludePrivateOwned = false }) {
   return db.transaction(() => {
@@ -144,6 +145,10 @@ export function mergeProject(db, { userId, projectId, intoId, by, excludePrivate
     db.prepare('UPDATE missions SET project_id=?, updated_at=? WHERE project_id=? AND user_id=?').run(dst.id, ts, src.id, userId)
     db.prepare(`UPDATE projects SET state='closed', close_summary=?, closed_by=?, closed_at=?, merged_into=?, updated_at=? WHERE id=?`)
       .run(`Merged into #${dst.num}`, by, ts, dst.id, ts, src.id)
+    // Flatten (controller ruling): every project earlier merged into the
+    // source now points straight at the survivor, so redirects stay one
+    // hop and "Merged into #N" names the project that actually holds the work.
+    db.prepare('UPDATE projects SET merged_into=? WHERE merged_into=? AND user_id=?').run(dst.id, src.id, userId)
     db.prepare('UPDATE projects SET updated_at=? WHERE id=?').run(ts, dst.id)
     return {
       project: getProject(db, userId, dst.id, { excludePrivateOwned }),

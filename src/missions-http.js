@@ -270,39 +270,48 @@ async function handleLeave(ctx, req, res, who, mission) {
   return true
 }
 
-// The conversation an agent close names (spec 2026-09-29 coordinator session
-// control, "Coordinator mission close"). Absent → the pre-field contract (any
-// agent of the user closes by id). Present → it must be a conversation this
-// device owns (404 otherwise, same stance as writableConvo), and either ON
-// the mission (its own close, a child of the origin included) or the user's
-// Coordinator, which may close any mission the user owns — the one mission
-// route the role gates. Anyone else: 403 not_coordinator, and nothing about
-// the mission is learned beyond what visibleMission already answered.
-// A client never names one; the apps' close is the user's own override.
 // A close summary: a non-blank string of at most BODY_MAX UTF-8 bytes.
 // Shared with the project close route.
 export const validCloseSummary = (summary) =>
   typeof summary === 'string' && !!summary.trim() && Buffer.byteLength(summary, 'utf8') <= BODY_MAX
 
-function closingConvo(db, who, mission, convoId) {
-  if (who.kind !== 'agent' || convoId === undefined) return { convoId: null }
+// The conversation an agent close names (spec 2026-09-29 coordinator session
+// control, "Coordinator mission close"). Absent → the pre-field contract (any
+// agent of the user closes by id) — unless `required`, as for project close
+// and merge (spec 2026-09-30 §4.2), where an agent naming none is 403.
+// Present → it must be a conversation this device owns (404 otherwise, same
+// stance as writableConvo), and either ON the target (`isOn(convoId)`: a
+// mission's own close, a child of the origin included) or the user's
+// Coordinator, which may close anything the user owns. Anyone else: 403
+// not_coordinator, and nothing about the target is learned beyond what the
+// caller's sieved lookup already answered. A client never names one; the
+// apps' close is the user's own override.
+export function closingConvo(db, who, convoId, { isOn = () => false, required = false } = {}) {
+  if (who.kind !== 'agent') return { convoId: null }
+  if (convoId === undefined) return required ? { status: 403 } : { convoId: null }
   if (typeof convoId !== 'string' || !convoId) return { status: 400 }
   const convo = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(convoId)
   if (!convo || convo.owner_user_id !== who.userId || convo.agent_device_id !== who.deviceId) return { status: 404 }
-  // "On the mission" = an ACTIVE link (spec 2026-09-30 §3): current or also-on.
-  if (hasActiveLink(db, mission.id, convoId)) return { convoId }
+  if (isOn(convoId)) return { convoId }
   if (getCoordinatorConvoId(db, who.userId) !== convoId) return { status: 403 }
   return { convoId }
+}
+
+// The one mapping every closingConvo caller uses. True when it answered.
+export function refusedCloser(res, closer) {
+  if (closer.status === 400) return badRequest(res)
+  if (closer.status === 404) return notFound(res)
+  if (closer.status === 403) { json(res, 403, { error: 'forbidden', detail: 'not_coordinator' }); return true }
+  return false
 }
 
 async function handleClose(ctx, req, res, who, mission) {
   const { db } = ctx
   const body = await readBody(req)
   if (!validCloseSummary(body.summary)) return badRequest(res)
-  const closer = closingConvo(db, who, mission, body.convo_id)
-  if (closer.status === 400) return badRequest(res)
-  if (closer.status === 404) return notFound(res)
-  if (closer.status === 403) { json(res, 403, { error: 'forbidden', detail: 'not_coordinator' }); return true }
+  // "On the mission" = an ACTIVE link (spec 2026-09-30 §3): current or also-on.
+  const closer = closingConvo(db, who, body.convo_id, { isOn: (convoId) => hasActiveLink(db, mission.id, convoId) })
+  if (refusedCloser(res, closer)) return true
   let out
   try {
     out = closeMission(db, { userId: who.userId, missionId: mission.id, by: byOf(who), summary: body.summary, closedConvoId: closer.convoId, excludePrivateOwned: filteredAgent(db, who) })
