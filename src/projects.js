@@ -148,7 +148,8 @@ export function mergeProject(db, { userId, projectId, intoId, by, excludePrivate
     // Flatten (controller ruling): every project earlier merged into the
     // source now points straight at the survivor, so redirects stay one
     // hop and "Merged into #N" names the project that actually holds the work.
-    db.prepare('UPDATE projects SET merged_into=? WHERE merged_into=? AND user_id=?').run(dst.id, src.id, userId)
+    // updated_at moves too, so an incremental reader sees the new pointer.
+    db.prepare('UPDATE projects SET merged_into=?, updated_at=? WHERE merged_into=? AND user_id=?').run(dst.id, ts, src.id, userId)
     db.prepare('UPDATE projects SET updated_at=? WHERE id=?').run(ts, dst.id)
     return {
       project: getProject(db, userId, dst.id, { excludePrivateOwned }),

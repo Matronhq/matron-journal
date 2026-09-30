@@ -181,9 +181,12 @@ test('mergeProject flattens: every project earlier merged into the source now po
   const d = mk(db, { title: 'D' }).project
   mergeProject(db, { userId: 1, projectId: a.id, intoId: b.id, by: 'user' })
   mergeProject(db, { userId: 1, projectId: d.id, intoId: b.id, by: 'user' })
+  db.prepare('UPDATE projects SET updated_at=1 WHERE id IN (?,?)').run(a.id, d.id)
   mergeProject(db, { userId: 1, projectId: b.id, intoId: c.id, by: 'user' })
   const into = (p) => db.prepare('SELECT merged_into FROM projects WHERE id=?').get(p.id).merged_into
   assert.deepEqual([into(a), into(d), into(b), into(c)], [c.id, c.id, c.id, null])
+  const updatedAt = (p) => db.prepare('SELECT updated_at FROM projects WHERE id=?').get(p.id).updated_at
+  assert.ok(updatedAt(a) > 1 && updatedAt(d) > 1, 'a flattened row is bumped so incremental readers see its new pointer')
   // The one-hop pointer is what "Merged into #N" reads now.
   assert.equal(getProject(db, 1, a.id).merged_into_num, c.num)
 })
