@@ -1133,7 +1133,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: `hasActiveLink` (Task 3).
 - Produces:
-  - `missionDetail(db, userId, missionId, {excludePrivateOwned, subchats = false})`. Its `conversations[]` rows are `{id, title, state, box, parent_convo_id, current, how, joined_at, ended_at, subchat_count, status?}`.
+  - `missionDetail(db, userId, missionId, {excludePrivateOwned, subchats = false})`. Its `conversations[]` rows are `{id, title, state, box, parent_convo_id, current, how, joined_at, ended_at, subchat_count, other_missions, status?}`. `other_missions` is `[{id, num, title, current, active, joined_at, ended_at}]`: that conversation's links to missions other than this one, ordered as `conversationMissions` orders them, capped at `OTHER_MISSIONS_MAX = 5`, with `ORIGIN_SIEVE` applied for a filtered caller. Mockup 03 draws "also on #N" / "moved to #N" from it.
   - `foldSubchats(rows, {subchats}) → rows`.
   - `conversationMissions(db, userId, convoId, {excludePrivateOwned}) → [missionRow & {current, active, how, joined_at, ended_at}]`.
   - `ORIGIN_SIEVE` (exported string, alias `m`).
@@ -1165,7 +1165,7 @@ test('missionDetail: rows carry current/how/joined_at/ended_at/parent_convo_id/s
     ['c3', false, 'joined', false, 0],    // ended → after every active row
   ])
   const c1 = full.conversations[0]
-  for (const k of ['id', 'title', 'state', 'box', 'parent_convo_id', 'current', 'how', 'joined_at', 'ended_at', 'subchat_count']) assert.ok(k in c1, k)
+  for (const k of ['id', 'title', 'state', 'box', 'parent_convo_id', 'current', 'how', 'joined_at', 'ended_at', 'subchat_count', 'other_missions']) assert.ok(k in c1, k)
   assert.equal(full.conversations.find((c) => c.id === 'stray').parent_convo_id, 'c4')
   const expanded = missionDetail(db, 1, a.id, { subchats: true })
   assert.deepEqual(expanded.conversations.map((c) => c.id), ['c1', 'kid', 'grandkid', 'pkid', 'c2', 'stray', 'c3'])
@@ -1192,6 +1192,40 @@ test('conversationMissions: current first, then active newest-joined, then ended
   const sieved = conversationMissions(db, 1, 'c1', { excludePrivateOwned: true })
   assert.deepEqual(sieved.map((m) => m.id), [c.id, b.id, a.id])
   assert.equal(JSON.stringify(sieved).includes('Hidden'), false)
+})
+```
+
+Also append this test (same file). Add `OTHER_MISSIONS_MAX` to the missions import:
+
+```js
+test('missionDetail other_missions: each row names the conversation\'s OTHER missions (current first, then active, then ended; capped); a private-origin one is hidden from a filtered caller', () => {
+  const db = withPrivateBox()
+  const a = startOn(db, 'c1', 'A'); const b = startOn(db, 'c2', 'B')
+  const h = createMission(db, { userId: 1, deviceId: 9, createdBy: 'agent', convoId: 'secret', title: 'Hidden' }).mission
+  join(db, b.id, 'c1')                  // c1: B current, A also-on
+  const rowOf = (detail, id) => detail.conversations.find((c) => c.id === id)
+  const onB = missionDetail(db, 1, b.id)
+  assert.deepEqual(rowOf(onB, 'c1').other_missions.map((m) => [m.num, m.title, m.current, m.active]), [[a.num, 'A', false, true]])
+  assert.deepEqual(rowOf(onB, 'c2').other_missions, [], 'c2 is on B only')
+  const onA = missionDetail(db, 1, a.id)
+  const other = rowOf(onA, 'c1').other_missions
+  assert.deepEqual(other.map((m) => [m.id, m.current, m.active, m.ended_at]), [[b.id, true, true, null]])
+  for (const k of ['id', 'num', 'title', 'current', 'active', 'joined_at', 'ended_at']) assert.ok(k in other[0], k)
+  // Leaving B: c1's row on A now shows B as ended ("moved to" / "earlier").
+  join(db, h.id, 'c1')                  // c1: H current, B and A active
+  leaveMission(db, { userId: 1, missionId: b.id, convoId: 'c1' })
+  const full = rowOf(missionDetail(db, 1, a.id), 'c1').other_missions
+  assert.deepEqual(full.map((m) => [m.id, m.current, m.active]), [[h.id, true, true], [b.id, false, false]])
+  const sieved = rowOf(missionDetail(db, 1, a.id, { excludePrivateOwned: true }), 'c1').other_missions
+  assert.deepEqual(sieved.map((m) => m.id), [b.id], 'the private-origin mission is neither named nor counted')
+  assert.equal(JSON.stringify(sieved).includes('Hidden'), false)
+  // Capped: c3 on A plus six more missions lists only OTHER_MISSIONS_MAX of them.
+  join(db, a.id, 'c3')
+  for (let i = 0; i < 6; i++) join(db, startOn(db, 'c3', `X${i}`, { attach: false }).id, 'c3')
+  assert.equal(OTHER_MISSIONS_MAX, 5)
+  const capped = rowOf(missionDetail(db, 1, a.id), 'c3').other_missions
+  assert.equal(capped.length, OTHER_MISSIONS_MAX)
+  assert.equal(capped[0].current, true, 'the current mission is never the one cut')
 })
 ```
 
@@ -1227,6 +1261,7 @@ test('GET /missions/:id folds sub-chats by default and lists them with ?subchats
   s.db.prepare("UPDATE mission_conversations SET joined_at=1 WHERE convo_id='c1'").run()
   const folded = await s.http(`/missions/${a.num}`, { token: client })
   assert.deepEqual(folded.json.conversations.map((c) => [c.id, c.subchat_count]), [['c1', 1]])
+  assert.deepEqual(folded.json.conversations[0].other_missions, [])
   const open = await s.http(`/missions/${a.num}?subchats=1`, { token: client })
   assert.deepEqual(open.json.conversations.map((c) => [c.id, c.parent_convo_id]), [['c1', null], ['kid', 'c1']])
 })
@@ -1249,7 +1284,7 @@ test('close gate: an agent naming a conversation that is ALSO ON the mission (ac
 - [ ] **Step 3: Run the tests to verify they fail**
 
 Run: `node --test --test-timeout=30000 test/mission-links.test.js test/mission-links-http.test.js 2>&1 | grep -E '^not ok|^# (pass|fail)'`
-Expected: FAIL. `conversationMissions` is not exported, detail rows lack the link fields, the route 404s, and the close gate refuses `c1`.
+Expected: FAIL. `conversationMissions` and `OTHER_MISSIONS_MAX` are not exported, detail rows lack the link fields and `other_missions`, the route 404s, and the close gate refuses `c1`.
 
 - [ ] **Step 4: Implement the reads in `src/missions.js`**
 
@@ -1302,8 +1337,40 @@ export function foldSubchats(rows, { subchats = false } = {}) {
     WHERE l.mission_id = ? ${sieve}
     ORDER BY (l.ended_at IS NOT NULL), l.joined_at, c.created_at`).all(userId, mission.id)
     .map((r) => withConvoStatus({ ...r, current: !!r.current }))
-  return { mission, milestones, items, conversations: foldSubchats(rows, { subchats }) }
+  const conversations = foldSubchats(rows, { subchats })
+  const others = otherMissionsStmt(db, excludePrivateOwned)
+  for (const c of conversations) c.other_missions = others.all(userId, c.id, mission.id).map(otherMissionRow)
+  return { mission, milestones, items, conversations }
 ```
+
+Add above `missionDetail` (next to `foldSubchats`):
+
+```js
+// Mockup 03's "also on #N" / "moved to #N" on a mission page's conversation
+// rows (spec 2026-09-30 §3): each listed row names the conversation's links
+// to OTHER missions — current first, then active, then ended newest first
+// (conversationMissions' order), at most OTHER_MISSIONS_MAX. A slim shape,
+// not a mission row: the page needs a chip, not counts. ORIGIN_SIEVE keeps
+// a private-origin mission (the user may have joined this public
+// conversation to one) from being named to an ordinary agent. Folded
+// sub-chats are not listed, so they carry none.
+export const OTHER_MISSIONS_MAX = 5
+
+function otherMissionsStmt(db, excludePrivateOwned) {
+  return db.prepare(`SELECT m.id, m.num, m.title, (c.mission_id = m.id) AS current, (l.ended_at IS NULL) AS active,
+      l.joined_at, l.ended_at
+    FROM mission_conversations l
+    JOIN missions m ON m.id = l.mission_id AND m.user_id = ?
+    JOIN conversations c ON c.id = l.convo_id
+    WHERE l.convo_id = ? AND l.mission_id <> ? ${excludePrivateOwned ? `AND ${ORIGIN_SIEVE}` : ''}
+    ORDER BY current DESC, (l.ended_at IS NULL) DESC, COALESCE(l.ended_at, l.joined_at) DESC
+    LIMIT ${OTHER_MISSIONS_MAX}`)
+}
+
+const otherMissionRow = (r) => ({ ...r, current: !!r.current, active: !!r.active })
+```
+
+(`ORIGIN_SIEVE` is declared further down the file as a `const`. That is fine, because `otherMissionsStmt` reads it only when called, after the module has loaded. If you prefer, move the `export const ORIGIN_SIEVE` declaration above `foldSubchats`.)
 
 Change `missionDetail`'s signature to `export function missionDetail(db, userId, missionId, { excludePrivateOwned = false, subchats = false } = {})`.
 
@@ -3040,8 +3107,10 @@ sub-chats never count toward the 200-conversation cap).
 - \`GET /missions/:id\` → \`{mission, milestones (newest first), items
   (open), conversations}\`. Each conversation row has \`current\`, \`how\`,
   \`joined_at\`, \`ended_at\` (null = on it now), \`parent_convo_id\` and
-  \`subchat_count\`; sub-chats are folded into their parent's row — add
-  \`?subchats=1\` to list them too.
+  \`subchat_count\`, plus \`other_missions\` (up to 5 of that
+  conversation's other missions: \`{id, num, title, current, active,
+  joined_at, ended_at}\`); sub-chats are folded into their parent's row —
+  add \`?subchats=1\` to list them too.
 ```
 
 5. In the `PATCH /missions/:id` bullet, change `{title?, body?, status?: string|null, convo_id?}` to `{title?, body?, status?: string|null, project?, convo_id?}` and append: `\`project: id|"#n"|n|null\` files the mission in a project (null takes it out); it works on a closed mission too. The \`updated\` marker carries \`project_changed: true\` when it moved. \`POST /missions\` also takes \`project\`. 404 for a project you cannot see, 409 \`project_closed\`.`
@@ -3146,7 +3215,7 @@ cannot be recovered. It never runs again once any link exists.
 
    - In the `POST /missions` row, append: `Optional \`project\` (id, \`#n\` or \`n\`) files the new mission: 404 for a project the caller cannot see, 409 \`{blocked_by:'project_closed'}\`, 400 on a non-string/non-number; ignored on the \`existing: true\` answer.`
    - In the `GET /missions` row, append: `Rows also carry \`project_id\`, \`project_num\`, \`activity\` and \`last_activity_at\` (see *Activity*). \`conversations\` is the number of **active top-level** links. \`?scope=shared\` rows carry \`project_id: null, project_num: null\`.`
-   - Replace the own-view `GET /missions/:id` row's Returns cell with: `` `{mission, milestones:[…] newest first, items:[open items], conversations:[{id, title, box, state, parent_convo_id, current, how, joined_at, ended_at, subchat_count, status?}]}` — every linked conversation, active links first (by `joined_at`), then ended ones. A sub-chat whose parent (or any ancestor) is also linked is **folded**: counted in its nearest linked ancestor's `subchat_count` and left out of the list; `?subchats=1` lists them as well. A sub-chat whose parent is not linked stands as its own row. `status` is the session header (own-user view only). ``
+   - Replace the own-view `GET /missions/:id` row's Returns cell with: `` `{mission, milestones:[…] newest first, items:[open items], conversations:[{id, title, box, state, parent_convo_id, current, how, joined_at, ended_at, subchat_count, other_missions, status?}]}` — every linked conversation, active links first (by `joined_at`), then ended ones. A sub-chat whose parent (or any ancestor) is also linked is **folded**: counted in its nearest linked ancestor's `subchat_count` and left out of the list; `?subchats=1` lists them as well. A sub-chat whose parent is not linked stands as its own row. `other_missions` is `[{id, num, title, current, active, joined_at, ended_at}]`: the listed conversation's links to *other* missions (for "also on #N" / "moved to #N"), current first, then active, then ended newest first, at most 5; for an ordinary agent a private-origin mission is left out. `status` is the session header (own-user view only). ``
    - In the `PATCH /missions/:id` row, change the body to `{title?, body?, status?: string\|null, project?: id\|"#n"\|n\|null, convo_id?}` and append: `\`project\` files or (null) unfiles the mission — same 404/409 \`project_closed\`/400 as on create — and is the one change a **closed** mission still accepts (any other field on a closed mission is 409 \`closed\`). The \`updated\` marker carries \`project_changed: true\` when the project changed.`
    - Replace the `POST /milestones` row's body/returns with: `` `{convo_id, kind:'user_input'\|'progress', title, body?, mission?}` + optional `Idempotency-Key` `` → `` 201 `{milestone, mission}`. `mission` (id, `#n` or `n`; `null`/absent = current) may name any mission this conversation has an **active** link to; anything else — unknown, invisible to the caller, never linked, or ended — is 409 `{blocked_by:'not_linked'}` (one answer, so it is never an existence oracle), and a non-string/non-number is 400. With no `mission`: 409 `{blocked_by:'no_mission'}` if the conversation has no current mission (or its mission is invisible to the caller), 409 `{blocked_by:'closed'}` if the target mission is closed; 502 `{error:'marker_append_failed'}` as before. ``
 
@@ -3188,7 +3257,7 @@ hidden milestone never count.
 agent (the user may have joined a public conversation to one), `/snapshot`'s
 `mission_id` reads null and `mission_count` excludes it, a mission's
 `conversations` rows and `subchat_count` exclude private-owned
-conversations, and `activity` ignores them. `POST /milestones {mission}`
+conversations, each row's `other_missions` omits private-origin missions, and `activity` ignores them. `POST /milestones {mission}`
 answers `not_linked` for a mission the caller cannot see.
 ```
 
