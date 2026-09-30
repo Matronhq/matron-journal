@@ -139,19 +139,44 @@ legacy fallback without adding a column.
 `seen_ranges` rows go when their conversation goes (retention.js already walks
 conversations). `unseen_flags` rows are pruned after 30 days.
 
-## 5. Privacy (Q3)
+## 5. Privacy (Q3, decided)
 
-**Recommended:**
-- Read state is Dan's own. Only his client devices write it, and only his
-  Coordinator can query it.
-- Ordinary agents never learn whether Dan has seen a message. There is no read
-  receipt to agents, so they won't nag or play games with it.
-- Other users never see it, including team members on shared items.
-- Private devices are respected. The Coordinator's `/unseen` excludes
-  conversations owned by a private device, unless the Coordinator itself runs
-  on that device. This is the same exclusion `coordinatorFor` already uses.
-- Nothing about seen state goes into search, push payloads or the apps'
+Dan chose Coordinator-only visibility, then added that an agent should be able
+to tell which of **its own** messages he hasn't seen. The use case is an agent
+at the end of a long turn noticing that something it said early on was never
+seen, and mentioning it again.
+
+- **Writes.** Only Dan's client devices write read state.
+- **The Coordinator** can query all of it (`unseen_list`, §6).
+- **Any agent** can ask about its own messages in its own conversation, and in
+  rooms it takes part in, with `unseen_mine()`. It sees nothing about other
+  conversations and nothing about other senders' messages.
+- **Nobody else sees it.** Other users, including team members on shared
+  items, never do.
+- **Private devices.** The Coordinator's `/unseen` excludes conversations owned
+  by a private device, unless the Coordinator itself runs on that device. This
+  is the same exclusion `coordinatorFor` already uses. `unseen_mine` is scoped
+  to the caller's own rooms, so it needs no extra rule.
+- **Nothing** about seen state goes into search, push payloads or the apps'
   roster.
+
+### `unseen_mine` (every agent)
+
+```
+unseen_mine({ older_than?: '10m' })
+→ [{ seq, ts, snippet, reasons[] }]   // the caller's own messages Dan hasn't seen
+```
+
+- This is backed by the journal route `GET /unseen?mine=1&convo_id=`, scoped
+  to the caller's rooms.
+- **Instructions in the bridge's base prompt.** Check it when finishing a long
+  turn. If something that matters is unseen, restate it once, briefly, in the
+  closing message ("Earlier I said X; you may have missed it"). Never repeat a
+  restatement. Never tell Dan he hasn't read something.
+- **Restating counts as raised.** The restatement is itself a new message. The
+  agent calls `unseen_flag` on the original ref, but only for its own
+  messages. The Coordinator's no-repeat rule then skips the original, and the
+  Coordinator flags the restatement only if that also goes unseen.
 
 ## 6. Importance, the Coordinator tool, and the no-repeat rule (Q2, Q4)
 
@@ -238,8 +263,8 @@ and "one line each, lead with why it matters".
    simpler variant.
 2. What counts as important: a journal floor plus Coordinator judgment
    (recommended), an agent flag, or heuristics only.
-3. Privacy: Coordinator-only (recommended), or agents may ask about their own
-   messages.
+3. Privacy: **decided.** Coordinator sees all, and each agent sees its own
+   messages only (§5).
 4. Tool shape and triggers: `unseen_list` + `unseen_flag` with status updates
    plus a 2 h nudge (recommended), or status updates only.
 
@@ -256,7 +281,7 @@ and "one line each, lead with why it matters".
 Build order once approved:
 1. **journal:** tables, the `seen` and `item_seen` ops, the legacy fallback,
    `/unseen` and flags, and the nudge frame. Tests with real merged ranges.
-2. **bridge:** `unseen_list` / `unseen_flag`, the nudge turn, and the
+2. **bridge:** `unseen_list` / `unseen_flag` / `unseen_mine`, the nudge turn, and the
    Coordinator brief.
 3. **apple:** visibility tracker (iOS `ChatTimelineController` visible index
    paths; Mac `LazyVStack` row geometry), flush on scene phase, item detail
