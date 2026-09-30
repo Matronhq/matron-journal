@@ -1,6 +1,6 @@
 # Read state — the Coordinator knows what Dan hasn't seen
 
-Date: 2026-09-30. Status: **plan for review. Nothing is built until Dan approves.**
+Date: 2026-09-30. Status: **design decided by Dan (all four questions answered, 30 Sep); build awaits his go-ahead.**
 This is mission 5427 and spans matron-journal, matron-apple and matron-bridge.
 matron-web and matron-android come later.
 
@@ -9,9 +9,9 @@ read status of messages, so that if someone has said something in a chat and
 I haven't seen it, the Coordinator could tell me: by the way, you didn't see
 this, it was an important thing that you should have seen."
 
-The open design questions are in Dan's tracker. §7 lists them, and every
-section marks where a choice is still open. This document describes the
-recommended answer to each one.
+Dan answered all four design questions in his tracker (§7). He chose the
+recommended option each time, and added that agents may see which of their
+own messages he hasn't seen (§5).
 
 ## 1. What exists today
 
@@ -44,9 +44,9 @@ a new, finer-grained record of which messages were actually on Dan's screen.
 It never changes `unread_count`, the badge, or push. This keeps the change
 additive, with no risk to the badge that every app already relies on.
 
-## 3. What counts as seen (Q1)
+## 3. What counts as seen (Q1, decided: A)
 
-**Recommended:** a message counts as seen when it has been on screen for at
+**Decided:** a message counts as seen when it has been on screen for at
 least 1 second in the foreground app. "On screen" means at least half the row
 is visible, or the row fills at least half the viewport. On Mac the window
 must also be key or at least visible. Clients report **seq ranges**, not a
@@ -61,8 +61,7 @@ middle as seen.
   conversation-list snippet, a bridge's `read_marker`, or Dan replying from a
   notification.
 - **Tapping a notification** counts the message it names as seen: the banner
-  showed Dan the text. This is open in Q1. The default is yes, for that one
-  message.
+  showed Dan the text.
 - **Items:** opening an item's detail counts the item body and every comment
   rendered in the thread as seen. An inline item card in the timeline is
   covered by the card's own message seq.
@@ -180,9 +179,9 @@ unseen_mine({ older_than?: '10m' })
 
 ## 6. Importance, the Coordinator tool, and the no-repeat rule (Q2, Q4)
 
-### Importance (Q2)
+### Importance (Q2, decided: A)
 
-**Recommended:** a journal-computed floor, plus the Coordinator's judgment. No
+**Decided:** a journal-computed floor, plus the Coordinator's judgment. No
 agent-side flag in v1. The journal tags each unseen thing with `reasons[]`:
 
 | reason | rule |
@@ -243,9 +242,9 @@ Default exclusions:
   shows up as unseen. That is one message to catch up on, not N repeated
   flags.
 
-### When the Coordinator uses it (Q4)
+### When the Coordinator uses it (Q4, decided: A)
 
-**Recommended:**
+**Decided:**
 1. Every status update gets a short "You haven't seen" section with at most 5
    entries, each giving the conversation link, one line, and why it matters.
 2. **An event-driven nudge.** The journal sends the Coordinator one ephemeral
@@ -257,16 +256,16 @@ Default exclusions:
 `BRIDGE_COORDINATOR.md` gets a short section on this, with the no-repeat rule
 and "one line each, lead with why it matters".
 
-## 7. Questions for Dan (in the tracker)
+## 7. Dan's decisions (30 Sep)
 
-1. What counts as seen: on screen for 1 s as seq ranges (recommended), or a
-   simpler variant.
-2. What counts as important: a journal floor plus Coordinator judgment
-   (recommended), an agent flag, or heuristics only.
-3. Privacy: **decided.** Coordinator sees all, and each agent sees its own
-   messages only (§5).
-4. Tool shape and triggers: `unseen_list` + `unseen_flag` with status updates
-   plus a 2 h nudge (recommended), or status updates only.
+1. Seen: on screen for 1 s, reported as seq ranges. Tapping a notification
+   counts that one message.
+2. Important: journal reasons plus the Coordinator's judgement. No agent flag
+   in v1.
+3. Privacy: the Coordinator sees all. Each agent sees only its own unseen
+   messages (`unseen_mine`). Nobody else sees any of it.
+4. Triggers: a "You haven't seen" section in status updates, plus a 2 h
+   nudge (at most hourly, 07:00–22:00 UK). The no-repeat rule applies.
 
 ## 8. Order of work, and the Projects work (mission 5181)
 
@@ -275,8 +274,19 @@ and "one line each, lead with why it matters".
 - Read-state adds new tables, ops, routes and a new bridge tool. It does not
   alter `events`, `conversations`, `items` or `missions`. In Apple it touches
   the chat timeline and item detail, not the mission and project views.
-- **The order is still to be agreed with the Projects session. The record will
-  go here.**
+- **Projects' Apple work** is at the plan stage (apple #276) and touches the
+  mission and project views only. Read-state's Apple work touches neither.
+  Projects' bridge #332 adds `projects-*` and `missions-*` tools and edits
+  `ask-user.js`. Read-state adds separate `unseen-*` files, and its small
+  `ask-user.js` edit rebases onto #332 if that merges first.
+- **Proposed order:** Projects' bridge #332 lands first, and read-state's
+  bridge PR rebases onto it. Read-state's journal work doesn't depend on
+  anything. The Projects session was asked to confirm by agent chat on 30 Sep
+  and hadn't replied when this was written. No file overlap was found.
+- **Mac timeline:** apple #264 moves the Mac chat timeline to a virtualised
+  AppKit view behind `chat.timeline.appkit`. The Mac visibility tracker is
+  built on the AppKit timeline's visible rows. It covers the SwiftUI
+  `MacChatView` only while that is still the default.
 
 Build order once approved:
 1. **journal:** tables, the `seen` and `item_seen` ops, the legacy fallback,
