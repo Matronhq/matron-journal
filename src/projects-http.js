@@ -32,7 +32,8 @@ async function handleCreate(ctx, req, res, who) {
   if (idemKey === undefined) return badRequest(res)
   // convo_id is optional provenance (a client creates from the Projects
   // tab); when named it must be a conversation this caller may write to.
-  if (body.convo_id !== undefined && !writableConvo(db, who, body.convo_id)) return notFound(res)
+  // null is the same as absent.
+  if (body.convo_id != null && !writableConvo(db, who, body.convo_id)) return notFound(res)
   const excludePrivateOwned = filteredAgent(db, who)
   const out = createProject(db, {
     userId: who.userId, deviceId: who.deviceId, createdBy: byOf(who), convoId: body.convo_id ?? null,

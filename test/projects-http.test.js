@@ -98,6 +98,8 @@ test('POST/GET/PATCH /projects: any agent creates (idempotent), lists with rollu
   assert.equal((await newProject(s, agent.token, {}, { 'idempotency-key': 'p1' })).status, 200)
   assert.equal((await newProject(s, agent.token, { title: '' })).status, 400)
   assert.equal((await newProject(s, agent.token, { convo_id: 'nope' })).status, 404)
+  const nullConvo = await newProject(s, agent.token, { title: 'No convo', convo_id: null })
+  assert.equal(nullConvo.status, 201, 'convo_id: null is the same as leaving it out'); assert.equal(nullConvo.json.project.origin_convo_id, null)
   assert.equal((await newProject(s, client, { title: 'From the app' })).status, 201)
   await startMission(s, agent.token, { project: p.id })
   const list = await s.http('/projects?state=open', { token: client })
