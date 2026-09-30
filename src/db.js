@@ -638,12 +638,13 @@ export function openDb(path) {
   // refreshSpawnRoomTitle (spawns.js) looks a started row up by its child
   // on every titled convo_upsert; keep that a point lookup.
   db.exec('CREATE INDEX IF NOT EXISTS idx_spawn_child ON agent_spawn_requests(child_convo_id)')
-  // Missions (spec 2026-09-10): a conversation belongs to at most one
-  // mission, set once and never changed; an item follows its origin
-  // conversation but can be moved (PATCH /items/:id {mission}). Both are
-  // NULL for every row predating the column. Placed here, after every
-  // table-rebuild block, so a rebuild can never drop them. Not foreign
-  // keys — same stance as parent_convo_id.
+  // Missions (spec 2026-09-10): conversations.mission_id is the
+  // conversation's CURRENT mission (spec 2026-09-30: see
+  // mission_conversations); an item follows its origin conversation but
+  // can be moved (PATCH /items/:id {mission}). Both are NULL for every row
+  // predating the column. Placed here, after every table-rebuild block, so
+  // a rebuild can never drop them. Not foreign keys — same stance as
+  // parent_convo_id.
   const missionConvoCols = db.prepare('PRAGMA table_info(conversations)').all()
   if (!missionConvoCols.some((c) => c.name === 'mission_id')) {
     db.exec('ALTER TABLE conversations ADD COLUMN mission_id TEXT')

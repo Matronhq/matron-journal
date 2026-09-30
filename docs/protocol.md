@@ -23,6 +23,12 @@ the machine-checkable version of this page.
   omitted everywhere else (solo conversations, dissolved rooms, rooms whose
   only joined participants were sieved out by the privacy predicate below),
   so the wire is unchanged for everything that is not a live room.
+  Every row also carries `mission_id` — the conversation's **current**
+  mission, or `null` — and `mission_count`, the number of missions it was
+  ever linked to (active and ended; the header's "+n" is `mission_count − 1`).
+  For an ordinary agent both are sieved: a private-origin mission reads as
+  `mission_id: null` and is not counted (see *Missions & milestones →
+  Visibility*).
   `agents` is `[{device_id, name, tag_char}]` for the caller's
   `kind='agent'` devices — the id→name table a client needs to render which
   box owns a conversation, so no second round-trip is required. It obeys the
@@ -1865,23 +1871,39 @@ mission is refused — `409 {"error":"conflict","blocked_by":"no_mission"}`
 — rather than minting one implicitly. `mission_start` (`POST /missions`)
 is the only way in.
 
-A conversation gains a mission in exactly four ways: `POST /missions`
-(which attaches its origin unless `attach: false`), `POST /missions/:id/join`,
-a spawn that named the mission (`spawn_request` `mission_num`, see
-*Agent-spawned sessions*), and **inheritance**
-— a spawned conversation takes its parent's mission at creation, and never
-afterwards (like `parent_convo_id`, it is immutable once the row exists).
-Inheritance is a way *into* a mission, so `join`'s gates apply to it
-identically: the parent's mission must be `open`, it must hold fewer than
-200 conversations (the raw count — never the sieved one the creator can
-see), and it must be **visible to the creating device** under the rule in
-*Visibility* below. That last gate refuses two shapes an ordinary
-(non-private) agent could otherwise be attached through: a **private-owned
-parent**, and a *public* parent the user has joined to a **private-origin**
-mission — the second is invisible from the parent row alone, and either
-one would hand the child a `mission_id` it can never read, join or post a
-milestone to. A child that fails any gate simply starts with no mission;
-its agent can `mission_start` its own.
+A conversation may be linked to **many** missions (spec
+2026-09-30 projects & mission links §3). The `mission_conversations` table
+holds one row per (mission, conversation): `how` it was made (`origin |
+joined | spawned | inherited | backfill`), `joined_at`, and `ended_at`
+(`null` = active). Exactly one active link is **current**, or none;
+`conversations.mission_id` is the pointer to it (invariant: a non-null
+pointer always has an active link), and it is where `POST /milestones` and
+new items go by default. The pointer changes only through create (origin),
+join, leave, spawn and inheritance.
+
+A conversation gains a link by `POST /missions` (its origin, unless
+`attach: false`), `POST /missions/:id/join`, a spawn that named the mission
+(`spawn_request` `mission_num`; `how: spawned`), and **inheritance** — a
+sub-chat takes its parent's *current* mission at creation (`how:
+inherited`), and never afterwards. Inheritance is a way into a mission, so
+two of join's gates apply: the mission must be `open`, and **visible to the
+creating device** under *Visibility* (a private-owned parent, or a public
+parent joined to a private-origin mission, is refused for an ordinary
+agent). There is no cap gate: **sub-chats never count toward the 200**. A
+child that fails a gate starts with no mission.
+
+**Cap.** `CONVOS_MAX = 200` counts a mission's *active* links from
+*top-level* conversations (`parent_convo_id IS NULL`). Ended links and
+sub-chats never count.
+
+**Backfill.** On the first start after this change, while the link table
+is empty, the journal writes one active link per current pointer (`origin`
+when the mission was born there, `inherited` for a sub-chat, else `joined`;
+`joined_at` from the conversation's earliest `created`/`joined` marker for
+that mission, else the later of the two creation times), then one ended
+`backfill` link for every other (mission, conversation) pair a milestone or
+an item records, from its first to its last trace. Pairs that left no trace
+cannot be recovered. It never runs again once any link exists.
 
 A mission is **unassigned** while it is `open` and has no conversations
 (`conversations: 0` on the list and detail rows) — typically one the
@@ -1892,14 +1914,16 @@ column.
 
 | Route | Body / query | Returns |
 |---|---|---|
-| `POST /missions` | `{title, body?, convo_id, attach?: boolean}` + optional `Idempotency-Key` (also served at `POST /missions/create`) | 201 `{mission}`. If `convo_id` already has a mission: 200 that mission with `existing: true`, nothing changed — or **404** if that mission is invisible to the caller (see *Visibility*). Attaches the conversation, repoints its unassigned items (each repointed item's own `updated_at` is bumped too, so `GET /items?since=` learns it gained a mission). With `attach: false`: always a new mission (201; a replay 200), `origin_convo_id` = `convo_id`, and neither the conversation nor its items are touched — no `existing` short-circuit. Either way, on a genuine 201 the `created` mission marker is still appended into `convo_id` — provenance of where the mission was born, independent of whether it was ever attached there. A non-boolean `attach` is 400. |
-| `GET /missions` | `?state=open\|closed` (omit = both), `?since=<ms>`, `?scope=mine\|shared` (shared: neither `state` nor `since`; rows carry `owner`) | `{missions:[…]}` with per-row counts: `open_items`, `needs_you` (open and awaiting user), `conversations`, `milestones`, `last_milestone` `{num,title,kind,created_at}`. Sorted `last_milestone_at DESC NULLS LAST`, then `created_at DESC` — for a filtered (ordinary agent) caller this is the SIEVED last-milestone timestamp (the same sieved subquery the `last_milestone` field itself uses), so the order never disagrees with the row shown; an owner or private agent sorts on the stored column, which is the same thing. |
-| `GET /missions/:id` | | `{mission, milestones:[…] newest first, items:[open items], conversations:[{id,title,box,state,status?}]}` — `status` is the session's persisted header (same block as `GET /roster`), own-user view only; the shared view below never carries it |
-| `GET /missions/:id` (shared) | `:id` must be `ms_…` (a colleague's number is not resolvable) of a mission visible under *Shared visibility* | mission detail with `owner`; `PATCH`, `join`, and `close` on it are all **403 `forbidden`** |
-| `PATCH /missions/:id` | `{title?, body?, status?: string\|null, convo_id?}` | 200 `{mission}`; 400 on a bad `status` (see *Status*); 409 `{blocked_by:'closed'}` |
-| `POST /missions/:id/join` | `{convo_id}` | 200 `{mission}`; 409 `{blocked_by:'other_mission'}` if the conversation already has a different mission, 409 `{blocked_by:'closed'}` if this one is closed, 400 `{error:'bad_request'}` once the mission already has 200 conversations. Repeat-joining the same mission is a no-op 200, not a conflict. Repoints the conversation's unassigned items (same `updated_at` bump as `POST /missions`). |
+| `POST /missions` | `{title, body?, convo_id, attach?: boolean}` + optional `Idempotency-Key` (also served at `POST /missions/create`) | 201 `{mission}`. If `convo_id` already has a mission: 200 that mission with `existing: true`, nothing changed — or **404** if that mission is invisible to the caller (see *Visibility*). Attaches the conversation, repoints its unassigned items (each repointed item's own `updated_at` is bumped too, so `GET /items?since=` learns it gained a mission). With `attach: false`: always a new mission (201; a replay 200), `origin_convo_id` = `convo_id`, and neither the conversation nor its items are touched — no `existing` short-circuit. Either way, on a genuine 201 the `created` mission marker is still appended into `convo_id` — provenance of where the mission was born, independent of whether it was ever attached there. A non-boolean `attach` is 400. Optional `project` (id, `#n` or `n`) files the new mission: 404 for a project the caller cannot see, 409 `{blocked_by:'project_closed'}`, 400 on a non-string/non-number; ignored on the `existing: true` answer. |
+| `GET /missions` | `?state=open\|closed` (omit = both), `?since=<ms>`, `?scope=mine\|shared` (shared: neither `state` nor `since`; rows carry `owner`) | `{missions:[…]}` with per-row counts: `open_items`, `needs_you` (open and awaiting user), `conversations`, `milestones`, `last_milestone` `{num,title,kind,created_at}`. Sorted `last_milestone_at DESC NULLS LAST`, then `created_at DESC` — for a filtered (ordinary agent) caller this is the SIEVED last-milestone timestamp (the same sieved subquery the `last_milestone` field itself uses), so the order never disagrees with the row shown; an owner or private agent sorts on the stored column, which is the same thing. Rows also carry `project_id`, `project_num`, `activity` and `last_activity_at` (see *Activity*). `conversations` is the number of **active top-level** links. `?scope=shared` rows carry `project_id: null, project_num: null`. |
+| `GET /missions/:id` | `?subchats=1`, `?history=1` | `{mission, milestones:[…] newest first, items:[open items], conversations:[{id, title, box, state, parent_convo_id, current, how, joined_at, ended_at, subchat_count, other_missions, status?}]}`. By default only **active** links, ordered by `joined_at`; `?history=1` appends the ended links after them (each with its `ended_at`); the two orderings never interleave. A sub-chat whose parent (or nearest linked ancestor) is also linked is **folded**: counted in that ancestor's `subchat_count` and left out of the list — `?subchats=1` lists them too (folding runs separately within the active group and the history group, so an ended sub-chat never folds into an active row); the two flags combine. A sub-chat whose parent is not linked stands as its own row. `other_missions` is `[{id, num, title, current, active, joined_at, ended_at}]`: the listed conversation's links to *other* missions (for "also on #N" / "moved to #N"), current first, then active, then ended newest first, at most 5; for an ordinary agent a private-origin mission is left out. `status` is the session header (own-user view only). |
+| `GET /missions/:id` (shared) | `?subchats=1` (honoured; `?history=1` is ignored — a colleague has no members table to reconcile) | `:id` must be `ms_…` (a colleague's number is not resolvable) of a mission visible under *Shared visibility*; mission detail with `owner`; `PATCH`, `join`, and `close` on it are all **403 `forbidden`** |
+| `PATCH /missions/:id` | `{title?, body?, status?: string\|null, project?: id\|"#n"\|n\|null, convo_id?}` | 200 `{mission}`; 400 on a bad `status` (see *Status*); 409 `{blocked_by:'closed'}`. `project` files or (`null`) unfiles the mission — same 404/409 `project_closed`/400 as on create — and is the one change a **closed** mission still accepts (any other field on a closed mission is 409 `closed`). The `updated` marker carries `project_changed: true` when the project changed. |
+| `POST /missions/:id/join` | `{convo_id}` | 200 `{mission}`. Adds a link — or reactivates an ended one, keeping its original `how` unless that was `backfill` — stamps `joined_at`, and makes it **current**. The previous current mission stays active ("also on"): there is **no 409 `other_mission`** any more (an old bridge simply sees 200). Re-joining the current mission is a no-op 200 with no marker. 409 `{blocked_by:'closed'}`; 400 `{error:'bad_request'}` when the mission already has 200 active top-level links (a sub-chat is never refused by the cap). Repoints the conversation's unassigned items. Marker: `joined` for a new or reactivated link, `current_changed` for an already-active one. |
+| `POST /missions/:id/leave` | `{convo_id}` | 200 `{mission, current_mission}`. Ends the link (`ended_at`), keeping it as history. Leaving the current one moves current to the most recently joined remaining active link **on an open mission**, else to none (`current_mission: null`). Leaving an already-ended link is a 200 no-op; **404** when the conversation was never linked, or the conversation fails join's gate. Items stay where they are. Markers: `left`, and `current_changed` (for the new current mission) when current moved. |
+| `GET /conversations/:id/missions` | | `{missions:[…]}` — every mission the conversation is or was linked to: current first, then other active links newest-joined first, then ended links newest-ended first. Each is a full mission row plus `current`, `active`, `how`, `joined_at`, `ended_at`. Own conversations only; 404 for another user's, an unknown one, or (ordinary agent) a private-owned one. |
 | `POST /missions/:id/close` | `{summary, convo_id?}` | 200 `{mission}`, or 409 as in *Closing*, below. `convo_id` (agents only; a client's is ignored) names the closing conversation: **404** unless this device owns it, **403** `{error:'forbidden', detail:'not_coordinator'}` when it is neither on the mission nor the user's Coordinator — see *Closing*. |
-| `POST /milestones` | `{convo_id, kind:'user_input'\|'progress', title, body?}` + optional `Idempotency-Key` | 201 `{milestone, mission}`; 409 `{blocked_by:'no_mission'}` if the conversation has none — or if its mission is invisible to the caller (see *Visibility*), 409 `{blocked_by:'closed'}` if its mission is closed; 502 `{error:'marker_append_failed'}` if the anchor marker couldn't be written (the milestone row is not created either — see "Marker events" below). |
+| `POST /milestones` | `{convo_id, kind:'user_input'\|'progress', title, body?, mission?}` + optional `Idempotency-Key` | 201 `{milestone, mission}`. `mission` (id, `#n` or `n`; `null`/absent = current) may name any mission this conversation has an **active** link to; anything else — unknown, invisible to the caller, never linked, or ended — is 409 `{blocked_by:'not_linked'}` (one answer, so it is never an existence oracle), and a non-string/non-number is 400. With no `mission`: 409 `{blocked_by:'no_mission'}` if the conversation has no current mission (or its mission is invisible to the caller), 409 `{blocked_by:'closed'}` if the target mission is closed; 502 `{error:'marker_append_failed'}` as before. |
 | `GET /milestones?convo=<id>` | | `{milestones:[…]}` newest first — the per-conversation view. 400 without `convo`; 404 for an unknown conversation, another user's, or (for an ordinary agent) a private-owned one. Also works on a colleague's conversation visible under *Shared visibility*. |
 | `PATCH /items/:id` | gains `mission: id \| "#num" \| null` | existing route (see "Items" above); moves or detaches the item, gated by the same visibility rule as `GET /missions/:id` — a mission an ordinary agent can't see is never a reachable move target, and is **404**, not 403. A closed mission is still a legal target (see the Items table). Emits the item marker `updated`. |
 
@@ -1912,7 +1936,8 @@ Row shapes: a mission is `{id, user_id, num, state, title, body,
 close_summary, closed_by, closed_over_open_items, origin_convo_id,
 origin_device_id, created_by, created_at, updated_at, last_milestone_at,
 closed_at, status, status_by, status_convo_id, status_updated_at,
-closed_convo_id}` plus the counts listed against `GET /missions` above
+closed_convo_id, project_id, project_num, activity, last_activity_at}` plus
+the counts listed against `GET /missions` above
 (`closed_convo_id` is null when no conversation was named and, for an
 ordinary agent, when the closing conversation is private-owned — the same
 sieve `status_convo_id` gets); a milestone is `{id,
@@ -1923,7 +1948,9 @@ used only by the privacy sieve) and `user_id` (milestone — always the
 caller's own id, so no route reads it back). Query-computed columns such as
 `sieved_last_milestone_at` and `status_hidden` (the sort key and the
 per-caller status sieve verdict, both internal to `countsSql`/
-`sharedCountsSql`) are never returned either.
+`sharedCountsSql`) are never returned either. `running_convos`,
+`waiting_convos` and `convo_activity_at` (activity inputs computed by
+`countsSql`) are never returned.
 
 ### Status
 
@@ -1960,6 +1987,26 @@ Every mission row — `GET /missions`, `GET /missions/:id`, and the `mission`
 object in every other response — carries the four fields, null when unset
 or withheld (see *Visibility*).
 
+### Activity
+
+Every mission row carries `activity` and `last_activity_at`, computed per
+caller (spec 2026-09-30 §2):
+
+- `closed` — the mission is closed;
+- `running` — any actively linked conversation's `session_state` is `running`;
+- `waiting` — any actively linked conversation is `waiting`, or `needs_you > 0`;
+- `quiet` — `now − last_activity_at ≥ 7 days`;
+- `idle` — none of the above.
+
+`last_activity_at` is the latest of the mission's `created_at`, its last
+milestone, its `status_updated_at`, and — for each **active** link — the
+link's `joined_at` and the conversation's newest message event (the
+`MESSAGE_TYPES` rule `/snapshot` uses for `last_ts`; `session_status` and
+marker events are not activity). There is no stored activity column.
+Every input goes through the caller's sieve: for an ordinary agent a
+private-owned conversation's state and messages, a withheld status and a
+hidden milestone never count.
+
 ### Idempotency
 
 `POST /missions` and `POST /milestones` accept an `Idempotency-Key`
@@ -1993,8 +2040,8 @@ caller kind.
 closes by id, as before. An agent that names its conversation (every
 current bridge does) is held to a rule: the conversation must be one this
 device owns (else **404**, same stance as `join`'s `convo_id`), and either
-**on the mission** — the origin conversation or any conversation attached
-to it, a child of the origin included — or the user's **Coordinator**
+**on the mission** — any conversation with an *active* link to it, current
+or also-on — or the user's **Coordinator**
 (`user_settings.coordinator_convo_id`), which may close any mission the
 user owns: the one mission route the role gates (spec: matron-bridge
 2026-09-29 coordinator session control, "Coordinator mission close"). Any
@@ -2030,19 +2077,23 @@ INSERT, so if the append fails, nothing (not even the number) survives.
 ```json
 { "type": "mission",
   "payload": { "mission_id": "ms_…", "num": 61, "title": "…",
-               "action": "created" | "joined" | "updated" | "closed",
+               "action": "created" | "joined" | "updated" | "closed" | "left" | "current_changed",
                "by": "user" | "agent",
                "open_item_nums": [64, 70],          // only on a user-forced close
-               "status_changed": true } }           // only on an `updated` that wrote the status
+               "status_changed": true,              // only on an `updated` that wrote the status
+               "project_changed": true } }           // only on an `updated` that moved the mission between projects
 ```
-Appended to the conversation that performed the action (`created`/`joined`
-on that conversation; `updated`/`closed` on the origin conversation).
+Appended to the conversation concerned: `created`, `joined`, `left` and
+`current_changed` on that conversation (`current_changed` names the mission
+that became current; `left` the one it left); `updated`/`closed` on the
+origin conversation. A merge (see *Projects*) writes one `updated` with
+`project_changed` per moved mission.
 Written **after** the mission's own transaction has committed, not inside
 it — a broadcast can never advertise a write that then rolls back, and a
 marker append that itself fails (e.g. the origin conversation vanished
 underneath it) is logged and swallowed; the mission write stands. Apps use
 it only as an invalidation signal; it renders as a small inline notice
-("🏁 Mission #61 closed").
+("🏁 Mission #61 closed", "🏁 Left mission #N", "🏁 Now on mission #N").
 
 `status_changed: true` is present on an `updated` marker whenever that
 PATCH carried `status` — set, re-set to the same text (its
@@ -2148,6 +2199,53 @@ which may include ones the colleague can't read, so an unattributed agent
 write fails closed rather than being taken on faith. Otherwise the four
 fields are null.
 
+**Links.** Every link read is sieved the same way: `GET
+/conversations/:id/missions` omits a private-origin mission for an ordinary
+agent (the user may have joined a public conversation to one), `/snapshot`'s
+`mission_id` reads null and `mission_count` excludes it, a mission's
+`conversations` rows and `subchat_count` exclude private-owned
+conversations, each row's `other_missions` omits private-origin missions, and `activity` ignores them. `POST /milestones {mission}`
+answers `not_linked` for a mission the caller cannot see.
+
+## Projects
+
+Spec: matron-apple `docs/superpowers/specs/2026-09-30-projects-and-mission-links-design.md` §4.
+
+A project (`projects`, id `pj_…`) groups missions. A mission belongs to at
+most one (`missions.project_id`). Projects share the per-user `#num`
+counter, so `/lookup` resolves them (`kind: 'project'`). Mounted in
+`src/projects-http.js`; `:id` accepts `pj_…` or a number.
+
+| Route | Body / query | Returns |
+|---|---|---|
+| `POST /projects` | `{title, body?, convo_id?}` + optional `Idempotency-Key` | 201 `{project}`; replay 200. Any device may create. `convo_id` is optional provenance and must pass the same gate as `POST /missions` (404 otherwise). No marker. |
+| `GET /projects` | `?state=open\|closed` (omit = both) | `{projects:[…]}`, newest `last_activity_at` first. Each row adds `missions: {running, waiting, idle, quiet, closed}` (its missions' *Activity*), `needs_you` and `open_items` (sums of its missions' counts), and `last_activity_at` (the latest of the project's `created_at`, its `status_updated_at` and its missions' `last_activity_at`). |
+| `GET /projects/:id` | | `{project, missions:[mission rows], needs_you:[open items awaiting the user, each with mission_id and mission_num], recent_milestones:[the 5 newest across its missions, each with mission_num], sessions_by_box:{box name: n}}` — `sessions_by_box` counts distinct top-level conversations actively linked to its **open** missions. For a **merged** project: the detail of the project it was merged into (following up to 16 merges) plus `merged_from: {id, num}` of the one asked for. |
+| `PATCH /projects/:id` | `{title?, body?, status?: string\|null, convo_id?}` | 200 `{project}`. Title/body/status rules and status attribution are exactly the mission ones (see *Missions & milestones → Status*). 409 `{blocked_by:'closed'}` on a closed (or merged) project. No marker. |
+| `POST /projects/:id/close` | `{summary, convo_id?}` | 200 `{project}`. A client always may, over open missions: `closed_over_open_missions` records the count and the missions stay open and filed. An agent must be the **Coordinator** and prove it by naming its conversation (owned by this device, else 404); any other agent — or one naming none — is **403** `{error:'forbidden', detail:'not_coordinator'}`. The Coordinator is blocked by open missions: 409 `{blocked_by:'open_missions', missions:[{num,title}]}` (listed through its sieve; a hidden one still blocks). 409 `closed` if already closed. |
+| `POST /projects/:id/merge` | `{into, convo_id?}` | 200 `{project: into, merged: this}`. Same who-may rule as close. Moves **every** mission of this project (any state) to `into`, closes this one with `close_summary: "Merged into #N"`, `merged_into` and `merged_into_num`, and writes one `updated` mission marker with `project_changed: true` per moved mission on its origin conversation. 400 when `into` is this project or not a string/number; 404 for an `into` the caller cannot see; 409 `{blocked_by:'closed'}` if this one is closed, `{blocked_by:'into_closed'}` if `into` is. |
+| `POST /missions`, `PATCH /missions/:id` | `project` | see *Missions & milestones* |
+
+Row shape: `{id, user_id, num, state, title, body, status, status_by,
+status_convo_id, status_updated_at, close_summary, closed_by,
+closed_over_open_missions, closed_at, merged_into, merged_into_num,
+origin_convo_id, origin_device_id, created_by, created_at, updated_at}`,
+plus the rollup fields on every route that returns one. `idem_key` and
+`status_device_id` are never returned.
+
+There is no project marker: the apps refresh `GET /projects` on any
+`mission` marker and while the Projects tab is open.
+
+**Visibility.** Same rules as missions. An ordinary agent never sees a
+project whose origin conversation is private-owned or that a private device
+created (404, absent from lists, not resolvable by `/lookup`); a status
+written from/by a private device reads as four nulls; rollups, needs-you
+items, milestones and session counts are computed from that agent's own
+sieved mission rows. `project_id` / `project_num` on a mission row it *can*
+see still travel as bare handles (the same "numbers, never words" exception
+as `mission_num` on items). Projects are never shared with colleagues:
+shared mission rows carry `project_id: null`.
+
 ## Shared visibility (GitHub-verified, per repo)
 
 Spec: `docs/superpowers/specs/2026-09-23-tracker-web-teams-and-item-links-design.md`.
@@ -2200,7 +2298,7 @@ no secret to pair with),
 | `POST /github/refresh` | — | `{github}`; marks the link `stale` on 401/403 from GitHub; 502 `upstream` if unreachable (nothing changes); 404 if this user has no linked account |
 | `DELETE /github/link` | — | `{ok:true}`; 404 if not linked |
 | `GET /me` | — | `{user:{id,name,is_admin}, github: {…} \| null, github_linking:{enabled, web_flow}}` |
-| `GET /lookup?user=<name>&num=<n>` | also `GET /u/<name>/<n>` with `Accept: application/json` | `{kind:'item'\|'mission'\|'milestone', id, owner:{user_id,name}}`; 404 unknown or invisible |
+| `GET /lookup?user=<name>&num=<n>` | also `GET /u/<name>/<n>` with `Accept: application/json` | `{kind:'item'\|'mission'\|'milestone'\|'project', id, owner:{user_id,name}}`; 404 unknown or invisible. A merged project resolves to the project it was merged into, with `merged_from: <the id asked for>`. |
 
 Why the confirm page: an authorize URL can be handed to anyone, and GitHub's
 own pages name the OAuth App, never the journal user — so the person who
