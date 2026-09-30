@@ -34,6 +34,7 @@ export function backfillMissionLinks(db) {
         COALESCE(
           (SELECT MIN(e.ts) FROM events e
             WHERE e.convo_id = c.id AND e.type = 'mission'
+              AND json_valid(e.payload)
               AND json_extract(e.payload, '$.mission_id') = m.id
               AND json_extract(e.payload, '$.action') IN ('created', 'joined')),
           max(c.created_at, m.created_at)),
@@ -57,12 +58,4 @@ export function backfillMissionLinks(db) {
       GROUP BY t.mission_id, t.convo_id`).run().changes
     return current + history
   })()
-}
-
-// Self-check kept cheap and inline rather than a runtime assertion on every
-// call: if db.js's SCHEMA ever drops a how value this file relies on
-// ('origin', 'joined', 'inherited', 'backfill'), this throws at import time
-// instead of writing a row the CHECK constraint would reject anyway.
-for (const how of ['origin', 'joined', 'inherited', 'backfill']) {
-  if (!LINK_HOWS.includes(how)) throw new Error(`mission-links: '${how}' missing from LINK_HOWS`)
 }

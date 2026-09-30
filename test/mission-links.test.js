@@ -114,3 +114,33 @@ test('backfill: the first open with an empty link table recovers current, origin
     db3.close()
   } finally { rmDb(p) }
 })
+
+test('backfill: a malformed mission-marker payload never aborts openDb; the link falls back to its non-marker joined_at', () => {
+  const p = tmpPath('mc-backfill-bad-json')
+  try {
+    const db1 = openDb(p)
+    db1.exec(`
+      INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0);
+      INSERT INTO devices(id, user_id, kind, name, token_hash, created_at) VALUES(7,1,'agent','dev-2','h',0);
+      INSERT INTO conversations(id, owner_user_id, title, created_at, mission_id, parent_convo_id) VALUES
+        ('origin',1,'o',100,'ms_a',NULL), ('joiner',1,'j',200,'ms_a',NULL);
+      INSERT INTO missions(id,user_id,num,state,title,origin_convo_id,origin_device_id,created_by,created_at,updated_at) VALUES
+        ('ms_a',1,1,'open','A','origin',7,'agent',1000,1000);
+      -- Malformed JSON: not valid, so json_extract would raise 'malformed JSON'
+      -- without the json_valid guard. It carries a ts (150) earlier than the
+      -- fallback (max(200,1000)=1000), so if it were (wrongly) used as the
+      -- marker, joined_at would read 150 instead of 1000.
+      INSERT INTO events(user_id, seq, convo_id, ts, sender, type, payload) VALUES
+        (1, 10, 'joiner', 150, 'agent:dev-2', 'mission', '{not json');
+      DELETE FROM mission_conversations;
+    `)
+    db1.close()
+
+    const db2 = openDb(p) // must not throw
+    assert.deepEqual(linkMap(db2), {
+      'ms_a/joiner': { how: 'joined', joined_at: 1000, ended_at: null }, // marker ignored (invalid JSON); falls back to max(200,1000)
+      'ms_a/origin': { how: 'origin', joined_at: 1000, ended_at: null },
+    })
+    db2.close()
+  } finally { rmDb(p) }
+})
