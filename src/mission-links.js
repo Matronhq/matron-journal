@@ -45,14 +45,18 @@ export function backfillMissionLinks(db) {
     // 2. History: a conversation that posted a milestone or filed an item on
     //    a mission it no longer points at. Ended at its last such trace.
     //    Same-user only — a row whose conversation belongs to someone else is
-    //    never a link.
+    //    never a link. The Coordinator files items into many missions it was
+    //    never on, so its item traces are skipped.
     const history = db.prepare(`
       INSERT OR IGNORE INTO mission_conversations(mission_id, convo_id, user_id, how, joined_at, ended_at)
       SELECT t.mission_id, t.convo_id, c.owner_user_id, 'backfill', MIN(t.at), MAX(t.at)
       FROM (
         SELECT mission_id, convo_id, created_at AS at FROM milestones
         UNION ALL
-        SELECT mission_id, origin_convo_id AS convo_id, created_at AS at FROM items WHERE mission_id IS NOT NULL
+        SELECT i.mission_id, i.origin_convo_id AS convo_id, i.created_at AS at FROM items i
+        WHERE i.mission_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM user_settings us
+            WHERE us.user_id = i.user_id AND us.coordinator_convo_id = i.origin_convo_id)
       ) t
       JOIN conversations c ON c.id = t.convo_id
       JOIN missions m ON m.id = t.mission_id AND m.user_id = c.owner_user_id

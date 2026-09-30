@@ -156,6 +156,30 @@ test('backfill: a malformed mission-marker payload never aborts openDb; the link
   } finally { rmDb(p) }
 })
 
+test('backfill: a history trace from the Coordinator conversation (items it filed into missions) never becomes a link; a normal conversation\'s does', () => {
+  const p = tmpPath('mc-backfill-coord')
+  try {
+    const db1 = openDb(p)
+    db1.exec(`
+      INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0);
+      INSERT INTO devices(id, user_id, kind, name, token_hash, created_at) VALUES(7,1,'agent','dev-2','h',0);
+      INSERT INTO user_settings(user_id, coordinator_convo_id, updated_at) VALUES(1,'coord',0);
+      INSERT INTO conversations(id, owner_user_id, title, created_at, mission_id, parent_convo_id) VALUES
+        ('coord',1,'c',100,NULL,NULL), ('mover',1,'m',200,NULL,NULL);
+      INSERT INTO missions(id,user_id,num,state,title,origin_convo_id,origin_device_id,created_by,created_at,updated_at) VALUES
+        ('ms_x',1,1,'open','X','mover',7,'agent',50,50);
+      INSERT INTO items(id,user_id,num,kind,state,rank,title,origin_convo_id,origin_device_id,created_by,created_at,updated_at,mission_id) VALUES
+        ('it_c',1,2,'task','open',1024,'moved by coord','coord',7,'agent',60,60,'ms_x'),
+        ('it_m',1,3,'task','open',2048,'moved by mover','mover',7,'agent',70,70,'ms_x');
+      DELETE FROM mission_conversations;
+    `)
+    db1.close()
+    const db2 = openDb(p)
+    assert.deepEqual(linkMap(db2), { 'ms_x/mover': { how: 'backfill', joined_at: 70, ended_at: 70 } })
+    db2.close()
+  } finally { rmDb(p) }
+})
+
 test('heal: every open restores the invariant after old code wrote a pointer with no active link (a rollback); a second open changes nothing', () => {
   const p = tmpPath('mc-heal')
   try {
