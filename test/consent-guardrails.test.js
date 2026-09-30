@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { getSpawn } from '../src/spawns.js'
+import { recordConsentDecision } from '../src/consent.js'
 import { getParticipant } from '../src/participants.js'
 import { fleet, parkSpawn, parkInviteAsk, pending, answer, settle } from './consent-fleet.js'
 
@@ -67,6 +68,17 @@ test('daily cap: approvals in the last 24 h at the cap answer 409 daily_cap and 
   assert.equal(capped.status, 409); assert.equal(capped.json.detail, 'daily_cap'); assert.equal(capped.json.cap, 1)
   assert.equal(getSpawn(f.s.db, second).state, 'awaiting_user')
   assert.equal((await answer(f, f.coordDev.token, { kind: 'spawn', id: second, decision: 'decline', reason: 'over the cap anyway' })).status, 200)
+})
+
+test('cap 0 is no cap: an approval goes through with more approvals in the last 24 h than the default cap', async (t) => {
+  const f = await fleet(t, { consentDailyCap: 0 })
+  for (let i = 0; i < 25; i++) recordConsentDecision(f.s.db, { userId: f.dan.id, kind: 'chat', askId: `room/${i}`, decision: 'approve', convoId: 'coord', reason: 'routine' })
+  const id = await parkSpawn(f, { rid: 'q1' })
+  f.target.waitFor((x) => x.kind === 'rpc' && x.request?.method === 'start').then((req) => {
+    f.target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { convo_id: 'child' } })
+  })
+  assert.equal((await answer(f, f.coordDev.token, { kind: 'spawn', id, decision: 'approve', reason: 'ok' })).status, 200)
+  assert.equal((await f.asker.waitFor((x) => x.kind === 'spawn' && x.event === 'outcome' && x.request_id === id)).outcome, 'started')
 })
 
 test('nudge: another agent\'s ask sends the Coordinator\'s box a consent pending frame; the Coordinator\'s own ask does not; the switch off silences it', async (t) => {

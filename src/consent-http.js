@@ -10,8 +10,8 @@
 // consent_disabled; then per answer: the ask must exist (404) and still be
 // awaiting (409 conflict); a spawn approval into an offline, unwakeable box
 // is 409 target_offline; approvals at the rolling 24 h cap are 409
-// daily_cap. Nothing here can reach a tool permission prompt or a secret
-// request — those never exist as journal asks.
+// daily_cap (a cap of 0 is no cap). Nothing here can reach a tool
+// permission prompt or a secret request — those never exist as journal asks.
 import { json, readBody } from './http-body.js'
 import { sanitizePeerText } from './peer-text.js'
 import { getCoordinatorConvoId } from './coordinator.js'
@@ -63,7 +63,8 @@ export async function handleConsentRoute(ctx, req, res, url, who) {
   const cap = Number.isInteger(ctx.consentDailyCap) && ctx.consentDailyCap >= 0 ? ctx.consentDailyCap : CONSENT_DAILY_CAP_DEFAULT
   // The cap and the offline check come BEFORE any state changes, so a
   // refused answer leaves the ask exactly as it was — for the user.
-  if (body.decision === 'approve' && coordinatorApprovalsSince(db, who.userId, Date.now() - CONSENT_DAILY_WINDOW_MS) >= cap) {
+  // cap 0 = unlimited (MATRON_COORDINATOR_CONSENT_DAILY_CAP=0).
+  if (body.decision === 'approve' && cap > 0 && coordinatorApprovalsSince(db, who.userId, Date.now() - CONSENT_DAILY_WINDOW_MS) >= cap) {
     json(res, 409, { error: 'conflict', detail: 'daily_cap', cap }); return true
   }
   if (body.kind === 'spawn') {
