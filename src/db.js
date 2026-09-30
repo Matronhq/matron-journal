@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3'
 import { healBakedTitles } from './heal-titles.js'
+import { backfillMissionLinks } from './mission-links.js'
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users(
@@ -701,6 +702,10 @@ export function openDb(path) {
   // upgraded database SCHEMA runs before this ALTER adds the column.
   addMissionCol('project_id', 'project_id TEXT')
   db.exec('CREATE INDEX IF NOT EXISTS idx_missions_project ON missions(project_id, state)')
+  // Spec 2026-09-30 §3 backfill: once, while the link table is empty. After
+  // every mission/conversation/item column it reads has been added above.
+  const backfilled = backfillMissionLinks(db)
+  if (backfilled > 0) console.log(`mission_conversations: backfilled ${backfilled} link(s)`)
   // Coordinator consent approval (spec: matron-bridge 2026-09-29 coordinator
   // consent): the off switch (default ON, the choice Dan made), and on both
   // ask tables who answered a parked row and why — 'coordinator' + reason
