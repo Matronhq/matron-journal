@@ -13,15 +13,17 @@ export const json = (res, status, obj) => {
 
 // The raw text of a request body, with the same 1 MB cap and socket
 // handling as readBody. For the one non-JSON POST the journal accepts (the
-// browser form on the GitHub confirm page).
-export const readRawBody = (req) => new Promise((resolve, reject) => {
+// browser form on the GitHub confirm page). `maxBytes` lets a route cap
+// tighter than the 1 MB default (the Alertmanager webhook takes 256 KiB);
+// the overflow path is the same 413 either way.
+export const readRawBody = (req, { maxBytes = 1e6 } = {}) => new Promise((resolve, reject) => {
   let data = ''
   let settled = false
   const fail = (err) => { if (!settled) { settled = true; reject(err) } }
   req.setEncoding('utf8')
   req.on('data', (c) => {
     data += c
-    if (data.length > 1e6) {
+    if (data.length > maxBytes) {
       req.removeAllListeners('data')
       req.pause()
       fail(Object.assign(new Error('body too large'), { statusCode: 413 }))
@@ -36,7 +38,7 @@ export const readRawBody = (req) => new Promise((resolve, reject) => {
   req.on('error', fail)
 })
 
-export const readBody = (req) => readRawBody(req).then((data) => new Promise((resolve, reject) => {
+export const readBody = (req, opts) => readRawBody(req, opts).then((data) => new Promise((resolve, reject) => {
     if (!data) { resolve({}); return }
     let parsed
     try {

@@ -29,6 +29,7 @@ import { makeTokenBox } from './token-box.js'
 import { startStallWakeSweep } from './stall-wake.js'
 import { sealStoredTokens } from './github-accounts.js'
 import { CONSENT_DAILY_CAP_DEFAULT } from './consent.js'
+import { warnAlertWebhookConfig } from './alerts-http.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
@@ -310,6 +311,9 @@ export function startServer({
   stallWakeIntervalMs = null,
   mediaReapHighPct, mediaReapLowPct, waker, transcriber, github, githubRefreshIntervalMs, webDir,
   appleAppIds, androidPackage, androidCertSha256, tokenKey,
+  // Alertmanager webhook (src/alerts-http.js): {token, username}. The
+  // option is the test seam; env otherwise. Off unless both are usable.
+  alertWebhook,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
@@ -399,12 +403,18 @@ export function startServer({
     androidPackage: androidPackage !== undefined ? androidPackage : (process.env.MATRON_ANDROID_PACKAGE || null),
     androidCertSha256: androidCertSha256 !== undefined ? androidCertSha256 : parseList(process.env.MATRON_ANDROID_CERT_SHA256),
   })
+  const resolvedAlertWebhook = alertWebhook !== undefined ? alertWebhook : {
+    token: process.env.MATRON_ALERT_WEBHOOK_TOKEN || null,
+    username: process.env.MATRON_ALERT_WEBHOOK_USER || null,
+  }
+  if (resolvedAlertWebhook) warnAlertWebhookConfig(db, resolvedAlertWebhook)
   const server = http.createServer(makeHttpHandler({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, consentDailyCap,
     github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
+    sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
