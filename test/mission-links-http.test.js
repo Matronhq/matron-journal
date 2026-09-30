@@ -4,6 +4,7 @@ import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import { pinDevicePrivate } from '../src/db.js'
+import { saveGithubIdentity } from '../src/github-accounts.js'
 
 async function fleet(t) {
   const s = await startTestServer({})
@@ -67,4 +68,96 @@ test('POST /missions/:id/leave: ends the link, moves current, writes left + curr
   const last = await leave(a.id, 'c1')
   assert.equal(last.status, 200); assert.equal(last.json.current_mission, null)
   assert.equal(markerCount(s, 'c1', 'current_changed'), 1)
+})
+
+test('GET /conversations/:id/missions: the header list for own conversations only; 404 for another user\'s, an unknown one, or (ordinary agent) a private-owned one', async (t) => {
+  const { s, dan, agent, client } = await fleet(t)
+  const a = (await start(s, agent.token, {})).json.mission
+  const b = (await start(s, agent.token, { title: 'B', convo_id: 'c2' })).json.mission
+  await join(s, agent.token, b.id, 'c1')
+  for (const token of [agent.token, client]) {
+    const r = await s.http('/conversations/c1/missions', { token })
+    assert.equal(r.status, 200)
+    assert.deepEqual(r.json.missions.map((m) => [m.num, m.current, m.active]), [[b.num, true, true], [a.num, false, true]])
+  }
+  assert.equal((await s.http('/conversations/p1/missions', { token: client })).status, 404)
+  assert.equal((await s.http('/conversations/nope/missions', { token: client })).status, 404)
+  assert.equal((await s.http('/conversations/c1/missions', { method: 'POST', token: client, body: {} })).status, 404)
+  const priv = createAgent(s.db, dan.id, 'private-box')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  upsertConversation(s.db, { id: 'secret', ownerUserId: dan.id, title: 'S', agentDeviceId: priv.deviceId })
+  assert.equal((await s.http('/conversations/secret/missions', { token: agent.token })).status, 404)
+  const own = await s.http('/conversations/secret/missions', { token: client })
+  assert.equal(own.status, 200); assert.deepEqual(own.json.missions, [])
+})
+
+test('GET /missions/:id folds sub-chats by default and lists them with ?subchats=1', async (t) => {
+  const { s, dan, agent, client } = await fleet(t)
+  const a = (await start(s, agent.token, {})).json.mission
+  upsertConversation(s.db, { id: 'kid', ownerUserId: dan.id, title: 'kid', agentDeviceId: agent.deviceId, parentConvoId: 'c1' })
+  // Pin the order: both links can be stamped in the same millisecond.
+  s.db.prepare("UPDATE mission_conversations SET joined_at=1 WHERE convo_id='c1'").run()
+  const folded = await s.http(`/missions/${a.num}`, { token: client })
+  assert.deepEqual(folded.json.conversations.map((c) => [c.id, c.subchat_count]), [['c1', 1]])
+  assert.deepEqual(folded.json.conversations[0].other_missions, [])
+  assert.equal(folded.json.mission.conversations, 1)
+  const open = await s.http(`/missions/${a.num}?subchats=1`, { token: client })
+  assert.deepEqual(open.json.conversations.map((c) => [c.id, c.parent_convo_id]), [['c1', null], ['kid', 'c1']])
+})
+
+test('GET /missions/:id lists only ACTIVE links by default (old apps never see a conversation that left); ?history=1 adds ended ones with ended_at; both flags combine', async (t) => {
+  const { s, dan, agent, client } = await fleet(t)
+  const a = (await start(s, agent.token, {})).json.mission
+  await join(s, agent.token, a.id, 'c2')
+  upsertConversation(s.db, { id: 'kid', ownerUserId: dan.id, title: 'kid', agentDeviceId: agent.deviceId, parentConvoId: 'c1' })
+  await s.http(`/missions/${a.id}/leave`, { method: 'POST', token: agent.token, body: { convo_id: 'c2' } })
+  for (const [id, at] of [['c1', 1], ['kid', 2], ['c2', 3]]) s.db.prepare('UPDATE mission_conversations SET joined_at=? WHERE convo_id=?').run(at, id)
+  const ids = async (q) => (await s.http(`/missions/${a.num}${q}`, { token: client })).json.conversations.map((c) => [c.id, c.ended_at === null])
+  assert.deepEqual(await ids(''), [['c1', true]])
+  assert.deepEqual(await ids('?history=1'), [['c1', true], ['c2', false]])
+  assert.deepEqual(await ids('?subchats=1'), [['c1', true], ['kid', true]])
+  assert.deepEqual(await ids('?subchats=1&history=1'), [['c1', true], ['kid', true], ['c2', false]])
+  const hist = await s.http(`/missions/${a.num}?history=1`, { token: client })
+  assert.equal(typeof hist.json.conversations[1].ended_at, 'number')
+})
+
+test('close gate: an agent naming a conversation that is ALSO ON the mission (active, not current) may close it; one that left may not', async (t) => {
+  const { s, agent } = await fleet(t)
+  const a = (await start(s, agent.token, {})).json.mission
+  const b = (await start(s, agent.token, { title: 'B', convo_id: 'c2' })).json.mission
+  await join(s, agent.token, b.id, 'c1')                        // c1 current on B, still active on A
+  await join(s, agent.token, a.id, 'c3')
+  await s.http(`/missions/${a.id}/leave`, { method: 'POST', token: agent.token, body: { convo_id: 'c3' } })
+  const close = (convoId) => s.http(`/missions/${a.id}/close`, { method: 'POST', token: agent.token, body: { summary: 'done', convo_id: convoId } })
+  const refused = await close('c3')
+  assert.equal(refused.status, 403); assert.equal(refused.json.detail, 'not_coordinator')
+  const ok = await close('c1')
+  assert.equal(ok.status, 200)
+  assert.deepEqual([ok.json.mission.state, ok.json.mission.closed_convo_id], ['closed', 'c1'])
+})
+
+test('shared view reads active links: a joined shared conversation shows, sub-chats fold (count equals list), and one that left drops out', async (t) => {
+  const { s, dan, pat, agent } = await fleet(t)
+  const link = (u, gid) => saveGithubIdentity(s.db, { userId: u.id, host: 'github.com', identity: { github_id: gid, login: u.name, scopes: ['github.com/matronhq'] }, token: `t${gid}`, now: 1 })
+  link(dan, 1); link(pat, 2)
+  const patClient = (await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'mac' } })).json.token
+  const repo = 'github.com/matronhq/journal'
+  // Born on c2 (no repo): shared only through the joined c1.
+  const m = (await start(s, agent.token, { title: 'Born elsewhere', convo_id: 'c2' })).json.mission
+  upsertConversation(s.db, { id: 'c1', ownerUserId: dan.id, agentDeviceId: agent.deviceId, repo })
+  await join(s, agent.token, m.id, 'c1')
+  upsertConversation(s.db, { id: 'kid', ownerUserId: dan.id, title: 'kid', agentDeviceId: agent.deviceId, parentConvoId: 'c1', repo })
+  s.db.prepare("UPDATE mission_conversations SET joined_at=1 WHERE convo_id='c1'").run()
+  const detail = await s.http(`/missions/${m.id}`, { token: patClient })
+  assert.equal(detail.status, 200)
+  assert.deepEqual(detail.json.conversations.map((c) => [c.id, c.subchat_count]), [['c1', 1]])
+  assert.equal(detail.json.mission.conversations, detail.json.conversations.length)
+  const listed = (await s.http('/missions?scope=shared', { token: patClient })).json.missions
+  assert.deepEqual(listed.map((x) => [x.id, x.conversations]), [[m.id, 1]])
+  const open = await s.http(`/missions/${m.id}?subchats=1`, { token: patClient })
+  assert.deepEqual(open.json.conversations.map((c) => [c.id, c.parent_convo_id]), [['c1', null], ['kid', 'c1']])
+  // c1 and its sub-chat leave: nothing shared is left on the mission, so pat loses it.
+  for (const id of ['kid', 'c1']) await s.http(`/missions/${m.id}/leave`, { method: 'POST', token: agent.token, body: { convo_id: id } })
+  assert.equal((await s.http(`/missions/${m.id}`, { token: patClient })).status, 404)
+  assert.deepEqual((await s.http('/missions?scope=shared', { token: patClient })).json.missions, [])
 })

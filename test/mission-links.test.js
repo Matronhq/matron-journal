@@ -8,7 +8,10 @@ import { openDb } from '../src/db.js'
 import { backfillMissionLinks } from '../src/mission-links.js'
 import { upsertConversation } from '../src/journal.js'
 import { createItem } from '../src/items.js'
-import { createMission, joinMission, closeMission, leaveMission, createMilestone, CONVOS_MAX } from '../src/missions.js'
+import {
+  createMission, joinMission, closeMission, leaveMission, createMilestone, CONVOS_MAX,
+  missionDetail, conversationMissions, getMission, foldSubchats, OTHER_MISSIONS_MAX,
+} from '../src/missions.js'
 import { append } from '../src/journal.js'
 
 const cols = (db, t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name)
@@ -276,4 +279,118 @@ test('leaveMission: a closed mission is never the fallback — leaving the last 
   assert.equal(linksOf(db, 'c1').find((l) => l.mission_id === a.id).ended_at, null, 'the closed mission keeps its active link as history')
   const appendMarker = (payload) => append(db, { userId: 1, convoId: 'c1', sender: 'agent:dev-2', type: 'milestone', payload })
   assert.throws(() => createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'progress', title: 'x', appendMarker }), /no_mission/)
+})
+
+test('missionDetail: rows carry current/how/joined_at/ended_at/parent_convo_id/subchat_count; active only by default, ended after them with history; sub-chats fold under their nearest linked ancestor unless subchats; sieved', () => {
+  const db = withPrivateBox()
+  const a = startOn(db, 'c1', 'A'); const b = startOn(db, 'c2', 'B')
+  upsertConversation(db, { id: 'kid', ownerUserId: 1, title: 'kid', agentDeviceId: 7, parentConvoId: 'c1' })       // inherits A
+  upsertConversation(db, { id: 'grandkid', ownerUserId: 1, title: 'gk', agentDeviceId: 7, parentConvoId: 'kid' })  // inherits A
+  upsertConversation(db, { id: 'pkid', ownerUserId: 1, title: 'pk', agentDeviceId: 9, parentConvoId: 'c1' })       // private sub-chat, inherits A
+  upsertConversation(db, { id: 'c4', ownerUserId: 1, title: 'C4', agentDeviceId: 7 })
+  upsertConversation(db, { id: 'stray', ownerUserId: 1, title: 'st', agentDeviceId: 7, parentConvoId: 'c4' })      // parent not on A
+  join(db, a.id, 'c2')              // c2 current on A, B stays active
+  join(db, a.id, 'stray')
+  join(db, a.id, 'c3'); leaveMission(db, { userId: 1, missionId: a.id, convoId: 'c3' })
+  for (const [id, at] of [['c1', 100], ['kid', 110], ['grandkid', 120], ['pkid', 130], ['c3', 150], ['c2', 200], ['stray', 300]]) pinJoined(db, a.id, id, at)
+
+  const row = (c) => [c.id, c.current, c.how, c.ended_at === null, c.subchat_count]
+  const active = [
+    ['c1', true, 'origin', true, 3],
+    ['c2', true, 'joined', true, 0],
+    ['stray', true, 'joined', true, 0],   // parent c4 is not on A: never hidden
+  ]
+  // Default (spec §7): an old app copies this list into its members table
+  // without reading ended_at, so a conversation that left is not on it.
+  const full = missionDetail(db, 1, a.id)
+  assert.deepEqual(full.conversations.map(row), active)
+  const c1 = full.conversations[0]
+  for (const k of ['id', 'title', 'state', 'box', 'parent_convo_id', 'current', 'how', 'joined_at', 'ended_at', 'subchat_count', 'other_missions']) assert.ok(k in c1, k)
+  assert.deepEqual([c1.title, c1.box, c1.parent_convo_id, c1.joined_at], ['C1', 'dev-2', null, 100])
+  assert.equal(full.conversations.find((c) => c.id === 'stray').parent_convo_id, 'c4')
+  assert.deepEqual(full.conversations[1].other_missions.map((m) => [m.id, m.current, m.active]), [[b.id, false, true]], 'c2 is also on B')
+  // history: the ended link follows every active row, with ended_at set.
+  const hist = missionDetail(db, 1, a.id, { history: true })
+  assert.deepEqual(hist.conversations.map(row), [...active, ['c3', false, 'joined', false, 0]])
+  assert.ok(hist.conversations[3].ended_at >= hist.conversations[3].joined_at)
+  const expanded = missionDetail(db, 1, a.id, { subchats: true })
+  assert.deepEqual(expanded.conversations.map((c) => c.id), ['c1', 'kid', 'grandkid', 'pkid', 'c2', 'stray'])
+  assert.deepEqual(expanded.conversations.slice(1, 4).map((c) => [c.parent_convo_id, c.how]), [['c1', 'inherited'], ['kid', 'inherited'], ['c1', 'inherited']])
+  const both = missionDetail(db, 1, a.id, { subchats: true, history: true })
+  assert.deepEqual(both.conversations.map((c) => c.id), ['c1', 'kid', 'grandkid', 'pkid', 'c2', 'stray', 'c3'])
+  const sieved = missionDetail(db, 1, a.id, { excludePrivateOwned: true })
+  assert.equal(sieved.conversations[0].subchat_count, 2, 'the private sub-chat is neither listed nor counted')
+  assert.equal(missionDetail(db, 1, a.id, { excludePrivateOwned: true, subchats: true }).conversations.some((c) => c.id === 'pkid'), false)
+  // The row count is active TOP-LEVEL links: c1 and c2 (stray is a sub-chat; c3 ended).
+  assert.equal(getMission(db, 1, a.id).conversations, 2)
+})
+
+test('missionDetail history: an ended sub-chat never folds into an active row, so subchat_count is the same with or without history', () => {
+  const db = seeded()
+  const a = startOn(db, 'c1', 'A')
+  upsertConversation(db, { id: 'kid', ownerUserId: 1, title: 'kid', agentDeviceId: 7, parentConvoId: 'c1' })
+  upsertConversation(db, { id: 'kid2', ownerUserId: 1, title: 'kid2', agentDeviceId: 7, parentConvoId: 'c1' })
+  leaveMission(db, { userId: 1, missionId: a.id, convoId: 'kid2' })
+  pinJoined(db, a.id, 'c1', 100); pinJoined(db, a.id, 'kid', 110); pinJoined(db, a.id, 'kid2', 120)
+  const counts = (d) => d.conversations.map((c) => [c.id, c.subchat_count])
+  assert.deepEqual(counts(missionDetail(db, 1, a.id)), [['c1', 1]])
+  assert.deepEqual(counts(missionDetail(db, 1, a.id, { history: true })), [['c1', 1], ['kid2', 0]])
+})
+
+test('foldSubchats: nearest linked ancestor, cycle-safe, input order kept', () => {
+  const rows = [
+    { id: 'a', parent_convo_id: null }, { id: 'b', parent_convo_id: 'a' }, { id: 'c', parent_convo_id: 'gone' },
+    { id: 'd', parent_convo_id: 'c' }, { id: 'x', parent_convo_id: 'y' }, { id: 'y', parent_convo_id: 'x' },
+  ]
+  assert.deepEqual(foldSubchats(rows).map((r) => [r.id, r.subchat_count]), [['a', 1], ['c', 1], ['x', 0], ['y', 0]], 'a parent cycle folds nothing away')
+  assert.deepEqual(foldSubchats(rows, { subchats: true }).map((r) => r.id), ['a', 'b', 'c', 'd', 'x', 'y'])
+  assert.equal(rows[0].subchat_count, undefined, 'the input rows are not mutated')
+})
+
+test('conversationMissions: current first, then active newest-joined, then ended newest; link fields; a private-origin mission is hidden from a filtered caller', () => {
+  const db = withPrivateBox()
+  const a = startOn(db, 'c1', 'A'); const b = startOn(db, 'c2', 'B'); const c = startOn(db, 'c3', 'C')
+  const h = createMission(db, { userId: 1, deviceId: 9, createdBy: 'agent', convoId: 'secret', title: 'Hidden' }).mission
+  join(db, b.id, 'c1'); join(db, h.id, 'c1'); join(db, c.id, 'c1')
+  leaveMission(db, { userId: 1, missionId: a.id, convoId: 'c1' })
+  pinJoined(db, b.id, 'c1', 200); pinJoined(db, h.id, 'c1', 250); pinJoined(db, c.id, 'c1', 300)
+  const full = conversationMissions(db, 1, 'c1')
+  assert.deepEqual(full.map((m) => [m.id, m.current, m.active, m.how]), [
+    [c.id, true, true, 'joined'], [h.id, false, true, 'joined'], [b.id, false, true, 'joined'], [a.id, false, false, 'origin'],
+  ])
+  assert.ok(full[3].ended_at > 0); assert.equal(full[0].ended_at, null); assert.equal(full[0].joined_at, 300)
+  assert.equal(full[0].title, 'C'); assert.equal(typeof full[0].conversations, 'number')
+  const sieved = conversationMissions(db, 1, 'c1', { excludePrivateOwned: true })
+  assert.deepEqual(sieved.map((m) => m.id), [c.id, b.id, a.id])
+  assert.equal(JSON.stringify(sieved).includes('Hidden'), false)
+})
+
+test('missionDetail other_missions: each row names the conversation\'s OTHER missions (current first, then active, then ended; capped); a private-origin one is hidden from a filtered caller', () => {
+  const db = withPrivateBox()
+  const a = startOn(db, 'c1', 'A'); const b = startOn(db, 'c2', 'B')
+  const h = createMission(db, { userId: 1, deviceId: 9, createdBy: 'agent', convoId: 'secret', title: 'Hidden' }).mission
+  join(db, b.id, 'c1')                  // c1: B current, A also-on
+  const rowOf = (detail, id) => detail.conversations.find((c) => c.id === id)
+  const onB = missionDetail(db, 1, b.id)
+  assert.deepEqual(rowOf(onB, 'c1').other_missions.map((m) => [m.num, m.title, m.current, m.active]), [[a.num, 'A', false, true]])
+  assert.deepEqual(rowOf(onB, 'c2').other_missions, [], 'c2 is on B only')
+  const onA = missionDetail(db, 1, a.id)
+  const other = rowOf(onA, 'c1').other_missions
+  assert.deepEqual(other.map((m) => [m.id, m.current, m.active, m.ended_at]), [[b.id, true, true, null]])
+  for (const k of ['id', 'num', 'title', 'current', 'active', 'joined_at', 'ended_at']) assert.ok(k in other[0], k)
+  // Leaving B: c1's row on A now shows B as ended ("moved to" / "earlier").
+  join(db, h.id, 'c1')                  // c1: H current, B and A active
+  leaveMission(db, { userId: 1, missionId: b.id, convoId: 'c1' })
+  const full = rowOf(missionDetail(db, 1, a.id), 'c1').other_missions
+  assert.deepEqual(full.map((m) => [m.id, m.current, m.active]), [[h.id, true, true], [b.id, false, false]])
+  const sieved = rowOf(missionDetail(db, 1, a.id, { excludePrivateOwned: true }), 'c1').other_missions
+  assert.deepEqual(sieved.map((m) => m.id), [b.id], 'the private-origin mission is neither named nor counted')
+  assert.equal(JSON.stringify(sieved).includes('Hidden'), false)
+  // Capped: c3 on A plus six more missions lists only OTHER_MISSIONS_MAX of them.
+  join(db, a.id, 'c3')
+  for (let i = 0; i < 6; i++) join(db, startOn(db, 'c3', `X${i}`, { attach: false }).id, 'c3')
+  assert.equal(OTHER_MISSIONS_MAX, 5)
+  const capped = rowOf(missionDetail(db, 1, a.id), 'c3').other_missions
+  assert.equal(capped.length, OTHER_MISSIONS_MAX)
+  assert.equal(capped[0].current, true, 'the current mission is never the one cut')
 })

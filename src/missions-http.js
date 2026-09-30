@@ -11,8 +11,9 @@ import { BODY_MAX } from './items.js'
 import {
   MILESTONE_KINDS, TITLE_MAX, validateMissionFields, createMission, getMission, listMissions, missionDetail,
   updateMission, joinMission, leaveMission, closeMission, createMilestone, listMilestones, milestoneRow,
-  listSharedMissions, getSharedMission, sharedMissionDetail, listSharedMilestones,
+  listSharedMissions, getSharedMission, sharedMissionDetail, listSharedMilestones, conversationMissions,
 } from './missions.js'
+import { hasActiveLink } from './mission-links.js'
 import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE, missionMarkerPayload, milestoneMarkerPayload } from './missions-marker.js'
 import { filteredAgent, privateOwnedConvo, markerTitleAllowed } from './privacy.js'
 import { getCoordinatorConvoId } from './coordinator.js'
@@ -224,9 +225,10 @@ async function handleLeave(ctx, req, res, who, mission) {
 function closingConvo(db, who, mission, convoId) {
   if (who.kind !== 'agent' || convoId === undefined) return { convoId: null }
   if (typeof convoId !== 'string' || !convoId) return { status: 400 }
-  const convo = db.prepare('SELECT owner_user_id, agent_device_id, mission_id FROM conversations WHERE id=?').get(convoId)
+  const convo = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(convoId)
   if (!convo || convo.owner_user_id !== who.userId || convo.agent_device_id !== who.deviceId) return { status: 404 }
-  if (convo.mission_id === mission.id) return { convoId }
+  // "On the mission" = an ACTIVE link (spec 2026-09-30 §3): current or also-on.
+  if (hasActiveLink(db, mission.id, convoId)) return { convoId }
   if (getCoordinatorConvoId(db, who.userId) !== convoId) return { status: 403 }
   return { convoId }
 }
@@ -351,6 +353,21 @@ function handleMilestoneList(ctx, res, url, who) {
 export async function handleMissionsRoute(ctx, req, res, url, who) {
   const { db } = ctx
   const path = url.pathname
+  // The conversation header's list (spec 2026-09-30 §3). Own conversations
+  // only; an ordinary agent never reads a private-owned one — same 404 as
+  // missing, like GET /milestones?convo=.
+  const cm = path.match(/^\/conversations\/([^/]+)\/missions$/)
+  if (cm) {
+    if (req.method !== 'GET') return false
+    let convoId
+    try { convoId = decodeURIComponent(cm[1]) } catch { return badRequest(res) }
+    const convo = db.prepare('SELECT owner_user_id FROM conversations WHERE id=?').get(convoId)
+    if (!convo || convo.owner_user_id !== who.userId) return notFound(res)
+    const excludePrivateOwned = filteredAgent(db, who)
+    if (excludePrivateOwned && privateOwnedConvo(db, convoId)) return notFound(res)
+    json(res, 200, { missions: conversationMissions(db, who.userId, convoId, { excludePrivateOwned }) })
+    return true
+  }
   if (path === '/milestones') {
     if (req.method === 'POST') return handleMilestoneCreate(ctx, req, res, who)
     if (req.method === 'GET') return handleMilestoneList(ctx, res, url, who)
@@ -378,7 +395,7 @@ export async function handleMissionsRoute(ctx, req, res, url, who) {
   if (!mission) {
     const shared = getSharedMission(db, who.userId, idOrNum)
     if (!shared) return notFound(res)
-    if (!sub && req.method === 'GET') { json(res, 200, sharedMissionDetail(db, who.userId, shared)); return true }
+    if (!sub && req.method === 'GET') { json(res, 200, sharedMissionDetail(db, who.userId, shared, { subchats: url.searchParams.get('subchats') === '1' })); return true }
     json(res, 403, { error: 'forbidden' })
     return true
   }
@@ -386,7 +403,13 @@ export async function handleMissionsRoute(ctx, req, res, url, who) {
     if (req.method === 'GET') {
       // Only null if the mission vanished between the gate above and this
       // re-read — 404 like any other missing mission, never `200 null`.
-      const detail = missionDetail(db, who.userId, mission.id, { excludePrivateOwned: filteredAgent(db, who) })
+      // Sub-chats fold into their parent's row unless ?subchats=1; ended
+      // links (history) appear only with ?history=1 (spec §7: old apps).
+      const detail = missionDetail(db, who.userId, mission.id, {
+        excludePrivateOwned: filteredAgent(db, who),
+        subchats: url.searchParams.get('subchats') === '1',
+        history: url.searchParams.get('history') === '1',
+      })
       if (!detail) return notFound(res)
       json(res, 200, detail); return true
     }

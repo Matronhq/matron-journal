@@ -127,7 +127,8 @@ function countsSql(excludePrivateOwned) {
   return `
     (SELECT COUNT(*) FROM items i WHERE i.mission_id = m.id AND i.state='open' ${itemSieve}) AS open_items,
     (SELECT COUNT(*) FROM items i WHERE i.mission_id = m.id AND i.state='open' AND i.awaiting='user' ${itemSieve}) AS needs_you,
-    (SELECT COUNT(*) FROM conversations c WHERE c.mission_id = m.id ${convoSieve}) AS conversations,
+    (SELECT COUNT(*) FROM mission_conversations cl JOIN conversations c ON c.id = cl.convo_id
+       WHERE cl.mission_id = m.id AND cl.ended_at IS NULL AND c.parent_convo_id IS NULL ${convoSieve}) AS conversations,
     (SELECT COUNT(*) FROM milestones l WHERE l.mission_id = m.id ${milestoneSieve}) AS milestones,
     (SELECT json_object('num', l.num, 'title', l.title, 'kind', l.kind, 'created_at', l.created_at)
        FROM milestones l WHERE l.mission_id = m.id ${milestoneSieve} ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS last_milestone_json,
@@ -146,7 +147,7 @@ function countsSql(excludePrivateOwned) {
 // used to hand back (and, for milestones, write into) the unsieved row.
 // Same predicate listMissions applies to its WHERE clause; one caller
 // passing `excludePrivateOwned` now gets one consistent answer everywhere.
-const ORIGIN_SIEVE = `NOT EXISTS (SELECT 1 FROM conversations cv JOIN devices d ON d.id = cv.agent_device_id
+export const ORIGIN_SIEVE = `NOT EXISTS (SELECT 1 FROM conversations cv JOIN devices d ON d.id = cv.agent_device_id
   WHERE cv.id = m.origin_convo_id AND d.private = 1)`
 
 // Cross-user variant of ORIGIN_SIEVE: fails closed when the origin
@@ -251,7 +252,67 @@ function withConvoStatus({ status_reported_at, status_json, ...row }) {
   try { return { ...row, status: { reported_at: status_reported_at, ...JSON.parse(status_json) } } } catch { return row }
 }
 
-export function missionDetail(db, userId, missionId, { excludePrivateOwned = false } = {}) {
+// Spec 2026-09-30 §3: every sub-chat whose parent (or any ancestor) is also
+// among `rows` folds into that nearest listed ancestor's row — it is counted
+// in that row's subchat_count and, unless `subchats`, left out of the list.
+// A sub-chat whose parent is not among the rows stands as its own row:
+// folding never hides a link. A parent cycle (never written by the journal,
+// but not guarded by the schema either) folds nothing: each row on it is its
+// own root. Callers run it AFTER the privacy sieve, so a hidden sub-chat is
+// neither listed nor counted. Input order is kept; input rows are not mutated.
+export function foldSubchats(rows, { subchats = false } = {}) {
+  const byId = new Map(rows.map((r) => [r.id, r]))
+  const rootOf = (r) => {
+    let cur = r
+    const seen = new Set([r.id])
+    while (cur.parent_convo_id && byId.has(cur.parent_convo_id)) {
+      if (seen.has(cur.parent_convo_id)) return r
+      cur = byId.get(cur.parent_convo_id); seen.add(cur.id)
+    }
+    return cur
+  }
+  const counts = new Map()
+  const folded = new Set()
+  for (const r of rows) {
+    const root = rootOf(r)
+    if (root !== r) { counts.set(root.id, (counts.get(root.id) || 0) + 1); folded.add(r.id) }
+  }
+  const out = rows.map((r) => ({ ...r, subchat_count: counts.get(r.id) || 0 }))
+  return subchats ? out : out.filter((r) => !folded.has(r.id))
+}
+
+// Mockup 03's "also on #N" / "moved to #N" on a mission page's conversation
+// rows (spec 2026-09-30 §3): each listed row names the conversation's links
+// to OTHER missions — current first, then active, then ended newest first
+// (conversationMissions' order), at most OTHER_MISSIONS_MAX. A slim shape,
+// not a mission row: the page needs a chip, not counts. ORIGIN_SIEVE keeps
+// a private-origin mission (the user may have joined this public
+// conversation to one) from being named to an ordinary agent. Folded
+// sub-chats are not listed, so they carry none.
+export const OTHER_MISSIONS_MAX = 5
+
+function otherMissionsStmt(db, excludePrivateOwned) {
+  return db.prepare(`SELECT m.id, m.num, m.title, (c.mission_id = m.id) AS current, (l.ended_at IS NULL) AS active,
+      l.joined_at, l.ended_at
+    FROM mission_conversations l
+    JOIN missions m ON m.id = l.mission_id AND m.user_id = ?
+    JOIN conversations c ON c.id = l.convo_id
+    WHERE l.convo_id = ? AND l.mission_id <> ? ${excludePrivateOwned ? `AND ${ORIGIN_SIEVE}` : ''}
+    ORDER BY current DESC, (l.ended_at IS NULL) DESC, COALESCE(l.ended_at, l.joined_at) DESC
+    LIMIT ${OTHER_MISSIONS_MAX}`)
+}
+
+const otherMissionRow = (r) => ({ ...r, current: !!r.current, active: !!r.active })
+
+// `conversations[]` lists the conversations LINKED to this mission (spec
+// 2026-09-30 §3). By default only ACTIVE links (controller ruling D3, spec
+// §7: an old app copies this list into its members table without reading
+// ended_at, so a conversation that left must not appear); `history` appends
+// the ended links after every active row, each with its ended_at. Folding
+// runs within each group: an ended sub-chat never folds into an active row
+// (nor an active one into an ended row), so an active row's subchat_count
+// is the same with or without history.
+export function missionDetail(db, userId, missionId, { excludePrivateOwned = false, subchats = false, history = false } = {}) {
   const mission = getMission(db, userId, missionId, { excludePrivateOwned })
   if (!mission) return null
   const sieve = excludePrivateOwned ? `AND NOT ${PRIVATE_CONVO}` : ''
@@ -261,12 +322,43 @@ export function missionDetail(db, userId, missionId, { excludePrivateOwned = fal
     FROM items i JOIN conversations c ON c.id = i.origin_convo_id
     WHERE i.mission_id=? AND i.state='open' ${sieve}
     ORDER BY (i.awaiting = 'user') DESC, i.updated_at DESC`).all(mission.id)
-  const conversations = db.prepare(`SELECT c.id, c.title, c.session_state AS state, d.name AS box,
+  const rows = db.prepare(`SELECT c.id, c.title, c.session_state AS state, d.name AS box, c.parent_convo_id,
+      (c.mission_id IS NOT NULL AND c.mission_id = l.mission_id) AS current, l.how, l.joined_at, l.ended_at,
       s.reported_at AS status_reported_at, s.status AS status_json
-    FROM conversations c LEFT JOIN devices d ON d.id = c.agent_device_id
+    FROM mission_conversations l JOIN conversations c ON c.id = l.convo_id AND c.owner_user_id = ?
+    LEFT JOIN devices d ON d.id = c.agent_device_id
     LEFT JOIN conversation_status s ON s.convo_id = c.id
-    WHERE c.mission_id=? ${sieve} ORDER BY c.created_at`).all(mission.id).map(withConvoStatus)
+    WHERE l.mission_id = ? ${history ? '' : 'AND l.ended_at IS NULL'} ${sieve}
+    ORDER BY (l.ended_at IS NOT NULL), l.joined_at, c.created_at`).all(userId, mission.id)
+    .map((r) => withConvoStatus({ ...r, current: !!r.current }))
+  const conversations = [
+    ...foldSubchats(rows.filter((r) => r.ended_at == null), { subchats }),
+    ...foldSubchats(rows.filter((r) => r.ended_at != null), { subchats }),
+  ]
+  const others = otherMissionsStmt(db, excludePrivateOwned)
+  for (const c of conversations) c.other_missions = others.all(userId, c.id, mission.id).map(otherMissionRow)
   return { mission, milestones, items, conversations }
+}
+
+// GET /conversations/:id/missions (spec 2026-09-30 §3): every mission this
+// conversation is or was linked to — current first, then the other active
+// links newest-joined first, then ended links newest-ended first. Full
+// mission rows (same countsSql, same sieve as GET /missions) plus the link.
+// ORIGIN_SIEVE drops a private-origin mission for a filtered caller: the
+// user may have joined this public conversation to it.
+export function conversationMissions(db, userId, convoId, { excludePrivateOwned = false } = {}) {
+  const sieve = excludePrivateOwned ? `AND ${ORIGIN_SIEVE}` : ''
+  return db.prepare(`SELECT m.*, ${countsSql(excludePrivateOwned)},
+      (c.mission_id IS NOT NULL AND c.mission_id = m.id) AS link_current, l.how AS link_how, l.joined_at AS link_joined_at, l.ended_at AS link_ended_at
+    FROM mission_conversations l
+    JOIN missions m ON m.id = l.mission_id AND m.user_id = ?
+    JOIN conversations c ON c.id = l.convo_id AND c.owner_user_id = ?
+    WHERE l.convo_id = ? ${sieve}
+    ORDER BY link_current DESC, (l.ended_at IS NULL) DESC, COALESCE(l.ended_at, l.joined_at) DESC`)
+    .all(userId, userId, convoId)
+    .map(({ link_current: cur, link_how: how, link_joined_at: joinedAt, link_ended_at: endedAt, ...row }) => ({
+      ...missionRow(row), current: !!cur, active: endedAt == null, how, joined_at: joinedAt, ended_at: endedAt,
+    }))
 }
 
 // `statusWriter` {by, convoId, deviceId} (spec 2026-09-28 missions dashboard
@@ -474,7 +566,8 @@ const MISSION_SHARED = `(
   ${ORIGIN_SHARED_SIEVE}
   AND (
     EXISTS (SELECT 1 FROM conversations cv WHERE cv.id = m.origin_convo_id AND ${sharedConvoSql('cv')})
-    OR EXISTS (SELECT 1 FROM conversations cv WHERE cv.mission_id = m.id AND ${sharedConvoSql('cv')})
+    OR EXISTS (SELECT 1 FROM mission_conversations sl JOIN conversations cv ON cv.id = sl.convo_id
+               WHERE sl.mission_id = m.id AND sl.ended_at IS NULL AND ${sharedConvoSql('cv')})
   )
 )`
 const OWNER_JSON = `json_object('user_id', u.id, 'name', u.name, 'github_login', ga.login) AS owner_json`
@@ -506,7 +599,8 @@ function sharedCountsSql() {
        WHERE i.mission_id = m.id AND i.state='open' AND i.consent IS NULL AND ${sharedConvoSql('ic')}) AS open_items,
     (SELECT COUNT(*) FROM items i JOIN conversations ic ON ic.id = i.origin_convo_id
        WHERE i.mission_id = m.id AND i.state='open' AND i.awaiting='user' AND i.consent IS NULL AND ${sharedConvoSql('ic')}) AS needs_you,
-    (SELECT COUNT(*) FROM conversations cc WHERE cc.mission_id = m.id AND ${sharedConvoSql('cc')}) AS conversations,
+    (SELECT COUNT(*) FROM mission_conversations sl JOIN conversations cc ON cc.id = sl.convo_id
+       WHERE sl.mission_id = m.id AND sl.ended_at IS NULL AND cc.parent_convo_id IS NULL AND ${sharedConvoSql('cc')}) AS conversations,
     (SELECT COUNT(*) FROM milestones l JOIN conversations mc ON mc.id = l.convo_id
        WHERE l.mission_id = m.id AND ${sharedConvoSql('mc')}) AS milestones,
     (SELECT json_object('num', l.num, 'title', l.title, 'kind', l.kind, 'created_at', l.created_at)
@@ -545,7 +639,11 @@ export function getSharedMission(db, viewerUserId, missionId) {
     WHERE m.id = @id AND ${MISSION_SHARED}`).get({ viewer: viewerUserId, id: missionId }))
 }
 
-export function sharedMissionDetail(db, viewerUserId, mission) {
+// The colleague's conversation list reads ACTIVE links (never history: a
+// colleague has no members table to reconcile) and folds sub-chats exactly
+// like the owner's (controller ruling D8), so its `conversations` count —
+// active top-level links — matches the folded list.
+export function sharedMissionDetail(db, viewerUserId, mission, { subchats = false } = {}) {
   const args = { viewer: viewerUserId, mid: mission.id }
   const milestones = db.prepare(`SELECT l.* FROM milestones l JOIN conversations cv ON cv.id = l.convo_id
     WHERE l.mission_id = @mid AND ${sharedConvoSql('cv')} ORDER BY l.created_at DESC, l.seq DESC`).all(args).map(milestoneRow)
@@ -553,9 +651,10 @@ export function sharedMissionDetail(db, viewerUserId, mission) {
     FROM items i JOIN conversations cv ON cv.id = i.origin_convo_id
     WHERE i.mission_id = @mid AND i.state='open' AND i.consent IS NULL AND ${sharedConvoSql('cv')}
     ORDER BY (i.awaiting = 'user') DESC, i.updated_at DESC`).all(args)
-  const conversations = db.prepare(`SELECT cv.id, cv.title, cv.session_state AS state, cv.repo, d.name AS box
-    FROM conversations cv LEFT JOIN devices d ON d.id = cv.agent_device_id
-    WHERE cv.mission_id = @mid AND ${sharedConvoSql('cv')} ORDER BY cv.created_at`).all(args)
+  const conversations = foldSubchats(db.prepare(`SELECT cv.id, cv.title, cv.session_state AS state, cv.repo, d.name AS box, cv.parent_convo_id
+    FROM mission_conversations sl JOIN conversations cv ON cv.id = sl.convo_id
+    LEFT JOIN devices d ON d.id = cv.agent_device_id
+    WHERE sl.mission_id = @mid AND sl.ended_at IS NULL AND ${sharedConvoSql('cv')} ORDER BY sl.joined_at, cv.created_at`).all(args), { subchats })
   return { mission, milestones, items, conversations }
 }
 
