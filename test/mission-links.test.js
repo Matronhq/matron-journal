@@ -394,3 +394,21 @@ test('missionDetail other_missions: each row names the conversation\'s OTHER mis
   assert.equal(capped.length, OTHER_MISSIONS_MAX)
   assert.equal(capped[0].current, true, 'the current mission is never the one cut')
 })
+
+test('missionDetail: a filtered caller never learns a hidden (private-device) parent\'s id through a sub-chat row; the owner does', () => {
+  const db = withPrivateBox()
+  const a = startOn(db, 'secret', 'Private-born', { deviceId: 9 })
+  upsertConversation(db, { id: 'pubkid', ownerUserId: 1, title: 'pk', agentDeviceId: 7, parentConvoId: 'secret' })  // inherits a
+  upsertConversation(db, { id: 'c4', ownerUserId: 1, title: 'C4', agentDeviceId: 7 })
+  upsertConversation(db, { id: 'stray', ownerUserId: 1, title: 'st', agentDeviceId: 7, parentConvoId: 'c4' })
+  const b = startOn(db, 'c1', 'Public')
+  join(db, b.id, 'pubkid'); join(db, b.id, 'stray')
+  const rowOf = (d, id) => d.conversations.find((c) => c.id === id)
+  const owner = missionDetail(db, 1, b.id)
+  assert.equal(rowOf(owner, 'pubkid').parent_convo_id, 'secret')
+  const sieved = missionDetail(db, 1, b.id, { excludePrivateOwned: true })
+  assert.equal(rowOf(sieved, 'pubkid').parent_convo_id, null)
+  assert.equal(JSON.stringify(sieved.conversations).includes('secret'), false)
+  assert.equal(rowOf(sieved, 'stray').parent_convo_id, 'c4', 'a visible parent off the mission is still named')
+  assert.equal(a.origin_convo_id, 'secret')
+})

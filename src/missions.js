@@ -322,7 +322,14 @@ export function missionDetail(db, userId, missionId, { excludePrivateOwned = fal
     FROM items i JOIN conversations c ON c.id = i.origin_convo_id
     WHERE i.mission_id=? AND i.state='open' ${sieve}
     ORDER BY (i.awaiting = 'user') DESC, i.updated_at DESC`).all(mission.id)
+  // A sub-chat whose parent the caller cannot see (a filtered agent and a
+  // private-device parent) must not name it: parent_convo_id is withheld.
+  const parentHidden = excludePrivateOwned
+    ? `EXISTS (SELECT 1 FROM conversations pc JOIN devices pd ON pd.id = pc.agent_device_id
+         WHERE pc.id = c.parent_convo_id AND pd.private = 1)`
+    : '0'
   const rows = db.prepare(`SELECT c.id, c.title, c.session_state AS state, d.name AS box, c.parent_convo_id,
+      ${parentHidden} AS parent_hidden,
       (c.mission_id IS NOT NULL AND c.mission_id = l.mission_id) AS current, l.how, l.joined_at, l.ended_at,
       s.reported_at AS status_reported_at, s.status AS status_json
     FROM mission_conversations l JOIN conversations c ON c.id = l.convo_id AND c.owner_user_id = ?
@@ -330,7 +337,7 @@ export function missionDetail(db, userId, missionId, { excludePrivateOwned = fal
     LEFT JOIN conversation_status s ON s.convo_id = c.id
     WHERE l.mission_id = ? ${history ? '' : 'AND l.ended_at IS NULL'} ${sieve}
     ORDER BY (l.ended_at IS NOT NULL), l.joined_at, c.created_at`).all(userId, mission.id)
-    .map((r) => withConvoStatus({ ...r, current: !!r.current }))
+    .map(({ parent_hidden: hidden, ...r }) => withConvoStatus({ ...r, current: !!r.current, parent_convo_id: hidden ? null : r.parent_convo_id }))
   const conversations = [
     ...foldSubchats(rows.filter((r) => r.ended_at == null), { subchats }),
     ...foldSubchats(rows.filter((r) => r.ended_at != null), { subchats }),
@@ -651,7 +658,10 @@ export function sharedMissionDetail(db, viewerUserId, mission, { subchats = fals
     FROM items i JOIN conversations cv ON cv.id = i.origin_convo_id
     WHERE i.mission_id = @mid AND i.state='open' AND i.consent IS NULL AND ${sharedConvoSql('cv')}
     ORDER BY (i.awaiting = 'user') DESC, i.updated_at DESC`).all(args)
-  const conversations = foldSubchats(db.prepare(`SELECT cv.id, cv.title, cv.session_state AS state, cv.repo, d.name AS box, cv.parent_convo_id
+  // parent_convo_id is withheld when the colleague cannot read the parent.
+  const conversations = foldSubchats(db.prepare(`SELECT cv.id, cv.title, cv.session_state AS state, cv.repo, d.name AS box,
+      CASE WHEN EXISTS (SELECT 1 FROM conversations pc WHERE pc.id = cv.parent_convo_id AND ${sharedConvoSql('pc')})
+        THEN cv.parent_convo_id END AS parent_convo_id
     FROM mission_conversations sl JOIN conversations cv ON cv.id = sl.convo_id
     LEFT JOIN devices d ON d.id = cv.agent_device_id
     WHERE sl.mission_id = @mid AND sl.ended_at IS NULL AND ${sharedConvoSql('cv')} ORDER BY sl.joined_at, cv.created_at`).all(args), { subchats })

@@ -161,3 +161,20 @@ test('shared view reads active links: a joined shared conversation shows, sub-ch
   assert.equal((await s.http(`/missions/${m.id}`, { token: patClient })).status, 404)
   assert.deepEqual((await s.http('/missions?scope=shared', { token: patClient })).json.missions, [])
 })
+
+test('shared view: a shared sub-chat whose parent the colleague cannot read carries parent_convo_id null', async (t) => {
+  const { s, dan, pat, agent, client } = await fleet(t)
+  const link = (u, gid) => saveGithubIdentity(s.db, { userId: u.id, host: 'github.com', identity: { github_id: gid, login: u.name, scopes: ['github.com/matronhq'] }, token: `t${gid}`, now: 1 })
+  link(dan, 1); link(pat, 2)
+  const patClient = (await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'mac' } })).json.token
+  const repo = 'github.com/matronhq/journal'
+  // c2 has no repo: pat cannot read it. Its sub-chat kid carries a shared repo.
+  const m = (await start(s, agent.token, { title: 'M', convo_id: 'c2' })).json.mission
+  upsertConversation(s.db, { id: 'kid', ownerUserId: dan.id, title: 'kid', agentDeviceId: agent.deviceId, parentConvoId: 'c2', repo })
+  const shared = await s.http(`/missions/${m.id}`, { token: patClient })
+  assert.equal(shared.status, 200)
+  assert.deepEqual(shared.json.conversations.map((c) => [c.id, c.parent_convo_id]), [['kid', null]])
+  assert.equal(JSON.stringify(shared.json.conversations).includes('c2'), false)
+  const own = await s.http(`/missions/${m.id}?subchats=1`, { token: client })
+  assert.equal(own.json.conversations.find((c) => c.id === 'kid').parent_convo_id, 'c2')
+})
