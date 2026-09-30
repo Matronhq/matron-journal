@@ -6,11 +6,6 @@
 // conversations.mission_id is the CURRENT pointer; this table is the truth
 // for "which conversations belong to which mission". Invariant: a non-null
 // pointer always has an active (ended_at IS NULL) link.
-//
-// LINK_HOWS mirrors the mission_conversations.how CHECK constraint in
-// src/db.js's SCHEMA — kept module-private since nothing outside this file
-// needs the vocabulary yet (D12: never export what no task uses).
-const LINK_HOWS = ['origin', 'joined', 'spawned', 'inherited', 'backfill']
 
 // One pass over what the journal already knows, run by openDb while the
 // table is empty (the spec's guard). It is idempotent in practice: once any

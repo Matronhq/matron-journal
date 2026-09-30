@@ -358,7 +358,7 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
             ${omitSnippet ? 'NULL' : 'snippet'} AS snippet,
             parent_convo_id, summary, repo, created_at, agent_device_id,
             ${excludePrivateOwned
-              ? `(CASE WHEN EXISTS (SELECT 1 FROM missions m WHERE m.id = conversations.mission_id AND ${ORIGIN_SIEVE}) THEN mission_id END)`
+              ? `(CASE WHEN EXISTS (SELECT 1 FROM missions m WHERE m.id = conversations.mission_id AND ${ORIGIN_SIEVE}) THEN conversations.mission_id END)`
               : 'mission_id'} AS mission_id,
             (SELECT COUNT(*) FROM mission_conversations l JOIN missions m ON m.id = l.mission_id
               WHERE l.convo_id = conversations.id${excludePrivateOwned ? ` AND ${ORIGIN_SIEVE}` : ''}) AS mission_count,
