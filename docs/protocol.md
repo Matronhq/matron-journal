@@ -1853,6 +1853,60 @@ learns about the ask from `/consent/pending` at its next sweep instead.
 {consent:false}`, clients only; default on). Off, both routes answer
 `consent_disabled` and no nudge is sent; the cards and taps work as ever.
 
+### Alertmanager webhook (`POST /alerts/alertmanager`)
+
+(`src/alerts-http.js`, formatting in `src/alerts.js`.) Prometheus
+Alertmanager's `webhook_configs` receiver posts here and the alert arrives
+as a turn in one user's Coordinator session, so a disk alert reaches the
+agent that looks after the boxes without anyone forwarding an email.
+
+| Env | |
+|---|---|
+| `MATRON_ALERT_WEBHOOK_TOKEN` | Shared secret, sent as `Authorization: Bearer <token>`. Unset or shorter than 32 chars: the route is off. |
+| `MATRON_ALERT_WEBHOOK_USER` | Username (`users.name`) whose Coordinator receives the alerts. Unset or no such user: the route is off (a warning is logged at boot when the token is set but the user is missing). |
+
+Off, the handler declines and the request meets the rest of the chain
+exactly as an unknown path would (401 without a device token, 404 with
+one). On, it is mounted **ahead of** the device Bearer auth:
+
+- missing/wrong token → **401** `unauthenticated` (compared in constant
+  time on sha256 digests). Wrong tokens are charged to the same per-IP
+  limiter as `/login` (5/min); once an IP's budget is spent every request
+  from it is **429** `rate_limited`, the right token included. A right token
+  never spends the budget.
+- body: JSON object ≤ 256 KiB (**413** over) with an `alerts` array (the
+  Alertmanager webhook v4 shape); anything else **400** `bad_request`.
+- otherwise always **202** — Alertmanager retries only on 5xx:
+  `{delivered:false, reason:'no_coordinator'}` when the user has no
+  Coordinator or its conversation has no box; `{delivered:false,
+  reason:'busy'}` when 4 deliveries are already in flight in this journal
+  process; else `{accepted:true}`. The delivery then runs off the request:
+  the Coordinator's box is woken if asleep and waited for
+  (`MATRON_SPAWN_WAKE_WAIT_MS`), and a journal-originated RPC is issued to
+  it (`MATRON_SESSION_CONTROL_TIMEOUT_MS`):
+
+```json
+{ "method": "session_control",
+  "params": { "convo_id": "<the Coordinator conversation>", "action": "alert",
+              "message": "<≤ 2000 chars, one or more lines>", "from_name": "Alertmanager" } }
+```
+
+The bridge answers `{ok:true, result:{applied:'now'|'deferred'}}` or
+`{ok:false, error:{code, detail?}}`; the outcome is logged (one line), never
+returned. `alert` is **not** a `session_control` op action: only this route
+builds it, so no agent can forge an alert through its own op (which still
+answers `bad_request` / `bad action`).
+
+The message: a header `🔔 Alertmanager: FIRING|RESOLVED <alertname>
+[<severity>] (<n> alert(s))` (severity only when common to the group), one
+line per alert (at most 10, each ≤ 300 chars) `- <status> <where>:
+<summary or description>` where `<where>` is `guest` (else `instance`),
+then `mountpoint`, then `on <hostname>` when it differs, `+N more` when
+lines were dropped, and — for a firing alert whose name matches
+`/Disk|Zpool/` — a closing line telling the Coordinator to check the box's
+disk and start a safe clean-up below 20% free. Every payload field is
+peer-text sanitised on its own, so nothing in a label can add a line.
+
 ## Missions & milestones
 
 Spec: `docs/superpowers/specs/2026-09-10-missions-milestones-design.md`.
