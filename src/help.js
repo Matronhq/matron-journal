@@ -162,12 +162,18 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   counts active top-level conversations.
 - \`GET /missions/:id\` → \`{mission, milestones (newest first), items
   (open), conversations}\`. Each conversation row has \`current\`, \`how\`,
-  \`joined_at\`, \`ended_at\` (null = on it now), \`parent_convo_id\` and
-  \`subchat_count\`, plus \`other_missions\` (up to 5 of that
-  conversation's other missions: \`{id, num, title, current, active,
+  \`joined_at\`, \`ended_at\` (null = on it now), \`parent_convo_id\` (null
+  when you can't see the parent — a private-owned one, or, on a colleague's
+  shared view, one they can't read — so null there can mean "hidden", not
+  just "no parent") and \`subchat_count\`, plus \`other_missions\` (up to 5
+  of that conversation's other missions: \`{id, num, title, current, active,
   joined_at, ended_at}\`); sub-chats are folded into their parent's row —
   add \`?subchats=1\` to list them too, and \`?history=1\` to also list ended
-  links (each carrying its \`ended_at\`); the two combine.
+  links (each carrying its \`ended_at\`); the two combine. This array can be
+  longer than the mission's \`conversations\` count (active top-level links
+  only): an unfolded sub-chat whose parent isn't linked, or a row added by
+  \`?subchats=1\`/\`?history=1\`, grows the array without growing the count —
+  never assume \`conversations === conversations.length\` here.
 - \`PATCH /missions/:id\` \`{title?, body?, status?: string|null, project?,
   convo_id?}\` → 200 \`{mission}\`; 409 once the mission is closed.
   \`status\` is the mission's one-paragraph headline (markdown, 1–600
@@ -234,12 +240,14 @@ close or merge.
   answers with the project it was merged into plus \`merged_from\`.
 - \`PATCH /projects/:id\` \`{title?, body?, status?: string|null,
   convo_id?}\` — status rules as for missions. 409 once closed.
-- \`POST /projects/:id/close\` \`{summary, convo_id}\` — as an agent you must
-  be the Coordinator and name its conversation (else 403
-  \`not_coordinator\`); open missions block you with 409 \`open_missions\`.
-- \`POST /projects/:id/merge\` \`{into, convo_id}\` — Coordinator or user
-  only; moves every mission into \`into\` and closes this one ("Merged into
-  #N").
+- \`POST /projects/:id/close\` \`{summary, convo_id?}\` — \`convo_id\` is
+  required when you call as an agent (name your own conversation so you
+  prove you're the Coordinator; else 403 \`not_coordinator\`); a client
+  never needs it. Open missions block a Coordinator close with 409
+  \`open_missions\`.
+- \`POST /projects/:id/merge\` \`{into, convo_id?}\` — same \`convo_id\` rule
+  as close. Coordinator or user only; moves every mission into \`into\` and
+  closes this one ("Merged into #N").
 - Activity: \`running\` (a linked session is running), \`waiting\` (one is
   waiting, or items await the user), \`quiet\` (no milestone, status update
   or conversation activity for 7 days), else \`idle\`.
