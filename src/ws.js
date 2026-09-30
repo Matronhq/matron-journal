@@ -15,6 +15,7 @@ import { coordinatorFor } from './coordinator.js'
 import { getMission } from './missions.js'
 import { sanitizeConvoStatus, upsertConvoStatus } from './convo-status.js'
 import { validateSessionControl, authorizeSessionControl, sessionControlResultFrame } from './session-control.js'
+import { validRanges, addSeenRanges, markDeviceUsesRanges, legacyReadAsSeen, markItemSeen } from './seen.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -1539,6 +1540,48 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           sender, type: 'read_marker',
           payload: { convo_id: msg.convo_id, up_to_seq: r.upToSeq },
         }))
+        // Read state's legacy fallback (spec 2026-09-30 read state §3): a
+        // client that doesn't report seen ranges yet has "seen" what it
+        // marked read. A bridge's marker never counts — it mirrors the
+        // user's own message, it doesn't mean the user looked.
+        if (conn.kind === 'client') legacyReadAsSeen(db, conn.userId, msg.convo_id, conn.deviceId, r.upToSeq)
+        break
+      }
+      case 'seen': {
+        // What the user actually had on screen (spec 2026-09-30 read state):
+        // client connections only, the owner's own conversations only. Not
+        // journaled — seen state is not conversation content and must not
+        // bump unread, the snippet or push. No reply. An empty `ranges`
+        // registers the device as a range reporter (ending its legacy
+        // read_marker fallback) without marking anything.
+        if (conn.kind !== 'client') return fail('forbidden')
+        if (typeof msg.convo_id !== 'string' || !msg.convo_id || msg.convo_id.length > CONVO_ID_MAX_CHARS) return fail('bad_request')
+        const ranges = validRanges(msg.ranges)
+        if (!ranges) return fail('bad_request')
+        markDeviceUsesRanges(db, conn.deviceId)
+        if (ranges.length === 0) break
+        try {
+          addSeenRanges(db, conn.userId, msg.convo_id, ranges)
+        } catch (err) {
+          if (err.message === 'not_found') return fail('forbidden')
+          throw err
+        }
+        break
+      }
+      case 'item_seen': {
+        // An item's detail was on screen: its body and its comments up to
+        // `through_comment_at` (the newest rendered; 0 = none). Same rules as
+        // `seen`.
+        if (conn.kind !== 'client') return fail('forbidden')
+        if (typeof msg.item_id !== 'string' || !msg.item_id || msg.item_id.length > 128) return fail('bad_request')
+        const through = msg.through_comment_at ?? 0
+        if (!Number.isInteger(through) || through < 0) return fail('bad_request')
+        try {
+          markItemSeen(db, conn.userId, msg.item_id, through)
+        } catch (err) {
+          if (err.message === 'not_found') return fail('forbidden')
+          throw err
+        }
         break
       }
       case 'convo_upsert': {

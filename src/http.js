@@ -21,6 +21,7 @@ import { handleUsersRoute } from './users-http.js'
 import { githubAccountView } from './github-accounts.js'
 import { handleCoordinatorRoute } from './coordinator-http.js'
 import { handleMemoriesRoute } from './memories-http.js'
+import { handleSeenRoute } from './seen-http.js'
 import { handleConsentRoute } from './consent-http.js'
 import { answerChatAsk, answerSpawnAsk } from './consent-answer.js'
 import { coordinatorFor } from './coordinator.js'
@@ -269,6 +270,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       if (await handleMissionsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
       if (await handleProjectsRoute({ db, hub }, req, res, url, who)) return
       if (await handleMemoriesRoute({ db, hub }, req, res, url, who)) return
+      if (await handleSeenRoute({ db }, req, res, url, who)) return
       if (await handleGithubRoute({ db, github, rateLimiter, tokenBox: tokenBox || undefined }, req, res, url, who)) return
       if (handleLookupRoute({ db }, req, res, url, who)) return
       if (await handleUsersRoute({ db, links }, req, res, url, who)) return

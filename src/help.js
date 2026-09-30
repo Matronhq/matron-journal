@@ -154,6 +154,15 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   updating. 409 \`too_many\` at 200 memories. \`DELETE /memories/:name\` →
   200 \`{memory}\`. Every change lands as a quiet \`memory\` event on your
   conversation and on the Coordinator's.
+- \`GET /unseen?convo_id=<coordinator convo>\` → \`{entries, truncated}\` —
+  what the user hasn't seen (Coordinator only). Params: \`older_than_ms\`
+  (default 30 min), \`since_ms\` (default 3 d), \`importance\`
+  (important|all), \`in_convo_id\`, \`mission\`, \`include_flagged=1\`,
+  \`limit\`. With \`mine=1\` and your own conversation as \`convo_id\`: only
+  YOUR messages there that the user hasn't seen (any agent).
+- \`POST /unseen/flags\` \`{convo_id, refs}\` — record that you raised these
+  entries with the user, so they are not listed again (an agent: only its
+  own messages).
 - \`GET /missions?state=open|closed&since=<ms>\` → \`{missions}\` with
   per-row \`open_items\`, \`needs_you\`, \`conversations\`,
   \`milestones\`, \`last_milestone\`; most recent activity first. Rows also

@@ -26,6 +26,7 @@ import { makeItemTranscription } from './items-transcribe.js'
 import { emitTranscriptionMarker } from './items-http.js'
 import { makeGithub, DEFAULT_GITHUB_CLIENT_ID } from './github.js'
 import { makeTokenBox } from './token-box.js'
+import { startUnseenNudge } from './unseen-nudge.js'
 import { startStallWakeSweep } from './stall-wake.js'
 import { sealStoredTokens } from './github-accounts.js'
 import { CONSENT_DAILY_CAP_DEFAULT } from './consent.js'
@@ -309,6 +310,9 @@ export function startServer({
   // coordinator consent); beyond it the ask stays for the user. 0 = no cap.
   consentDailyCap = resolveConsentDailyCap(process.env.MATRON_COORDINATOR_CONSENT_DAILY_CAP),
   stallWakeIntervalMs = null,
+  // The unseen nudge (src/unseen-nudge.js). MATRON_UNSEEN_NUDGE=0 turns it off.
+  unseenNudgeIntervalMs = null,
+  unseenNudge = process.env.MATRON_UNSEEN_NUDGE !== '0',
   mediaReapHighPct, mediaReapLowPct, waker, transcriber, github, githubRefreshIntervalMs, webDir,
   appleAppIds, androidPackage, androidCertSha256, tokenKey,
   // Alertmanager webhook (src/alerts-http.js): {token, username}. The
@@ -368,6 +372,7 @@ export function startServer({
   // usage-limit reset has passed is woken so its bridge can carry on. No-op
   // without a waker; stopped in close().
   const stallWakeSweep = startStallWakeSweep({ db, hub, waker: resolvedWaker, ...(stallWakeIntervalMs ? { intervalMs: stallWakeIntervalMs } : {}) })
+  const unseenNudgeSweep = startUnseenNudge({ db, hub, enabled: unseenNudge, ...(unseenNudgeIntervalMs ? { intervalMs: unseenNudgeIntervalMs } : {}) })
   const toolStreams = makeToolStreamStore({
     maxBytes: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BYTES', process.env.MATRON_TOOL_STREAM_MAX_BYTES, 1048576),
     maxBuffers: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BUFFERS', process.env.MATRON_TOOL_STREAM_MAX_BUFFERS, 64),
@@ -461,6 +466,7 @@ export function startServer({
         itemTranscription,
         preapproveKey: resolvedPreapproveKey,
         searchBackfill,
+        unseenNudge: unseenNudgeSweep,
         github: resolvedGithub,
         close: () => new Promise((r) => {
           closing = true
@@ -468,6 +474,7 @@ export function startServer({
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
           if (githubRefreshInterval) clearInterval(githubRefreshInterval)
           stallWakeSweep.stop()
+          unseenNudgeSweep.stop()
           // Wake-before-spawn waiters (hub.waitForDevice) hold ref'd timers
           // of up to spawnWakeWaitMs; release them before the sockets go so
           // each approveSpawn settles its row while the DB is still open.
