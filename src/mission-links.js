@@ -1,7 +1,8 @@
 // The conversation ↔ mission link table (spec 2026-09-30 projects & mission
 // links §3): low-level SQL shared by missions.js (join/leave/reads),
-// journal.js (inheritance) and db.js (the one-time backfill). Deliberately
-// imports nothing from missions.js or db.js, so no import cycle can form.
+// journal.js (inheritance) and db.js (the one-time backfill and the
+// every-open heal). Deliberately imports nothing from missions.js or db.js,
+// so no import cycle can form.
 // conversations.mission_id is the CURRENT pointer; this table is the truth
 // for "which conversations belong to which mission". Invariant: a non-null
 // pointer always has an active (ended_at IS NULL) link.
@@ -58,6 +59,23 @@ export function backfillMissionLinks(db) {
       GROUP BY t.mission_id, t.convo_id`).run().changes
     return current + history
   })()
+}
+
+// Run by openDb on EVERY open, after the backfill: restores the invariant
+// wherever something outside this code (old code after a rollback, a hand
+// edit) left a current pointer with no active link. Inserts a 'backfill'
+// link stamped now, or reactivates an ended one keeping its how and
+// joined_at. The NOT EXISTS keeps it one index probe per pointed
+// conversation when nothing is broken. Same-user missions only, as above.
+export function healMissionLinks(db) {
+  return db.transaction(() => db.prepare(`
+    INSERT INTO mission_conversations(mission_id, convo_id, user_id, how, joined_at, ended_at)
+    SELECT c.mission_id, c.id, c.owner_user_id, 'backfill', ?, NULL
+    FROM conversations c JOIN missions m ON m.id = c.mission_id AND m.user_id = c.owner_user_id
+    WHERE c.mission_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM mission_conversations l
+      WHERE l.mission_id = c.mission_id AND l.convo_id = c.id AND l.ended_at IS NULL)
+    ON CONFLICT(mission_id, convo_id) DO UPDATE SET ended_at = NULL`).run(Date.now()).changes)()
 }
 
 export function linkRow(db, missionId, convoId) {

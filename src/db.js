@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3'
 import { healBakedTitles } from './heal-titles.js'
-import { backfillMissionLinks } from './mission-links.js'
+import { backfillMissionLinks, healMissionLinks } from './mission-links.js'
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users(
@@ -707,6 +707,10 @@ export function openDb(path) {
   // every mission/conversation/item column it reads has been added above.
   const backfilled = backfillMissionLinks(db)
   if (backfilled > 0) console.log(`mission_conversations: backfilled ${backfilled} link(s)`)
+  // And on EVERY open: a pointer written without a link (old code after a
+  // rollback) gets its active link back, so the invariant always holds.
+  const healed = healMissionLinks(db)
+  if (healed > 0) console.log(`mission_conversations: healed ${healed} link(s)`)
   // Coordinator consent approval (spec: matron-bridge 2026-09-29 coordinator
   // consent): the off switch (default ON, the choice Dan made), and on both
   // ask tables who answered a parked row and why — 'coordinator' + reason

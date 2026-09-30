@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import { openDb } from '../src/db.js'
-import { backfillMissionLinks } from '../src/mission-links.js'
+import { backfillMissionLinks, healMissionLinks, hasActiveLink } from '../src/mission-links.js'
 import { upsertConversation, snapshot } from '../src/journal.js'
 import { createItem } from '../src/items.js'
 import {
@@ -113,7 +113,10 @@ test('backfill: the first open with an empty link table recovers current, origin
     assert.equal(db2.prepare(`SELECT COUNT(*) AS n FROM conversations c WHERE c.mission_id IS NOT NULL AND NOT EXISTS (
       SELECT 1 FROM mission_conversations l WHERE l.mission_id = c.mission_id AND l.convo_id = c.id AND l.ended_at IS NULL)`).get().n, 0)
     assert.equal(backfillMissionLinks(db2), 0, 'a non-empty table is never backfilled again')
+    // A legitimate leave: the link ends AND the pointer moves off. (Ending the
+    // link while the pointer stays is the rollback state the heal repairs.)
     db2.prepare("UPDATE mission_conversations SET ended_at=9999 WHERE convo_id='joiner'").run()
+    db2.prepare("UPDATE conversations SET mission_id=NULL WHERE id='joiner'").run()
     db2.close()
 
     const db3 = openDb(p)
@@ -150,6 +153,38 @@ test('backfill: a malformed mission-marker payload never aborts openDb; the link
       'ms_a/origin': { how: 'origin', joined_at: 1000, ended_at: null },
     })
     db2.close()
+  } finally { rmDb(p) }
+})
+
+test('heal: every open restores the invariant after old code wrote a pointer with no active link (a rollback); a second open changes nothing', () => {
+  const p = tmpPath('mc-heal')
+  try {
+    const db1 = openDb(p)
+    db1.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+    db1.prepare("INSERT INTO devices(id, user_id, kind, name, token_hash, created_at) VALUES(7,1,'agent','dev-2','h',0)").run()
+    for (const id of ['c1', 'c2', 'c3']) upsertConversation(db1, { id, ownerUserId: 1, title: id, agentDeviceId: 7 })
+    const a = createMission(db1, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
+    joinMission(db1, { userId: 1, missionId: a.id, convoId: 'c3' })
+    // Old code: c2 is pointed at A with no link at all; c3's link was ended
+    // but its pointer stayed.
+    db1.prepare('UPDATE conversations SET mission_id=? WHERE id=?').run(a.id, 'c2')
+    db1.prepare("UPDATE mission_conversations SET ended_at=5 WHERE convo_id='c3'").run()
+    db1.close()
+
+    const db2 = openDb(p)
+    assert.ok(hasActiveLink(db2, a.id, 'c2'))
+    assert.ok(hasActiveLink(db2, a.id, 'c3'))
+    assert.equal(db2.prepare("SELECT how FROM mission_conversations WHERE convo_id='c2'").get().how, 'backfill')
+    assert.equal(db2.prepare("SELECT how FROM mission_conversations WHERE convo_id='c3'").get().how, 'joined', 'a reactivated link keeps its how')
+    assert.deepEqual(missionDetail(db2, 1, a.id).conversations.map((c) => c.id).sort(), ['c1', 'c2', 'c3'])
+    assert.equal(leaveMission(db2, { userId: 1, missionId: a.id, convoId: 'c2' }).left, true)
+    const before = linkMap(db2)
+    db2.close()
+
+    const db3 = openDb(p)
+    assert.deepEqual(linkMap(db3), before, 'a second open changes nothing')
+    assert.equal(healMissionLinks(db3), 0)
+    db3.close()
   } finally { rmDb(p) }
 })
 
