@@ -1807,7 +1807,8 @@ conversation this device owns **404**; not `user_settings.coordinator_convo_id`
 line the user reads; the ask must exist (**404**, unknown and another
 user's indistinguishable) and still be `awaiting_user` (**409** `conflict`);
 an approval when the Coordinator's approvals in the last 24 h are at the
-**daily cap** (`MATRON_COORDINATOR_CONSENT_DAILY_CAP`, default 20) is
+**daily cap** (`MATRON_COORDINATOR_CONSENT_DAILY_CAP`, default 20; `0` is
+no cap) is
 **409** `{detail:'daily_cap', cap}` and the ask stays for the user —
 declines are never capped; a **spawn** approval into a target box that is
 `offline` (no socket and no wake possible) is **409**

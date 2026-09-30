@@ -28,6 +28,7 @@ import { makeGithub, DEFAULT_GITHUB_CLIENT_ID } from './github.js'
 import { makeTokenBox } from './token-box.js'
 import { startStallWakeSweep } from './stall-wake.js'
 import { sealStoredTokens } from './github-accounts.js'
+import { CONSENT_DAILY_CAP_DEFAULT } from './consent.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
@@ -57,6 +58,15 @@ export function resolveNumericEnv(name, raw, defaultValue) {
     return defaultValue
   }
   return n
+}
+
+// The consent cap is the one knob where 0 is a value, not garbage: it means
+// "no cap" — the operator has decided the reason on every decision and the
+// audit trail are guardrail enough (Dan, 2026-09-30, after a routine day
+// hit 20). Anything else is validated like every other numeric knob.
+export function resolveConsentDailyCap(raw, defaultValue = CONSENT_DAILY_CAP_DEFAULT) {
+  if (typeof raw === 'string' && raw.trim() === '0') return 0
+  return resolveNumericEnv('MATRON_COORDINATOR_CONSENT_DAILY_CAP', raw, defaultValue)
 }
 
 // `override` is startServer's `retentionDays` opt — when given, it takes
@@ -295,8 +305,8 @@ export function startServer({
   spawnWakeWaitMs = resolveNumericEnv('MATRON_SPAWN_WAKE_WAIT_MS', process.env.MATRON_SPAWN_WAKE_WAIT_MS, 240000),
   sessionControlTimeoutMs = resolveNumericEnv('MATRON_SESSION_CONTROL_TIMEOUT_MS', process.env.MATRON_SESSION_CONTROL_TIMEOUT_MS, 30000),
   // Coordinator consent approvals per rolling 24 h (spec: 2026-09-29
-  // coordinator consent); beyond it the ask stays for the user.
-  consentDailyCap = resolveNumericEnv('MATRON_COORDINATOR_CONSENT_DAILY_CAP', process.env.MATRON_COORDINATOR_CONSENT_DAILY_CAP, 20),
+  // coordinator consent); beyond it the ask stays for the user. 0 = no cap.
+  consentDailyCap = resolveConsentDailyCap(process.env.MATRON_COORDINATOR_CONSENT_DAILY_CAP),
   stallWakeIntervalMs = null,
   mediaReapHighPct, mediaReapLowPct, waker, transcriber, github, githubRefreshIntervalMs, webDir,
   appleAppIds, androidPackage, androidCertSha256, tokenKey,
