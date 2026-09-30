@@ -1903,7 +1903,10 @@ when the mission was born there, `inherited` for a sub-chat, else `joined`;
 that mission, else the later of the two creation times), then one ended
 `backfill` link for every other (mission, conversation) pair a milestone or
 an item records, from its first to its last trace. Pairs that left no trace
-cannot be recovered. It never runs again once any link exists.
+cannot be recovered. It never runs again once any link exists. A separate
+heal pass runs on every start: any conversation whose current pointer has
+no active link (written by older code, e.g. after a rollback) gets one back
+— a new `backfill` link, or its ended link reactivated with its `how` kept.
 
 A mission is **unassigned** while it is `open` and its `conversations`
 count (active top-level links) is `0` — typically one the Coordinator
