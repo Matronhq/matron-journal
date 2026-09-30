@@ -86,6 +86,9 @@ test('413 over the 256 KiB cap', async (t) => {
   const { s } = await fleet(t, { connect: false })
   const r = await post(s, { body: { ...PAYLOAD, pad: 'x'.repeat(300 * 1024) } })
   assert.equal(r.status, 413)
+  // Bytes, not characters: 100k € is ~98k UTF-16 units but ~293 KiB on the wire.
+  const multi = await post(s, { body: { ...PAYLOAD, pad: '€'.repeat(100000) } })
+  assert.equal(multi.status, 413)
 })
 
 test('202 no_coordinator when none is set or its conversation has no box', async (t) => {
