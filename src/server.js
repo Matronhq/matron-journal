@@ -387,7 +387,9 @@ export function startServer({
   // `null` forces it off.
   const itemTranscription = makeItemTranscription({
     db,
-    transcriber: transcriber === undefined ? makeTranscriber() : transcriber,
+    transcriber: transcriber === undefined
+      ? makeTranscriber({ deviceNames: (userId) => db.prepare('SELECT DISTINCT name FROM devices WHERE user_id=? ORDER BY name').all(userId).map((r) => r.name) })
+      : transcriber,
     onSettled: (out) => emitTranscriptionMarker({ db, hub, pushPipeline, waker: resolvedWaker }, out),
   })
   // GitHub account linking (spec 2026-09-23 tracker web/teams). `github` is
