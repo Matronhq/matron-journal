@@ -117,9 +117,15 @@ export function makeTranscriber({
         const run = async (extra) => cleanWhisperText((await exec(cli, ['-m', modelPath, '-f', wavPath, '--no-timestamps', '-l', language, ...extra], { timeout: whisperTimeoutMs, signal })).stdout)
         let text = await run(promptArgs)
         if (promptArgs.length && promptLooksTruncated(text, wavSeconds(wavPath))) {
-          const bare = await run([])
-          const words = (t) => t.split(/\s+/).filter(Boolean).length
-          if (words(bare) > words(text)) text = bare
+          // A rerun that fails (timeout, crash) costs nothing: the prompted
+          // transcript stands. Cancellation still propagates.
+          try {
+            const bare = await run([])
+            const words = (t) => t.split(/\s+/).filter(Boolean).length
+            if (words(bare) > words(text)) text = bare
+          } catch (err) {
+            if (signal?.aborted || err?.name === 'AbortError') throw err
+          }
         }
         if (!text) throw new Error('empty transcription result')
         return text

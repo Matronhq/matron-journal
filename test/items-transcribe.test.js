@@ -218,6 +218,15 @@ test('prompt guard: an implausibly short prompted transcript is rerun without th
   assert.ok(!whisper[1].args.includes('--prompt'))
   assert.equal(text.split(' ').length, 300)
 
+  // A rerun that fails keeps the prompted transcript; an abort still propagates.
+  calls.length = 0
+  const flaky = makeTranscriber({ modelPath, cliPath, prompt: 'Matron.', exec: async (cmd, args) => { calls.push({ cmd, args }); if (cmd === 'ffmpeg') { fs.writeFileSync(args[args.length - 1], Buffer.alloc(44 + 32000 * 124)); return { stdout: '' } } if (args.includes('--prompt')) return { stdout: words(16) }; throw new Error('timed out') } })
+  assert.equal((await flaky.transcribeFile('/blob')).split(' ').length, 16)
+  assert.equal(calls.filter((c) => c.cmd === cliPath).length, 2)
+  const ac = new AbortController()
+  const aborting = makeTranscriber({ modelPath, cliPath, prompt: 'Matron.', exec: async (cmd, args) => { if (cmd === 'ffmpeg') { fs.writeFileSync(args[args.length - 1], Buffer.alloc(44 + 32000 * 124)); return { stdout: '' } } if (args.includes('--prompt')) return { stdout: words(16) }; ac.abort(); throw Object.assign(new Error('aborted'), { name: 'AbortError' }) } })
+  await assert.rejects(aborting.transcribeFile('/blob', { signal: ac.signal }), { name: 'AbortError' })
+
   // A plausible transcript is never rerun.
   calls.length = 0
   const fine = makeTranscriber({ modelPath, cliPath, prompt: 'Matron.', exec: async (cmd, args) => { calls.push({ cmd, args }); if (cmd === 'ffmpeg') fs.writeFileSync(args[args.length - 1], Buffer.alloc(44 + 32000 * 60)); return { stdout: cmd === cliPath ? words(150) : '' } } })
@@ -238,7 +247,15 @@ test('withDeviceNames: dedupes and sorts, drops names that are not hostname-shap
 })
 
 test('resolveWhisperPrompt: unset -> built-in vocabulary, empty -> off, set -> trimmed value', () => {
-  assert.equal(resolveWhisperPrompt(undefined), DEFAULT_WHISPER_PROMPT)
+  // An explicit undefined still triggers the default parameter, which reads
+  // the real environment, so the test's own env is isolated here.
+  const saved = process.env.MATRON_WHISPER_PROMPT
+  delete process.env.MATRON_WHISPER_PROMPT
+  try {
+    assert.equal(resolveWhisperPrompt(), DEFAULT_WHISPER_PROMPT)
+  } finally {
+    if (saved !== undefined) process.env.MATRON_WHISPER_PROMPT = saved
+  }
   assert.ok(DEFAULT_WHISPER_PROMPT.length > 0)
   assert.equal(resolveWhisperPrompt(''), '')
   assert.equal(resolveWhisperPrompt('  '), '')
