@@ -178,3 +178,22 @@ test('shared view: a shared sub-chat whose parent the colleague cannot read carr
   const own = await s.http(`/missions/${m.id}?subchats=1`, { token: client })
   assert.equal(own.json.conversations.find((c) => c.id === 'kid').parent_convo_id, 'c2')
 })
+
+test('POST /milestones {mission}: names an also-on mission; 409 not_linked when not an active link; 400 on a bad type; old callers unchanged', async (t) => {
+  const { s, agent } = await fleet(t)
+  const a = (await start(s, agent.token, {})).json.mission
+  const b = (await start(s, agent.token, { title: 'B', convo_id: 'c2' })).json.mission
+  await join(s, agent.token, b.id, 'c1')
+  const post = (body) => s.http('/milestones', { method: 'POST', token: agent.token, body: { convo_id: 'c1', kind: 'progress', title: 'step', ...body } })
+  const plain = await post({})
+  assert.equal(plain.status, 201); assert.equal(plain.json.mission.id, b.id)
+  const named = await post({ mission: `#${a.num}` })
+  assert.equal(named.status, 201); assert.equal(named.json.milestone.mission_id, a.id)
+  const marker = s.db.prepare("SELECT payload FROM events WHERE type='milestone' AND seq=?").get(named.json.milestone.seq)
+  assert.equal(JSON.parse(marker.payload).mission_num, a.num)
+  const c = (await start(s, agent.token, { title: 'C', convo_id: 'c3' })).json.mission
+  const refused = await post({ mission: c.num })
+  assert.equal(refused.status, 409); assert.deepEqual(refused.json, { error: 'conflict', blocked_by: 'not_linked' })
+  assert.equal((await post({ mission: { id: a.id } })).status, 400)
+  assert.equal((await post({ mission: null })).status, 201, 'null = the current mission')
+})

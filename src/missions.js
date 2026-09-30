@@ -6,7 +6,7 @@ import { nextNum, newId, BODY_MAX } from './items.js'
 import { milestoneMarkerPayload } from './missions-marker.js'
 import { markerTitleAllowed } from './privacy.js'
 import { sharedConvoSql } from './visibility.js'
-import { activateLink, endLink, linkRow, nextCurrent, topLevelActiveCount } from './mission-links.js'
+import { activateLink, endLink, hasActiveLink, linkRow, nextCurrent, topLevelActiveCount } from './mission-links.js'
 
 export const MILESTONE_KINDS = ['user_input', 'progress']
 export const TITLE_MAX = 200
@@ -491,7 +491,7 @@ export function closeMission(db, { userId, missionId, by, summary, closedConvoId
 // this transaction (append() is itself a sync better-sqlite3 transaction,
 // nested as a savepoint) and the returned seq is the row's anchor. If the
 // append throws, nothing — not even the number — survives.
-export function createMilestone(db, { userId, deviceId, createdBy, convoId, kind, title, body = '', idemKey = null, appendMarker, excludePrivateOwned = false }) {
+export function createMilestone(db, { userId, deviceId, createdBy, convoId, kind, title, body = '', idemKey = null, appendMarker, excludePrivateOwned = false, missionRef = null }) {
   return db.transaction(() => {
     if (!MILESTONE_KINDS.includes(kind)) throw new Error('bad_kind')
     if (idemKey) {
@@ -506,12 +506,22 @@ export function createMilestone(db, { userId, deviceId, createdBy, convoId, kind
     }
     const convo = db.prepare('SELECT mission_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)
     if (!convo) throw new Error('no_convo')
-    if (!convo.mission_id) throw new Error('no_mission')
+    // Spec 2026-09-30 §3: `missionRef` (id, "#n" or n) may name ANY mission
+    // this conversation has an active link to; the default stays the current
+    // one. Unknown, invisible (the caller's own sieve) and unlinked are one
+    // answer — not_linked — so the name is never an existence oracle.
+    let targetId = convo.mission_id
+    if (missionRef != null) {
+      const named = getMission(db, userId, missionRef, { excludePrivateOwned })
+      if (!named || !hasActiveLink(db, named.id, convoId)) throw new Error('not_linked')
+      targetId = named.id
+    }
+    if (!targetId) throw new Error('no_mission')
     // Resolved THROUGH the caller's own sieve (C1): a conversation the user
     // joined to a private-origin mission must not become a write path into
     // it for an ordinary agent. Refused before the marker append, so nothing
     // — not the row, not the number, not the event — is written.
-    const mission = getMission(db, userId, convo.mission_id, { excludePrivateOwned })
+    const mission = getMission(db, userId, targetId, { excludePrivateOwned })
     if (!mission) throw new Error('no_mission')
     if (mission.state === 'closed') throw new Error('closed')
     const id = newId('ml')

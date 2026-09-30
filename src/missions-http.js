@@ -269,6 +269,8 @@ async function handleMilestoneCreate(ctx, req, res, who) {
   if (!MILESTONE_KINDS.includes(body.kind)) return badRequest(res)
   if (typeof body.title !== 'string' || !body.title.trim() || body.title.trim().length > TITLE_MAX) return badRequest(res)
   if (body.body !== undefined && (typeof body.body !== 'string' || Buffer.byteLength(body.body, 'utf8') > BODY_MAX)) return badRequest(res)
+  // Optional mission name (spec 2026-09-30 §3): id, "#n" or n; null/absent = current.
+  if (body.mission != null && typeof body.mission !== 'string' && typeof body.mission !== 'number') return badRequest(res)
   const idemKey = idemKeyOf(req, who)
   if (idemKey === undefined) return badRequest(res)
   if (!writableConvo(db, who, body.convo_id)) return notFound(res)
@@ -279,9 +281,11 @@ async function handleMilestoneCreate(ctx, req, res, who) {
     out = createMilestone(db, {
       userId: who.userId, deviceId: who.deviceId, createdBy: byOf(who), convoId: body.convo_id,
       kind: body.kind, title: body.title.trim(), body: body.body ?? '', idemKey, excludePrivateOwned,
+      missionRef: body.mission ?? null,
       appendMarker: (payload) => append(db, { userId: who.userId, convoId: body.convo_id, sender, type: MILESTONE_EVENT_TYPE, payload }),
     })
   } catch (err) {
+    if (err.message === 'not_linked') return conflict(res, { blocked_by: 'not_linked' })
     if (err.message === 'no_mission' || err.message === 'closed') return conflict(res, { blocked_by: err.message })
     // Unreachable through this route (MILESTONE_KINDS is checked above) —
     // kept mapped rather than dropped so the module's own guard, which other

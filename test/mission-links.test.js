@@ -412,3 +412,24 @@ test('missionDetail: a filtered caller never learns a hidden (private-device) pa
   assert.equal(rowOf(sieved, 'stray').parent_convo_id, 'c4', 'a visible parent off the mission is still named')
   assert.equal(a.origin_convo_id, 'secret')
 })
+
+test('createMilestone: default posts to the current mission; mission names any ACTIVE link; ended, unrelated, unknown or hidden → not_linked and nothing is written', () => {
+  const db = withPrivateBox()
+  const a = startOn(db, 'c1', 'A'); const b = startOn(db, 'c2', 'B'); const c = startOn(db, 'c3', 'C')
+  const h = createMission(db, { userId: 1, deviceId: 9, createdBy: 'agent', convoId: 'secret', title: 'Hidden' }).mission
+  join(db, h.id, 'c1'); join(db, b.id, 'c1')   // c1: A origin, H active, B current
+  const appendMarker = (payload) => append(db, { userId: 1, convoId: 'c1', sender: 'agent:dev-2', type: 'milestone', payload })
+  const post = (extra) => createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'progress', title: 't', appendMarker, ...extra })
+  assert.equal(post({}).mission.id, b.id, 'no name → the NEW current mission')
+  assert.equal(post({ missionRef: `#${a.num}` }).mission.id, a.id)
+  assert.equal(post({ missionRef: a.num }).mission.id, a.id)
+  assert.equal(post({ missionRef: a.id }).mission.id, a.id)
+  leaveMission(db, { userId: 1, missionId: a.id, convoId: 'c1' })
+  const before = db.prepare('SELECT COUNT(*) AS n FROM milestones').get().n
+  const events = db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='milestone'").get().n
+  for (const ref of [a.id, `#${c.num}`, '#9999', 'nonsense']) assert.throws(() => post({ missionRef: ref }), /not_linked/, String(ref))
+  assert.throws(() => post({ missionRef: h.id, excludePrivateOwned: true }), /not_linked/, 'hidden to a filtered caller')
+  assert.equal(post({ missionRef: h.id }).mission.id, h.id, 'the unfiltered caller may')
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM milestones').get().n, before + 1)
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='milestone'").get().n, events + 1)
+})
