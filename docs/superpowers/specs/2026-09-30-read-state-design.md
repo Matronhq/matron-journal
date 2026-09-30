@@ -76,67 +76,40 @@ middle as seen.
 
 ### Storage
 
-Three new tables. No ALTER on existing tables, so there is no overlap with the
-Projects migrations (§8).
+As built: five new tables in `src/db.js`. There are no ALTERs on existing
+tables.
 
-```sql
--- Merged seen ranges per conversation, for the owning user. Adjacent and
--- overlapping ranges are coalesced on write, so a normally-read conversation
--- stays at one or a few rows.
-CREATE TABLE IF NOT EXISTS seen_ranges(
-  user_id   INTEGER NOT NULL,
-  convo_id  TEXT NOT NULL,
-  from_seq  INTEGER NOT NULL,
-  to_seq    INTEGER NOT NULL,
-  first_device_id INTEGER,          -- where it was first seen (audit only)
-  seen_at   INTEGER NOT NULL,       -- earliest time any part was seen
-  PRIMARY KEY(user_id, convo_id, from_seq)
-);
--- Item threads: seen through which comment (or just the item itself).
-CREATE TABLE IF NOT EXISTS item_seen(
-  user_id  INTEGER NOT NULL,
-  item_id  TEXT NOT NULL,
-  seen_through_comment_at INTEGER,  -- created_at of the newest comment rendered
-  seen_at  INTEGER NOT NULL,
-  PRIMARY KEY(user_id, item_id)
-);
--- What the Coordinator has already told Dan about (the no-repeat rule, §6).
-CREATE TABLE IF NOT EXISTS unseen_flags(
-  user_id   INTEGER NOT NULL,
-  ref       TEXT NOT NULL,          -- 'msg:<convo_id>:<seq>' or 'item:<id>' or 'comment:<id>'
-  flagged_at INTEGER NOT NULL,
-  flagged_in_convo_id TEXT NOT NULL,
-  PRIMARY KEY(user_id, ref)
-);
-```
+- `seen_ranges(user_id, convo_id, from_seq, to_seq, seen_at)` holds the
+  coalesced seen ranges. Two ranges merge when the seqs between them hold no
+  content event of that conversation, because seqs are per user.
+- `seen_devices(device_id, first_at)` lists the devices that report ranges.
+  Any other device's client `read_marker` is the legacy fallback.
+- `item_seen(user_id, item_id, seen_through_comment_at, seen_at)`.
+- `unseen_flags(user_id, ref, flagged_at, flagged_in_convo_id)` implements the
+  no-repeat rule.
+- `unseen_nudges(user_id, last_at, covered_ts)` records when the Coordinator
+  was last nudged and what that nudge covered.
 
-A device that has sent at least one range is marked with a `devices` bit held
-in memory, rebuilt at start from `seen_ranges.first_device_id`. That drives the
-legacy fallback without adding a column.
+The code lives in `src/seen.js` (store and query), `src/seen-http.js`
+(routes), `src/unseen-nudge.js` (the sweep) and the `seen` / `item_seen` ops
+in `src/ws.js`. The wire contract is in `docs/protocol.md`, "Read state".
 
 ### Protocol
 
-- **The new WebSocket op `seen`** is sent only by client connections:
-  `{op:'seen', convo_id, ranges:[[from,to],...]}`. It is validated against
-  the owner and capped at 64 ranges per op. It is not journaled as an event,
-  because seen state is not conversation content and must not bump anything.
-  The server fans out an ephemeral `seen` frame to the user's other client
-  devices, so an unread-in-this-session highlight can clear everywhere.
-- **The new WebSocket op `item_seen`** is `{item_id, through_comment_at}`, and
-  follows the same rules.
-- **`GET /unseen`** is Coordinator-only (§5). It returns unseen message events
-  and items by the rules in §6.
-- **`POST /unseen/flags`** is Coordinator-only and takes `{refs[], convo_id}`.
-- **`GET /seen?convo_id=`** is for the user's own clients only, so an app can
-  draw a "new since you last looked" divider from real seen state. This is
-  optional and comes after v1.
-- The **privacy gate** (§5) runs before anything else, as it does for
-  `read_marker`.
+- **WebSocket op `seen`:** `{op:'seen', convo_id, ranges:[[from,to],...]}`.
+  Client only, up to 64 ranges, not journaled, no reply. An empty `ranges`
+  registers the device as a range reporter.
+- **WebSocket op `item_seen`:** `{item_id, through_comment_at}`.
+- **`GET /unseen`:** for the Coordinator, or any agent with `mine=1`, where it
+  covers only its own messages.
+- **`POST /unseen/flags`**
+- **Dropped from v1:** fanning `seen` out to other devices, and a client
+  `GET /seen`. No app has a UI for either yet.
 
 ### Retention
 
-`seen_ranges` rows go when their conversation goes (retention.js already walks
-conversations). `unseen_flags` rows are pruned after 30 days.
+Conversations are never deleted by the journal, so seen ranges need no
+cleanup. `unseen_flags` rows are pruned after 30 days by the nudge sweep.
 
 ## 5. Privacy (Q3, decided)
 
@@ -191,7 +164,7 @@ agent-side flag in v1. The journal tags each unseen thing with `reasons[]`:
 | `permission` / `prompt` | a `permission_request` or `prompt` event, unseen, still unanswered |
 | `final` | the last agent message before a conversation went `done` or `waiting` |
 | `failure` | `spawn_outcome` failure, session stalled, or a notice from the bridge's error paths |
-| `mentions_dan` | in an agent-to-agent room, text that names Dan (in his own conversations every message is addressed to him, so this rule is for rooms only) |
+| `mentions_user` | in an agent-to-agent room, text that names Dan (in his own conversations every message is addressed to him, so this rule is for rooms only) |
 
 Anything with at least one reason is `important`. The rest of the unseen
 agent text is `other`. The Coordinator reads the snippets and decides whether

@@ -359,6 +359,50 @@ CREATE TABLE IF NOT EXISTS projects(
   UNIQUE(user_id, idem_key)
 );
 CREATE INDEX IF NOT EXISTS idx_projects_user_state ON projects(user_id, state);
+-- Read state (spec 2026-09-30 read state). What the user has actually SEEN,
+-- as reported by their client apps: separate from read_marker/unread_count,
+-- which stay the badge's business. Seq ranges per conversation, coalesced on
+-- write (src/seen.js) so a normally-read conversation is one or a few rows.
+-- No foreign keys: same stance as mission_conversations; ownership is checked
+-- on write.
+CREATE TABLE IF NOT EXISTS seen_ranges(
+  user_id   INTEGER NOT NULL,
+  convo_id  TEXT NOT NULL,
+  from_seq  INTEGER NOT NULL,
+  to_seq    INTEGER NOT NULL,
+  seen_at   INTEGER NOT NULL,
+  PRIMARY KEY(user_id, convo_id, from_seq)
+);
+-- Client devices that report precise ranges. A client read_marker from a
+-- device NOT listed here counts as "seen up to that seq" (the legacy
+-- fallback for apps that don't send ranges yet).
+CREATE TABLE IF NOT EXISTS seen_devices(
+  device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+  first_at  INTEGER NOT NULL
+);
+-- Item threads: the item itself, and its comments up to a created_at.
+CREATE TABLE IF NOT EXISTS item_seen(
+  user_id                 INTEGER NOT NULL,
+  item_id                 TEXT NOT NULL,
+  seen_through_comment_at INTEGER NOT NULL DEFAULT 0,
+  seen_at                 INTEGER NOT NULL,
+  PRIMARY KEY(user_id, item_id)
+);
+-- What an agent has already raised with the user (the no-repeat rule).
+CREATE TABLE IF NOT EXISTS unseen_flags(
+  user_id             INTEGER NOT NULL,
+  ref                 TEXT NOT NULL,
+  flagged_at          INTEGER NOT NULL,
+  flagged_in_convo_id TEXT NOT NULL,
+  PRIMARY KEY(user_id, ref)
+);
+-- The unseen nudge's memory: when the Coordinator was last nudged and the
+-- newest entry that nudge covered, so an entry is nudged about once.
+CREATE TABLE IF NOT EXISTS unseen_nudges(
+  user_id    INTEGER PRIMARY KEY,
+  last_at    INTEGER NOT NULL,
+  covered_ts INTEGER NOT NULL
+);
 `
 
 export function openDb(path) {

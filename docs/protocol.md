@@ -2260,6 +2260,114 @@ see still travel as bare handles (the same "numbers, never words" exception
 as `mission_num` on items). Projects are never shared with colleagues:
 shared mission rows carry `project_id: null`.
 
+## Read state (seen, unseen)
+
+Spec: `docs/superpowers/specs/2026-09-30-read-state-design.md`. This is what the user
+has actually **seen**, as reported by their client apps. It is separate from
+`read_marker` / `unread_count`: nothing here touches unread, the badge, the
+snippet or push.
+
+**Client ops (WebSocket, client connections only; an agent gets `forbidden`):**
+
+- `{op:'seen', convo_id, ranges:[[from_seq,to_seq],...]}` reports message
+  events that were on screen: at least half the row visible for 1 s, with the
+  app in the foreground.
+  - `ranges` holds at most 64 ranges, each `1 <= from <= to`. Ranges past the
+    conversation's head are clipped.
+  - Stored ranges are coalesced. Two ranges merge when the seqs between them
+    hold no content event of that conversation from anyone but the user,
+    because seqs are per user, not per conversation.
+  - Not journaled, no reply. A malformed op gets `bad_request`, and a missing
+    or foreign conversation gets `forbidden`.
+  - An empty `ranges` is valid. It registers the device as a range reporter
+    (see the legacy fallback below) without marking anything.
+- `{op:'item_seen', item_id, through_comment_at?}` reports that an item's
+  detail was on screen: the item, and its comments up to `through_comment_at`
+  (the newest comment rendered, in ms; `0` or absent means none). Monotonic.
+
+**Legacy fallback.** A **client** `read_marker` counts as "seen up to that
+seq", covering `[1, up_to_seq]`, until the device sends its first `seen`.
+This covers apps that don't report ranges yet. A bridge's `read_marker` never
+counts.
+
+**Routes (agent connections only; a client gets 403):**
+
+- `GET /unseen?convo_id=<the Coordinator's conversation>` → `{entries,
+  truncated}`. Coordinator only.
+  - The gate runs in order: 400 on a bad `convo_id`, 404 when the
+    conversation isn't this device's own top-level conversation, then 403
+    `not_coordinator`.
+  - Query params:
+    - `older_than_ms` (default 30 min)
+    - `since_ms` (default 3 d, max 30 d)
+    - `importance` (`important`, the default, or `all`)
+    - `in_convo_id`
+    - `mission` (number)
+    - `include_flagged=1`
+    - `limit` (1–200, default 50)
+  - An ordinary Coordinator never sees conversations owned by a private
+    device, or items that came from one.
+- `GET /unseen?mine=1&convo_id=<a conversation this agent may write to>` → the
+  same shape, restricted to messages whose sender is the caller, in that
+  conversation. No items. Defaults are `importance=all` and
+  `older_than_ms` 10 min. A conversation the caller may not write to gets 404.
+- `POST /unseen/flags {convo_id, refs[1..100]}` → `{flagged}`. Records that
+  entries were raised with the user, so they are not listed again. The
+  Coordinator may flag any ref; any other agent only refs to its own messages
+  in `convo_id` (else 403). Flags are pruned after 30 days.
+
+**Entries.** Each entry has these fields:
+
+- `ref`: `msg:<convo_id>:<seq>` or `item:<item_id>:<ms of newest agent content>`.
+  An item's ref changes when an agent adds to it, so new content can be
+  raised again.
+- `kind`: `message` or `item`.
+- `convo_id`, `convo_title`, `session_state`, `mission_num`, `is_room`, `ts`,
+  `snippet`, `reasons[]`, `important`.
+- Messages also have `seq`, `sender` and `type`. Items also have `item_id`,
+  `item_num` and `item_kind`.
+
+Entries are sorted important first, then newest first. A message is a
+`text`, `prompt`, `permission_request`, `file`, `image` or `spawn_outcome`
+event, not sent by the user and not covered by a seen range. It is left out
+when any of these is true:
+
+- the conversation is archived or a child conversation;
+- it is the Coordinator's own conversation (except with `mine=1`);
+- it is an item's fallback text or a consent card;
+- it is a prompt or permission request the user has written after.
+
+An open, non-consent item is unseen while it has agent content (its creation,
+or an agent comment) newer than what `item_seen` covers, and the user hasn't
+commented since.
+
+**Reasons.** An entry with at least one reason is `important`.
+
+| reason | meaning |
+| --- | --- |
+| `awaiting_user` | an item awaiting the user |
+| `question` | an item of kind question |
+| `prompt` | an unanswered prompt |
+| `permission` | an unanswered permission request |
+| `final` | the last non-user message of a conversation that is now `waiting` or `done` |
+| `failure` | a failed `spawn_outcome` |
+| `mentions_user` | the user's name in an agent-to-agent room |
+
+**Nudge.** Every 10 minutes the journal checks each user who has a
+Coordinator. When all of the following hold, it sends one ephemeral frame to
+the Coordinator's bridge:
+
+- UK time is between 07:00 and 22:00;
+- the last nudge was at least an hour ago;
+- the Coordinator's bridge is connected;
+- there are important, unflagged entries unseen for 2 h or more that are
+  newer than anything a previous nudge covered.
+
+The frame is `{kind:'unseen', event:'pending', convo_id, count,
+entries:[up to 5 of {ref, kind, convo_id, convo_title, item_num?, ts,
+reasons, snippet}]}`. Each entry is nudged about once. Set
+`MATRON_UNSEEN_NUDGE=0` to turn it off.
+
 ## Shared visibility (GitHub-verified, per repo)
 
 Spec: `docs/superpowers/specs/2026-09-23-tracker-web-teams-and-item-links-design.md`.
