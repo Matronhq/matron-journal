@@ -10,7 +10,7 @@ import { idemKeyOf, senderOf, badRequest, notFound, conflict } from './http-who.
 import { BODY_MAX } from './items.js'
 import {
   MILESTONE_KINDS, TITLE_MAX, validateMissionFields, createMission, getMission, listMissions, missionDetail,
-  updateMission, joinMission, closeMission, createMilestone, listMilestones, milestoneRow,
+  updateMission, joinMission, leaveMission, closeMission, createMilestone, listMilestones, milestoneRow,
   listSharedMissions, getSharedMission, sharedMissionDetail, listSharedMilestones,
 } from './missions.js'
 import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE, missionMarkerPayload, milestoneMarkerPayload } from './missions-marker.js'
@@ -183,6 +183,35 @@ async function handleJoin(ctx, req, res, who, mission) {
   return true
 }
 
+// Spec 2026-09-30 §3: ends this conversation's link to the mission. Same
+// conversation gate as join. Markers go to the conversation concerned:
+// `left` for this mission and, when current moved to another mission,
+// `current_changed` for that one. Both are built from the unsieved row —
+// markerTitleAllowed (inside emitMissionMarker) is what drops a private
+// title — while the response is sieved like every other mission read.
+async function handleLeave(ctx, req, res, who, mission) {
+  const { db } = ctx
+  const body = await readBody(req)
+  if (!writableConvo(db, who, body.convo_id)) return notFound(res)
+  const excludePrivateOwned = filteredAgent(db, who)
+  let out
+  try {
+    out = leaveMission(db, { userId: who.userId, missionId: mission.id, convoId: body.convo_id, excludePrivateOwned })
+  } catch (err) {
+    if (['no_link', 'no_mission', 'no_convo'].includes(err.message)) return notFound(res)
+    throw err
+  }
+  if (out.left) {
+    emitMissionMarker(ctx, who, { mission: getMission(db, who.userId, mission.id), action: 'left', convoId: body.convo_id })
+    if (out.currentChanged) {
+      emitMissionMarker(ctx, who, { mission: getMission(db, who.userId, out.currentMissionId), action: 'current_changed', convoId: body.convo_id })
+    }
+  }
+  const current = out.currentMissionId ? getMission(db, who.userId, out.currentMissionId, { excludePrivateOwned }) : null
+  json(res, 200, { mission: out.mission, current_mission: current })
+  return true
+}
+
 // The conversation an agent close names (spec 2026-09-29 coordinator session
 // control, "Coordinator mission close"). Absent → the pre-field contract (any
 // agent of the user closes by id). Present → it must be a conversation this
@@ -340,7 +369,7 @@ export async function handleMissionsRoute(ctx, req, res, url, who) {
     return false
   }
   // Nested sub segment on purpose (see items-http.js): /missions/:id/junk must not match.
-  const m = path.match(/^\/missions\/([^/]+)(?:\/(join|close))?$/)
+  const m = path.match(/^\/missions\/([^/]+)(?:\/(join|leave|close))?$/)
   if (!m) return false
   let idOrNum
   try { idOrNum = decodeURIComponent(m[1]) } catch { return badRequest(res) }
@@ -366,5 +395,6 @@ export async function handleMissionsRoute(ctx, req, res, url, who) {
   }
   if (req.method !== 'POST') return false
   if (sub === 'join') return handleJoin(ctx, req, res, who, mission)
+  if (sub === 'leave') return handleLeave(ctx, req, res, who, mission)
   return handleClose(ctx, req, res, who, mission)
 }

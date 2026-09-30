@@ -8,7 +8,8 @@ import { openDb } from '../src/db.js'
 import { backfillMissionLinks } from '../src/mission-links.js'
 import { upsertConversation } from '../src/journal.js'
 import { createItem } from '../src/items.js'
-import { createMission, joinMission, closeMission, CONVOS_MAX } from '../src/missions.js'
+import { createMission, joinMission, closeMission, leaveMission, createMilestone, CONVOS_MAX } from '../src/missions.js'
+import { append } from '../src/journal.js'
 
 const cols = (db, t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name)
 const indexes = (db) => db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all().map((r) => r.name)
@@ -236,4 +237,43 @@ test('inheritance: a sub-chat inherits its parent\'s CURRENT mission with an inh
   // A later upsert never adds or changes a link.
   upsertConversation(db, { id: 'kid', ownerUserId: 1, title: 'k2' })
   assert.equal(linksOf(db, 'kid').length, 1)
+})
+
+const pinJoined = (db, missionId, convoId, at) =>
+  db.prepare('UPDATE mission_conversations SET joined_at=? WHERE mission_id=? AND convo_id=?').run(at, missionId, convoId)
+
+test('leaveMission: leaving the current falls back to the most recently joined open active link; leaving another keeps the pointer; a repeat is a no-op; rejoin reactivates', () => {
+  const db = seeded()
+  const a = startOn(db, 'c1', 'A'); const b = startOn(db, 'c2', 'B'); const c = startOn(db, 'c3', 'C')
+  join(db, b.id, 'c1'); join(db, c.id, 'c1')
+  // Pin the join order: Date.now() can repeat within a millisecond.
+  pinJoined(db, a.id, 'c1', 100); pinJoined(db, b.id, 'c1', 200); pinJoined(db, c.id, 'c1', 300)
+  const r = leaveMission(db, { userId: 1, missionId: c.id, convoId: 'c1' })
+  assert.deepEqual([r.left, r.currentChanged, r.currentMissionId], [true, true, b.id])
+  assert.equal(r.mission.id, c.id)
+  assert.equal(currentOf(db, 'c1'), b.id)
+  assert.ok(linksOf(db, 'c1').find((l) => l.mission_id === c.id).ended_at > 0)
+  const r2 = leaveMission(db, { userId: 1, missionId: a.id, convoId: 'c1' })
+  assert.deepEqual([r2.left, r2.currentChanged, r2.currentMissionId], [true, false, b.id])
+  const r3 = leaveMission(db, { userId: 1, missionId: a.id, convoId: 'c1' })
+  assert.equal(r3.left, false, 'an ended link: 200 no-op, never 404')
+  assert.throws(() => leaveMission(db, { userId: 1, missionId: b.id, convoId: 'c3' }), /no_link/)
+  assert.throws(() => leaveMission(db, { userId: 1, missionId: 'ms_nope', convoId: 'c1' }), /no_mission/)
+  // Rejoining reactivates the ended link with its original how.
+  assert.equal(join(db, a.id, 'c1').action, 'joined')
+  assert.deepEqual(linksOf(db, 'c1').find((l) => l.mission_id === a.id), { mission_id: a.id, how: 'origin', ended_at: null })
+  assert.equal(currentOf(db, 'c1'), a.id)
+})
+
+test('leaveMission: a closed mission is never the fallback — leaving the last open one leaves the conversation on none, and an unnamed milestone then answers no_mission', () => {
+  const db = seeded()
+  const a = startOn(db, 'c1', 'A'); const b = startOn(db, 'c2', 'B')
+  join(db, b.id, 'c1')
+  closeMission(db, { userId: 1, missionId: a.id, by: 'user', summary: 'done' })
+  const r = leaveMission(db, { userId: 1, missionId: b.id, convoId: 'c1' })
+  assert.deepEqual([r.left, r.currentChanged, r.currentMissionId], [true, false, null])
+  assert.equal(currentOf(db, 'c1'), null)
+  assert.equal(linksOf(db, 'c1').find((l) => l.mission_id === a.id).ended_at, null, 'the closed mission keeps its active link as history')
+  const appendMarker = (payload) => append(db, { userId: 1, convoId: 'c1', sender: 'agent:dev-2', type: 'milestone', payload })
+  assert.throws(() => createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'progress', title: 'x', appendMarker }), /no_mission/)
 })

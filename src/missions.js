@@ -6,7 +6,7 @@ import { nextNum, newId, BODY_MAX } from './items.js'
 import { milestoneMarkerPayload } from './missions-marker.js'
 import { markerTitleAllowed } from './privacy.js'
 import { sharedConvoSql } from './visibility.js'
-import { activateLink, linkRow, topLevelActiveCount } from './mission-links.js'
+import { activateLink, endLink, linkRow, nextCurrent, topLevelActiveCount } from './mission-links.js'
 
 export const MILESTONE_KINDS = ['user_input', 'progress']
 export const TITLE_MAX = 200
@@ -319,6 +319,38 @@ export function joinMission(db, { userId, missionId, convoId, how = 'joined', ex
     db.prepare('UPDATE missions SET updated_at=? WHERE id=?').run(ts, m.id)
     if (convo.mission_id && convo.mission_id !== m.id) db.prepare('UPDATE missions SET updated_at=? WHERE id=?').run(ts, convo.mission_id)
     return { mission: getMission(db, userId, m.id, { excludePrivateOwned }), action: active ? 'current_changed' : 'joined' }
+  })()
+}
+
+// Spec 2026-09-30 §3: leave ends a link (kept as history). Leaving the
+// CURRENT one moves current to the most recently joined remaining active
+// link on an open mission, else to none (nextCurrent). An already-ended
+// link is a no-op (left:false) so a retried leave is safe; no link at all
+// is 'no_link'. Items stay where they are. A closed mission may be left.
+export function leaveMission(db, { userId, missionId, convoId, excludePrivateOwned = false }) {
+  return db.transaction(() => {
+    const m = db.prepare('SELECT id FROM missions WHERE id=? AND user_id=?').get(missionId, userId)
+    if (!m) throw new Error('no_mission')
+    const convo = db.prepare('SELECT mission_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)
+    if (!convo) throw new Error('no_convo')
+    const link = linkRow(db, m.id, convoId)
+    if (!link) throw new Error('no_link')
+    if (link.ended_at != null) {
+      return { mission: getMission(db, userId, m.id, { excludePrivateOwned }), left: false, currentChanged: false, currentMissionId: convo.mission_id ?? null }
+    }
+    const ts = now()
+    endLink(db, { missionId: m.id, convoId, ts })
+    let current = convo.mission_id ?? null
+    const wasCurrent = current === m.id
+    if (wasCurrent) {
+      current = nextCurrent(db, convoId)
+      db.prepare('UPDATE conversations SET mission_id=? WHERE id=? AND owner_user_id=?').run(current, convoId, userId)
+    }
+    db.prepare('UPDATE missions SET updated_at=? WHERE id=?').run(ts, m.id)
+    return {
+      mission: getMission(db, userId, m.id, { excludePrivateOwned }),
+      left: true, currentChanged: wasCurrent && current !== null, currentMissionId: current,
+    }
   })()
 }
 

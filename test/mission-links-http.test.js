@@ -41,3 +41,30 @@ test('POST /missions/:id/join: a conversation on another mission now joins (200,
   assert.equal(markerCount(s, 'c1', 'current_changed'), 1)
   assert.equal(markerCount(s, 'c1', 'joined'), 1)
 })
+
+test('POST /missions/:id/leave: ends the link, moves current, writes left + current_changed; repeat is a 200 no-op; no link, foreign or unknown convo is 404', async (t) => {
+  const { s, agent, client } = await fleet(t)
+  const a = (await start(s, agent.token, {})).json.mission
+  const b = (await start(s, agent.token, { title: 'B', convo_id: 'c2' })).json.mission
+  await join(s, agent.token, b.id, 'c1')
+  const leave = (missionId, convoId, token = agent.token) => s.http(`/missions/${missionId}/leave`, { method: 'POST', token, body: { convo_id: convoId } })
+  const ws = await makeWsClient(s.base, { token: client, cursor: null })
+  await ws.waitFor((f) => f.op === 'hello_ok')
+  const r = await leave(b.id, 'c1')
+  assert.equal(r.status, 200)
+  assert.equal(r.json.mission.id, b.id); assert.equal(r.json.current_mission.id, a.id)
+  const left = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'mission' && f.convo_id === 'c1' && f.payload.action === 'left')
+  assert.equal(left.payload.num, b.num)
+  const moved = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'mission' && f.convo_id === 'c1' && f.payload.action === 'current_changed')
+  assert.equal(moved.payload.num, a.num)
+  ws.close()
+  const again = await leave(b.id, 'c1')
+  assert.equal(again.status, 200); assert.equal(markerCount(s, 'c1', 'left'), 1)
+  assert.equal((await leave(b.id, 'c3')).status, 404, 'no link')
+  assert.equal((await leave(b.id, 'p1')).status, 404, 'another user\'s conversation')
+  assert.equal((await leave(b.id, 'nope')).status, 404)
+  // Leaving the last one: current_mission null, and no current_changed marker.
+  const last = await leave(a.id, 'c1')
+  assert.equal(last.status, 200); assert.equal(last.json.current_mission, null)
+  assert.equal(markerCount(s, 'c1', 'current_changed'), 1)
+})
