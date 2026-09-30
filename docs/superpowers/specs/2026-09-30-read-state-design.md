@@ -274,15 +274,18 @@ and "one line each, lead with why it matters".
 - Read-state adds new tables, ops, routes and a new bridge tool. It does not
   alter `events`, `conversations`, `items` or `missions`. In Apple it touches
   the chat timeline and item detail, not the mission and project views.
-- **Projects' Apple work** is at the plan stage (apple #276) and touches the
-  mission and project views only. Read-state's Apple work touches neither.
-  Projects' bridge #332 adds `projects-*` and `missions-*` tools and edits
-  `ask-user.js`. Read-state adds separate `unseen-*` files, and its small
-  `ask-user.js` edit rebases onto #332 if that merges first.
-- **Proposed order:** Projects' bridge #332 lands first, and read-state's
-  bridge PR rebases onto it. Read-state's journal work doesn't depend on
-  anything. The Projects session was asked to confirm by agent chat on 30 Sep
-  and hadn't replied when this was written. No file overlap was found.
+- **Agreed with the Projects session (dan-mac, 30 Sep): Projects first,
+  read-state rebases after.**
+- **Journal:** Projects PR 101 is merged and live, and there is no further
+  Projects schema work, so the three new tables collide with nothing.
+- **Bridge:** Projects PR 332 is merged and deployed. A small follow-up is
+  coming: `reminder_create` gets `repeat: "daily"`, and a check-in paragraph
+  goes into BRIDGE_COORDINATOR.md. Our `unseen` section in that file will
+  need a trivial text rebase.
+- **Apple:** Projects is 4 stacked PRs (`feat/projects-data` first). None of
+  them touch ChatTimelineController or ItemDetailView. They do touch the
+  headers and toolbars in ChatView.swift and MacChatView.swift, but not the
+  timeline rows, so our tracker should only need a small rebase.
 - **Mac timeline:** apple #264 moves the Mac chat timeline to a virtualised
   AppKit view behind `chat.timeline.appkit`. The Mac visibility tracker is
   built on the AppKit timeline's visible rows. It covers the SwiftUI
