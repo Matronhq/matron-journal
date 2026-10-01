@@ -40,6 +40,14 @@ const kTokens = (n) => (n >= 1_000_000 ? `${+(n / 1_000_000).toFixed(1)}M` : `${
 // the bridge said.
 const WINDOW_1M_RE = /opus|fable|mythos|\[1m\]/i
 const WINDOW_1M = 1_000_000
+
+// Codex sessions never trip context_over: their window is small (~258k)
+// and Codex compacts them itself, so a fire at 40% only costs them context
+// they would have kept (item 6058, Dan, 1 Oct 2026). The journal knows no
+// provider, only the model the bridge publishes, so a GPT, o-series or
+// codex model name is the signal.
+const CODEX_MODEL_RE = /^(gpt|o\d|codex)\b|^(gpt|o\d|codex)-/i
+export const isCodexModel = (model) => CODEX_MODEL_RE.test(String(model || '').trim())
 export function contextWindowOf(model, reported) {
   const w = Number.isFinite(reported) && reported > 0 ? reported : 0
   return WINDOW_1M_RE.test(String(model || '')) ? Math.max(w, WINDOW_1M) : w
@@ -78,6 +86,7 @@ export function evaluateTrigger(db, userId, trigger, { now = Date.now(), coordin
       if (excludePrivateOwned && privateOwnedConvo(db, c.id)) continue
       const title = linkLabel(c.title)
       if (trigger.kind === 'context_over') {
+        if (isCodexModel(st.model)) continue
         // Measured from the tokens against the window the session really
         // has (contextWindowOf); the reported pct only when there is no
         // gauge to measure.

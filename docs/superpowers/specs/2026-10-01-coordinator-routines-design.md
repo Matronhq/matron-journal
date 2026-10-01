@@ -54,7 +54,7 @@ Dan, 1 Oct ("Add triggers"): the journal already holds every session's context g
 
 | `trigger` | trips for |
 |---|---|
-| `{kind:'context_over', pct}` (1–99) | a live session (`running`/`waiting`, not the Coordinator itself, not a helper conversation inside a session) whose context tokens are at or past `pct` of its window — 1M at least for the 1M-class models (Opus, Fable, Mythos, any `[1m]` alias), since a bridge can only prove a 1M window once the gauge passes 200k (item 5894) |
+| `{kind:'context_over', pct}` (1–99) | a live session (`running`/`waiting`, not the Coordinator itself, not a helper conversation inside a session, not a Codex session — GPT, o-series or codex model names — since Codex compacts itself, item 6058) whose context tokens are at or past `pct` of its window — 1M at least for the 1M-class models (Opus, Fable, Mythos, any `[1m]` alias), since a bridge can only prove a 1M window once the gauge passes 200k (item 5894) |
 | `{kind:'stalled', reset_minutes}` (0–10080, default 120) | a live session stalled on a usage limit whose reset is at least `reset_minutes` away, or has no reset time |
 | `{kind:'disk_under', pct}` (1–99) | an agent box whose last report shows under `pct`% free disk |
 
