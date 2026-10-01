@@ -706,7 +706,7 @@ export function isConsentMirror(db, itemId) {
 // whose blob can't be sized) is left as it is, and a re-run after a restart
 // mid-walk just finds less to do. Each blob's header is read at most once
 // ever (blobImageDims caches the answer on the blob row).
-export async function backfillImageDims(db, { batchSize = 200, log = () => {}, shouldStop = () => false } = {}) {
+export async function backfillImageDims(db, { batchSize = 50, log = () => {}, shouldStop = () => false } = {}) {
   const select = db.prepare(`SELECT rowid, id, attachments FROM item_comments
     WHERE rowid>? AND attachments LIKE '%"mime":"image/%' ORDER BY rowid LIMIT ?`)
   const update = db.prepare('UPDATE item_comments SET attachments=? WHERE id=?')

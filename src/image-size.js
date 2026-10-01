@@ -43,10 +43,12 @@ function webp(b) {
   return null
 }
 
-// EXIF orientation from an APP1 segment's payload (starting at 'Exif\0\0').
-// 5–8 are the four orientations that turn the stored image a quarter turn.
+// EXIF orientation from an APP1 segment's payload (starting at 'Exif\0\0'),
+// or null when the APP1 isn't EXIF (XMP shares the marker, and often follows
+// the EXIF segment) so the caller keeps what EXIF said. 5–8 are the four
+// orientations that turn the stored image a quarter turn.
 function exifOrientation(b, start, end) {
-  if (end - start < 14 || b.toString('latin1', start, start + 6) !== 'Exif\0\0') return 1
+  if (end - start < 14 || b.toString('latin1', start, start + 6) !== 'Exif\0\0') return null
   const tiff = start + 6
   const le = b.toString('latin1', tiff, tiff + 2) === 'II'
   const u16 = (o) => (le ? b.readUInt16LE(o) : b.readUInt16BE(o))
@@ -77,7 +79,7 @@ function jpeg(b) {
     if (len < 2) return null
     const seg = i + 4
     if (marker === 0xe1 && seg + len - 2 <= b.length) {
-      try { orientation = exifOrientation(b, seg, seg + len - 2) } catch { orientation = 1 }
+      try { orientation = exifOrientation(b, seg, seg + len - 2) ?? orientation } catch { /* keep what we had */ }
     }
     if (SOF.has(marker)) {
       if (seg + 5 > b.length) return null
@@ -155,8 +157,13 @@ export function imageSizeFromBuffer(b) {
 
 // The header almost always sits in the first 64 KB. A JPEG with a large EXIF
 // thumbnail or ICC profile can push the SOF further, and a HEIC's meta box can
-// sit after a large mdat, so a miss retries with a bigger read before giving up.
+// sit after a large mdat, so a miss retries with a bigger read before giving
+// up — but only for those two: any other format's size is in its first bytes,
+// and an image we can't size (SVG, TIFF) must not cost megabytes of
+// synchronous reads on the event loop.
 const READS = [64 * 1024, 1024 * 1024, 8 * 1024 * 1024]
+const mayNeedMore = (b) => (b.length >= 2 && b[0] === 0xff && b[1] === 0xd8)
+  || (b.length >= 8 && b.toString('latin1', 4, 8) === 'ftyp')
 
 export function imageSizeFromFile(filePath) {
   let fd
@@ -168,7 +175,7 @@ export function imageSizeFromFile(filePath) {
       const buf = Buffer.alloc(n)
       fs.readSync(fd, buf, 0, n, 0)
       const dims = imageSizeFromBuffer(buf)
-      if (dims || n === size) return dims
+      if (dims || n === size || !mayNeedMore(buf)) return dims
     }
     return null
   } catch {

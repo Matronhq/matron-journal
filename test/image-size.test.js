@@ -68,3 +68,31 @@ test('image size: a JPEG whose SOF sits past the first 64 KB is still found', ()
     fs.rmSync(path.dirname(tmp), { recursive: true, force: true })
   }
 })
+
+test('image size: an XMP APP1 after the EXIF one keeps the EXIF orientation (phone HDR / Lightroom JPEGs)', () => {
+  const jpg = fs.readFileSync(fixture('w40h30-orient6.jpg'))
+  // Find the end of the EXIF APP1 and splice an XMP APP1 right after it.
+  const exifAt = jpg.indexOf(Buffer.from([0xff, 0xe1]))
+  assert.ok(exifAt > 0 && jpg.toString('latin1', exifAt + 4, exifAt + 8) === 'Exif')
+  const exifEnd = exifAt + 2 + jpg.readUInt16BE(exifAt + 2)
+  const xmpBody = Buffer.from('http://ns.adobe.com/xap/1.0/\0<x:xmpmeta/>', 'latin1')
+  const xmp = Buffer.concat([Buffer.from([0xff, 0xe1, 0, 0]), xmpBody])
+  xmp.writeUInt16BE(xmpBody.length + 2, 2)
+  const spliced = Buffer.concat([jpg.subarray(0, exifEnd), xmp, jpg.subarray(exifEnd)])
+  assert.deepEqual(imageSizeFromBuffer(spliced), { width: 30, height: 40 })
+})
+
+test('image size: an unsizable non-JPEG/HEIF image is read once, not retried at megabytes', () => {
+  const tmp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'matron-img-')), 'big.svg')
+  fs.writeFileSync(tmp, Buffer.concat([Buffer.from('<svg xmlns="http://www.w3.org/2000/svg">'), Buffer.alloc(3 * 1024 * 1024, 0x20)]))
+  const reads = []
+  const realRead = fs.readSync
+  fs.readSync = (fd, buf, ...rest) => { reads.push(buf.length); return realRead(fd, buf, ...rest) }
+  try {
+    assert.equal(imageSizeFromFile(tmp), null)
+    assert.deepEqual(reads, [64 * 1024])
+  } finally {
+    fs.readSync = realRead
+    fs.rmSync(path.dirname(tmp), { recursive: true, force: true })
+  }
+})
