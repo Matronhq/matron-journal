@@ -27,6 +27,8 @@ import { emitTranscriptionMarker } from './items-http.js'
 import { makeGithub, DEFAULT_GITHUB_CLIENT_ID } from './github.js'
 import { makeTokenBox } from './token-box.js'
 import { startUnseenNudge } from './unseen-nudge.js'
+import { makeRoutineFirer, startRoutinesSweep } from './routines-sweep.js'
+import { seedRoutines } from './routines.js'
 import { startStallWakeSweep } from './stall-wake.js'
 import { sealStoredTokens } from './github-accounts.js'
 import { CONSENT_DAILY_CAP_DEFAULT } from './consent.js'
@@ -313,6 +315,10 @@ export function startServer({
   // The unseen nudge (src/unseen-nudge.js). MATRON_UNSEEN_NUDGE=0 turns it off.
   unseenNudgeIntervalMs = null,
   unseenNudge = process.env.MATRON_UNSEEN_NUDGE !== '0',
+  // Coordinator routines (src/routines-sweep.js). MATRON_ROUTINES=0 stops
+  // the sweep (the routes and `run` still work).
+  routinesSweepIntervalMs = null,
+  routinesSweep = process.env.MATRON_ROUTINES !== '0',
   mediaReapHighPct, mediaReapLowPct, waker, transcriber, github, githubRefreshIntervalMs, webDir,
   appleAppIds, androidPackage, androidCertSha256, tokenKey,
   // Alertmanager webhook (src/alerts-http.js): {token, username}. The
@@ -373,6 +379,18 @@ export function startServer({
   // without a waker; stopped in close().
   const stallWakeSweep = startStallWakeSweep({ db, hub, waker: resolvedWaker, ...(stallWakeIntervalMs ? { intervalMs: stallWakeIntervalMs } : {}) })
   const unseenNudgeSweep = startUnseenNudge({ db, hub, enabled: unseenNudge, ...(unseenNudgeIntervalMs ? { intervalMs: unseenNudgeIntervalMs } : {}) })
+  // Coordinator routines (spec 2026-10-01): one firer per process (the
+  // sweep and POST /routines/:key/run share its in-flight bound), the
+  // once-a-minute sweep, and the one-off seed for users who already have a
+  // Coordinator (new assignments seed in coordinator-http.js).
+  const routineFirer = makeRoutineFirer({ db, hub, broker, waker: resolvedWaker, wakeWaitMs: effectiveWakeWaitMs, timeoutMs: sessionControlTimeoutMs })
+  const routinesSweeper = startRoutinesSweep({ db, firer: routineFirer, enabled: routinesSweep, ...(routinesSweepIntervalMs ? { intervalMs: routinesSweepIntervalMs } : {}) })
+  try {
+    for (const { user_id: userId } of db.prepare('SELECT user_id FROM user_settings WHERE coordinator_convo_id IS NOT NULL AND routines_seeded_at IS NULL').all()) {
+      const n = seedRoutines(db, userId)
+      if (n > 0) console.log(`routines: seeded ${n} starter routine(s) for user ${userId}`)
+    }
+  } catch (err) { console.error('routines: boot seeding failed', err) }
   const toolStreams = makeToolStreamStore({
     maxBytes: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BYTES', process.env.MATRON_TOOL_STREAM_MAX_BYTES, 1048576),
     maxBuffers: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BUFFERS', process.env.MATRON_TOOL_STREAM_MAX_BUFFERS, 64),
@@ -421,7 +439,7 @@ export function startServer({
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, consentDailyCap,
     github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
-    sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook,
+    sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
@@ -469,6 +487,8 @@ export function startServer({
         preapproveKey: resolvedPreapproveKey,
         searchBackfill,
         unseenNudge: unseenNudgeSweep,
+        routinesSweep: routinesSweeper,
+        routineFirer,
         github: resolvedGithub,
         close: () => new Promise((r) => {
           closing = true
@@ -477,6 +497,7 @@ export function startServer({
           if (githubRefreshInterval) clearInterval(githubRefreshInterval)
           stallWakeSweep.stop()
           unseenNudgeSweep.stop()
+          routinesSweeper.stop()
           // Wake-before-spawn waiters (hub.waitForDevice) hold ref'd timers
           // of up to spawnWakeWaitMs; release them before the sockets go so
           // each approveSpawn settles its row while the DB is still open.

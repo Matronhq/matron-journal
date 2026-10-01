@@ -409,6 +409,30 @@ CREATE TABLE IF NOT EXISTS unseen_nudged(
   nudged_at INTEGER NOT NULL,
   PRIMARY KEY(user_id, ref)
 );
+-- Coordinator routines (spec 2026-10-01 coordinator routines): a schedule
+-- and a prompt the journal owns and fires into whichever conversation holds
+-- the Coordinator role. next_at is the next fire in ms (NULL while paused);
+-- retry_at the one retry after a failed delivery (internal, never on the
+-- wire). Names are the handle agents and prompts use, unique per user.
+CREATE TABLE IF NOT EXISTS routines(
+  id            TEXT PRIMARY KEY,
+  user_id       INTEGER NOT NULL REFERENCES users(id),
+  name          TEXT NOT NULL,
+  title         TEXT NOT NULL,
+  schedule      TEXT NOT NULL,
+  tz            TEXT NOT NULL,
+  prompt        TEXT NOT NULL,
+  enabled       INTEGER NOT NULL DEFAULT 1,
+  origin        TEXT NOT NULL CHECK(origin IN ('seed','user','agent')),
+  next_at       INTEGER,
+  retry_at      INTEGER,
+  last_fired_at INTEGER,
+  last_outcome  TEXT,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL,
+  UNIQUE(user_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_routines_due ON routines(enabled, next_at);
 `
 
 export function openDb(path) {
@@ -768,6 +792,12 @@ export function openDb(path) {
   const settingsCols = db.prepare('PRAGMA table_info(user_settings)').all()
   if (!settingsCols.some((c) => c.name === 'coordinator_consent')) {
     db.exec('ALTER TABLE user_settings ADD COLUMN coordinator_consent INTEGER NOT NULL DEFAULT 1')
+  }
+  // Coordinator routines (spec 2026-10-01): when the starter set was seeded
+  // for this user, so it happens once — never again after the user empties
+  // the list. NULL = not yet.
+  if (!settingsCols.some((c) => c.name === 'routines_seeded_at')) {
+    db.exec('ALTER TABLE user_settings ADD COLUMN routines_seeded_at INTEGER')
   }
   for (const table of ['convo_agents', 'agent_spawn_requests']) {
     const cols = db.prepare(`PRAGMA table_info(${table})`).all()
