@@ -131,13 +131,13 @@ function heif(b) {
   const ipco = iprp && child(b, iprp, 'ipco')
   if (!ipco) return null
   let best = null
-  let rotate = 0
+  let rotate = null // the first irot wins, including an identity (0) one
   for (const p of boxes(b, ipco.start, ipco.end)) {
     if (p.type === 'ispe' && p.start + 12 <= p.end) {
       const w = b.readUInt32BE(p.start + 4)
       const h = b.readUInt32BE(p.start + 8)
       if (!best || w * h > best.w * best.h) best = { w, h }
-    } else if (p.type === 'irot' && p.start < p.end && !rotate) {
+    } else if (p.type === 'irot' && p.start < p.end && rotate === null) {
       rotate = b[p.start] & 0x3
     }
   }

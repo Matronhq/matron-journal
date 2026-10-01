@@ -96,3 +96,18 @@ test('image size: an unsizable non-JPEG/HEIF image is read once, not retried at 
     fs.rmSync(path.dirname(tmp), { recursive: true, force: true })
   }
 })
+
+test('image size: an identity irot sticks; a later irot (a thumbnail\'s) does not turn the primary', () => {
+  const b = fs.readFileSync(fixture('w40h30.heic'))
+  const at = b.indexOf('irot')
+  // Append a second ipco property: a 90° irot after the identity one.
+  const ipcoAt = b.indexOf('ipco') - 4
+  const extra = Buffer.from([0, 0, 0, 9, 0x69, 0x72, 0x6f, 0x74, 1])
+  const grow = (buf, off) => buf.writeUInt32BE(buf.readUInt32BE(off) + extra.length, off)
+  const ipcoEnd = ipcoAt + b.readUInt32BE(ipcoAt)
+  const c = Buffer.concat([b.subarray(0, ipcoEnd), extra, b.subarray(ipcoEnd)])
+  c[at + 4] = 0
+  // Grow every enclosing box: ipco, iprp, meta (all start before ipcoEnd and end at/after it).
+  for (const name of ['ipco', 'iprp', 'meta']) grow(c, c.indexOf(name) - 4)
+  assert.deepEqual(imageSizeFromBuffer(c), { width: 40, height: 30 })
+})
