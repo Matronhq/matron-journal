@@ -2539,10 +2539,13 @@ commented since.
 | `permission` | an unanswered permission request |
 | `final` | the last non-user message of a conversation that is now `waiting` or `done` |
 | `failure` | a failed `spawn_outcome` |
-| `mentions_user` | the user's name in an agent-to-agent room |
 
-In an agent-to-agent room only `mentions_user` applies: the room's prompts
-and last messages are addressed to the other agent. The `final` reason
+A message in an agent-to-agent room never has a reason: the room's prompts
+and last messages are addressed to the other agent, and whatever there needs
+the user becomes a tracker item, which is raised as `awaiting_user`. (Until
+2026-10-01 the user's name in a room was a reason, `mentions_user`; a name
+that is also a box name and in every "approved by …" made it noise.) The
+`final` reason
 ignores item fallback texts and consent cards. A scan reads at most 20 000
 candidate messages; hitting that sets `truncated`.
 

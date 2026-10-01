@@ -201,7 +201,7 @@ test('listUnseen: a button answer (prompt_reply) answers a prompt; a read_marker
   assert.ok(!listUnseen(db, dan.id, { now: later, importance: 'all' }).entries.some((e) => e.ref === `msg:c1:${q}`))
 })
 
-test('listUnseen: "final" skips item fallback text; agent rooms are important only when the user is named', async () => {
+test('listUnseen: "final" skips item fallback text; agent rooms are never important, even when the user is named', async () => {
   const { db, dan, agent, say, later } = await world()
   const last = say('c1', 'all done')
   say('c1', null, 'agent:ang', 'text', { body: 'Q?', fallback_for: 'item' })
@@ -210,10 +210,11 @@ test('listUnseen: "final" skips item fallback text; agent rooms are important on
   upsertConversation(db, { id: 'room', ownerUserId: dan.id, title: 'A ↔ B', agentDeviceId: agent.deviceId, sessionState: 'waiting' })
   db.prepare("INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, created_at) VALUES('room', ?, ?, 'joined', 0)").run(agent.deviceId, agent.deviceId)
   const plain = say('room', 'over to you, bev')
-  const named = say('room', 'Dan should see this')
-  const important = listUnseen(db, dan.id, { now: later }).entries.filter((e) => e.convo_id === 'room')
-  assert.deepEqual(important.map((e) => [e.ref, e.reasons]), [[`msg:room:${named}`, ['mentions_user']]])
-  assert.ok(listUnseen(db, dan.id, { now: later, importance: 'all' }).entries.some((e) => e.ref === `msg:room:${plain}` && !e.important))
+  const named = say('room', 'Dan approved this on dan-mac, over to you')
+  const q = say('room', null, 'agent:ang', 'prompt', { question: 'Dan, shall I?' })
+  assert.deepEqual(listUnseen(db, dan.id, { now: later }).entries.filter((e) => e.convo_id === 'room'), [])
+  const all = listUnseen(db, dan.id, { now: later, importance: 'all' }).entries.filter((e) => e.convo_id === 'room')
+  assert.deepEqual(all.map((e) => [e.ref, e.reasons, e.important]), [[`msg:room:${q}`, [], false], [`msg:room:${named}`, [], false], [`msg:room:${plain}`, [], false]])
 })
 
 test('runUnseenNudge: an entry that becomes important after an earlier nudge is still nudged, once', async () => {
