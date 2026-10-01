@@ -102,6 +102,15 @@ test('evaluateTrigger: context_over, stalled, disk_under — live sessions only,
   assert.equal(describeTrigger({ kind: 'stalled', reset_minutes: 0 }), 'when a session stalls on a usage limit')
   assert.equal(describeTrigger({ kind: 'disk_under', pct: 20 }), 'when a box drops under 20% free disk')
   assert.equal(trigMessage('Routine x: do it.', [{ line: '- a' }, { line: '- b' }]), 'Routine x: do it.\n\nTripped by:\n- a\n- b')
+  // Under the message cap: lines that do not fit fold into "+N more"; a prompt that fills the cap goes alone.
+  const many = Array.from({ length: 60 }, (_, i) => ({ line: `- [session ${i}](matron://convo/${'x'.repeat(36)}) at 99% of its window (opus-5-5)` }))
+  const capped = trigMessage('Routine x: do it.', many)
+  assert.ok(capped.length <= 2000)
+  assert.match(capped, /\n\+\d+ more$/)
+  assert.ok(capped.split('\n').length > 5)
+  const full = 'p'.repeat(2000)
+  assert.equal(trigMessage(full, many), full)
+  assert.equal(trigMessage('p'.repeat(1990), many), 'p'.repeat(1990))
 })
 
 test('trippedSubjects: fires once per subject per crossing; cleared subjects re-fire when they cross again', async () => {
@@ -118,10 +127,48 @@ test('trippedSubjects: fires once per subject per crossing; cleared subjects re-
   assert.deepEqual(trippedSubjects(db, r, { now: NOW + 2, coordinatorConvoId: 'coord' }).fresh, [])
   at(45)
   assert.deepEqual(trippedSubjects(db, r, { now: NOW + 3, coordinatorConvoId: 'coord' }).fresh.map((s) => s.subject), ['convo:g1'])
+  // Paused between the sweep's listing and the evaluation: nothing is recorded or fired.
+  at(10); trippedSubjects(db, r, { now: NOW + 4, coordinatorConvoId: 'coord' }); at(80)
+  db.prepare('UPDATE routines SET enabled=0 WHERE id=?').run(r.id)
+  assert.deepEqual(trippedSubjects(db, r, { now: NOW + 5, coordinatorConvoId: 'coord' }), { fresh: [], matching: [] })
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM routine_trigger_state WHERE routine_id=?').get(r.id).n, 0)
+  db.prepare('UPDATE routines SET enabled=1 WHERE id=?').run(r.id)
   // Deleting the routine removes its state (cascade).
   const { deleteRoutine } = await import('../src/routines.js')
   deleteRoutine(db, dan.id, r.id)
   assert.equal(db.prepare('SELECT COUNT(*) n FROM routine_trigger_state').get().n, 0)
+})
+
+test('no Coordinator when a trigger trips: the crossing is not consumed — it fires once a Coordinator is set', async (t) => {
+  const s = await startTestServer({ sessionControlTimeoutMs: 2000, routinesSweepIntervalMs: 3600_000, routinesTriggerIntervalMs: 3600_000 })
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const mavis = createAgent(s.db, dan.id, 'mavis')
+  const gene = createAgent(s.db, dan.id, 'gene')
+  upsertConversation(s.db, { id: 'coord', ownerUserId: dan.id, title: 'Coordinator', sessionState: 'waiting', agentDeviceId: mavis.deviceId })
+  upsertConversation(s.db, { id: 'g1', ownerUserId: dan.id, title: 'Big', sessionState: 'running', agentDeviceId: gene.deviceId })
+  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const client = login.json.token
+  const c = await s.http('/routines', { method: 'POST', token: client, body: { name: 'ctx', title: 'Ctx', prompt: 'p', trigger: { kind: 'context_over', pct: 40 } } })
+  assert.equal(c.status, 201)
+  upsertConvoStatus(s.db, { userId: dan.id, convoId: 'g1', status: { model: 'x', context: { tokens: 1, window: 2, pct: 61 } }, reportedAt: Date.now() })
+  assert.deepEqual(await s.routinesSweep.runTriggers(Date.now()), { fired: 1 })
+  const row = getRoutine(s.db, dan.id, 'ctx')
+  assert.equal(row.last_outcome, 'no_coordinator')
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM routine_trigger_state').get().n, 0, 'the subject is forgotten, to re-trip')
+  // Backed off: nothing for the next 15 minutes even though it still matches.
+  assert.deepEqual(await s.routinesSweep.runTriggers(Date.now()), { fired: 0 })
+  // A Coordinator appears; after the backoff the crossing fires for real.
+  await s.http('/coordinator', { method: 'PUT', token: client, body: { convo_id: 'coord' } })
+  const coord = await makeWsClient(s.base, { token: mavis.token, cursor: null })
+  t.after(() => coord.close())
+  await coord.waitFor((f) => f.op === 'hello_ok')
+  const later = Date.now() + 16 * 60000
+  const sweep = s.routinesSweep.runTriggers(later)
+  const req = await coord.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'session_control' && f.request.params.name === 'ctx')
+  coord.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { applied: 'now' } })
+  assert.deepEqual(await sweep, { fired: 1 })
+  assert.equal(getRoutine(s.db, dan.id, 'ctx').last_outcome, 'applied now')
 })
 
 test('seedRoutines: the starter set includes the three trigger routines', async () => {

@@ -12,7 +12,7 @@ import { convoStatuses } from './convo-status.js'
 import { deviceStatuses, isPrivateDevice } from './db.js'
 import { privateOwnedConvo } from './privacy.js'
 import { sanitizePeerText } from './peer-text.js'
-import { triggeredRoutines, RETRY_AFTER_MS } from './routines.js'
+import { triggeredRoutines, RETRY_AFTER_MS, PROMPT_MAX } from './routines.js'
 
 const LIVE_STATES = new Set(['running', 'waiting'])
 const TITLE_CAP = 80
@@ -83,9 +83,21 @@ export function evaluateTrigger(db, userId, trigger, { now = Date.now(), coordin
   return out.sort((a, b) => (a.subject < b.subject ? -1 : a.subject > b.subject ? 1 : 0))
 }
 
-export function trigMessage(prompt, subjects) {
+// The prompt plus its subjects, kept under the session-control message
+// cap (the prompt alone may fill it): lines that do not fit are folded
+// into a "+N more" line, and when not even that fits the prompt goes
+// alone — a fire is never refused as oversize.
+export function trigMessage(prompt, subjects, cap = PROMPT_MAX) {
   if (!subjects.length) return prompt
-  return `${prompt}\n\nTripped by:\n${subjects.map((s) => s.line).join('\n')}`
+  const head = `${prompt}\n\nTripped by:`
+  const lines = subjects.map((s) => s.line)
+  for (let keep = lines.length; keep >= 1; keep--) {
+    const rest = lines.length - keep
+    const text = [head, ...lines.slice(0, keep), ...(rest ? [`+${rest} more`] : [])].join('\n')
+    if (text.length <= cap) return text
+  }
+  const bare = `${head}\n+${lines.length} more`
+  return bare.length <= cap ? bare : prompt
 }
 
 function viewFor(db, routine) {
@@ -105,11 +117,15 @@ export function currentSubjects(db, routine, { now = Date.now() } = {}) {
 // fire, never a double) and returned as `fresh`.
 export function trippedSubjects(db, routine, { now = Date.now(), coordinatorConvoId = null, excludePrivateOwned = false } = {}) {
   return db.transaction(() => {
+    // Paused (or deleted) since the sweep listed it: nothing is recorded
+    // and nothing fires — the same window the scheduled path closes.
+    const live = db.prepare('SELECT enabled FROM routines WHERE id=?').get(routine.id)
+    if (!live || !live.enabled) return { fresh: [], matching: [] }
     const matching = evaluateTrigger(db, routine.user_id, routine.trigger, { now, coordinatorConvoId, excludePrivateOwned })
     const known = new Set(db.prepare('SELECT subject FROM routine_trigger_state WHERE routine_id=?').all(routine.id).map((r) => r.subject))
-    const live = new Set(matching.map((s) => s.subject))
+    const still = new Set(matching.map((s) => s.subject))
     const forget = db.prepare('DELETE FROM routine_trigger_state WHERE routine_id=? AND subject=?')
-    for (const s of known) if (!live.has(s)) forget.run(routine.id, s)
+    for (const s of known) if (!still.has(s)) forget.run(routine.id, s)
     const fresh = matching.filter((s) => !known.has(s.subject))
     const mark = db.prepare('INSERT OR IGNORE INTO routine_trigger_state(routine_id, subject, tripped_at) VALUES(?,?,?)')
     for (const s of fresh) mark.run(routine.id, s.subject, now)
@@ -118,9 +134,10 @@ export function trippedSubjects(db, routine, { now = Date.now(), coordinatorConv
 }
 
 // One pass over every enabled triggered routine. A delivery failure the
-// next attempt might cure forgets the fresh subjects (so they re-trip) and
-// backs the routine off for RETRY_AFTER_MS; a refusal keeps them recorded
-// (nothing until the condition clears and trips again). Returns {fired}.
+// next attempt might cure — and "no Coordinator", which a later assignment
+// cures — forgets the fresh subjects (so they re-trip) and backs the
+// routine off for RETRY_AFTER_MS; a refusal keeps them recorded (nothing
+// until the condition clears and trips again). Returns {fired}.
 export async function runTriggerSweep({ db, firer, log = console }, now = Date.now()) {
   let routines = []
   try { routines = triggeredRoutines(db, now) } catch (err) {
@@ -142,9 +159,10 @@ export async function runTriggerSweep({ db, firer, log = console }, now = Date.n
     fired += 1
     db.prepare('UPDATE routines SET last_fired_at=?, retry_at=NULL WHERE id=?').run(now, r.id)
     const onOutcome = (outcome, retryable) => {
+      const again = retryable || outcome === 'no_coordinator'
       db.transaction(() => {
-        db.prepare('UPDATE routines SET last_outcome=?, retry_at=? WHERE id=?').run(outcome, retryable ? Date.now() + RETRY_AFTER_MS : null, r.id)
-        if (retryable) {
+        db.prepare('UPDATE routines SET last_outcome=?, retry_at=? WHERE id=?').run(outcome, again ? Date.now() + RETRY_AFTER_MS : null, r.id)
+        if (again) {
           const forget = db.prepare('DELETE FROM routine_trigger_state WHERE routine_id=? AND subject=?')
           for (const s of fresh) forget.run(r.id, s.subject)
         }
