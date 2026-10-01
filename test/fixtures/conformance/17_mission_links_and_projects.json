@@ -66,7 +66,10 @@
           "origin_device_id": { "$ref": "bridge.device_id" }, "created_by": "agent",
           "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" },
           "missions": { "running": 1, "waiting": 0, "idle": 0, "quiet": 0, "closed": 0 },
-          "needs_you": 0, "open_items": 0, "last_activity_at": { "$type": "integer" } }
+          "needs_you": 0, "open_items": 0, "last_activity_at": { "$type": "integer" },
+          "waiting_on": null,
+          "latest": { "title": "Work on A", "kind": "progress", "at": { "$type": "integer" }, "mission_num": 1 },
+          "sessions_now": 1 }
       ] } } },
     { "kind": "http", "method": "GET", "path": "/convo/c1/messages?limit=20", "token": { "$ref": "bridge.token" },
       "expect": { "status": 200, "body": { "events": [

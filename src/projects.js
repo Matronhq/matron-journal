@@ -4,6 +4,7 @@
 // HTTP layer maps to one status.
 import { nextNum, newId } from './items.js'
 import { listMissions, milestoneRow, ORIGIN_SIEVE, STATUS_FIELDS, statusPrivateSql } from './missions.js'
+import { cardFields, feedFirstPages } from './projects-feed.js'
 
 export const MERGE_HOPS_MAX = 16
 const now = () => Date.now()
@@ -194,7 +195,11 @@ export function listProjects(db, userId, { state = null, excludePrivateOwned = f
   if (excludePrivateOwned) where.push(PROJECT_ORIGIN_SIEVE)
   const rows = db.prepare(`${selectSql(excludePrivateOwned)} WHERE ${where.join(' AND ')}`).all(...args).map(projectRow)
   const rollups = rollupsByProject(listMissions(db, userId, { filed: true, excludePrivateOwned }))
-  return rows.map((p) => withRollup(p, rollups.get(p.id)))
+  // The card's line and small numbers (Projects view v2): what it waits on
+  // you for, its newest milestone, how many sessions are on it now.
+  const cards = cardFields(db, userId, { excludePrivateOwned })
+  const noCard = { waiting_on: null, latest: null, sessions_now: 0 }
+  return rows.map((p) => ({ ...withRollup(p, rollups.get(p.id)), ...(cards.get(p.id) ?? noCard) }))
     .sort((a, b) => (b.last_activity_at - a.last_activity_at) || (b.created_at - a.created_at))
 }
 
@@ -227,5 +232,8 @@ export function projectDetail(db, userId, project, { excludePrivateOwned = false
     needs_you: needsYou,
     recent_milestones: recent,
     sessions_by_box: Object.fromEntries(boxes.map((b) => [b.box, b.n])),
+    // The roll-up across missions (Projects view v2): the first page of
+    // each kind; GET /projects/:id/feed pages on from next_before.
+    ...feedFirstPages(db, userId, project, { excludePrivateOwned }),
   }
 }

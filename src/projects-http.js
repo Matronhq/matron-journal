@@ -14,6 +14,7 @@ import {
   createProject, getProject, resolveProject, listProjects, projectDetail, projectWithRollup,
   updateProject, closeProject, mergeProject,
 } from './projects.js'
+import { FEED_KINDS, FEED_LIMIT_DEFAULT, FEED_LIMIT_MAX, parseCursor, projectFeed } from './projects-feed.js'
 
 const STATES = ['open', 'closed']
 
@@ -128,6 +129,21 @@ async function handleMerge(ctx, req, res, who, project) {
   return true
 }
 
+// GET /projects/:id/feed?kind=decisions|files|milestones&before=<cursor>&limit=<n>
+// — one page of the roll-up. A read, so it follows a merge like GET
+// /projects/:id (the route resolves before calling this).
+function handleFeed(ctx, res, url, who, project, excludePrivateOwned) {
+  const kind = url.searchParams.get('kind')
+  if (!FEED_KINDS.includes(kind)) return badRequest(res)
+  const before = parseCursor(url.searchParams.get('before'))
+  if (before === undefined) return badRequest(res)
+  const rawLimit = url.searchParams.get('limit')
+  const limit = rawLimit == null ? FEED_LIMIT_DEFAULT : Number(rawLimit)
+  if (!Number.isInteger(limit) || limit < 1 || limit > FEED_LIMIT_MAX) return badRequest(res)
+  json(res, 200, projectFeed(ctx.db, who.userId, project, kind, { before, limit, excludePrivateOwned }))
+  return true
+}
+
 export async function handleProjectsRoute(ctx, req, res, url, who) {
   const { db } = ctx
   const path = url.pathname
@@ -136,7 +152,7 @@ export async function handleProjectsRoute(ctx, req, res, url, who) {
     if (req.method === 'GET') return handleList(ctx, res, url, who)
     return false
   }
-  const m = path.match(/^\/projects\/([^/]+)(?:\/(close|merge))?$/)
+  const m = path.match(/^\/projects\/([^/]+)(?:\/(close|merge|feed))?$/)
   if (!m) return false
   let idOrNum
   try { idOrNum = decodeURIComponent(m[1]) } catch { return badRequest(res) }
@@ -148,6 +164,12 @@ export async function handleProjectsRoute(ctx, req, res, url, who) {
     if (!r) return notFound(res)
     json(res, 200, { ...projectDetail(db, who.userId, r.project, { excludePrivateOwned }), ...(r.mergedFrom ? { merged_from: r.mergedFrom } : {}) })
     return true
+  }
+  if (sub === 'feed') {
+    if (req.method !== 'GET') return false
+    const r = resolveProject(db, who.userId, idOrNum, { excludePrivateOwned })
+    if (!r) return notFound(res)
+    return handleFeed(ctx, res, url, who, r.project, excludePrivateOwned)
   }
   // Writes address the row itself, never the merge target.
   const project = getProject(db, who.userId, idOrNum, { excludePrivateOwned })

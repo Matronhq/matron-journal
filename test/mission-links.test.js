@@ -29,7 +29,7 @@ const PROJECT_COLS = [
 
 test('schema: mission_conversations and projects exist; missions gains project_id; constraints hold', () => {
   const db = openDb(':memory:')
-  assert.deepEqual(cols(db, 'mission_conversations'), ['mission_id', 'convo_id', 'user_id', 'how', 'joined_at', 'ended_at'])
+  assert.deepEqual(cols(db, 'mission_conversations'), ['mission_id', 'convo_id', 'user_id', 'how', 'joined_at', 'ended_at', 'first_joined_at'])
   assert.deepEqual(cols(db, 'projects'), PROJECT_COLS)
   assert.ok(cols(db, 'missions').includes('project_id'))
   for (const n of ['idx_mc_convo', 'idx_projects_user_state', 'idx_missions_project']) assert.ok(indexes(db).includes(n), n)

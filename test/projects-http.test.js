@@ -116,7 +116,7 @@ test('POST/GET/PATCH /projects: any agent creates (idempotent), lists with rollu
   assert.equal((await s.http('/projects', { token: agent.token })).json.projects.some((x) => x.id === hidden.id), false)
   assert.equal((await s.http(`/projects/${hidden.num}`, { token: client })).status, 200)
   const detail = await s.http(`/projects/${p.id}`, { token: client })
-  assert.deepEqual(Object.keys(detail.json).sort(), ['missions', 'needs_you', 'project', 'recent_milestones', 'sessions_by_box'])
+  assert.deepEqual(Object.keys(detail.json).sort(), ['decisions', 'files', 'milestones', 'missions', 'needs_you', 'project', 'recent_milestones', 'sessions_by_box'])
   assert.deepEqual(detail.json.sessions_by_box, { 'dev-2': 1 })
 })
 
@@ -197,4 +197,37 @@ test('a merge chain A into B then B into C: /lookup #A and GET /projects/A both 
   const read = await s.http(`/projects/${pa.id}`, { token: client })
   assert.equal(read.status, 200); assert.equal(read.json.project.id, pc.id)
   assert.deepEqual(read.json.merged_from, { id: pa.id, num: pa.num })
+})
+
+test('GET /projects/:id/feed: pages decisions, files and milestones; 400 on a bad kind, cursor or limit; 404 hidden; follows a merge; GET /projects rows carry the card fields', async (t) => {
+  const { s, dan, agent, priv, client } = await fleet(t)
+  const p = seedProject(s, dan, agent.deviceId)
+  const m = (await startMission(s, agent.token, { project: p.id })).json.mission
+  for (let i = 0; i < 3; i++) {
+    await s.http('/milestones', { method: 'POST', token: agent.token, body: { convo_id: 'c1', kind: 'progress', title: `step ${i}` } })
+  }
+  const feed = (ref, query, token = client) => s.http(`/projects/${ref}/feed?${query}`, { token })
+  const first = await feed(p.id, 'kind=milestones&limit=2')
+  assert.equal(first.status, 200)
+  assert.equal(first.json.kind, 'milestones'); assert.equal(first.json.total, 3)
+  assert.deepEqual(first.json.rows.map((r) => r.title), ['step 2', 'step 1'])
+  assert.equal(first.json.rows[0].mission_num, m.num)
+  const second = await feed(p.num, `kind=milestones&limit=2&before=${encodeURIComponent(first.json.next_before)}`)
+  assert.deepEqual(second.json.rows.map((r) => r.title), ['step 0']); assert.equal(second.json.next_before, null)
+  assert.equal((await feed(p.id, 'kind=decisions')).json.total, 0)
+  assert.equal((await feed(p.id, 'kind=files')).status, 200)
+  for (const bad of ['', 'kind=bogus', 'kind=files&before=x', 'kind=files&limit=0', 'kind=files&limit=101', 'kind=files&limit=2.5']) {
+    assert.equal((await feed(p.id, bad)).status, 400, bad)
+  }
+  assert.equal((await s.http(`/projects/${p.id}/feed?kind=files`, { method: 'POST', token: client, body: {} })).status, 404)
+  const hidden = createProject(s.db, { userId: dan.id, deviceId: priv.deviceId, createdBy: 'agent', title: 'Hidden' }).project
+  assert.equal((await feed(hidden.id, 'kind=files', agent.token)).status, 404)
+  assert.equal((await feed(hidden.id, 'kind=files')).status, 200)
+  const into = seedProject(s, dan, agent.deviceId, { title: 'Into' })
+  mergeProject(s.db, { userId: dan.id, projectId: p.id, intoId: into.id, by: 'user' })
+  const redirected = await feed(p.id, 'kind=milestones')
+  assert.equal(redirected.status, 200); assert.equal(redirected.json.total, 3, 'the merge target now holds the mission')
+  const list = await s.http('/projects', { token: client })
+  const row = list.json.projects.find((x) => x.id === into.id)
+  assert.equal(row.latest.title, 'step 2'); assert.equal(row.waiting_on, null); assert.equal(row.sessions_now, 1)
 })

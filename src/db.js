@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS events(
   PRIMARY KEY(user_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_events_convo ON events(convo_id, seq);
+-- A project's "Files and images" (projects-feed.js) reads only these rows.
+CREATE INDEX IF NOT EXISTS idx_events_media ON events(convo_id, seq) WHERE type IN ('image', 'file');
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idem
   ON events(user_id, convo_id, idem_key) WHERE idem_key IS NOT NULL;
 CREATE TABLE IF NOT EXISTS user_seq(
@@ -851,6 +853,13 @@ export function openDb(path) {
   // upgraded database SCHEMA runs before this ALTER adds the column.
   addMissionCol('project_id', 'project_id TEXT')
   db.exec('CREATE INDEX IF NOT EXISTS idx_missions_project ON missions(project_id, state)')
+  // When a conversation FIRST joined a mission: joined_at is re-stamped on
+  // every rejoin (activateLink), which would hide an earlier stint's files
+  // from the project page (projects-feed.js). NULL on older rows reads as
+  // joined_at there.
+  if (!db.prepare('PRAGMA table_info(mission_conversations)').all().some((c) => c.name === 'first_joined_at')) {
+    db.exec('ALTER TABLE mission_conversations ADD COLUMN first_joined_at INTEGER')
+  }
   // Spec 2026-09-30 §3 backfill: once, while the link table is empty. After
   // every mission/conversation/item column it reads has been added above.
   const backfilled = backfillMissionLinks(db)
