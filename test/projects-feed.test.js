@@ -119,6 +119,7 @@ test('files: item attachments and chat images posted while the conversation was 
   assert.equal(both.mission_num, Math.min(m1.num, m2.num)); assert.deepEqual(both.source, { convo_id: 'c1', seq: both.source.seq })
   assert.equal(both.blob_id, 'b-both.png'); assert.equal(both.content_type, 'image/png'); assert.equal(both.size, 9)
   assert.deepEqual(out.rows[1].source, { item_num: it.num }); assert.equal(out.rows[1].content_type, 'image/png')
+  assert.equal(both.posted_at, 3000); assert.equal(out.rows[1].posted_at, 2600)
 })
 
 test('files sieve: a private conversation\'s images and a private-origin mission\'s attachments are invisible to a filtered caller', () => {

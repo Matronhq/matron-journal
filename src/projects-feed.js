@@ -105,6 +105,7 @@ const SHAPE = {
   decisions: (r) => strip(r),
   files: ({ source, item_num: itemNum, convo_id: convoId, seq, ...r }) => ({
     ...strip(r),
+    posted_at: r.at,
     source: source === 'item' ? { item_num: itemNum } : { convo_id: convoId, seq },
   }),
   milestones: (r) => milestoneRow(strip(r)),
