@@ -161,8 +161,6 @@ function firstSeqAtOrAfter(db, userId, ts) {
   return lo
 }
 
-const nameRegex = (name) => new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i')
-
 function parsePayload(raw) {
   try { return JSON.parse(raw) } catch { return null }
 }
@@ -180,8 +178,6 @@ export function listUnseen(db, userId, {
   const from = now - sinceMs
   const until = now - olderThanMs
   if (until < from) return { entries: [], truncated: false }
-  const userName = db.prepare('SELECT name FROM users WHERE id=?').get(userId)?.name ?? ''
-  const mentions = userName ? nameRegex(userName) : null
   let missionId = null
   if (missionNum != null) {
     missionId = db.prepare('SELECT id FROM missions WHERE user_id=? AND num=?').get(userId, missionNum)?.id
@@ -252,11 +248,13 @@ export function listUnseen(db, userId, {
     }
     if (r.type === 'spawn_outcome' && payload?.outcome === 'failed') reasons.push('failure')
     if ((r.session_state === 'done' || r.session_state === 'waiting') && lastOther.get(r.convo_id) === r.seq) reasons.push('final')
-    // An agent-to-agent room is the user's to skim: its prompts and last
-    // messages are addressed to the other agent. Only being named there
-    // makes a room message important.
+    // An agent-to-agent room is the user's to skim, never important on its
+    // own: its prompts and last messages are addressed to the other agent,
+    // and whatever there needs the user becomes a tracker item (which is
+    // raised as awaiting_user). Being named in a room used to count, but
+    // the user's name is also a box name and in every "<name> approved…",
+    // so that reason was mostly noise and was dropped (mission 5798).
     if (r.is_room) reasons.length = 0
-    if (r.is_room && r.type === 'text' && mentions && mentions.test(String(payload?.body ?? ''))) reasons.push('mentions_user')
     entries.push({
       ref: `msg:${r.convo_id}:${r.seq}`, kind: 'message',
       convo_id: r.convo_id, convo_title: r.title, session_state: r.session_state, mission_num: numOf(r.mission_id),
@@ -309,8 +307,8 @@ export function listUnseen(db, userId, {
   }
 
   let out = entries
-  // 'important' also keeps agent-to-agent rooms out unless the user is named
-  // there: those are the user's to skim, not to be told about.
+  // 'important' also keeps agent-to-agent rooms out: those are the user's
+  // to skim, not to be told about.
   if (importance === 'important') out = out.filter((e) => e.important)
   if (!includeFlagged && out.length) {
     const flagged = new Set(db.prepare('SELECT ref FROM unseen_flags WHERE user_id=?').all(userId).map((r) => r.ref))

@@ -166,7 +166,7 @@ agent-side flag in v1. The journal tags each unseen thing with `reasons[]`:
 | `permission` / `prompt` | a `permission_request` or `prompt` event, unseen, still unanswered |
 | `final` | the last agent message before a conversation went `done` or `waiting` |
 | `failure` | `spawn_outcome` failure, session stalled, or a notice from the bridge's error paths |
-| `mentions_user` | in an agent-to-agent room, text that names Dan (in his own conversations every message is addressed to him, so this rule is for rooms only) |
+| ~~`mentions_user`~~ | ~~in an agent-to-agent room, text that names Dan~~ — dropped 2026-10-01 (mission 5798): Dan's name is also a box name (dan-mac) and in every "Dan approved…", so nearly every nudge was this rule. Room messages are never important on their own; what needs Dan there becomes a tracker item. |
 
 Anything with at least one reason is `important`. The rest of the unseen
 agent text is `other`. The Coordinator reads the snippets and decides whether
