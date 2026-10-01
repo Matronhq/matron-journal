@@ -1812,7 +1812,8 @@ name.
 
 ## Memories
 
-Spec: `docs/superpowers/specs/2026-09-27-memories-design.md`.
+Spec: `docs/superpowers/specs/2026-09-27-memories-design.md`; scopes:
+`docs/superpowers/specs/2026-10-01-memory-scopes-design.md`.
 
 A memory is the user's shared agent memory: a standing rule or fact any of
 their agents may save and every one of them may read, shaped like a Claude
@@ -1820,17 +1821,28 @@ Code memory file so an agent's own memory instructions apply to it. Per
 user (`memories` table, `src/memories.js`, `src/memories-http.js`), one row
 per `name`, overwritten in place. A bridge with the memories update
 (matron-bridge, the `memory_*` tools) injects the index (name, type,
-description) into the Coordinator's instructions at spawn; against an
-older bridge the memories are stored and shown in the apps only.
+scope, description) into every session's instructions at spawn — the
+memories whose `scope` matches that session; against an older bridge the
+memories are stored and shown in the apps only.
 
 ```
-{ id: "me_<16 hex>", name, type, description, body,
+{ id: "me_<16 hex>", name, type, scope, description, body,
   origin_convo_id, origin_device_id, created_by, updated_by, created_at, updated_at }
 ```
 
 - `name`: `^[a-z0-9][a-z0-9-]{0,63}$`, unique per user.
 - `type`: `user | feedback | project | reference`; `feedback` when omitted
   on create, kept when omitted on update.
+- `scope`: who the memory is for — `global` (every session; what every
+  memory was before the column existed, and the default on create),
+  `coordinator` (the user's Coordinator only) or `repo:<name>` (sessions
+  whose working directory is a checkout of that repo; `<name>` is the bare
+  repo name, `^[A-Za-z0-9_.-]+$`, the `name` segment of the canonical
+  `host/org/name` a bridge reports on `convo_upsert`). At most 128
+  characters. Kept when omitted on update. The journal stores and shows
+  it; the **bridge** does the matching at spawn (global always, the repo
+  scope of the session's workdir, `coordinator` for the Coordinator) and
+  the Coordinator's `memory_list` sees every scope.
 - `description`: 1–200 characters, trimmed, one line (no C0/C1 control
   characters, no U+2028/U+2029). It is the line the Coordinator sees at
   spawn, so it must be the actionable one-liner.
@@ -1849,11 +1861,11 @@ older bridge the memories are stored and shown in the apps only.
 |---|---|---|
 | `GET /memories` | | 200 `{memories:[…]}` ordered by `name` (≤200 rows, no paging) |
 | `GET /memories/:key` | `:key` = `me_…` or the name | 200 `{memory}`; 404 |
-| `PUT /memories/:name` | `{description, body?, type?, convo_id?}` | 201 `{memory}` created / 200 `{memory}` updated; 400 `bad_request`; 409 `too_many`; 404 |
+| `PUT /memories/:name` | `{description, body?, type?, scope?, convo_id?}` | 201 `{memory}` created / 200 `{memory}` updated; 400 `bad_request` (a `scope` outside the three forms included); 409 `too_many`; 404 |
 | `DELETE /memories/:key` | | 200 `{memory}` (the deleted row); 404 |
 
 `PUT` is the only write and is an **upsert by name**: the same name from
-any device overwrites `description`, `body` and `type` and bumps
+any device overwrites `description`, `body`, `type` and `scope` and bumps
 `updated_at` / `updated_by`. A `PUT` is the whole memory — an omitted
 `body` on an update **clears** it. Retries are therefore free; there is no
 `Idempotency-Key`. An invalid `:name` is 400, not 404.
@@ -1881,7 +1893,7 @@ logged and swallowed; the write stands):
 ```json
 { "seq": 123, "convo_id": "…", "ts": 1790550000000,
   "sender": "user:dan" | "agent:bev", "type": "memory",
-  "payload": { "memory_id": "me_…", "name": "avoid-eric", "type": "feedback",
+  "payload": { "memory_id": "me_…", "name": "avoid-eric", "type": "feedback", "scope": "global",
     "description": "Never start sessions on eric.",
     "action": "saved" | "deleted", "created": true | false, "by": "user" | "agent" } }
 ```
