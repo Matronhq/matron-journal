@@ -1821,8 +1821,11 @@ Code memory file so an agent's own memory instructions apply to it. Per
 user (`memories` table, `src/memories.js`, `src/memories-http.js`), one row
 per `name`, overwritten in place. A bridge with the memories update
 (matron-bridge, the `memory_*` tools) injects the index (name, type,
-scope, description) into every session's instructions at spawn — the
-memories whose `scope` matches that session; against an older bridge the
+scope, description) into every session's instructions at spawn. A bridge
+with the **scopes update** injects only the memories whose `scope` matches
+that session; a bridge with the memories update but not the scopes update
+injects every memory into every session, so a stored scope restricts
+nothing until the bridge is updated; against a bridge older than both the
 memories are stored and shown in the apps only.
 
 ```
