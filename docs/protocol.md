@@ -1777,8 +1777,10 @@ per user. A routine is scheduled or triggered for life: `PATCH` may give
 one, never both (`bad_request`).
 
 **Triggers.** `trigger` is `{kind:'context_over', pct}` (1–99: a live
-session, never the Coordinator's own, whose context gauge is at or past
-`pct`), `{kind:'stalled', reset_minutes}` (0–10080, default 120: a live
+session, never the Coordinator's own nor a helper conversation inside a
+session, whose context tokens are at or past `pct` of its window — 1M at
+least for the 1M-class models, Opus, Fable, Mythos and any `[1m]` alias,
+whose bridges can only prove 1M once the gauge passes 200k), `{kind:'stalled', reset_minutes}` (0–10080, default 120: a live
 session stalled on a usage limit whose reset is at least that far away or
 unknown) or `{kind:'disk_under', pct}` (an agent box under `pct`% free
 disk), evaluated against `conversation_status` and `device_status` by a
@@ -1789,11 +1791,13 @@ or `device:<id>`) fires **once per crossing**: `routine_trigger_state`
 records the subjects fired for and forgets them when they stop matching.
 The fire's `message` is the prompt plus a `Tripped by:` list, one line per
 fresh subject (`- [title](matron://convo/<id>) at 42% of its window
-(model)`, `- […] stalled on <model>, resets <iso> (in 5 h)` / `no reset
+(420k/1M, model)`, `- […] stalled on <model>, resets <iso> (in 5 h)` / `no reset
 time`, `- <box>: 15% free (15.0 GB of 100.0 GB)`). Pausing a triggered
-routine or changing its trigger clears its records; a retryable delivery
-failure forgets the fresh subjects and backs the routine off 15 minutes;
-`run` fires with whatever matches now, records untouched.
+routine or changing its trigger clears its records. A triggered routine
+fires at most once per 15 minutes — subjects crossing inside the gap are
+fresh at the first sweep after it; a retryable delivery failure forgets the
+fresh subjects and backs the routine off 15 minutes; `run` fires with
+whatever matches now, records untouched.
 
 | Route | Who | Body | Returns |
 |---|---|---|---|

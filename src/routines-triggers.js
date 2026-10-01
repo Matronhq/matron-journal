@@ -12,7 +12,7 @@ import { convoStatuses } from './convo-status.js'
 import { deviceStatuses, isPrivateDevice } from './db.js'
 import { privateOwnedConvo } from './privacy.js'
 import { sanitizePeerText } from './peer-text.js'
-import { triggeredRoutines, RETRY_AFTER_MS, PROMPT_MAX } from './routines.js'
+import { triggeredRoutines, RETRY_AFTER_MS, PROMPT_MAX, MIN_GAP_MS } from './routines.js'
 
 const LIVE_STATES = new Set(['running', 'waiting'])
 const TITLE_CAP = 80
@@ -28,6 +28,28 @@ const inWords = (ms) => {
   return h < 48 ? `${h} h` : `${Math.round(h / 24)} d`
 }
 const gb = (bytes) => `${(bytes / GB).toFixed(1)} GB`
+const kTokens = (n) => (n >= 1_000_000 ? `${+(n / 1_000_000).toFixed(1)}M` : `${Math.round(n / 1000)}k`)
+
+// The window a session really has, for context_over. The bridge reports a
+// window per session, but for the 1M-class models (Opus, Fable, Mythos,
+// any `[1m]` alias) it can only prove 1M once the gauge passes 200k: below
+// that a session started as `opus` or as the box default reads 200k, and
+// 100k tokens shows as 50% (item 5894, 1 Oct 2026). The user's rule
+// (compact at 40%, "about 400k") is a 1M rule, so 1M is the floor for those
+// models and a reported window above it is trusted. Other models keep what
+// the bridge said.
+const WINDOW_1M_RE = /opus|fable|mythos|\[1m\]/i
+const WINDOW_1M = 1_000_000
+export function contextWindowOf(model, reported) {
+  const w = Number.isFinite(reported) && reported > 0 ? reported : 0
+  return WINDOW_1M_RE.test(String(model || '')) ? Math.max(w, WINDOW_1M) : w
+}
+
+// Floor between two fires of one triggered routine. Subjects crossing
+// inside the gap are not consumed — they are fresh at the first sweep after
+// it — so a run of crossings costs the Coordinator one turn a quarter hour,
+// not one per five-minute sweep (fourteen turns in two hours, 1 Oct 2026).
+export const TRIGGER_GAP_MS = MIN_GAP_MS
 
 export function describeTrigger(t) {
   if (!t || typeof t !== 'object') return 'no trigger'
@@ -39,14 +61,16 @@ export function describeTrigger(t) {
 
 // The subjects a trigger matches right now: [{subject, line}], ordered by
 // subject so two sweeps agree. The Coordinator's own conversation never
-// counts (it cannot act on itself), nor do done/archived sessions. With
+// counts (it cannot act on itself), nor do done/archived sessions, nor the
+// helper conversations inside a session (parent_convo_id set): a subagent
+// cannot be compacted or switched on its own and ends with its turn. With
 // excludePrivateOwned (the Coordinator sits on an ordinary box), sessions
 // on private devices and private boxes are invisible, as everywhere else.
 export function evaluateTrigger(db, userId, trigger, { now = Date.now(), coordinatorConvoId = null, excludePrivateOwned = false } = {}) {
   const out = []
   if (trigger.kind === 'context_over' || trigger.kind === 'stalled') {
     const statuses = convoStatuses(db, userId)
-    const rows = db.prepare('SELECT id, title, session_state FROM conversations WHERE owner_user_id=? AND agent_device_id IS NOT NULL').all(userId)
+    const rows = db.prepare('SELECT id, title, session_state FROM conversations WHERE owner_user_id=? AND agent_device_id IS NOT NULL AND parent_convo_id IS NULL').all(userId)
     for (const c of rows) {
       if (c.id === coordinatorConvoId || !LIVE_STATES.has(c.session_state)) continue
       const st = statuses.get(c.id)
@@ -54,9 +78,16 @@ export function evaluateTrigger(db, userId, trigger, { now = Date.now(), coordin
       if (excludePrivateOwned && privateOwnedConvo(db, c.id)) continue
       const title = linkLabel(c.title)
       if (trigger.kind === 'context_over') {
-        const pct = st.context?.pct
+        // Measured from the tokens against the window the session really
+        // has (contextWindowOf); the reported pct only when there is no
+        // gauge to measure.
+        const tokens = st.context?.tokens
+        const window = contextWindowOf(st.model, st.context?.window)
+        const measured = Number.isFinite(tokens) && tokens > 0 && window > 0
+        const pct = measured ? Math.floor((tokens / window) * 100) : st.context?.pct
         if (!Number.isInteger(pct) || pct < trigger.pct) continue
-        out.push({ subject: `convo:${c.id}`, line: `- [${title}](matron://convo/${c.id}) at ${pct}% of its window${st.model ? ` (${st.model})` : ''}` })
+        const detail = measured ? `${kTokens(tokens)}/${kTokens(window)}${st.model ? `, ${st.model}` : ''}` : (st.model || '')
+        out.push({ subject: `convo:${c.id}`, line: `- [${title}](matron://convo/${c.id}) at ${pct}% of its window${detail ? ` (${detail})` : ''}` })
       } else {
         const stall = st.stall
         if (!stall || stall.kind !== 'usage_limit') continue
@@ -133,11 +164,12 @@ export function trippedSubjects(db, routine, { now = Date.now(), coordinatorConv
   })()
 }
 
-// One pass over every enabled triggered routine. A delivery failure the
-// next attempt might cure — and "no Coordinator", which a later assignment
-// cures — forgets the fresh subjects (so they re-trip) and backs the
-// routine off for RETRY_AFTER_MS; a refusal keeps them recorded (nothing
-// until the condition clears and trips again). Returns {fired}.
+// One pass over every enabled triggered routine. Every fire rests the
+// routine for TRIGGER_GAP_MS (retry_at doubles as "not before"). A delivery
+// failure the next attempt might cure — and "no Coordinator", which a later
+// assignment cures — forgets the fresh subjects (so they re-trip) and backs
+// the routine off for RETRY_AFTER_MS instead; a refusal keeps them recorded
+// (nothing until the condition clears and trips again). Returns {fired}.
 export async function runTriggerSweep({ db, firer, log = console }, now = Date.now()) {
   let routines = []
   try { routines = triggeredRoutines(db, now) } catch (err) {
@@ -157,12 +189,13 @@ export async function runTriggerSweep({ db, firer, log = console }, now = Date.n
     }
     if (!fresh.length) continue
     fired += 1
-    db.prepare('UPDATE routines SET last_fired_at=?, retry_at=NULL WHERE id=?').run(now, r.id)
+    db.prepare('UPDATE routines SET last_fired_at=?, retry_at=? WHERE id=?').run(now, now + TRIGGER_GAP_MS, r.id)
     const onOutcome = (outcome, retryable) => {
       const again = retryable || outcome === 'no_coordinator'
       db.transaction(() => {
-        db.prepare('UPDATE routines SET last_outcome=?, retry_at=? WHERE id=?').run(outcome, again ? Date.now() + RETRY_AFTER_MS : null, r.id)
+        db.prepare('UPDATE routines SET last_outcome=? WHERE id=?').run(outcome, r.id)
         if (again) {
+          db.prepare('UPDATE routines SET retry_at=? WHERE id=?').run(Date.now() + RETRY_AFTER_MS, r.id)
           const forget = db.prepare('DELETE FROM routine_trigger_state WHERE routine_id=? AND subject=?')
           for (const s of fresh) forget.run(r.id, s.subject)
         }
