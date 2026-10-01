@@ -1777,8 +1777,9 @@ per user. A routine is scheduled or triggered for life: `PATCH` may give
 one, never both (`bad_request`).
 
 **Triggers.** `trigger` is `{kind:'context_over', pct}` (1–99: a live
-session, never the Coordinator's own nor a helper conversation inside a
-session, whose context tokens are at or past `pct` of its window — 1M at
+session, never the Coordinator's own, a helper conversation inside a
+session, nor a Codex session (GPT, o-series or codex model names: Codex
+compacts itself), whose context tokens are at or past `pct` of its window — 1M at
 least for the 1M-class models, Opus, Fable, Mythos and any `[1m]` alias,
 whose bridges can only prove 1M once the gauge passes 200k), `{kind:'stalled', reset_minutes}` (0–10080, default 120: a live
 session stalled on a usage limit whose reset is at least that far away or

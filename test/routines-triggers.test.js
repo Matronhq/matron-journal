@@ -6,7 +6,7 @@ import { setCoordinatorConvoId } from '../src/coordinator.js'
 import { upsertConversation } from '../src/journal.js'
 import { upsertConvoStatus } from '../src/convo-status.js'
 import { validateRoutineFields, createRoutine, getRoutine, seedRoutines, listRoutines, STARTER_ROUTINES, TRIGGER_KINDS } from '../src/routines.js'
-import { evaluateTrigger, trippedSubjects, trigMessage, describeTrigger, contextWindowOf } from '../src/routines-triggers.js'
+import { evaluateTrigger, trippedSubjects, trigMessage, describeTrigger, contextWindowOf, isCodexModel } from '../src/routines-triggers.js'
 import { startTestServer, makeWsClient } from './helpers.js'
 
 // Triggered routines (spec 2026-10-01 coordinator routines, "Triggers"):
@@ -33,6 +33,7 @@ async function seedDb() {
   upsertConversation(db, { id: 'g4', ownerUserId: dan.id, title: 'Small window', sessionState: 'running', agentDeviceId: gene.deviceId })
   upsertConversation(db, { id: 'g5', ownerUserId: dan.id, title: 'Opus on an old bridge', sessionState: 'running', agentDeviceId: gene.deviceId })
   upsertConversation(db, { id: 'g1:sub:h1', ownerUserId: dan.id, title: 'Helper', sessionState: 'running', agentDeviceId: gene.deviceId, parentConvoId: 'g1' })
+  upsertConversation(db, { id: 'g6', ownerUserId: dan.id, title: 'Codex one', sessionState: 'running', agentDeviceId: gene.deviceId })
   setCoordinatorConvoId(db, dan.id, 'coord')
   return { db, dan, mavis, gene, priv }
 }
@@ -79,6 +80,8 @@ test('evaluateTrigger: context_over, stalled, disk_under — live sessions only,
   upsertConvoStatus(db, { userId: dan.id, convoId: 'g4', status: { model: 'haiku-4-5', context: { tokens: 100000, window: 200000, pct: 50 } }, reportedAt: NOW })
   upsertConvoStatus(db, { userId: dan.id, convoId: 'g5', status: { model: 'claude-opus-5-5', context: { tokens: 100000, window: 200000, pct: 50 } }, reportedAt: NOW })
   upsertConvoStatus(db, { userId: dan.id, convoId: 'g1:sub:h1', status: { model: 'opus-5-5', context: { tokens: 900000, window: 1000000, pct: 90 } }, reportedAt: NOW })
+  // A Codex session compacts itself: never a subject, however full (item 6058).
+  upsertConvoStatus(db, { userId: dan.id, convoId: 'g6', status: { model: 'gpt-6-astra', context: { tokens: 207000, window: 258000, pct: 80 } }, reportedAt: NOW })
   upsertConvoStatus(db, { userId: dan.id, convoId: 'g2', status: { model: 'fable-5-1', context: { tokens: 1000, window: 1000000, pct: 1 }, stall: { kind: 'usage_limit', model: 'fable-5-1', resets_at: '2026-10-01T15:00:00Z' } }, reportedAt: NOW })
   upsertConvoStatus(db, { userId: dan.id, convoId: 'g3', status: { model: 'x', context: { tokens: 9, window: 10, pct: 90 } }, reportedAt: NOW })
   upsertConvoStatus(db, { userId: dan.id, convoId: 'coord', status: { model: 'x', context: { tokens: 9, window: 10, pct: 90 } }, reportedAt: NOW })
@@ -97,6 +100,10 @@ test('evaluateTrigger: context_over, stalled, disk_under — live sessions only,
   assert.equal(contextWindowOf('claude-opus-5-5', 200000), 1000000); assert.equal(contextWindowOf('opus', 200000), 1000000)
   assert.equal(contextWindowOf('fable-5-1', 2000000), 2000000); assert.equal(contextWindowOf('sonnet-5[1m]', 200000), 1000000)
   assert.equal(contextWindowOf('haiku-4-5', 200000), 200000); assert.equal(contextWindowOf('sonnet-5', 200000), 200000); assert.equal(contextWindowOf('x', undefined), 0)
+  // Codex model names, as the Codex bridge publishes them; Claude names and nothing else.
+  for (const m of ['gpt-6-astra', 'gpt-5.1-codex', 'GPT-5', 'o3', 'o4-mini', 'codex-mini-latest']) assert.equal(isCodexModel(m), true, m)
+  for (const m of ['claude-opus-5-5', 'opus', 'fable-5-1', 'haiku-4-5', '', undefined, 'gpto']) assert.equal(isCodexModel(m), false, String(m))
+  assert.deepEqual(evaluateTrigger(db, dan.id, { kind: 'context_over', pct: 1 }, { now: NOW, coordinatorConvoId: 'coord', excludePrivateOwned: true }).map((s) => s.subject), ['convo:g1', 'convo:g4', 'convo:g5'], 'Codex never, even at 1%')
   // stalled: reset at least reset_minutes away (5 h here), or no reset time at all.
   const st = evaluateTrigger(db, dan.id, { kind: 'stalled', reset_minutes: 120 }, { now: NOW, coordinatorConvoId: 'coord' })
   assert.deepEqual(st.map((s) => s.subject), ['convo:g2'])
