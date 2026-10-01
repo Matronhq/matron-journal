@@ -228,6 +228,23 @@ test('resumeHeldConsent: after a restart, a recent ask still pending gets its pu
   assert.equal(ctx.stub.calls.length, 1)
 })
 
+test('resumeHeldConsent: never re-pushes an ask that was not held (every-session mode) or is older than its hold', async (t) => {
+  const ctx = await setup(t, { holdMs: 0 })
+  setNotifyPrefs(ctx.db, ctx.dan.id, { mode: 'all' })
+  createSpawnRequest(ctx.db, { id: 'p', userId: ctx.dan.id, fromDeviceId: ctx.workBox, fromConvoId: 'work', targetDeviceId: ctx.workBox, workdir: '/w', task: 't' })
+  append(ctx.db, { userId: ctx.dan.id, convoId: 'work', sender: 'agent:box', type: 'permission_request', payload: { kind: 'agent_spawn', request_id: 'p', from_device_id: ctx.workBox } })
+  assert.equal(ctx.pipeline.resumeHeldConsent(), 0, 'pushed at once when it arrived: not again')
+  setNotifyPrefs(ctx.db, ctx.dan.id, { mode: 'coordinator' })
+  assert.equal(ctx.pipeline.resumeHeldConsent(Date.now() + 5 * 60 * 1000), 0, 'its hold long over: it already pushed before the restart')
+  assert.equal(ctx.pipeline.resumeHeldConsent(), 1)
+})
+
+test('resumeHeldConsent: the startup read uses the partial index, not a full events scan', async () => {
+  const db = openDb(':memory:')
+  const plan = db.prepare("EXPLAIN QUERY PLAN SELECT user_id, seq FROM events WHERE type='permission_request' AND ts > ?").all(0).map((r) => r.detail).join(' ')
+  assert.match(plan, /idx_events_permission_request/)
+})
+
 test('badge: Coordinator mode counts the Coordinator\'s unread plus items awaiting the user', async (t) => {
   const ctx = await setup(t)
   append(ctx.db, { userId: ctx.dan.id, convoId: 'work', sender: 'agent:box', type: 'text', payload: { body: 'unread elsewhere' } })

@@ -832,6 +832,10 @@ export function openDb(path) {
     updated_at INTEGER NOT NULL,
     PRIMARY KEY(user_id, convo_id)
   )`)
+  // The startup resume of held consent pushes (push.js resumeHeldConsent)
+  // reads recent permission_request cards; partial, so ordinary appends
+  // never touch it.
+  db.exec("CREATE INDEX IF NOT EXISTS idx_events_permission_request ON events(ts) WHERE type='permission_request'")
   for (const table of ['convo_agents', 'agent_spawn_requests']) {
     const cols = db.prepare(`PRAGMA table_info(${table})`).all()
     if (!cols.some((c) => c.name === 'answered_by')) db.exec(`ALTER TABLE ${table} ADD COLUMN answered_by TEXT`)

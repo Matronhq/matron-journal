@@ -11,9 +11,11 @@ const ROUTINE_COALESCE_MS = 10000
 // How long a consent card's push waits for the Coordinator to decide it, in
 // Coordinator mode (spec 2026-10-01 notification settings; Dan chose 30 s).
 export const CONSENT_HOLD_MS = 30000
-// At startup, an ask still pending that is younger than this gets the push
-// a restart may have swallowed mid-hold.
-export const CONSENT_RESUME_WINDOW_MS = 10 * 60 * 1000
+// At startup, an ask whose hold had not run out by the time the process went
+// down gets the push the restart swallowed. Older asks either got theirs
+// before the restart or were never held; resuming them would push twice.
+// The slack covers the restart's own downtime.
+export const CONSENT_RESUME_SLACK_MS = 60 * 1000
 
 // Returns null for event types that must not push at all. Product call
 // (dispatcher decision): convo_meta (a title rename) is always journal-sync
@@ -97,7 +99,7 @@ export function classify(type, payload, sender, prevState) {
 // as a test seam — production callers never override it — so a test can
 // exercise a hypothetical future `cls.kind` the prefs object doesn't know
 // about without reaching into module internals.
-export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COALESCE_MS, consentHoldMs = CONSENT_HOLD_MS, resumeWindowMs = CONSENT_RESUME_WINDOW_MS, classify: classifyEvent = classify } = {}) {
+export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COALESCE_MS, consentHoldMs = CONSENT_HOLD_MS, resumeSlackMs = CONSENT_RESUME_SLACK_MS, classify: classifyEvent = classify } = {}) {
   const counters = { sent: 0, failed: 0, pruned: 0, byReason: {} }
 
   // Coalescing state lives in memory only, keyed by `${deviceId}:${convoId}`.
@@ -238,8 +240,9 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     // Notification settings (spec 2026-10-01): the user's mode and event
     // switches, then this conversation's level or mute. Decided once per
     // event; the per-device level applies in the loop below.
-    const { mode, events } = effectiveEvents(db, userId)
-    const isCoordinator = getCoordinatorConvoId(db, userId) === event.convo_id
+    const coordinatorConvoId = getCoordinatorConvoId(db, userId)
+    const { mode, events } = effectiveEvents(db, userId, undefined, coordinatorConvoId)
+    const isCoordinator = coordinatorConvoId === event.convo_id
     const isRoom = cls.kind === 'activity' && !!db.prepare("SELECT 1 FROM convo_agents WHERE convo_id=? AND state='joined' LIMIT 1").get(event.convo_id)
     const key = eventKey(cls, { isCoordinator, isRoom })
     if (!allowedForUser(key, events, getConvoNotify(db, userId, event.convo_id))) return
@@ -304,17 +307,23 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
   }
 
   // After a restart: a consent card whose hold the restart swallowed still
-  // gets its push, if the ask is still pending and recent. Held again for
-  // whatever is left of its 30 s; sent now if that has passed.
+  // gets its push, if the ask is still pending. Only cards young enough to
+  // have been mid-hold, and only where the hold applies now (the same gate
+  // onAppend uses) — a card that pushed at once must not push again. Held
+  // again for whatever is left of its 30 s; sent now if that has passed.
+  // The partial index idx_events_permission_request keeps this off a full
+  // events scan.
   function resumeHeldConsent(now = Date.now()) {
     if (!apnsClient) return 0
     const rows = db.prepare(`SELECT user_id, seq, convo_id, ts, sender, type, payload FROM events
-      WHERE type='permission_request' AND ts > ? AND json_extract(payload, '$.kind') IN ('agent_spawn','agent_chat')`).all(now - resumeWindowMs)
+      WHERE type='permission_request' AND ts > ?`).all(now - consentHoldMs - resumeSlackMs)
     let n = 0
     for (const r of rows) {
       let payload
       try { payload = JSON.parse(r.payload) } catch { continue }
+      if (!payload || (payload.kind !== 'agent_spawn' && payload.kind !== 'agent_chat')) continue
       if (!consentStillPending(db, payload)) continue
+      if (!holdsConsent(db, r.user_id, effectiveEvents(db, r.user_id).mode, payload.from_device_id)) continue
       const event = { seq: r.seq, convo_id: r.convo_id, ts: r.ts, sender: r.sender, type: r.type, payload }
       const timer = setTimeout(() => {
         held.delete(timer)

@@ -48,6 +48,7 @@ export function setNotifyPrefs(db, userId, patch, now = Date.now()) {
   if (patch.events) {
     if (patch.mode == null) mode = 'custom'
     for (const k of NOTIFY_EVENTS) if (typeof patch.events[k] === 'boolean') events[k] = patch.events[k]
+    events.prompts = true
   }
   const stored = mode === 'custom' ? { mode, events } : { mode }
   db.prepare(`INSERT INTO user_settings(user_id, notify_prefs, updated_at) VALUES(?,?,?)
@@ -58,8 +59,9 @@ export function setNotifyPrefs(db, userId, patch, now = Date.now()) {
 
 // Coordinator mode only means something while there is a Coordinator to
 // watch the other sessions; without one it behaves as 'all'.
-export function effectiveEvents(db, userId, prefs = getNotifyPrefs(db, userId)) {
-  if (prefs.mode === 'coordinator' && !getCoordinatorConvoId(db, userId)) return { mode: 'all', events: { ...PRESETS.all } }
+// `coordinatorConvoId` lets a caller that already read it skip the lookup.
+export function effectiveEvents(db, userId, prefs = getNotifyPrefs(db, userId), coordinatorConvoId = getCoordinatorConvoId(db, userId)) {
+  if (prefs.mode === 'coordinator' && !coordinatorConvoId) return { mode: 'all', events: { ...PRESETS.all } }
   return prefs
 }
 

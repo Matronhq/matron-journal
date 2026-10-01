@@ -65,8 +65,11 @@ push is sent only if the ask is still `awaiting_user`. A Coordinator that
 decides in time therefore never buzzes the phone.
 
 A held push is lost if the journal restarts. `resumeHeldConsent()` runs at
-startup and sends the push for any ask still pending that was created in the
-last 10 minutes. Questions and items are never held (Dan's call).
+startup and re-arms any card that was still mid-hold when the journal went
+down: one younger than the hold plus 60 s of slack, still pending, and held
+under the current settings. Older cards, and cards that pushed at once, got
+their push before the restart. The read uses a partial index on
+`permission_request` events. Questions and items are never held (Dan's call).
 
 ### Badge
 
