@@ -5,7 +5,7 @@ import { upsertConversation, append } from '../src/journal.js'
 import { createItem, addComment, closeItem } from '../src/items.js'
 import { createMission, joinMission, leaveMission, createMilestone } from '../src/missions.js'
 import { createProject, listProjects, projectDetail } from '../src/projects.js'
-import { projectFeed, parseCursor, cardFields } from '../src/projects-feed.js'
+import { projectFeed, parseCursor, cardFields, filesSqlForTest } from '../src/projects-feed.js'
 
 function seeded() {
   const db = openDb(':memory:')
@@ -197,4 +197,23 @@ test('projectDetail carries the first page of each kind with totals', () => {
   assert.equal(out.decisions.total, 1); assert.equal(out.decisions.next_before, null)
   assert.deepEqual(out.files, { total: 0, rows: [], next_before: null })
   assert.equal(out.recent_milestones.length, 5, 'kept for older apps')
+})
+
+test('files query reads a linked conversation through idx_events_media, never every event of the user', () => {
+  const db = seeded()
+  const p = project(db)
+  const m1 = mission(db, 'c1', 'one'); file(db, m1.id, p.id)
+  const plan = db.prepare(`EXPLAIN QUERY PLAN SELECT * FROM (${filesSqlForTest(false)})`).all({ projectId: p.id, userId: 1 })
+  const text = plan.map((r) => r.detail).join('\n')
+  assert.match(text, /idx_events_media/)
+  assert.doesNotMatch(text, /SEARCH e USING INDEX sqlite_autoindex_events_1/)
+})
+
+test('waiting_on counts a consent card like the needs_you number does', () => {
+  const db = seeded()
+  const p = project(db)
+  const m1 = mission(db, 'c1', 'one'); file(db, m1.id, p.id)
+  item(db, 'c1', 'question', 'Approve the spawn?', { consent: 'spawn:x' })
+  const row = listProjects(db, 1).find((r) => r.id === p.id)
+  assert.equal(row.needs_you, 1); assert.equal(row.waiting_on.title, 'Approve the spawn?'); assert.equal(row.waiting_on.more, 0)
 })

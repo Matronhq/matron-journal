@@ -87,8 +87,12 @@ function filesSql(excludePrivateOwned) {
     JOIN conversations c ON c.id = l.convo_id
     JOIN events e ON e.convo_id = l.convo_id AND e.type IN ('image', 'file')
       AND e.ts >= l.joined_at AND (l.ended_at IS NULL OR e.ts <= l.ended_at)
-    WHERE m.project_id = @projectId AND m.user_id = @userId AND e.user_id = @userId AND e.blob_ref IS NOT NULL ${eventSieve}
+    WHERE m.project_id = @projectId AND m.user_id = @userId AND +e.user_id = @userId AND e.blob_ref IS NOT NULL ${eventSieve}
     GROUP BY e.seq`
+  // `+e.user_id`: the unary plus keeps SQLite off the events primary key
+  // (user_id, seq), which it otherwise prefers without ANALYZE statistics,
+  // reading every event the user has. With it, each linked conversation is
+  // read through idx_events_media (pinned by a test).
 }
 
 function milestonesSql(excludePrivateOwned) {
@@ -99,6 +103,8 @@ function milestonesSql(excludePrivateOwned) {
 }
 
 const SQL = { decisions: decisionsSql, files: filesSql, milestones: milestonesSql }
+// Test seam: the query-plan test reads the files SQL directly.
+export const filesSqlForTest = filesSql
 
 const strip = ({ at: _at, sort_key: _key, ...rest }) => rest
 const SHAPE = {
@@ -131,7 +137,7 @@ export function feedFirstPages(db, userId, project, { excludePrivateOwned = fals
 
 // The card's three fields for every project of `userId`, in three grouped
 // queries: waiting_on (the newest item awaiting the user, plus how many
-// more), latest (the newest milestone) and sessions_now (live top-level
+// more — consent cards included, as in the needs_you count beside it), latest (the newest milestone) and sessions_now (live top-level
 // conversations on its open missions — the conversations sessions_by_box
 // counts).
 export function cardFields(db, userId, { excludePrivateOwned = false } = {}) {
@@ -143,7 +149,7 @@ export function cardFields(db, userId, { excludePrivateOwned = false } = {}) {
   }
   const waiting = db.prepare(`SELECT m.project_id, i.id AS item_id, i.num, i.kind, i.title, m.num AS mission_num
     FROM items i JOIN missions m ON m.id = i.mission_id JOIN conversations c ON c.id = i.origin_convo_id
-    WHERE m.user_id = ? AND m.project_id IS NOT NULL AND i.state = 'open' AND i.awaiting = 'user' AND i.consent IS NULL ${sieve}
+    WHERE m.user_id = ? AND m.project_id IS NOT NULL AND i.state = 'open' AND i.awaiting = 'user' ${sieve}
     ORDER BY i.updated_at DESC, i.num DESC`).all(userId)
   for (const { project_id: pid, ...row } of waiting) {
     const f = of(pid)
