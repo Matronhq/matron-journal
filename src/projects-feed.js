@@ -38,7 +38,8 @@ function page(db, sql, args, { before, limit }) {
 
 const total = (db, sql, args) => db.prepare(`SELECT COUNT(*) AS n FROM (${sql})`).get(args).n
 
-// Decision items (open = in force; closed = decided, done or reversed) and
+// Decision items (open = in force; closed = decided, done or reversed; a
+// cancelled one never took effect and is left out) and
 // questions closed as answered, on the project's missions. A decision dates
 // from when it was recorded, an answered question from when it closed.
 // `answer` is the newest user comment: the tapped label, else its words,
@@ -58,13 +59,17 @@ function decisionsSql(excludePrivateOwned) {
         ORDER BY ic.created_at DESC, ic.id DESC LIMIT 1) END AS answer
     FROM items i JOIN missions m ON m.id = i.mission_id JOIN conversations c ON c.id = i.origin_convo_id
     WHERE m.project_id = @projectId AND m.user_id = @userId AND i.consent IS NULL
-      AND (i.kind = 'decision' OR (i.kind = 'question' AND i.state = 'closed' AND i.resolution = 'answered'))
+      AND ((i.kind = 'decision' AND COALESCE(i.resolution, '') <> 'cancelled')
+           OR (i.kind = 'question' AND i.state = 'closed' AND i.resolution = 'answered'))
       ${sieve}`
 }
 
 // Files and images: (a) attachments on comments of the project's items,
 // and (b) image/file events in conversations linked to the project's
-// missions, posted while the link was active. An event in a conversation
+// missions, posted between the conversation first joining the mission and
+// leaving it. A rejoin keeps the first start (first_joined_at); a file
+// posted in a gap between two stints counts too, since the link table
+// keeps no history of gaps. An event in a conversation
 // linked to two of the project's missions is listed once, under the
 // lower-numbered mission.
 function filesSql(excludePrivateOwned) {
@@ -86,7 +91,7 @@ function filesSql(excludePrivateOwned) {
     JOIN mission_conversations l ON l.mission_id = m.id
     JOIN conversations c ON c.id = l.convo_id
     JOIN events e ON e.convo_id = l.convo_id AND e.type IN ('image', 'file')
-      AND e.ts >= l.joined_at AND (l.ended_at IS NULL OR e.ts <= l.ended_at)
+      AND e.ts >= COALESCE(l.first_joined_at, l.joined_at) AND (l.ended_at IS NULL OR e.ts <= l.ended_at)
     WHERE m.project_id = @projectId AND m.user_id = @userId AND +e.user_id = @userId AND e.blob_ref IS NOT NULL ${eventSieve}
     GROUP BY e.seq`
   // `+e.user_id`: the unary plus keeps SQLite off the events primary key

@@ -91,15 +91,18 @@ export function hasActiveLink(db, missionId, convoId) {
 // was 'joined' and is now 'spawned' (the stronger account of the same
 // arrival). No other how is ever replaced.
 export function activateLink(db, { missionId, convoId, userId, how, ts }) {
-  db.prepare(`INSERT INTO mission_conversations(mission_id, convo_id, user_id, how, joined_at, ended_at)
-    VALUES(?,?,?,?,?,NULL)
+  // first_joined_at keeps the first stint's start across rejoins (SET
+  // expressions read the row as it was before this update).
+  db.prepare(`INSERT INTO mission_conversations(mission_id, convo_id, user_id, how, joined_at, ended_at, first_joined_at)
+    VALUES(?,?,?,?,?,NULL,?)
     ON CONFLICT(mission_id, convo_id) DO UPDATE SET
       ended_at = NULL,
+      first_joined_at = COALESCE(mission_conversations.first_joined_at, mission_conversations.joined_at),
       joined_at = excluded.joined_at,
       how = CASE WHEN mission_conversations.how = 'backfill' THEN excluded.how
                  WHEN mission_conversations.how = 'joined' AND excluded.how = 'spawned' THEN 'spawned'
                  ELSE mission_conversations.how END`)
-    .run(missionId, convoId, userId, how, ts)
+    .run(missionId, convoId, userId, how, ts, ts)
 }
 
 export function endLink(db, { missionId, convoId, ts }) {
