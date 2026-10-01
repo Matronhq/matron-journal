@@ -16,14 +16,20 @@ the machine-checkable version of this page.
   carries `parent_convo_id` (`null` for a normal conversation; set for a
   subagent child — see "Child conversations") and `agent_device_id` (the
   agent box that manages it; `null` for legacy rows created before ownership
-  was recorded). A conversation with at least one **joined** `convo_agents`
-  row (an agent-chat room, see "Agent chat") additionally carries
+  was recorded). A **room** — a conversation that has or ever had a
+  `convo_agents` row (any state) or a spawn naming it as its room (an
+  agent-chat room, see "Agent chat") — additionally carries
   `participants`: the recorded owner plus every joined participant's device
-  id, deduped and ascending — one box chip per id, client-side. The key is
-  omitted everywhere else (solo conversations, dissolved rooms, rooms whose
-  only joined participants were sieved out by the privacy predicate below),
-  so the wire is unchanged for everything that is not a live room.
-  Wherever `participants` appears, the row also carries
+  id, deduped and ascending — one box chip per id, client-side. A room with
+  nobody joined (still pending, or dissolved) carries just `[owner]`, the
+  same value its dissolve `convo_meta` carried: clients keep a stored value
+  when a key is absent, so a room always sends it and a client that missed
+  the dissolve frame is corrected by its next snapshot. The key is omitted
+  for every non-room conversation, so the wire is unchanged for solo
+  sessions. For an ordinary agent, rows involving a private device neither
+  count as members nor make a conversation a room, so a room only a private
+  box was ever in reads as a plain conversation.
+  Every room row also carries
   `participant_convos: [string]` — the room's participant **conversation**
   ids, so a client can show a room under its participants' missions. It is
   the deduped union, in journal order (row creation; asker before target,
@@ -44,8 +50,8 @@ the machine-checkable version of this page.
   lists the joiners' sessions alone. For an ordinary agent the same privacy
   sieve applies: a row whose participant device is private, and any id a
   private device owns, are dropped. `[]` when the room's sessions are
-  unknown (a pre-3.5 invite that named none); never present without
-  `participants`.
+  unknown (a pre-3.5 invite that named none) or nobody is joined (pending
+  or dissolved); present on exactly the rows that carry `participants`.
   Every row also carries `mission_id` — the conversation's **current**
   mission, or `null` — and `mission_count`, the number of missions it was
   ever linked to (active and ended; the header's "+n" is `mission_count − 1`).

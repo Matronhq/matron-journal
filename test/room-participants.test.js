@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { inviteParticipant, answerInvite, answerParkedInvite, recordJoined, leaveConvo, getParticipant, participantConvoIds } from '../src/participants.js'
+import { inviteParticipant, answerInvite, answerParkedInvite, recordJoined, leaveConvo, leaveAllParticipants, getParticipant, participantConvoIds } from '../src/participants.js'
 import { createSpawnRequest, claimApprove, markStarted } from '../src/spawns.js'
 import { snapshot } from '../src/journal.js'
 
@@ -35,9 +35,10 @@ test('snapshot: rooms carry participants (owner + joined), plain convos omit the
   await a.waitFor((f) => f.kind === 'journal' && f.convo_id === 'solo')
   inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x' })
 
-  // Merely invited is not membership — no participants array yet.
+  // Merely invited is not membership: the room carries only its owner (a
+  // room row always carries the key, so a client never keeps a stale set).
   let rows = Object.fromEntries(snapshot(s.db, dan.id).conversations.map((c) => [c.id, c]))
-  assert.equal(rows.room.participants, undefined, 'an invited-but-unanswered room is not yet multi-agent')
+  assert.deepEqual(rows.room.participants, [agA.deviceId], 'an invited-but-unanswered room is not yet multi-agent')
 
   answerInvite(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, accept: true })
   rows = Object.fromEntries(snapshot(s.db, dan.id).conversations.map((c) => [c.id, c]))
@@ -127,8 +128,8 @@ test('participant_convos: an accepted invite room yields both sessions; the fan 
   a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, target_convo_id: 'b-sess', from_convo_id: 'a-sess', justification: 'help' })
   await a.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
   assert.ok(answerParkedInvite(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, approve: true }))
-  // Invited is not membership: no key yet, exactly like participants.
-  assert.equal(rowsOf(snapshot(s.db, dan.id)).room.participant_convos, undefined)
+  // Invited is not membership: nobody's session yet, but the room carries the key.
+  assert.deepEqual(rowsOf(snapshot(s.db, dan.id)).room.participant_convos, [])
 
   b.send({ op: 'agent_invite_answer', room_id: 'room', accept: true })
   const meta = await client.waitFor((f) => f.kind === 'journal' && f.type === 'convo_meta'
@@ -148,10 +149,11 @@ test('participant_convos: a participant who left drops out (snapshot and the lea
     && f.convo_id === 'room' && f.payload.participants?.length === 1)
   assert.deepEqual(meta.payload.participant_convos, [])
   assert.deepEqual(participantConvoIds(s.db, 'room'), [])
-  // No joined row left: the room reads as no room, both keys omitted.
+  // No joined row left: the room still carries both keys, matching the
+  // leave fan, so a client that missed that frame is corrected by a snapshot.
   const row = rowsOf(snapshot(s.db, dan.id)).room
-  assert.equal(row.participants, undefined)
-  assert.equal(row.participant_convos, undefined)
+  assert.deepEqual(row.participants, [agA.deviceId])
+  assert.deepEqual(row.participant_convos, [])
 })
 
 test('participant_convos: a started spawn room yields parent and child; a left child takes both out', async (t) => {
@@ -307,4 +309,56 @@ test('participant_convos: a spawn child re-invited after leaving does not resurr
   inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x', targetConvoId: 'b-new' })
   answerInvite(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, accept: true })
   assert.deepEqual(participantConvoIds(s.db, 'room'), ['a-sess', 'c-sess', 'b-new'])
+})
+
+test('dissolved room: the owner-leave fan and the snapshot both carry participants [owner] and participant_convos []', async (t) => {
+  const { s, dan, agA, agB, a, b, client } = await fleet(t)
+  await sessions(a, b)
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x', targetConvoId: 'b-sess', initiatorConvoId: 'a-sess' })
+  b.send({ op: 'agent_invite_answer', room_id: 'room', accept: true })
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'convo_meta' && f.convo_id === 'room'
+    && f.payload.participant_convos?.length === 2)
+
+  a.send({ op: 'agent_leave', room_id: 'room' })
+  const meta = await client.waitFor((f) => f.kind === 'journal' && f.type === 'convo_meta' && f.convo_id === 'room'
+    && f.payload.participants?.length === 1)
+  assert.deepEqual(meta.payload.participants, [agA.deviceId])
+  assert.deepEqual(meta.payload.participant_convos, [])
+
+  // A client that missed that frame gets the same values from /snapshot,
+  // never an absent key it would read as "keep what you had".
+  const rows = rowsOf(snapshot(s.db, dan.id))
+  assert.deepEqual(rows.room.participants, [agA.deviceId])
+  assert.deepEqual(rows.room.participant_convos, [])
+  // A plain session is still no room.
+  assert.equal('participants' in rows['a-sess'], false)
+  assert.equal('participant_convos' in rows['a-sess'], false)
+})
+
+test('a spawn room with no joined member still reads as a room in the snapshot', async (t) => {
+  const { s, dan, agA, agB } = await fleet(t)
+  startedSpawnRoom(s, dan, agA, agB)
+  // Remove the membership row outright: the spawn alone marks it a room.
+  s.db.prepare('DELETE FROM convo_agents WHERE convo_id=?').run('room')
+  const row = rowsOf(snapshot(s.db, dan.id)).room
+  assert.deepEqual(row.participants, [agA.deviceId])
+  assert.deepEqual(row.participant_convos, [])
+})
+
+test('filtered snapshot: a room only a private box was ever in stays keyless; a mixed room keeps its keys after dissolving', async (t) => {
+  const { s, dan, agA, agB } = await fleet(t)
+  const agC = createAgent(s.db, dan.id, 'dev-c')
+  s.db.prepare('UPDATE devices SET private=1 WHERE id=?').run(agB.deviceId)
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x' })
+  answerInvite(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, accept: true })
+  let filtered = rowsOf(snapshot(s.db, dan.id, { excludePrivateOwned: true })).room
+  assert.equal('participants' in filtered, false, 'must not reveal a room made only by a private box')
+  assert.equal('participant_convos' in filtered, false)
+
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agC.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x', targetConvoId: 'c-sess', initiatorConvoId: 'a-sess' })
+  answerInvite(s.db, { convoId: 'room', agentDeviceId: agC.deviceId, accept: true })
+  leaveAllParticipants(s.db, 'room')
+  filtered = rowsOf(snapshot(s.db, dan.id, { excludePrivateOwned: true })).room
+  assert.deepEqual(filtered.participants, [agA.deviceId])
+  assert.deepEqual(filtered.participant_convos, [])
 })

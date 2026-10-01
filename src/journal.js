@@ -372,35 +372,51 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
      ORDER BY last_seq DESC`
   ).all(userId)
   // Room membership, so a client can chip every participating box, not just
-  // the recorded owner (spec: multi-agent room tags). One grouped query for
-  // all of this user's joined convo_agents rows, attached per-convo as
-  // `participants` (owner + joined, deduped, sorted). Convos with no joined
-  // row — solo sessions, dissolved rooms — omit the key entirely, so the
-  // wire stays byte-identical for everything that is not a live room. Same
-  // private-device sieve as the `agents` list below: a filtered caller must
-  // not learn a private box's id from a membership array.
+  // the recorded owner (spec: multi-agent room tags), and place a room under
+  // its participants' missions (spec: 2026-10-01 rooms under missions).
+  // Every ROOM row carries both keys; every other row omits both, so the wire
+  // stays byte-identical for solo sessions:
+  //   - `participants`: owner + joined device ids, deduped, ascending — the
+  //     array membership convo_meta frames carry (participantIds);
+  //   - `participant_convos`: the room's participant sessions
+  //     (participantConvoIds in participants.js), [] when unknown or when
+  //     nobody is joined.
+  // A room is any conversation that has, or ever had, a convo_agents row or
+  // a spawn naming it as its room — so a dissolved room still carries
+  // `participants: [owner]` and `participant_convos: []`, the same values its
+  // dissolve convo_meta carried. Clients keep a stored value when the key is
+  // absent, so omitting it there would strand a client that missed the
+  // dissolve frame with the old membership forever. Same private-device
+  // sieve as the `agents` list below: a filtered caller must not learn a
+  // private box's id from a membership array, nor that a room exists only
+  // because a private box was in it — rows involving a private device
+  // neither count as members nor make a conversation a room.
+  const sieve = (col) => excludePrivateOwned
+    ? ` AND NOT EXISTS(SELECT 1 FROM devices d WHERE d.id=${col} AND d.private=1)`
+    : ''
+  const roomIds = new Set(db.prepare(
+    `SELECT ca.convo_id AS id FROM convo_agents ca
+     JOIN conversations c ON c.id = ca.convo_id
+     WHERE c.owner_user_id=?${sieve('ca.agent_device_id')}${sieve('ca.initiator_device_id')}
+     UNION
+     SELECT s.room_id FROM agent_spawn_requests s
+     JOIN conversations c ON c.id = s.room_id
+     WHERE c.owner_user_id=?${sieve('s.from_device_id')}${sieve('s.target_device_id')}`
+  ).all(userId, userId).map((r) => r.id))
   const joinedRows = db.prepare(
     `SELECT ca.convo_id, ca.agent_device_id FROM convo_agents ca
      JOIN conversations c ON c.id = ca.convo_id
-     WHERE c.owner_user_id=? AND ca.state='joined'${excludePrivateOwned
-       ? ` AND NOT EXISTS(SELECT 1 FROM devices d WHERE d.id=ca.agent_device_id AND d.private=1)`
-       : ''}`
+     WHERE c.owner_user_id=? AND ca.state='joined'${sieve('ca.agent_device_id')}`
   ).all(userId)
   const joinedByConvo = new Map()
   for (const r of joinedRows) {
     if (!joinedByConvo.has(r.convo_id)) joinedByConvo.set(r.convo_id, [])
     joinedByConvo.get(r.convo_id).push(r.agent_device_id)
   }
-  // participant_convos (spec: 2026-10-01 rooms under missions): the room's
-  // participant CONVERSATIONS (see participantConvoIds in participants.js),
-  // so a client can show a room under its participants' missions. Rides
-  // exactly where `participants` does — same key-presence rule, same sieve —
-  // and is [] for a room whose sessions are unknown (pre-3.5 invites).
   const convosByRoom = participantConvosByRoom(db, userId, { excludePrivateOwned })
   for (const c of conversations) {
-    const joined = joinedByConvo.get(c.id)
-    if (!joined) continue
-    const ids = new Set(joined)
+    if (!roomIds.has(c.id)) continue
+    const ids = new Set(joinedByConvo.get(c.id) ?? [])
     if (c.agent_device_id != null) ids.add(c.agent_device_id)
     c.participants = [...ids].sort((a, b) => a - b)
     c.participant_convos = convosByRoom.get(c.id) ?? []
