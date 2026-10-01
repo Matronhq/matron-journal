@@ -20,6 +20,7 @@ import { handleLookupRoute } from './lookup-http.js'
 import { handleUsersRoute } from './users-http.js'
 import { githubAccountView } from './github-accounts.js'
 import { handleCoordinatorRoute } from './coordinator-http.js'
+import { handleNotifyRoute } from './notify-http.js'
 import { handleMemoriesRoute } from './memories-http.js'
 import { handleRoutinesRoute } from './routines-http.js'
 import { handleSeenRoute } from './seen-http.js'
@@ -285,6 +286,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         })
       }
       if (await handleCoordinatorRoute({ db, hub }, req, res, url, who)) return
+      if (await handleNotifyRoute({ db, hub }, req, res, url, who)) return
       // Coordinator consent approval (src/consent-http.js): the same answer
       // path the two client routes below use, gated on the Coordinator.
       if (await handleConsentRoute({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs, consentDailyCap }, req, res, url, who)) return

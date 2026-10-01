@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { openDb, setApnsRegistration, setPushPrefs } from '../src/db.js'
 import { makeHub } from '../src/hub.js'
 import { makePushPipeline, classify } from '../src/push.js'
+import { setNotifyPrefs, NOTIFY_EVENTS } from '../src/notify.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
 import { handleOp } from '../src/ws.js'
@@ -36,6 +37,10 @@ async function setup(t, { apnsClient, coalesceMs } = {}) {
   const pipeline = makePushPipeline({ db, hub, apnsClient: stub, coalesceMs })
   t.after(() => pipeline.close())
   upsertConversation(db, { id: 'c1', ownerUserId: dan.id, title: 'convo one' })
+  // Most of this file predates the notification settings and exercises
+  // pipeline mechanics against a user who receives everything; the settings
+  // themselves are covered in test/notify.test.js.
+  setNotifyPrefs(db, dan.id, { mode: 'custom', events: Object.fromEntries(NOTIFY_EVENTS.map((k) => [k, true])) })
   return { db, hub, dan, stub, pipeline }
 }
 
@@ -261,6 +266,7 @@ test('alert body: title falls back to convo id, body is the event snippet, badge
   upsertConversation(db, { id: 'no-title-convo', ownerUserId: dan.id }) // title stays ''
   upsertConversation(db, { id: 'c2', ownerUserId: dan.id })
   registerDevice(db, dan.id, 'phone')
+  setNotifyPrefs(db, dan.id, { mode: 'custom', events: { activity: true } })
 
   append(db, { userId: dan.id, convoId: 'c2', sender: 'agent:a', type: 'text', payload: { body: 'unread elsewhere' } })
   const r = append(db, { userId: dan.id, convoId: 'no-title-convo', sender: 'agent:a', type: 'text', payload: { body: 'hello there, this is the body' } })
@@ -545,6 +551,8 @@ test('end-to-end wiring: real WS ops reach the push pipeline through both ws.js 
   // is opt-in by default (see push_prefs defaults) — opt phone in so this
   // wiring check isn't tangled up with prefs enforcement.
   await s.http('/push/prefs', { method: 'PUT', token: login.json.token, body: { activity: true } })
+  // ...and the user-level switch (notification settings), off in both presets.
+  assert.equal((await s.http('/notify', { method: 'PUT', token: login.json.token, body: { mode: 'custom', events: { activity: true } } })).status, 200)
 
   const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
   await agent.waitFor((f) => f.op === 'hello_ok')
@@ -669,9 +677,12 @@ test('push_prefs: a disabled category skips that device only; wake is never filt
   assert.equal(wakes[0].deviceToken, 'phone-token')
 })
 
-test('push_prefs: NULL prefs default activity off — routine pushes are skipped, attention/done still send', async (t) => {
+test('push_prefs: a NULL-prefs device follows the user\'s synced switches (default: activity off), attention/done still send', async (t) => {
   const { db, dan, stub, pipeline } = await setup(t, { coalesceMs: 50 })
   registerDevice(db, dan.id, 'phone', { prefs: null }) // exercise the real defaults, not this file's fixture-level all-on override
+  // Back to the user defaults (no Coordinator set, so they behave as
+  // every-session: activity off, turns on).
+  db.prepare('UPDATE user_settings SET notify_prefs=NULL WHERE user_id=?').run(dan.id)
 
   const fire = (type, payload, hint) => {
     const r = append(db, { userId: dan.id, convoId: 'c1', sender: 'agent:a', type, payload })
