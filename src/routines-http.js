@@ -12,6 +12,7 @@ import {
 } from './routines.js'
 import { emitRoutineMarker } from './routines-marker.js'
 import { coordinatorDevice } from './consent.js'
+import { currentSubjects, trigMessage } from './routines-triggers.js'
 
 const conflict = (res, blockedBy) => { json(res, 409, { error: 'conflict', blocked_by: blockedBy }); return true }
 
@@ -67,7 +68,11 @@ export async function handleRoutinesRoute(ctx, req, res, url, who) {
     }
     markRun(db, routine.id)
     json(res, 202, { accepted: true })
-    void ctx.routineFirer.fire(row).catch((err) => console.error(`routines: run of ${routine.name} failed`, err))
+    // A triggered routine run by hand carries whatever is tripped right now
+    // (state untouched, so the sweep's own bookkeeping is unaffected).
+    const message = routine.trigger ? trigMessage(routine.prompt, currentSubjects(db, row, { now: Date.now() })) : null
+    void ctx.routineFirer.fire(row, { message, onOutcome: (outcome) => db.prepare('UPDATE routines SET last_outcome=? WHERE id=?').run(outcome, routine.id) })
+      .catch((err) => console.error(`routines: run of ${routine.name} failed`, err))
     return true
   }
   if (req.method === 'GET') {
@@ -85,7 +90,7 @@ export async function handleRoutinesRoute(ctx, req, res, url, who) {
     try {
       routine = updateRoutine(db, { userId: who.userId, key, fields: v.value })
     } catch (err) {
-      if (err.message === 'bad_schedule') return badRequest(res)
+      if (err.message === 'bad_schedule' || err.message === 'mixed') return badRequest(res)
       throw err
     }
     if (!routine) return notFound(res)

@@ -25,7 +25,7 @@ const fields = (over = {}) => ({ name: 'daily-sweep', title: 'Daily sweep', sche
 test('validateRoutineFields: the full shape, defaults, and every refusal', () => {
   const ok = validateRoutineFields(fields())
   assert.equal(ok.ok, true)
-  assert.deepEqual(ok.value, { name: 'daily-sweep', title: 'Daily sweep', schedule: '5 7 * * *', prompt: 'Routine daily-sweep: sweep.', tz: 'Europe/London', enabled: true })
+  assert.deepEqual(ok.value, { name: 'daily-sweep', title: 'Daily sweep', schedule: '5 7 * * *', trigger: null, prompt: 'Routine daily-sweep: sweep.', tz: 'Europe/London', enabled: true })
   // Partial (PATCH): only the given keys, no defaults filled in.
   const part = validateRoutineFields({ enabled: false, prompt: ' trimmed \n' }, { partial: true })
   assert.deepEqual(part, { ok: true, value: { enabled: false, prompt: 'trimmed' } })
@@ -38,6 +38,10 @@ test('validateRoutineFields: the full shape, defaults, and every refusal', () =>
   bad({ schedule: '*/10 * * * *' })       // every 10 minutes: still under it
   bad({ schedule: '0 0 * * * *' })        // six fields (seconds) are not accepted
   bad({ schedule: '99 7 * * *' }); bad({ schedule: 'daily' }); bad({ schedule: '' })
+  bad({ schedule: '0 0 30 2 *' })         // never fires (30 Feb): fewer than five future runs
+  // Across the spring-forward fold croner reports the skipped hour twice at
+  // the same instant; that is not a 0-minute gap (review finding 4).
+  assert.equal(validateRoutineFields(fields({ schedule: '0 1,2 * * *' }), { now: Date.parse('2027-03-27T12:00:00Z') }).ok, true)
   bad({ tz: 'Nope/Zone' }); bad({ tz: '' }); bad({ tz: 7 })
   bad({ enabled: 'yes' })
   bad({ name: 'x' }, true)                // name is not editable
@@ -132,6 +136,22 @@ test('dueRoutines / advanceRoutine / recordOutcome: due on next_at or retry_at, 
   // A paused routine is never due, and recordOutcome never re-arms it.
   recordOutcome(db, paused.id, { outcome: 'applied now', retryable: true, now: late })
   assert.deepEqual(dueRoutines(db, late + 3600000).map((r) => r.name), ['b'])
+  // Paused between dueRoutines and advanceRoutine: not fired (review finding 2).
+  db.prepare('UPDATE routines SET enabled=0 WHERE id=?').run(b.id)
+  assert.equal(advanceRoutine(db, b.id, late + 3600000), null)
+  db.prepare('UPDATE routines SET enabled=1 WHERE id=?').run(b.id)
+  // A stale retry (the journal was down for hours) is missed, not delivered,
+  // and a past next_at is moved on with it (review finding 1).
+  db.prepare('UPDATE routines SET retry_at=?, next_at=? WHERE id=?').run(late - 8 * 3600000, late - 7 * 3600000, b.id)
+  const staleRetry = advanceRoutine(db, b.id, late)
+  assert.equal(staleRetry.missed, true)
+  assert.equal(staleRetry.retry, true)
+  assert.ok(staleRetry.routine.next_at > late)
+  assert.equal(getRoutine(db, dan.id, b.id).last_outcome, 'missed')
+  // A fresh retry whose next_at has meanwhile passed advances next_at too.
+  db.prepare('UPDATE routines SET retry_at=?, next_at=? WHERE id=?').run(late - 60000, late - 30000, b.id)
+  const fresh = advanceRoutine(db, b.id, late)
+  assert.equal(fresh.missed, false); assert.equal(fresh.retry, true); assert.ok(fresh.routine.next_at > late)
 })
 
 test('seedRoutines: the starter set once per user, at Coordinator assignment or boot, never after the user emptied the list', async () => {
@@ -139,10 +159,10 @@ test('seedRoutines: the starter set once per user, at Coordinator assignment or 
   const pat = await createUser(db, 'pat', 'pw')
   upsertConversation(db, { id: 'coord', ownerUserId: dan.id, title: 'Coordinator' })
   assert.equal(seedRoutines(db, dan.id, T0), STARTER_ROUTINES.length)
-  assert.deepEqual(listRoutines(db, dan.id).map((r) => [r.name, r.schedule, r.tz, r.origin]), [...STARTER_ROUTINES].sort((x, y) => x.name.localeCompare(y.name)).map((r) => [r.name, r.schedule, 'Europe/London', 'seed']))
+  assert.deepEqual(listRoutines(db, dan.id).map((r) => [r.name, r.schedule, r.tz, r.origin]), [...STARTER_ROUTINES].sort((x, y) => x.name.localeCompare(y.name)).map((r) => [r.name, r.schedule ?? null, 'Europe/London', 'seed']))
   for (const r of listRoutines(db, dan.id)) {
     assert.equal(validateRoutineFields(r).ok, true, r.name)
-    assert.ok(r.next_at > T0)
+    if (r.schedule) assert.ok(r.next_at > T0); else assert.equal(r.next_at, null)
     assert.match(r.prompt, new RegExp(`^Routine ${r.name}: `))
   }
   assert.equal(seedRoutines(db, dan.id, T0), 0, 'already seeded')

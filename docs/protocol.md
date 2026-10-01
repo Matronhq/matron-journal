@@ -1697,25 +1697,49 @@ the others theirs. No-op without a wake command.
 
 Spec: `docs/superpowers/specs/2026-10-01-coordinator-routines-design.md`.
 
-A routine is a schedule and a prompt the journal owns (`routines` table,
+A routine is a prompt the journal owns (`routines` table,
 `src/routines.js`) and fires into whichever conversation holds the
-Coordinator role — nothing in any conversation keeps it alive. Fields:
-`id` (`rt_…`), `name` (slug `/^[a-z0-9][a-z0-9-]{0,63}$/`, unique per
-user, the handle agents and prompts use), `title` (one line ≤ 200),
-`schedule` (exactly five cron fields, evaluated by `croner` in `tz`),
-`tz` (IANA, default `Europe/London`), `prompt` (≤ 2000 chars, line breaks
+Coordinator role — on a schedule, or when a trigger trips — so nothing in
+any conversation keeps it alive. Fields: `id` (`rt_…`), `name` (slug
+`/^[a-z0-9][a-z0-9-]{0,63}$/`, unique per user, the handle agents and
+prompts use), `title` (one line ≤ 200), exactly one of `schedule` (five
+cron fields, evaluated by `croner` in `tz`) and `trigger` (below), `tz`
+(IANA, default `Europe/London`), `prompt` (≤ 2000 chars, line breaks
 kept, other control characters stripped), `enabled`, `origin`
-(`seed|user|agent`), `next_at` (ms; NULL while paused), `last_fired_at`,
-`last_outcome`, `created_at`, `updated_at`. A schedule whose consecutive
-fires (checked over the next five from now) are under 15 minutes apart is
-`bad_request`: a routine is a check-in, not a poll. At most 50 per user.
+(`seed|user|agent`), `next_at` (ms; NULL while paused, always NULL for a
+triggered routine), `last_fired_at`, `last_outcome`, `created_at`,
+`updated_at`. A schedule whose consecutive fires (checked over the next
+five from now) are under 15 minutes apart, or with fewer than five future
+fires, is `bad_request`: a routine is a check-in, not a poll. At most 50
+per user. A routine is scheduled or triggered for life: `PATCH` may give
+`schedule` only to a scheduled routine and `trigger` only to a triggered
+one, never both (`bad_request`).
+
+**Triggers.** `trigger` is `{kind:'context_over', pct}` (1–99: a live
+session, never the Coordinator's own, whose context gauge is at or past
+`pct`), `{kind:'stalled', reset_minutes}` (0–10080, default 120: a live
+session stalled on a usage limit whose reset is at least that far away or
+unknown) or `{kind:'disk_under', pct}` (an agent box under `pct`% free
+disk), evaluated against `conversation_status` and `device_status` by a
+sweep every five minutes (`src/routines-triggers.js`), as the Coordinator's
+box may see them (private-owned sessions and private boxes are invisible
+to a Coordinator on an ordinary box). Each matching subject (`convo:<id>`
+or `device:<id>`) fires **once per crossing**: `routine_trigger_state`
+records the subjects fired for and forgets them when they stop matching.
+The fire's `message` is the prompt plus a `Tripped by:` list, one line per
+fresh subject (`- [title](matron://convo/<id>) at 42% of its window
+(model)`, `- […] stalled on <model>, resets <iso> (in 5 h)` / `no reset
+time`, `- <box>: 15% free (15.0 GB of 100.0 GB)`). Pausing a triggered
+routine or changing its trigger clears its records; a retryable delivery
+failure forgets the fresh subjects and backs the routine off 15 minutes;
+`run` fires with whatever matches now, records untouched.
 
 | Route | Who | Body | Returns |
 |---|---|---|---|
 | `GET /routines` | any | | 200 `{routines}` by name |
 | `GET /routines/:key` | any | | 200 `{routine}`; `:key` is the id or the name |
-| `POST /routines` | client, or the Coordinator | `{name, title, schedule, prompt, tz?, enabled?, convo_id?}` | 201 `{routine}`; **409** `{error:'conflict', blocked_by:'name'|'cap'}` |
-| `PATCH /routines/:key` | client, or the Coordinator | `{title?, schedule?, tz?, prompt?, enabled?, convo_id?}` — at least one; `name` is not editable | 200 `{routine}` |
+| `POST /routines` | client, or the Coordinator | `{name, title, schedule \| trigger, prompt, tz?, enabled?, convo_id?}` | 201 `{routine}`; **409** `{error:'conflict', blocked_by:'name'|'cap'}` |
+| `PATCH /routines/:key` | client, or the Coordinator | `{title?, schedule?, trigger?, tz?, prompt?, enabled?, convo_id?}` — at least one; `name` is not editable | 200 `{routine}` |
 | `DELETE /routines/:key` | client only (agent → **403** `forbidden`) | | 200 `{ok:true}` |
 | `POST /routines/:key/run` | client, or the Coordinator | `{convo_id?}` | 202 `{accepted:true}`, or `{delivered:false, reason:'no_coordinator'\|'busy'}` |
 
@@ -1732,13 +1756,14 @@ alone. `run` fires whatever `enabled` says, stamps `last_fired_at`, and
 never touches `next_at`.
 
 **Firing** (`src/routines-sweep.js`). Once a minute (`MATRON_ROUTINES=0`
-turns the sweep off; the routes and `run` still work) the journal takes
-every enabled routine whose `next_at` or `retry_at` has passed and, in one
-transaction *before* delivering, stamps `last_fired_at`, moves `next_at`
-past now and clears `retry_at` — so a crash, a slow wake or a restart
-mid-delivery never fires the same occurrence twice. A scheduled fire more
-than 6 hours late is recorded as `last_outcome: 'missed'` and not
-delivered. Delivery is the Alertmanager relay's path: resolve the
+turns both sweeps off; the routes and `run` still work) the journal takes
+every enabled scheduled routine whose `next_at` or `retry_at` has passed
+and, in one transaction *before* delivering, stamps `last_fired_at`, moves
+`next_at` past now and clears `retry_at` — so a crash, a slow wake or a
+restart mid-delivery never fires the same occurrence twice. A fire more
+than 6 hours late (measured from `retry_at` for a retry, `next_at`
+otherwise) is recorded as `last_outcome: 'missed'` and not delivered; a
+routine paused between the due query and its advance is not fired. Delivery is the Alertmanager relay's path: resolve the
 Coordinator and its box (none → `no_coordinator`), `wakeIfOffline`, wait
 for the box to attach (`MATRON_SPAWN_WAKE_WAIT_MS`) when a wake was fired,
 then issue the journal-originated RPC
@@ -1780,8 +1805,10 @@ already had one — the journal creates the starter set with `origin:
 per user and never again after the user empties the list: `daily-sweep`
 07:05, `session-health` every 2 h, `project-status` 08:00 and 17:00,
 `unseen-digest` 12:00 and 18:00, `deploy-window` 18:30 Mon–Fri, all
-Europe/London, each prompt one line pointing at the Coordinator playbook's
-section of that name.
+Europe/London, plus the triggered `context-over` (`context_over` 40),
+`stalled-session` (`stalled` 120) and `disk-low` (`disk_under` 20) — each
+prompt one line pointing at the Coordinator playbook's section of that
+name.
 
 ## Memories
 

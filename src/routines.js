@@ -35,7 +35,38 @@ export const STARTER_ROUTINES = Object.freeze([
   { name: 'project-status', title: 'Project status refresh', schedule: '0 8,17 * * *', prompt: 'Routine project-status: follow the Project status refresh section of your playbook.' },
   { name: 'unseen-digest', title: 'Unseen digest', schedule: '0 12,18 * * *', prompt: 'Routine unseen-digest: follow the Unseen digest section of your playbook.' },
   { name: 'deploy-window', title: 'Evening deploy window', schedule: '30 18 * * 1-5', prompt: 'Routine deploy-window: follow the Evening deploy window section of your playbook.' },
+  // Triggered (Dan, 1 Oct: "Add triggers"): fired the moment a rule trips,
+  // once per session or box per crossing, with the specifics in the turn.
+  { name: 'context-over', title: 'Session context over the threshold', trigger: { kind: 'context_over', pct: 40 }, prompt: 'Routine context-over: follow the Session context over the threshold section of your playbook.' },
+  { name: 'stalled-session', title: 'Session stalled on a usage limit', trigger: { kind: 'stalled', reset_minutes: 120 }, prompt: 'Routine stalled-session: follow the Session stalled on a usage limit section of your playbook.' },
+  { name: 'disk-low', title: 'Box disk under the threshold', trigger: { kind: 'disk_under', pct: 20 }, prompt: 'Routine disk-low: follow the Box disk under the threshold section of your playbook.' },
 ])
+
+// Triggers (spec "Triggers"): what a routine can fire on instead of a clock.
+//   context_over {pct}        a live session's context gauge at or past pct
+//   stalled {reset_minutes}   a session stalled on a usage limit whose reset
+//                             is at least reset_minutes away, or unknown
+//   disk_under {pct}          an agent box with under pct% free disk
+export const TRIGGER_KINDS = Object.freeze(['context_over', 'stalled', 'disk_under'])
+const STALLED_DEFAULT_MINUTES = 120
+const STALLED_MAX_MINUTES = 7 * 24 * 60
+
+export function validateTrigger(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const keys = Object.keys(raw).filter((k) => raw[k] !== undefined)
+  if (!TRIGGER_KINDS.includes(raw.kind)) return null
+  if (raw.kind === 'stalled') {
+    if (keys.some((k) => !['kind', 'reset_minutes'].includes(k))) return null
+    const m = raw.reset_minutes === undefined ? STALLED_DEFAULT_MINUTES : raw.reset_minutes
+    if (!Number.isInteger(m) || m < 0 || m > STALLED_MAX_MINUTES) return null
+    return { kind: 'stalled', reset_minutes: m }
+  }
+  if (keys.some((k) => !['kind', 'pct'].includes(k))) return null
+  if (!Number.isInteger(raw.pct) || raw.pct < 1 || raw.pct > 99) return null
+  return { kind: raw.kind, pct: raw.pct }
+}
+
+export const parseTrigger = (text) => { try { return text ? validateTrigger(JSON.parse(text)) : null } catch { return null } }
 
 export const newRoutineId = () => `rt_${randomBytes(8).toString('hex')}`
 
@@ -63,8 +94,15 @@ function validSchedule(schedule, tz, now) {
   const cron = cronOf(schedule, tz)
   if (!cron) return false
   const runs = cron.nextRuns(GAP_CHECK_FIRES, new Date(now))
-  if (!runs.length) return false
-  for (let i = 1; i < runs.length; i++) if (runs[i].getTime() - runs[i - 1].getTime() < MIN_GAP_MS) return false
+  // Fewer fires than asked for means the pattern runs out (a date that
+  // never comes): an enabled routine would silently stop with next_at NULL.
+  if (runs.length < GAP_CHECK_FIRES) return false
+  for (let i = 1; i < runs.length; i++) {
+    const gap = runs[i].getTime() - runs[i - 1].getTime()
+    // Across a spring-forward fold croner reports the skipped hour as the
+    // same instant twice; nextRun() fires it once, so a 0 gap is not a poll.
+    if (gap > 0 && gap < MIN_GAP_MS) return false
+  }
   return true
 }
 
@@ -100,7 +138,13 @@ export function validateRoutineFields(body, { partial = false, now = Date.now() 
     if (!validTz(tz)) return { ok: false }
     out.tz = tz
   }
-  if ('schedule' in body || !partial) {
+  // Exactly one of schedule and trigger on create; on a PATCH either may be
+  // given (updateRoutine refuses the one the row does not have), never both.
+  const hasSchedule = body.schedule !== undefined && body.schedule !== null
+  const hasTrigger = body.trigger !== undefined && body.trigger !== null
+  if (hasSchedule && hasTrigger) return { ok: false }
+  if (!partial && !hasSchedule && !hasTrigger) return { ok: false }
+  if (hasSchedule) {
     // Spacing depends on the zone only at DST edges; validate against the
     // zone given (or the default) — a PATCH of schedule alone is checked
     // against the default zone here and the row's own zone in updateRoutine.
@@ -108,6 +152,13 @@ export function validateRoutineFields(body, { partial = false, now = Date.now() 
     const schedule = body.schedule.trim()
     if (!validSchedule(schedule, out.tz ?? DEFAULT_TZ, now)) return { ok: false }
     out.schedule = schedule
+    if (!partial) out.trigger = null
+  }
+  if (hasTrigger) {
+    const trigger = validateTrigger(body.trigger)
+    if (!trigger) return { ok: false }
+    out.trigger = trigger
+    if (!partial) out.schedule = null
   }
   if ('enabled' in body || !partial) {
     const e = body.enabled === undefined ? true : body.enabled
@@ -121,6 +172,8 @@ export function routineRow(row) {
   if (!row) return null
   const { retry_at: _retry, ...out } = row
   out.enabled = !!out.enabled
+  out.schedule = out.schedule ?? null
+  out.trigger = parseTrigger(out.trigger)
   return out
 }
 
@@ -141,9 +194,9 @@ export function createRoutine(db, { userId, origin, fields, now = Date.now() }) 
     if (n >= ROUTINES_MAX) throw new Error('cap')
     if (db.prepare('SELECT 1 FROM routines WHERE user_id=? AND name=?').get(userId, fields.name)) throw new Error('conflict')
     const id = newRoutineId()
-    const nextAt = fields.enabled ? nextRunAt(fields.schedule, fields.tz, now) : null
-    db.prepare(`INSERT INTO routines(id, user_id, name, title, schedule, tz, prompt, enabled, origin, next_at, created_at, updated_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, userId, fields.name, fields.title, fields.schedule, fields.tz, fields.prompt, fields.enabled ? 1 : 0, origin, nextAt, now, now)
+    const nextAt = fields.enabled && fields.schedule ? nextRunAt(fields.schedule, fields.tz, now) : null
+    db.prepare(`INSERT INTO routines(id, user_id, name, title, schedule, trigger, tz, prompt, enabled, origin, next_at, created_at, updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, userId, fields.name, fields.title, fields.schedule ?? null, fields.trigger ? JSON.stringify(fields.trigger) : null, fields.tz, fields.prompt, fields.enabled ? 1 : 0, origin, nextAt, now, now)
     return getRoutine(db, userId, id)
   })()
 }
@@ -154,16 +207,24 @@ export function updateRoutine(db, { userId, key, fields, now = Date.now() }) {
   return db.transaction(() => {
     const row = db.prepare(`SELECT * FROM routines WHERE user_id=? AND ${byKey(key)}`).get(userId, key)
     if (!row) return null
+    // A scheduled routine stays scheduled and a triggered one triggered: the
+    // kind is chosen at creation (the apps create; a PATCH edits).
+    if (fields.schedule !== undefined && fields.schedule !== null && row.schedule == null) throw new Error('mixed')
+    if (fields.trigger !== undefined && fields.trigger !== null && row.trigger == null) throw new Error('mixed')
     const next = { ...row, ...fields, enabled: fields.enabled === undefined ? !!row.enabled : fields.enabled }
-    if (fields.schedule !== undefined || fields.tz !== undefined) {
+    const scheduled = row.schedule != null
+    if (scheduled && (fields.schedule !== undefined || fields.tz !== undefined)) {
       if (!validSchedule(next.schedule, next.tz, now)) throw new Error('bad_schedule')
     }
-    const reschedule = fields.schedule !== undefined || fields.tz !== undefined || (next.enabled && !row.enabled)
+    const reschedule = scheduled && (fields.schedule !== undefined || fields.tz !== undefined || (next.enabled && !row.enabled))
     let nextAt = row.next_at
     let retryAt = row.retry_at
     if (!next.enabled) { nextAt = null; retryAt = null } else if (reschedule) { nextAt = nextRunAt(next.schedule, next.tz, now); retryAt = null }
-    db.prepare(`UPDATE routines SET title=?, schedule=?, tz=?, prompt=?, enabled=?, next_at=?, retry_at=?, updated_at=? WHERE id=?`)
-      .run(next.title, next.schedule, next.tz, next.prompt, next.enabled ? 1 : 0, nextAt, retryAt, now, row.id)
+    const triggerText = scheduled ? null : JSON.stringify(fields.trigger ?? parseTrigger(row.trigger))
+    db.prepare(`UPDATE routines SET title=?, schedule=?, trigger=?, tz=?, prompt=?, enabled=?, next_at=?, retry_at=?, updated_at=? WHERE id=?`)
+      .run(next.title, scheduled ? next.schedule : null, triggerText, next.tz, next.prompt, next.enabled ? 1 : 0, nextAt, retryAt, now, row.id)
+    // A paused or re-thresholded trigger starts afresh: its subjects re-trip.
+    if (!scheduled && (!next.enabled || fields.trigger !== undefined)) db.prepare('DELETE FROM routine_trigger_state WHERE routine_id=?').run(row.id)
     return getRoutine(db, userId, row.id)
   })()
 }
@@ -180,8 +241,13 @@ export function deleteRoutine(db, userId, key) {
 // What the sweep fires this minute: enabled, and either the scheduled time
 // or the one retry has come. Oldest first so a backlog drains in order.
 export function dueRoutines(db, now = Date.now()) {
-  return db.prepare(`SELECT * FROM routines WHERE enabled=1 AND ((next_at IS NOT NULL AND next_at<=?) OR (retry_at IS NOT NULL AND retry_at<=?))
+  return db.prepare(`SELECT * FROM routines WHERE enabled=1 AND schedule IS NOT NULL AND ((next_at IS NOT NULL AND next_at<=?) OR (retry_at IS NOT NULL AND retry_at<=?))
     ORDER BY COALESCE(retry_at, next_at), id`).all(now, now).map(routineRow)
+}
+
+// Every enabled triggered routine whose retry backoff (if any) has passed.
+export function triggeredRoutines(db, now = Date.now()) {
+  return db.prepare('SELECT * FROM routines WHERE enabled=1 AND trigger IS NOT NULL AND (retry_at IS NULL OR retry_at<=?) ORDER BY user_id, name').all(now).map(routineRow)
 }
 
 // Advance BEFORE delivery, in one transaction: last_fired_at stamped,
@@ -193,14 +259,19 @@ export function dueRoutines(db, now = Date.now()) {
 export function advanceRoutine(db, id, now = Date.now()) {
   return db.transaction(() => {
     const row = db.prepare('SELECT * FROM routines WHERE id=?').get(id)
-    if (!row) return null
+    // Paused between the due query and now: nothing fires.
+    if (!row || !row.enabled || !row.schedule) return null
     const retry = row.retry_at != null && row.retry_at <= now
-    const missed = !retry && row.next_at != null && now - row.next_at > MISSED_AFTER_MS
-    const nextAt = row.enabled ? nextRunAt(row.schedule, row.tz, now) : null
+    // A retry is as stale as its own time, a scheduled fire as next_at.
+    const lateBy = retry ? now - row.retry_at : row.next_at != null ? now - row.next_at : 0
+    const missed = lateBy > MISSED_AFTER_MS
+    // next_at moves past now whenever it has been reached — on a retry too,
+    // so a retry never leaves a scheduled time behind to be reported missed.
+    const nextAt = row.next_at != null && row.next_at <= now ? nextRunAt(row.schedule, row.tz, now) : row.next_at
     if (missed) {
       db.prepare('UPDATE routines SET next_at=?, retry_at=NULL, last_outcome=? WHERE id=?').run(nextAt, 'missed', id)
     } else if (retry) {
-      db.prepare('UPDATE routines SET retry_at=NULL WHERE id=?').run(id)
+      db.prepare('UPDATE routines SET next_at=?, retry_at=NULL WHERE id=?').run(nextAt, id)
     } else {
       db.prepare('UPDATE routines SET last_fired_at=?, next_at=?, retry_at=NULL WHERE id=?').run(now, nextAt, id)
     }

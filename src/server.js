@@ -318,6 +318,7 @@ export function startServer({
   // Coordinator routines (src/routines-sweep.js). MATRON_ROUTINES=0 stops
   // the sweep (the routes and `run` still work).
   routinesSweepIntervalMs = null,
+  routinesTriggerIntervalMs = null,
   routinesSweep = process.env.MATRON_ROUTINES !== '0',
   mediaReapHighPct, mediaReapLowPct, waker, transcriber, github, githubRefreshIntervalMs, webDir,
   appleAppIds, androidPackage, androidCertSha256, tokenKey,
@@ -384,7 +385,7 @@ export function startServer({
   // once-a-minute sweep, and the one-off seed for users who already have a
   // Coordinator (new assignments seed in coordinator-http.js).
   const routineFirer = makeRoutineFirer({ db, hub, broker, waker: resolvedWaker, wakeWaitMs: effectiveWakeWaitMs, timeoutMs: sessionControlTimeoutMs })
-  const routinesSweeper = startRoutinesSweep({ db, firer: routineFirer, enabled: routinesSweep, ...(routinesSweepIntervalMs ? { intervalMs: routinesSweepIntervalMs } : {}) })
+  const routinesSweeper = startRoutinesSweep({ db, firer: routineFirer, enabled: routinesSweep, ...(routinesSweepIntervalMs ? { intervalMs: routinesSweepIntervalMs } : {}), ...(routinesTriggerIntervalMs ? { triggerIntervalMs: routinesTriggerIntervalMs } : {}) })
   try {
     for (const { user_id: userId } of db.prepare('SELECT user_id FROM user_settings WHERE coordinator_convo_id IS NOT NULL AND routines_seeded_at IS NULL').all()) {
       const n = seedRoutines(db, userId)

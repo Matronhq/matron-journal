@@ -410,16 +410,20 @@ CREATE TABLE IF NOT EXISTS unseen_nudged(
   PRIMARY KEY(user_id, ref)
 );
 -- Coordinator routines (spec 2026-10-01 coordinator routines): a schedule
--- and a prompt the journal owns and fires into whichever conversation holds
--- the Coordinator role. next_at is the next fire in ms (NULL while paused);
--- retry_at the one retry after a failed delivery (internal, never on the
--- wire). Names are the handle agents and prompts use, unique per user.
+-- (or a trigger) and a prompt the journal owns and fires into whichever
+-- conversation holds the Coordinator role. Exactly one of schedule (5-field
+-- cron in tz) and trigger (JSON: context_over / stalled / disk_under) is
+-- set. next_at is the next scheduled fire in ms (NULL while paused, and
+-- always NULL for a triggered routine); retry_at the one retry after a
+-- failed delivery (internal, never on the wire). Names are the handle
+-- agents and prompts use, unique per user.
 CREATE TABLE IF NOT EXISTS routines(
   id            TEXT PRIMARY KEY,
   user_id       INTEGER NOT NULL REFERENCES users(id),
   name          TEXT NOT NULL,
   title         TEXT NOT NULL,
-  schedule      TEXT NOT NULL,
+  schedule      TEXT,
+  trigger       TEXT,
   tz            TEXT NOT NULL,
   prompt        TEXT NOT NULL,
   enabled       INTEGER NOT NULL DEFAULT 1,
@@ -430,9 +434,19 @@ CREATE TABLE IF NOT EXISTS routines(
   last_outcome  TEXT,
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL,
-  UNIQUE(user_id, name)
+  UNIQUE(user_id, name),
+  CHECK((schedule IS NULL) <> (trigger IS NULL))
 );
 CREATE INDEX IF NOT EXISTS idx_routines_due ON routines(enabled, next_at);
+-- A triggered routine's currently-tripped subjects (convo:<id> or
+-- device:<id>): a row means this crossing has been fired for; it is removed
+-- when the condition clears, so the next crossing fires again.
+CREATE TABLE IF NOT EXISTS routine_trigger_state(
+  routine_id TEXT NOT NULL REFERENCES routines(id) ON DELETE CASCADE,
+  subject    TEXT NOT NULL,
+  tripped_at INTEGER NOT NULL,
+  PRIMARY KEY(routine_id, subject)
+);
 `
 
 export function openDb(path) {

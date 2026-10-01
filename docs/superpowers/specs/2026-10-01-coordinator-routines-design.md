@@ -1,6 +1,6 @@
 # Coordinator routines — journal-owned schedules and a playbook loaded at spawn
 
-**Status:** approved by Dan, 1 Oct 2026 (tracker item "Plan: journal-owned Coordinator routines + a playbook loaded at spawn", answered "build it"). Mission 5651.
+**Status:** approved by Dan, 1 Oct 2026 (tracker item "Plan: journal-owned Coordinator routines + a playbook loaded at spawn", answered "build it"; triggers added the same day on "Add triggers"). Mission 5651.
 **Repos:** matron-journal (routines table, routes, sweep, firing, seeding), matron-bridge (the `routine` session-control action, `routine_*` tools, the playbook), matron-apple (Settings ▸ Coordinator ▸ Routines — a separate mission).
 **Related:** [memories](2026-09-27-memories-design.md), [read state](2026-09-30-read-state-design.md), matron-bridge `2026-09-29-coordinator-session-control-design.md` (session control, the Alertmanager relay).
 
@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS routines(
   user_id       INTEGER NOT NULL REFERENCES users(id),
   name          TEXT NOT NULL,               -- slug, the handle agents and prompts use
   title         TEXT NOT NULL,
-  schedule      TEXT NOT NULL,               -- 5-field cron, in `tz`
+  schedule      TEXT,                        -- 5-field cron, in `tz` — or NULL for a triggered routine
+  trigger       TEXT,                        -- JSON, see "Triggers" — exactly one of schedule/trigger
   tz            TEXT NOT NULL,               -- IANA zone, default Europe/London
   prompt        TEXT NOT NULL,               -- the turn text, ≤ 2000 chars
   enabled       INTEGER NOT NULL DEFAULT 1,
@@ -29,16 +30,46 @@ CREATE TABLE IF NOT EXISTS routines(
   last_outcome  TEXT,
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL,
-  UNIQUE(user_id, name)
+  UNIQUE(user_id, name),
+  CHECK((schedule IS NULL) <> (trigger IS NULL))
 );
 CREATE INDEX IF NOT EXISTS idx_routines_due ON routines(enabled, next_at);
+CREATE TABLE IF NOT EXISTS routine_trigger_state(   -- a triggered routine's currently-tripped subjects
+  routine_id TEXT NOT NULL REFERENCES routines(id) ON DELETE CASCADE,
+  subject    TEXT NOT NULL,                  -- convo:<id> | device:<id>
+  tripped_at INTEGER NOT NULL,
+  PRIMARY KEY(routine_id, subject)
+);
 ```
 
 `user_settings` gains `routines_seeded_at INTEGER` (added with the same `PRAGMA table_info` guard as `coordinator_consent`), so the starter set is seeded once per user and never again after the user deletes it.
 
 Limits: `name` matches `/^[a-z0-9][a-z0-9-]{0,63}$/`; `title` one line ≤ 200; `prompt` ≤ 2000 characters (the session-control message cap), control characters other than newlines stripped; `schedule` exactly five whitespace-separated fields that `croner` accepts, and whose consecutive fires are at least 15 minutes apart (checked over the next five fires from now — a routine is a check-in, not a poll); `tz` a zone `Intl.DateTimeFormat` accepts; at most 50 routines per user.
 
-Cron is evaluated by **croner** (MIT, no dependencies, DST-correct in a named zone): the one new dependency. `next_at` is always `Cron(schedule, {timezone: tz}).nextRun(from)` for the `from` named below.
+Cron is evaluated by **croner** (MIT, no dependencies, DST-correct in a named zone): the one new dependency. `next_at` is always `Cron(schedule, {timezone: tz}).nextRun(from)` for the `from` named below. A pattern with fewer than five future fires (a date that never comes) is refused, so an enabled routine can never silently run out; across a spring-forward fold croner reports the skipped hour twice at one instant, which the spacing check ignores.
+
+## Triggers
+
+Dan, 1 Oct ("Add triggers"): the journal already holds every session's context gauge and stall (`conversation_status`) and every box's disk figures (`device_status`), so a routine may carry a **trigger** instead of a schedule and fire the moment a rule trips, rather than waiting for the Coordinator to notice at its next 2-hourly check. The Coordinator still decides what to do; the journal only prompts it.
+
+| `trigger` | trips for |
+|---|---|
+| `{kind:'context_over', pct}` (1–99) | a live session (`running`/`waiting`, not the Coordinator itself) whose context gauge is at or past `pct` |
+| `{kind:'stalled', reset_minutes}` (0–10080, default 120) | a live session stalled on a usage limit whose reset is at least `reset_minutes` away, or has no reset time |
+| `{kind:'disk_under', pct}` (1–99) | an agent box whose last report shows under `pct`% free disk |
+
+A **trigger sweep** runs every five minutes (`src/routines-triggers.js`). For each enabled triggered routine it evaluates the rule for the routine's user as the Coordinator's box may see it (sessions on private devices and private boxes are invisible when the Coordinator sits on an ordinary box), then in one transaction forgets recorded subjects that no longer match and records the matching subjects it has not fired for (`routine_trigger_state`) — before delivery, so a crash mid-delivery costs one fire, never a double. The fresh subjects are delivered as one fire with the specifics appended to the prompt:
+
+```
+Routine context-over: follow the Session context over the threshold section of your playbook.
+
+Tripped by:
+- [Big session](matron://convo/<id>) at 42% of its window (opus-5-5)
+```
+
+(`stalled` lines read `… stalled on fable-5-1, resets 2026-10-01T15:00:00Z (in 5 h)` or `…, no reset time`; `disk_under` lines `- gene: 15% free (15.0 GB of 100.0 GB)`.) A subject fires once per crossing: while it keeps matching nothing more is sent; once it stops matching (compacted, reset, cleaned up) its record goes, and the next crossing fires again. Pausing a triggered routine or changing its trigger clears its records. A delivery failure the next attempt might cure forgets the fresh subjects and backs the routine off 15 minutes (`retry_at`); a refusal keeps them recorded. `next_at` is always NULL for a triggered routine; `run` fires it with whatever matches at that moment, records untouched. A routine is scheduled or triggered for life: a `PATCH` may change `schedule` only on a scheduled routine and `trigger` only on a triggered one (**400** otherwise).
+
+Three more starter routines (seeded with the rest): `context-over` (`context_over` 40), `stalled-session` (`stalled` 120), `disk-low` (`disk_under` 20), each prompt pointing at its playbook section. The thresholds are the user's to edit; the playbook sections tell the Coordinator to act under the user's memories (compaction, which model a maxed box runs, what may be cleaned on which box).
 
 ## Routes (Bearer, either device kind)
 
@@ -46,12 +77,12 @@ Cron is evaluated by **croner** (MIT, no dependencies, DST-correct in a named zo
 |---|---|---|---|
 | `GET /routines` | any | | 200 `{routines:[…]}`, by `name` |
 | `GET /routines/:key` | any | | 200 `{routine}`; `:key` is the id or the name |
-| `POST /routines` | client, or the Coordinator | `{name, title, schedule, prompt, tz?, enabled?, convo_id?}` | 201 `{routine}`; **409** `conflict` when the name is taken; **409** `{error:'conflict', blocked_by:'cap'}` at 50 |
-| `PATCH /routines/:key` | client, or the Coordinator | `{title?, schedule?, tz?, prompt?, enabled?, convo_id?}` — at least one | 200 `{routine}` |
+| `POST /routines` | client, or the Coordinator | `{name, title, schedule \| trigger, prompt, tz?, enabled?, convo_id?}` | 201 `{routine}`; **409** `conflict` when the name is taken; **409** `{error:'conflict', blocked_by:'cap'}` at 50 |
+| `PATCH /routines/:key` | client, or the Coordinator | `{title?, schedule?, trigger?, tz?, prompt?, enabled?, convo_id?}` — at least one, never both schedule and trigger | 200 `{routine}` |
 | `DELETE /routines/:key` | client only (agent → **403**) | | 200 `{ok:true}` |
 | `POST /routines/:key/run` | client, or the Coordinator | `{convo_id?}` | 202 `{accepted:true}` or `{delivered:false, reason:'no_coordinator'\|'busy'}` |
 
-A routine row on the wire is every column except `retry_at`. **400** `bad_request` for any invalid field; **404** `not_found` for an unknown key or another user's routine.
+A routine row on the wire is every column except `retry_at`; `trigger` is the parsed object or null, `schedule` a string or null. **400** `bad_request` for any invalid field; **404** `not_found` for an unknown key or another user's routine.
 
 **The Coordinator gate.** An agent writer must name its own conversation in `convo_id`, and it must be the user's Coordinator — the `closingConvo(…, {required: true})` rule missions and projects use: no `convo_id` or another conversation → **403** `{error:'forbidden', detail:'not_coordinator'}`; a conversation this device does not own → **404**. The journal is the gate, as for consent: an ordinary agent can read the list but never change it, and no agent can delete a routine (the user's list, the user's delete).
 
@@ -82,8 +113,8 @@ For each due routine, in one transaction *before* anything is delivered: `last_f
 ## The bridge
 
 - `lib/session-control.js` gains action `routine` (journal-only, Coordinator-only, like `alert`). The turn is framed on the bridge: `[routine daily-sweep, fired by the journal at 07:05 Europe/London] <prompt>`. Parked while the Coordinator is mid-turn, in its own slot kind: a newer fire of the **same** routine replaces an unapplied one (a 2-hourly check never piles up); fires of different routines are appended, oldest first, under the alert cap. Notice line: `🔔 Routine daily-sweep: Daily sweep` (`… once this turn finishes` when parked).
-- `lib/routines-client.js` + `lib/routines-tools.js`: `routine_list`, `routine_update(name, {title?, schedule?, tz?, prompt?, enabled?})`, `routine_run(name)`, mounted in `ask-user.js` like the consent tools and refused locally for a session that is not the Coordinator. No create or delete tool: the apps own those.
-- **Playbook.** `BRIDGE_COORDINATOR.md` stays the preamble (role, never do the work, memories, tracker, links, consent, session control). A `coordinator/` directory holds `procedures/*.md` (sweep, triage a consent request, unstick a session, close missions, file projects, hand to the merge train or deploy-1, infrastructure alert) and `routines/*.md` (one per starter routine, each a section headed by the routine's name). `loadCoordinatorBlock` concatenates the preamble, then every file in each directory in name order, into the one block appended to the Coordinator's system prompt. The `Check-ins` section (bridge reminders) is replaced by a `Routines` section.
+- `lib/routines-client.js` + `lib/routines-tools.js`: `routine_list`, `routine_update(name, {title?, schedule?, trigger?, tz?, prompt?, enabled?})`, `routine_run(name)`, mounted in `ask-user.js` like the consent tools and refused locally for a session that is not the Coordinator. No create or delete tool: the apps own those. A routine body keeps its line breaks (a triggered fire lists its subjects) but a continuation line that starts with `[` is indented one space, so a prompt can never forge a second provenance frame inside the turn.
+- **Playbook.** `BRIDGE_COORDINATOR.md` stays the preamble (role, never do the work, hand work out, links, memories, tracker, reading the journal, and a short section on the playbook and the routine tools). A `coordinator/` directory holds `procedures/*.md` (sweep, triage a consent request, unstick a session, close missions, refresh statuses, file projects, infrastructure alert, what the user missed, hand work to the merge train or deploy owner — consent and session control moved here from the preamble, as procedures) and `routines/*.md` (one per starter routine, scheduled and triggered, each a section headed by the routine's name). The playbook stays generic: it names the user's memories by meaning (thresholds, boxes, who deploys) and never copies one user's rules. `loadCoordinatorBlock` concatenates the preamble, then every file in each directory in name order, into the one block appended to the Coordinator's system prompt. The `Check-ins` section (bridge reminders) is replaced by a `Routines` section.
 
 ## Seeding
 

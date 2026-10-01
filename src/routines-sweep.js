@@ -17,8 +17,10 @@ import { wakeIfOffline } from './wake.js'
 import { sanitizePeerText } from './peer-text.js'
 import { dueRoutines, advanceRoutine, recordOutcome, routineRow } from './routines.js'
 import { emitRoutineMarker } from './routines-marker.js'
+import { runTriggerSweep } from './routines-triggers.js'
 
 export const ROUTINES_SWEEP_INTERVAL_MS = 60_000
+export const ROUTINES_TRIGGER_INTERVAL_MS = 5 * 60_000
 export const ROUTINE_MAX_INFLIGHT = 4
 export const ROUTINE_FROM_NAME = 'Routines'
 // Failures the next attempt might cure: the box was asleep or slow, the
@@ -36,18 +38,22 @@ export function makeRoutineFirer({ db, hub, broker, waker = null, wakeWaitMs = 0
   // Deliver one routine's prompt to the user's Coordinator. `routine` is the
   // row as advanced (or as-is for a run); `retry` marks the one retry so a
   // second failure is final. Resolves to the outcome string once recorded.
-  async function fire(routine, { retry = false, now = Date.now() } = {}) {
+  // `message` overrides the prompt (a triggered fire appends its subjects);
+  // `onOutcome(outcome, retryable)` lets the trigger sweep keep its own
+  // state instead of recordOutcome's retry_at rule.
+  async function fire(routine, { retry = false, now = Date.now(), message = null, onOutcome = null } = {}) {
     const coord = coordinatorDevice(db, routine.user_id)
     const label = `${routine.name} for ${userName(routine.user_id)}`
     if (!coord) {
-      recordOutcome(db, routine.id, { outcome: 'no_coordinator', retryable: false, retry, now })
+      if (onOutcome) onOutcome('no_coordinator', false)
+      else recordOutcome(db, routine.id, { outcome: 'no_coordinator', retryable: false, retry, now })
       finish(routine, 'no_coordinator')
       log.log(`routines: ${label} not delivered: no Coordinator (or it has no box)`)
       return 'no_coordinator'
     }
     const params = {
       convo_id: coord.convoId, action: 'routine', routine_id: routine.id, name: routine.name, title: routine.title,
-      message: routine.prompt, fired_at: new Date(now).toISOString(), tz: routine.tz, from_name: ROUTINE_FROM_NAME,
+      message: message ?? routine.prompt, fired_at: new Date(now).toISOString(), tz: routine.tz, from_name: ROUTINE_FROM_NAME,
     }
     inflight += 1
     let outcome
@@ -71,7 +77,10 @@ export function makeRoutineFirer({ db, hub, broker, waker = null, wakeWaitMs = 0
     } finally {
       inflight -= 1
     }
-    try { recordOutcome(db, routine.id, { outcome, retryable, retry, now: Date.now() }) } catch (err) { log.error(`routines: ${label}: outcome not recorded`, err) }
+    try {
+      if (onOutcome) onOutcome(outcome, retryable)
+      else recordOutcome(db, routine.id, { outcome, retryable, retry, now: Date.now() })
+    } catch (err) { log.error(`routines: ${label}: outcome not recorded`, err) }
     finish(routine, outcome)
     log.log(`routines: ${label} -> Coordinator ${coord.convoId} on device ${coord.deviceId}: ${outcome}${waking ? ' (after wake)' : ''}${retry ? ' (retry)' : ''}`)
     return outcome
@@ -86,7 +95,11 @@ export function makeRoutineFirer({ db, hub, broker, waker = null, wakeWaitMs = 0
   return { fire, busy, inflight: () => inflight }
 }
 
-export function startRoutinesSweep({ db, firer, intervalMs = ROUTINES_SWEEP_INTERVAL_MS, enabled = true, log = console } = {}) {
+export function startRoutinesSweep({ db, firer, intervalMs = ROUTINES_SWEEP_INTERVAL_MS, triggerIntervalMs = ROUTINES_TRIGGER_INTERVAL_MS, enabled = true, log = console } = {}) {
+  // The trigger sweep (src/routines-triggers.js): every five minutes,
+  // evaluate each enabled triggered routine against the sessions' and
+  // boxes' persisted status and fire what newly tripped.
+  const runTriggers = (now = Date.now()) => runTriggerSweep({ db, firer, log }, now)
   // One pass. Resolves when every delivery it started has settled, so tests
   // can await it; the timer path ignores the promise.
   async function run(now = Date.now()) {
@@ -116,8 +129,10 @@ export function startRoutinesSweep({ db, firer, intervalMs = ROUTINES_SWEEP_INTE
     await Promise.all(deliveries)
     return { fired, missed }
   }
-  if (!enabled) return { stop() {}, run }
+  if (!enabled) return { stop() {}, run, runTriggers }
   const interval = setInterval(() => { void run() }, intervalMs)
   if (typeof interval.unref === 'function') interval.unref()
-  return { stop() { clearInterval(interval) }, run }
+  const triggerInterval = setInterval(() => { void runTriggers() }, triggerIntervalMs)
+  if (typeof triggerInterval.unref === 'function') triggerInterval.unref()
+  return { stop() { clearInterval(interval); clearInterval(triggerInterval) }, run, runTriggers }
 }

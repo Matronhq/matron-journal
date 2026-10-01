@@ -155,17 +155,20 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   200 \`{memory}\`. Every change lands as a quiet \`memory\` event on your
   conversation and on the Coordinator's.
 - \`GET /routines\` → \`{routines}\` — the user's Coordinator routines: a
-  schedule (5-field cron in \`tz\`) and a prompt the journal fires into the
-  Coordinator conversation, by \`name\`. \`GET /routines/:name\` (or the
-  \`rt_…\` id) → \`{routine}\` with \`enabled\`, \`next_at\`, \`last_fired_at\`,
+  prompt the journal fires into the Coordinator conversation on a
+  \`schedule\` (5-field cron in \`tz\`) or when a \`trigger\` trips
+  (\`{kind: context_over|disk_under, pct}\` or \`{kind: stalled,
+  reset_minutes}\`), by \`name\`. \`GET /routines/:name\` (or the \`rt_…\` id)
+  → \`{routine}\` with \`enabled\`, \`next_at\`, \`last_fired_at\`,
   \`last_outcome\`.
-- \`POST /routines\` \`{name, title, schedule, prompt (≤2000), tz?
-  (default Europe/London), enabled?, convo_id}\` → 201 \`{routine}\`;
-  \`PATCH /routines/:name\` \`{title?, schedule?, tz?, prompt?, enabled?,
-  convo_id}\` → 200. Agents: the Coordinator only, naming its own
-  conversation as \`convo_id\` (403 \`not_coordinator\` otherwise). Fires
-  at least 15 minutes apart; 409 \`blocked_by: name|cap\`. \`DELETE\` is the
-  user's alone (403 for every agent): pause with \`enabled: false\` instead.
+- \`POST /routines\` \`{name, title, schedule | trigger, prompt (≤2000),
+  tz? (default Europe/London), enabled?, convo_id}\` → 201 \`{routine}\`;
+  \`PATCH /routines/:name\` \`{title?, schedule?, trigger?, tz?, prompt?,
+  enabled?, convo_id}\` → 200 (a routine stays scheduled or triggered).
+  Agents: the Coordinator only, naming its own conversation as
+  \`convo_id\` (403 \`not_coordinator\` otherwise). Fires at least 15
+  minutes apart; 409 \`blocked_by: name|cap\`. \`DELETE\` is the user's
+  alone (403 for every agent): pause with \`enabled: false\` instead.
 - \`POST /routines/:name/run\` \`{convo_id}\` → 202 — fire it now, whatever
   \`enabled\` says; the schedule is untouched. Every change and fire lands as
   a quiet \`routine\` event in the Coordinator conversation.
