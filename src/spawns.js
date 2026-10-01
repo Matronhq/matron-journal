@@ -8,7 +8,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { upsertConversation, appendAndBroadcast, CONVO_ID_MAX_CHARS } from './journal.js'
-import { recordJoined, participantIds } from './participants.js'
+import { recordJoined, recordOwnerConvo, participantIds, participantConvoIds } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { isPrivateDevice } from './db.js'
 import { sessionShortFromTitle, sideTag, roomTitle } from './room-title.js'
@@ -61,9 +61,15 @@ export function claimApprove(db, id, now = Date.now(), { answeredBy = null, answ
 }
 
 export function markStarted(db, id, { roomId, childConvoId, now = Date.now() }) {
-  return db.prepare(
-    "UPDATE agent_spawn_requests SET state='started', room_id=?, child_convo_id=?, resolved_at=? WHERE id=? AND state='approved'"
-  ).run(roomId, childConvoId, now, id).changes > 0
+  const row = db.prepare(
+    "UPDATE agent_spawn_requests SET state='started', room_id=?, child_convo_id=?, resolved_at=? WHERE id=? AND state='approved' RETURNING from_device_id, from_convo_id, created_at"
+  ).get(roomId, childConvoId, now, id)
+  if (!row) return false
+  // The parent's session joins the room's owner side (participant_convos)
+  // once the spawn has actually started; recordOwnerConvo skips a room that
+  // is gone or no longer live, so a dissolve during the start RPC sticks.
+  if (roomId) recordOwnerConvo(db, { roomId, convoId: row.from_convo_id, deviceId: row.from_device_id, createdAt: row.created_at })
+  return true
 }
 
 export function markFailed(db, id, now = Date.now()) {
@@ -229,7 +235,7 @@ export function refreshSpawnRoomTitle(db, hub, childConvoId) {
   const title = spawnRoomTitle(db, row, short)
   if (title === room.title) return false
   upsertConversation(db, { id: row.room_id, ownerUserId: room.owner_user_id, title })
-  appendAndBroadcast(db, hub, { userId: row.user_id, convoId: row.room_id, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null, participants: participantIds(db, row.room_id) } })
+  appendAndBroadcast(db, hub, { userId: row.user_id, convoId: row.room_id, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null, participants: participantIds(db, row.room_id), participant_convos: participantConvoIds(db, row.room_id) } })
   return true
 }
 
@@ -382,7 +388,7 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
       // The parent owns the room (conversations.agent_device_id), the target is
       // its joined participant — the same shape an accepted chat invite leaves.
       upsertConversation(db, { id: roomId, ownerUserId: row.user_id, title, sessionState: 'running', agentDeviceId: row.from_device_id })
-      recordJoined(db, { convoId: roomId, agentDeviceId: row.target_device_id, initiatorDeviceId: row.from_device_id })
+      recordJoined(db, { convoId: roomId, agentDeviceId: row.target_device_id, initiatorDeviceId: row.from_device_id, spawnId: row.id })
       // Live clients learn the room exists now, not at their next /snapshot —
       // the same two frames convo_upsert fans for a fresh conversation.
       appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'session_status', payload: { state: 'running' } })
@@ -394,7 +400,7 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
       // spawn proceed — not trip the outer catch into reporting a failed
       // outcome for a room that exists with joined membership.
       try {
-        appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null, participants: participantIds(db, roomId) } })
+        appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null, participants: participantIds(db, roomId), participant_convos: participantConvoIds(db, roomId) } })
       } catch (err) {
         console.error('approveSpawn: room meta fan failed (title and membership already committed)', err)
       }
@@ -462,8 +468,16 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
       // The child's bridge may already have published its title (it does
       // when it flushes the seed before answering); if so the room can
       // carry the child's tag from the start. Best-effort like every fan.
+      // The room's participant_convos only become complete here: the child's
+      // id is first known at markStarted. A retitle carries them on its own
+      // meta; without one, a membership-only meta does, so live clients can
+      // place the room under the child's mission without a /snapshot.
       if (roomId) {
-        try { refreshSpawnRoomTitle(db, hub, r.result.convo_id) } catch (err) { console.error('approveSpawn: room retitle failed', err) }
+        try {
+          if (!refreshSpawnRoomTitle(db, hub, r.result.convo_id)) {
+            appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { participants: participantIds(db, roomId), participant_convos: participantConvoIds(db, roomId) } })
+          }
+        } catch (err) { console.error('approveSpawn: room retitle / membership fan failed', err) }
       }
       emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'started', roomId, childConvoId: r.result.convo_id, answeredByDeviceId })
       return 'started'

@@ -926,6 +926,12 @@ test('a linked spawn room is titled like a bridge room and gains the child tag w
   const born = client.frames.find((f) => f.kind === 'journal' && f.type === 'convo_meta' && f.convo_id === roomId)
   assert.equal(born.payload.title, 'D:ab ↔️ eric — job')
   assert.deepEqual(born.payload.participants, [parentDev.deviceId, targetDev.deviceId].sort((a, b) => a - b))
+  // The child's id is unknown at creation; the start reply completes the
+  // room's participant sessions, and with no retitle possible yet a
+  // membership-only meta carries them to live clients.
+  assert.deepEqual(born.payload.participant_convos, [])
+  const started = client.frames.find((f) => f.kind === 'journal' && f.type === 'convo_meta' && f.convo_id === roomId && f.payload.title === undefined)
+  assert.deepEqual(started.payload.participant_convos, ['parent-convo', 'child-t'])
   // The child's bridge publishes its seed title — the room retitles and
   // every live client hears it.
   client.frames.length = 0
