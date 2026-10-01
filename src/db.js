@@ -409,6 +409,44 @@ CREATE TABLE IF NOT EXISTS unseen_nudged(
   nudged_at INTEGER NOT NULL,
   PRIMARY KEY(user_id, ref)
 );
+-- Coordinator routines (spec 2026-10-01 coordinator routines): a schedule
+-- (or a trigger) and a prompt the journal owns and fires into whichever
+-- conversation holds the Coordinator role. Exactly one of schedule (5-field
+-- cron in tz) and trigger (JSON: context_over / stalled / disk_under) is
+-- set. next_at is the next scheduled fire in ms (NULL while paused, and
+-- always NULL for a triggered routine); retry_at the one retry after a
+-- failed delivery (internal, never on the wire). Names are the handle
+-- agents and prompts use, unique per user.
+CREATE TABLE IF NOT EXISTS routines(
+  id            TEXT PRIMARY KEY,
+  user_id       INTEGER NOT NULL REFERENCES users(id),
+  name          TEXT NOT NULL,
+  title         TEXT NOT NULL,
+  schedule      TEXT,
+  trigger       TEXT,
+  tz            TEXT NOT NULL,
+  prompt        TEXT NOT NULL,
+  enabled       INTEGER NOT NULL DEFAULT 1,
+  origin        TEXT NOT NULL CHECK(origin IN ('seed','user','agent')),
+  next_at       INTEGER,
+  retry_at      INTEGER,
+  last_fired_at INTEGER,
+  last_outcome  TEXT,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL,
+  UNIQUE(user_id, name),
+  CHECK((schedule IS NULL) <> (trigger IS NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_routines_due ON routines(enabled, next_at);
+-- A triggered routine's currently-tripped subjects (convo:<id> or
+-- device:<id>): a row means this crossing has been fired for; it is removed
+-- when the condition clears, so the next crossing fires again.
+CREATE TABLE IF NOT EXISTS routine_trigger_state(
+  routine_id TEXT NOT NULL REFERENCES routines(id) ON DELETE CASCADE,
+  subject    TEXT NOT NULL,
+  tripped_at INTEGER NOT NULL,
+  PRIMARY KEY(routine_id, subject)
+);
 `
 
 export function openDb(path) {
@@ -768,6 +806,12 @@ export function openDb(path) {
   const settingsCols = db.prepare('PRAGMA table_info(user_settings)').all()
   if (!settingsCols.some((c) => c.name === 'coordinator_consent')) {
     db.exec('ALTER TABLE user_settings ADD COLUMN coordinator_consent INTEGER NOT NULL DEFAULT 1')
+  }
+  // Coordinator routines (spec 2026-10-01): when the starter set was seeded
+  // for this user, so it happens once — never again after the user empties
+  // the list. NULL = not yet.
+  if (!settingsCols.some((c) => c.name === 'routines_seeded_at')) {
+    db.exec('ALTER TABLE user_settings ADD COLUMN routines_seeded_at INTEGER')
   }
   for (const table of ['convo_agents', 'agent_spawn_requests']) {
     const cols = db.prepare(`PRAGMA table_info(${table})`).all()
