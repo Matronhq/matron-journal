@@ -54,7 +54,7 @@ Dan, 1 Oct ("Add triggers"): the journal already holds every session's context g
 
 | `trigger` | trips for |
 |---|---|
-| `{kind:'context_over', pct}` (1–99) | a live session (`running`/`waiting`, not the Coordinator itself) whose context gauge is at or past `pct` |
+| `{kind:'context_over', pct}` (1–99) | a live session (`running`/`waiting`, not the Coordinator itself, not a helper conversation inside a session) whose context tokens are at or past `pct` of its window — 1M at least for the 1M-class models (Opus, Fable, Mythos, any `[1m]` alias), since a bridge can only prove a 1M window once the gauge passes 200k (item 5894) |
 | `{kind:'stalled', reset_minutes}` (0–10080, default 120) | a live session stalled on a usage limit whose reset is at least `reset_minutes` away, or has no reset time |
 | `{kind:'disk_under', pct}` (1–99) | an agent box whose last report shows under `pct`% free disk |
 
@@ -64,10 +64,10 @@ A **trigger sweep** runs every five minutes (`src/routines-triggers.js`). For ea
 Routine context-over: follow the Session context over the threshold section of your playbook.
 
 Tripped by:
-- [Big session](matron://convo/<id>) at 42% of its window (opus-5-5)
+- [Big session](matron://convo/<id>) at 42% of its window (420k/1M, opus-5-5)
 ```
 
-(`stalled` lines read `… stalled on fable-5-1, resets 2026-10-01T15:00:00Z (in 5 h)` or `…, no reset time`; `disk_under` lines `- gene: 15% free (15.0 GB of 100.0 GB)`.) A subject fires once per crossing: while it keeps matching nothing more is sent; once it stops matching (compacted, reset, cleaned up) its record goes, and the next crossing fires again. Pausing a triggered routine or changing its trigger clears its records. A delivery failure the next attempt might cure forgets the fresh subjects and backs the routine off 15 minutes (`retry_at`); a refusal keeps them recorded. `next_at` is always NULL for a triggered routine; `run` fires it with whatever matches at that moment, records untouched. A routine is scheduled or triggered for life: a `PATCH` may change `schedule` only on a scheduled routine and `trigger` only on a triggered one (**400** otherwise).
+(`stalled` lines read `… stalled on fable-5-1, resets 2026-10-01T15:00:00Z (in 5 h)` or `…, no reset time`; `disk_under` lines `- gene: 15% free (15.0 GB of 100.0 GB)`.) A subject fires once per crossing: while it keeps matching nothing more is sent; once it stops matching (compacted, reset, cleaned up) its record goes, and the next crossing fires again. Pausing a triggered routine or changing its trigger clears its records. A triggered routine fires at most once per 15 minutes (`retry_at` doubles as "not before"); a resting routine still forgets subjects that stop matching, and subjects crossing inside the gap are fresh at the first sweep after it, so a run of crossings costs the Coordinator one turn a quarter hour. A delivery failure the next attempt might cure forgets the fresh subjects and backs the routine off 15 minutes (`retry_at`); a refusal keeps them recorded. `next_at` is always NULL for a triggered routine; `run` fires it with whatever matches at that moment, records untouched. A routine is scheduled or triggered for life: a `PATCH` may change `schedule` only on a scheduled routine and `trigger` only on a triggered one (**400** otherwise).
 
 Three more starter routines (seeded with the rest): `context-over` (`context_over` 40), `stalled-session` (`stalled` 120), `disk-low` (`disk_under` 20), each prompt pointing at its playbook section. The thresholds are the user's to edit; the playbook sections tell the Coordinator to act under the user's memories (compaction, which model a maxed box runs, what may be cleaned on which box).
 
