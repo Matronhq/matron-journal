@@ -146,12 +146,18 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   \`coordinator\` event \`{role: 'assigned'|'released'}\` in the conversation.
 - \`GET /memories\` → \`{memories}\` — the user's shared agent memory:
   standing rules and facts, one row per kebab-case \`name\`, ordered by
-  name. \`GET /memories/:name\` (or the \`me_…\` id) → \`{memory}\`.
+  name. Each carries a \`scope\`: \`global\` (every session), \`coordinator\`
+  (the Coordinator only) or \`repo:<name>\` (sessions working in that
+  repo). A bridge with the scopes update gives a session only the memories
+  whose scope matches it; an older bridge still gives every memory to
+  every session, so a stored scope restricts nothing until the bridge is
+  updated. \`GET /memories/:name\` (or the \`me_…\` id) → \`{memory}\`.
 - \`PUT /memories/:name\` \`{description (≤200 chars, one line), body?
-  (markdown ≤8 KB), type?: user|feedback|project|reference, convo_id?
-  (agents: your conversation)}\` → 201 created / 200 updated \`{memory}\`.
-  The same name overwrites — the whole memory, so send the body back when
-  updating. 409 \`too_many\` at 200 memories. \`DELETE /memories/:name\` →
+  (markdown ≤8 KB), type?: user|feedback|project|reference, scope?:
+  global|coordinator|repo:<name> (global on create, kept on update when
+  omitted), convo_id? (agents: your conversation)}\` → 201 created / 200
+  updated \`{memory}\`. The same name overwrites — the whole memory, so send
+  the body back when updating. 409 \`too_many\` at 200 memories. \`DELETE /memories/:name\` →
   200 \`{memory}\`. Every change lands as a quiet \`memory\` event on your
   conversation and on the Coordinator's.
 - \`GET /routines\` → \`{routines}\` — the user's Coordinator routines: a

@@ -309,6 +309,7 @@ CREATE TABLE IF NOT EXISTS memories(
   updated_by       TEXT NOT NULL CHECK(updated_by IN ('user','agent')),
   created_at       INTEGER NOT NULL,
   updated_at       INTEGER NOT NULL,
+  scope            TEXT NOT NULL DEFAULT 'global',
   UNIQUE(user_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(user_id, updated_at);
@@ -865,6 +866,14 @@ export function openDb(path) {
     db.exec('ALTER TABLE conversations ADD COLUMN repo_scope TEXT')
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_conversations_repo_scope ON conversations(repo_scope)')
+  // Memory scopes (spec 2026-10-01 memory scopes): who a memory is for —
+  // 'global' (every session, how every memory worked before the column),
+  // 'coordinator', or 'repo:<name>'. Additive: every pre-migration row is
+  // global, which is exactly what it was.
+  const memoryCols = db.prepare('PRAGMA table_info(memories)').all()
+  if (!memoryCols.some((c) => c.name === 'scope')) {
+    db.exec("ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'global'")
+  }
   // GitHub account linking. One GitHub identity per journal user and one
   // journal user per GitHub identity (the unique index). `token` is the
   // user's read:org OAuth token, stored as-is (spec: "Token at rest").
