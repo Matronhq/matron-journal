@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3'
 import { healBakedTitles } from './heal-titles.js'
 import { backfillMissionLinks, healMissionLinks } from './mission-links.js'
+import { backfillDefaultProjects } from './default-project.js'
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users(
@@ -852,6 +853,9 @@ export function openDb(path) {
   if (!db.prepare('PRAGMA table_info(mission_conversations)').all().some((c) => c.name === 'first_joined_at')) {
     db.exec('ALTER TABLE mission_conversations ADD COLUMN first_joined_at INTEGER')
   }
+  // Every open mission has a project (default-project.js).
+  const filed = backfillDefaultProjects(db)
+  if (filed > 0) console.log(`missions: gave ${filed} open mission(s) a project of their own`)
   // Spec 2026-09-30 §3 backfill: once, while the link table is empty. After
   // every mission/conversation/item column it reads has been added above.
   const backfilled = backfillMissionLinks(db)

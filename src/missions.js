@@ -7,6 +7,7 @@ import { milestoneMarkerPayload } from './missions-marker.js'
 import { markerTitleAllowed } from './privacy.js'
 import { sharedConvoSql } from './visibility.js'
 import { MESSAGE_TYPES_SQL } from './message-types.js'
+import { insertDefaultProject } from './default-project.js'
 import { activateLink, endLink, hasActiveLink, linkRow, nextCurrent, topLevelActiveCount } from './mission-links.js'
 
 export const MILESTONE_KINDS = ['user_input', 'progress']
@@ -262,6 +263,8 @@ export function createMission(db, { userId, deviceId, createdBy, convoId, title,
     const id = newId('ms')
     const num = nextNum(db, userId)
     const ts = now()
+    // No project named: the mission gets its own, of the same name.
+    if (projectId == null) projectId = insertDefaultProject(db, { userId, deviceId, createdBy, convoId, title, body, ts })
     try {
       db.prepare(`INSERT INTO missions(id,user_id,num,state,title,body,origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at,project_id)
         VALUES(?,?,?,'open',?,?,?,?,?,?,?,?,?)`).run(id, userId, num, title, body, convoId, deviceId, createdBy, idemKey, ts, ts, projectId)

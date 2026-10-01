@@ -61,7 +61,7 @@ test('POST /milestones: 409 no_mission writes nothing; 201 with marker seq as an
   const ws = await makeWsClient(s.base, { token: client, cursor: null })
   await ws.waitFor((f) => f.op === 'hello_ok')
   const r = await post(s, agent.token, { kind: 'user_input', title: 'Dan asked', body: 'b' }, { 'idempotency-key': 'm1' })
-  assert.equal(r.status, 201); assert.equal(r.json.milestone.num, 2); assert.equal(r.json.mission.id, m.id)
+  assert.equal(r.status, 201); assert.equal(r.json.milestone.num, 3, 'mission #1, its own project #2'); assert.equal(r.json.mission.id, m.id)
   const marker = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'milestone')
   assert.equal(marker.seq, r.json.milestone.seq); assert.equal(marker.payload.milestone_id, r.json.milestone.id)
   assert.equal(marker.payload.mission_num, m.num); assert.equal(marker.payload.kind, 'user_input'); assert.equal(marker.payload.by, 'agent')

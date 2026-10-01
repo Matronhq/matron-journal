@@ -383,12 +383,12 @@ test('createMilestone: marker appended inside the transaction, seq stored, missi
   const m = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title: 'A' }).mission
   const appendMarker = (payload) => append(db, { userId: 1, convoId: 'c1', sender: 'agent:dev-2', type: 'milestone', payload })
   const r = createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'user_input', title: 'Start', body: 'b', idemKey: '7:m1', appendMarker })
-  assert.equal(r.duplicate, false); assert.equal(r.milestone.num, 2); assert.equal(r.mission.id, m.id)
+  assert.equal(r.duplicate, false); assert.equal(r.milestone.num, 3, 'mission #1, its own project #2'); assert.equal(r.mission.id, m.id)
   const ev = db.prepare("SELECT seq, payload FROM events WHERE type='milestone'").get()
   assert.equal(ev.seq, r.milestone.seq)
   assert.equal(JSON.parse(ev.payload).milestone_id, r.milestone.id)
   assert.equal(getMission(db, 1, m.id).last_milestone_at, r.milestone.created_at)
-  assert.equal(getMission(db, 1, m.id).last_milestone.num, 2)
+  assert.equal(getMission(db, 1, m.id).last_milestone.num, 3)
   const again = createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'user_input', title: 'Start', idemKey: '7:m1', appendMarker })
   assert.equal(again.duplicate, true); assert.equal(again.milestone.id, r.milestone.id)
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='milestone'").get().n, 1)
@@ -404,7 +404,7 @@ test('createMilestone: a failing marker append rolls the row back and surfaces m
   const boom = () => { throw new Error('disk on fire') }
   assert.throws(() => createMilestone(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', kind: 'progress', title: 'x', appendMarker: boom }), /marker_append_failed/)
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM milestones').get().n, 0)
-  assert.equal(db.prepare('SELECT next_num FROM item_counters WHERE user_id=1').get().next_num, 2) // number allocation rolled back too
+  assert.equal(db.prepare('SELECT next_num FROM item_counters WHERE user_id=1').get().next_num, 3) // the mission and its project took #1 and #2; the milestone's number rolled back
 })
 
 test('closed mission rejects milestones; listMilestones is newest first per conversation', () => {
