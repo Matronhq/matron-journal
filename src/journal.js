@@ -5,7 +5,7 @@ import { getMission, ORIGIN_SIEVE } from './missions.js'
 import { activateLink } from './mission-links.js'
 import { privateOwnedConvo } from './privacy.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
-import { joinedAgentIds } from './participants.js'
+import { joinedAgentIds, participantConvosByRoom } from './participants.js'
 import { parseRepo } from './repo-identity.js'
 import { MESSAGE_TYPES, MESSAGE_TYPES_SQL } from './message-types.js'
 export { MESSAGE_TYPES, MESSAGE_TYPES_SQL }
@@ -391,12 +391,19 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
     if (!joinedByConvo.has(r.convo_id)) joinedByConvo.set(r.convo_id, [])
     joinedByConvo.get(r.convo_id).push(r.agent_device_id)
   }
+  // participant_convos (spec: 2026-10-01 rooms under missions): the room's
+  // participant CONVERSATIONS (see participantConvoIds in participants.js),
+  // so a client can show a room under its participants' missions. Rides
+  // exactly where `participants` does — same key-presence rule, same sieve —
+  // and is [] for a room whose sessions are unknown (pre-3.5 invites).
+  const convosByRoom = participantConvosByRoom(db, userId, { excludePrivateOwned })
   for (const c of conversations) {
     const joined = joinedByConvo.get(c.id)
     if (!joined) continue
     const ids = new Set(joined)
     if (c.agent_device_id != null) ids.add(c.agent_device_id)
     c.participants = [...ids].sort((a, b) => a - b)
+    c.participant_convos = convosByRoom.get(c.id) ?? []
   }
   // id -> name for the user's agent boxes, so a client can render the
   // owning box of each conversation without a second round-trip. Same

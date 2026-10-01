@@ -4,7 +4,7 @@ import { authToken, authorizeAgentWrite } from './auth.js'
 import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses } from './db.js'
 import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, agentTargetsFor, CONVO_ID_MAX_CHARS } from './journal.js'
 import { parseRepo, REPO_MAX } from './repo-identity.js'
-import { participantIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
+import { participantIds, participantConvoIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
@@ -714,11 +714,30 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
   // append/broadcast must log and move on, not surface as {code:'internal'}
   // (the caller would retry an op that already happened) or strand the peer
   // notifications that follow it.
+  // The requester's own asking conversation on agent_invite / agent_join
+  // (spec: agent chat request naming; 2026-10-01 for agent_join). Optional —
+  // absent resolves to {title:''} — but when present it is authorisation,
+  // not a hint: a top-level conversation of this user that THIS connection's
+  // device owns, else not_found (never confirm a conversation the caller
+  // cannot see). The title is shown to the user as the asker's identity, and
+  // the id is persisted as the row's initiator_convo_id, which places the
+  // room under that session's missions (participantConvoIds).
+  const resolveFromConvo = () => {
+    if (msg.from_convo_id == null) return { title: '' }
+    if (typeof msg.from_convo_id !== 'string' || !msg.from_convo_id) return { err: ['bad_request', 'bad from_convo_id'] }
+    const fromConvo = db.prepare(
+      'SELECT owner_user_id, agent_device_id, parent_convo_id, title FROM conversations WHERE id=?'
+    ).get(msg.from_convo_id)
+    if (!fromConvo || fromConvo.owner_user_id !== conn.userId
+      || fromConvo.agent_device_id !== conn.deviceId
+      || fromConvo.parent_convo_id != null) return { err: ['not_found'] }
+    return { title: sanitizePeerText(fromConvo.title, CARD_TITLE_MAX_CHARS) }
+  }
   const fanParticipants = (roomId) => {
     try {
       appendAndBroadcast(db, hub, {
         userId: conn.userId, convoId: roomId, sender: 'journal',
-        type: 'convo_meta', payload: { participants: participantIds(db, roomId) },
+        type: 'convo_meta', payload: { participants: participantIds(db, roomId), participant_convos: participantConvoIds(db, roomId) },
       })
     } catch (err) {
       console.error('participants meta fan failed (the membership change itself already committed)', err)
@@ -1237,17 +1256,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // borrowing someone else's name to be trusted by. Optional — a
         // bridge that predates this field sends none and the card simply
         // says less.
-        let fromConvoTitle = ''
-        if (msg.from_convo_id != null) {
-          if (typeof msg.from_convo_id !== 'string' || !msg.from_convo_id) return fail('bad_request', 'bad from_convo_id')
-          const fromConvo = db.prepare(
-            'SELECT owner_user_id, agent_device_id, parent_convo_id, title FROM conversations WHERE id=?'
-          ).get(msg.from_convo_id)
-          if (!fromConvo || fromConvo.owner_user_id !== conn.userId
-            || fromConvo.agent_device_id !== conn.deviceId
-            || fromConvo.parent_convo_id != null) return fail('not_found')
-          fromConvoTitle = sanitizePeerText(fromConvo.title, CARD_TITLE_MAX_CHARS)
-        }
+        const from = resolveFromConvo()
+        if (from.err) return fail(...from.err)
+        const fromConvoTitle = from.title
         const topic = sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS)
         const justification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
         // The raw-string check above only catches a literally empty string —
@@ -1323,6 +1334,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // catches a literally empty string, not whitespace/control chars
         // that sanitise down to ''.
         if (!justification) return fail('bad_request', 'bad justification')
+        // The joiner's own session, same rules as agent_invite's from_convo_id.
+        const from = resolveFromConvo()
+        if (from.err) return fail(...from.err)
         // Room ownership was established above, so this row exists; `?.name`
         // only guards the device being deleted between the two statements,
         // in which case the card degrades to a nameless owner rather than
@@ -1336,7 +1350,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (countPendingAsks(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
           return fail('conflict', 'too many requests awaiting user approval')
         }
-        const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId, initiatorDeviceId: conn.deviceId, justification, topic: '' })
+        const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId, initiatorDeviceId: conn.deviceId, justification, topic: '', initiatorConvoId: msg.from_convo_id ?? null })
         if (!r.ok) return fail('conflict', `already ${r.state}`)
         // The recipient of a join is the room's owner box; start it if asleep
         // (same stance as agent_invite above).
@@ -1359,8 +1373,8 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             // does NOT follow target_device_id: that field names the row to
             // answer (the joiner, self-targeted), whereas the user needs to
             // read who is being asked to let them in — the room's owner.
-            from_convo_id: '',
-            from_convo_title: '',
+            from_convo_id: msg.from_convo_id ?? '',
+            from_convo_title: from.title,
             to_name: sanitizePeerText(ownerName, PEER_NAME_CAP),
             to_convo_id: '',
             to_convo_title: '',
@@ -1369,7 +1383,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // Mirror in the tracker, keyed on the joiner like the row (spec:
         // 2026-09-22 consent-items); best-effort.
         fileChatConsentItem({ db, hub }, { userId: conn.userId, fromDeviceId: conn.deviceId, fromName: conn.name, roomId: msg.room_id, agentDeviceId: conn.deviceId, card: joinCard })
-        nudgeCoordinator({ db, hub, waker }, conn.userId, { kind: 'chat', id: chatAskId(msg.room_id, conn.deviceId) }, { askerDeviceId: conn.deviceId })
+        nudgeCoordinator({ db, hub, waker }, conn.userId, { kind: 'chat', id: chatAskId(msg.room_id, conn.deviceId) }, { askerConvoId: msg.from_convo_id ?? null, askerDeviceId: conn.deviceId })
         conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_device_id: room.agent_device_id }))
         break
       }

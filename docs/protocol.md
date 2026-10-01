@@ -23,6 +23,21 @@ the machine-checkable version of this page.
   omitted everywhere else (solo conversations, dissolved rooms, rooms whose
   only joined participants were sieved out by the privacy predicate below),
   so the wire is unchanged for everything that is not a live room.
+  Wherever `participants` appears, the row also carries
+  `participant_convos: [string]` — the room's participant **conversation**
+  ids, so a client can show a room under its participants' missions. It is
+  the deduped union, in journal order (row creation; asker before target,
+  parent before child — so the owner's session normally leads), of every
+  joined `convo_agents` row's `initiator_convo_id` (the asking session:
+  the owner's on an invite, the joiner's on an `agent_join` that named one)
+  and `target_convo_id`, plus every `started` spawn on the room's
+  `from_convo_id` and `child_convo_id` while the spawned target's row is
+  still joined. A participant that left drops both ids of its row, exactly
+  as it drops out of `participants`. For an ordinary agent the same privacy
+  sieve applies: a row whose participant device is private, and any id a
+  private device owns, are dropped. `[]` when the room's sessions are
+  unknown (a pre-3.5 invite that named none); never present without
+  `participants`.
   Every row also carries `mission_id` — the conversation's **current**
   mission, or `null` — and `mission_count`, the number of missions it was
   ever linked to (active and ended; the header's "+n" is `mission_count − 1`).
@@ -467,11 +482,17 @@ an agent token, selected by which query parameter is present:
   `repo_scope` (`host/org`) from it — the unit shared visibility is decided
   on (see "Shared visibility").
 - Room membership changes append a server-authored `convo_meta` (sender
-  `journal`) whose payload is just `{participants}` — the same
-  owner-plus-joined array `/snapshot` carries — so live clients re-chip a
+  `journal`) whose payload is just `{participants, participant_convos}` —
+  the same owner-plus-joined array `/snapshot` carries, and the room's
+  participant conversation ids (unsieved, like `participants` here; see
+  `/snapshot` above for the rule) — so live clients re-chip a
   room the moment an invite is accepted, a spawn room appears (there it
-  rides the creation `convo_meta` alongside `title`), a participant leaves,
-  or the owner dissolves the room. Emitted only when membership actually
+  rides the creation `convo_meta` alongside `title`), a spawn starts (the
+  child's id is first known then; it rides the retitle `convo_meta` when
+  there is one), a participant leaves,
+  or the owner dissolves the room. Every `convo_meta` that carries
+  `participants` carries `participant_convos` too, and a present value
+  replaces the stored one. Emitted only when membership actually
   changed: refusals and repeat dissolves append nothing. Clients treat every
   `convo_meta` key independently; a membership-only payload leaves
   title/parent/owner untouched.
@@ -828,7 +849,7 @@ malformed id is never echoed back. Other ops' error frames are unchanged.
   until the user approves it (see "Consent gating" below). The caller still
   gets `{kind:'invite', event:'delivered', room_id, target_device_id}`
   immediately — see "Consent gating" below for what `delivered` means here.
-- **`agent_join {room_id, justification}`** — the reverse direction: an
+- **`agent_join {room_id, justification, from_convo_id?}`** — the reverse direction: an
   agent asks to join a room it doesn't own. The room must have a recorded
   owner (`{code:'conflict', detail:'room has no recorded owner to ask'}`
   otherwise) and the caller can't be that owner
@@ -838,6 +859,16 @@ malformed id is never echoed back. Other ops' error frames are unchanged.
   an `awaiting_user` row, and the caller gets `{kind:'invite',
   event:'delivered', room_id, target_device_id:<owner>}` while the owner
   is sent nothing until the user answers.
+
+  `from_convo_id` is optional and names **which of the joiner's own
+  conversations** is asking in — validated exactly like `agent_invite`'s
+  `from_convo_id` (a top-level conversation of this user that the caller's
+  own device owns, else `not_found`; a non-string or empty value is
+  `bad_request`). It is persisted as the row's `initiator_convo_id`, fills
+  the join card's `from_convo_id`/`from_convo_title`, and, once the join is
+  accepted, puts that conversation in the room's `participant_convos`.
+  Absent, the join behaves as before: no conversation is recorded and the
+  card's `from_convo_*` fields stay `''`.
 - **`agent_invite_ack {room_id, peer_device_id?, session_state}`** — a
   non-committal status ping while an invite/join is still pending
   (`invited`), sent by whichever side did NOT initiate. `session_state` must

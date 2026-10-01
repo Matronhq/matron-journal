@@ -307,3 +307,73 @@ export function expireInvites(db, ttlMs, now = Date.now()) {
     "UPDATE convo_agents SET state='expired', answered_at=? WHERE state='invited' AND delivered_at IS NOT NULL AND delivered_at<=? RETURNING convo_id, agent_device_id, initiator_device_id"
   ).all(now, now - ttlMs)
 }
+
+// The CONVERSATIONS in a room, alongside participantIds' devices (spec:
+// 2026-10-01 rooms under missions): a room is its own top-level convo, and a
+// client can only place it under its participants' missions if it knows
+// which of their sessions are talking in it. Sourced from columns the room
+// lifecycle already writes:
+//   - every joined convo_agents row: initiator_convo_id (the asker's
+//     session — the owner's for an invite, the joiner's for an agent_join
+//     that named one) and target_convo_id (the invited session);
+//   - every started spawn on the room: from_convo_id (parent) and
+//     child_convo_id, gated on the spawned target's convo_agents row still
+//     being joined — a spawn row stays 'started' forever, so without the
+//     gate a left child or a dissolved room would keep listing both.
+// A pair counts only while its row is joined, mirroring participants: a
+// leaver's row drops both of its ids, exactly as it drops its device.
+// Each id's owning device is the one the write path validated it against
+// (agent_invite/agent_join: from_convo_id owned by the caller, target_convo_id
+// by the target; a spawn's child comes from the target's own `start` reply),
+// so `own` below needs no conversations lookup — which matters for a spawn
+// child, whose conversation row usually lands after markStarted.
+// Order is journal order — row creation, initiator before target, parent
+// before child — deduped keeping the first, so the room's owner session
+// normally leads. `excludePrivateOwned` is snapshot's filtered-caller
+// sieve: rows whose participant device is private drop out (as they do
+// from `participants`), and so does any convo a private device owns.
+const PARTICIPANT_CONVO_SQL = (scope, excludePrivateOwned) => `
+  SELECT p.room_id, p.convo_id FROM (
+    SELECT ca.convo_id AS room_id, ca.initiator_convo_id AS convo_id, ca.initiator_device_id AS own, ca.agent_device_id AS dev, ca.created_at AS ord, ca.rowid AS rk, 0 AS sub
+      FROM convo_agents ca WHERE ca.state='joined'
+    UNION ALL
+    SELECT ca.convo_id, ca.target_convo_id, ca.agent_device_id, ca.agent_device_id, ca.created_at, ca.rowid, 1
+      FROM convo_agents ca WHERE ca.state='joined'
+    UNION ALL
+    SELECT s.room_id, s.from_convo_id, s.from_device_id, ca.agent_device_id, s.created_at, ca.rowid, 2
+      FROM agent_spawn_requests s
+      JOIN convo_agents ca ON ca.convo_id=s.room_id AND ca.agent_device_id=s.target_device_id AND ca.state='joined'
+      WHERE s.state='started'
+    UNION ALL
+    SELECT s.room_id, s.child_convo_id, s.target_device_id, ca.agent_device_id, s.created_at, ca.rowid, 3
+      FROM agent_spawn_requests s
+      JOIN convo_agents ca ON ca.convo_id=s.room_id AND ca.agent_device_id=s.target_device_id AND ca.state='joined'
+      WHERE s.state='started'
+  ) p
+  JOIN conversations room ON room.id = p.room_id
+  WHERE p.convo_id IS NOT NULL AND ${scope}${excludePrivateOwned ? `
+    AND NOT EXISTS(SELECT 1 FROM devices d WHERE d.id IN (p.dev, p.own) AND d.private=1)` : ''}
+  ORDER BY p.room_id, p.ord, p.rk, p.sub`
+
+function groupConvoIds(rows) {
+  const byRoom = new Map()
+  for (const r of rows) {
+    if (!byRoom.has(r.room_id)) byRoom.set(r.room_id, new Set())
+    byRoom.get(r.room_id).add(r.convo_id)
+  }
+  return new Map([...byRoom].map(([room, ids]) => [room, [...ids]]))
+}
+
+// One room's participant conversation ids — the `participant_convos` array
+// membership convo_meta frames carry next to `participants`. Empty for a
+// room with no joined pair (or a convo that is no room at all).
+export function participantConvoIds(db, roomId, { excludePrivateOwned = false } = {}) {
+  const rows = db.prepare(PARTICIPANT_CONVO_SQL('room.id = ?', excludePrivateOwned)).all(roomId)
+  return groupConvoIds(rows).get(roomId) ?? []
+}
+
+// Every room of one user at once, for snapshot: Map roomId -> ids. Rooms
+// with no resolvable conversation are absent from the map.
+export function participantConvosByRoom(db, userId, { excludePrivateOwned = false } = {}) {
+  return groupConvoIds(db.prepare(PARTICIPANT_CONVO_SQL('room.owner_user_id = ?', excludePrivateOwned)).all(userId))
+}

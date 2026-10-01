@@ -8,7 +8,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { upsertConversation, appendAndBroadcast, CONVO_ID_MAX_CHARS } from './journal.js'
-import { recordJoined, participantIds } from './participants.js'
+import { recordJoined, participantIds, participantConvoIds } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { isPrivateDevice } from './db.js'
 import { sessionShortFromTitle, sideTag, roomTitle } from './room-title.js'
@@ -229,7 +229,7 @@ export function refreshSpawnRoomTitle(db, hub, childConvoId) {
   const title = spawnRoomTitle(db, row, short)
   if (title === room.title) return false
   upsertConversation(db, { id: row.room_id, ownerUserId: room.owner_user_id, title })
-  appendAndBroadcast(db, hub, { userId: row.user_id, convoId: row.room_id, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null, participants: participantIds(db, row.room_id) } })
+  appendAndBroadcast(db, hub, { userId: row.user_id, convoId: row.room_id, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null, participants: participantIds(db, row.room_id), participant_convos: participantConvoIds(db, row.room_id) } })
   return true
 }
 
@@ -394,7 +394,7 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
       // spawn proceed — not trip the outer catch into reporting a failed
       // outcome for a room that exists with joined membership.
       try {
-        appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null, participants: participantIds(db, roomId) } })
+        appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { title, parent_convo_id: null, participants: participantIds(db, roomId), participant_convos: participantConvoIds(db, roomId) } })
       } catch (err) {
         console.error('approveSpawn: room meta fan failed (title and membership already committed)', err)
       }
@@ -462,8 +462,16 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
       // The child's bridge may already have published its title (it does
       // when it flushes the seed before answering); if so the room can
       // carry the child's tag from the start. Best-effort like every fan.
+      // The room's participant_convos only become complete here: the child's
+      // id is first known at markStarted. A retitle carries them on its own
+      // meta; without one, a membership-only meta does, so live clients can
+      // place the room under the child's mission without a /snapshot.
       if (roomId) {
-        try { refreshSpawnRoomTitle(db, hub, r.result.convo_id) } catch (err) { console.error('approveSpawn: room retitle failed', err) }
+        try {
+          if (!refreshSpawnRoomTitle(db, hub, r.result.convo_id)) {
+            appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'convo_meta', payload: { participants: participantIds(db, roomId), participant_convos: participantConvoIds(db, roomId) } })
+          }
+        } catch (err) { console.error('approveSpawn: room retitle / membership fan failed', err) }
       }
       emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'started', roomId, childConvoId: r.result.convo_id, answeredByDeviceId })
       return 'started'
