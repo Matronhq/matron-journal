@@ -71,11 +71,14 @@ export function emitMissionMarker({ db, hub }, who, { mission, action, convoId, 
 }
 
 // `project` on POST /missions and PATCH /missions/:id (spec 2026-09-30
-// §4.2): id, "#n" or n — or null (take it out). Resolved through the
+// §4.2): id, "#n" or n. null is refused (409 project_required): every
+// mission has a project, so it can move but never be unfiled (Dan,
+// 1 Oct 2026). On create, leaving it out gives the mission a project of its
+// own (createMission). Resolved through the
 // caller's own sieve, so a project it cannot read is the same 404 as one
 // that does not exist. Filing INTO a closed project is refused.
 export function projectRefOf(db, who, ref) {
-  if (ref === null) return { projectId: null }
+  if (ref === null) return { status: 409, blockedBy: 'project_required' }
   if (typeof ref !== 'string' && typeof ref !== 'number') return { status: 400 }
   const p = getProject(db, who.userId, ref, { excludePrivateOwned: filteredAgent(db, who) })
   if (!p) return { status: 404 }
@@ -88,7 +91,7 @@ export function projectRefOf(db, who, ref) {
 function refusedProjectRef(res, ref) {
   if (ref.status === 400) return badRequest(res)
   if (ref.status === 404) return notFound(res)
-  if (ref.status === 409) return conflict(res, { blocked_by: 'project_closed' })
+  if (ref.status === 409) return conflict(res, { blocked_by: ref.blockedBy ?? 'project_closed' })
   return false
 }
 

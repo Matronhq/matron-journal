@@ -63,7 +63,10 @@ test('PATCH /missions/:id {project}: moves and detaches with a project_changed m
   const marker = await ws.waitFor((f) => f.kind === 'journal' && f.type === 'mission' && f.payload.action === 'updated')
   assert.equal(marker.convo_id, 'c1'); assert.equal(marker.payload.project_changed, true)
   ws.close()
-  assert.equal((await patch({ project: null })).json.mission.project_id, null)
+  // Every mission has a project: it can move, never be unfiled.
+  const unfile = await patch({ project: null })
+  assert.equal(unfile.status, 409); assert.equal(unfile.json.blocked_by, 'project_required')
+  assert.equal(s.db.prepare('SELECT project_id FROM missions WHERE id=?').get(m.id).project_id, p.id)
   await s.http(`/missions/${m.id}/close`, { method: 'POST', token: client, body: { summary: 'done' } })
   const refiled = await patch({ project: `#${q.num}` })
   assert.equal(refiled.status, 200); assert.equal(refiled.json.mission.project_id, q.id)

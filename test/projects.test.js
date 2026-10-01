@@ -23,16 +23,16 @@ const file = (db, missionId, projectId) => db.prepare('UPDATE missions SET proje
 
 test('createProject: shared numbering, pj_ id, optional origin, idempotent replay; getProject by id, #n and n', () => {
   const db = seeded()
-  mission(db, 'c1', 'M')   // #1
+  mission(db, 'c1', 'M')   // #1, its own project #2
   const r = mk(db, { idemKey: '7:k', convoId: 'c1', body: 'goal' })
   assert.equal(r.duplicate, false)
-  assert.match(r.project.id, /^pj_/); assert.equal(r.project.num, 2); assert.equal(r.project.state, 'open')
+  assert.match(r.project.id, /^pj_/); assert.equal(r.project.num, 3); assert.equal(r.project.state, 'open')
   assert.equal(r.project.origin_convo_id, 'c1'); assert.equal(r.project.body, 'goal')
   for (const k of ['idem_key', 'status_device_id', 'status_hidden']) assert.equal(k in r.project, false, k)
   assert.equal(r.project.merged_into_num, null)
   assert.equal(mk(db, { idemKey: '7:k' }).duplicate, true)
   assert.equal(mk(db).project.origin_convo_id, null)
-  for (const ref of [r.project.id, '#2', 2, '2']) assert.equal(getProject(db, 1, ref).id, r.project.id)
+  for (const ref of [r.project.id, '#3', 3, '3']) assert.equal(getProject(db, 1, ref).id, r.project.id)
   assert.equal(getProject(db, 1, 'pj_nope'), null); assert.equal(getProject(db, 2, 2), null); assert.equal(getProject(db, 1, '#x'), null)
 })
 
@@ -103,8 +103,9 @@ test('mergeProject: moves every mission (open and closed), closes the source as 
 test('listMissions {filed}: only missions filed in some project (what listProjects rolls up)', () => {
   const db = seeded()
   const p = mk(db).project
-  const filed = mission(db, 'c1', 'Filed'); mission(db, 'c2', 'Loose')
+  const filed = mission(db, 'c1', 'Filed'); const loose = mission(db, 'c2', 'Loose')
   file(db, filed.id, p.id)
+  file(db, loose.id, null) // a row from before every mission had a project
   assert.deepEqual(listMissions(db, 1, { filed: true }).map((m) => m.id), [filed.id])
   assert.equal(listMissions(db, 1).length, 2)
 })
@@ -119,15 +120,17 @@ test('listProjects: rollups count mission activity, sum needs_you/open_items, an
   for (const m of [running, waiting, done]) file(db, m.id, p.id)
   const old = Date.now() - 30 * 24 * 60 * 60 * 1000
   db.prepare('UPDATE projects SET created_at=? WHERE id=?').run(old, q.id)
-  const rows = listProjects(db, 1)
+  // Each mission's own default project is left out: only p and q matter here.
+  const ours = (list) => list.filter((r) => r.id === p.id || r.id === q.id)
+  const rows = ours(listProjects(db, 1))
   assert.deepEqual(rows.map((r) => r.id), [p.id, q.id])
   assert.deepEqual(rows[0].missions, { running: 1, waiting: 1, idle: 0, quiet: 0, closed: 1 })
   assert.equal(rows[0].needs_you, 1); assert.equal(rows[0].open_items, 1)
   assert.deepEqual(rows[1].missions, { running: 0, waiting: 0, idle: 0, quiet: 0, closed: 0 })
   assert.equal(rows[1].last_activity_at, old)
   closeProject(db, { userId: 1, projectId: q.id, by: 'user', summary: 'x' })
-  assert.deepEqual(listProjects(db, 1, { state: 'open' }).map((r) => r.id), [p.id])
-  assert.deepEqual(listProjects(db, 1, { state: 'closed' }).map((r) => r.id), [q.id])
+  assert.deepEqual(ours(listProjects(db, 1, { state: 'open' })).map((r) => r.id), [p.id])
+  assert.deepEqual(ours(listProjects(db, 1, { state: 'closed' })).map((r) => r.id), [q.id])
 })
 
 test('projectDetail: missions, needs-you items with mission_num, 5 latest milestones with mission_num, sessions per box — all sieved', () => {

@@ -1,6 +1,6 @@
 {
   "name": "missions: agent starts a mission, posts a milestone whose marker seq is the anchor, closes it; markers land in the right conversations",
-  "description": "Exercises POST /missions, POST /milestones (201 then a 409 no_mission on a second conversation), POST /missions/:id/close, and the 'mission'/'milestone' marker events a client sees on the HTTP read. Numbers are shared with items: the mission is #1, the milestone #2.",
+  "description": "Exercises POST /missions, POST /milestones (201 then a 409 no_mission on a second conversation), POST /missions/:id/close, and the 'mission'/'milestone' marker events a client sees on the HTTP read. Numbers are shared with items: the mission is #1, the project it gets of its own (none was named) #2, the milestone #3.",
   "server": { "tmpDb": true },
   "seed": {
     "users": [ { "as": "dan", "name": "dan", "password": "fixture-pw-16" } ],
@@ -19,15 +19,15 @@
         "origin_convo_id": "c1", "origin_device_id": { "$ref": "bridge.device_id" }, "created_by": "agent",
         "created_at": { "$type": "integer" }, "updated_at": { "$type": "integer" }, "last_milestone_at": null, "closed_at": null,
         "status": null, "status_by": null, "status_convo_id": null, "status_updated_at": null, "closed_convo_id": null,
-        "open_items": 0, "needs_you": 0, "conversations": 1, "milestones": 0, "last_milestone": null, "project_id": null,
-        "project_num": null, "activity": "running", "last_activity_at": { "$type": "integer" } } } } },
+        "open_items": 0, "needs_you": 0, "conversations": 1, "milestones": 0, "last_milestone": null, "project_id": { "$type": "string" },
+        "project_num": 2, "activity": "running", "last_activity_at": { "$type": "integer" } } } } },
     { "kind": "http", "method": "POST", "path": "/milestones", "token": { "$ref": "bridge.token" },
       "body": { "convo_id": "c2", "kind": "progress", "title": "nope" },
       "expect": { "status": 409, "body": { "error": "conflict", "blocked_by": "no_mission" } } },
     { "kind": "http", "method": "POST", "path": "/milestones", "token": { "$ref": "bridge.token" },
       "body": { "convo_id": "c1", "kind": "user_input", "title": "Dan asked for missions", "body": "the brief" },
       "expect": { "status": 201, "body": {
-        "milestone": { "id": { "$bind": "milestone_id" }, "mission_id": { "$ref": "mission_id" }, "num": 2, "kind": "user_input",
+        "milestone": { "id": { "$bind": "milestone_id" }, "mission_id": { "$ref": "mission_id" }, "num": 3, "kind": "user_input",
           "title": "Dan asked for missions", "body": "the brief", "convo_id": "c1", "seq": { "$bind": "anchor_seq" },
           "device_id": { "$ref": "bridge.device_id" }, "created_by": "agent", "created_at": { "$type": "integer" } },
         "mission": { "$ignore": true } } } },
@@ -39,7 +39,7 @@
         { "seq": { "$type": "integer" }, "convo_id": "c1", "ts": { "$type": "integer" }, "sender": "agent:dev-2", "type": "mission",
           "payload": { "mission_id": { "$ref": "mission_id" }, "num": 1, "title": "Missions & milestones", "action": "created", "by": "agent" } },
         { "seq": { "$ref": "anchor_seq" }, "convo_id": "c1", "ts": { "$type": "integer" }, "sender": "agent:dev-2", "type": "milestone",
-          "payload": { "milestone_id": { "$ref": "milestone_id" }, "num": 2, "kind": "user_input", "title": "Dan asked for missions", "body": "the brief",
+          "payload": { "milestone_id": { "$ref": "milestone_id" }, "num": 3, "kind": "user_input", "title": "Dan asked for missions", "body": "the brief",
             "mission_id": { "$ref": "mission_id" }, "mission_num": 1, "mission_title": "Missions & milestones", "by": "agent" } },
         { "seq": { "$type": "integer" }, "convo_id": "c1", "ts": { "$type": "integer" }, "sender": "agent:dev-2", "type": "mission",
           "payload": { "mission_id": { "$ref": "mission_id" }, "num": 1, "title": "Missions & milestones", "action": "closed", "by": "agent" } }

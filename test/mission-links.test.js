@@ -545,7 +545,7 @@ test('mission rows: activity follows linked sessions, needs-you, messages and cl
   const m = startOn(db, 'c1', 'A')
   const row = () => getMission(db, 1, m.id)
   assert.equal(row().activity, 'running')
-  assert.equal(row().project_id, null); assert.equal(row().project_num, null)
+  assert.match(row().project_id, /^pj_/); assert.equal(row().project_num, m.num + 1, 'its own project, numbered next')
   assert.ok(row().last_activity_at >= row().created_at)
   db.prepare("UPDATE conversations SET session_state='waiting' WHERE id='c1'").run()
   assert.equal(row().activity, 'waiting')
