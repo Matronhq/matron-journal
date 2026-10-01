@@ -400,6 +400,8 @@ export function startServer({
   })
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
   const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient })
+  // A consent-card push whose 30 s hold a restart swallowed still goes out.
+  try { pushPipeline.resumeHeldConsent() } catch (err) { console.error('push: consent resume failed', err) }
   // Voice notes on tracker items are transcribed here when whisper is
   // configured (MATRON_WHISPER_MODEL; src/transcribe.js) — off otherwise, and
   // then the origin bridge does it as before. `transcriber` is the test seam;

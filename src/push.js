@@ -1,8 +1,19 @@
 import { snippetOf } from './journal.js'
 import { clientDevicesForPush, parsePushPrefs, pruneApnsToken, unreadBadge } from './db.js'
+import { getCoordinatorConvoId } from './coordinator.js'
+import {
+  effectiveEvents, eventKey, allowedForUser, allowedForDevice, getConvoNotify,
+  holdsConsent, consentStillPending, notifyBadge,
+} from './notify.js'
 
 // Min gap between routine (priority-5) pushes to the same (device, convo).
 const ROUTINE_COALESCE_MS = 10000
+// How long a consent card's push waits for the Coordinator to decide it, in
+// Coordinator mode (spec 2026-10-01 notification settings; Dan chose 30 s).
+export const CONSENT_HOLD_MS = 30000
+// At startup, an ask still pending that is younger than this gets the push
+// a restart may have swallowed mid-hold.
+export const CONSENT_RESUME_WINDOW_MS = 10 * 60 * 1000
 
 // Returns null for event types that must not push at all. Product call
 // (dispatcher decision): convo_meta (a title rename) is always journal-sync
@@ -44,7 +55,10 @@ export function classify(type, payload, sender, prevState) {
   if (type === 'session_status') {
     const state = payload && payload.state
     const turnFinished = prevState === 'running' && (state === 'waiting' || state === 'done')
-    return turnFinished ? { priority: 10, coalesce: false, kind: 'done' } : null
+    // `stopped` (running -> done: crashed or stopped mid-work) is its own
+    // switch in the notification settings; the kind stays 'done' for the
+    // legacy per-device prefs.
+    return turnFinished ? { priority: 10, coalesce: false, kind: 'done', stopped: state === 'done' } : null
   }
   if (type === 'convo_meta') return null
   // TOC summary events are derived metadata, not new activity — journal-sync only.
@@ -63,7 +77,7 @@ export function classify(type, payload, sender, prevState) {
     const p = payload && typeof payload === 'object' ? payload : {}
     const needsUser = p.awaiting === 'user' && p.by === 'agent'
       && (p.action === 'created' || p.action === 'commented' || p.action === 'reopened')
-    return needsUser ? { priority: 10, coalesce: false, kind: 'attention' } : null
+    return needsUser ? { priority: 10, coalesce: false, kind: 'attention', question: true } : null
   }
   // Missions and milestones are navigation, never a push (spec: Marker events).
   if (type === 'milestone' || type === 'mission') return null
@@ -83,7 +97,7 @@ export function classify(type, payload, sender, prevState) {
 // as a test seam — production callers never override it — so a test can
 // exercise a hypothetical future `cls.kind` the prefs object doesn't know
 // about without reaching into module internals.
-export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COALESCE_MS, classify: classifyEvent = classify } = {}) {
+export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COALESCE_MS, consentHoldMs = CONSENT_HOLD_MS, resumeWindowMs = CONSENT_RESUME_WINDOW_MS, classify: classifyEvent = classify } = {}) {
   const counters = { sent: 0, failed: 0, pruned: 0, byReason: {} }
 
   // Coalescing state lives in memory only, keyed by `${deviceId}:${convoId}`.
@@ -91,6 +105,9 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
   // the next routine event after restart just does a fresh leading-edge
   // send since no window is latched for it.
   const coalesceState = new Map()
+  // Consent-card pushes waiting out their hold (memory only; see
+  // resumeHeldConsent for the restart case).
+  const held = new Set()
 
   const bumpReason = (key) => { counters.byReason[key] = (counters.byReason[key] || 0) + 1 }
 
@@ -123,7 +140,7 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     // at build time stale by the time it's sent. Recomputed fresh on every
     // send, here, rather than once up in onAppend and closed over by the
     // opts builders.
-    const badge = unreadBadge(db, userId)
+    const badge = notifyBadge(db, userId, unreadBadge)
     const opts2 = { ...opts, payload: { ...opts.payload, aps: { ...opts.payload.aps, badge } } }
     // Fire and forget from the caller's perspective: apnsClient.send() is
     // documented to never reject, but the .catch() (and the sync try/catch —
@@ -184,7 +201,8 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
   // `pushHint` is optional, in-memory-only extra context a caller (today:
   // ws.js's convo_upsert handler, for session_status's prevSessionState)
   // can pass through to classify(). Every other call site omits it.
-  function onAppend(userId, event, originDeviceId, pushHint) {
+  // `noHold` is internal: resumeHeldConsent's own, already-waited send.
+  function onAppend(userId, event, originDeviceId, pushHint, { noHold = false } = {}) {
     if (!apnsClient) return
     const convo = db.prepare('SELECT id, title, parent_convo_id FROM conversations WHERE id=? AND owner_user_id=?').get(event.convo_id, userId)
     if (!convo) return
@@ -217,6 +235,35 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
 
     const cls = classifyEvent(event.type, event.payload, event.sender, pushHint && pushHint.prevSessionState)
     if (!cls) return // journal-sync-only type (convo_meta, a session_status transition that isn't turn-finished), or a user's own event (T2)
+    // Notification settings (spec 2026-10-01): the user's mode and event
+    // switches, then this conversation's level or mute. Decided once per
+    // event; the per-device level applies in the loop below.
+    const { mode, events } = effectiveEvents(db, userId)
+    const isCoordinator = getCoordinatorConvoId(db, userId) === event.convo_id
+    const isRoom = cls.kind === 'activity' && !!db.prepare("SELECT 1 FROM convo_agents WHERE convo_id=? AND state='joined' LIMIT 1").get(event.convo_id)
+    const key = eventKey(cls, { isCoordinator, isRoom })
+    if (!allowedForUser(key, events, getConvoNotify(db, userId, event.convo_id))) return
+    // A consent card the Coordinator may decide waits for it: the push goes
+    // out after the hold only if the ask is still waiting on someone.
+    const p = event.payload
+    if (!noHold && event.type === 'permission_request' && p && (p.kind === 'agent_spawn' || p.kind === 'agent_chat')
+      && holdsConsent(db, userId, mode, p.from_device_id)) {
+      const timer = setTimeout(() => {
+        held.delete(timer)
+        try {
+          if (consentStillPending(db, p)) sendAlert(userId, event, convo, cls, key, devices, originDeviceId)
+        } catch (err) {
+          console.error('push: held consent push failed', err)
+        }
+      }, consentHoldMs)
+      timer.unref()
+      held.add(timer)
+      return
+    }
+    sendAlert(userId, event, convo, cls, key, devices, originDeviceId)
+  }
+
+  function sendAlert(userId, event, convo, cls, key, devices, originDeviceId) {
     const title = convo.title || convo.id
     const body = snippetOf(event.type, event.payload)
     for (const device of devices) {
@@ -229,14 +276,14 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
       // uniformly rather than being asymmetrically special-cased.
       if (device.id === originDeviceId) continue
       if (!device.apns_env) continue
-      // Per-device notification prefs: skip the device only when its prefs
-      // explicitly disable this event's category. Deliberately BEFORE the
-      // isViewing/cursor checks (cheapest first) and only on the alert path —
-      // read_marker wakes above are invisible to the user and never filtered.
-      // A `cls.kind` absent from the prefs object (a future category prefs
-      // hasn't caught up to) fails open rather than muting every device —
-      // matches the module's documented fail-open rule.
-      if (parsePushPrefs(device.push_prefs)[cls.kind] === false) continue
+      // This device's own level ("On this device: all / needs me / off").
+      if (!allowedForDevice(key, device.push_level)) continue
+      // Legacy per-device prefs (PUT /push/prefs), only where a device ever
+      // stored some: a NULL row's defaults (activity off) would otherwise
+      // overrule the user's synced switches. Skip the device only when its
+      // prefs explicitly disable this event's category; a `cls.kind` absent
+      // from the prefs object fails open rather than muting every device.
+      if (device.push_prefs != null && parsePushPrefs(device.push_prefs)[cls.kind] === false) continue
       if (hub.isViewing(userId, device.id, event.convo_id)) continue
       if (device.cursor >= event.seq) continue
       const buildOpts = () => ({
@@ -256,14 +303,44 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     }
   }
 
+  // After a restart: a consent card whose hold the restart swallowed still
+  // gets its push, if the ask is still pending and recent. Held again for
+  // whatever is left of its 30 s; sent now if that has passed.
+  function resumeHeldConsent(now = Date.now()) {
+    if (!apnsClient) return 0
+    const rows = db.prepare(`SELECT user_id, seq, convo_id, ts, sender, type, payload FROM events
+      WHERE type='permission_request' AND ts > ? AND json_extract(payload, '$.kind') IN ('agent_spawn','agent_chat')`).all(now - resumeWindowMs)
+    let n = 0
+    for (const r of rows) {
+      let payload
+      try { payload = JSON.parse(r.payload) } catch { continue }
+      if (!consentStillPending(db, payload)) continue
+      const event = { seq: r.seq, convo_id: r.convo_id, ts: r.ts, sender: r.sender, type: r.type, payload }
+      const timer = setTimeout(() => {
+        held.delete(timer)
+        try {
+          if (consentStillPending(db, payload)) onAppend(r.user_id, event, null, undefined, { noHold: true })
+        } catch (err) {
+          console.error('push: resumed consent push failed', err)
+        }
+      }, Math.max(0, r.ts + consentHoldMs - now))
+      timer.unref()
+      held.add(timer)
+      n += 1
+    }
+    return n
+  }
+
   function close() {
     for (const state of coalesceState.values()) {
       if (state.timer) clearTimeout(state.timer)
     }
     coalesceState.clear()
+    for (const timer of held) clearTimeout(timer)
+    held.clear()
   }
 
   // _coalesceState is exposed for tests (eviction assertions) and as a
   // cheap gauge candidate for Task 5's /metrics; not part of the public API.
-  return { onAppend, counters, close, _coalesceState: coalesceState }
+  return { onAppend, resumeHeldConsent, counters, close, _coalesceState: coalesceState, _held: held }
 }

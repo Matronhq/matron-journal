@@ -814,6 +814,24 @@ export function openDb(path) {
   if (!settingsCols.some((c) => c.name === 'routines_seeded_at')) {
     db.exec('ALTER TABLE user_settings ADD COLUMN routines_seeded_at INTEGER')
   }
+  // Notification settings (spec 2026-10-01 notification settings): the
+  // user's synced mode + event switches (JSON, NULL = Coordinator mode
+  // defaults), the per-device level beside the APNs token it gates (NULL =
+  // 'all'), and per-conversation levels and mutes.
+  if (!settingsCols.some((c) => c.name === 'notify_prefs')) {
+    db.exec('ALTER TABLE user_settings ADD COLUMN notify_prefs TEXT')
+  }
+  if (!db.prepare('PRAGMA table_info(devices)').all().some((c) => c.name === 'push_level')) {
+    db.exec('ALTER TABLE devices ADD COLUMN push_level TEXT')
+  }
+  db.exec(`CREATE TABLE IF NOT EXISTS convo_notify(
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    convo_id TEXT NOT NULL,
+    level TEXT CHECK(level IN ('all','needs_me','none')),
+    mute_until INTEGER,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(user_id, convo_id)
+  )`)
   for (const table of ['convo_agents', 'agent_spawn_requests']) {
     const cols = db.prepare(`PRAGMA table_info(${table})`).all()
     if (!cols.some((c) => c.name === 'answered_by')) db.exec(`ALTER TABLE ${table} ADD COLUMN answered_by TEXT`)
@@ -1028,7 +1046,7 @@ export function pruneApnsToken(db, deviceId) {
 // registered token, for the push pipeline to fan a journal event out to.
 export function clientDevicesForPush(db, userId) {
   return db.prepare(
-    "SELECT id, apns_token, apns_env, cursor, push_prefs FROM devices WHERE user_id=? AND kind='client' AND apns_token IS NOT NULL"
+    "SELECT id, apns_token, apns_env, cursor, push_prefs, push_level FROM devices WHERE user_id=? AND kind='client' AND apns_token IS NOT NULL"
   ).all(userId)
 }
 
