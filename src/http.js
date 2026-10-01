@@ -5,6 +5,7 @@ import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice,
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice, deviceStatuses } from './db.js'
 import { receiveBlob } from './media.js'
+import { imageSizeFromFile } from './image-size.js'
 import { buildMetrics } from './metrics.js'
 import { listAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
@@ -789,6 +790,10 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           return json(res, 413, { error: 'quota_exceeded' })
         }
         const contentType = req.headers['content-type'] || 'application/octet-stream'
+        // An image's displayed size, read from its own header now while the
+        // file is hot, so every attachment naming it can carry width/height
+        // (apps reserve the box before the bytes load). Not an image: 0 × 0.
+        const dims = contentType.startsWith('image/') ? imageSizeFromFile(received.diskPath) : null
         try {
           insertBlob(db, {
             id: received.id,
@@ -797,6 +802,8 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
             size: received.size,
             sha256: received.sha256,
             diskPath: received.diskPath,
+            width: dims?.width ?? 0,
+            height: dims?.height ?? 0,
           })
         } catch (e) {
           // receiveBlob already renamed the tmp file into its final sharded
@@ -808,7 +815,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           await fs.promises.unlink(received.diskPath).catch(() => {})
           throw e
         }
-        return json(res, 200, { media_id: received.id, size: received.size, content_type: contentType, sha256: received.sha256 })
+        return json(res, 200, { media_id: received.id, size: received.size, content_type: contentType, sha256: received.sha256, ...(dims ?? {}) })
       }
       const mm = url.pathname.match(/^\/media\/([^/]+)$/)
       if (req.method === 'GET' && mm) {
