@@ -27,13 +27,21 @@ the machine-checkable version of this page.
   `participant_convos: [string]` — the room's participant **conversation**
   ids, so a client can show a room under its participants' missions. It is
   the deduped union, in journal order (row creation; asker before target,
-  parent before child — so the owner's session normally leads), of every
-  joined `convo_agents` row's `initiator_convo_id` (the asking session:
-  the owner's on an invite, the joiner's on an `agent_join` that named one)
-  and `target_convo_id`, plus every `started` spawn on the room's
-  `from_convo_id` and `child_convo_id` while the spawned target's row is
-  still joined. A participant that left drops both ids of its row, exactly
-  as it drops out of `participants`. For an ordinary agent the same privacy
+  parent before child — so the owner's session normally leads), of two
+  halves. **Owner side**: the session each owner invite was sent from
+  (`initiator_convo_id` on an owner-initiated row, joined or since left)
+  and each `started` spawn's parent `from_convo_id` — kept for as long as
+  the room has any joined row, because the owner stays in `participants`
+  until it dissolves the room. **Member side**: an invited member's
+  `target_convo_id`, a joiner's own `initiator_convo_id` (an `agent_join`
+  that named one), and a spawn's `child_convo_id` — each only while that
+  member's row is joined (for a spawn child, the same membership the spawn
+  created: a later re-invite of the device does not bring the old child
+  session back). So a member that leaves drops its own session exactly as
+  it drops out of `participants`, and the owner's sessions go only when the
+  owner dissolves the room. The journal learns an owner's session only
+  from an invite it sent or a spawn, so a room built purely from joins
+  lists the joiners' sessions alone. For an ordinary agent the same privacy
   sieve applies: a row whose participant device is private, and any id a
   private device owns, are dropped. `[]` when the room's sessions are
   unknown (a pre-3.5 invite that named none); never present without
@@ -484,15 +492,23 @@ an agent token, selected by which query parameter is present:
 - Room membership changes append a server-authored `convo_meta` (sender
   `journal`) whose payload is just `{participants, participant_convos}` —
   the same owner-plus-joined array `/snapshot` carries, and the room's
-  participant conversation ids (unsieved, like `participants` here; see
-  `/snapshot` above for the rule) — so live clients re-chip a
+  participant conversation ids (see `/snapshot` above for the rule) — so
+  live clients re-chip a
   room the moment an invite is accepted, a spawn room appears (there it
   rides the creation `convo_meta` alongside `title`), a spawn starts (the
   child's id is first known then; it rides the retitle `convo_meta` when
   there is one), a participant leaves,
   or the owner dissolves the room. Every `convo_meta` that carries
   `participants` carries `participant_convos` too, and a present value
-  replaces the stored one. Emitted only when membership actually
+  replaces the stored one. **Privacy:** this frame is composed once and
+  fanned unsieved — to the user's clients and to the room's agent
+  connections (recorded owner plus joined members, live and on hello
+  replay) — exactly like `participants` in the same frame. A room member
+  therefore receives every member's session id, a private box's included,
+  whereas `/snapshot` applies the private-device sieve for an ordinary
+  agent. The ids grant nothing: every read/write path still refuses a
+  private-owned conversation to an ordinary agent. A per-connection payload
+  sieve in the hub would be needed to close this; it is not done. Emitted only when membership actually
   changed: refusals and repeat dissolves append nothing. Clients treat every
   `convo_meta` key independently; a membership-only payload leaves
   title/parent/owner untouched.

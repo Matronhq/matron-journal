@@ -312,42 +312,54 @@ export function expireInvites(db, ttlMs, now = Date.now()) {
 // 2026-10-01 rooms under missions): a room is its own top-level convo, and a
 // client can only place it under its participants' missions if it knows
 // which of their sessions are talking in it. Sourced from columns the room
-// lifecycle already writes:
-//   - every joined convo_agents row: initiator_convo_id (the asker's
-//     session — the owner's for an invite, the joiner's for an agent_join
-//     that named one) and target_convo_id (the invited session);
-//   - every started spawn on the room: from_convo_id (parent) and
-//     child_convo_id, gated on the spawned target's convo_agents row still
-//     being joined — a spawn row stays 'started' forever, so without the
-//     gate a left child or a dissolved room would keep listing both.
-// A pair counts only while its row is joined, mirroring participants: a
-// leaver's row drops both of its ids, exactly as it drops its device.
-// Each id's owning device is the one the write path validated it against
-// (agent_invite/agent_join: from_convo_id owned by the caller, target_convo_id
-// by the target; a spawn's child comes from the target's own `start` reply),
-// so `own` below needs no conversations lookup — which matters for a spawn
-// child, whose conversation row usually lands after markStarted.
+// lifecycle already writes, in two halves that are gated differently:
+//   - OWNER side — the session an owner invite was sent from
+//     (initiator_convo_id on a row the room's owner initiated, joined or
+//     since left) and a started spawn's parent session (from_convo_id).
+//     The owner stays in `participants` until it dissolves the room, so its
+//     sessions stay for as long as the room has ANY joined row — not just
+//     while the particular member whose row carried the id is still there.
+//     Dissolution flips every row to 'left', which drops them.
+//   - MEMBER side — an invited member's target_convo_id, a joiner's own
+//     initiator_convo_id (agent_join's from_convo_id), and a spawn's
+//     child_convo_id: only while that member's row is joined, so a leaver's
+//     session drops exactly as its device drops out of `participants`. A
+//     spawn row stays 'started' forever, so the child additionally requires
+//     the target's row to predate the start (created_at <= resolved_at): a
+//     re-invite renews created_at, and must not resurrect an old spawn's
+//     child.
+// Each id's owning device (`own`) is the one the write path validated it
+// against (agent_invite/agent_join: from_convo_id owned by the caller,
+// target_convo_id by the target; a spawn's child comes from the target's own
+// `start` reply), so no conversations lookup is needed — which matters for a
+// spawn child, whose conversation row usually lands after markStarted.
 // Order is journal order — row creation, initiator before target, parent
 // before child — deduped keeping the first, so the room's owner session
 // normally leads. `excludePrivateOwned` is snapshot's filtered-caller
 // sieve: rows whose participant device is private drop out (as they do
 // from `participants`), and so does any convo a private device owns.
+const ROOM_LIVE = (roomCol) => `EXISTS(SELECT 1 FROM convo_agents j WHERE j.convo_id = ${roomCol} AND j.state='joined')`
 const PARTICIPANT_CONVO_SQL = (scope, excludePrivateOwned) => `
   SELECT p.room_id, p.convo_id FROM (
-    SELECT ca.convo_id AS room_id, ca.initiator_convo_id AS convo_id, ca.initiator_device_id AS own, ca.agent_device_id AS dev, ca.created_at AS ord, ca.rowid AS rk, 0 AS sub
-      FROM convo_agents ca WHERE ca.state='joined'
+    SELECT ca.convo_id AS room_id, ca.initiator_convo_id AS convo_id, ca.initiator_device_id AS own, ca.initiator_device_id AS dev, ca.created_at AS ord, ca.rowid AS rk, 0 AS sub
+      FROM convo_agents ca JOIN conversations r ON r.id = ca.convo_id
+      WHERE ca.initiator_device_id = r.agent_device_id AND ca.state IN ('joined','left') AND ${ROOM_LIVE('ca.convo_id')}
+    UNION ALL
+    SELECT ca.convo_id, ca.initiator_convo_id, ca.initiator_device_id, ca.agent_device_id, ca.created_at, ca.rowid, 0
+      FROM convo_agents ca
+      WHERE ca.initiator_device_id = ca.agent_device_id AND ca.state='joined'
     UNION ALL
     SELECT ca.convo_id, ca.target_convo_id, ca.agent_device_id, ca.agent_device_id, ca.created_at, ca.rowid, 1
       FROM convo_agents ca WHERE ca.state='joined'
     UNION ALL
-    SELECT s.room_id, s.from_convo_id, s.from_device_id, ca.agent_device_id, s.created_at, ca.rowid, 2
-      FROM agent_spawn_requests s
-      JOIN convo_agents ca ON ca.convo_id=s.room_id AND ca.agent_device_id=s.target_device_id AND ca.state='joined'
-      WHERE s.state='started'
+    SELECT s.room_id, s.from_convo_id, s.from_device_id, s.from_device_id, s.created_at, s.rowid, 2
+      FROM agent_spawn_requests s JOIN conversations r ON r.id = s.room_id
+      WHERE s.state='started' AND s.from_device_id = r.agent_device_id AND ${ROOM_LIVE('s.room_id')}
     UNION ALL
-    SELECT s.room_id, s.child_convo_id, s.target_device_id, ca.agent_device_id, s.created_at, ca.rowid, 3
+    SELECT s.room_id, s.child_convo_id, s.target_device_id, ca.agent_device_id, s.created_at, s.rowid, 3
       FROM agent_spawn_requests s
       JOIN convo_agents ca ON ca.convo_id=s.room_id AND ca.agent_device_id=s.target_device_id AND ca.state='joined'
+        AND ca.created_at <= s.resolved_at
       WHERE s.state='started'
   ) p
   JOIN conversations room ON room.id = p.room_id

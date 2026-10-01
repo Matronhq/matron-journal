@@ -219,6 +219,11 @@ test('agent_join with from_convo_id persists it and the joiner\'s session appear
   a.send({ op: 'agent_invite_answer', room_id: 'room', peer_device_id: agB.deviceId, accept: true })
   const meta = await client.waitFor((f) => f.kind === 'journal' && f.type === 'convo_meta'
     && f.convo_id === 'room' && Array.isArray(f.payload.participants))
+  // Only the joiner's session: in a join-created membership the owner's
+  // session is genuinely unknown — the journal learns an owner's session
+  // only from an invite it sent (initiator_convo_id) or a spawn's parent.
+  // A room the owner has also invited into carries it (see the three-party
+  // test below).
   assert.deepEqual(meta.payload.participant_convos, ['b-sess'])
   assert.deepEqual(rowsOf(snapshot(s.db, dan.id)).room.participant_convos, ['b-sess'])
 })
@@ -246,4 +251,60 @@ test('agent_join without from_convo_id is unchanged; a session it does not own i
   const meta = await client.waitFor((f) => f.kind === 'journal' && f.type === 'convo_meta'
     && f.convo_id === 'room' && Array.isArray(f.payload.participants))
   assert.deepEqual(meta.payload.participant_convos, [])
+})
+
+test('participant_convos: the owner\'s session stays while the owner is in the room, even after the invitee that carried it leaves', async (t) => {
+  // Review repro: A invites B from a-sess, C joins from c-sess, B leaves.
+  const { s, dan, agA, agB } = await fleet(t)
+  const agC = createAgent(s.db, dan.id, 'dev-c')
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x', targetConvoId: 'b-sess', initiatorConvoId: 'a-sess' })
+  answerInvite(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, accept: true })
+  // agent_join's row shape: the joiner is both participant and initiator.
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agC.deviceId, initiatorDeviceId: agC.deviceId, justification: 'x', initiatorConvoId: 'c-sess' })
+  answerInvite(s.db, { convoId: 'room', agentDeviceId: agC.deviceId, accept: true })
+  assert.deepEqual(participantConvoIds(s.db, 'room'), ['a-sess', 'b-sess', 'c-sess'])
+
+  leaveConvo(s.db, { convoId: 'room', agentDeviceId: agB.deviceId })
+  assert.deepEqual(participantConvoIds(s.db, 'room'), ['a-sess', 'c-sess'], 'only the leaver\'s session drops')
+  assert.deepEqual(rowsOf(snapshot(s.db, dan.id)).room.participant_convos, ['a-sess', 'c-sess'])
+
+  // The joiner leaving too ends the room (no joined row): owner side goes.
+  leaveConvo(s.db, { convoId: 'room', agentDeviceId: agC.deviceId })
+  assert.deepEqual(participantConvoIds(s.db, 'room'), [])
+})
+
+// The spawn room approveSpawn leaves: A (parent, a-sess) owns it, B is the
+// joined child participant, the row is started with child-1.
+function startedSpawnRoom(s, dan, agA, agB) {
+  createSpawnRequest(s.db, { id: 'sp1', userId: dan.id, fromDeviceId: agA.deviceId, fromConvoId: 'a-sess', targetDeviceId: agB.deviceId, workdir: '/w', task: 't', link: true })
+  assert.ok(claimApprove(s.db, 'sp1'))
+  recordJoined(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId })
+  assert.ok(markStarted(s.db, 'sp1', { roomId: 'room', childConvoId: 'child-1' }))
+}
+
+test('participant_convos: the spawn parent\'s session stays after the child leaves while others remain', async (t) => {
+  const { s, dan, agA, agB } = await fleet(t)
+  const agC = createAgent(s.db, dan.id, 'dev-c')
+  startedSpawnRoom(s, dan, agA, agB)
+  // An invite naming no owner session, so a-sess can only come from the spawn.
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agC.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x', targetConvoId: 'c-sess' })
+  answerInvite(s.db, { convoId: 'room', agentDeviceId: agC.deviceId, accept: true })
+  assert.deepEqual(participantConvoIds(s.db, 'room'), ['a-sess', 'child-1', 'c-sess'])
+
+  leaveConvo(s.db, { convoId: 'room', agentDeviceId: agB.deviceId })
+  assert.deepEqual(participantConvoIds(s.db, 'room'), ['a-sess', 'c-sess'])
+})
+
+test('participant_convos: a spawn child re-invited after leaving does not resurrect the old spawn\'s child session', async (t) => {
+  const { s, dan, agA, agB } = await fleet(t)
+  const agC = createAgent(s.db, dan.id, 'dev-c')
+  startedSpawnRoom(s, dan, agA, agB)
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agC.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x', targetConvoId: 'c-sess' })
+  answerInvite(s.db, { convoId: 'room', agentDeviceId: agC.deviceId, accept: true })
+  leaveConvo(s.db, { convoId: 'room', agentDeviceId: agB.deviceId })
+  // The renewal must land on a later millisecond than the spawn's start.
+  await new Promise((r) => setTimeout(r, 5))
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x', targetConvoId: 'b-new' })
+  answerInvite(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, accept: true })
+  assert.deepEqual(participantConvoIds(s.db, 'room'), ['a-sess', 'c-sess', 'b-new'])
 })
