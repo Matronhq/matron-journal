@@ -8,7 +8,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { upsertConversation, appendAndBroadcast, CONVO_ID_MAX_CHARS } from './journal.js'
-import { recordJoined, participantIds, participantConvoIds } from './participants.js'
+import { recordJoined, recordOwnerConvo, participantIds, participantConvoIds } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { isPrivateDevice } from './db.js'
 import { sessionShortFromTitle, sideTag, roomTitle } from './room-title.js'
@@ -61,9 +61,15 @@ export function claimApprove(db, id, now = Date.now(), { answeredBy = null, answ
 }
 
 export function markStarted(db, id, { roomId, childConvoId, now = Date.now() }) {
-  return db.prepare(
-    "UPDATE agent_spawn_requests SET state='started', room_id=?, child_convo_id=?, resolved_at=? WHERE id=? AND state='approved'"
-  ).run(roomId, childConvoId, now, id).changes > 0
+  const row = db.prepare(
+    "UPDATE agent_spawn_requests SET state='started', room_id=?, child_convo_id=?, resolved_at=? WHERE id=? AND state='approved' RETURNING from_device_id, from_convo_id, created_at"
+  ).get(roomId, childConvoId, now, id)
+  if (!row) return false
+  // The parent's session joins the room's owner side (participant_convos)
+  // once the spawn has actually started; recordOwnerConvo skips a room that
+  // is gone or no longer live, so a dissolve during the start RPC sticks.
+  if (roomId) recordOwnerConvo(db, { roomId, convoId: row.from_convo_id, deviceId: row.from_device_id, createdAt: row.created_at })
+  return true
 }
 
 export function markFailed(db, id, now = Date.now()) {
@@ -382,7 +388,7 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
       // The parent owns the room (conversations.agent_device_id), the target is
       // its joined participant — the same shape an accepted chat invite leaves.
       upsertConversation(db, { id: roomId, ownerUserId: row.user_id, title, sessionState: 'running', agentDeviceId: row.from_device_id })
-      recordJoined(db, { convoId: roomId, agentDeviceId: row.target_device_id, initiatorDeviceId: row.from_device_id })
+      recordJoined(db, { convoId: roomId, agentDeviceId: row.target_device_id, initiatorDeviceId: row.from_device_id, spawnId: row.id })
       // Live clients learn the room exists now, not at their next /snapshot —
       // the same two frames convo_upsert fans for a fresh conversation.
       appendAndBroadcast(db, hub, { userId: row.user_id, convoId: roomId, sender: 'journal', type: 'session_status', payload: { state: 'running' } })

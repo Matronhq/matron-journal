@@ -32,26 +32,34 @@ the machine-checkable version of this page.
   Every room row also carries
   `participant_convos: [string]` — the room's participant **conversation**
   ids, so a client can show a room under its participants' missions. It is
-  the deduped union, in journal order (row creation; asker before target,
-  parent before child — so the owner's session normally leads), of two
-  halves. **Owner side**: the session each owner invite was sent from
-  (`initiator_convo_id` on an owner-initiated row, joined or since left)
-  and each `started` spawn's parent `from_convo_id` — kept for as long as
-  the room has any joined row, because the owner stays in `participants`
-  until it dissolves the room. **Member side**: an invited member's
+  the deduped union of two halves, owner side first, each in journal
+  order (row creation; a member's own session before a spawn child) — so
+  the owner's sessions lead. **Owner side**: the session an owner invite
+  was sent from (its `initiator_convo_id`), recorded once that invite is
+  **accepted**, and each `started` spawn's parent `from_convo_id` — kept
+  for as long as the room has any joined row, because the owner stays in
+  `participants` until it dissolves the room. A re-invite of a member who
+  left does not take an accepted owner session away, and the re-invite's
+  own source session only joins the list if it is accepted. Dissolving the
+  room forgets them: a room repopulated later lists only the sessions its
+  new memberships bring. **Member side**: an invited member's
   `target_convo_id`, a joiner's own `initiator_convo_id` (an `agent_join`
   that named one), and a spawn's `child_convo_id` — each only while that
-  member's row is joined (for a spawn child, the same membership the spawn
-  created: a later re-invite of the device does not bring the old child
-  session back). So a member that leaves drops its own session exactly as
-  it drops out of `participants`, and the owner's sessions go only when the
-  owner dissolves the room. The journal learns an owner's session only
-  from an invite it sent or a spawn, so a room built purely from joins
-  lists the joiners' sessions alone. For an ordinary agent the same privacy
-  sieve applies: a row whose participant device is private, and any id a
-  private device owns, are dropped. `[]` when the room's sessions are
-  unknown (a pre-3.5 invite that named none) or nobody is joined (pending
-  or dissolved); present on exactly the rows that carry `participants`.
+  member's row is joined (for a spawn child, the very membership the spawn
+  created: a leave and re-invite of the device, even one that lands before
+  the target's `start` reply, does not bind the old child session to the
+  new membership). So a member that leaves drops its own session exactly
+  as it drops out of `participants`, and the owner's sessions go only when
+  the owner dissolves the room. The journal learns an owner's session only
+  from an accepted invite it sent or a spawn, so a room built purely from
+  joins lists the joiners' sessions alone. For an ordinary agent the same
+  privacy sieve applies: a row whose participant device is private, and any id a
+  private device owns, are dropped — judged by the conversation's
+  **current** owner when its row exists (a session handed to a private
+  device after the invite is dropped too), else by the device that
+  recorded it (a spawn child whose conversation has not landed yet). `[]`
+  when the room's sessions are unknown (a pre-3.5 invite that named none)
+  or nobody is joined (pending or dissolved); present on exactly the rows that carry `participants`.
   Every row also carries `mission_id` — the conversation's **current**
   mission, or `null` — and `mission_count`, the number of missions it was
   ever linked to (active and ended; the header's "+n" is `mission_count − 1`).

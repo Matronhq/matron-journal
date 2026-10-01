@@ -162,7 +162,7 @@ test('participant_convos: a started spawn room yields parent and child; a left c
   // target is its joined participant, the row is started with the child id.
   createSpawnRequest(s.db, { id: 'sp1', userId: dan.id, fromDeviceId: agA.deviceId, fromConvoId: 'a-sess', targetDeviceId: agB.deviceId, workdir: '/w', task: 't', link: true })
   assert.ok(claimApprove(s.db, 'sp1'))
-  recordJoined(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId })
+  recordJoined(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, spawnId: 'sp1' })
   // Approved but not started: the child is not known yet.
   assert.deepEqual(participantConvoIds(s.db, 'room'), [])
   // The child's conversation row need not exist yet — its bridge publishes
@@ -280,7 +280,7 @@ test('participant_convos: the owner\'s session stays while the owner is in the r
 function startedSpawnRoom(s, dan, agA, agB) {
   createSpawnRequest(s.db, { id: 'sp1', userId: dan.id, fromDeviceId: agA.deviceId, fromConvoId: 'a-sess', targetDeviceId: agB.deviceId, workdir: '/w', task: 't', link: true })
   assert.ok(claimApprove(s.db, 'sp1'))
-  recordJoined(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId })
+  recordJoined(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, spawnId: 'sp1' })
   assert.ok(markStarted(s.db, 'sp1', { roomId: 'room', childConvoId: 'child-1' }))
 }
 
@@ -361,4 +361,77 @@ test('filtered snapshot: a room only a private box was ever in stays keyless; a 
   filtered = rowsOf(snapshot(s.db, dan.id, { excludePrivateOwned: true })).room
   assert.deepEqual(filtered.participants, [agA.deviceId])
   assert.deepEqual(filtered.participant_convos, [])
+})
+
+test('participant_convos: the owner\'s accepted session survives re-inviting a member who left, and an unaccepted invite\'s source never replaces it', async (t) => {
+  // Review repro: A invites B from a-sess, C joins, B leaves, A re-invites B.
+  const { s, dan, agA, agB } = await fleet(t)
+  const agC = createAgent(s.db, dan.id, 'dev-c')
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x', targetConvoId: 'b-sess', initiatorConvoId: 'a-sess' })
+  answerInvite(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, accept: true })
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agC.deviceId, initiatorDeviceId: agC.deviceId, justification: 'x', initiatorConvoId: 'c-sess' })
+  answerInvite(s.db, { convoId: 'room', agentDeviceId: agC.deviceId, accept: true })
+  leaveConvo(s.db, { convoId: 'room', agentDeviceId: agB.deviceId })
+  assert.deepEqual(participantConvoIds(s.db, 'room'), ['a-sess', 'c-sess'])
+
+  // The renewal is pending (and then denied): a-sess must stay, and the
+  // renewal's own source session (a-other) must not appear.
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x', targetConvoId: 'b-new', initiatorConvoId: 'a-other' })
+  assert.deepEqual(participantConvoIds(s.db, 'room'), ['a-sess', 'c-sess'], 'pending renewal')
+  answerInvite(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, accept: false })
+  assert.deepEqual(participantConvoIds(s.db, 'room'), ['a-sess', 'c-sess'], 'refused renewal')
+  assert.deepEqual(rowsOf(snapshot(s.db, dan.id)).room.participant_convos, ['a-sess', 'c-sess'])
+})
+
+test('participant_convos: a dissolved room\'s old owner sessions do not come back when the room is repopulated', async (t) => {
+  const { s, dan, agA, agB } = await fleet(t)
+  const agC = createAgent(s.db, dan.id, 'dev-c')
+  startedSpawnRoom(s, dan, agA, agB)
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agC.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x', targetConvoId: 'c-sess', initiatorConvoId: 'a-sess2' })
+  answerInvite(s.db, { convoId: 'room', agentDeviceId: agC.deviceId, accept: true })
+  assert.deepEqual(participantConvoIds(s.db, 'room'), ['a-sess', 'a-sess2', 'child-1', 'c-sess'])
+
+  leaveAllParticipants(s.db, 'room')
+  // A later join (no owner session named) repopulates the room.
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agC.deviceId, initiatorDeviceId: agC.deviceId, justification: 'x', initiatorConvoId: 'c-new' })
+  answerInvite(s.db, { convoId: 'room', agentDeviceId: agC.deviceId, accept: true })
+  assert.deepEqual(participantConvoIds(s.db, 'room'), ['c-new'], 'neither the old invite source nor the old spawn parent resurrects')
+})
+
+test('participant_convos: a spawn target renewed before the start reply does not bind the child to the replacement membership', async (t) => {
+  const { s, dan, agA, agB } = await fleet(t)
+  createSpawnRequest(s.db, { id: 'sp1', userId: dan.id, fromDeviceId: agA.deviceId, fromConvoId: 'a-sess', targetDeviceId: agB.deviceId, workdir: '/w', task: 't', link: true })
+  assert.ok(claimApprove(s.db, 'sp1'))
+  recordJoined(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, spawnId: 'sp1' })
+  // While approveSpawn awaits the start RPC: B leaves and accepts a fresh
+  // invite for another of its sessions.
+  leaveConvo(s.db, { convoId: 'room', agentDeviceId: agB.deviceId })
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x', targetConvoId: 'b-new' })
+  answerInvite(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, accept: true })
+  assert.ok(markStarted(s.db, 'sp1', { roomId: 'room', childConvoId: 'child-1' }))
+  // The parent is still the owner's session in the room; only the child,
+  // which belongs to the membership B left, must not appear.
+  assert.deepEqual(participantConvoIds(s.db, 'room'), ['a-sess', 'b-new'], 'child-1 belongs to the membership B left')
+})
+
+test('participant_convos: the filtered snapshot drops a session a private device has since taken over', async (t) => {
+  const { s, dan, agA, agB, a, b } = await fleet(t)
+  const agP = createAgent(s.db, dan.id, 'dev-p')
+  await sessions(a, b)
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, initiatorDeviceId: agA.deviceId, justification: 'x', targetConvoId: 'b-sess', initiatorConvoId: 'a-sess' })
+  answerInvite(s.db, { convoId: 'room', agentDeviceId: agB.deviceId, accept: true })
+  // convo_upsert's last-writer-wins takeover of a participant-less session
+  // by a private device (ws.js permits it when the old owner is ordinary).
+  const p = await makeWsClient(s.base, { token: agP.token, cursor: null })
+  t.after(() => p.close())
+  await p.waitFor((f) => f.op === 'hello_ok')
+  // After hello: the handshake re-derives an unpinned private flag.
+  s.db.prepare('UPDATE devices SET private=1 WHERE id=?').run(agP.deviceId)
+  p.send({ op: 'convo_upsert', convo_id: 'a-sess', title: 'taken', session_state: 'running' })
+  await p.waitFor((f) => f.kind === 'journal' && f.convo_id === 'a-sess' && f.payload?.title === 'taken')
+  assert.equal(s.db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get('a-sess').agent_device_id, agP.deviceId)
+
+  const filtered = rowsOf(snapshot(s.db, dan.id, { excludePrivateOwned: true })).room
+  assert.deepEqual(filtered.participant_convos, ['b-sess'], 'a-sess is private-owned now')
+  assert.deepEqual(rowsOf(snapshot(s.db, dan.id)).room.participant_convos, ['a-sess', 'b-sess'])
 })

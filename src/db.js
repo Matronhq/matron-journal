@@ -635,6 +635,57 @@ export function openDb(path) {
     db.exec('ALTER TABLE convo_agents ADD COLUMN item_id TEXT')
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_convo_agents_item ON convo_agents(item_id)')
+  // Room participant conversations (participant_convos, see
+  // participantConvoIds in participants.js). Both additive; each backfills
+  // exactly what the previous derivation produced, once, when it first
+  // appears, so no live room's list changes at deploy.
+  //
+  // convo_agents.spawn_id: the spawn whose approval created this membership
+  // generation (recordJoined), reset to NULL by any renewal. A started
+  // spawn's child counts only while that same generation is joined. After
+  // both convo_agents rebuilds above, for the reason target_convo_id is.
+  // Backfill: the old rule (a joined row created no later than the start).
+  const caColsSpawn = db.prepare('PRAGMA table_info(convo_agents)').all()
+  if (!caColsSpawn.some((c) => c.name === 'spawn_id')) {
+    db.exec('ALTER TABLE convo_agents ADD COLUMN spawn_id TEXT')
+    db.exec(`
+      UPDATE convo_agents SET spawn_id = (
+        SELECT s.id FROM agent_spawn_requests s
+         WHERE s.room_id = convo_agents.convo_id AND s.target_device_id = convo_agents.agent_device_id
+           AND s.state = 'started' AND convo_agents.created_at <= s.resolved_at
+         ORDER BY s.created_at DESC LIMIT 1)
+       WHERE state = 'joined'`)
+  }
+  // room_owner_convos: the room owner's sessions that accepted membership
+  // brought in (an accepted owner invite's initiator_convo_id, a started
+  // spawn's from_convo_id) — kept off the membership row because a re-invite
+  // renews that row. Dissolve deletes a room's rows. Backfill: the old
+  // owner-side rule, for rooms with a joined row (others were not showing
+  // any owner session and a dissolved one must not get them back).
+  const hasOwnerConvos = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='room_owner_convos'").get()
+  if (!hasOwnerConvos) {
+    db.exec(`
+      CREATE TABLE room_owner_convos(
+        room_id TEXT NOT NULL,
+        convo_id TEXT NOT NULL,
+        device_id INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY(room_id, convo_id)
+      );
+      INSERT OR IGNORE INTO room_owner_convos(room_id, convo_id, device_id, created_at)
+        SELECT room_id, convo_id, device_id, created_at FROM (
+          SELECT ca.convo_id AS room_id, ca.initiator_convo_id AS convo_id, ca.initiator_device_id AS device_id, ca.created_at AS created_at, ca.rowid AS rk, 0 AS sub
+            FROM convo_agents ca JOIN conversations r ON r.id = ca.convo_id
+           WHERE ca.initiator_device_id = r.agent_device_id AND ca.state IN ('joined','left') AND ca.initiator_convo_id IS NOT NULL
+          UNION ALL
+          SELECT s.room_id, s.from_convo_id, s.from_device_id, s.created_at, s.rowid, 1
+            FROM agent_spawn_requests s JOIN conversations r ON r.id = s.room_id
+           WHERE s.state = 'started' AND s.from_device_id = r.agent_device_id
+        ) o
+        WHERE EXISTS(SELECT 1 FROM convo_agents j WHERE j.convo_id = o.room_id AND j.state = 'joined')
+        ORDER BY created_at, rk, sub;
+    `)
+  }
   // Which Claude model the spawned session should run (spec: agent-spawned
   // sessions). An alias like 'opus' or a full model id — the target bridge's
   // vocabulary, not the journal's, so no CHECK: a bridge that learns a new
