@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS events(
   PRIMARY KEY(user_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_events_convo ON events(convo_id, seq);
+-- A project's "Files and images" (projects-feed.js) reads only these rows.
+CREATE INDEX IF NOT EXISTS idx_events_media ON events(convo_id, seq) WHERE type IN ('image', 'file');
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idem
   ON events(user_id, convo_id, idem_key) WHERE idem_key IS NOT NULL;
 CREATE TABLE IF NOT EXISTS user_seq(
