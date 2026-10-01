@@ -140,6 +140,11 @@ test('trippedSubjects: fires once per subject per crossing; cleared subjects re-
   assert.deepEqual(trippedSubjects(db, r, { now: NOW + 2, coordinatorConvoId: 'coord' }).fresh, [])
   at(45)
   assert.deepEqual(trippedSubjects(db, r, { now: NOW + 3, coordinatorConvoId: 'coord' }).fresh.map((s) => s.subject), ['convo:g1'])
+  // Resting (inside its gap, record: false): cleared subjects are still forgotten; fresh ones are reported, not recorded.
+  at(10); assert.deepEqual(trippedSubjects(db, r, { now: NOW + 4, coordinatorConvoId: 'coord', record: false }).fresh, [])
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM routine_trigger_state WHERE routine_id=?').get(r.id).n, 0)
+  at(42); assert.deepEqual(trippedSubjects(db, r, { now: NOW + 4, coordinatorConvoId: 'coord', record: false }).fresh.map((s) => s.subject), ['convo:g1'])
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM routine_trigger_state WHERE routine_id=?').get(r.id).n, 0)
   // Paused between the sweep's listing and the evaluation: nothing is recorded or fired.
   at(10); trippedSubjects(db, r, { now: NOW + 4, coordinatorConvoId: 'coord' }); at(80)
   db.prepare('UPDATE routines SET enabled=0 WHERE id=?').run(r.id)
@@ -227,13 +232,18 @@ test('the trigger sweep fires a tripped routine into the Coordinator with the sp
   assert.equal(row.last_outcome, 'applied now'); assert.ok(row.last_fired_at > 0); assert.equal(row.next_at, null)
   // Still tripped: no second fire.
   assert.deepEqual(await s.routinesSweep.runTriggers(Date.now()), { fired: 0 })
-  // A second session crossing inside the 15-minute gap waits for the gap to pass; one fire then carries it.
+  // Inside the 15-minute gap: a second session crossing waits for the gap, and the first one clearing (compacted)
+  // is forgotten even while the routine rests, so its climbing back counts as a new crossing. One fire then carries both.
   upsertConversation(s.db, { id: 'g2', ownerUserId: dan.id, title: 'Second', sessionState: 'running', agentDeviceId: gene.deviceId })
   upsertConvoStatus(s.db, { userId: dan.id, convoId: 'g2', status: { model: 'opus-5-5', context: { tokens: 500000, window: 1000000, pct: 50 } }, reportedAt: Date.now() })
+  upsertConvoStatus(s.db, { userId: dan.id, convoId: 'g1', status: { model: 'opus-5-5', context: { tokens: 40000, window: 1000000, pct: 4 } }, reportedAt: Date.now() })
+  assert.deepEqual(await s.routinesSweep.runTriggers(Date.now()), { fired: 0 })
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM routine_trigger_state').get().n, 0, 'the cleared subject is forgotten during the gap; the new one is not recorded yet')
+  upsertConvoStatus(s.db, { userId: dan.id, convoId: 'g1', status: { model: 'opus-5-5', context: { tokens: 580000, window: 1000000, pct: 58 } }, reportedAt: Date.now() })
   assert.deepEqual(await s.routinesSweep.runTriggers(Date.now()), { fired: 0 })
   const sweepB = s.routinesSweep.runTriggers(Date.now() + 16 * 60000)
   const reqB = await coord.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'session_control' && String(f.request.params.message).includes('[Second]'))
-  assert.equal(reqB.request.params.message, 'Routine context-over: follow the Session context over the threshold section of your playbook.\n\nTripped by:\n- [Second](matron://convo/g2) at 50% of its window (500k/1M, opus-5-5)')
+  assert.equal(reqB.request.params.message, 'Routine context-over: follow the Session context over the threshold section of your playbook.\n\nTripped by:\n- [Big](matron://convo/g1) at 58% of its window (580k/1M, opus-5-5)\n- [Second](matron://convo/g2) at 50% of its window (500k/1M, opus-5-5)')
   coord.send({ op: 'agent_response', request_id: reqB.request.request_id, to_device_id: 0, ok: true, result: { applied: 'now' } })
   assert.deepEqual(await sweepB, { fired: 1 })
   // A paused trigger routine never fires.

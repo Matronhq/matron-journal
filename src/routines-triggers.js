@@ -84,7 +84,7 @@ export function evaluateTrigger(db, userId, trigger, { now = Date.now(), coordin
         const tokens = st.context?.tokens
         const window = contextWindowOf(st.model, st.context?.window)
         const measured = Number.isFinite(tokens) && tokens > 0 && window > 0
-        const pct = measured ? Math.floor((tokens / window) * 100) : st.context?.pct
+        const pct = measured ? Math.floor((tokens * 100) / window) : st.context?.pct
         if (!Number.isInteger(pct) || pct < trigger.pct) continue
         const detail = measured ? `${kTokens(tokens)}/${kTokens(window)}${st.model ? `, ${st.model}` : ''}` : (st.model || '')
         out.push({ subject: `convo:${c.id}`, line: `- [${title}](matron://convo/${c.id}) at ${pct}% of its window${detail ? ` (${detail})` : ''}` })
@@ -145,8 +145,11 @@ export function currentSubjects(db, routine, { now = Date.now() } = {}) {
 // The sweep's step for one routine, in one transaction: subjects that no
 // longer match are forgotten; subjects that match and are not yet recorded
 // are recorded now (before delivery — a crash mid-delivery costs one
-// fire, never a double) and returned as `fresh`.
-export function trippedSubjects(db, routine, { now = Date.now(), coordinatorConvoId = null, excludePrivateOwned = false } = {}) {
+// fire, never a double) and returned as `fresh`. With `record: false` (a
+// routine resting inside its gap) the forgetting still happens, so a
+// subject that clears and crosses again inside the gap fires at the first
+// sweep after it, but nothing is recorded and `fresh` is only a report.
+export function trippedSubjects(db, routine, { now = Date.now(), coordinatorConvoId = null, excludePrivateOwned = false, record = true } = {}) {
   return db.transaction(() => {
     // Paused (or deleted) since the sweep listed it: nothing is recorded
     // and nothing fires — the same window the scheduled path closes.
@@ -158,14 +161,17 @@ export function trippedSubjects(db, routine, { now = Date.now(), coordinatorConv
     const forget = db.prepare('DELETE FROM routine_trigger_state WHERE routine_id=? AND subject=?')
     for (const s of known) if (!still.has(s)) forget.run(routine.id, s)
     const fresh = matching.filter((s) => !known.has(s.subject))
-    const mark = db.prepare('INSERT OR IGNORE INTO routine_trigger_state(routine_id, subject, tripped_at) VALUES(?,?,?)')
-    for (const s of fresh) mark.run(routine.id, s.subject, now)
+    if (record) {
+      const mark = db.prepare('INSERT OR IGNORE INTO routine_trigger_state(routine_id, subject, tripped_at) VALUES(?,?,?)')
+      for (const s of fresh) mark.run(routine.id, s.subject, now)
+    }
     return { fresh, matching }
   })()
 }
 
 // One pass over every enabled triggered routine. Every fire rests the
-// routine for TRIGGER_GAP_MS (retry_at doubles as "not before"). A delivery
+// routine for TRIGGER_GAP_MS (retry_at doubles as "not before"); a resting
+// routine only reconciles its records. A delivery
 // failure the next attempt might cure — and "no Coordinator", which a later
 // assignment cures — forgets the fresh subjects (so they re-trip) and backs
 // the routine off for RETRY_AFTER_MS instead; a refusal keeps them recorded
@@ -179,15 +185,17 @@ export async function runTriggerSweep({ db, firer, log = console }, now = Date.n
   let fired = 0
   const deliveries = []
   for (const r of routines) {
-    if (firer.busy()) break
+    // A busy firer skips the due routines (nothing recorded, so nothing is
+    // lost) but the resting ones still reconcile.
+    if (!r.resting && firer.busy()) continue
     let fresh
     try {
-      ({ fresh } = trippedSubjects(db, r, { now, ...viewFor(db, r) }))
+      ({ fresh } = trippedSubjects(db, r, { now, record: !r.resting, ...viewFor(db, r) }))
     } catch (err) {
       try { log.error(`routines: ${r.name}: trigger evaluation failed: ${err?.message || err}`) } catch { /* never throw from a timer */ }
       continue
     }
-    if (!fresh.length) continue
+    if (r.resting || !fresh.length) continue
     fired += 1
     db.prepare('UPDATE routines SET last_fired_at=?, retry_at=? WHERE id=?').run(now, now + TRIGGER_GAP_MS, r.id)
     const onOutcome = (outcome, retryable) => {

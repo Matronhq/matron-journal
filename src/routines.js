@@ -246,8 +246,12 @@ export function dueRoutines(db, now = Date.now()) {
 }
 
 // Every enabled triggered routine whose retry backoff (if any) has passed.
+// Every enabled triggered routine, `resting` while its retry_at (the gap
+// after a fire, or a backoff) lies ahead: a resting routine still
+// reconciles its records on the sweep but neither records nor fires.
 export function triggeredRoutines(db, now = Date.now()) {
-  return db.prepare('SELECT * FROM routines WHERE enabled=1 AND trigger IS NOT NULL AND (retry_at IS NULL OR retry_at<=?) ORDER BY user_id, name').all(now).map(routineRow)
+  return db.prepare('SELECT * FROM routines WHERE enabled=1 AND trigger IS NOT NULL ORDER BY user_id, name').all()
+    .map((row) => ({ ...routineRow(row), resting: row.retry_at != null && row.retry_at > now }))
 }
 
 // Advance BEFORE delivery, in one transaction: last_fired_at stamped,

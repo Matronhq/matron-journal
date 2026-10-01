@@ -1794,7 +1794,8 @@ fresh subject (`- [title](matron://convo/<id>) at 42% of its window
 (420k/1M, model)`, `- […] stalled on <model>, resets <iso> (in 5 h)` / `no reset
 time`, `- <box>: 15% free (15.0 GB of 100.0 GB)`). Pausing a triggered
 routine or changing its trigger clears its records. A triggered routine
-fires at most once per 15 minutes — subjects crossing inside the gap are
+fires at most once per 15 minutes — a resting routine still forgets
+subjects that stop matching, and subjects crossing inside the gap are
 fresh at the first sweep after it; a retryable delivery failure forgets the
 fresh subjects and backs the routine off 15 minutes; `run` fires with
 whatever matches now, records untouched.
