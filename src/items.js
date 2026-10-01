@@ -4,6 +4,7 @@
 // wake: those are src/items-http.js's job.
 import { randomBytes } from 'node:crypto'
 import { sharedConvoSql } from './visibility.js'
+import { blobImageDims } from './db.js'
 
 export const ITEM_KINDS = ['task', 'question', 'decision']
 export const RESOLUTIONS = ['done', 'answered', 'decided', 'reversed', 'cancelled']
@@ -306,7 +307,7 @@ export function createItem(db, {
       bodyCommentId = newId('ic')
       db.prepare(`INSERT INTO item_comments(id,item_id,user_id,author,device_id,kind,body,attachments,meta,created_at)
         VALUES(?,?,?,?,?,'status','',?,?,?)`)
-        .run(bodyCommentId, id, userId, createdBy, originDeviceId, JSON.stringify(attachments), JSON.stringify({ role: 'body' }), now)
+        .run(bodyCommentId, id, userId, createdBy, originDeviceId, JSON.stringify(withImageDims(db, attachments)), JSON.stringify({ role: 'body' }), now)
     }
     // `bodyComment`: the synthetic row above, so the caller can queue its
     // voice notes for transcription exactly like a comment's (null without
@@ -456,7 +457,21 @@ function touch(db, itemId, now) {
   db.prepare('UPDATE items SET updated_at=? WHERE id=?').run(now, itemId)
 }
 
+// Stamps each image attachment with its blob's displayed width/height (spec:
+// 2026-10-01 item thread layout shift) so the apps can reserve the image's box
+// before its bytes load. Server-attested, like transcripts: a size a client
+// sends is dropped by validateAttachments, and only the blob's own header is
+// believed. A blob that can't be sized (gone, not an image) adds nothing.
+export function withImageDims(db, attachments) {
+  return (attachments ?? []).map((a) => {
+    if (typeof a?.mime !== 'string' || !a.mime.startsWith('image/')) return a
+    const dims = blobImageDims(db, a.blob_ref)
+    return dims ? { ...a, width: dims.width, height: dims.height } : a
+  })
+}
+
 function insertComment(db, { itemId, userId, author, deviceId, kind, body, attachments, meta, idemKey, now }) {
+  attachments = withImageDims(db, attachments)
   const id = newId('ic')
   db.prepare(`INSERT INTO item_comments(id,item_id,user_id,author,device_id,kind,body,attachments,meta,idem_key,created_at)
     VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
@@ -681,4 +696,43 @@ export function rerankItem(db, { userId, itemId, position, after, before, now = 
 // and neither may turn the old mirror into an ordinary item.
 export function isConsentMirror(db, itemId) {
   return db.prepare('SELECT consent FROM items WHERE id=?').get(itemId)?.consent != null
+}
+
+// Stamps width/height onto the image attachments of comments written before
+// the journal recorded image sizes (spec: 2026-10-01 item thread layout
+// shift). Fire-and-forget after listen, like the search backfill: batched by
+// rowid with a yield between batches, so a large thread history never holds
+// the event loop. Idempotent — a row whose images already carry a size (or
+// whose blob can't be sized) is left as it is, and a re-run after a restart
+// mid-walk just finds less to do. Each blob's header is read at most once
+// ever (blobImageDims caches the answer on the blob row).
+export async function backfillImageDims(db, { batchSize = 200, log = () => {}, shouldStop = () => false } = {}) {
+  const select = db.prepare(`SELECT rowid, id, attachments FROM item_comments
+    WHERE rowid>? AND attachments LIKE '%"mime":"image/%' ORDER BY rowid LIMIT ?`)
+  const update = db.prepare('UPDATE item_comments SET attachments=? WHERE id=?')
+  let cursor = 0
+  let updated = 0
+  for (;;) {
+    if (shouldStop()) break
+    const rows = select.all(cursor, batchSize)
+    if (rows.length === 0) break
+    db.transaction(() => {
+      for (const row of rows) {
+        const atts = parseJson(row.attachments, null)
+        if (!Array.isArray(atts)) continue
+        const missing = atts.some((a) => typeof a?.mime === 'string' && a.mime.startsWith('image/') && !(a.width > 0 && a.height > 0))
+        if (!missing) continue
+        const stamped = withImageDims(db, atts)
+        const next = JSON.stringify(stamped)
+        if (next !== row.attachments) {
+          update.run(next, row.id)
+          updated++
+        }
+      }
+    })()
+    cursor = rows[rows.length - 1].rowid
+    await new Promise((r) => setImmediate(r))
+  }
+  if (updated > 0) log(`items: stamped image sizes on ${updated} comment(s)`)
+  return { updated }
 }

@@ -16,6 +16,7 @@ import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
 import { runOffload, runExpireLogs, runReapMedia } from './retention.js'
 import { backfillSearchIndex } from './search.js'
+import { backfillImageDims } from './items.js'
 import { scheduleGithubRefresh } from './github-refresh.js'
 import { makeRpcBroker } from './rpc-broker.js'
 import { resolveWebDir, makeStaticHandler } from './static-http.js'
@@ -476,6 +477,11 @@ export function startServer({
         log: (l) => console.log(l),
         shouldStop: () => closing,
       }).catch((err) => { console.error('search backfill failed', err) })
+      // Same shape: older item comments get their images' sizes stamped on.
+      const imageDimsBackfill = backfillImageDims(db, {
+        log: (l) => console.log(l),
+        shouldStop: () => closing,
+      }).catch((err) => { console.error('image size backfill failed', err) })
       resolve({
         port: server.address().port,
         db,
@@ -487,6 +493,7 @@ export function startServer({
         itemTranscription,
         preapproveKey: resolvedPreapproveKey,
         searchBackfill,
+        imageDimsBackfill,
         unseenNudge: unseenNudgeSweep,
         routinesSweep: routinesSweeper,
         routineFirer,
@@ -510,7 +517,7 @@ export function startServer({
           // The transcription queue touches the DB between awaits: abort its
           // child and let it drain before the handle closes.
           const transcriptionDone = itemTranscription.close()
-          server.close(() => { Promise.all([searchBackfill, transcriptionDone]).then(() => { db.close(); r() }) })
+          server.close(() => { Promise.all([searchBackfill, imageDimsBackfill, transcriptionDone]).then(() => { db.close(); r() }) })
         }),
       })
     })

@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3'
 import { healBakedTitles } from './heal-titles.js'
+import { imageSizeFromFile } from './image-size.js'
 import { backfillMissionLinks, healMissionLinks } from './mission-links.js'
 
 const SCHEMA = `
@@ -563,6 +564,13 @@ export function openDb(path) {
   if (!convoCols.some((c) => c.name === 'summary')) {
     db.exec("ALTER TABLE conversations ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
   }
+  // Displayed pixel size of an image blob (spec: 2026-10-01 item thread
+  // layout shift), read from the file's own header by image-size.js. NULL =
+  // not read yet (blobs from before this column; backfillImageDims and
+  // blobImageDims fill them in), 0 × 0 = read, and not an image we can size.
+  const blobCols = db.prepare('PRAGMA table_info(blobs)').all()
+  if (!blobCols.some((c) => c.name === 'width')) db.exec('ALTER TABLE blobs ADD COLUMN width INTEGER')
+  if (!blobCols.some((c) => c.name === 'height')) db.exec('ALTER TABLE blobs ADD COLUMN height INTEGER')
   // Keeps the per-user quota SUM (see userBlobBytes) a cheap index scan rather
   // than a full-table read as the blob store grows.
   db.exec('CREATE INDEX IF NOT EXISTS idx_blobs_owner ON blobs(owner_user_id)')
@@ -991,10 +999,27 @@ export function openDb(path) {
   return db
 }
 
-export function insertBlob(db, { id, ownerUserId, contentType, size, sha256, diskPath }) {
+export function insertBlob(db, { id, ownerUserId, contentType, size, sha256, diskPath, width = null, height = null }) {
   db.prepare(
-    'INSERT INTO blobs(id, owner_user_id, content_type, size, sha256, disk_path, created_at) VALUES(?,?,?,?,?,?,?)'
-  ).run(id, ownerUserId, contentType, size, sha256, diskPath, Date.now())
+    'INSERT INTO blobs(id, owner_user_id, content_type, size, sha256, disk_path, created_at, width, height) VALUES(?,?,?,?,?,?,?,?,?)'
+  ).run(id, ownerUserId, contentType, size, sha256, diskPath, Date.now(), width, height)
+}
+
+// { width, height } of an image blob as displayed, or null when it isn't one
+// we can size (or the blob is gone). Reads the file header once and caches the
+// answer on the row — 0 × 0 records "read, unknown" so a non-image is never
+// re-read. Sync: a header read is at most a few KB in the common case.
+export function blobImageDims(db, blobId) {
+  const row = db.prepare('SELECT disk_path, width, height FROM blobs WHERE id=?').get(blobId)
+  if (!row) return null
+  if (row.width == null || row.height == null) {
+    const dims = imageSizeFromFile(row.disk_path)
+    const width = dims?.width ?? 0
+    const height = dims?.height ?? 0
+    db.prepare('UPDATE blobs SET width=?, height=? WHERE id=?').run(width, height, blobId)
+    return dims
+  }
+  return row.width > 0 && row.height > 0 ? { width: row.width, height: row.height } : null
 }
 
 export function getBlob(db, id) {

@@ -133,8 +133,11 @@ the machine-checkable version of this page.
   (non-private) agent caller additionally has hits from private-owned
   conversations excluded — see "Device privacy" below.
 - `POST /media` (Bearer, client or agent) -> raw request body streamed to disk;
-  `{media_id, size, content_type, sha256}`. Content-Type header captured
-  (default `application/octet-stream`). 400 `{error:'empty'}` on a zero-byte
+  `{media_id, size, content_type, sha256, width?, height?}`. Content-Type header captured
+  (default `application/octet-stream`). For an `image/*` upload the journal
+  reads the displayed pixel size from the file's own header (PNG, JPEG with
+  EXIF orientation, GIF, WebP, HEIC/HEIF with `irot`) and answers it as
+  `width`/`height`; absent when it isn't an image it can size. 400 `{error:'empty'}` on a zero-byte
   body; 413 `{error:'too_large'}` over `MATRON_MEDIA_MAX_BYTES` (default 50 MB);
   413 `{error:'quota_exceeded'}` when the user's total blob bytes would exceed
   `MATRON_MEDIA_USER_QUOTA_BYTES` (default 2 GiB) — checked up front (rejected
@@ -1506,7 +1509,13 @@ spawn and agent-chat consent cards — are invisible to every agent caller
 here is the item **body**'s attachments (set at create only, v1) — a
 comment's own attachments live on the comment. Comment shape:
 `{id, item_id, author, device_id, kind:'comment'|'status', body,
-created_at, attachments[{blob_ref,mime,name,size,transcript?,transcript_status?}], meta, action}`.
+created_at, attachments[{blob_ref,mime,name,size,width?,height?,transcript?,transcript_status?}], meta, action}`.
+`width`/`height` (spec 2026-10-01, item thread layout shift) are the image's
+displayed pixel size, stamped by the journal from the blob's header when the
+attachment is stored (and backfilled after boot onto older comments) so the
+apps can reserve the image's aspect ratio before its bytes load. Server-
+attested like `transcript`: a size a client sends is dropped. Absent on
+non-image attachments and on images the journal can't size.
 `meta` is `null` for an ordinary comment, `{action:"<label>"}` for an action
 tap, and `{from:{state,
 resolution,awaiting}, to:{…}}` for the synthetic `status` comment a
