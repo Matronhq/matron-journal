@@ -1100,6 +1100,15 @@ export function openDb(path) {
   if (!userCols.some((c) => c.name === 'is_admin')) {
     db.exec('ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0')
   }
+  // Unlisted accounts (person-to-person sharing): an account that is on the
+  // journal but is nobody's colleague, such as the App Store review login.
+  // It is left out of the "add contact" user list, gets an empty list
+  // itself, and can neither send nor be sent a contact request
+  // (contacts.js). Set from the shell with `matron-admin user unlisted
+  // <name> on`. Default 0.
+  if (!userCols.some((c) => c.name === 'unlisted')) {
+    db.exec('ALTER TABLE users ADD COLUMN unlisted INTEGER NOT NULL DEFAULT 0')
+  }
   // One-time title cleanup (spec: agent box rename). Gated on user_version
   // inside, so this is a cheap pragma read on every subsequent open.
   healBakedTitles(db, { log: (m) => console.log(m) })

@@ -66,6 +66,29 @@ test('the user directory lists the journal\'s other users, names only', async (t
   assert.deepEqual((await w.timPhone('/contacts/users')).json, { users: [{ name: 'dan' }] })
 })
 
+test('an unlisted account: not in the directory, an empty directory of its own, and one 404 either way', async (t) => {
+  const w = await world(t)
+  w.s.db.prepare('UPDATE users SET unlisted=1 WHERE id=?').run(w.tim.id)
+  assert.deepEqual((await w.danBox('/contacts/users')).json, { users: [] })
+  assert.deepEqual((await w.danPhone('/contacts/users')).json, { users: [] })
+  assert.deepEqual((await w.timPhone('/contacts/users')).json, { users: [] })
+  assert.deepEqual((await w.timBox('/contacts/users')).json, { users: [] })
+  const unknown = await w.danPhone('/contacts', post({ user: 'nobody' }))
+  for (const r of [
+    await w.danPhone('/contacts', post({ user: 'tim' })),
+    await w.danBox('/contacts', post({ user: 'tim', convo_id: 'work' })),
+    await w.timPhone('/contacts', post({ user: 'dan' })),
+    await w.timBox('/contacts', post({ user: 'dan', convo_id: 'timwork' })),
+  ]) {
+    assert.equal(r.status, 404)
+    assert.deepEqual(r.json, unknown.json, 'indistinguishable from a name that does not exist')
+  }
+  await settle()
+  assert.equal(cards(w.ws.timPhone, 'contact_request').length, 0)
+  assert.equal(cards(w.ws.danPhone, 'contact_request').length, 0)
+  assert.deepEqual((await w.timPhone('/contacts')).json.contacts, [])
+})
+
 test('an agent\'s contact ask parks for its own user; the tap sends it; the other person accepts once', async (t) => {
   const w = await world(t)
   // Being on the same journal makes nobody a contact (spec decision 8).

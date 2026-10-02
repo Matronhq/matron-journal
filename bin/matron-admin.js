@@ -16,6 +16,7 @@ const USAGE = `usage:
   matron-admin user add <name> (--password <pw> | --password-stdin | env MATRON_PASSWORD)
   matron-admin user passwd <name> (--password <pw> | --password-stdin | env MATRON_PASSWORD)
   matron-admin user admin <name> on|off
+  matron-admin user unlisted <name> on|off
   matron-admin agent add <username> <agent-name>
   matron-admin device list <username>
   matron-admin device revoke <device_id>
@@ -141,6 +142,16 @@ export async function runAdmin(db, argv, deps = {}) {
     const r = db.prepare('UPDATE users SET is_admin=? WHERE name=?').run(value === 'on' ? 1 : 0, name)
     if (r.changes === 0) throw new Error(`no such user: ${name}`)
     return value === 'on' ? `${name} is now a journal admin` : `${name} is no longer a journal admin`
+  }
+  if (a === 'user' && b === 'unlisted') {
+    const name = argv[2]
+    const value = argv[3]
+    if (!name || (value !== 'on' && value !== 'off')) throw new Error(USAGE)
+    const r = db.prepare('UPDATE users SET unlisted=? WHERE name=?').run(value === 'on' ? 1 : 0, name)
+    if (r.changes === 0) throw new Error(`no such user: ${name}`)
+    return value === 'on'
+      ? `${name} is now unlisted: left out of the add-contact user list, and cannot send or be sent a contact request`
+      : `${name} is listed again in the add-contact user list`
   }
   if (a === 'agent' && b === 'add') {
     const [, , username, agentName] = argv

@@ -52,10 +52,18 @@ const rawBetween = (db, userId, peerUserId) =>
   db.prepare('SELECT * FROM contacts WHERE user_id=? AND peer_user_id=? AND peer_journal IS NULL').get(userId, peerUserId)
 const userName = (db, id) => db.prepare('SELECT name FROM users WHERE id=?').get(id)?.name ?? null
 
+// An unlisted account (users.unlisted, e.g. the App Store review login) is
+// outside contacts altogether: it is in nobody's list, its own list is
+// empty, and a request to it or from it is the same answer as a name that
+// does not exist — so it can be neither found nor used to probe for names.
+// Contact rows made before the flag was set are left as they are.
+const isUnlisted = (db, userId) => !!db.prepare('SELECT unlisted FROM users WHERE id=?').get(userId)?.unlisted
+
 // "Add contact" on the same journal lists the journal's users — names only
-// (spec decision 4), never the caller.
+// (spec decision 4), never the caller, never an unlisted account.
 export function listJournalUsers(db, userId) {
-  return db.prepare('SELECT name FROM users WHERE id<>? ORDER BY name COLLATE NOCASE').all(userId).map((r) => ({ name: r.name }))
+  if (isUnlisted(db, userId)) return []
+  return db.prepare('SELECT name FROM users WHERE id<>? AND unlisted=0 ORDER BY name COLLATE NOCASE').all(userId).map((r) => ({ name: r.name }))
 }
 
 // By id (ct_…) or, for a same-journal peer, by name. Always the caller's
@@ -171,9 +179,10 @@ function send(db, own, now) {
 // Returns {outcome: 'parked'|'sent'|'crossed'|'silent'|'accepted', contact, peer?, superseded?}.
 export function requestContact(db, { userId, peerName, by, convoId = null, deviceId = null, now = Date.now() }) {
   return db.transaction(() => {
-    const peer = typeof peerName === 'string' ? db.prepare('SELECT id, name FROM users WHERE name=?').get(peerName) : null
-    // Unknown and "yourself" are one answer.
-    if (!peer || peer.id === userId) fail('no_user')
+    const peer = typeof peerName === 'string' ? db.prepare('SELECT id, name, unlisted FROM users WHERE name=?').get(peerName) : null
+    // Unknown, "yourself", an unlisted account, and anyone at all when the
+    // caller is unlisted are one answer.
+    if (!peer || peer.id === userId || peer.unlisted || isUnlisted(db, userId)) fail('no_user')
     const cur = rawBetween(db, userId, peer.id)
     if (cur) {
       if (cur.state === 'active') fail('already_contact')

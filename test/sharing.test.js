@@ -6,7 +6,7 @@ import { upsertConversation, append } from '../src/journal.js'
 import { createMission, createMilestone, listGrantedMissions, getGrantedMission, grantedMissionDetail, updateMission } from '../src/missions.js'
 import { createItem, addComment, getSharedItem } from '../src/items.js'
 import {
-  requestContact, answerContact, removeContact, blockContact, listContacts, expireContactAsks, getContactRaw,
+  requestContact, answerContact, removeContact, blockContact, listContacts, expireContactAsks, getContactRaw, listJournalUsers,
   OWN_ASK_TTL_MS, MAX_PARKED_PER_DEVICE,
 } from '../src/contacts.js'
 import { shareMission, answerGrant, revokeGrant, listGrants, expireGrantAsks, sharePreview, activeGranteeIds } from '../src/grants.js'
@@ -297,6 +297,32 @@ test('the grantee\'s view applies the private sieve and carries no ids', async (
   assert.equal(getGrantedMission(db, tim.id, m.id), null)
   assert.equal(getSharedItem(db, tim.id, open.id), null)
   assert.equal(canReadBlob(db, tim.id, 'blob1'), false)
+  db.close()
+})
+
+test('contacts: an unlisted account is in nobody\'s list, has no list, and can neither be asked nor ask', async () => {
+  const w = await world()
+  const { db, dan, tim, sam, box } = w
+  const names = (u) => listJournalUsers(db, u.id).map((r) => r.name)
+  assert.deepEqual(names(dan), ['sam', 'tim'])
+  // sam and tim are contacts before sam is flagged: that row is left alone.
+  contacts(db, sam, tim)
+  db.prepare('UPDATE users SET unlisted=1 WHERE id=?').run(sam.id)
+  assert.deepEqual(names(dan), ['tim'])
+  assert.deepEqual(names(tim), ['dan'])
+  assert.deepEqual(names(sam), [], 'the unlisted account sees nobody')
+  // To it, and from it, by a tap or by an agent: the answer for a name that does not exist.
+  assert.throws(() => requestContact(db, { userId: dan.id, peerName: 'sam', by: 'user' }), /^Error: no_user$/)
+  assert.throws(() => requestContact(db, { userId: dan.id, peerName: 'sam', by: 'agent', convoId: 'work', deviceId: box.deviceId }), /^Error: no_user$/)
+  assert.throws(() => requestContact(db, { userId: sam.id, peerName: 'dan', by: 'user' }), /^Error: no_user$/)
+  assert.throws(() => requestContact(db, { userId: sam.id, peerName: 'nobody', by: 'user' }), /^Error: no_user$/)
+  assert.equal(state(db, dan.id, 'sam'), null, 'no row was made')
+  assert.equal(state(db, sam.id, 'dan'), null)
+  assert.equal(state(db, tim.id, 'sam'), 'active')
+  // Off again: listed, and reachable.
+  db.prepare('UPDATE users SET unlisted=0 WHERE id=?').run(sam.id)
+  assert.deepEqual(names(dan), ['sam', 'tim'])
+  assert.equal(requestContact(db, { userId: dan.id, peerName: 'sam', by: 'user' }).outcome, 'sent')
   db.close()
 })
 

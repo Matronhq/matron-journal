@@ -2737,7 +2737,7 @@ page needs no shell.
 
 | Route | Body | Response |
 |---|---|---|
-| `GET /users` | — | `{users:[{id, name, is_admin, created_at, github:{login, state, host} \| null}]}` (no token, no hash) |
+| `GET /users` | — | `{users:[{id, name, is_admin, unlisted, created_at, github:{login, state, host} \| null}]}` (no token, no hash) |
 | `POST /users` | `{name, password, is_admin?}` — name `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, password ≥ 8 | `201 {user}`; `400 bad_request` \| `400 weak_password`; `409 conflict` if the name is taken |
 | `PATCH /users/:id` | `{is_admin: boolean}` | `{user}`; `409 conflict {reason:'last_admin'}` when it would demote the only admin |
 | `POST /users/:id/password` | `{password}` ≥ 8 | `{ok:true}`; device tokens stay valid (same as `matron-admin user passwd`) |
@@ -2804,7 +2804,7 @@ journals (later).
 | `declined`, `removed`, `expired` | ended; a new request reuses the row |
 
 ```
-GET    /contacts/users                    {users:[{name}]} — this journal's other users, names only
+GET    /contacts/users                    {users:[{name}]} — this journal's other listed users, names only
 GET    /contacts[?state=]                 {contacts:[contact]} — live rows unless a state is named
 POST   /contacts {user, convo_id?}        201 {contact, pending?:'peer'} | 202 {contact, pending:'owner'}
 GET    /contacts/:id                      :id is the row id (ct_…) or a same-journal user name
@@ -2822,7 +2822,11 @@ revoked_at}`.
 to the other person. From an **agent** it needs `convo_id` (a conversation
 the agent may write to, else 404), sends nothing, and parks as
 `awaiting_user` until the user approves it. Unknown user and "yourself"
-are one 404. 409 `blocked_by`: `already_contact`, `pending`, `pending_in`
+are one 404. So is an **unlisted** account (`users.unlisted`, set with
+`matron-admin user unlisted <name> on|off`; e.g. the App Store review
+login): it is left out of `GET /contacts/users`, its own list is empty, and
+a request to it, or from it to anyone, is that same 404. Contact rows made
+before the flag was set are untouched. 409 `blocked_by`: `already_contact`, `pending`, `pending_in`
 (an agent asking back is not a way around the accept card; a client asking
 back **is** the accept), `blocked`, `too_many_asks` (10 parked asks per
 agent device, contacts and grants together).

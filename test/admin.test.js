@@ -692,3 +692,18 @@ test('admin CLI: user admin on|off flips users.is_admin; unknown user and bad va
   await assert.rejects(runAdmin(db, ['user', 'admin', 'dan', 'maybe']), /usage/i)
   await assert.rejects(runAdmin(db, ['user', 'admin', 'dan']), /usage/i)
 })
+
+test('admin CLI: user unlisted on|off flips users.unlisted; unknown user and bad value are usage errors', async () => {
+  const db = openDb(':memory:')
+  await runAdmin(db, ['user', 'add', 'applereview', '--password', 'pw123456'])
+  const flagOf = () => db.prepare("SELECT unlisted FROM users WHERE name='applereview'").get().unlisted
+  assert.equal(flagOf(), 0)
+  assert.match(await runAdmin(db, ['user', 'unlisted', 'applereview', 'on']), /applereview is now unlisted/)
+  assert.equal(flagOf(), 1)
+  assert.match(await runAdmin(db, ['user', 'unlisted', 'applereview', 'off']), /applereview is listed again/)
+  assert.equal(flagOf(), 0)
+  await assert.rejects(runAdmin(db, ['user', 'unlisted', 'nobody', 'on']), /no such user/)
+  await assert.rejects(runAdmin(db, ['user', 'unlisted', 'applereview', 'maybe']), /usage/i)
+  await assert.rejects(runAdmin(db, ['user', 'unlisted', 'applereview']), /usage/i)
+  db.close()
+})
