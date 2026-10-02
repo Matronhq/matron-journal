@@ -620,6 +620,10 @@ export function setAttachmentTranscript(db, { userId, itemId, commentId, blobRef
     if (!targets.length) return null
     for (const target of targets) {
       target.transcript = transcript
+      // When the words landed — what runExpireVoiceNotes (retention.js)
+      // measures the audio's 7-day life from. Rows from before this stamp
+      // fall back to the comment's created_at there.
+      target.transcribed_at = now
       // The origin bridge beat the journal's own job to it (an older bridge
       // transcribes without waiting): the words are in, so it is no longer
       // pending. The job keeps this transcript when it lands (below).
@@ -665,6 +669,9 @@ export function finishAttachmentTranscript(db, { commentId, blobRef, transcript,
       const have = typeof target.transcript === 'string' && target.transcript.trim()
       if (!have && got) target.transcript = transcript.trim().slice(0, BODY_MAX)
       target.transcript_status = have || got ? 'done' : 'failed'
+      // Same stamp as setAttachmentTranscript; a failed attempt is not a
+      // transcription, so it starts no clock on the audio.
+      if ((have || got) && !Number.isInteger(target.transcribed_at)) target.transcribed_at = now
     }
     if (changed) {
       db.prepare('UPDATE item_comments SET attachments=? WHERE id=?').run(JSON.stringify(atts), commentId)

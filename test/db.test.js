@@ -687,3 +687,34 @@ test('room_owner_convos + spawn_id backfill reproduce the pre-migration particip
   db.close()
   assert.doesNotThrow(() => openDb(dbPath).close())
 })
+
+// One-off repair for rows written before agent publishes set the blob_ref
+// column (see the agent.test.js case): image/file events whose payload names
+// a blob the column does not. Idempotent, cheap (idx_events_media narrows
+// the scan to attachment rows), and never touches tombstones or other types.
+test('openDb backfills events.blob_ref for image/file rows that only carry payload.blob_ref', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-blobref-backfill-'))
+  const dbPath = path.join(dir, 'm.db')
+  let db = openDb(dbPath)
+  const ins = db.prepare('INSERT INTO events(user_id, seq, convo_id, ts, sender, type, payload, blob_ref) VALUES(1,?,?,?,?,?,?,?)')
+  ins.run(1, 'c1', 1000, 'agent:dev-2', 'image', JSON.stringify({ blob_ref: 'img1', name: 'a.png' }), null)
+  ins.run(2, 'c1', 1001, 'agent:dev-2', 'file', JSON.stringify({ blob_ref: 'file2', name: 'a.pdf' }), null)
+  ins.run(3, 'c1', 1002, 'user:dan', 'image', JSON.stringify({ blob_ref: 'img3', name: 'b.png' }), 'img3')
+  ins.run(4, 'c1', 1003, 'agent:dev-2', 'image', JSON.stringify({ blob_ref: null, expired: true, name: 'gone.png' }), null)
+  ins.run(5, 'c1', 1004, 'agent:dev-2', 'text', JSON.stringify({ body: 'x', blob_ref: 'img1' }), null)
+  ins.run(6, 'c1', 1005, 'agent:dev-2', 'image', JSON.stringify({ blob_ref: 42, name: 'bad.png' }), null)
+  db.close()
+
+  db = openDb(dbPath)
+  const refs = db.prepare('SELECT seq, blob_ref FROM events ORDER BY seq').all()
+  assert.deepEqual(refs, [
+    { seq: 1, blob_ref: 'img1' },
+    { seq: 2, blob_ref: 'file2' },
+    { seq: 3, blob_ref: 'img3' },
+    { seq: 4, blob_ref: null },
+    { seq: 5, blob_ref: null },
+    { seq: 6, blob_ref: null },
+  ])
+  db.close()
+  assert.doesNotThrow(() => openDb(dbPath).close(), 'backfill must be idempotent on the next boot')
+})

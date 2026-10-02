@@ -480,3 +480,37 @@ test('convo_upsert: repo rides to the row and the convo_meta fan-out; junk is ba
   assert.match(err.detail, /bad repo/)
   agent.close(); client.close()
 })
+
+// Agent attachment publishes (send_attachment on the bridge) carry blob_ref
+// INSIDE the payload only — the top-level copy the client `send` path and
+// finalizeToolOutput provide is absent. The events.blob_ref COLUMN is what
+// the quota-pressure reaper joins on, so without this fallback every
+// agent-posted picture was invisible to it: on 2026-10-02 Dan's user held
+// 882 MB of such attachments the reaper counted as an un-reapable floor.
+test('agent publish of an image/file sets the events.blob_ref column from payload.blob_ref', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const ag = createAgent(s.db, dan.id, 'dev-2')
+  const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+  agent.send({ op: 'convo_upsert', convo_id: 'sess-a', title: 'shots', session_state: 'running' })
+
+  agent.send({ op: 'publish', convo_id: 'sess-a', type: 'image', payload: { blob_ref: 'img0001', name: 'a.png', content_type: 'image/png', size: 10 } })
+  agent.send({ op: 'publish', convo_id: 'sess-a', type: 'file', payload: { blob_ref: 'file0002', name: 'a.pdf', content_type: 'application/pdf', size: 10 } })
+  // A top-level blob_ref still wins when both are given.
+  agent.send({ op: 'publish', convo_id: 'sess-a', type: 'image', blob_ref: 'top0003', payload: { blob_ref: 'top0003', name: 'b.png', content_type: 'image/png', size: 10 } })
+  // Non-attachment types are untouched: a text payload mentioning a blob_ref
+  // must not acquire a column ref (only image/file rows are reap candidates).
+  agent.send({ op: 'publish', convo_id: 'sess-a', type: 'text', payload: { body: 'see above', blob_ref: 'img0001' } })
+  await new Promise((r) => setTimeout(r, 150))
+
+  const rows = s.db.prepare("SELECT type, blob_ref FROM events WHERE convo_id='sess-a' AND type IN ('image','file','text') ORDER BY seq").all()
+  assert.deepEqual(rows, [
+    { type: 'image', blob_ref: 'img0001' },
+    { type: 'file', blob_ref: 'file0002' },
+    { type: 'image', blob_ref: 'top0003' },
+    { type: 'text', blob_ref: null },
+  ])
+  agent.close()
+})

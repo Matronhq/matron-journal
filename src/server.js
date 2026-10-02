@@ -14,7 +14,7 @@ import { makeApnsClient } from './apns.js'
 import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
-import { runOffload, runExpireLogs, runReapMedia } from './retention.js'
+import { runOffload, runExpireLogs, runReapMedia, runExpireVoiceNotes } from './retention.js'
 import { backfillSearchIndex } from './search.js'
 import { backfillImageDims } from './items.js'
 import { scheduleGithubRefresh } from './github-refresh.js'
@@ -45,6 +45,7 @@ export const DEFAULT_MAX_REPLAY = 50000
 const DEFAULT_RETENTION_DAYS = 30
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
 const DEFAULT_TOOL_LOG_TTL_HOURS = 24
+const DEFAULT_VOICE_NOTE_TTL_DAYS = 7 // Dan, 2026-10-02: audio goes a week after its transcript
 
 // Shared validator for small numeric env knobs that guard a size/gap check
 // (`size > mediaMaxBytes`, `gap > maxReplay`): an unset var is the normal,
@@ -121,6 +122,27 @@ function resolveToolLogTtlHours(override) {
   return n
 }
 
+// `override` is startServer's `voiceNoteTtlDays` opt — same precedence and
+// fail-closed validation as the two above: unset means ENABLED at 7 days;
+// `0` disables; anything else that isn't a non-negative integer disables
+// with one log line. Returns the window in days, or null when disabled.
+function resolveVoiceNoteTtlDays(override) {
+  const fromEnv = override === undefined
+  const raw = fromEnv ? process.env.MATRON_VOICE_NOTE_TTL_DAYS : override
+  if (raw === undefined) return DEFAULT_VOICE_NOTE_TTL_DAYS
+  const name = fromEnv ? 'MATRON_VOICE_NOTE_TTL_DAYS' : 'voiceNoteTtlDays'
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 0) {
+    console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid — voice-note expiry disabled`)
+    return null
+  }
+  if (n === 0) {
+    console.warn(`retention: ${name}=0 — voice-note expiry disabled`)
+    return null
+  }
+  return n
+}
+
 export const DEFAULT_MEDIA_REAP_HIGH_PCT = 90
 export const DEFAULT_MEDIA_REAP_LOW_PCT = 70
 
@@ -179,11 +201,12 @@ export function resolveReapPcts({ mediaReapHighPct, mediaReapLowPct } = {}) {
 // blobs, so reaping after offload sees the user's honest post-offload
 // footprint instead of triggering one tick late. Returns the interval handle
 // (for close()) or null only when ALL passes are disabled.
-function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes }) {
+function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes }) {
   const days = resolveRetentionDays(retentionDays)
   const ttlHours = resolveToolLogTtlHours(toolLogTtlHours)
+  const voiceDays = resolveVoiceNoteTtlDays(voiceNoteTtlDays)
   const reapPcts = resolveReapPcts({ mediaReapHighPct, mediaReapLowPct })
-  if (days === null && ttlHours === null && reapPcts === null) return null
+  if (days === null && ttlHours === null && voiceDays === null && reapPcts === null) return null
   const run = () => {
     if (ttlHours !== null) {
       try {
@@ -191,6 +214,16 @@ function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, t
         if (r.expired > 0) console.log(`retention: purged ${r.expired} live_log payload(s) older than ${ttlHours}h`)
       } catch (err) {
         console.error('retention: expire-logs run failed', err)
+      }
+    }
+    // Voice-note audio before offload/reap, so the reaper sees the user's
+    // footprint without recordings whose words have already outlived them.
+    if (voiceDays !== null) {
+      try {
+        const r = runExpireVoiceNotes(db, { days: voiceDays })
+        if (r.expired > 0) console.log(`retention: expired ${r.expired} voice-note recording(s) transcribed more than ${voiceDays}d ago, ${r.bytesFreed} bytes`)
+      } catch (err) {
+        console.error('retention: voice-note expiry run failed', err)
       }
     }
     if (days !== null) {
@@ -300,7 +333,7 @@ function warnIfBindTrustsSpoofableIp(bind) {
 export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
-  toolLogTtlHours, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
+  toolLogTtlHours, voiceNoteTtlDays, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
   // How long an approved spawn waits for a woken target box to attach
   // before issuing `start` (wake-before-spawn). Sized for a cold VM boot:
   // incus start + bridge start + journal dial is ~3 minutes on the shared
@@ -464,7 +497,7 @@ export function startServer({
   return new Promise((resolve) => {
     server.listen(port, bind, () => {
       retentionInterval = scheduleRetention(db, {
-        mediaDir: resolvedMediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours,
+        mediaDir: resolvedMediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays,
         mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)

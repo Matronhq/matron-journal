@@ -157,13 +157,23 @@ the machine-checkable version of this page.
   and not-shared are indistinguishable, all 404 `{error:'not_found'}`.
   A blob may also disappear later via the quota-pressure reaper: once a user's
   total blob bytes reach `MATRON_MEDIA_REAP_HIGH_PCT` (default 90%) of the
-  quota, the retention scheduler deletes their oldest `file`/`image`
-  attachment blobs (never `tool_output` blobs, never orphan uploads) until the
-  footprint is back under `MATRON_MEDIA_REAP_LOW_PCT` (default 70%). Each
-  reaped event's payload is rewritten in place to a tombstone — the original
-  fields (`name`, `size`, `content_type`, `caption`) with `blob_ref: null` and
-  `expired: true` — so fresh syncs render an "expired" attachment; clients
-  that already hold the event learn from the 404 on `GET /media/:id`.
+  quota, the retention scheduler deletes, oldest first, their orphan uploads
+  older than 24 h (no event and no item comment names the blob — a send that
+  failed after its upload) and then their oldest `file`/`image` attachment
+  blobs, until the footprint is back under `MATRON_MEDIA_REAP_LOW_PCT`
+  (default 70%). Never reaped: `tool_output` blobs, uploads under 24 h old
+  (in flight between `POST /media` and the send or comment that attaches
+  them), and item-thread attachments (`item_comments.attachments`). When
+  those alone keep the user above the low-water mark the pass refuses and
+  logs the floor broken down by kind, deleting nothing. Attachment events
+  are found through the `events.blob_ref` column, which agent `publish`
+  frames of type `image`/`file` fill from `payload.blob_ref` when no
+  top-level `blob_ref` is given (rows from before that fallback are
+  repaired at boot). Each reaped event's payload is rewritten in place to a
+  tombstone — the original fields (`name`, `size`, `content_type`,
+  `caption`) with `blob_ref: null` and `expired: true` — so fresh syncs
+  render an "expired" attachment; clients that already hold the event learn
+  from the 404 on `GET /media/:id`.
 - `GET /help` (Bearer, any authenticated device) -> `text/markdown`. A
   hand-maintained digest of this API surface (`src/help.js`), aimed at agent
   callers that arrive with a token and no repo checkout — it names the
@@ -1556,7 +1566,20 @@ by the journal's own transcription job (below) or by the origin bridge's
 `PATCH /items/:id/comments/:cid`, and one supplied by a client on a create
 or a comment is stripped before storage (not a 400 — the blob still lands,
 just without the forged words). It is the text the apps show in place of a
-voice note, so it must never be caller-authored.
+voice note, so it must never be caller-authored. `transcribed_at` (ms) is
+stamped alongside it by both writers.
+
+**Voice-note audio expires; the words do not.** `MATRON_VOICE_NOTE_TTL_DAYS`
+(default 7, `0` disables): the retention scheduler deletes an `audio/*`
+attachment's blob once its transcript is older than that (`transcribed_at`,
+or the comment's `created_at` for entries from before the stamp), rewriting
+the entry in place with `expired: true` — every other field, `blob_ref` and
+`transcript` included, is kept, so a thread still reads as it did and a
+client that fetches the blob gets the ordinary 404. Audio with no
+successful transcript (none, `pending`, `failed`) and non-audio attachments
+are never touched, and the item's `updated_at` is not bumped. Chat voice
+notes (`file` events) are outside this rule: the journal holds no transcript
+for them.
 
 **Journal-side transcription.** When the journal host has whisper configured
 (`MATRON_WHISPER_MODEL` — path to a whisper.cpp `ggml-*.bin`; optional
