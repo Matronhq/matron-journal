@@ -1329,6 +1329,8 @@ Like agent-chat cards, this is a **client-only event** excluded from agent deliv
 
 **Model.** `model` is optional and names which Claude model the child session should run — an alias like `opus` or a full model id like `claude-opus-4-20250514`. The vocabulary is the **target bridge's**, not the journal's: this is a length bound (`SPAWN_MODEL_MAX_CHARS`, 64) and the usual peer-text sanitisation only, never an allowlist, so a bridge that learns a new alias keeps working against an older journal. It is stored on the spawn row and relayed to the target in the `start` RPC params **only when non-empty** — a request that names no model produces the exact params a pre-`model` journal sent, and the consent card omits the key rather than carrying an empty one. An unrecognised model is the target's business to reject (its `start` error surfaces as the usual `failed` outcome).
 
+**Fable-limit fallback.** When no `model` is named, the target bridge decides the model at `start` time: if its default is Fable and its own /usage reading shows the Fable weekly meter at 99% or more (and not past its reset) while a live all-models weekly reading is under 100% (no such reading means no fallback), it starts the child on Opus (matron-bridge `lib/fable-fallback.js`). An explicit `model` always wins. The journal predicts this for the card from the target's last `box_status` report (`src/spawn-model.js`, same rule): a no-model card then carries `fallback_model: "opus"` and `fallback_reason: "fable_limit"` (both omitted otherwise), the consent item's body says the session starts on Opus, and `GET /consent/pending` adds the same two keys to the spawn row, predicted again at list time. The target's `start` reply says what actually happened — `{convo_id, model: "opus", model_reason: "fable_limit"}` — and the `started` outcome (frame and durable `spawn_outcome` event) carries `model` and `model_reason` when the reply named a known reason and a plain model token (≤64 chars, `[A-Za-z0-9._[\]-]`), omitted otherwise. The consent item's closing note then reads "started on <box> on `opus` — Fable limit reached".
+
 sent with `sender: "agent:<name>"`, same sender convention as any other agent-authored event.
 
 ### Tracker item
@@ -3348,7 +3350,9 @@ typing text commands into the control conversation.
   delivery, re-asking is the retry.
 - v1 method vocabulary (bridge-owned, normative in the spec):
   `recent_folders {} -> {folders:[{path, last_used}], activity?, limits?}` and
-  `start {workdir?, browser?, prompt?, room_id?, from_name?, model?} -> {convo_id}`
+  `start {workdir?, browser?, prompt?, room_id?, from_name?, model?} -> {convo_id, model?, model_reason?}`
+  (`model`/`model_reason` only when no model was asked for and the target
+  fell back from its default — see "Fable-limit fallback" above)
   (errors `bad_workdir` — workdir does not resolve to a directory on the
   target box; `spawn_failed` — the target threw while starting the session;
   `bad_request` — `room_id` was sent without `prompt`, or `room_id` on its

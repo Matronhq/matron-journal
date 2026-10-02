@@ -13,6 +13,7 @@ import { nudgeCoordinator, chatAskId } from './consent.js'
 import { expireContactAsks } from './contacts.js'
 import { expireGrantAsks } from './grants.js'
 import { onContactAskExpired, onGrantAskExpired } from './sharing-events.js'
+import { predictSpawnFallback } from './spawn-model.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableBoxName } from './wake.js'
 import { coordinatorFor } from './coordinator.js'
 import { getMission } from './missions.js'
@@ -1065,6 +1066,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           // topic's): a client renders this as a "will run on <model>" chip,
           // and an empty one would read as a model named "".
           ...(model ? { model } : {}),
+          // No model named, and the target's last box_status shows its
+          // Fable weekly meter spent: the bridge will start the child on
+          // Opus (src/spawn-model.js), so the card says so up front —
+          // fallback_model/fallback_reason, omitted otherwise.
+          ...predictSpawnFallback(db, conn.userId, msg.target_device_id, { model }),
           // Same omit-when-absent stance: a linked ask says so, a detached
           // one says nothing about a room — the common case stays the
           // card shape every client already renders.

@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { getSpawn } from '../src/spawns.js'
 import { fleet, parkSpawn, parkInviteAsk, pending, answer, settle } from './consent-fleet.js'
+import { upsertDeviceStatus } from '../src/db.js'
 
 test('GET /coordinator carries consent (default on); a client switches it off and on, alone or with convo_id; an agent PUT is 403', async (t) => {
   const f = await fleet(t)
@@ -38,6 +39,15 @@ test('GET /consent/pending: client 403; an ordinary agent 403 not_coordinator; a
   assert.equal(ch.id, `room/${f.targetDev.deviceId}`); assert.equal(ch.request, 'invite'); assert.equal(ch.room_id, 'room')
   assert.equal(ch.from_name, 'asker-box'); assert.equal(ch.from_convo_id, 'ask'); assert.equal(ch.to_name, 'eric'); assert.equal(ch.target_state, 'online')
   assert.equal(ch.topic, 'review'); assert.equal(ch.justification, 'need eyes on the diff'); assert.equal(typeof ch.item_num, 'number')
+})
+
+test('GET /consent/pending: a no-model spawn onto a box out of Fable carries the predicted Opus fallback, read at list time', async (t) => {
+  const f = await fleet(t)
+  await parkSpawn(f)
+  assert.ok(!('fallback_model' in (await pending(f, f.coordDev.token)).json.pending[0]))
+  upsertDeviceStatus(f.s.db, { userId: f.dan.id, deviceId: f.targetDev.deviceId, status: { limits: { as_of: 1, lines: [{ id: 'week_all', label: 'Week (all models)', percent: 40 }, { id: 'week_fable', label: 'Week (Fable)', percent: 100 }] } } })
+  const sp = (await pending(f, f.coordDev.token)).json.pending[0]
+  assert.equal(sp.fallback_model, 'opus'); assert.equal(sp.fallback_reason, 'fable_limit')
 })
 
 test('approve a spawn: the start RPC reaches the target, the outcome and its durable event carry decided_by coordinator + reason, the item closes "Approved by the Coordinator", the consent_decision event is client-only, the decision is recorded', async (t) => {
