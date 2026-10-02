@@ -10,7 +10,7 @@
 import { json } from './http-body.js'
 import { badRequest, notFound } from './http-who.js'
 import { getItem, getSharedItem, isConsentMirror } from './items.js'
-import { getMission, getSharedMission } from './missions.js'
+import { getMission, getSharedMission, getGrantedMission } from './missions.js'
 import { resolveProject } from './projects.js'
 import { canReadConvo } from './visibility.js'
 import { filteredAgent, privateOwnedConvo } from './privacy.js'
@@ -33,7 +33,7 @@ function resolve(db, who, ownerName, num) {
   }
   const mission = db.prepare('SELECT id FROM missions WHERE user_id=? AND num=?').get(owner.id, num)
   if (mission) {
-    const ok = own ? !!getMission(db, who.userId, mission.id, { excludePrivateOwned: filteredAgent(db, who) }) : !!getSharedMission(db, who.userId, mission.id)
+    const ok = own ? !!getMission(db, who.userId, mission.id, { excludePrivateOwned: filteredAgent(db, who) }) : (!!getSharedMission(db, who.userId, mission.id) || !!getGrantedMission(db, who.userId, mission.id))
     return ok ? { kind: 'mission', id: mission.id, owner } : null
   }
   const ms = db.prepare('SELECT id, convo_id FROM milestones WHERE user_id=? AND num=?').get(owner.id, num)

@@ -5,7 +5,7 @@
 import { nextNum, newId, BODY_MAX } from './items.js'
 import { milestoneMarkerPayload } from './missions-marker.js'
 import { markerTitleAllowed } from './privacy.js'
-import { sharedConvoSql } from './visibility.js'
+import { sharedConvoSql, grantedMissionSql } from './visibility.js'
 import { MESSAGE_TYPES_SQL } from './message-types.js'
 import { insertDefaultProject } from './default-project.js'
 import { activateLink, endLink, hasActiveLink, linkRow, nextCurrent, topLevelActiveCount } from './mission-links.js'
@@ -759,4 +759,85 @@ export function listSharedMilestones(db, viewerUserId, convoId) {
   return db.prepare(`SELECT l.* FROM milestones l JOIN conversations cv ON cv.id = l.convo_id
     WHERE l.convo_id = @cid AND ${sharedConvoSql('cv')} ORDER BY l.created_at DESC, l.seq DESC`)
     .all({ viewer: viewerUserId, cid: convoId }).map(milestoneRow)
+}
+
+// Grantee reads (spec 2026-10-02 matron-to-matron sharing, "Grants": read).
+// A mission granted to @viewer is shown as an ORDINARY AGENT of its owner
+// would see it — the private-device sieve applies in full, consent mirrors
+// never count — and then stripped of everything the spec says never
+// crosses: conversation ids, device ids, box names, seqs, the project.
+// `conversations` is always empty and always 0: the transcripts stay home.
+// A mission born on a private box is never shown (ORIGIN_SIEVE), and
+// shareMission refuses to grant one in the first place.
+//
+// origin_convo_id reads '' and origin_device_id 0 rather than null: the
+// apps' Mission model requires both, and a row they cannot decode is a row
+// they silently drop.
+const GRANT_ITEM_SIEVE = `AND i.consent IS NULL AND NOT EXISTS (SELECT 1 FROM conversations oc JOIN devices d ON d.id = oc.agent_device_id
+  WHERE oc.id = i.origin_convo_id AND d.private = 1)`
+const GRANT_MILESTONE_SIEVE = `AND NOT EXISTS (SELECT 1 FROM conversations mc JOIN devices d ON d.id = mc.agent_device_id
+  WHERE mc.id = l.convo_id AND d.private = 1)`
+const GRANT_CONVO_SIEVE = `AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.id = c.agent_device_id AND d.private = 1)`
+
+function grantedCountsSql() {
+  return `
+    (SELECT COUNT(*) FROM items i WHERE i.mission_id = m.id AND i.state='open' ${GRANT_ITEM_SIEVE}) AS open_items,
+    (SELECT COUNT(*) FROM items i WHERE i.mission_id = m.id AND i.state='open' AND i.awaiting='user' ${GRANT_ITEM_SIEVE}) AS needs_you,
+    0 AS conversations,
+    (SELECT COUNT(*) FROM milestones l WHERE l.mission_id = m.id ${GRANT_MILESTONE_SIEVE}) AS milestones,
+    (SELECT json_object('num', l.num, 'title', l.title, 'kind', l.kind, 'created_at', l.created_at)
+       FROM milestones l WHERE l.mission_id = m.id ${GRANT_MILESTONE_SIEVE} ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS last_milestone_json,
+    (SELECT l.created_at FROM milestones l WHERE l.mission_id = m.id ${GRANT_MILESTONE_SIEVE}
+       ORDER BY l.created_at DESC, l.seq DESC LIMIT 1) AS sieved_last_milestone_at,
+    ${STATUS_PRIVATE} AS status_hidden,
+    1 AS closed_hidden
+    ,${activitySql(GRANT_CONVO_SIEVE)},
+    NULL AS project_num,
+    (SELECT json_object('id', g.id, 'level', g.level) FROM grants g JOIN contacts oc ON oc.id = g.contact_id
+       WHERE g.subject_kind = 'mission' AND g.subject_id = m.id AND g.state = 'active' AND oc.peer_user_id = @viewer LIMIT 1) AS grant_json
+  `
+}
+
+const MISSION_GRANTED = `(${ORIGIN_SIEVE} AND ${grantedMissionSql('m')})`
+
+function grantedMissionRow(row) {
+  if (!row) return null
+  const { owner_json: ownerJson, grant_json: grantJson, ...rest } = row
+  const mission = missionRow(rest)
+  mission.owner = JSON.parse(ownerJson)
+  mission.shared_via = 'grant'
+  mission.grant = grantJson ? JSON.parse(grantJson) : null
+  mission.project_id = null
+  mission.origin_convo_id = ''
+  mission.origin_device_id = 0
+  mission.status_convo_id = null
+  // The viewer's "needs you" is about the viewer; a read grantee is never
+  // the one an item waits on.
+  mission.needs_you = 0
+  return mission
+}
+
+export function listGrantedMissions(db, viewerUserId) {
+  return db.prepare(`SELECT m.*, ${grantedCountsSql()}, ${OWNER_JSON} FROM missions m ${OWNER_FROM}
+    WHERE ${MISSION_GRANTED}
+    ORDER BY (sieved_last_milestone_at IS NULL), sieved_last_milestone_at DESC, m.created_at DESC`)
+    .all({ viewer: viewerUserId }).map(grantedMissionRow)
+}
+
+export function getGrantedMission(db, viewerUserId, missionId) {
+  if (typeof missionId !== 'string' || !missionId.startsWith('ms_')) return null
+  return grantedMissionRow(db.prepare(`SELECT m.*, ${grantedCountsSql()}, ${OWNER_JSON} FROM missions m ${OWNER_FROM}
+    WHERE m.id = @id AND ${MISSION_GRANTED}`).get({ viewer: viewerUserId, id: missionId }))
+}
+
+// Milestones as text: no conversation, seq or device — the jump target
+// they anchor is in a transcript that did not cross. Items: the open list,
+// as the owner's detail shows it, without the origin conversation.
+export function grantedMissionDetail(db, mission) {
+  const milestones = db.prepare(`SELECT l.id, l.mission_id, l.num, l.kind, l.title, l.body, l.created_by, l.created_at
+    FROM milestones l WHERE l.mission_id = ? ${GRANT_MILESTONE_SIEVE} ORDER BY l.created_at DESC, l.seq DESC`).all(mission.id)
+  const items = db.prepare(`SELECT i.id, i.num, i.kind, i.state, i.awaiting, i.title, '' AS origin_convo_id, i.updated_at
+    FROM items i WHERE i.mission_id = ? AND i.state='open' ${GRANT_ITEM_SIEVE}
+    ORDER BY (i.awaiting = 'user') DESC, i.updated_at DESC`).all(mission.id)
+  return { mission, milestones, items, conversations: [] }
 }

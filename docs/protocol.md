@@ -2773,6 +2773,171 @@ The app-link files are served unauthenticated from env and are
 
 Malformed values refuse to start the journal, naming the variable.
 
+## Contacts and grants (person-to-person sharing)
+
+Spec: `docs/superpowers/specs/2026-10-02-matron-to-matron-sharing-design.md`,
+phase 1 (same journal, read-only mission share). Plan:
+`docs/superpowers/plans/2026-10-02-contacts-grants-phase1-journal.md`.
+
+The second way across the user boundary, beside the org rule above. Unlike
+the org rule it is explicit: two people become **contacts** by one asking
+and the other accepting, and then either may **grant** the other a mission
+to read. Nothing is derived from being on the same journal.
+
+### Contacts
+
+A contact is one row per side; anything is shared only while both rows are
+`active`. `address` is `user` on this journal and `user@journal` across
+journals (later).
+
+| State | Meaning |
+|---|---|
+| `awaiting_user` | my own agent asked; I have not approved (expires after 24 h) |
+| `pending_out` | I asked; waiting for the other person (no expiry; `DELETE` withdraws) |
+| `pending_in` | they asked; my accept card is open |
+| `active` | contacts |
+| `blocked` | I blocked them: their requests reach nobody and look, to them, exactly like `pending_out` |
+| `declined`, `removed`, `expired` | ended; a new request reuses the row |
+
+```
+GET    /contacts/users                    {users:[{name}]} — this journal's other users, names only
+GET    /contacts[?state=]                 {contacts:[contact]} — live rows unless a state is named
+POST   /contacts {user, convo_id?}        201 {contact, pending?:'peer'} | 202 {contact, pending:'owner'}
+GET    /contacts/:id                      :id is the row id (ct_…) or a same-journal user name
+POST   /contacts/:id/answer {decision}    'approve' | 'decline' — client devices only
+DELETE /contacts/:id                      remove, or withdraw a request
+POST   /contacts/:id/block                POST /contacts/:id/unblock (client only)
+GET    /contacts/:id/activity             {events:[…]} — the audit events naming this contact, newest first
+```
+
+`contact`: `{id, address, peer_user, peer_journal, display_name, state,
+requested_by, origin_convo_id, created_at, updated_at, accepted_at,
+revoked_at}`.
+
+`POST /contacts` from a **client** is the user's own tap and goes straight
+to the other person. From an **agent** it needs `convo_id` (a conversation
+the agent may write to, else 404), sends nothing, and parks as
+`awaiting_user` until the user approves it. Unknown user and "yourself"
+are one 404. 409 `blocked_by`: `already_contact`, `pending`, `pending_in`
+(an agent asking back is not a way around the accept card; a client asking
+back **is** the accept), `blocked`, `too_many_asks` (10 parked asks per
+agent device, contacts and grants together).
+
+Removing or blocking revokes every live grant between the two, in both
+directions, in the same transaction. Unblocking makes nobody a contact
+again.
+
+### Grants
+
+```
+POST   /missions/:id/shares {contact, level, convo_id?}   201|202 {grant, pending} | 200 {grant, existing:true}
+GET    /missions/:id/shares                               {grants} — the owner's grants on one mission
+GET    /grants[?direction=in|out][&state=]                {grants} — live rows unless a state is named
+GET    /grants/:id
+POST   /grants/:id/answer {decision}                      client devices only
+DELETE /grants/:id                                        the owner revokes, the grantee leaves
+```
+
+`grant`: `{id, direction:'out'|'in', subject_kind, subject_id, level, state,
+owner:{user_id,name}, grantee:{name,address}, mission?:{id,num,title},
+requested_by, revoked_by, created_at, updated_at, answered_at, revoked_at}`.
+States: `awaiting_owner` (the owner's agent asked, 24 h) → `pending` (the
+grantee's accept card is open) → `active`; `declined`, `revoked`
+(`revoked_by`: `owner` | `grantee` | `contact_removed`), `expired`.
+
+`contact` is the owner's contact row id or a same-journal user name; the
+two must be mutual contacts (409 `not_contact`). `level` defaults to
+`read`; `contribute` and `owner` are the spec's later phases and answer
+409 `level_unavailable`. A mission born on a private device is 409
+`private_mission`. The mission is resolved through the caller's own sieve.
+A grantee is never told of a grant its owner has not approved: until then
+the id is a 404 for them.
+
+### What a grantee reads
+
+`src/visibility.js` holds the rule (`grantedMissionSql`): an active grant,
+on a mission of its owner, for a contact that is the viewer, with both
+contact rows active. It is a **mission** rule; `canReadConvo` is not
+widened, so no transcript route opens (`/convo/:id/messages`,
+`/milestones?convo=` stay 404).
+
+- `GET /missions?scope=shared` also lists granted missions, and
+  `GET /missions/:id` (an `ms_…` id) serves one. Rows carry
+  `shared_via: 'grant'`, `grant: {id, level}` and `owner`.
+- The view is the one an ordinary agent of the owner would get — milestones
+  and items from private-device conversations, consent mirrors and a
+  privately written status are withheld — with everything that names a
+  conversation, device or project removed: `origin_convo_id: ''`,
+  `origin_device_id: 0`, `project_id`/`status_convo_id`/`closed_convo_id`
+  null, `conversations: []` (count 0), milestones as `{id, mission_id, num,
+  kind, title, body, created_by, created_at}`.
+- `GET /items/:id` and `GET /items?scope=shared` serve the items of a
+  granted mission with `shared_via: 'grant'`, no origin, no action buttons,
+  and comments with `device_id: 0`. `GET /media/:id` serves their
+  attachments. `GET /lookup` resolves the owner's number.
+- Every write by a grantee is 403.
+
+### Cards, mirrors and who answers
+
+Each ask is a `permission_request` card plus a tracker mirror (a `question`
+item, label `consent`, `items.consent` = `contact` | `share`, link
+`matron://consent/contact/<contact id>` or `matron://consent/share/<grant
+id>`), on each side that has something to decide:
+
+| Card `kind` | `direction` | Where | Buttons on the mirror |
+|---|---|---|---|
+| `contact_request` | `out` | the asking agent's conversation | Approve / Decline |
+| `contact_request` | `in` | the recipient's People conversation | Accept / Decline |
+| `mission_share` | `out` | the asking agent's conversation; carries `preview` `{milestones, items, comments, attachments}` | Approve / Decline |
+| `mission_share` | `in` | the grantee's People conversation | Accept / Decline |
+
+Card payloads: `contact_request` `{kind, direction, contact_id, peer:{name,
+address}}`; `mission_share` `{kind, direction, grant_id, level, owner,
+grantee, mission:{id,num,title}, preview}`; `out` cards add
+`from_device_id`, `from_name`, `from_convo_id`.
+
+A card is answered by `POST …/answer` **or** by tapping the mirror's button
+(`POST /items/:id/comments {action}`), which the journal applies itself and
+answers `200 {item, comment, contact|grant}`.
+
+**Only a client device answers.** Both cards and the `people` events are
+client-only events, the mirrors' markers carry `consent`, both answer
+routes and the button tap refuse agents with 403, and these asks are never
+in `/consent/pending` nor accepted by `/consent/answer`. The Coordinator is
+an agent: it neither sees nor answers a card that comes from another
+person or sends data to one. Agents may remove, block and revoke, which
+only reduce access.
+
+### The People conversation
+
+One conversation per user that the journal itself owns
+(`conversations.system = 'people'`, title "People", created on first use,
+announced by a `convo_meta` carrying `system`): the home of `in` cards,
+their mirrors and the audit events. `/snapshot` lists it for clients with
+`system: 'people'`. No agent can read it (`/snapshot`, `/roster`, replay,
+fan-out), write to it, file into it or adopt it.
+
+### Audit and live frames
+
+Every transition appends one `people` event to **each** side's People
+conversation: `{event, summary, contact_id, peer:{name,address}, grant_id?,
+level?, mission?:{id,num,title}, owner?, by?}` with `event` one of
+`contact.requested|received|accepted|declined|removed|blocked|unblocked`
+and `grant.offered|received|accepted|declined|revoked`. Never a push.
+
+Ephemeral frames, client sockets only:
+
+```
+{kind:'people', event:'changed', contact_id?|grant_id?}        refetch /contacts and /grants
+{kind:'shared', event:'mission_added',   mission_id, grant_id, owner}
+{kind:'shared', event:'mission_changed', mission_id, what:'milestone'|'item'|'mission', owner}
+{kind:'shared', event:'mission_removed', mission_id, grant_id}
+```
+
+`mission_changed` fires on every milestone, item write and mission
+update/close on a granted mission. It is an invalidation: the grantee
+refetches through the sieved reads above.
+
 ## Device privacy
 
 (spec: `docs/superpowers/specs/2026-08-07-agent-visibility-privacy-design.md`.)

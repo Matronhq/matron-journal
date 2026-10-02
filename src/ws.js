@@ -10,6 +10,9 @@ import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem } from './consent-items.js'
 import { nudgeCoordinator, chatAskId } from './consent.js'
+import { expireContactAsks } from './contacts.js'
+import { expireGrantAsks } from './grants.js'
+import { onContactAskExpired, onGrantAskExpired } from './sharing-events.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableBoxName } from './wake.js'
 import { coordinatorFor } from './coordinator.js'
 import { getMission } from './missions.js'
@@ -313,6 +316,16 @@ export function attachWs({
       // ambiguity. Rows carry their own user/device ids — no lookups.
       for (const row of expireSpawns(db, AWAITING_USER_TTL_MS)) {
         emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'expired' })
+      }
+      // Contact and share asks an agent parked for its own user (spec
+      // 2026-10-02 matron-to-matron sharing): the same 24 h. Nothing was
+      // sent to the other person, so there is nobody else to tell; the
+      // mirror closes as cancelled. Best-effort like every sweep tail.
+      try {
+        for (const row of expireContactAsks(db)) onContactAskExpired({ db, hub }, row)
+        for (const row of expireGrantAsks(db)) onGrantAskExpired({ db, hub }, row)
+      } catch (err) {
+        console.error('sharing: ask expiry sweep failed', err)
       }
       // Stranded-'approved' recovery (see spawns.js expireApproved's doc
       // comment): a row a claimApprove won but whose orchestration never

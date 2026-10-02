@@ -15,6 +15,7 @@ import { serveHelp } from './help.js'
 import { wakeIfOffline, isWakeableBoxName } from './wake.js'
 import { handleItemsRoute } from './items-http.js'
 import { handleMissionsRoute } from './missions-http.js'
+import { handleSharingRoute } from './sharing-http.js'
 import { handleProjectsRoute } from './projects-http.js'
 import { handleGithubRoute, handleGithubCallback } from './github-http.js'
 import { handleLookupRoute } from './lookup-http.js'
@@ -270,6 +271,8 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       // its /items* paths never collide with the chain below, and inside the
       // outer try/catch so readBody's 400/413 map like every other route's.
       if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription }, req, res, url, who)) return
+      // Ahead of the missions routes: /missions/:id/shares is its own surface.
+      if (await handleSharingRoute({ db, hub, pushPipeline }, req, res, url, who)) return
       if (await handleMissionsRoute({ db, hub, pushPipeline, waker }, req, res, url, who)) return
       if (await handleProjectsRoute({ db, hub }, req, res, url, who)) return
       if (await handleMemoriesRoute({ db, hub }, req, res, url, who)) return
@@ -309,7 +312,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         //     /search, so /snapshot can't be used as an end-run around them.
         const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
         return json(res, 200, {
-          ...snapshot(db, who.userId, { omitSnippet: who.kind === 'agent', excludePrivateOwned: filtered }),
+          ...snapshot(db, who.userId, { omitSnippet: who.kind === 'agent', excludePrivateOwned: filtered, excludeSystem: who.kind === 'agent' }),
           coordinator_convo_id: coordinatorFor(db, who.userId, { excludePrivateOwned: filtered }),
         })
       }
@@ -414,7 +417,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
                   (SELECT ts FROM events e WHERE e.convo_id = conversations.id
                    AND e.type IN (${MESSAGE_TYPES_SQL})
                    ORDER BY e.seq DESC LIMIT 1) AS last_ts
-           FROM conversations WHERE owner_user_id=? AND parent_convo_id IS NULL${filtered
+           FROM conversations WHERE owner_user_id=? AND parent_convo_id IS NULL AND system IS NULL${filtered
              ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
                     SELECT 1 FROM devices d WHERE d.id=conversations.agent_device_id AND d.private=1))`
              : ''}

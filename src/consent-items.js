@@ -13,7 +13,7 @@
 // consent flow must never fail because the tracker did.
 import { createItem, closeItem, TITLE_MAX } from './items.js'
 import { emitMarker } from './items-http.js'
-import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
+import { sanitizePeerText, PEER_NAME_CAP, plainText as plain } from './peer-text.js'
 
 export const CONSENT_LABEL = 'consent'
 // Titles are capped at TITLE_MAX; the box name (PEER_NAME_CAP) plus the
@@ -34,7 +34,6 @@ const cut = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
 // runs): a task carrying backtick runs simply gets a longer fence than
 // its longest run, which is the CommonMark rule for keeping it inside.
 const codeSpan = (s) => `\`${String(s).replace(/`/g, '')}\``
-const plain = (s) => String(s ?? '').replace(/[*_`~[\]()<>!#|\\"]/g, '')
 const fenced = (s) => {
   const text = String(s)
   const longest = Math.max(0, ...(text.match(/`+/g) || []).map((run) => run.length))

@@ -12,7 +12,9 @@ import {
   MILESTONE_KINDS, TITLE_MAX, validateMissionFields, createMission, getMission, listMissions, missionDetail,
   updateMission, joinMission, leaveMission, closeMission, createMilestone, listMilestones, milestoneRow,
   listSharedMissions, getSharedMission, sharedMissionDetail, listSharedMilestones, conversationMissions,
+  listGrantedMissions, getGrantedMission, grantedMissionDetail,
 } from './missions.js'
+import { notifyGrantees } from './sharing-events.js'
 import { getProject } from './projects.js'
 import { hasActiveLink } from './mission-links.js'
 import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE, missionMarkerPayload, milestoneMarkerPayload } from './missions-marker.js'
@@ -68,6 +70,10 @@ export function emitMissionMarker({ db, hub }, who, { mission, action, convoId, 
   } catch (err) {
     console.error('missions: marker append failed (mission write already committed)', err)
   }
+  // The mission's own content changed (title, body, status, closed): a
+  // grantee's shared view follows it live. Conversation links are not
+  // something a grantee sees, so they tell nobody.
+  if (action === 'updated' || action === 'closed') notifyGrantees({ db, hub }, mission.id, 'mission')
 }
 
 // `project` on POST /missions and PATCH /missions/:id (spec 2026-09-30
@@ -170,7 +176,12 @@ function handleList(ctx, res, url, who) {
   if (scope !== 'mine' && scope !== 'shared') return badRequest(res)
   if (scope === 'shared') {
     if (state != null || since != null) return badRequest(res)
-    json(res, 200, { missions: listSharedMissions(db, who.userId) })
+    // Two ways a mission is shared with the caller: the org rule and a
+    // grant (visibility.js). A mission readable both ways is listed once,
+    // through the org rule, whose view is the wider one.
+    const org = listSharedMissions(db, who.userId)
+    const seen = new Set(org.map((m) => m.id))
+    json(res, 200, { missions: [...org, ...listGrantedMissions(db, who.userId).filter((m) => !seen.has(m.id))] })
     return true
   }
   json(res, 200, { missions: listMissions(db, who.userId, { state, since, excludePrivateOwned: filteredAgent(db, who) }) })
@@ -406,6 +417,7 @@ async function handleMilestoneCreate(ctx, req, res, who) {
       payload: milestoneMarkerPayload({ milestone: out.milestone, mission: out.mission, by: byOf(who), withTitle: out.markerWithTitle }),
     })
   } catch (err) { console.error('missions: milestone broadcast failed (row and marker already committed)', err) }
+  notifyGrantees({ db, hub }, out.mission.id, 'milestone')
   json(res, 201, { milestone: out.milestone, mission: out.mission })
   return true
 }
@@ -472,8 +484,15 @@ export async function handleMissionsRoute(ctx, req, res, url, who) {
   const mission = visibleMission(db, who, idOrNum)
   if (!mission) {
     const shared = getSharedMission(db, who.userId, idOrNum)
-    if (!shared) return notFound(res)
-    if (!sub && req.method === 'GET') { json(res, 200, sharedMissionDetail(db, who.userId, shared, { subchats: url.searchParams.get('subchats') === '1' })); return true }
+    const granted = shared ? null : getGrantedMission(db, who.userId, idOrNum)
+    if (!shared && !granted) return notFound(res)
+    if (!sub && req.method === 'GET') {
+      json(res, 200, shared
+        ? sharedMissionDetail(db, who.userId, shared, { subchats: url.searchParams.get('subchats') === '1' })
+        : grantedMissionDetail(db, granted))
+      return true
+    }
+    // Readable, not writable: a read grant never passes canWriteMission.
     json(res, 403, { error: 'forbidden' })
     return true
   }
