@@ -164,7 +164,7 @@ test('the sweep reconciles by itself: revoking the invited box takes its chat as
   assert.deepEqual(await awaitingUser(f), [])
 })
 
-test('a consent item follows its ask, never a comment: a reply does not reopen a settled one or take a waiting one out of Decisions, and Reopen is refused', async (t) => {
+test('a consent item follows its ask, never a comment: a reply reaches the asking agent but does not reopen a settled item or take a waiting one out of Decisions, and Reopen is refused', async (t) => {
   const f = await fleet(t)
   const comment = (id, body) => f.s.http(`/items/${id}/comments`, { method: 'POST', token: f.clientToken, body: { body } })
   // Waiting: a reply is kept, the item still awaits the user.
@@ -174,16 +174,24 @@ test('a consent item follows its ask, never a comment: a reply does not reopen a
   assert.equal((await comment(waitingItem.id, 'which box is this?')).status, 201)
   const still = reread(f.s, waitingItem.id)
   assert.equal(still.state, 'open'); assert.equal(still.awaiting, 'user')
-  // The comment's marker is the user's alone, like every marker of a
-  // consent item: the apps hear it, no agent does, and no fallback text
-  // carries the item's title into the conversation.
-  const heard = await f.client.waitFor((x) => isItemMarker(x) && x.payload.action === 'commented' && x.payload.item_id === waitingItem.id)
-  assert.equal(heard.payload.consent, 'spawn')
+  // The reply is addressed to the agent that asked, so the asking
+  // conversation hears it as an ordinary item marker (the bridge turns it
+  // into a turn) — and only that conversation: the Coordinator's and the
+  // target's do not.
+  const heard = await f.asker.waitFor((x) => isItemMarker(x) && x.payload.action === 'commented' && x.payload.item_id === waitingItem.id)
+  assert.equal(heard.convo_id, 'ask'); assert.equal(heard.payload.comment.body, 'which box is this?'); assert.equal(heard.payload.consent, undefined)
   await settle()
-  for (const agent of [f.asker, f.target, f.coord]) {
-    assert.equal(agent.frames.some((x) => x.kind === 'journal' && (x.type === 'item' || x.payload?.fallback_for === 'item')), false)
-  }
-  assert.equal(f.s.db.prepare("SELECT COUNT(*) c FROM events WHERE convo_id='ask' AND type='text' AND payload LIKE '%fallback_for%'").get().c, 0)
+  for (const agent of [f.target, f.coord]) assert.equal(agent.frames.some(isItemMarker), false)
+  // The item itself is still unreadable to the agent that heard the reply.
+  assert.equal((await f.s.http(`/items/${waitingItem.id}`, { token: f.askerDev.token })).status, 404)
+  // A hand-close stays the user's alone: no agent hears its marker.
+  const other = itemOf(f.s, await parkSpawn(f, { rid: 'q2' }))
+  for (const w of [f.asker, f.target, f.coord, f.client]) w.frames.length = 0
+  assert.equal((await f.s.http(`/items/${other.id}/close`, { method: 'POST', token: f.clientToken, body: { resolution: 'cancelled' } })).status, 200)
+  const closedMarker = await f.client.waitFor((x) => isItemMarker(x) && x.payload.action === 'closed' && x.payload.item_id === other.id)
+  assert.equal(closedMarker.payload.consent, 'spawn')
+  await settle()
+  for (const agent of [f.asker, f.target, f.coord]) assert.equal(agent.frames.some(isItemMarker), false)
   // Settled: a reply is kept, the item stays closed; Reopen is a 409.
   assert.equal((await tap(f, waiting, 'deny')).status, 200)
   assert.equal(reread(f.s, waitingItem.id).state, 'closed')
@@ -197,4 +205,48 @@ test('a consent item follows its ask, never a comment: a reply does not reopen a
   assert.equal((await f.s.http(`/items/${plain.json.item.id}/close`, { method: 'POST', token: f.askerDev.token, body: { resolution: 'answered' } })).status, 200)
   const reopened = await comment(plain.json.item.id, 'one more thing')
   assert.equal(reopened.json.item.state, 'open'); assert.equal(reopened.json.item.awaiting, 'agent')
+})
+
+test("a reply on a chat ask reaches the asker only when the room is the asker's own: an invite's reply goes to the room owner, a join's stays with the user", async (t) => {
+  const f = await fleet(t)
+  const comment = (id, body) => f.s.http(`/items/${id}/comments`, { method: 'POST', token: f.clientToken, body: { body } })
+  const chatItem = (deviceId) => f.s.db.prepare("SELECT item_id FROM convo_agents WHERE convo_id='room' AND agent_device_id=?").get(deviceId).item_id
+  // Invite: asker-box owns the room and asks to bring eric in.
+  await parkInviteAsk(f)
+  const invite = chatItem(f.targetDev.deviceId)
+  for (const w of [f.asker, f.target, f.coord]) w.frames.length = 0
+  assert.equal((await comment(invite, 'what for?')).status, 201)
+  const heard = await f.asker.waitFor((x) => isItemMarker(x) && x.payload.action === 'commented' && x.payload.item_id === invite)
+  assert.equal(heard.convo_id, 'room'); assert.equal(heard.payload.consent, undefined)
+  // Join: coord-box asks to join asker-box's room. The room's owner must not
+  // hear the ask, so the user's reply on it stays client-only.
+  f.coord.send({ op: 'agent_join', room_id: 'room', justification: 'I have the fix' })
+  await f.coord.waitFor((x) => x.kind === 'invite' && x.event === 'delivered')
+  const join = chatItem(f.coordDev.deviceId)
+  for (const w of [f.asker, f.target, f.coord, f.client]) w.frames.length = 0
+  assert.equal((await comment(join, 'which fix?')).status, 201)
+  const mine = await f.client.waitFor((x) => isItemMarker(x) && x.payload.action === 'commented' && x.payload.item_id === join)
+  assert.equal(mine.payload.consent, 'chat')
+  await settle()
+  for (const agent of [f.asker, f.target, f.coord]) assert.equal(agent.frames.some((x) => x.kind === 'journal' && (x.type === 'item' || x.payload?.fallback_for === 'item')), false)
+})
+
+test('a voice reply on a spawn consent item delivers its transcript to the asking agent: the pending marker and the follow-up both reach it', async (t) => {
+  const waiters = []
+  const transcriber = { transcribeFile: () => new Promise((resolve) => waiters.push(resolve)) }
+  const f = await fleet(t, { transcriber })
+  const spawnId = await parkSpawn(f)
+  const item = itemOf(f.s, spawnId)
+  f.s.db.prepare('INSERT INTO blobs(id,owner_user_id,content_type,size,sha256,disk_path,created_at) VALUES(?,?,?,?,?,?,?)').run('v1', f.dan.id, 'audio/mp4', 3, 'x', '/media/v1', Date.now())
+  for (const w of [f.asker, f.target, f.coord]) w.frames.length = 0
+  const r = await f.s.http(`/items/${item.id}/comments`, { method: 'POST', token: f.clientToken, body: { attachments: [{ blob_ref: 'v1', mime: 'audio/mp4', name: 'v1.m4a', size: 3 }] } })
+  assert.equal(r.status, 201)
+  const pending = await f.asker.waitFor((x) => isItemMarker(x) && x.payload.action === 'commented' && x.payload.item_id === item.id)
+  assert.equal(pending.payload.comment.attachments[0].transcript_status, 'pending')
+  for (let i = 0; i < 40 && waiters.length === 0; i += 1) await settle(25)
+  waiters.shift()('use the other repo')
+  const done = await f.asker.waitFor((x) => isItemMarker(x) && x.payload.action === 'updated' && x.payload.transcription === 'done' && x.payload.item_id === item.id)
+  assert.equal(done.payload.comment.attachments[0].transcript, 'use the other repo'); assert.equal(done.payload.consent, undefined)
+  const still = reread(f.s, item.id)
+  assert.equal(still.state, 'open'); assert.equal(still.awaiting, 'user')
 })

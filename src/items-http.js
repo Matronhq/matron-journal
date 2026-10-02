@@ -63,6 +63,25 @@ function visibleItem(db, who, idOrNum) {
   return item
 }
 
+// Does a user's reply on this consent mirror belong in front of the agents
+// of its conversation? Only when that conversation is the asker's own:
+//   - a spawn ask's mirror lives on the parent conversation — the asker's;
+//   - a chat INVITE's mirror lives on the room, which the asker owns;
+//   - a chat JOIN's mirror lives on the room too, but the asker is the
+//     joiner, who is not in it — parking exists to keep the ask from the
+//     room's owner until the user says yes, so the reply stays client-only;
+//   - contact and share mirrors are answered on the item and never reach an
+//     agent.
+// A chat row renewed since (its item_id names a newer item) no longer vouches
+// for this one: client-only.
+function replyReachesAsker(db, item) {
+  if (item.consent === 'spawn') return true
+  if (item.consent !== 'chat') return false
+  return !!db.prepare(`
+    SELECT 1 FROM convo_agents ca JOIN conversations c ON c.id = ca.convo_id
+    WHERE ca.item_id = ? AND ca.convo_id = ? AND ca.initiator_device_id = c.agent_device_id`).get(item.id, item.origin_convo_id)
+}
+
 // The one place an 'item' marker is written. Called AFTER the item's own
 // transaction has committed — never inside it, so a broadcast can never
 // advertise a write that then rolls back. Exported for the journal's own
@@ -76,13 +95,23 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
   // that's a programmer error, not a request error, so it throws.
   if (!ITEM_ACTIONS.includes(action)) throw new Error(`unknown item action: ${action}`)
   // A consent mirror is the user's alone, whichever route wrote to it: its
-  // marker always carries `consent` (client-only, isClientOnlyEvent), has no
+  // marker carries `consent` (client-only, isClientOnlyEvent), has no
   // fallback text, and neither pushes nor wakes. The journal's own mirror
   // writes ask for all of that themselves; this is what holds for the
-  // generic routes too — a user's comment on the item would otherwise put
-  // its title (the ask no agent may read) in front of the asking agent and
-  // wake its box for an item it cannot see.
-  const mirror = item.consent != null
+  // generic routes too (a hand-close, a retitle, a reorder).
+  //
+  // The one exception is the user's own reply, when the mirror's
+  // conversation is the asker's (replyReachesAsker). It is addressed to the
+  // agent that asked — "why this box?", "use the other repo" — and replying
+  // on the card is where the user is when they think of it, so it goes out
+  // as an ordinary marker: the asking agent hears it as a turn and its box
+  // is woken. A voice reply's transcription follow-up (`updated`,
+  // for_action 'commented') goes the same way, or the bridge holding that
+  // turn would never get the words. The item itself stays unreadable to
+  // every agent, and the reply does not change its status (keepStatus).
+  const userReply = who.kind !== 'agent'
+    && (action === 'commented' || (action === 'updated' && extra?.transcription != null && extra?.for_action === 'commented'))
+  const mirror = item.consent != null && !(userReply && replyReachesAsker(db, item))
   if (mirror) { extra = { ...extra, consent: item.consent }; fallback = false }
   const author = by == null ? (who.kind === 'agent' ? 'agent' : 'user') : by
   const payload = itemMarkerPayload({ item, action, by: author, comment, extra })
