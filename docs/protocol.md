@@ -1566,7 +1566,20 @@ by the journal's own transcription job (below) or by the origin bridge's
 `PATCH /items/:id/comments/:cid`, and one supplied by a client on a create
 or a comment is stripped before storage (not a 400 — the blob still lands,
 just without the forged words). It is the text the apps show in place of a
-voice note, so it must never be caller-authored.
+voice note, so it must never be caller-authored. `transcribed_at` (ms) is
+stamped alongside it by both writers.
+
+**Voice-note audio expires; the words do not.** `MATRON_VOICE_NOTE_TTL_DAYS`
+(default 7, `0` disables): the retention scheduler deletes an `audio/*`
+attachment's blob once its transcript is older than that (`transcribed_at`,
+or the comment's `created_at` for entries from before the stamp), rewriting
+the entry in place with `expired: true` — every other field, `blob_ref` and
+`transcript` included, is kept, so a thread still reads as it did and a
+client that fetches the blob gets the ordinary 404. Audio with no
+successful transcript (none, `pending`, `failed`) and non-audio attachments
+are never touched, and the item's `updated_at` is not bumped. Chat voice
+notes (`file` events) are outside this rule: the journal holds no transcript
+for them.
 
 **Journal-side transcription.** When the journal host has whisper configured
 (`MATRON_WHISPER_MODEL` — path to a whisper.cpp `ggml-*.bin`; optional

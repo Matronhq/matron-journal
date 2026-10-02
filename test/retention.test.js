@@ -6,10 +6,10 @@ import os from 'node:os'
 import { openDb, getBlob, insertBlob } from '../src/db.js'
 import { createUser } from '../src/auth.js'
 import { upsertConversation, append, markRead } from '../src/journal.js'
-import { runOffload, runExpireLogs, runReapMedia } from '../src/retention.js'
+import { runOffload, runExpireLogs, runReapMedia, runExpireVoiceNotes } from '../src/retention.js'
 import { resolveReapPcts } from '../src/server.js'
 import { writeBlobSync, resolveMediaDir } from '../src/media.js'
-import { createItem, addComment } from '../src/items.js'
+import { createItem, addComment, setAttachmentTranscript, finishAttachmentTranscript, listComments } from '../src/items.js'
 
 function tmpMediaDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'matron-retention-'))
@@ -773,6 +773,172 @@ test('media reap never touches a blob referenced only by an item comment', async
   assert.equal(getBlob(db, blobA), undefined, 'blob A (the real candidate) must be gone')
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM blobs WHERE id=?').get(blobB).n, 1)
   void mediaDir
+})
+
+// ---------------------------------------------------------------------------
+// runExpireVoiceNotes — audio goes 7 days after its transcript landed
+// (Dan, 2026-10-02, tracker question "Auto-delete voice-note audio after it's
+// been transcribed?": A, 7 days). The words stay; only the bytes go.
+// ---------------------------------------------------------------------------
+
+const DAY = 86400000
+
+// An item comment carrying one audio attachment (+ optional extras), its
+// blob real on disk. `transcribedDaysAgo` stamps the transcript the way
+// setAttachmentTranscript does; `commentDaysAgo` backdates the comment row
+// (the fallback age for pre-stamp rows).
+function seedVoiceNote(db, mediaDir, { userId, bytes = 100, mime = 'audio/mp4', transcript = 'hello', transcribedDaysAgo = null, commentDaysAgo = 0, extras = [], stamp = true }) {
+  upsertConversation(db, { id: 'c1', ownerUserId: userId, title: 'T' })
+  const it = createItem(db, { userId, kind: 'task', title: 'T', originConvoId: 'c1', originDeviceId: 1, createdBy: 'agent' }).item
+  const blob = seedBlob(db, mediaDir, { userId, bytes, contentType: mime, fill: 7 })
+  const c = addComment(db, { userId, itemId: it.id, author: 'user', deviceId: 1, body: '', attachments: [{ blob_ref: blob.id, mime, name: 'Voice 1.m4a', size: bytes }, ...extras] }).comment
+  if (commentDaysAgo) db.prepare('UPDATE item_comments SET created_at=? WHERE id=?').run(Date.now() - commentDaysAgo * DAY, c.id)
+  if (transcript !== null) {
+    const now = transcribedDaysAgo == null ? Date.now() : Date.now() - transcribedDaysAgo * DAY
+    setAttachmentTranscript(db, { userId, itemId: it.id, commentId: c.id, blobRef: blob.id, transcript, now })
+    if (!stamp) {
+      // A row from before transcribed_at existed: strip the stamp again.
+      const atts = JSON.parse(db.prepare('SELECT attachments FROM item_comments WHERE id=?').get(c.id).attachments)
+      for (const a of atts) delete a.transcribed_at
+      db.prepare('UPDATE item_comments SET attachments=? WHERE id=?').run(JSON.stringify(atts), c.id)
+    }
+  }
+  const updatedAt = db.prepare('SELECT updated_at FROM items WHERE id=?').get(it.id).updated_at
+  return { item: it, comment: c, blob, updatedAt }
+}
+
+const attachmentsOf = (db, commentId) => JSON.parse(db.prepare('SELECT attachments FROM item_comments WHERE id=?').get(commentId).attachments)
+
+test('setAttachmentTranscript and finishAttachmentTranscript stamp transcribed_at', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const v = seedVoiceNote(db, mediaDir, { userId: dan.id, transcript: 'hello', transcribedDaysAgo: 0 })
+  const [a] = attachmentsOf(db, v.comment.id)
+  assert.equal(a.transcript, 'hello')
+  assert.ok(Number.isInteger(a.transcribed_at) && Date.now() - a.transcribed_at < 5000, 'stamp must be the write time')
+
+  const w = seedVoiceNote(db, mediaDir, { userId: dan.id, transcript: null })
+  const pending = attachmentsOf(db, w.comment.id).map((x) => ({ ...x, transcript_status: 'pending' }))
+  db.prepare('UPDATE item_comments SET attachments=? WHERE id=?').run(JSON.stringify(pending), w.comment.id)
+  finishAttachmentTranscript(db, { commentId: w.comment.id, blobRef: w.blob.id, transcript: 'from whisper', now: 1234567 })
+  const [b] = attachmentsOf(db, w.comment.id)
+  assert.equal(b.transcript, 'from whisper')
+  assert.equal(b.transcribed_at, 1234567)
+  // A failed attempt is not a transcription: no stamp.
+  const x = seedVoiceNote(db, mediaDir, { userId: dan.id, transcript: null })
+  db.prepare('UPDATE item_comments SET attachments=? WHERE id=?').run(JSON.stringify(attachmentsOf(db, x.comment.id).map((y) => ({ ...y, transcript_status: 'pending' }))), x.comment.id)
+  finishAttachmentTranscript(db, { commentId: x.comment.id, blobRef: x.blob.id, transcript: '', now: 99 })
+  assert.equal(attachmentsOf(db, x.comment.id)[0].transcribed_at, undefined)
+})
+
+test('runExpireVoiceNotes deletes audio transcribed more than `days` ago, keeps the words, and is idempotent', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const old = seedVoiceNote(db, mediaDir, { userId: dan.id, bytes: 300, transcribedDaysAgo: 8 })
+  const young = seedVoiceNote(db, mediaDir, { userId: dan.id, bytes: 300, transcribedDaysAgo: 6 })
+
+  const r = runExpireVoiceNotes(db, { days: 7 })
+  assert.deepEqual(r, { expired: 1, bytesFreed: 300 })
+  assert.equal(getBlob(db, old.blob.id), undefined, 'blob row must go')
+  assert.equal(fs.existsSync(old.blob.diskPath), false, 'file must be unlinked')
+  const [a] = attachmentsOf(db, old.comment.id)
+  assert.equal(a.expired, true)
+  assert.equal(a.transcript, 'hello', 'the words stay')
+  assert.equal(a.blob_ref, old.blob.id, 'blob_ref stays a string: the apps decode it as required')
+  assert.equal(a.mime, 'audio/mp4'); assert.equal(a.name, 'Voice 1.m4a'); assert.equal(a.size, 300)
+  assert.equal(db.prepare('SELECT updated_at FROM items WHERE id=?').get(old.item.id).updated_at, old.updatedAt, 'expiry must not resurface the item')
+  // listComments still parses the row and exposes the tombstone.
+  const listed = listComments(db, old.item.id).find((c) => c.id === old.comment.id)
+  assert.equal(listed.attachments[0].expired, true)
+
+  assert.ok(getBlob(db, young.blob.id), 'younger than `days` must survive')
+  assert.equal(attachmentsOf(db, young.comment.id)[0].expired, undefined)
+
+  assert.deepEqual(runExpireVoiceNotes(db, { days: 7 }), { expired: 0, bytesFreed: 0 }, 'second run is a no-op')
+})
+
+test('runExpireVoiceNotes falls back to the comment time for rows stamped before transcribed_at existed', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const legacyOld = seedVoiceNote(db, mediaDir, { userId: dan.id, stamp: false, commentDaysAgo: 30 })
+  const legacyYoung = seedVoiceNote(db, mediaDir, { userId: dan.id, stamp: false, commentDaysAgo: 2 })
+  // Stamp beats comment age: an old comment transcribed yesterday keeps its audio.
+  const lateTranscript = seedVoiceNote(db, mediaDir, { userId: dan.id, commentDaysAgo: 30, transcribedDaysAgo: 1 })
+
+  const r = runExpireVoiceNotes(db, { days: 7 })
+  assert.deepEqual(r, { expired: 1, bytesFreed: 100 })
+  assert.equal(getBlob(db, legacyOld.blob.id), undefined)
+  assert.ok(getBlob(db, legacyYoung.blob.id))
+  assert.ok(getBlob(db, lateTranscript.blob.id))
+})
+
+test('runExpireVoiceNotes never touches audio without a successful transcript, nor non-audio attachments', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const untranscribed = seedVoiceNote(db, mediaDir, { userId: dan.id, transcript: null, commentDaysAgo: 40 })
+  const pending = seedVoiceNote(db, mediaDir, { userId: dan.id, transcript: null, commentDaysAgo: 40 })
+  db.prepare('UPDATE item_comments SET attachments=? WHERE id=?').run(JSON.stringify(attachmentsOf(db, pending.comment.id).map((a) => ({ ...a, transcript_status: 'pending' }))), pending.comment.id)
+  const failed = seedVoiceNote(db, mediaDir, { userId: dan.id, transcript: null, commentDaysAgo: 40 })
+  db.prepare('UPDATE item_comments SET attachments=? WHERE id=?').run(JSON.stringify(attachmentsOf(db, failed.comment.id).map((a) => ({ ...a, transcript_status: 'failed', transcript: '' }))), failed.comment.id)
+  const png = seedBlob(db, mediaDir, { userId: dan.id, bytes: 100, contentType: 'image/png', fill: 8 })
+  const withImage = seedVoiceNote(db, mediaDir, { userId: dan.id, transcribedDaysAgo: 30, extras: [{ blob_ref: png.id, mime: 'image/png', name: 'shot.png', size: 100, transcript: 'not really' }] })
+
+  const r = runExpireVoiceNotes(db, { days: 7 })
+  assert.deepEqual(r, { expired: 1, bytesFreed: 100 })
+  for (const kept of [untranscribed, pending, failed]) assert.ok(getBlob(db, kept.blob.id), 'no transcript, no deletion')
+  assert.ok(getBlob(db, png.id), 'a picture is never a voice note, whatever keys it carries')
+  const atts = attachmentsOf(db, withImage.comment.id)
+  assert.equal(atts[0].expired, true)
+  assert.equal(atts[1].expired, undefined)
+})
+
+test('runExpireVoiceNotes expires every comment naming a shared audio blob and deletes it once; a blob another user owns is left alone', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const v = seedVoiceNote(db, mediaDir, { userId: dan.id, transcribedDaysAgo: 10 })
+  const twice = addComment(db, { userId: dan.id, itemId: v.item.id, author: 'user', deviceId: 1, body: '', attachments: [{ blob_ref: v.blob.id, mime: 'audio/mp4', name: 'again.m4a', size: 100 }] }).comment
+  setAttachmentTranscript(db, { userId: dan.id, itemId: v.item.id, commentId: twice.id, blobRef: v.blob.id, transcript: 'hello', now: Date.now() - 9 * DAY })
+  const bev = await createUser(db, 'bev', 'pw')
+  upsertConversation(db, { id: 'cb', ownerUserId: bev.id })
+  const bevItem = createItem(db, { userId: bev.id, kind: 'task', title: 'B', originConvoId: 'cb', originDeviceId: 1, createdBy: 'agent' }).item
+  // Pathological: bev's comment names dan's blob (ids are unguessable in practice).
+  const bevC = addComment(db, { userId: bev.id, itemId: bevItem.id, author: 'user', deviceId: 1, body: '', attachments: [{ blob_ref: v.blob.id, mime: 'audio/mp4', name: 'x.m4a', size: 100 }] }).comment
+  setAttachmentTranscript(db, { userId: bev.id, itemId: bevItem.id, commentId: bevC.id, blobRef: v.blob.id, transcript: 'mine', now: Date.now() - 9 * DAY })
+
+  const r = runExpireVoiceNotes(db, { days: 7 })
+  assert.deepEqual(r, { expired: 2, bytesFreed: 100 })
+  assert.equal(getBlob(db, v.blob.id), undefined)
+  assert.equal(attachmentsOf(db, v.comment.id)[0].expired, true)
+  assert.equal(attachmentsOf(db, twice.id)[0].expired, true)
+  assert.equal(attachmentsOf(db, bevC.id)[0].expired, undefined, "another user's comment is never rewritten")
+})
+
+test('runExpireVoiceNotes tolerates a blob file already missing on disk', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const v = seedVoiceNote(db, mediaDir, { userId: dan.id, transcribedDaysAgo: 10 })
+  fs.unlinkSync(v.blob.diskPath)
+  assert.deepEqual(runExpireVoiceNotes(db, { days: 7 }), { expired: 1, bytesFreed: 100 })
+  assert.equal(attachmentsOf(db, v.comment.id)[0].expired, true)
+})
+
+test('MATRON_VOICE_NOTE_TTL_DAYS: default 7 runs at boot; 0 (voiceNoteTtlDays: 0) and garbage disable the pass', async (t) => {
+  const { startTestServer } = await import('./helpers.js')
+  const mute = t.mock.method(console, 'warn', () => {})
+  t.after(() => mute.mock.restore())
+  for (const [override, expectDeleted] of [[undefined, true], [0, false], [-3, false], ['soon', false], [30, false]]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-voice-ttl-'))
+    const dbPath = path.join(dir, 'test.db')
+    const mediaDir = resolveMediaDir(dbPath)
+    const preDb = openDb(dbPath)
+    const dan = await createUser(preDb, 'dan', 'pw')
+    const v = seedVoiceNote(preDb, mediaDir, { userId: dan.id, transcribedDaysAgo: 10 })
+    preDb.close()
+    const s = await startTestServer({ dbPath, ...(override === undefined ? {} : { voiceNoteTtlDays: override }) })
+    const gone = s.db.prepare('SELECT COUNT(*) n FROM blobs WHERE id=?').get(v.blob.id).n === 0
+    s.close()
+    assert.equal(gone, expectDeleted, `voiceNoteTtlDays=${override}`)
+  }
 })
 
 test('resolveReapPcts: defaults, overrides, disable-on-zero, fail-closed on garbage or inverted marks', (t) => {

@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import { writeBlobSync } from './media.js'
 import { insertBlob, getBlob } from './db.js'
+import { isAudioAttachment } from './items.js'
 import { snippetOf, MESSAGE_TYPES } from './journal.js'
 
 const OFFLOAD_TYPE = 'tool_output'
@@ -149,6 +150,98 @@ export function runExpireLogs(db, { hours = 24, mediaDir }) {
     expired += 1
   }
   return { expired }
+}
+
+// Voice-note audio expiry (fourth retention pass). Dan, 2026-10-02 (tracker
+// question "Auto-delete voice-note audio after it's been transcribed?"):
+// keep the transcript forever, delete the recording 7 days after a
+// SUCCESSFUL transcription — long enough to replay or re-transcribe a
+// garbled note, short enough that audio is not what fills the quota.
+//
+// Scope is item-thread voice notes: `audio/*` entries in
+// item_comments.attachments whose `transcript` is a non-empty string. The
+// clock is `transcribed_at` (stamped by setAttachmentTranscript /
+// finishAttachmentTranscript), falling back to the comment's created_at for
+// entries written before the stamp existed. Never touched: audio with no
+// transcript, a pending or failed job, anything that is not audio (whatever
+// keys it carries), and — like every pass here — a blob another user owns.
+// Chat voice notes (file events) are out of scope: the journal holds no
+// transcript for them (the origin bridge transcribes those into its own
+// turn), so "after it's been transcribed" cannot be decided here.
+//
+// A blob several of the owner's comments name (the same note attached
+// twice) goes only once every one of those entries is due; then all of
+// them are rewritten in the same transaction as the blob-row delete. The
+// entry keeps every field — `blob_ref` included, since the apps decode it
+// as a required string — and gains `expired: true`; the file is unlinked
+// after commit (ENOENT = already gone, the expected steady state on a
+// re-run). The item's updated_at is NOT bumped: an expiry is housekeeping,
+// not news.
+export function runExpireVoiceNotes(db, { days = 7, now = Date.now() }) {
+  if (!Number.isInteger(days) || days <= 0) {
+    console.warn(`retention: voice-note TTL days=${JSON.stringify(days)} is invalid — voice-note expiry skipped`)
+    return { expired: 0, bytesFreed: 0 }
+  }
+  const cutoff = now - days * 86400000
+  // LIKE prefilters only; the parsed checks below are the rule.
+  const rows = db.prepare(
+    `SELECT id, user_id, created_at, attachments FROM item_comments
+     WHERE attachments LIKE '%"mime":"audio/%' AND attachments LIKE '%"transcript":"%' ORDER BY created_at`
+  ).all()
+  const naming = db.prepare(`SELECT id, created_at, attachments FROM item_comments WHERE user_id = ? AND attachments LIKE ?`)
+  const update = db.prepare('UPDATE item_comments SET attachments=? WHERE id=?')
+  const deleteBlobRow = db.prepare('DELETE FROM blobs WHERE id=?')
+
+  const isDue = (a, commentCreatedAt) =>
+    isAudioAttachment(a) && typeof a.blob_ref === 'string' && a.blob_ref && !a.expired &&
+    typeof a.transcript === 'string' && a.transcript.trim() !== '' &&
+    (Number.isInteger(a.transcribed_at) ? a.transcribed_at : commentCreatedAt) < cutoff
+  const isLive = (a) => isAudioAttachment(a) && !a.expired
+
+  let expired = 0
+  let bytesFreed = 0
+  const settled = new Set()
+  for (const row of rows) {
+    let atts
+    try { atts = JSON.parse(row.attachments) } catch { continue }
+    if (!Array.isArray(atts)) continue
+    for (const a of atts) {
+      if (!isDue(a, row.created_at) || settled.has(a.blob_ref)) continue
+      const blobRef = a.blob_ref
+      settled.add(blobRef)
+      const blob = getBlob(db, blobRef)
+      if (blob && blob.owner_user_id !== row.user_id) continue
+      // Every comment of this user naming the blob: all due, or none go.
+      const holders = []
+      let allDue = true
+      for (const h of naming.all(row.user_id, `%"blob_ref":"${blobRef}"%`)) {
+        let hatts
+        try { hatts = JSON.parse(h.attachments) } catch { allDue = false; break }
+        if (!Array.isArray(hatts)) { allDue = false; break }
+        const mine = hatts.filter((x) => x.blob_ref === blobRef && isLive(x))
+        if (mine.some((x) => !isDue(x, h.created_at))) { allDue = false; break }
+        if (mine.length) holders.push({ id: h.id, atts: hatts, mine })
+      }
+      if (!allDue || !holders.length) continue
+      db.transaction(() => {
+        for (const h of holders) {
+          for (const x of h.mine) x.expired = true
+          update.run(JSON.stringify(h.atts), h.id)
+          expired += h.mine.length
+        }
+        if (blob) deleteBlobRow.run(blobRef)
+      })()
+      if (blob) {
+        try {
+          fs.unlinkSync(blob.disk_path)
+        } catch (err) {
+          if (err.code !== 'ENOENT') console.error(`retention: failed to unlink voice-note blob ${blob.id} at ${blob.disk_path}`, err)
+        }
+        bytesFreed += blob.size
+      }
+    }
+  }
+  return { expired, bytesFreed }
 }
 
 // Quota-pressure attachment reaper (third retention pass). Does nothing until
