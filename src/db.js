@@ -243,6 +243,21 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
 CREATE TRIGGER IF NOT EXISTS search_messages_ai AFTER INSERT ON search_messages BEGIN
   INSERT INTO search_fts(rowid, body) VALUES (new.rowid, new.body);
 END;
+-- A second mirror of the same content, unstemmed, for the apps' typed
+-- modes (src/search.js "Typed matching"): there a query means the words
+-- as typed, and the word still being typed is a prefix. Neither survives
+-- the porter index — "run" would find "running", and a prefix "runn"
+-- matches nothing because the stored token is "run". Same content table,
+-- same insert-only discipline; \`openDb\` rebuilds it once when it is new.
+CREATE VIRTUAL TABLE IF NOT EXISTS search_fts_plain USING fts5(
+  body,
+  content='search_messages',
+  content_rowid='rowid',
+  tokenize='unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS search_messages_ai_plain AFTER INSERT ON search_messages BEGIN
+  INSERT INTO search_fts_plain(rowid, body) VALUES (new.rowid, new.body);
+END;
 CREATE TABLE IF NOT EXISTS search_backfill_state(
   id INTEGER PRIMARY KEY CHECK(id=1),
   last_events_rowid INTEGER NOT NULL
@@ -531,7 +546,12 @@ export function openDb(path) {
   // SQLite's stock inline auto-checkpoint so a long one-shot run (e.g. a
   // backlog retention offload) cannot grow the WAL unbounded.
   db.pragma('journal_size_limit = 4194304')
+  // The unstemmed search mirror is populated by trigger from here on; a
+  // database that predates it has rows to index. 'rebuild' reads the
+  // content table (seconds for a few hundred thousand prose rows).
+  const hadPlainFts = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_fts_plain'").get()
   db.exec(SCHEMA)
+  if (!hadPlainFts) db.exec("INSERT INTO search_fts_plain(search_fts_plain) VALUES('rebuild')")
   // The live DB on dev-2 predates apns_env (only apns_token existed) — in-place
   // migration, never a destructive rebuild. Sygnal lesson: environment
   // ('sandbox'|'prod') has to be tracked per device, not assumed from topic.

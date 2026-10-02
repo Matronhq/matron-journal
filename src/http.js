@@ -10,7 +10,7 @@ import { imageSizeFromFile } from './image-size.js'
 import { buildMetrics } from './metrics.js'
 import { listAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
-import { searchMessages, indexableBody } from './search.js'
+import { searchMessages, searchChats, searchRecent, indexableBody } from './search.js'
 import { canReadConvo, canReadBlob } from './visibility.js'
 import { serveHelp } from './help.js'
 import { wakeIfOffline, isWakeableBoxName } from './wake.js'
@@ -506,7 +506,28 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // one-caller-rule predicate the roster uses — applies only to an
         // ORDINARY agent caller, never to clients or private agents.
         const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
-        const r = searchMessages(db, who.userId, { query: q, limit, convoId, excludePrivateOwned: filtered })
+        // mode (spec: "Journal search", typed modes): `ranked` is the
+        // original bm25 list agents use; `chats` and `recent` are the apps'
+        // modes under the typed matching rule. exclude_subagents=1 drops
+        // hits in subagent child conversations (Dan, 2026-10-02: they are
+        // 71% of the index and almost never what a person is looking for).
+        const mode = url.searchParams.get('mode') || 'ranked'
+        if (!['ranked', 'chats', 'recent'].includes(mode)) return json(res, 400, { error: 'bad_request' })
+        const excludeSubagents = url.searchParams.get('exclude_subagents') === '1'
+        if (mode === 'chats') {
+          const r = searchChats(db, who.userId, { query: q, limit, excludeSubagents, excludePrivateOwned: filtered })
+          if (r.badQuery) return json(res, 400, { error: 'bad_request' })
+          return json(res, 200, { chats: r.chats })
+        }
+        if (mode === 'recent') {
+          // A conversation's whole match list is what find-in-chat steps
+          // through, so the clamp is wider when scoped to one.
+          const recentLimit = convoId != null ? Math.min(rawLimit, 500) : limit
+          const r = searchRecent(db, who.userId, { query: q, limit: recentLimit, convoId, excludeSubagents, excludePrivateOwned: filtered })
+          if (r.badQuery) return json(res, 400, { error: 'bad_request' })
+          return json(res, 200, { hits: r.hits })
+        }
+        const r = searchMessages(db, who.userId, { query: q, limit, convoId, excludePrivateOwned: filtered, excludeSubagents })
         if (r.badQuery) return json(res, 400, { error: 'bad_request' })
         return json(res, 200, { hits: r.hits })
       }

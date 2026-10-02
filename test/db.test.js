@@ -369,14 +369,17 @@ test('search schema: tables, insert trigger, and NOTHING else', () => {
   db.prepare("INSERT INTO search_messages(user_id, convo_id, seq, ts, sender, body) VALUES(1,'c1',1,1,'user:dan','hello sqlite search')").run()
   const hit = db.prepare("SELECT rowid FROM search_fts WHERE search_fts MATCH 'sqlite'").get()
   assert.ok(hit, 'insert trigger populates the FTS index')
+  const plain = db.prepare("SELECT rowid FROM search_fts_plain WHERE search_fts_plain MATCH 'sqlite'").get()
+  assert.ok(plain, 'insert trigger populates the unstemmed mirror too')
   assert.equal(db.prepare('SELECT COUNT(*) n FROM search_backfill_state').get().n, 0)
-  // The append-only invariant, pinned: exactly ONE trigger (after-insert) on
-  // search_messages — a future update/delete trigger means someone added a
-  // mutation path to events and must revisit the whole design.
+  // The append-only invariant, pinned: ONLY after-insert triggers on
+  // search_messages (one per FTS mirror) — a future update/delete trigger
+  // means someone added a mutation path to events and must revisit the
+  // whole design.
   const triggers = db.prepare(
-    "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='search_messages'"
+    "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='search_messages' ORDER BY name"
   ).all()
-  assert.deepEqual(triggers.map((t) => t.name), ['search_messages_ai'])
+  assert.deepEqual(triggers.map((t) => t.name), ['search_messages_ai', 'search_messages_ai_plain'])
   db.close()
 })
 

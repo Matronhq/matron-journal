@@ -132,6 +132,40 @@ the machine-checkable version of this page.
   agents (the feature's primary audience) and clients; an ordinary
   (non-private) agent caller additionally has hits from private-owned
   conversations excluded — see "Device privacy" below.
+  `exclude_subagents=1` drops hits in subagent child conversations
+  (`conversations.parent_convo_id` set) in every mode — the apps pass it,
+  since those are most of the index and rarely what a person is after.
+  `mode` selects the result shape (400 on anything else):
+  - `ranked` (default): the list above.
+  - `chats` and `recent` are the apps' modes (matron-apple, 2026-10-02)
+    and match under the **typed rule** rather than stems: a message
+    matches when it contains every typed word as typed; only the last
+    word, when `q` does not end in whitespace, also matches as the start
+    of a longer word (`"time" "cris"*`), so as-you-type results hold
+    between keystrokes and a trailing space finishes the word. These run
+    against `search_fts_plain`, an unstemmed (`unicode61`) mirror of the
+    same content table (db.js): on the porter index a finished "run"
+    finds "running" and a prefix `runn*` finds nothing, because the
+    stored token is "run". Case and diacritics still fold. `typedQuery()`
+    in `src/search.js` is the one parser. A database from before the
+    mirror existed gets it rebuilt once at open (seconds).
+  - `mode=chats` -> `{chats: [{convo_id, title, parent_convo_id,
+    parent_title, count, exact, live, top: {seq, ts, sender, excerpt}}]}`:
+    one row per conversation, at most `limit` (clamped to 50).
+    Conversations holding the query as an exact phrase (`exact: true`)
+    come first, then those containing every word; newest first (highest
+    seq) within each. `count` is every matching message in the
+    conversation, `top` the previewed one — the newest exact match when
+    there is one, else the newest match — and `excerpt` up to ~1 KB of
+    its body around the first literal occurrence (the phrase if present,
+    else the earliest word; the head of the body when neither is found
+    literally), `…`-marked where cut. Highlighting is the client's.
+    `convo_id` is ignored in this mode.
+  - `mode=recent` -> `{hits: [{convo_id, seq, ts, sender}]}`: flat, newest
+    first, no body or snippet — find-in-chat's match list, which the app
+    steps through by seq while already showing the messages. With
+    `convo_id` the clamp is 500 rather than 50, so a conversation's whole
+    match list fits.
 - `POST /media` (Bearer, client or agent) -> raw request body streamed to disk;
   `{media_id, size, content_type, sha256, width?, height?}`. Content-Type header captured
   (default `application/octet-stream`). For an `image/*` upload the journal
