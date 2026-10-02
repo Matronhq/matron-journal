@@ -22,7 +22,8 @@ import { makeRpcBroker } from './rpc-broker.js'
 import { resolveWebDir, makeStaticHandler } from './static-http.js'
 import { makeWellKnown, parseList } from './well-known.js'
 import { makeWaker } from './wake.js'
-import { makeTranscriber } from './transcribe.js'
+import { makeConfiguredTranscriber } from './cloud-transcribe.js'
+import { makeBlobTranscripts } from './blob-transcripts.js'
 import { makeItemTranscription } from './items-transcribe.js'
 import { emitTranscriptionMarker } from './items-http.js'
 import { makeGithub, DEFAULT_GITHUB_CLIENT_ID } from './github.js'
@@ -436,15 +437,20 @@ export function startServer({
   const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient })
   // A consent-card push whose 30 s hold a restart swallowed still goes out.
   try { pushPipeline.resumeHeldConsent() } catch (err) { console.error('push: consent resume failed', err) }
-  // Voice notes on tracker items are transcribed here when whisper is
-  // configured (MATRON_WHISPER_MODEL; src/transcribe.js) — off otherwise, and
-  // then the origin bridge does it as before. `transcriber` is the test seam;
-  // `null` forces it off.
+  // Voice notes are transcribed here when the journal has a transcriber: a
+  // cloud one (MATRON_STT_AZURE_KEY; src/cloud-transcribe.js), or whisper
+  // (MATRON_WHISPER_MODEL; src/transcribe.js). Neither: off, and the origin
+  // bridge does it as before. `transcriber` is the test seam; `null` forces
+  // it off.
+  const resolvedTranscriber = transcriber === undefined
+    ? makeConfiguredTranscriber({ deviceNames: (userId) => db.prepare('SELECT DISTINCT name FROM devices WHERE user_id=? ORDER BY name').all(userId).map((r) => r.name) })
+    : transcriber
+  // Chat voice notes, at upload: cloud only (src/blob-transcripts.js).
+  const blobTranscripts = makeBlobTranscripts({ db, transcriber: resolvedTranscriber })
   const itemTranscription = makeItemTranscription({
     db,
-    transcriber: transcriber === undefined
-      ? makeTranscriber({ deviceNames: (userId) => db.prepare('SELECT DISTINCT name FROM devices WHERE user_id=? ORDER BY name').all(userId).map((r) => r.name) })
-      : transcriber,
+    transcriber: resolvedTranscriber,
+    blobTranscripts,
     onSettled: (out) => emitTranscriptionMarker({ db, hub, pushPipeline, waker: resolvedWaker }, out),
   })
   // GitHub account linking (spec 2026-09-23 tracker web/teams). `github` is
@@ -474,7 +480,7 @@ export function startServer({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
-    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, consentDailyCap,
+    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap,
     github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer,
   }))
@@ -505,6 +511,7 @@ export function startServer({
       // Whatever a previous process left mid-transcription: a bridge is
       // holding a turn for each, so finish them (or fail them) now.
       itemTranscription.recover()
+      blobTranscripts.recover()
       // Fire-and-forget: search serves partial results until this finishes
       // (self-healing — spec). shouldStop lets close() end the walk cleanly
       // instead of racing a closed DB handle.
@@ -526,6 +533,7 @@ export function startServer({
         toolStreams,
         pushPipeline,
         itemTranscription,
+        blobTranscripts,
         preapproveKey: resolvedPreapproveKey,
         searchBackfill,
         imageDimsBackfill,
@@ -551,7 +559,7 @@ export function startServer({
           if (ownsApnsClient) resolvedApnsClient.close()
           // The transcription queue touches the DB between awaits: abort its
           // child and let it drain before the handle closes.
-          const transcriptionDone = itemTranscription.close()
+          const transcriptionDone = Promise.all([itemTranscription.close(), blobTranscripts.close()])
           server.close(() => { Promise.all([searchBackfill, imageDimsBackfill, transcriptionDone]).then(() => { db.close(); r() }) })
         }),
       })

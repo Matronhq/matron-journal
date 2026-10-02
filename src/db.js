@@ -637,6 +637,11 @@ export function openDb(path) {
   const blobCols = db.prepare('PRAGMA table_info(blobs)').all()
   if (!blobCols.some((c) => c.name === 'width')) db.exec('ALTER TABLE blobs ADD COLUMN width INTEGER')
   if (!blobCols.some((c) => c.name === 'height')) db.exec('ALTER TABLE blobs ADD COLUMN height INTEGER')
+  // A voice note's words, transcribed at upload when the journal has a cloud
+  // transcriber (blob-transcripts.js). transcript_status NULL = never asked,
+  // else 'pending' | 'done' | 'failed'; transcript is set only when 'done'.
+  if (!blobCols.some((c) => c.name === 'transcript')) db.exec('ALTER TABLE blobs ADD COLUMN transcript TEXT')
+  if (!blobCols.some((c) => c.name === 'transcript_status')) db.exec('ALTER TABLE blobs ADD COLUMN transcript_status TEXT')
   // Keeps the per-user quota SUM (see userBlobBytes) a cheap index scan rather
   // than a full-table read as the blob store grows.
   db.exec('CREATE INDEX IF NOT EXISTS idx_blobs_owner ON blobs(owner_user_id)')

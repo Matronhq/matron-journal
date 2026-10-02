@@ -289,6 +289,9 @@ close or merge.
 
 - \`POST /media\` (raw body, Content-Type captured) →
   \`{media_id, size, content_type, sha256}\`; fetch with \`GET /media/:id\`.
+- \`GET /media/:id/transcript?wait=N\` → \`{status, transcript?}\` — a
+  voice note's words when the journal transcribed it at upload (\`status\`
+  none|pending|done|failed; \`wait\` ≤ 30 s holds a pending answer).
 `
 
 /**
