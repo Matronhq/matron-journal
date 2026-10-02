@@ -421,7 +421,11 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     if (!text.trim() && attachments.length === 0) return badRequest(res)
     let out
     try {
-      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, body: text, attachments, action, idemKey })
+      // A consent mirror follows its ask, never a comment: left to the
+      // generic rule, a reply on one would reopen it (or take it out of the
+      // user's Decisions list while the ask still waits) with no agent able
+      // to see the item, let alone close it again.
+      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, body: text, attachments, action, idemKey, keepStatus: item.consent != null })
     } catch (err) {
       if (answerKnownError(res, err)) return true
       throw err
@@ -484,6 +488,9 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
   if (sub === 'reopen' && subId == null && req.method === 'POST') {
     const body = await readBody(req)
     if (!okNote(body.comment)) return badRequest(res)
+    // A consent mirror is open exactly while its ask waits for an answer;
+    // reopening one would offer the user a decision that can only fail.
+    if (item.consent != null) return conflict(res)
     const out = reopenItem(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, comment: body.comment ?? '' })
     if (!out) return conflict(res) // already open
     emitMarker(ctx, who, { item: out.item, action: 'reopened', comment: out.comment })

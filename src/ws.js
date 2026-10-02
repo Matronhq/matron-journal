@@ -8,7 +8,7 @@ import { participantIds, participantConvoIds, answerInvite, leaveConvo, leaveAll
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
-import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem } from './consent-items.js'
+import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem, reconcileConsentItems } from './consent-items.js'
 import { nudgeCoordinator, chatAskId } from './consent.js'
 import { expireContactAsks } from './contacts.js'
 import { expireGrantAsks } from './grants.js'
@@ -372,6 +372,10 @@ export function attachWs({
         }
         emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'failed', errorCode: 'orphaned' })
       }
+      // After every expiry above has settled its own mirror: any spawn or
+      // chat consent item still open on an ask that is not waiting is
+      // closed (consent-items.js reconcileConsentItems).
+      reconcileConsentItems({ db, hub })
       const conns = hub.allConns()
       if (conns.length === 0) return
       const ids = [...new Set(conns.map((c) => c.deviceId))]

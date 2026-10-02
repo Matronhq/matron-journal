@@ -960,6 +960,7 @@ const consentItemFor = (s, spawnId) => {
   return s.db.prepare('SELECT * FROM items WHERE id=?').get(row.item_id)
 }
 const closingStatus = (s, itemId) => s.db.prepare("SELECT * FROM item_comments WHERE item_id=? AND kind='status' ORDER BY rowid DESC LIMIT 1").get(itemId)
+const lastNote = (s, itemId) => s.db.prepare('SELECT * FROM item_comments WHERE item_id=? ORDER BY rowid DESC LIMIT 1').get(itemId)
 
 function makeStubApnsClient() {
   const calls = []
@@ -1060,12 +1061,17 @@ test('approve → started closes the consent item as decided, naming the box and
   assert.equal(out.outcome, 'started')
   const after = s.db.prepare('SELECT * FROM items WHERE id=?').get(item.id)
   assert.equal(after.state, 'closed'); assert.equal(after.resolution, 'decided')
+  // The approval closed it (test/consent-item-follows-answer.test.js); the
+  // outcome adds how the start went.
   const status = closingStatus(s, item.id)
   assert.equal(status.author, 'user'); assert.equal(status.device_id, clientDev.deviceId)
-  assert.ok(status.body.includes('Approved') && status.body.includes('eric') && /chat room/i.test(status.body))
+  assert.ok(status.body.startsWith('Approved.') && status.body.includes('eric'))
+  const note = lastNote(s, item.id)
+  assert.equal(note.kind, 'comment'); assert.equal(note.author, 'agent')
+  assert.ok(note.body.includes('started on eric') && /chat room/i.test(note.body))
 })
 
-test('approve → failed closes the consent item as cancelled with the failure code', async (t) => {
+test('approve → failed leaves the consent item closed as decided and adds the failure code', async (t) => {
   const { s, clientToken, parent, target, spawnId } = await parkedSpawn(t)
   const item = consentItemFor(s, spawnId)
   target.close()
@@ -1074,10 +1080,11 @@ test('approve → failed closes the consent item as cancelled with the failure c
   const out = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'outcome', 5000)
   assert.equal(out.outcome, 'failed')
   const after = s.db.prepare('SELECT * FROM items WHERE id=?').get(item.id)
-  assert.equal(after.state, 'closed'); assert.equal(after.resolution, 'cancelled')
-  const status = closingStatus(s, item.id)
-  assert.equal(status.author, 'agent')
-  assert.ok(status.body.includes('Approved, but') && status.body.includes(out.error_code))
+  assert.equal(after.state, 'closed'); assert.equal(after.resolution, 'decided')
+  assert.ok(closingStatus(s, item.id).body.startsWith('Approved.'))
+  const note = lastNote(s, item.id)
+  assert.equal(note.author, 'agent')
+  assert.ok(note.body.includes('could not be started') && note.body.includes(out.error_code))
 })
 
 test('an expired spawn ask closes its consent item as cancelled on the sweep', async (t) => {
