@@ -76,13 +76,20 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
   // that's a programmer error, not a request error, so it throws.
   if (!ITEM_ACTIONS.includes(action)) throw new Error(`unknown item action: ${action}`)
   // A consent mirror is the user's alone, whichever route wrote to it: its
-  // marker always carries `consent` (client-only, isClientOnlyEvent), has no
+  // marker carries `consent` (client-only, isClientOnlyEvent), has no
   // fallback text, and neither pushes nor wakes. The journal's own mirror
   // writes ask for all of that themselves; this is what holds for the
-  // generic routes too — a user's comment on the item would otherwise put
-  // its title (the ask no agent may read) in front of the asking agent and
-  // wake its box for an item it cannot see.
-  const mirror = item.consent != null
+  // generic routes too (a hand-close, a retitle, a reorder).
+  //
+  // The one exception is the user's own reply. It is addressed to the agent
+  // that asked — "why this box?", "use the other repo" — and replying on the
+  // card is where the user is when they think of it, so it goes out as an
+  // ordinary marker: the asking conversation's agent hears it as a turn and
+  // its box is woken. Nothing in it is news to that agent: the title is
+  // built from its own topic and target. The item itself stays unreadable
+  // to every agent, and the reply does not change its status (keepStatus).
+  const userReply = action === 'commented' && who.kind !== 'agent'
+  const mirror = item.consent != null && !userReply
   if (mirror) { extra = { ...extra, consent: item.consent }; fallback = false }
   const author = by == null ? (who.kind === 'agent' ? 'agent' : 'user') : by
   const payload = itemMarkerPayload({ item, action, by: author, comment, extra })
