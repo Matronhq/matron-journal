@@ -1037,3 +1037,16 @@ test('runExpireVoiceNotes: chat audio not transcribed here, failed, or shared wi
   assert.deepEqual(runExpireVoiceNotes(db, { days: 7 }), { expired: 0, bytesFreed: 0 })
   for (const b of [failed.blob, bridgeDid.blob, shared.blob, onText.blob, inItem.blob, orphan]) assert.ok(getBlob(db, b.id), `blob ${b.id} must stay`)
 })
+
+test('runExpireVoiceNotes: a recording in both an item thread and a chat goes on the item clock, and the chat event becomes a tombstone with the words', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const v = seedVoiceNote(db, mediaDir, { userId: dan.id, transcript: 'from the item', transcribedDaysAgo: 8 })
+  const r0 = append(db, { userId: dan.id, convoId: 'c1', sender: 'user:dan', type: 'file', payload: { blob_ref: v.blob.id, name: 'Voice 1.m4a', content_type: 'audio/mp4', size: 100 }, blobRef: v.blob.id })
+  const r = runExpireVoiceNotes(db, { days: 7 })
+  assert.equal(r.expired, 1)
+  assert.equal(getBlob(db, v.blob.id), undefined)
+  const ev = eventOf(db, dan.id, r0.seq)
+  assert.equal(ev.blob_ref, null)
+  assert.deepEqual(JSON.parse(ev.payload), { blob_ref: null, name: 'Voice 1.m4a', content_type: 'audio/mp4', size: 100, expired: true, transcript: 'from the item' })
+})

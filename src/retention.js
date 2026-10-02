@@ -231,7 +231,13 @@ export function runExpireVoiceNotes(db, { days = 7, now = Date.now() }) {
           update.run(JSON.stringify(h.atts), h.id)
           expired += h.mine.length
         }
-        if (blob) deleteBlobRow.run(blobRef)
+        if (blob) {
+          // The same recording sent in a chat too: its file/image events
+          // become tombstones carrying the words, as the chat pass writes
+          // them, rather than dangling refs to a deleted blob.
+          tombstoneAttachmentEvents(db, blobRef, holders[0].mine[0].transcript)
+          deleteBlobRow.run(blobRef)
+        }
       })()
       if (blob) {
         try {
@@ -266,25 +272,12 @@ function expireChatVoiceNotes(db, { cutoff }) {
        AND NOT EXISTS (SELECT 1 FROM item_comments ic WHERE ic.attachments LIKE '%"blob_ref":"' || b.id || '"%')
      ORDER BY b.transcribed_at`
   ).all(cutoff)
-  const refs = db.prepare('SELECT user_id, seq, payload FROM events WHERE blob_ref = ?')
-  const updateEvent = db.prepare('UPDATE events SET payload=?, blob_ref=NULL WHERE user_id=? AND seq=?')
   const deleteBlobRow = db.prepare('DELETE FROM blobs WHERE id=?')
   let expired = 0
   let bytesFreed = 0
   for (const blob of due) {
     db.transaction(() => {
-      for (const ref of refs.all(blob.id)) {
-        let payload
-        try { payload = JSON.parse(ref.payload) } catch { payload = null }
-        const tombstone = {
-          ...(payload && typeof payload === 'object' ? payload : {}),
-          blob_ref: null,
-          expired: true,
-          transcript: blob.transcript,
-        }
-        updateEvent.run(JSON.stringify(tombstone), ref.user_id, ref.seq)
-        expired += 1
-      }
+      expired += tombstoneAttachmentEvents(db, blob.id, blob.transcript)
       deleteBlobRow.run(blob.id)
     })()
     try {
@@ -295,6 +288,27 @@ function expireChatVoiceNotes(db, { cutoff }) {
     bytesFreed += blob.size
   }
   return { expired, bytesFreed }
+}
+
+// Rewrites every file/image event naming an expiring voice-note blob to the
+// reaper's tombstone (payload kept, blob_ref null, expired:true) plus the
+// transcript. Returns how many events it rewrote. Runs inside the caller's
+// transaction, before the blob row is deleted.
+function tombstoneAttachmentEvents(db, blobRef, transcript) {
+  const refs = db.prepare(`SELECT user_id, seq, payload FROM events WHERE blob_ref = ? AND type IN ${ATTACHMENT_TYPES}`).all(blobRef)
+  const updateEvent = db.prepare('UPDATE events SET payload=?, blob_ref=NULL WHERE user_id=? AND seq=?')
+  for (const ref of refs) {
+    let payload
+    try { payload = JSON.parse(ref.payload) } catch { payload = null }
+    const tombstone = {
+      ...(payload && typeof payload === 'object' ? payload : {}),
+      blob_ref: null,
+      expired: true,
+      ...(typeof transcript === 'string' && transcript ? { transcript } : {}),
+    }
+    updateEvent.run(JSON.stringify(tombstone), ref.user_id, ref.seq)
+  }
+  return refs.length
 }
 
 // Quota-pressure attachment reaper (third retention pass). Does nothing until
