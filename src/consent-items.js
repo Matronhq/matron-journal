@@ -55,6 +55,12 @@ export function spawnConsentItemFields(card) {
     `- **Box:** ${target}`,
     `- **Directory:** ${codeSpan(card.workdir)}`,
     ...(card.model ? [`- **Model:** ${codeSpan(card.model)}`] : []),
+    // No model named and the box is out of Fable (src/spawn-model.js): the
+    // bridge will start the child on the fallback, so the user approves
+    // knowing it.
+    ...(!card.model && card.fallback_reason === 'fable_limit' && card.fallback_model
+      ? [`- **Model:** ${codeSpan(card.fallback_model)} — ${target} is at its Fable weekly limit, so a session that would start on Fable starts on Opus`]
+      : []),
     // "joins mission #N" (coordinator redesign §2d): the user approves the
     // child AND where it lands. The title rides the card as mission_title —
     // the mission was resolved through the asker's sieve, and this item
@@ -87,12 +93,14 @@ export function spawnConsentItemFields(card) {
 // Coordinator, not a tap, answered: the note says so, in the Coordinator's
 // words, and is attributed to an agent (the Coordinator's device) rather
 // than the user — the whole point of the audit line.
-export function spawnConsentClosing({ outcome, errorCode, roomId }, { targetName, link = false, decidedBy = null }) {
+export function spawnConsentClosing({ outcome, errorCode, roomId, modelFallback = null }, { targetName, link = false, decidedBy = null }) {
   const room = link && roomId ? ' A chat room between the two sessions was opened.' : ''
+  // The bridge's start reply named a fallback model (src/spawn-model.js).
+  const onModel = modelFallback ? ` on ${codeSpan(modelFallback.model)} — Fable limit reached` : ''
   if (decidedBy) {
     const why = ` — ${decidedBy.reason || 'no reason given'}`
     switch (outcome) {
-      case 'started': return { resolution: 'decided', author: 'agent', byCoordinator: true, comment: `Approved by the Coordinator${why}. The session started on ${targetName}.${room}` }
+      case 'started': return { resolution: 'decided', author: 'agent', byCoordinator: true, comment: `Approved by the Coordinator${why}. The session started on ${targetName}${onModel}.${room}` }
       case 'declined': return { resolution: 'decided', author: 'agent', byCoordinator: true, comment: `Declined by the Coordinator${why}.` }
       case 'failed': return { resolution: 'cancelled', author: 'agent', byCoordinator: true, comment: `Approved by the Coordinator${why}, but the session could not be started (${errorCode || 'unknown'}).` }
       default: break
@@ -102,7 +110,7 @@ export function spawnConsentClosing({ outcome, errorCode, roomId }, { targetName
     case 'started':
       return {
         resolution: 'decided', author: 'user',
-        comment: `Approved — the session started on ${targetName}.${room}`,
+        comment: `Approved — the session started on ${targetName}${onModel}.${room}`,
       }
     case 'declined':
       return { resolution: 'decided', author: 'user', comment: 'Declined.' }
@@ -180,14 +188,14 @@ export function fileSpawnConsentItem({ db, hub }, { userId, fromDeviceId, fromNa
 // blocked by the tracker, which is also why the row lookup sits INSIDE
 // the try: a read failing under a sweep tick is a false here, never an
 // exception ahead of the frame the caller still has to send.
-export function closeSpawnConsentItem({ db, hub }, requestId, { outcome, errorCode, roomId, answeredByDeviceId = null }) {
+export function closeSpawnConsentItem({ db, hub }, requestId, { outcome, errorCode, roomId, answeredByDeviceId = null, modelFallback = null }) {
   try {
     const row = db.prepare('SELECT * FROM agent_spawn_requests WHERE id=?').get(requestId)
     if (!row || !row.item_id) return false
     const targetName = sanitizePeerText(db.prepare('SELECT name FROM devices WHERE id=?').get(row.target_device_id)?.name, PEER_NAME_CAP)
       || `box ${row.target_device_id}`
     const decidedBy = row.answered_by === 'coordinator' ? { reason: row.answer_reason } : null
-    const c = spawnConsentClosing({ outcome, errorCode, roomId }, { targetName, link: !!row.link, decidedBy })
+    const c = spawnConsentClosing({ outcome, errorCode, roomId, modelFallback }, { targetName, link: !!row.link, decidedBy })
     // The note's device: the tapping client for a user decision, the
     // Coordinator's box for its decision, the asking box otherwise.
     const deviceId = (c.author === 'user' || c.byCoordinator) && answeredByDeviceId != null ? answeredByDeviceId : row.from_device_id

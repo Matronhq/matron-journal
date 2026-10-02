@@ -10,6 +10,7 @@
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { getCoordinatorConvoId } from './coordinator.js'
 import { isWakeableBoxName } from './wake.js'
+import { predictSpawnFallback } from './spawn-model.js'
 
 export const CONSENT_REASON_MAX = 200
 export const CONSENT_DAILY_CAP_DEFAULT = 20
@@ -81,6 +82,9 @@ export function listPendingAsks({ db, hub, waker }, userId) {
     target_device_id: r.target_device_id, target_name: name(r.target_name), target_state: deviceState({ db, hub, waker }, userId, r.target_device_id),
     workdir: r.workdir, task: r.task, topic: r.topic || '',
     ...(r.model ? { model: r.model } : {}),
+    // Predicted from the box's latest report, not the one the card saw: the
+    // meter may have filled (or reset) while the ask waited.
+    ...predictSpawnFallback(db, userId, r.target_device_id, { model: r.model || '' }),
     ...(r.link ? { link: true } : {}),
     ...(r.mission_num ? { mission_num: r.mission_num } : {}),
     ...(r.item_num != null ? { item_num: r.item_num } : {}),

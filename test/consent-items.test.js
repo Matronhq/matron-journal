@@ -28,6 +28,21 @@ test('spawnConsentItemFields: title names the box and the topic; body carries ta
   assert.deepEqual(f.links, [{ url: 'matron://consent/spawn/sp-1', title: 'Spawn request sp-1' }])
 })
 
+test('spawnConsentItemFields: a predicted Fable-limit fallback names Opus; a named model shows alone', () => {
+  const f = spawnConsentItemFields({ ...card, fallback_model: 'opus', fallback_reason: 'fable_limit' })
+  assert.ok(f.body.includes('- **Model:** `opus` — eric is at its Fable weekly limit, so a session that would start on Fable starts on Opus'))
+  const named = spawnConsentItemFields({ ...card, model: 'fable', fallback_model: 'opus', fallback_reason: 'fable_limit' })
+  assert.ok(named.body.includes('- **Model:** `fable`'))
+  assert.ok(!named.body.includes('Fable weekly limit'))
+})
+
+test('spawnConsentClosing: a started spawn on a fallback says which model and why', () => {
+  const c = spawnConsentClosing({ outcome: 'started', modelFallback: { model: 'opus', model_reason: 'fable_limit' } }, { targetName: 'eric' })
+  assert.equal(c.comment, 'Approved — the session started on eric on `opus` — Fable limit reached.')
+  const coord = spawnConsentClosing({ outcome: 'started', modelFallback: { model: 'opus', model_reason: 'fable_limit' } }, { targetName: 'eric', decidedBy: { reason: 'ok' } })
+  assert.ok(coord.comment.includes('started on eric on `opus` — Fable limit reached.'))
+})
+
 test('spawnConsentItemFields: without a topic the title falls back to the task, cut to fit', () => {
   const f = spawnConsentItemFields({ ...card, topic: '', task: 'x'.repeat(500) })
   assert.ok(f.title.startsWith('Approve spawn on eric — xxxx'))
