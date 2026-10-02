@@ -206,3 +206,47 @@ test('a consent item follows its ask, never a comment: a reply reaches the askin
   const reopened = await comment(plain.json.item.id, 'one more thing')
   assert.equal(reopened.json.item.state, 'open'); assert.equal(reopened.json.item.awaiting, 'agent')
 })
+
+test("a reply on a chat ask reaches the asker only when the room is the asker's own: an invite's reply goes to the room owner, a join's stays with the user", async (t) => {
+  const f = await fleet(t)
+  const comment = (id, body) => f.s.http(`/items/${id}/comments`, { method: 'POST', token: f.clientToken, body: { body } })
+  const chatItem = (deviceId) => f.s.db.prepare("SELECT item_id FROM convo_agents WHERE convo_id='room' AND agent_device_id=?").get(deviceId).item_id
+  // Invite: asker-box owns the room and asks to bring eric in.
+  await parkInviteAsk(f)
+  const invite = chatItem(f.targetDev.deviceId)
+  for (const w of [f.asker, f.target, f.coord]) w.frames.length = 0
+  assert.equal((await comment(invite, 'what for?')).status, 201)
+  const heard = await f.asker.waitFor((x) => isItemMarker(x) && x.payload.action === 'commented' && x.payload.item_id === invite)
+  assert.equal(heard.convo_id, 'room'); assert.equal(heard.payload.consent, undefined)
+  // Join: coord-box asks to join asker-box's room. The room's owner must not
+  // hear the ask, so the user's reply on it stays client-only.
+  f.coord.send({ op: 'agent_join', room_id: 'room', justification: 'I have the fix' })
+  await f.coord.waitFor((x) => x.kind === 'invite' && x.event === 'delivered')
+  const join = chatItem(f.coordDev.deviceId)
+  for (const w of [f.asker, f.target, f.coord, f.client]) w.frames.length = 0
+  assert.equal((await comment(join, 'which fix?')).status, 201)
+  const mine = await f.client.waitFor((x) => isItemMarker(x) && x.payload.action === 'commented' && x.payload.item_id === join)
+  assert.equal(mine.payload.consent, 'chat')
+  await settle()
+  for (const agent of [f.asker, f.target, f.coord]) assert.equal(agent.frames.some((x) => x.kind === 'journal' && (x.type === 'item' || x.payload?.fallback_for === 'item')), false)
+})
+
+test('a voice reply on a spawn consent item delivers its transcript to the asking agent: the pending marker and the follow-up both reach it', async (t) => {
+  const waiters = []
+  const transcriber = { transcribeFile: () => new Promise((resolve) => waiters.push(resolve)) }
+  const f = await fleet(t, { transcriber })
+  const spawnId = await parkSpawn(f)
+  const item = itemOf(f.s, spawnId)
+  f.s.db.prepare('INSERT INTO blobs(id,owner_user_id,content_type,size,sha256,disk_path,created_at) VALUES(?,?,?,?,?,?,?)').run('v1', f.dan.id, 'audio/mp4', 3, 'x', '/media/v1', Date.now())
+  for (const w of [f.asker, f.target, f.coord]) w.frames.length = 0
+  const r = await f.s.http(`/items/${item.id}/comments`, { method: 'POST', token: f.clientToken, body: { attachments: [{ blob_ref: 'v1', mime: 'audio/mp4', name: 'v1.m4a', size: 3 }] } })
+  assert.equal(r.status, 201)
+  const pending = await f.asker.waitFor((x) => isItemMarker(x) && x.payload.action === 'commented' && x.payload.item_id === item.id)
+  assert.equal(pending.payload.comment.attachments[0].transcript_status, 'pending')
+  for (let i = 0; i < 40 && waiters.length === 0; i += 1) await settle(25)
+  waiters.shift()('use the other repo')
+  const done = await f.asker.waitFor((x) => isItemMarker(x) && x.payload.action === 'updated' && x.payload.transcription === 'done' && x.payload.item_id === item.id)
+  assert.equal(done.payload.comment.attachments[0].transcript, 'use the other repo'); assert.equal(done.payload.consent, undefined)
+  const still = reread(f.s, item.id)
+  assert.equal(still.state, 'open'); assert.equal(still.awaiting, 'user')
+})
