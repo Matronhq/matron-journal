@@ -135,6 +135,12 @@ test('contacts: a block is silent to the blocked, and survives their removal', a
   removeContact(db, { userId: dan.id, contactId: own.id })
   assert.equal(state(db, tim.id, 'dan'), 'blocked', 'dan removing his row does not lift tim\'s block')
   assert.deepEqual(listContacts(db, dan.id), [])
+  // Removing a blocked row is not a second way to unblock: it is refused,
+  // and dan's next request still reaches nobody.
+  assert.throws(() => removeContact(db, { userId: tim.id, contactId: theirs.id }), /blocked/)
+  assert.throws(() => blockContact(db, { userId: tim.id, contactId: theirs.id }), /not_active/)
+  assert.equal(requestContact(db, { userId: dan.id, peerName: 'tim', by: 'user' }).outcome, 'silent')
+  assert.equal(state(db, tim.id, 'dan'), 'blocked')
   db.close()
 })
 
@@ -258,6 +264,12 @@ test('the grantee\'s view applies the private sieve and carries no ids', async (
   assert.equal(row.shared_via, 'grant')
   assert.equal(row.milestones, 1)
   assert.equal(row.open_items, 1)
+  // An item waiting on the OWNER is not the grantee's to answer, in the
+  // count or in the activity derived from it.
+  db.prepare("UPDATE items SET awaiting='user' WHERE id=?").run(open.id)
+  const waiting = getGrantedMission(db, tim.id, m.id)
+  assert.equal(waiting.needs_you, 0)
+  assert.notEqual(waiting.activity, 'waiting')
   assert.equal(row.last_milestone.title, 'Public step')
   assert.equal(row.status, null, 'a privately written status is withheld')
   for (const k of ['status_convo_id', 'closed_convo_id', 'project_id']) assert.equal(row[k], null, k)

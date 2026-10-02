@@ -240,7 +240,7 @@ export function answerContact(db, { userId, contactId, decision, now = Date.now(
 }
 
 // Remove, withdraw, or (with block) block. Works from any state but the
-// ones already ended. The peer's row follows — except a row in which THEY
+// ones already ended, and a blocked row (unblockContact is its only exit). The peer's row follows — except a row in which THEY
 // blocked us, which stays theirs. Every live grant between the two is
 // revoked in the same transaction.
 function end(db, { userId, contactId, to, now }) {
@@ -248,6 +248,10 @@ function end(db, { userId, contactId, to, now }) {
     const own = getContactRaw(db, userId, contactId)
     if (!own) return null
     if (own.state === to || (to === 'removed' && ['declined', 'expired'].includes(own.state))) fail('not_active')
+    // Removing a blocked row would read exactly like an unblock, and an
+    // agent may remove but never unblock. The one way out of 'blocked' is
+    // unblockContact, which only the user's own device reaches.
+    if (own.state === 'blocked') fail('blocked')
     const theirs = peerRowOf(db, own)
     setState(db, own.id, to, now, `, revoked_at=${Number(now)}`)
     // An ask their own agent parked (awaiting_user) is theirs to answer and

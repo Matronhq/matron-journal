@@ -773,6 +773,11 @@ export function listSharedMilestones(db, viewerUserId, convoId) {
 // origin_convo_id reads '' and origin_device_id 0 rather than null: the
 // apps' Mission model requires both, and a row they cannot decode is a row
 // they silently drop.
+//
+// needs_you is 0 in the query itself, not patched on afterwards: "needs
+// you" is about the viewer, a read grantee is never the one an item waits
+// on, and missionRow derives `activity` from the same number — so the
+// owner's waiting items never read as the grantee's.
 const GRANT_ITEM_SIEVE = `AND i.consent IS NULL AND NOT EXISTS (SELECT 1 FROM conversations oc JOIN devices d ON d.id = oc.agent_device_id
   WHERE oc.id = i.origin_convo_id AND d.private = 1)`
 const GRANT_MILESTONE_SIEVE = `AND NOT EXISTS (SELECT 1 FROM conversations mc JOIN devices d ON d.id = mc.agent_device_id
@@ -782,7 +787,7 @@ const GRANT_CONVO_SIEVE = `AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.id = 
 function grantedCountsSql() {
   return `
     (SELECT COUNT(*) FROM items i WHERE i.mission_id = m.id AND i.state='open' ${GRANT_ITEM_SIEVE}) AS open_items,
-    (SELECT COUNT(*) FROM items i WHERE i.mission_id = m.id AND i.state='open' AND i.awaiting='user' ${GRANT_ITEM_SIEVE}) AS needs_you,
+    0 AS needs_you,
     0 AS conversations,
     (SELECT COUNT(*) FROM milestones l WHERE l.mission_id = m.id ${GRANT_MILESTONE_SIEVE}) AS milestones,
     (SELECT json_object('num', l.num, 'title', l.title, 'kind', l.kind, 'created_at', l.created_at)
@@ -811,9 +816,6 @@ function grantedMissionRow(row) {
   mission.origin_convo_id = ''
   mission.origin_device_id = 0
   mission.status_convo_id = null
-  // The viewer's "needs you" is about the viewer; a read grantee is never
-  // the one an item waits on.
-  mission.needs_you = 0
   return mission
 }
 

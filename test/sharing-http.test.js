@@ -201,6 +201,11 @@ test('declining, withdrawing and blocking', async (t) => {
   // tim cannot ask while he blocks; only his phone unblocks.
   assert.equal((await w.timPhone('/contacts', post({ user: 'dan' }))).json.blocked_by, 'blocked')
   assert.equal((await w.timBox(`/contacts/${timSide.id}/unblock`, post({}))).status, 403)
+  // DELETE is not a way around that for an agent (or anyone).
+  const sneak = await w.timBox(`/contacts/${timSide.id}`, { method: 'DELETE' })
+  assert.equal(sneak.status, 409)
+  assert.equal(sneak.json.blocked_by, 'blocked')
+  assert.equal((await w.timPhone(`/contacts/${timSide.id}`)).json.contact.state, 'blocked')
   assert.equal((await w.timPhone(`/contacts/${timSide.id}/unblock`, post({}))).status, 200)
   // dan's request is still out: tim asking now crosses it, and both are active.
   const crossed = await w.timPhone('/contacts', post({ user: 'dan' }))

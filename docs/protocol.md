@@ -2825,7 +2825,8 @@ agent device, contacts and grants together).
 
 Removing or blocking revokes every live grant between the two, in both
 directions, in the same transaction. Unblocking makes nobody a contact
-again.
+again. `DELETE` on a blocked row is 409 `blocked`: unblock is the only way
+out of a block, and only a client device may call it.
 
 ### Grants
 
