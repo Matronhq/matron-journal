@@ -88,13 +88,10 @@ export function searchMessages(db, userId, { query, limit = 20, convoId = null, 
 //
 // A message matches when it contains EVERY typed word, as typed. Only the
 // word still being typed (the text does not end in whitespace) also matches
-// as the start of a longer word, so results don't blink out mid-word. The
-// index is `porter unicode61`, so FTS alone matches stems ("running" finds
-// "run"); each plain ASCII word must also appear literally in the body — a
-// LIKE over the rows FTS already narrowed to, instead of a tokenizer change
-// that would mean rebuilding the index. Words with anything but ASCII
-// letters and digits are left to FTS alone: LIKE folds case for ASCII only,
-// and punctuation differs between what is typed and what is stored.
+// as the start of a longer word, so results don't blink out mid-word. Both
+// halves need an unstemmed index, which is what `search_fts_plain` is
+// (db.js): on the porter mirror "run" finds "running", and a prefix
+// "runn"* finds nothing because the stored token is "run".
 export function typedQuery(raw) {
   const text = String(raw)
   const words = text.split(/\s+/).filter(Boolean)
@@ -104,8 +101,6 @@ export function typedQuery(raw) {
   const quote = (t) => `"${t.replace(/"/g, '""')}"`
   const matchParts = terms.map(quote)
   if (lastIsPrefix) matchParts[matchParts.length - 1] += '*'
-  const isPlain = (t) => /^[A-Za-z0-9]+$/.test(t)
-  const likeEscaped = (t) => t.replace(/[\\%_]/g, (c) => `\\${c}`)
   return {
     terms,
     lastIsPrefix,
@@ -114,21 +109,14 @@ export function typedQuery(raw) {
     // The exact tier can only differ from the all-terms tier for a phrase
     // or a word still being typed.
     hasDistinctExactTier: terms.length > 1 || lastIsPrefix,
-    literalPatterns: terms.filter(isPlain).map((t) => `%${likeEscaped(t)}%`),
-    exactLiteralPattern: terms.every(isPlain) ? `%${terms.map(likeEscaped).join(' ')}%` : null,
   }
 }
 
-// WHERE fragment + arguments shared by the typed modes: FTS match, the
-// literal filter, user scope, optional conversation / subagent / privacy
-// filters.
-function typedWhere({ match, patterns, userId, convoId, excludeSubagents, excludePrivateOwned }) {
-  const clauses = ['search_fts MATCH ?', 'sm.user_id = ?']
+// WHERE fragment + arguments shared by the typed modes: FTS match, user
+// scope, optional conversation / subagent / privacy filters.
+function typedWhere({ match, userId, convoId, excludeSubagents, excludePrivateOwned }) {
+  const clauses = ['search_fts_plain MATCH ?', 'sm.user_id = ?']
   const args = [match, userId]
-  for (const pattern of patterns) {
-    clauses.push("sm.body LIKE ? ESCAPE '\\'")
-    args.push(pattern)
-  }
   if (convoId != null) { clauses.push('sm.convo_id = ?'); args.push(convoId) }
   if (excludeSubagents) clauses.push('c.parent_convo_id IS NULL')
   if (excludePrivateOwned) {
@@ -144,13 +132,13 @@ function typedWhere({ match, patterns, userId, convoId, excludeSubagents, exclud
 export function searchRecent(db, userId, { query, limit = 50, convoId = null, excludeSubagents = false, excludePrivateOwned = false } = {}) {
   const typed = typedQuery(query)
   if (typed == null) return { badQuery: true }
-  const where = typedWhere({ match: typed.allTermsMatch, patterns: typed.literalPatterns, userId, convoId, excludeSubagents, excludePrivateOwned })
+  const where = typedWhere({ match: typed.allTermsMatch, userId, convoId, excludeSubagents, excludePrivateOwned })
   let rows
   try {
     rows = db.prepare(`
       SELECT sm.convo_id, sm.seq, sm.ts, sm.sender
-      FROM search_fts
-      JOIN search_messages sm ON sm.rowid = search_fts.rowid
+      FROM search_fts_plain
+      JOIN search_messages sm ON sm.rowid = search_fts_plain.rowid
       JOIN conversations c ON c.id = sm.convo_id
       WHERE ${where.sql}
       ORDER BY sm.seq DESC
@@ -176,8 +164,8 @@ export function searchRecent(db, userId, { query, limit = 50, convoId = null, ex
 export function searchChats(db, userId, { query, limit = 20, excludeSubagents = false, excludePrivateOwned = false } = {}) {
   const typed = typedQuery(query)
   if (typed == null) return { badQuery: true }
-  const groups = (match, patterns, convoIds, n) => {
-    const where = typedWhere({ match, patterns, userId, excludeSubagents, excludePrivateOwned })
+  const groups = (match, convoIds, n) => {
+    const where = typedWhere({ match, userId, excludeSubagents, excludePrivateOwned })
     let scope = ''
     if (convoIds) {
       scope = ` AND sm.convo_id IN (${convoIds.map(() => '?').join(',')})`
@@ -185,8 +173,8 @@ export function searchChats(db, userId, { query, limit = 20, excludeSubagents = 
     }
     return db.prepare(`
       SELECT sm.convo_id, COUNT(*) AS hit_count, MAX(sm.seq) AS newest_seq, sm.rowid AS newest_rowid
-      FROM search_fts
-      JOIN search_messages sm ON sm.rowid = search_fts.rowid
+      FROM search_fts_plain
+      JOIN search_messages sm ON sm.rowid = search_fts_plain.rowid
       JOIN conversations c ON c.id = sm.convo_id
       WHERE ${where.sql}${scope}
       GROUP BY sm.convo_id
@@ -196,16 +184,14 @@ export function searchChats(db, userId, { query, limit = 20, excludeSubagents = 
   let exact = []
   let all
   try {
-    if (typed.hasDistinctExactTier) {
-      exact = groups(typed.exactMatch, typed.exactLiteralPattern ? [typed.exactLiteralPattern] : [], null, limit)
-    }
-    all = groups(typed.allTermsMatch, typed.literalPatterns, null, limit)
+    if (typed.hasDistinctExactTier) exact = groups(typed.exactMatch, null, limit)
+    all = groups(typed.allTermsMatch, null, limit)
     // An exact conversation older than the newest `limit` all-terms ones
     // still needs its total: every exact match is an all-terms match, so
     // the count comes from the same query, scoped.
     const listed = new Set(all.map((g) => g.convo_id))
     const unlisted = exact.map((g) => g.convo_id).filter((id) => !listed.has(id))
-    if (unlisted.length) all = all.concat(groups(typed.allTermsMatch, typed.literalPatterns, unlisted, unlisted.length))
+    if (unlisted.length) all = all.concat(groups(typed.allTermsMatch, unlisted, unlisted.length))
   } catch (err) {
     console.error('search (chats) query failed', err)
     return { badQuery: true }
@@ -241,9 +227,10 @@ export function searchChats(db, userId, { query, limit = 20, excludeSubagents = 
 
 // Up to ~1 KB of the body around the first place the query appears (the
 // phrase if it is there, else the earliest word), so the app can cut and
-// highlight its preview without the whole message crossing the wire. A
-// message that matched through FTS alone (a word LIKE could not check)
-// may show no literal occurrence; the head of the body is sent then.
+// highlight its preview without the whole message crossing the wire. The
+// tokenizer folds diacritics and punctuation that this plain text search
+// does not, so a match may show no literal occurrence; the head of the
+// body is sent then.
 export const EXCERPT_BEFORE = 200
 export const EXCERPT_LENGTH = 1000
 export function excerpt(body, typed) {

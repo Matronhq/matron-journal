@@ -142,12 +142,13 @@ the machine-checkable version of this page.
     matches when it contains every typed word as typed; only the last
     word, when `q` does not end in whitespace, also matches as the start
     of a longer word (`"time" "cris"*`), so as-you-type results hold
-    between keystrokes and a trailing space finishes the word. Words
-    made of ASCII letters and digits must also appear literally in the
-    body (`LIKE` over the FTS-narrowed rows), which is what removes the
-    stemmer's "running" → "run"; other words (`don't`, `café`, `100%`)
-    are left to FTS alone. `typedQuery()` in `src/search.js` is the one
-    parser.
+    between keystrokes and a trailing space finishes the word. These run
+    against `search_fts_plain`, an unstemmed (`unicode61`) mirror of the
+    same content table (db.js): on the porter index a finished "run"
+    finds "running" and a prefix `runn*` finds nothing, because the
+    stored token is "run". Case and diacritics still fold. `typedQuery()`
+    in `src/search.js` is the one parser. A database from before the
+    mirror existed gets it rebuilt once at open (seconds).
   - `mode=chats` -> `{chats: [{convo_id, title, parent_convo_id,
     parent_title, count, exact, live, top: {seq, ts, sender, excerpt}}]}`:
     one row per conversation, at most `limit` (clamped to 50).

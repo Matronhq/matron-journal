@@ -14,17 +14,13 @@ test('typedQuery: words, the last one a prefix while still being typed', () => {
   assert.equal(q.lastIsPrefix, true)
   assert.equal(q.allTermsMatch, '"time" "cris"*')
   assert.equal(q.exactMatch, '"time cris"')
-  assert.deepEqual(q.literalPatterns, ['%time%', '%cris%'])
-  assert.equal(q.exactLiteralPattern, '%time cris%')
 })
 
-test('typedQuery: a trailing space finishes the last word; syntax is quoted; LIKE wildcards escaped', () => {
+test('typedQuery: a trailing space finishes the last word; syntax is quoted', () => {
   assert.equal(typedQuery('time crisis ').lastIsPrefix, false)
   assert.equal(typedQuery('time crisis ').hasDistinctExactTier, true)
   assert.equal(typedQuery('time ').hasDistinctExactTier, false)
   assert.equal(typedQuery('say "hi" NEAR x*').allTermsMatch, '"say" """hi""" "NEAR" "x*"*')
-  assert.deepEqual(typedQuery('100% don\'t café deploy').literalPatterns, ['%deploy%'])
-  assert.equal(typedQuery('100% deploy').exactLiteralPattern, null)
   assert.equal(typedQuery('++ --'), null)
   assert.equal(typedQuery('   '), null)
   assert.equal(typedQuery('deploy ++').lastIsPrefix, false, 'a dropped trailing word still finished the one before it')
@@ -95,16 +91,50 @@ test('GET /search: exclude_subagents=1 drops child conversations in every mode',
   await s.close()
 })
 
-test('GET /search mode=chats: words must appear as typed — no other forms of the word; the last word is a prefix only while being typed', async () => {
+test('GET /search mode=chats: words must appear as typed — whole words, no other forms; the last word is a prefix only while being typed', async () => {
   const { s, token } = await seeded()
   const running = await s.http('/search?q=' + encodeURIComponent('running ') + '&mode=chats', { token })
   assert.deepEqual(running.json.chats.map((c) => c.convo_id), ['run'])
   assert.equal(running.json.chats[0].count, 1, '"I run every day" is a stem match only')
+  // A finished word matches only itself: "run " does not find "Running"
+  // (CodeRabbit on PR 127).
+  const run = await s.http('/search?q=' + encodeURIComponent('run ') + '&mode=recent&convo_id=run', { token })
+  assert.equal(run.json.hits.length, 1)
+  // Every prefix of a word being typed keeps matching it, including the
+  // ones longer than the word's stem (Bugbot on PR 127).
+  for (const prefix of ['ru', 'run', 'runn', 'runni', 'runnin', 'running']) {
+    const r = await s.http(`/search?q=${prefix}&mode=recent&convo_id=run`, { token })
+    assert.ok(r.json.hits.some((h) => h.seq), `${prefix} must still match "Running late"`)
+  }
   const finished = await s.http('/search?q=' + encodeURIComponent('tim ') + '&mode=chats', { token })
   assert.equal(finished.json.chats.length, 0)
   const typing = await s.http('/search?q=tim&mode=chats', { token })
   assert.ok(typing.json.chats.length >= 3)
+  // Diacritics fold both ways; punctuation inside a word is not a barrier.
   await s.close()
+})
+
+test('GET /search typed modes: an existing database gains the unstemmed mirror with every row indexed', async () => {
+  const { openDb } = await import('../src/db.js')
+  const fs = await import('node:fs')
+  const os = await import('node:os')
+  const path = await import('node:path')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'journal-plain-'))
+  const dbPath = path.join(dir, 'j.db')
+  // A database from before the mirror existed: create it, then drop the mirror.
+  const db = openDb(dbPath)
+  db.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1, 'u', 'x', 0)").run()
+  upsertConversation(db, { id: 'c', ownerUserId: 1, title: 'T', sessionState: 'done' })
+  for (const body of ['a crisis', 'another crisis', 'no match']) {
+    append(db, { userId: 1, convoId: 'c', sender: 'agent:x', type: 'text', payload: { body } })
+  }
+  db.exec('DROP TRIGGER search_messages_ai_plain; DROP TABLE search_fts_plain')
+  db.close()
+  const reopened = openDb(dbPath)
+  const n = reopened.prepare('SELECT COUNT(*) n FROM search_fts_plain WHERE search_fts_plain MATCH ?').get('"crisis"').n
+  assert.equal(n, 2)
+  reopened.close()
+  fs.rmSync(dir, { recursive: true, force: true })
 })
 
 test('GET /search mode=chats: an exact chat beyond the newest `limit` keeps its full count', async () => {
