@@ -16,6 +16,7 @@ import { closeSpawnConsentItem } from './consent-items.js'
 import { getMission, joinMission } from './missions.js'
 import { MISSION_EVENT_TYPE, missionMarkerPayload } from './missions-marker.js'
 import { markerTitleAllowed } from './privacy.js'
+import { startReplyFallback } from './spawn-model.js'
 
 // `model` is the optional Claude model the child session should run — an
 // alias ('opus') or a full model id, defaulted to '' like topic so a caller
@@ -95,7 +96,7 @@ export function markFailed(db, id, now = Date.now()) {
 // parent hears — because this is the ONE funnel every terminal transition
 // passes through. `answeredByDeviceId` is the client that tapped, when a
 // tap is what resolved the row; it only names the closing note's device.
-export function emitSpawnOutcome(db, hub, { userId, fromDeviceId, fromConvoId, requestId, outcome, roomId, childConvoId, errorCode, answeredByDeviceId = null }) {
+export function emitSpawnOutcome(db, hub, { userId, fromDeviceId, fromConvoId, requestId, outcome, roomId, childConvoId, errorCode, answeredByDeviceId = null, modelFallback = null }) {
   // decided_by / reason (spec: 2026-09-29 coordinator consent): the parent
   // hears WHO answered its ask when it was the Coordinator, on the durable
   // event and the frame alike. Omitted for a tap or a sweep.
@@ -107,6 +108,9 @@ export function emitSpawnOutcome(db, hub, { userId, fromDeviceId, fromConvoId, r
     ...(roomId ? { room_id: roomId } : {}),
     ...(childConvoId ? { child_convo_id: childConvoId } : {}),
     ...(errorCode ? { error_code: errorCode } : {}),
+    // The target started the child on a fallback model (src/spawn-model.js
+    // startReplyFallback): {model, model_reason}, omitted otherwise.
+    ...(modelFallback ? { model: modelFallback.model, model_reason: modelFallback.model_reason } : {}),
     ...decidedBy,
   }
   try {
@@ -117,7 +121,7 @@ export function emitSpawnOutcome(db, hub, { userId, fromDeviceId, fromConvoId, r
   } catch (err) {
     console.error('emitSpawnOutcome: durable outcome append failed', err)
   }
-  closeSpawnConsentItem({ db, hub }, requestId, { outcome, errorCode, roomId, answeredByDeviceId })
+  closeSpawnConsentItem({ db, hub }, requestId, { outcome, errorCode, roomId, answeredByDeviceId, modelFallback })
   hub.sendToDevice(userId, fromDeviceId, { kind: 'spawn', event: 'outcome', request_id: requestId, outcome, ...extras })
 }
 
@@ -479,7 +483,7 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
           }
         } catch (err) { console.error('approveSpawn: room retitle / membership fan failed', err) }
       }
-      emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'started', roomId, childConvoId: r.result.convo_id, answeredByDeviceId })
+      emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'started', roomId, childConvoId: r.result.convo_id, answeredByDeviceId, modelFallback: row.model ? null : startReplyFallback(r.result) })
       return 'started'
     }
     return fail(r.ok ? 'bad_start_reply' : (r.error?.code ?? 'unknown'))
