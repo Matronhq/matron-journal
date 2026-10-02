@@ -49,6 +49,11 @@ users on one journal, and two users on different journals.
 7. **Agents talk freely, act only with their owner's OK.** In a room with
    another person's agent, anything that changes state or sends data out
    needs a consent card to the owner; the bridge enforces it.
+8. **Same-journal users accept each other explicitly.** Being on the same
+   journal does not make two people contacts; one accept card is needed,
+   the same rule as across journals.
+9. **After a hand-over the old owner keeps `read`** on the new copy, and
+   the new owner can revoke it.
 
 ## Model
 
