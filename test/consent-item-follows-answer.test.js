@@ -170,9 +170,20 @@ test('a consent item follows its ask, never a comment: a reply does not reopen a
   // Waiting: a reply is kept, the item still awaits the user.
   const waiting = await parkSpawn(f, { rid: 'q1' })
   const waitingItem = itemOf(f.s, waiting)
+  for (const w of [f.asker, f.target, f.coord, f.client]) w.frames.length = 0
   assert.equal((await comment(waitingItem.id, 'which box is this?')).status, 201)
   const still = reread(f.s, waitingItem.id)
   assert.equal(still.state, 'open'); assert.equal(still.awaiting, 'user')
+  // The comment's marker is the user's alone, like every marker of a
+  // consent item: the apps hear it, no agent does, and no fallback text
+  // carries the item's title into the conversation.
+  const heard = await f.client.waitFor((x) => isItemMarker(x) && x.payload.action === 'commented' && x.payload.item_id === waitingItem.id)
+  assert.equal(heard.payload.consent, 'spawn')
+  await settle()
+  for (const agent of [f.asker, f.target, f.coord]) {
+    assert.equal(agent.frames.some((x) => x.kind === 'journal' && (x.type === 'item' || x.payload?.fallback_for === 'item')), false)
+  }
+  assert.equal(f.s.db.prepare("SELECT COUNT(*) c FROM events WHERE convo_id='ask' AND type='text' AND payload LIKE '%fallback_for%'").get().c, 0)
   // Settled: a reply is kept, the item stays closed; Reopen is a 409.
   assert.equal((await tap(f, waiting, 'deny')).status, 200)
   assert.equal(reread(f.s, waitingItem.id).state, 'closed')
