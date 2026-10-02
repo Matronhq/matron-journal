@@ -375,6 +375,34 @@ test('either side revokes, and the mission is gone at once', async (t) => {
   assert.ok(trail.includes('contact.removed'))
 })
 
+test('a failure to reach the other person never fails the request that made the contact or share', async (t) => {
+  const w = await world(t)
+  // tim's People conversation cannot be created: the card, its mirror and
+  // the audit line are all lost, and each is logged instead of thrown.
+  w.s.db.exec(`CREATE TRIGGER no_people BEFORE INSERT ON conversations WHEN NEW.system IS NOT NULL AND NEW.owner_user_id = ${Number(w.tim.id)}
+    BEGIN SELECT RAISE(ABORT, 'no people conversation today'); END`)
+  const quiet = t.mock.method(console, 'error', () => {})
+  const r = await w.danPhone('/contacts', post({ user: 'tim' }))
+  assert.equal(r.status, 201)
+  assert.equal(r.json.contact.state, 'pending_out')
+  assert.ok(quiet.mock.callCount() > 0, 'the failure is logged')
+  assert.equal(peopleConvoId(w.s.db, w.tim.id), null)
+  // The request stands and tim can still answer it from his list.
+  const timSide = (await w.timPhone('/contacts')).json.contacts[0]
+  assert.equal(timSide.state, 'pending_in')
+  assert.equal((await w.timPhone(`/contacts/${timSide.id}/answer`, post({ decision: 'approve' }))).status, 200)
+  const m = await makeMission(w)
+  const share = await w.danPhone(`/missions/${m.id}/shares`, post({ contact: 'tim', level: 'read' }))
+  assert.equal(share.status, 201)
+  assert.equal(share.json.grant.state, 'pending')
+  assert.equal(share.json.grant.contact_id, r.json.contact.id)
+  const offered = (await w.timPhone('/grants?direction=in')).json.grants[0]
+  assert.equal(offered.id, share.json.grant.id)
+  assert.equal('contact_id' in offered, false)
+  assert.equal((await w.timPhone(`/grants/${offered.id}/answer`, post({ decision: 'approve' }))).status, 200)
+  assert.equal((await w.timPhone(`/missions/${m.id}`)).status, 200)
+})
+
 test('the People conversation belongs to no agent', async (t) => {
   const w = await world(t)
   await w.danPhone('/contacts', post({ user: 'tim' }))

@@ -2842,8 +2842,10 @@ DELETE /grants/:id                                        the owner revokes, the
 ```
 
 `grant`: `{id, direction:'out'|'in', subject_kind, subject_id, level, state,
-owner:{user_id,name}, grantee:{name,address}, mission?:{id,num,title},
+owner:{user_id,name}, grantee:{name,address}, contact_id?, mission?:{id,num,title},
 requested_by, revoked_by, created_at, updated_at, answered_at, revoked_at}`.
+`contact_id` is the owner's contact row and is present only on the owner's
+side (`direction: 'out'`).
 States: `awaiting_owner` (the owner's agent asked, 24 h) → `pending` (the
 grantee's accept card is open) → `active`; `declined`, `revoked`
 (`revoked_by`: `owner` | `grantee` | `contact_removed`), `expired`.

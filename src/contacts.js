@@ -59,12 +59,13 @@ export function listJournalUsers(db, userId) {
 }
 
 // By id (ct_…) or, for a same-journal peer, by name. Always the caller's
-// own row.
+// own row. A username may itself start with ct_, so a ct_ reference that is
+// not one of the caller's row ids is still tried as a name.
 export function getContactRaw(db, userId, idOrName) {
   if (typeof idOrName !== 'string' || !idOrName) return null
   if (idOrName.startsWith('ct_')) {
     const row = rawById(db, idOrName)
-    return row && row.user_id === userId ? row : null
+    if (row && row.user_id === userId) return row
   }
   return db.prepare('SELECT * FROM contacts WHERE user_id=? AND peer_user=? AND peer_journal IS NULL').get(userId, idOrName) ?? null
 }

@@ -111,8 +111,9 @@ export function canReadBlob(db, viewerUserId, blobId) {
         AND ${sharedConvoSql('c')})
     OR EXISTS (
       -- A grantee: an attachment on an item of a granted mission, under the
-      -- same sieve as getGrantedItem (never a consent mirror, never an item
-      -- filed from a private box).
+      -- same sieve as GRANTED_ITEM in items.js (never a consent mirror,
+      -- never an item filed from a private box, never a mission whose origin
+      -- box is private).
       SELECT 1 FROM item_comments ic
       JOIN items i ON i.id = ic.item_id
       JOIN missions m ON m.id = i.mission_id
@@ -121,6 +122,8 @@ export function canReadBlob(db, viewerUserId, blobId) {
         AND m.user_id = i.user_id
         AND NOT EXISTS (SELECT 1 FROM conversations pc JOIN devices pd ON pd.id = pc.agent_device_id
                         WHERE pc.id = i.origin_convo_id AND pd.private = 1)
+        AND NOT EXISTS (SELECT 1 FROM conversations mo JOIN devices md ON md.id = mo.agent_device_id
+                        WHERE mo.id = m.origin_convo_id AND md.private = 1)
         AND ${grantedMissionSql('m')})`).get({ viewer: viewerUserId, id: blobId })
   return !!row
 }

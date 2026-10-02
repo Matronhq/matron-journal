@@ -34,6 +34,11 @@ const MISSION_TITLE_CAP = 120
 
 const cut = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
 const safely = (what, fn) => { try { return fn() } catch (err) { console.error(`sharing: ${what} failed (the contact or grant stands)`, err); return null } }
+// The four asks below run after the contact or grant has committed. Reaching
+// the user (the People conversation, the preview, the card, its mirror) must
+// never fail the request that made the row: a failure is logged and the row
+// stands, still listed by GET /contacts and GET /grants.
+const asking = (what, fn) => (...args) => { safely(what, () => fn(...args)) }
 const userName = (db, id) => db.prepare('SELECT name FROM users WHERE id=?').get(id)?.name ?? `user ${id}`
 const deviceName = (db, id) => db.prepare('SELECT name FROM devices WHERE id=?').get(id)?.name ?? null
 const addressOf = (row) => (row.peer_journal ? `${row.peer_user}@${row.peer_journal}` : row.peer_user)
@@ -131,7 +136,7 @@ function closeMirror({ db, hub }, { userId, itemId, consent, resolution, author,
 
 const contactLink = (id) => ({ url: consentLink('contact', id), title: 'Contact request' })
 
-function contactOwnerAsk(ctx, who, own) {
+const contactOwnerAsk = asking('contact approval card', (ctx, who, own) => {
   const peer = plain(own.peer_user)
   const box = plain(sanitizePeerText(who.name, 80))
   const payload = {
@@ -153,9 +158,9 @@ function contactOwnerAsk(ctx, who, own) {
     link: contactLink(own.id), actions: OWNER_ACTIONS, idemKey: `consent:contact:${own.id}:${own.updated_at}`,
   })
   if (item) setContactItem(ctx.db, own.id, item.id)
-}
+})
 
-function contactPeerAsk(ctx, peerRow) {
+const contactPeerAsk = asking('contact request card', (ctx, peerRow) => {
   const from = plain(peerRow.peer_user)
   const convoId = peopleConvo(ctx, peerRow.user_id)
   card(ctx, {
@@ -175,7 +180,7 @@ function contactPeerAsk(ctx, peerRow) {
     link: contactLink(peerRow.id), actions: PEER_ACTIONS, idemKey: `consent:contact:${peerRow.id}:${peerRow.updated_at}`,
   })
   if (item) setContactItem(ctx.db, peerRow.id, item.id)
-}
+})
 
 // After requestContact or answerContact. `who` is the caller (the asking
 // agent, or the client that tapped); `out` is what the pure layer returned.
@@ -299,7 +304,7 @@ function shareCardPayload(db, g, direction) {
   }
 }
 
-function shareOwnerAsk(ctx, who, g) {
+const shareOwnerAsk = asking('share approval card', (ctx, who, g) => {
   const { db } = ctx
   const to = plain(g.grantee_name)
   const p = sharePreview(db, g.subject_id)
@@ -325,9 +330,9 @@ function shareOwnerAsk(ctx, who, g) {
     link: shareLink(g.id), actions: OWNER_ACTIONS, idemKey: `consent:share:${g.id}:owner:${g.updated_at}`,
   })
   if (item) setGrantItem(db, g.id, 'owner', item.id)
-}
+})
 
-function shareGranteeAsk(ctx, g) {
+const shareGranteeAsk = asking('share offer card', (ctx, g) => {
   const { db } = ctx
   const from = plain(g.owner_name)
   const convoId = peopleConvo(ctx, g.grantee_user_id)
@@ -347,7 +352,7 @@ function shareGranteeAsk(ctx, g) {
     link: shareLink(g.id), actions: PEER_ACTIONS, idemKey: `consent:share:${g.id}:grantee:${g.updated_at}`,
   })
   if (item) setGrantItem(db, g.id, 'grantee', item.id)
-}
+})
 
 const missionWords = (g) => `mission #${g.mission_num} ${titleOf(g.mission_title)}`
 // The grantee never uses the owner's number as if it were their own: the

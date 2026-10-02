@@ -27,9 +27,10 @@ const RAW = `SELECT g.*, oc.user_id AS oc_user_id, oc.peer_user_id AS grantee_us
 export const getGrantRaw = (db, id) => (typeof id === 'string' && id.startsWith('gr_') ? db.prepare(`${RAW} WHERE g.id=?`).get(id) ?? null : null)
 
 // The wire shape, from one party's side. `direction` is 'out' for the
-// owner, 'in' for the grantee. The grantee's own contact row id is looked
-// up by the caller when it needs one; nothing here names a conversation
-// or a device.
+// owner, 'in' for the grantee. `contact_id` is the OWNER's contact row, so
+// only the owner's side carries it (it is how "unshare with ct_…" finds the
+// grant); the grantee's own contact row id is looked up by the caller when
+// it needs one. Nothing here names a conversation or a device.
 export function grantRow(row, viewerUserId) {
   if (!row) return null
   const out = row.owner_user_id === viewerUserId
@@ -42,6 +43,7 @@ export function grantRow(row, viewerUserId) {
     state: row.state,
     owner: { user_id: row.owner_user_id, name: row.owner_name },
     grantee: { name: row.grantee_name, address: row.grantee_journal ? `${row.grantee_name}@${row.grantee_journal}` : row.grantee_name },
+    ...(out ? { contact_id: row.contact_id } : {}),
     ...(row.subject_kind === 'mission' && row.mission_num != null
       ? { mission: { id: row.subject_id, num: row.mission_num, title: row.mission_title } } : {}),
     requested_by: row.requested_by ?? null,

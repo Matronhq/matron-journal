@@ -291,5 +291,30 @@ test('the grantee\'s view applies the private sieve and carries no ids', async (
   assert.equal(canReadBlob(db, tim.id, 'blob1'), true)
   assert.equal(canReadBlob(db, tim.id, 'blob2'), false, 'an attachment on a private-box item stays home')
   assert.equal(canReadBlob(db, w.sam.id, 'blob1'), false)
+  // The mission's origin box turning private later hides the mission, its
+  // items and their attachments together: a kept URL opens nothing.
+  pinDevicePrivate(db, box.deviceId, true)
+  assert.equal(getGrantedMission(db, tim.id, m.id), null)
+  assert.equal(getSharedItem(db, tim.id, open.id), null)
+  assert.equal(canReadBlob(db, tim.id, 'blob1'), false)
+  db.close()
+})
+
+test('contacts: a user whose name starts with ct_ is found by name; a grant names its contact to the owner only', async () => {
+  const w = await world()
+  const { db, dan, tim } = w
+  const odd = await createUser(db, 'ct_bob', 'pw')
+  assert.equal(requestContact(db, { userId: dan.id, peerName: 'ct_bob', by: 'user' }).outcome, 'sent')
+  const theirs = getContactRaw(db, odd.id, 'dan')
+  answerContact(db, { userId: odd.id, contactId: theirs.id, decision: 'approve' })
+  const own = getContactRaw(db, dan.id, 'ct_bob')
+  assert.equal(own.state, 'active')
+  assert.equal(getContactRaw(db, dan.id, own.id).id, own.id, 'and still by id')
+  assert.equal(getContactRaw(db, tim.id, own.id), null, 'never another user\'s row')
+  const m = mission(db, w)
+  const { grant } = shareMission(db, { ownerUserId: dan.id, missionId: m.id, contact: 'ct_bob', level: 'read', by: 'user' })
+  assert.equal(grant.contact_id, own.id)
+  assert.equal(listGrants(db, dan.id, { direction: 'out' })[0].contact_id, own.id)
+  assert.equal('contact_id' in listGrants(db, odd.id, { direction: 'in' })[0], false, 'the owner\'s row id is not the grantee\'s business')
   db.close()
 })
