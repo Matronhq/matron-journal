@@ -153,10 +153,11 @@ export function runExpireLogs(db, { hours = 24, mediaDir }) {
 
 // Quota-pressure attachment reaper (third retention pass). Does nothing until
 // a user's total blob footprint reaches highPct% of the per-user quota, then
-// deletes their oldest attachment blobs (file/image events only) until the
-// footprint is back under lowPct%. Age-based reaping was rejected on purpose:
-// the per-chat media browser exists to surface old attachments, so media
-// lives forever unless the disk ceiling is actually threatened.
+// deletes, oldest first, (1) their orphan uploads older than the grace
+// period and then (2) their attachment blobs (file/image events only) until
+// the footprint is back under lowPct%. Age-based reaping was rejected on
+// purpose: the per-chat media browser exists to surface old attachments, so
+// media lives forever unless the disk ceiling is actually threatened.
 //
 // What is never a candidate:
 //   - tool_output blobs (offload/live-log lifecycles own those, above) —
@@ -164,18 +165,31 @@ export function runExpireLogs(db, { hours = 24, mediaDir }) {
 //     reference": ws.js passes msg.blob_ref through unvalidated on text
 //     sends and agent publishes, so a broader exemption would let one stray
 //     blob_ref on a text event pin a blob out of the reaper forever;
-//   - orphan blobs with no referencing event — an upload sits orphaned
-//     between POST /media and the ws send that attaches it, so reaping
-//     orphans would corrupt an in-flight attachment (structurally excluded
-//     by the events-join);
-//   - anything, when the un-reapable floor (tool_output blobs + orphans,
-//     which nothing ever deletes) alone keeps the user at or above the
-//     low-water target: reaping can then never reach the target, so the
-//     pass must refuse and warn rather than grind through every attachment
-//     the user owns — including brand-new ones — tick after tick.
+//   - item-thread attachments (item_comments.attachments names the blob, no
+//     event does) — not until Dan decides they may be pruned (tracker
+//     question of 2026-10-02); they ARE counted in the floor below and
+//     named in the warning, because on that date 803 MB of them were being
+//     reported as "tool logs / in-flight uploads";
+//   - FRESH orphan blobs — an upload sits orphaned between POST /media and
+//     the ws send or item comment that attaches it, so reaping it would
+//     corrupt an in-flight attachment. Orphans older than orphanGraceMs (a
+//     send that failed after its upload, a retried upload) are garbage no
+//     client can reach and go first, with no tombstone to write;
+//   - anything, when the un-reapable floor (tool_output blobs + item
+//     attachments + fresh orphans + blobs only non-attachment events name)
+//     alone keeps the user at or above the low-water target: reaping can
+//     then never reach the target, so the pass must refuse and warn — with
+//     the floor broken down so the operator knows what to raise or shorten —
+//     rather than grind through every attachment the user owns, including
+//     brand-new ones, tick after tick.
 //
-// Each reaped blob's referencing events are rewritten to a tombstone — the
-// original payload with blob_ref nulled and expired:true, so name/size/
+// Candidates are found through the events.blob_ref COLUMN (idx_events_blob_ref).
+// ws.js publishBlobRef sets it for agent attachment publishes and db.js
+// openDb backfilled the rows from before it did; without both, every
+// agent-posted picture was invisible here and swelled the floor instead.
+//
+// Each reaped attachment's referencing events are rewritten to a tombstone —
+// the original payload with blob_ref nulled and expired:true, so name/size/
 // caption survive and clients can render "Expired" instead of a dead
 // download. Same per-row transaction + unlink-after-commit stance as
 // runExpireLogs (ENOENT is the expected steady state on a re-run after a
@@ -185,8 +199,12 @@ export function runExpireLogs(db, { hours = 24, mediaDir }) {
 // client learns a blob is gone from the 404 on GET /media, not from the
 // tombstone — the tombstone serves fresh syncs and new devices.
 const ATTACHMENT_TYPES = "('image','file')"
+export const ORPHAN_GRACE_MS = 24 * 3600000
+// Blob ids an item comment's attachments array names (items.js
+// validateAttachments guarantees blob_ref is a non-empty string there).
+const ITEM_REFS_CTE = "item_refs AS (SELECT DISTINCT json_extract(j.value, '$.blob_ref') AS blob_ref FROM item_comments ic, json_each(ic.attachments) j)"
 
-export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70 }) {
+export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphanGraceMs = ORPHAN_GRACE_MS, now = Date.now() }) {
   // This pass deletes user data; a nonsense quota must disable it loudly,
   // never run it. (quotaBytes=0 would make high=target=0: every user with
   // any blob selected, and `used <= target` unreachable.)
@@ -214,6 +232,31 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70 }) {
      GROUP BY b.id
      ORDER BY oldestTs ASC`
   )
+  // Orphans past the grace period: no event names the blob in its column
+  // and no item comment names it in its attachments. The events probe is
+  // the partial idx_events_blob_ref; the item probe materialises the CTE
+  // once per over-quota user (item_comments is small: ~10k rows, ms).
+  const orphans = db.prepare(
+    `WITH ${ITEM_REFS_CTE}
+     SELECT b.id AS blobRef, b.size AS size
+     FROM blobs b
+     WHERE b.owner_user_id = ? AND b.created_at < ?
+       AND NOT EXISTS (SELECT 1 FROM events e WHERE e.blob_ref = b.id)
+       AND NOT EXISTS (SELECT 1 FROM item_refs r WHERE r.blob_ref = b.id)
+     ORDER BY b.created_at ASC`
+  )
+  // Floor breakdown for the refusal warning only (two index probes per blob
+  // the user owns; never on the hot path).
+  const floorParts = db.prepare(
+    `WITH ${ITEM_REFS_CTE}
+     SELECT
+       COALESCE(SUM(CASE WHEN EXISTS (SELECT 1 FROM events e WHERE e.blob_ref = b.id AND e.type = 'tool_output') THEN b.size END), 0) AS toolBytes,
+       COALESCE(SUM(CASE WHEN NOT EXISTS (SELECT 1 FROM events e WHERE e.blob_ref = b.id)
+                          AND EXISTS (SELECT 1 FROM item_refs r WHERE r.blob_ref = b.id) THEN b.size END), 0) AS itemBytes,
+       COALESCE(SUM(CASE WHEN b.created_at >= ? AND NOT EXISTS (SELECT 1 FROM events e WHERE e.blob_ref = b.id)
+                          AND NOT EXISTS (SELECT 1 FROM item_refs r WHERE r.blob_ref = b.id) THEN b.size END), 0) AS freshBytes
+     FROM blobs b WHERE b.owner_user_id = ?`
+  )
   const refs = db.prepare(
     `SELECT user_id, seq, payload FROM events WHERE blob_ref = ? AND user_id = ? AND type IN ${ATTACHMENT_TYPES}`
   )
@@ -222,17 +265,44 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70 }) {
 
   let reaped = 0
   let bytesFreed = 0
+  const graceCutoff = now - orphanGraceMs
   for (const user of users) {
+    const garbage = orphans.all(user.userId, graceCutoff)
     const cands = candidates.all(user.userId)
-    const reapable = cands.reduce((n, c) => n + c.size, 0)
+    const reapable = garbage.reduce((n, c) => n + c.size, 0) + cands.reduce((n, c) => n + c.size, 0)
     if (user.bytes - reapable >= target) {
+      const floor = user.bytes - reapable
+      const parts = floorParts.get(graceCutoff, user.userId)
+      const other = floor - parts.toolBytes - parts.itemBytes - parts.freshBytes
       console.warn(
-        `retention: user ${user.userId} holds ${user.bytes} blob bytes but ${user.bytes - reapable} are un-reapable ` +
-        '(tool logs / in-flight uploads) — media reap skipped; raise the quota or shorten tool-log retention'
+        `retention: user ${user.userId} holds ${user.bytes} blob bytes but ${floor} are un-reapable ` +
+        `(${parts.toolBytes} in tool logs, ${parts.itemBytes} in item-thread attachments, ` +
+        `${parts.freshBytes} in uploads under ${Math.round(orphanGraceMs / 3600000)}h old, ${other} named only by non-attachment events) ` +
+        '— media reap skipped; raise the quota or shorten tool-log retention'
       )
       continue
     }
     let used = user.bytes
+    for (const orphan of garbage) {
+      if (used <= target) break
+      const blob = getBlob(db, orphan.blobRef)
+      if (!blob) { used -= orphan.size; continue }
+      // Re-check under the row delete: an orphan may have been attached
+      // between the candidate query and now (the grace period makes this a
+      // late attach of a day-old upload, not the normal in-flight window —
+      // still, never delete a blob a row now names).
+      const attached = db.prepare('SELECT 1 FROM events WHERE blob_ref = ? LIMIT 1').get(blob.id)
+      if (attached) continue
+      deleteBlobRow.run(blob.id)
+      try {
+        fs.unlinkSync(blob.disk_path)
+      } catch (err) {
+        if (err.code !== 'ENOENT') console.error(`retention: failed to unlink orphan blob ${blob.id} at ${blob.disk_path}`, err)
+      }
+      used -= orphan.size
+      bytesFreed += orphan.size
+      reaped += 1
+    }
     for (const cand of cands) {
       if (used <= target) break
       const blob = getBlob(db, cand.blobRef)

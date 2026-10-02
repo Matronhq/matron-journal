@@ -34,6 +34,24 @@ const CLIENT_SEND_TYPES = new Set(['text', 'file', 'image'])
 // convo_meta via convo_upsert's title-change detection) — none of the three
 // may be forged through a bare publish. Unknown/future types arrive via a
 // server upgrade to this whitelist, never through a bare agent frame.
+// Attachment rows must name their blob in the indexed events.blob_ref COLUMN,
+// not only inside the payload: the quota-pressure reaper (retention.js
+// runReapMedia) joins on the column. Client `send` validates a top-level
+// blob_ref (see the media-send check below); agent publishes — the bridge's
+// send_attachment — only ever carried it inside the payload, so every
+// agent-posted picture was invisible to the reaper and counted towards the
+// "un-reapable" floor that made it refuse to run (2026-10-02: 882 MB of
+// Dan's 2 GiB quota). A top-level blob_ref still wins; only image/file rows
+// fall back to the payload, so a text event that mentions a blob never
+// acquires a column ref (non-attachment refs are left out of reaping on
+// purpose). db.js openDb repairs the rows written before this fallback.
+const COLUMN_BLOB_REF_TYPES = new Set(['image', 'file'])
+function publishBlobRef(type, msg) {
+  if (msg.blob_ref != null) return msg.blob_ref
+  const inPayload = msg.payload?.blob_ref
+  return COLUMN_BLOB_REF_TYPES.has(type) && typeof inPayload === 'string' && inPayload ? inPayload : null
+}
+
 const AGENT_PUBLISH_TYPES = new Set([
   'text', 'prompt', 'prompt_reply', 'tool_output', 'diff',
   'permission_request', 'file', 'image', 'edit', 'summary',
@@ -1779,7 +1797,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `agent:${conn.name}`, type: msg.type, payload: msg.payload,
-          blobRef: msg.blob_ref ?? null,
+          blobRef: publishBlobRef(msg.type, msg),
           idemKey: msg.idem_key ? `agent:${conn.deviceId}:${msg.idem_key}` : null,
         })
         // After the append (which authorized the write): a message into a
@@ -1967,7 +1985,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `agent:${conn.name}`, type, payload: msg.payload,
-          blobRef: msg.blob_ref ?? null,
+          blobRef: publishBlobRef(type, msg),
           idemKey: `agent:${conn.deviceId}:fin:${msg.message_ref}`,
         })
         // Normal end-of-stream for a live tool-output overlay: the durable

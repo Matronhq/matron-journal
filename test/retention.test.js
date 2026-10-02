@@ -649,6 +649,65 @@ test('runReapMedia skips orphan blobs (uploaded but not yet attached to an event
   assert.equal(getBlob(db, file.blob.id), undefined)
 })
 
+// Orphans split by age. A FRESH orphan is an upload between POST /media and
+// the send/comment that attaches it — never touched. An orphan older than the
+// grace period is garbage nobody can reach (no event, no item comment names
+// it: a send that failed after the upload, a retried upload) — reaped FIRST,
+// before any attachment the user can still see, with no tombstone to write.
+test('runReapMedia reaps an orphan upload older than the grace period before any visible attachment', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  // Attachment 500 (10 days) + aged orphan 600 (2 days): used 1100 >= 900
+  // high water; dropping the orphan alone reaches 500 <= 700 target, so the
+  // attachment — older than the orphan — must survive.
+  const file = seedAttachment(db, mediaDir, { userId: dan.id, bytes: 500, daysAgo: 10 })
+  const orphan = seedBlob(db, mediaDir, { userId: dan.id, bytes: 600, contentType: 'image/png', fill: 4 })
+  db.prepare('UPDATE blobs SET created_at=? WHERE id=?').run(Date.now() - 2 * 86400000, orphan.id)
+
+  const r = runReapMedia(db, { quotaBytes: 1000 })
+  assert.deepEqual(r, { reaped: 1, bytesFreed: 600 })
+  assert.equal(getBlob(db, orphan.id), undefined, 'aged orphan must be reaped')
+  assert.equal(fs.existsSync(orphan.diskPath), false, 'aged orphan file must be unlinked')
+  assert.ok(getBlob(db, file.blob.id), 'a visible attachment must outlive garbage')
+  assert.equal(JSON.parse(db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(dan.id, file.seq).payload).expired, undefined)
+})
+
+test('runReapMedia keeps a fresh orphan and an item-thread attachment whatever its age, and names them when they block the pass', async (t) => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  upsertConversation(db, { id: 'c1', ownerUserId: dan.id, title: 'T' })
+  // Item-thread attachment 800 (100 days old, referenced only by an item
+  // comment) + fresh orphan 50 + chat attachment 300 (5 days): used 1150 >=
+  // 900, but the un-reapable floor (850) is above the 700 target. Item
+  // attachments are not candidates until Dan decides they may be (tracker
+  // question of 2026-10-02), so the pass must refuse, delete nothing, and
+  // say in the warning WHAT the floor is made of — the old line blamed
+  // "tool logs / in-flight uploads" for 1.6 GB that was neither.
+  const itemBlob = seedBlob(db, mediaDir, { userId: dan.id, bytes: 800, contentType: 'image/png', fill: 5 })
+  db.prepare('UPDATE blobs SET created_at=? WHERE id=?').run(Date.now() - 100 * 86400000, itemBlob.id)
+  const it = createItem(db, { userId: dan.id, kind: 'task', title: 'T', originConvoId: 'c1', originDeviceId: 1, createdBy: 'agent' }).item
+  addComment(db, { userId: dan.id, itemId: it.id, author: 'user', deviceId: 1, body: '', attachments: [{ blob_ref: itemBlob.id, mime: 'image/png', name: 'p.png', size: 800 }] })
+  const fresh = seedBlob(db, mediaDir, { userId: dan.id, bytes: 50, contentType: 'image/png', fill: 6 })
+  const file = seedAttachment(db, mediaDir, { userId: dan.id, bytes: 300, daysAgo: 5 })
+
+  const warns = []
+  const mute = t.mock.method(console, 'warn', (...a) => { warns.push(a.join(' ')) })
+  t.after(() => mute.mock.restore())
+  const r = runReapMedia(db, { quotaBytes: 1000 })
+  assert.deepEqual(r, { reaped: 0, bytesFreed: 0 })
+  for (const kept of [itemBlob, fresh]) {
+    assert.ok(getBlob(db, kept.id), 'item attachment and fresh orphan must both survive')
+    assert.ok(fs.existsSync(kept.diskPath))
+  }
+  assert.ok(getBlob(db, file.blob.id), 'no attachment may be sacrificed to an unreachable target')
+  const warn = warns.find((w) => w.includes('un-reapable'))
+  assert.ok(warn, 'skip must be loud')
+  assert.match(warn, /850 are un-reapable/)
+  assert.match(warn, /800 in item-thread attachments/)
+  assert.match(warn, /50 in uploads under 24h old/)
+  assert.match(warn, /0 in tool logs/)
+})
+
 test('runReapMedia tombstones every event referencing a shared blob, deleting the blob once', async () => {
   const { db, dan } = await setup()
   const mediaDir = tmpMediaDir()

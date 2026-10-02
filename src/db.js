@@ -645,6 +645,17 @@ export function openDb(path) {
   // each is a full events scan, synchronous, inside the listen callback.
   // Partial: most events carry no blob_ref.
   db.exec('CREATE INDEX IF NOT EXISTS idx_events_blob_ref ON events(blob_ref) WHERE blob_ref IS NOT NULL')
+  // One-off repair, idempotent and cheap (idx_events_media narrows the scan
+  // to attachment rows; 1,255 rows in ~5 ms on the 1.4M-event production
+  // db): image/file events whose blob is named only inside the payload.
+  // Agent publishes set no top-level blob_ref until ws.js publishBlobRef
+  // learned to fall back to payload.blob_ref (2026-10-02), so the reaper —
+  // which joins on this column — could not see any agent-posted attachment.
+  // Tombstones (blob_ref: null) and non-string refs are left alone, as are
+  // all other event types (a text row naming a blob is not an attachment).
+  db.exec(`UPDATE events SET blob_ref = json_extract(payload, '$.blob_ref')
+    WHERE type IN ('image', 'file') AND blob_ref IS NULL AND json_valid(payload)
+      AND json_type(payload, '$.blob_ref') = 'text'`)
   // SQLite cannot ALTER a CHECK constraint, so convo_agents needs a rebuild to
   // add consent states (awaiting_user, denied) and new columns (topic, delivered_at).
   // delivered_at = created_at is correct for pre-consent flow (rows were delivered
