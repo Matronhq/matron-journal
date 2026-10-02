@@ -8,7 +8,7 @@
 // conversation so the apps can show "approved by the Coordinator".
 // Returns {status, body} for the route to send.
 import { answerParkedInvite, getParticipant } from './participants.js'
-import { closeChatConsentItem } from './consent-items.js'
+import { closeChatConsentItem, closeSpawnConsentItem } from './consent-items.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
 import { wakeIfOffline } from './wake.js'
@@ -97,6 +97,13 @@ export function answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, sp
   // already won — 409, and nothing expensive has started (spec failure
   // table: two approve taps spawn once).
   if (!claimApprove(db, requestId, Date.now(), stamp(decidedBy))) return { status: 409, body: { error: 'conflict' } }
+  // The ask stopped waiting at the claim, so its tracker item closes now —
+  // not at the outcome, which can be minutes away when the target box has
+  // to be woken first. Left open, the item sits in the user's Decisions
+  // list offering an Approve that can only answer 409. The outcome adds how
+  // the start went (closeSpawnConsentItem). Best-effort, like every mirror
+  // write.
+  closeSpawnConsentItem({ db, hub }, requestId, { outcome: 'approved', answeredByDeviceId })
   recordAndAnnounce({ db, hub }, { userId, kind: 'spawn', askId: requestId, decision, decidedBy, convoId: row.from_convo_id, payload: { request_id: requestId } })
   // Everything after the claim is expensive and externally visible; it runs
   // off the request cycle — the caller needs its 200 now, the outcome

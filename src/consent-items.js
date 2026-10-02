@@ -3,15 +3,23 @@
 // card lives in one conversation's timeline and is easy to lose; the
 // Decisions list is where the user looks for things needing an answer. So
 // every parked spawn ask also files a `question` item on the parent
-// conversation, and the spawn's terminal outcome closes it — the item is
-// a MIRROR of the spawn row, never a second source of truth: answering
-// still happens on the card (POST /agent-spawn/answer), and the row's
-// state machine decides what the item says.
+// conversation, and the ANSWER closes it — the item is a MIRROR of the
+// spawn row, never a second source of truth: answering still happens on
+// the card (POST /agent-spawn/answer), and the row's state machine decides
+// what the item says.
+//
+// The one invariant: a consent item is open exactly while its ask is
+// 'awaiting_user'. An approved spawn leaves that state at the answer, long
+// before its outcome (the target box may be woken first, minutes), so the
+// approval itself closes the item and the outcome only adds a note. An item
+// left open on an ask that is not waiting is offered to the user as a
+// decision that can only fail with 409; reconcileConsentItems is the sweep
+// that closes any such item, however it came about.
 //
 // The pure half (fields, closing text) comes first; the two side-effecting
 // halves (file, close) follow and are best-effort by contract: the
 // consent flow must never fail because the tracker did.
-import { createItem, closeItem, TITLE_MAX } from './items.js'
+import { createItem, closeItem, addComment, TITLE_MAX } from './items.js'
 import { emitMarker } from './items-http.js'
 import { sanitizePeerText, PEER_NAME_CAP, plainText as plain } from './peer-text.js'
 
@@ -92,6 +100,14 @@ export function spawnConsentItemFields(card) {
 // Coordinator, not a tap, answered: the note says so, in the Coordinator's
 // words, and is attributed to an agent (the Coordinator's device) rather
 // than the user — the whole point of the audit line.
+//
+// 'approved' is not an outcome but the answer itself: the row has been
+// claimed and the start is under way. It closes the item at once (the ask
+// no longer waits on anyone); the outcome that follows is appended by
+// spawnConsentFollowUp. 'started' and 'failed' still carry the whole story
+// for an item the approval did not close (a row approved by a build that
+// predates this, or an approval note that failed to write).
+const STARTING = (targetName) => `Starting the session on ${targetName}; a box that is asleep is woken first, which can take a few minutes.`
 export function spawnConsentClosing({ outcome, errorCode, roomId, modelFallback = null }, { targetName, link = false, decidedBy = null }) {
   const room = link && roomId ? ' A chat room between the two sessions was opened.' : ''
   // The bridge's start reply named a fallback model (src/spawn-model.js).
@@ -99,6 +115,7 @@ export function spawnConsentClosing({ outcome, errorCode, roomId, modelFallback 
   if (decidedBy) {
     const why = ` — ${decidedBy.reason || 'no reason given'}`
     switch (outcome) {
+      case 'approved': return { resolution: 'decided', author: 'agent', byCoordinator: true, comment: `Approved by the Coordinator${why}. ${STARTING(targetName)}` }
       case 'started': return { resolution: 'decided', author: 'agent', byCoordinator: true, comment: `Approved by the Coordinator${why}. The session started on ${targetName}${onModel}.${room}` }
       case 'declined': return { resolution: 'decided', author: 'agent', byCoordinator: true, comment: `Declined by the Coordinator${why}.` }
       case 'failed': return { resolution: 'cancelled', author: 'agent', byCoordinator: true, comment: `Approved by the Coordinator${why}, but the session could not be started (${errorCode || 'unknown'}).` }
@@ -106,6 +123,8 @@ export function spawnConsentClosing({ outcome, errorCode, roomId, modelFallback 
     }
   }
   switch (outcome) {
+    case 'approved':
+      return { resolution: 'decided', author: 'user', comment: `Approved. ${STARTING(targetName)}` }
     case 'started':
       return {
         resolution: 'decided', author: 'user',
@@ -120,11 +139,27 @@ export function spawnConsentClosing({ outcome, errorCode, roomId, modelFallback 
         resolution: 'cancelled', author: 'agent',
         comment: `Approved, but the session could not be started (${errorCode || 'unknown'}).`,
       }
+    case 'gone':
+      // The reconcile sweep found the item open with no ask behind it (the
+      // row was deleted with its device) — nothing is known but that.
+      return { resolution: 'cancelled', author: 'agent', comment: 'Closed — the request is no longer waiting for an answer.' }
     default:
       // An outcome this build has never heard of must not be reported as
-      // any of the four above — least of all as an approval.
+      // any of the above — least of all as an approval.
       return { resolution: 'cancelled', author: 'agent', comment: `Closed — ${outcome}.` }
   }
+}
+
+// What a spawn's outcome adds to an item its approval already closed: how
+// the start went. Null for an outcome that says nothing new (a decline or
+// an expiry closes the item itself, and one the user closed by hand first
+// is left as they left it).
+export function spawnConsentFollowUp({ outcome, errorCode, roomId, modelFallback = null }, { targetName, link = false }) {
+  const room = link && roomId ? ' A chat room between the two sessions was opened.' : ''
+  const onModel = modelFallback ? ` on ${codeSpan(modelFallback.model)} — Fable limit reached` : ''
+  if (outcome === 'started') return `The session started on ${targetName}${onModel}.${room}`
+  if (outcome === 'failed') return `The session could not be started (${errorCode || 'unknown'}).`
+  return null
 }
 
 // The item's markers never push and never wake: the consent card already
@@ -177,12 +212,16 @@ export function fileSpawnConsentItem({ db, hub }, { userId, fromDeviceId, fromNa
   }
 }
 
-// Close the mirror from the spawn's terminal outcome. Called from
-// emitSpawnOutcome, so every path that resolves a row — answer route,
-// orchestration, both sweeps — keeps the item honest without knowing about
-// it. `answeredByDeviceId` is the client device whose tap resolved the row
-// (deny/approve routes); absent for the sweeps. An item the user already
-// closed by hand is left as they left it (closeItem returns null). Never
+// Settle the mirror from the spawn row's progress. Called with 'approved'
+// by the answer (consent-answer.js) the moment the row is claimed, and from
+// emitSpawnOutcome with the terminal outcome, so every path that resolves a
+// row — answer route, orchestration, both sweeps — keeps the item honest
+// without knowing about it. An open item is closed with the outcome's note;
+// one already closed (by the approval, normally) gets the start's result as
+// a follow-up note and stays closed. `answeredByDeviceId` is the device
+// whose answer resolved the row (a tapping client, or the Coordinator's
+// box); absent for the sweeps. An item the user closed by hand before
+// answering is left as they left it for a decline or an expiry. Never
 // throws — telling the parent is the caller's one job and must not be
 // blocked by the tracker, which is also why the row lookup sits INSIDE
 // the try: a read failing under a sweep tick is a false here, never an
@@ -198,15 +237,23 @@ export function closeSpawnConsentItem({ db, hub }, requestId, { outcome, errorCo
     // The note's device: the tapping client for a user decision, the
     // Coordinator's box for its decision, the asking box otherwise.
     const deviceId = (c.author === 'user' || c.byCoordinator) && answeredByDeviceId != null ? answeredByDeviceId : row.from_device_id
-    const out = closeItem(db, { userId: row.user_id, itemId: row.item_id, resolution: c.resolution, author: c.author, deviceId, comment: c.comment })
-    if (!out) return false
     // No connection here to read the asking device's name from; the
     // devices row is the same source the card's sender came from. A device
-    // deleted since the ask still gets its item closed — only the live
-    // marker is skipped (clients see the close at their next /items).
+    // deleted since the ask still gets its item settled — only the live
+    // marker is skipped (clients see the change at their next /items).
     const name = db.prepare('SELECT name FROM devices WHERE id=?').get(row.from_device_id)?.name
-    if (name) emitMarker({ db, hub, pushPipeline: quietPush, waker: null }, { kind: 'agent', userId: row.user_id, deviceId: row.from_device_id, name }, { item: out.item, action: 'closed', comment: out.comment, by: c.author, fallback: false, extra: { consent: 'spawn' } })
-    else console.error(`consent item: asking device ${row.from_device_id} is gone; item ${row.item_id} closed without a live marker`)
+    const mark = (item, action, comment, by) => {
+      if (name) emitMarker({ db, hub, pushPipeline: quietPush, waker: null }, { kind: 'agent', userId: row.user_id, deviceId: row.from_device_id, name }, { item, action, comment, by, fallback: false, extra: { consent: 'spawn' } })
+      else console.error(`consent item: asking device ${row.from_device_id} is gone; item ${row.item_id} ${action} without a live marker`)
+    }
+    const out = closeItem(db, { userId: row.user_id, itemId: row.item_id, resolution: c.resolution, author: c.author, deviceId, comment: c.comment })
+    if (out) { mark(out.item, 'closed', out.comment, c.author); return true }
+    // Already closed: the start's result is the one thing still to say.
+    const followUp = spawnConsentFollowUp({ outcome, errorCode, roomId, modelFallback }, { targetName, link: !!row.link })
+    if (!followUp) return false
+    const note = addComment(db, { userId: row.user_id, itemId: row.item_id, author: 'agent', deviceId: row.from_device_id, body: followUp })
+    if (!note) return false
+    mark(note.item, 'commented', note.comment, 'agent')
     return true
   } catch (err) {
     console.error('consent item: close failed (the spawn outcome stands)', err)
@@ -263,6 +310,7 @@ export function chatConsentClosing(outcome, decidedBy = null) {
     case 'denied': return { resolution: 'decided', author: 'user', comment: 'Declined.' }
     case 'expired': return { resolution: 'cancelled', author: 'agent', comment: 'Expired — no answer within 24 h.' }
     case 'left': return { resolution: 'cancelled', author: 'agent', comment: 'The room was closed before you answered.' }
+    case 'gone': return { resolution: 'cancelled', author: 'agent', comment: 'Closed — the request is no longer waiting for an answer.' }
     default: return { resolution: 'cancelled', author: 'agent', comment: `Closed — ${outcome}.` }
   }
 }
@@ -318,6 +366,62 @@ export function closeChatConsentItem({ db, hub }, roomId, agentDeviceId, { outco
     return true
   } catch (err) {
     console.error('consent item: chat close failed (the ask\'s own outcome stands)', err)
+    return false
+  }
+}
+
+// --- Reconcile -------------------------------------------------------------
+// The invariant's backstop: every open spawn or chat mirror whose ask is not
+// 'awaiting_user' is closed, with the most the ask's row can still say. One
+// pass at each sweep tick (ws.js), so it also runs within a tick of every
+// start — which is what closes the items earlier builds left open. The ways
+// an item gets here: a row approved by a build that closed only at the
+// outcome; a row deleted with its device (the cascade takes the ask, not the
+// item); a renewed chat row, whose item_id now names the newer ask's item;
+// an item reopened before reopening a mirror was refused. Contact and share
+// mirrors (sharing-events.js) are answered on the item itself and are not
+// swept here. Returns how many items it closed; never throws.
+const SPAWN_STATE_OUTCOME = { approved: 'approved', started: 'started', denied: 'declined', expired: 'expired', failed: 'failed' }
+const CHAT_STATE_OUTCOME = { invited: 'approved', joined: 'approved', denied: 'denied' }
+
+export function reconcileConsentItems({ db, hub }) {
+  let closed = 0
+  try {
+    const stale = db.prepare(`
+      SELECT i.id, i.user_id, i.consent, i.origin_device_id FROM items i
+      WHERE i.consent IN ('spawn','chat') AND i.state='open'
+        AND NOT EXISTS (SELECT 1 FROM agent_spawn_requests r WHERE r.item_id = i.id AND r.state='awaiting_user')
+        AND NOT EXISTS (SELECT 1 FROM convo_agents ca WHERE ca.item_id = i.id AND ca.state='awaiting_user')`).all()
+    for (const item of stale) {
+      let done = false
+      if (item.consent === 'spawn') {
+        const row = db.prepare('SELECT id, state, room_id FROM agent_spawn_requests WHERE item_id=?').get(item.id)
+        if (row) done = closeSpawnConsentItem({ db, hub }, row.id, { outcome: SPAWN_STATE_OUTCOME[row.state] ?? 'gone', roomId: row.room_id })
+      } else {
+        const row = db.prepare('SELECT convo_id, agent_device_id, state FROM convo_agents WHERE item_id=?').get(item.id)
+        if (row) done = closeChatConsentItem({ db, hub }, row.convo_id, row.agent_device_id, { outcome: CHAT_STATE_OUTCOME[row.state] ?? 'gone' })
+      }
+      if (!done) done = closeOrphanConsentItem({ db, hub }, item)
+      if (done) closed += 1
+    }
+  } catch (err) {
+    console.error('consent item: reconcile failed', err)
+  }
+  if (closed) console.log(`consent items: closed ${closed} whose request was no longer waiting`)
+  return closed
+}
+
+// An open mirror with no ask row behind it at all.
+function closeOrphanConsentItem({ db, hub }, item) {
+  try {
+    const c = spawnConsentClosing({ outcome: 'gone' }, { targetName: '' })
+    const out = closeItem(db, { userId: item.user_id, itemId: item.id, resolution: c.resolution, author: c.author, deviceId: item.origin_device_id, comment: c.comment })
+    if (!out) return false
+    const name = db.prepare('SELECT name FROM devices WHERE id=?').get(item.origin_device_id)?.name
+    if (hub && name) emitMarker({ db, hub, pushPipeline: quietPush, waker: null }, { kind: 'agent', userId: item.user_id, deviceId: item.origin_device_id, name }, { item: out.item, action: 'closed', comment: out.comment, by: c.author, fallback: false, extra: { consent: item.consent } })
+    return true
+  } catch (err) {
+    console.error('consent item: orphan close failed', err)
     return false
   }
 }

@@ -519,7 +519,11 @@ const ownedRow = (db, userId, itemId) => db.prepare('SELECT * FROM items WHERE i
 // comment records it as meta.action and the item's chosen_action follows it
 // in the same write. An idempotent replay is answered before the check — the
 // original tap was valid when it landed.
-export function addComment(db, { userId, itemId, author, deviceId, body = '', attachments = [], action = null, idemKey = null, now = Date.now() }) {
+//
+// `keepStatus` is for a consent mirror (isConsentMirror): its status belongs
+// to the ask it mirrors, so a user's comment is recorded but neither hands
+// the item to an agent (none can see it) nor reopens it.
+export function addComment(db, { userId, itemId, author, deviceId, body = '', attachments = [], action = null, idemKey = null, keepStatus = false, now = Date.now() }) {
   return db.transaction(() => {
     const row = ownedRow(db, userId, itemId)
     if (!row) return null
@@ -540,7 +544,7 @@ export function addComment(db, { userId, itemId, author, deviceId, body = '', at
       if (idemKey && err.code === 'SQLITE_CONSTRAINT_UNIQUE') throw new Error('idem_key_conflict')
       throw err
     }
-    if (author === 'user') {
+    if (author === 'user' && !keepStatus) {
       // The user's words always hand the ball to the agent, and wake a
       // closed item back up (spec: "any further user comment on a closed
       // item reopens it awaiting the agent").

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { spawnConsentItemFields, spawnConsentClosing, consentLink, fileSpawnConsentItem, closeSpawnConsentItem, chatConsentItemFields, chatConsentClosing } from '../src/consent-items.js'
+import { spawnConsentItemFields, spawnConsentClosing, spawnConsentFollowUp, consentLink, fileSpawnConsentItem, closeSpawnConsentItem, chatConsentItemFields, chatConsentClosing } from '../src/consent-items.js'
 import { openDb } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
@@ -163,4 +163,24 @@ test('spawnConsentItemFields: a spawn onto a mission says "joins mission #N" wit
   assert.ok(withMission.body.includes('- **Joins mission #42** — Ship the panel'), withMission.body)
   const untitled = spawnConsentItemFields({ ...card, mission_num: 42 })
   assert.ok(untitled.body.includes('- **Joins mission #42**\n'), 'no dangling dash when the title is absent')
+})
+
+test('spawnConsentClosing: the approval itself closes the item as decided, before any outcome; the Coordinator form names its reason', () => {
+  const tap = spawnConsentClosing({ outcome: 'approved' }, { targetName: 'eric' })
+  assert.equal(tap.resolution, 'decided'); assert.equal(tap.author, 'user')
+  assert.ok(tap.comment.startsWith('Approved. Starting the session on eric;'))
+  const coord = spawnConsentClosing({ outcome: 'approved' }, { targetName: 'eric', decidedBy: { reason: 'follows the box rules' } })
+  assert.equal(coord.resolution, 'decided'); assert.equal(coord.author, 'agent'); assert.equal(coord.byCoordinator, true)
+  assert.ok(coord.comment.startsWith('Approved by the Coordinator — follows the box rules. Starting the session on eric;'))
+  const gone = spawnConsentClosing({ outcome: 'gone' }, { targetName: '' })
+  assert.equal(gone.resolution, 'cancelled'); assert.equal(gone.comment, 'Closed — the request is no longer waiting for an answer.')
+  assert.equal(chatConsentClosing('gone').comment, gone.comment)
+})
+
+test('spawnConsentFollowUp: only a start or a failed start adds a note to an item its approval already closed', () => {
+  assert.equal(spawnConsentFollowUp({ outcome: 'started' }, { targetName: 'eric' }), 'The session started on eric.')
+  assert.equal(spawnConsentFollowUp({ outcome: 'started', roomId: 'r1', modelFallback: { model: 'opus' } }, { targetName: 'eric', link: true }),
+    'The session started on eric on `opus` — Fable limit reached. A chat room between the two sessions was opened.')
+  assert.equal(spawnConsentFollowUp({ outcome: 'failed', errorCode: 'agent_unreachable' }, { targetName: 'eric' }), 'The session could not be started (agent_unreachable).')
+  for (const outcome of ['approved', 'declined', 'expired', 'gone']) assert.equal(spawnConsentFollowUp({ outcome }, { targetName: 'eric' }), null)
 })

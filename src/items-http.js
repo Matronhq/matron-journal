@@ -75,6 +75,15 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
   // A typo'd action would ship a marker no client knows how to render;
   // that's a programmer error, not a request error, so it throws.
   if (!ITEM_ACTIONS.includes(action)) throw new Error(`unknown item action: ${action}`)
+  // A consent mirror is the user's alone, whichever route wrote to it: its
+  // marker always carries `consent` (client-only, isClientOnlyEvent), has no
+  // fallback text, and neither pushes nor wakes. The journal's own mirror
+  // writes ask for all of that themselves; this is what holds for the
+  // generic routes too — a user's comment on the item would otherwise put
+  // its title (the ask no agent may read) in front of the asking agent and
+  // wake its box for an item it cannot see.
+  const mirror = item.consent != null
+  if (mirror) { extra = { ...extra, consent: item.consent }; fallback = false }
   const author = by == null ? (who.kind === 'agent' ? 'agent' : 'user') : by
   const payload = itemMarkerPayload({ item, action, by: author, comment, extra })
   const sender = senderOf(db, who)
@@ -88,7 +97,7 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
     return
   }
   try {
-    pushPipeline.onAppend(who.userId, toEventShape({ seq: r.seq, convo_id: item.origin_convo_id, ts: r.ts, sender, type: ITEM_EVENT_TYPE, payload }), who.deviceId)
+    if (!mirror) pushPipeline.onAppend(who.userId, toEventShape({ seq: r.seq, convo_id: item.origin_convo_id, ts: r.ts, sender, type: ITEM_EVENT_TYPE, payload }), who.deviceId)
   } catch (err) {
     console.error('items: push onAppend failed', err)
   }
@@ -118,7 +127,7 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
   // Wake keys off the WRITER's device kind, not `by`: an agent filing on
   // behalf of the user is already awake. Keyed off the MARKER only — the
   // fallback text never independently wakes anything.
-  if (who.kind !== 'agent' && WAKE_ACTIONS.has(action)) wakeConvoAgent({ db, hub, waker }, who.userId, item.origin_convo_id)
+  if (!mirror && who.kind !== 'agent' && WAKE_ACTIONS.has(action)) wakeConvoAgent({ db, hub, waker }, who.userId, item.origin_convo_id)
   // A write on an item of a mission someone has been granted: their shared
   // view follows it live (spec 2026-10-02 matron-to-matron sharing). Never
   // for a consent mirror — the grantee's reads do not show one.
@@ -421,7 +430,11 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     if (!text.trim() && attachments.length === 0) return badRequest(res)
     let out
     try {
-      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, body: text, attachments, action, idemKey })
+      // A consent mirror follows its ask, never a comment: left to the
+      // generic rule, a reply on one would reopen it (or take it out of the
+      // user's Decisions list while the ask still waits) with no agent able
+      // to see the item, let alone close it again.
+      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, body: text, attachments, action, idemKey, keepStatus: item.consent != null })
     } catch (err) {
       if (answerKnownError(res, err)) return true
       throw err
@@ -484,6 +497,9 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
   if (sub === 'reopen' && subId == null && req.method === 'POST') {
     const body = await readBody(req)
     if (!okNote(body.comment)) return badRequest(res)
+    // A consent mirror is open exactly while its ask waits for an answer;
+    // reopening one would offer the user a decision that can only fail.
+    if (item.consent != null) return conflict(res)
     const out = reopenItem(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, comment: body.comment ?? '' })
     if (!out) return conflict(res) // already open
     emitMarker(ctx, who, { item: out.item, action: 'reopened', comment: out.comment })
