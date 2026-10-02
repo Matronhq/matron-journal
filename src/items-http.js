@@ -11,11 +11,13 @@ import { idemKeyOf, senderOf, badRequest, notFound, conflict } from './http-who.
 import {
   ITEM_KINDS, AWAITING, RESOLUTIONS, BODY_MAX, validateItemFields, createItem, getItem, listItems, listComments,
   updateItem, addComment, setAttachmentTranscript, closeItem, reopenItem, rerankItem,
-  markTranscriptsPending, isAudioAttachment, isConsentMirror, listSharedItems, getSharedItem,
+  markTranscriptsPending, isAudioAttachment, isConsentMirror, listSharedItems, getSharedItem, listGrantedComments,
 } from './items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE, ITEM_ACTIONS, itemFallbackText, FALLBACK_ACTIONS } from './items-marker.js'
 import { visibleMission } from './missions-http.js'
 import { filteredAgent, privateOwnedConvo } from './privacy.js'
+import { handleConsentTap, isSharingMirror } from './sharing-http.js'
+import { notifyGrantees } from './sharing-events.js'
 
 const SORTS = ['rank', 'updated']
 const SCOPES = ['mine', 'shared']
@@ -117,6 +119,10 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
   // behalf of the user is already awake. Keyed off the MARKER only — the
   // fallback text never independently wakes anything.
   if (who.kind !== 'agent' && WAKE_ACTIONS.has(action)) wakeConvoAgent({ db, hub, waker }, who.userId, item.origin_convo_id)
+  // A write on an item of a mission someone has been granted: their shared
+  // view follows it live (spec 2026-10-02 matron-to-matron sharing). Never
+  // for a consent mirror — the grantee's reads do not show one.
+  if (item.mission_id && item.consent == null) notifyGrantees({ db, hub }, item.mission_id, 'item')
 }
 
 // The journal's transcription job settled every voice note on a comment
@@ -332,7 +338,10 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
     // already read it.
     const shared = getSharedItem(db, who.userId, idOrNum)
     if (!shared) return notFound(res)
-    if (!sub && req.method === 'GET') { json(res, 200, { item: shared, comments: listComments(db, shared.id) }); return true }
+    if (!sub && req.method === 'GET') {
+      json(res, 200, { item: shared, comments: shared.shared_via === 'grant' ? listGrantedComments(db, shared.id) : listComments(db, shared.id) })
+      return true
+    }
     json(res, 403, { error: 'forbidden' })
     return true
   }
@@ -385,6 +394,10 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       if (who.kind === 'agent') { json(res, 403, { error: 'forbidden' }); return true }
       if (typeof body.action !== 'string' || !body.action.trim()) { json(res, 400, { error: 'unknown_action' }); return true }
       action = body.action.trim()
+      // A contact or share card's mirror (sharing-events.js): the tap is the
+      // answer to the card, applied by the journal itself — never a comment
+      // for an agent to read.
+      if (isSharingMirror(item)) return handleConsentTap(ctx, res, who, item, action)
     }
     const v = validateItemFields({ body: body.body ?? '', attachments: body.attachments }, { partial: true })
     if (!v.ok) return badRequest(res)

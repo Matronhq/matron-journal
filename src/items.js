@@ -3,7 +3,7 @@
 // tests, and any future WS op share one set of rules. No hub, no push, no
 // wake: those are src/items-http.js's job.
 import { randomBytes } from 'node:crypto'
-import { sharedConvoSql } from './visibility.js'
+import { sharedConvoSql, grantedMissionSql } from './visibility.js'
 import { blobImageDims } from './db.js'
 
 export const ITEM_KINDS = ['task', 'question', 'decision']
@@ -415,22 +415,53 @@ export function listItems(db, userId, {
 const OWNER_DECORATE = `
   cv.repo AS repo,
   json_object('user_id', u.id, 'name', u.name, 'github_login', ga.login) AS owner_json`
-const SHARED_FROM = `FROM items i
-  JOIN conversations cv ON cv.id = i.origin_convo_id
+
+// The grant rule for an item (spec 2026-10-02 matron-to-matron sharing): it
+// sits on a mission granted to @viewer, is not a consent mirror (callers add
+// i.consent IS NULL), and was not filed from a private box — the same sieve
+// the grantee's mission view applies (missions.js grantedMissionDetail).
+const GRANTED_ITEM = `(i.mission_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM missions m WHERE m.id = i.mission_id AND m.user_id = i.user_id
+      AND NOT EXISTS (SELECT 1 FROM conversations mo JOIN devices md ON md.id = mo.agent_device_id
+                      WHERE mo.id = m.origin_convo_id AND md.private = 1)
+      AND ${grantedMissionSql('m')})
+  AND NOT EXISTS (SELECT 1 FROM conversations pc JOIN devices pd ON pd.id = pc.agent_device_id
+                  WHERE pc.id = i.origin_convo_id AND pd.private = 1))`
+// LEFT JOIN: a granted item is readable even when its origin conversation's
+// row is gone; the org rule (which needs the row) is false for it either way.
+const SHARED_OR_GRANTED_FROM = `FROM items i
+  LEFT JOIN conversations cv ON cv.id = i.origin_convo_id
   JOIN users u ON u.id = i.user_id
   LEFT JOIN github_accounts ga ON ga.user_id = i.user_id`
+const ORG_SHARED = `(cv.id IS NOT NULL AND ${sharedConvoSql('cv')})`
 
+// `org_shared` 0 = the row is readable through a grant alone: nothing that
+// names a conversation, a device or a repo crosses, and the action buttons
+// (the owner's to tap) are not offered. '' and 0 rather than null for the
+// two origin fields the apps' item model requires.
 function rowToSharedItem(row) {
   if (!row) return null
-  const { owner_json: ownerJson, ...rest } = row
+  const { owner_json: ownerJson, org_shared: orgShared, ...rest } = row
   const item = rowToItem(rest)
   item.owner = parseJson(ownerJson, null)
+  if (orgShared === 0) {
+    Object.assign(item, {
+      shared_via: 'grant', origin_convo_id: '', origin_device_id: 0, origin_convo_title: null, repo: null,
+      actions: [], chosen_action: null,
+    })
+  }
   return item
+}
+
+// A grantee's comment thread: who said what and when, never from which
+// device.
+export function listGrantedComments(db, itemId) {
+  return listComments(db, itemId).map((c) => ({ ...c, device_id: 0 }))
 }
 
 export function listSharedItems(db, viewerUserId, { kind = null, state = null, awaiting = null, limit = 100, cursor = null } = {}) {
   limit = Math.min(Math.max(Number(limit) || 100, 1), 500)
-  const where = [sharedConvoSql('cv'), 'i.consent IS NULL']
+  const where = [`(${ORG_SHARED} OR ${GRANTED_ITEM})`, 'i.consent IS NULL']
   const args = { viewer: viewerUserId }
   if (kind != null) { where.push('i.kind = @kind'); args.kind = kind }
   if (state != null) { where.push('i.state = @state'); args.state = state }
@@ -438,7 +469,7 @@ export function listSharedItems(db, viewerUserId, { kind = null, state = null, a
   const cur = cursor ? decCursor(cursor) : null
   if (cursor && !cur) return { badCursor: true }
   if (cur) { where.push('(i.updated_at < @cu OR (i.updated_at = @cu AND i.id < @cid))'); args.cu = cur[0]; args.cid = cur[1] }
-  const rows = db.prepare(`SELECT i.*, ${DECORATE}, ${OWNER_DECORATE} ${SHARED_FROM}
+  const rows = db.prepare(`SELECT i.*, ${DECORATE}, ${OWNER_DECORATE}, ${ORG_SHARED} AS org_shared ${SHARED_OR_GRANTED_FROM}
     WHERE ${where.join(' AND ')} ORDER BY i.updated_at DESC, i.id DESC LIMIT @lim`).all({ ...args, lim: limit + 1 })
   const page = rows.slice(0, limit).map(rowToSharedItem)
   const last = page[page.length - 1]
@@ -448,8 +479,8 @@ export function listSharedItems(db, viewerUserId, { kind = null, state = null, a
 
 export function getSharedItem(db, viewerUserId, itemId) {
   if (typeof itemId !== 'string' || !itemId.startsWith('it_')) return null
-  const row = db.prepare(`SELECT i.*, ${DECORATE}, ${OWNER_DECORATE} ${SHARED_FROM}
-    WHERE i.id = @id AND i.consent IS NULL AND ${sharedConvoSql('cv')}`).get({ viewer: viewerUserId, id: itemId })
+  const row = db.prepare(`SELECT i.*, ${DECORATE}, ${OWNER_DECORATE}, ${ORG_SHARED} AS org_shared ${SHARED_OR_GRANTED_FROM}
+    WHERE i.id = @id AND i.consent IS NULL AND (${ORG_SHARED} OR ${GRANTED_ITEM})`).get({ viewer: viewerUserId, id: itemId })
   return rowToSharedItem(row)
 }
 

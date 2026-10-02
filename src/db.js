@@ -452,6 +452,69 @@ CREATE TABLE IF NOT EXISTS routine_trigger_state(
   tripped_at INTEGER NOT NULL,
   PRIMARY KEY(routine_id, subject)
 );
+-- Contacts and grants (spec 2026-10-02 matron-to-matron sharing, phase 1).
+-- A contact is one row PER SIDE; nothing is shared except between two rows
+-- that are both 'active'. peer_user is the address's user part and
+-- peer_journal its journal (NULL = this journal — the only kind phase 1
+-- writes; peer_journal_key is federation's pinned key). peer_user_id is the
+-- local users row of a same-journal peer: what every join uses, never on
+-- the wire. 'awaiting_user' is an ask the user's own agent made and the
+-- user has not approved yet. A row is reused when a request is made again
+-- after a decline, removal or expiry (the convo_agents renewal stance), so
+-- (user, address) is unique. origin_* name where an agent's ask was made
+-- and item_id its tracker mirror (consent-items) — not foreign keys, same
+-- stance as conversations.mission_id.
+CREATE TABLE IF NOT EXISTS contacts(
+  id               TEXT PRIMARY KEY,
+  user_id          INTEGER NOT NULL REFERENCES users(id),
+  peer_user        TEXT NOT NULL,
+  peer_journal     TEXT,
+  peer_journal_key TEXT,
+  peer_user_id     INTEGER REFERENCES users(id),
+  display_name     TEXT NOT NULL DEFAULT '',
+  state            TEXT NOT NULL CHECK(state IN
+                     ('awaiting_user','pending_out','pending_in','active','blocked','declined','removed','expired')),
+  requested_by     TEXT CHECK(requested_by IN ('user','agent')),
+  origin_convo_id  TEXT,
+  origin_device_id INTEGER,
+  item_id          TEXT,
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL,
+  accepted_at      INTEGER,
+  revoked_at       INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_address ON contacts(user_id, peer_user, COALESCE(peer_journal, ''));
+CREATE INDEX IF NOT EXISTS idx_contacts_peer ON contacts(peer_user_id, user_id);
+-- A grant: the owner of a subject lets one contact in at a level. Only
+-- subject_kind 'mission' at level 'read' is exercised in phase 1; the other
+-- values are the spec's and are refused by the route, not the schema.
+-- contact_id is the OWNER's contact row. 'awaiting_owner' is an ask the
+-- owner's agent made that the owner has not approved; 'pending' waits for
+-- the grantee's accept. One row per (subject, contact), renewed like a
+-- contact row. revoked_by says which side ended it.
+CREATE TABLE IF NOT EXISTS grants(
+  id               TEXT PRIMARY KEY,
+  owner_user_id    INTEGER NOT NULL REFERENCES users(id),
+  subject_kind     TEXT NOT NULL CHECK(subject_kind IN ('mission','project','room')),
+  subject_id       TEXT NOT NULL,
+  contact_id       TEXT NOT NULL REFERENCES contacts(id),
+  level            TEXT NOT NULL CHECK(level IN ('read','contribute','owner')),
+  state            TEXT NOT NULL CHECK(state IN ('awaiting_owner','pending','active','declined','revoked','expired')),
+  requested_by     TEXT CHECK(requested_by IN ('user','agent')),
+  origin_convo_id  TEXT,
+  origin_device_id INTEGER,
+  owner_item_id    TEXT,
+  grantee_item_id  TEXT,
+  revoked_by       TEXT CHECK(revoked_by IN ('owner','grantee','contact_removed')),
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL,
+  answered_at      INTEGER,
+  revoked_at       INTEGER,
+  UNIQUE(subject_kind, subject_id, contact_id)
+);
+CREATE INDEX IF NOT EXISTS idx_grants_subject ON grants(subject_kind, subject_id, state);
+CREATE INDEX IF NOT EXISTS idx_grants_contact ON grants(contact_id, state);
+CREATE INDEX IF NOT EXISTS idx_grants_owner ON grants(owner_user_id, state);
 `
 
 export function openDb(path) {
@@ -960,6 +1023,15 @@ export function openDb(path) {
     db.exec('ALTER TABLE conversations ADD COLUMN repo_scope TEXT')
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_conversations_repo_scope ON conversations(repo_scope)')
+  // System conversations (spec 2026-10-02 matron-to-matron sharing): 'people'
+  // marks the one conversation per user the journal itself owns — the home
+  // of cards from other people and the contact/grant audit events
+  // (people-convo.js). NULL on every ordinary conversation. No agent may
+  // read, write or adopt a row that carries it.
+  if (!repoCols.some((c) => c.name === 'system')) {
+    db.exec('ALTER TABLE conversations ADD COLUMN system TEXT')
+  }
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_system ON conversations(owner_user_id, system) WHERE system IS NOT NULL')
   // Memory scopes (spec 2026-10-01 memory scopes): who a memory is for —
   // 'global' (every session, how every memory worked before the column),
   // 'coordinator', or 'repo:<name>'. Additive: every pre-migration row is

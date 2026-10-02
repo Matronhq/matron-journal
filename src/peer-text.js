@@ -17,3 +17,7 @@ export function sanitizePeerText(value, max) {
     .trim()
     .slice(0, max)
 }
+// Peer text placed inside markdown the journal writes in its own voice (a
+// consent item's body): the characters that would bold, link, image-load or
+// close a code span from inside the sentence around it are dropped.
+export const plainText = (s) => String(s ?? '').replace(/[*_`~[\]()<>!#|\\"]/g, '')

@@ -37,9 +37,21 @@ export const CONVO_ID_MAX_CHARS = 128
 // announced by an `item` marker carrying `consent: 'spawn'|'chat'` — the
 // same rule applies to it: its title names the ask, and the room owner
 // hearing "dev-b asks to join" is exactly what parking exists to prevent.
+//
+// The two cards of person-to-person sharing (spec 2026-10-02
+// matron-to-matron sharing) are client-only for a stronger reason still:
+// they come from, or send data to, ANOTHER PERSON, and only a tap on the
+// user's own device may answer them — no agent, the Coordinator included,
+// ever hears of one.
+const CLIENT_ONLY_CARD_KINDS = new Set(['agent_chat', 'agent_spawn', 'contact_request', 'mission_share'])
+export const PEOPLE_EVENT_TYPE = 'people'
+
 export function isClientOnlyEvent(type, payload) {
   if (!payload || typeof payload !== 'object') return false
-  if (type === 'permission_request') return payload.kind === 'agent_chat' || payload.kind === 'agent_spawn'
+  if (type === 'permission_request') return CLIENT_ONLY_CARD_KINDS.has(payload.kind)
+  // Contact and grant audit events (sharing-events.js) name another person
+  // and what was shared with them: the user's business, never an agent's.
+  if (type === PEOPLE_EVENT_TYPE) return true
   if (type === 'item') return typeof payload.consent === 'string' && payload.consent !== ''
   // The Coordinator's answer to a consent card (spec: 2026-09-29 coordinator
   // consent): the apps' "approved by the Coordinator" badge, never an
@@ -54,8 +66,11 @@ export function snippetOf(type, payload) {
   // payload just yields an empty/placeholder snippet, never a thrown error.
   const p = payload && typeof payload === 'object' ? payload : {}
   if (type === 'permission_request' && isClientOnlyEvent(type, payload)) {
+    if (p.kind === 'contact_request') return '🤝 Contact request'
+    if (p.kind === 'mission_share') return '🤝 Mission share request'
     return p.kind === 'agent_spawn' ? '🤝 Agent spawn request' : '🤝 Agent chat request'
   }
+  if (type === PEOPLE_EVENT_TYPE) return `👥 ${String(p.summary || 'Contacts updated')}`.slice(0, 120)
   if (type === 'text') return String(p.body || '').slice(0, 120)
   if (type === 'prompt') return `? ${String(p.question || '').slice(0, 110)}`
   if (type === 'permission_request') return `permission: ${String(p.description || '').slice(0, 100)}`
@@ -162,6 +177,9 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
   let metaChanged = false
   if (existing) {
     if (existing.owner_user_id !== ownerUserId) throw new Error('not authorized: convo owned by another user')
+    // The journal's own conversations (people-convo.js) are never an
+    // agent's to title, adopt or re-state.
+    if (existing.system != null) throw new Error('not authorized: system conversation')
     if (title != null && title !== existing.title) metaChanged = true
     if (repoCols && (existing.repo ?? null) !== repoCols.repo) metaChanged = true
     // agent_device_id: last upsert wins — the device currently managing the
@@ -314,7 +332,11 @@ export function broadcastAppended(db, hub, { userId, convoId, seq, ts, sender, t
 // unjoined room therefore never reach another agent. Shared by live journal
 // fan-out, hello replay, and ephemeral delivery so the rule lives once.
 export function agentTargetsFor(db, convoId) {
-  const ownerId = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id ?? null
+  const row = db.prepare('SELECT agent_device_id, system FROM conversations WHERE id=?').get(convoId)
+  // A system conversation (people-convo.js) has no owner on purpose, and
+  // that must not read as the legacy "unknown owner, tell every agent".
+  if (row?.system != null) return new Set()
+  const ownerId = row?.agent_device_id ?? null
   return ownerId == null ? null : new Set([ownerId, ...joinedAgentIds(db, convoId)])
 }
 
@@ -336,7 +358,7 @@ export const toEventShape = ({ seq, convo_id, ts, sender, type, payload }) =>
 //     query — a private device's conversations are dropped unless
 //     agent_device_id is NULL (never private-owned). Only for the "ordinary
 //     agent" caller; clients and private agents pass this false.
-export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned = false } = {}) {
+export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned = false, excludeSystem = false } = {}) {
   // last_ts: timestamp of the conversation's newest MESSAGE event, so a
   // client can show a correct "last activity" time from a snapshot alone.
   // Without it, a client refreshing via /snapshot after missing frames
@@ -356,7 +378,7 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   const conversations = db.prepare(
     `SELECT id, title, session_state, session_outcome, last_seq, unread_count,
             ${omitSnippet ? 'NULL' : 'snippet'} AS snippet,
-            parent_convo_id, summary, repo, created_at, agent_device_id,
+            parent_convo_id, summary, repo, created_at, agent_device_id, system,
             ${excludePrivateOwned
               ? `(CASE WHEN EXISTS (SELECT 1 FROM missions m WHERE m.id = conversations.mission_id AND ${ORIGIN_SIEVE}) THEN conversations.mission_id END)`
               : 'mission_id'} AS mission_id,
@@ -365,7 +387,7 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
             (SELECT ts FROM events e WHERE e.convo_id = conversations.id
              AND e.type IN (${MESSAGE_TYPES_SQL})
              ORDER BY e.seq DESC LIMIT 1) AS last_ts
-     FROM conversations WHERE owner_user_id=?${excludePrivateOwned
+     FROM conversations WHERE owner_user_id=?${excludeSystem ? ' AND system IS NULL' : ''}${excludePrivateOwned
        ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
               SELECT 1 FROM devices d WHERE d.id=conversations.agent_device_id AND d.private=1))`
        : ''}
@@ -415,6 +437,9 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   }
   const convosByRoom = participantConvosByRoom(db, userId, { excludePrivateOwned })
   for (const c of conversations) {
+    // `system` rides only the journal's own conversations (people-convo.js);
+    // every other row keeps the shape it always had.
+    if (c.system == null) delete c.system
     if (!roomIds.has(c.id)) continue
     const ids = new Set(joinedByConvo.get(c.id) ?? [])
     if (c.agent_device_id != null) ids.add(c.agent_device_id)

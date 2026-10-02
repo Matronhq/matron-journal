@@ -129,8 +129,11 @@ export function authorize(db, userId, convoId) {
 // comes first, same as authorize(). Inline SQL rather than importing
 // participants.js — auth.js stays dependency-free below argon2/crypto.
 export function authorizeAgentWrite(db, userId, deviceId, convoId) {
-  const row = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(convoId)
+  const row = db.prepare('SELECT owner_user_id, agent_device_id, system FROM conversations WHERE id=?').get(convoId)
   if (!row || row.owner_user_id !== userId) return false
+  // The journal's own conversations (people-convo.js): no agent writes there,
+  // though the row has no recorded owner.
+  if (row.system != null) return false
   if (row.agent_device_id == null || row.agent_device_id === deviceId) return true
   return !!db.prepare(
     "SELECT 1 FROM convo_agents WHERE convo_id=? AND agent_device_id=? AND state='joined'"
