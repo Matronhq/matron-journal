@@ -46,6 +46,7 @@ test('users admin: list, create (validated, 409 on a taken name), reset password
   const made = await s.http('/users', { method: 'POST', token: rootTok, body: { name: 'pat', password: 'pw123456' } })
   assert.equal(made.status, 201)
   assert.deepEqual({ name: made.json.user.name, is_admin: made.json.user.is_admin, github: made.json.user.github }, { name: 'pat', is_admin: false, github: null })
+  assert.equal(made.json.user.unlisted, false)
   assert.ok((await login(s.db, { username: 'pat', password: 'pw123456', deviceName: 'ph' })).token, 'the new user can sign in')
   assert.equal((await s.http('/users', { method: 'POST', token: rootTok, body: { name: 'pat', password: 'pw123456' } })).status, 409)
   assert.equal((await s.http('/users', { method: 'POST', token: rootTok, body: { name: 'bad name', password: 'pw123456' } })).status, 400)

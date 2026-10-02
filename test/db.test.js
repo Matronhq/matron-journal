@@ -627,6 +627,20 @@ test('openDb adds repo/repo_scope and the GitHub link tables to a pre-existing p
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
+test('openDb adds users.unlisted (default 0) to a pre-existing users table in place', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-unlisted-migration-'))
+  const dbPath = path.join(dir, 'pre-unlisted.db')
+  const raw = new Database(dbPath)
+  raw.exec('CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL, is_admin INTEGER NOT NULL DEFAULT 0)')
+  raw.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(1,'dan','x',0)").run()
+  raw.close()
+  const db = openDb(dbPath)
+  assert.deepEqual(db.prepare('SELECT id, name, unlisted FROM users').all(), [{ id: 1, name: 'dan', unlisted: 0 }])
+  db.close()
+  assert.doesNotThrow(() => openDb(dbPath).close())
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
 test('openDb adds users.is_admin (default 0) to a pre-existing users table in place', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-admin-migration-'))
   const dbPath = path.join(dir, 'pre-admin.db')

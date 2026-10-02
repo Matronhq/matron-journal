@@ -34,12 +34,12 @@ function stillAdmin(db, who) {
   return !!db.prepare('SELECT 1 FROM devices WHERE id=?').get(who.deviceId) && isAdmin(db, who)
 }
 
-const USER_SQL = `SELECT u.id, u.name, u.is_admin, u.created_at,
+const USER_SQL = `SELECT u.id, u.name, u.is_admin, u.unlisted, u.created_at,
     ga.login AS github_login, ga.state AS github_state, ga.host AS github_host
   FROM users u LEFT JOIN github_accounts ga ON ga.user_id = u.id`
 const userRow = (db, id) => db.prepare(`${USER_SQL} WHERE u.id=?`).get(id)
 const shape = (r) => ({
-  id: r.id, name: r.name, is_admin: !!r.is_admin, created_at: r.created_at,
+  id: r.id, name: r.name, is_admin: !!r.is_admin, unlisted: !!r.unlisted, created_at: r.created_at,
   github: r.github_login ? { login: r.github_login, state: r.github_state, host: r.github_host } : null,
 })
 
