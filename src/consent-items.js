@@ -59,7 +59,7 @@ export function spawnConsentItemFields(card) {
     // bridge will start the child on the fallback, so the user approves
     // knowing it.
     ...(!card.model && card.fallback_reason === 'fable_limit' && card.fallback_model
-      ? [`- **Model:** ${codeSpan(card.fallback_model)} — ${target} is at its Fable weekly limit, so the session starts on Opus`]
+      ? [`- **Model:** ${codeSpan(card.fallback_model)} — ${target} is at its Fable weekly limit, so a session that would start on Fable starts on Opus`]
       : []),
     // "joins mission #N" (coordinator redesign §2d): the user approves the
     // child AND where it lands. The title rides the card as mission_title —

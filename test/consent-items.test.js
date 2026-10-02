@@ -30,7 +30,7 @@ test('spawnConsentItemFields: title names the box and the topic; body carries ta
 
 test('spawnConsentItemFields: a predicted Fable-limit fallback names Opus; a named model shows alone', () => {
   const f = spawnConsentItemFields({ ...card, fallback_model: 'opus', fallback_reason: 'fable_limit' })
-  assert.ok(f.body.includes('- **Model:** `opus` — eric is at its Fable weekly limit, so the session starts on Opus'))
+  assert.ok(f.body.includes('- **Model:** `opus` — eric is at its Fable weekly limit, so a session that would start on Fable starts on Opus'))
   const named = spawnConsentItemFields({ ...card, model: 'fable', fallback_model: 'opus', fallback_reason: 'fable_limit' })
   assert.ok(named.body.includes('- **Model:** `fable`'))
   assert.ok(!named.body.includes('Fable weekly limit'))

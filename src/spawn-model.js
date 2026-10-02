@@ -22,13 +22,14 @@ function liveLine(line, nowMs) {
 
 const isFableWeek = (id) => typeof id === 'string' && (id === 'week_fable' || id.startsWith('week_fable_'))
 
-// True when the Fable weekly meter is spent and the all-models one is not.
+// True when the Fable weekly meter is spent and a live all-models reading
+// shows room (none, or one past its reset, is no evidence of room).
 export function fableMaxed(lines, nowMs = Date.now()) {
   if (!Array.isArray(lines)) return false
   const fable = lines.find((l) => l && isFableWeek(l.id) && liveLine(l, nowMs))
   if (!fable || fable.percent < FABLE_MAXED_PERCENT) return false
   const all = lines.find((l) => l && l.id === 'week_all' && liveLine(l, nowMs))
-  return !all || all.percent < 100
+  return !!all && all.percent < 100
 }
 
 // {fallback_model, fallback_reason} for an ask that named no model onto a

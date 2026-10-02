@@ -45,7 +45,7 @@ test('GET /consent/pending: a no-model spawn onto a box out of Fable carries the
   const f = await fleet(t)
   await parkSpawn(f)
   assert.ok(!('fallback_model' in (await pending(f, f.coordDev.token)).json.pending[0]))
-  upsertDeviceStatus(f.s.db, { userId: f.dan.id, deviceId: f.targetDev.deviceId, status: { limits: { as_of: 1, lines: [{ id: 'week_fable', label: 'Week (Fable)', percent: 100 }] } } })
+  upsertDeviceStatus(f.s.db, { userId: f.dan.id, deviceId: f.targetDev.deviceId, status: { limits: { as_of: 1, lines: [{ id: 'week_all', label: 'Week (all models)', percent: 40 }, { id: 'week_fable', label: 'Week (Fable)', percent: 100 }] } } })
   const sp = (await pending(f, f.coordDev.token)).json.pending[0]
   assert.equal(sp.fallback_model, 'opus'); assert.equal(sp.fallback_reason, 'fable_limit')
 })
