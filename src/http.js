@@ -5,6 +5,7 @@ import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice,
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice, deviceStatuses } from './db.js'
 import { receiveBlob } from './media.js'
+import { readBlobTranscript } from './blob-transcripts.js'
 import { imageSizeFromFile } from './image-size.js'
 import { buildMetrics } from './metrics.js'
 import { listAwaiting } from './participants.js'
@@ -94,7 +95,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, itemTranscription = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, itemTranscription = null, blobTranscripts = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null }) {
   // Alertmanager webhook (src/alerts-http.js): built once so its in-flight
   // bound is per process. Off (declines every request) without config.
   const handleAlerts = makeAlertsHandler({
@@ -818,7 +819,30 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           await fs.promises.unlink(received.diskPath).catch(() => {})
           throw e
         }
-        return json(res, 200, { media_id: received.id, size: received.size, content_type: contentType, sha256: received.sha256, ...(dims ?? {}) })
+        // A user's voice note goes straight off to the cloud transcriber, so
+        // its words are usually ready before the message naming it is sent.
+        // An agent's upload is never a voice note to transcribe.
+        const transcribing = who.kind !== 'agent' && !!blobTranscripts?.start(received.id, who.userId, contentType)
+        return json(res, 200, { media_id: received.id, size: received.size, content_type: contentType, sha256: received.sha256, ...(dims ?? {}), ...(transcribing ? { transcript_status: 'pending' } : {}) })
+      }
+      const mt = url.pathname.match(/^\/media\/([^/]+)\/transcript$/)
+      if (req.method === 'GET' && mt) {
+        // The words of a voice note transcribed at upload (blob-transcripts.js):
+        // {status: 'none'|'pending'|'done'|'failed', transcript?}. ?wait=N
+        // (seconds, at most 30) holds a pending answer until the job settles,
+        // so a bridge asks once instead of polling. Same read rule and same
+        // 404 for missing-or-not-yours as GET /media/:id.
+        const blob = getBlob(db, mt[1])
+        if (!blob) return json(res, 404, { error: 'not_found' })
+        if (blob.owner_user_id !== who.userId && !canReadBlob(db, who.userId, blob.id)) return json(res, 404, { error: 'not_found' })
+        const waitS = Math.min(30, Math.max(0, Number(url.searchParams.get('wait')) || 0))
+        const gone = new AbortController()
+        res.on('close', () => gone.abort())
+        const out = blobTranscripts
+          ? await blobTranscripts.wait(blob.id, waitS * 1000, gone.signal)
+          : readBlobTranscript(db, blob.id)
+        if (gone.signal.aborted && !res.writable) return
+        return json(res, 200, out)
       }
       const mm = url.pathname.match(/^\/media\/([^/]+)$/)
       if (req.method === 'GET' && mm) {

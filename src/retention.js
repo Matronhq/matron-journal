@@ -165,9 +165,11 @@ export function runExpireLogs(db, { hours = 24, mediaDir }) {
 // entries written before the stamp existed. Never touched: audio with no
 // transcript, a pending or failed job, anything that is not audio (whatever
 // keys it carries), and — like every pass here — a blob another user owns.
-// Chat voice notes (file events) are out of scope: the journal holds no
-// transcript for them (the origin bridge transcribes those into its own
-// turn), so "after it's been transcribed" cannot be decided here.
+// Chat voice notes (file events) are covered when the journal transcribed
+// them itself at upload (blob-transcripts.js, cloud transcriber): their
+// clock is blobs.transcribed_at — see expireChatVoiceNotes below. One the
+// origin bridge transcribed into its own turn has no journal transcript,
+// so "after it's been transcribed" cannot be decided for it, and it stays.
 //
 // A blob several of the owner's comments name (the same note attached
 // twice) goes only once every one of those entries is due; then all of
@@ -229,7 +231,13 @@ export function runExpireVoiceNotes(db, { days = 7, now = Date.now() }) {
           update.run(JSON.stringify(h.atts), h.id)
           expired += h.mine.length
         }
-        if (blob) deleteBlobRow.run(blobRef)
+        if (blob) {
+          // The same recording sent in a chat too: its file/image events
+          // become tombstones carrying the words, as the chat pass writes
+          // them, rather than dangling refs to a deleted blob.
+          tombstoneAttachmentEvents(db, blobRef, holders[0].mine[0].transcript)
+          deleteBlobRow.run(blobRef)
+        }
       })()
       if (blob) {
         try {
@@ -241,7 +249,66 @@ export function runExpireVoiceNotes(db, { days = 7, now = Date.now() }) {
       }
     }
   }
+  const chat = expireChatVoiceNotes(db, { cutoff })
+  return { expired: expired + chat.expired, bytesFreed: bytesFreed + chat.bytesFreed }
+}
+
+// The chat half of runExpireVoiceNotes: an audio blob the journal
+// transcribed at upload (transcript_status 'done', transcribed_at before the
+// cutoff) that only its owner's file/image events name. Each such event is
+// rewritten to the same tombstone the media reaper writes (payload kept,
+// blob_ref null, expired:true) plus the transcript, so the words outlive the
+// recording on the event too; then the blob row goes and the file is
+// unlinked after commit. Never touched: a blob an item comment names (the
+// item pass above owns it, by its own clock), one another user's event
+// names, one no event names (an orphan is the reaper's), and anything not
+// transcribed here.
+function expireChatVoiceNotes(db, { cutoff }) {
+  const due = db.prepare(
+    `SELECT b.id, b.owner_user_id, b.disk_path, b.size, b.transcript FROM blobs b
+     WHERE b.transcript_status = 'done' AND b.transcribed_at < ? AND b.content_type LIKE 'audio/%'
+       AND EXISTS (SELECT 1 FROM events e WHERE e.blob_ref = b.id)
+       AND NOT EXISTS (SELECT 1 FROM events e WHERE e.blob_ref = b.id AND (e.user_id != b.owner_user_id OR e.type NOT IN ${ATTACHMENT_TYPES}))
+       AND NOT EXISTS (SELECT 1 FROM item_comments ic WHERE ic.attachments LIKE '%"blob_ref":"' || b.id || '"%')
+     ORDER BY b.transcribed_at`
+  ).all(cutoff)
+  const deleteBlobRow = db.prepare('DELETE FROM blobs WHERE id=?')
+  let expired = 0
+  let bytesFreed = 0
+  for (const blob of due) {
+    db.transaction(() => {
+      expired += tombstoneAttachmentEvents(db, blob.id, blob.transcript)
+      deleteBlobRow.run(blob.id)
+    })()
+    try {
+      fs.unlinkSync(blob.disk_path)
+    } catch (err) {
+      if (err.code !== 'ENOENT') console.error(`retention: failed to unlink chat voice-note blob ${blob.id} at ${blob.disk_path}`, err)
+    }
+    bytesFreed += blob.size
+  }
   return { expired, bytesFreed }
+}
+
+// Rewrites every file/image event naming an expiring voice-note blob to the
+// reaper's tombstone (payload kept, blob_ref null, expired:true) plus the
+// transcript. Returns how many events it rewrote. Runs inside the caller's
+// transaction, before the blob row is deleted.
+function tombstoneAttachmentEvents(db, blobRef, transcript) {
+  const refs = db.prepare(`SELECT user_id, seq, payload FROM events WHERE blob_ref = ? AND type IN ${ATTACHMENT_TYPES}`).all(blobRef)
+  const updateEvent = db.prepare('UPDATE events SET payload=?, blob_ref=NULL WHERE user_id=? AND seq=?')
+  for (const ref of refs) {
+    let payload
+    try { payload = JSON.parse(ref.payload) } catch { payload = null }
+    const tombstone = {
+      ...(payload && typeof payload === 'object' ? payload : {}),
+      blob_ref: null,
+      expired: true,
+      ...(typeof transcript === 'string' && transcript ? { transcript } : {}),
+    }
+    updateEvent.run(JSON.stringify(tombstone), ref.user_id, ref.seq)
+  }
+  return refs.length
 }
 
 // Quota-pressure attachment reaper (third retention pass). Does nothing until

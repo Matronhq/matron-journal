@@ -19,6 +19,9 @@ const DEFAULT_MAX_QUEUED_PER_USER = 10
 
 export function makeItemTranscription({
   db, transcriber, onSettled, log = console,
+  // blob-transcripts.js: a voice note the cloud transcriber already did (or is
+  // doing) at upload is reused here rather than paid for twice. null = none.
+  blobTranscripts = null,
   maxQueued = DEFAULT_MAX_QUEUED, maxQueuedPerUser = DEFAULT_MAX_QUEUED_PER_USER, retryDelayMs = 500, closeTimeoutMs = 5000,
 }) {
   if (!transcriber) {
@@ -44,6 +47,16 @@ export function makeItemTranscription({
     }
   }
 
+  // The upload-time transcript of this blob, waiting for its job if one is
+  // running; null when there is none to reuse (never asked, or it failed —
+  // then this queue runs its own attempt, as before).
+  async function fromUpload(blobRef) {
+    if (!blobTranscripts) return null
+    const running = blobTranscripts.inFlight(blobRef)
+    const out = running ? await running : blobTranscripts.lookup(blobRef)
+    return out?.status === 'done' && out.transcript ? out.transcript : null
+  }
+
   async function runOne({ commentId, userId, blobRef }) {
     if (closed) return
     let transcript = null
@@ -57,7 +70,7 @@ export function makeItemTranscription({
       // must never pull words out of another user's audio.
       const blob = db.prepare('SELECT disk_path FROM blobs WHERE id=? AND owner_user_id=?').get(blobRef, userId)
       if (!blob) throw new Error('blob not found for this user')
-      transcript = await transcriber.transcribeFile(blob.disk_path, { signal: abort.signal, userId })
+      transcript = await fromUpload(blobRef) ?? await transcriber.transcribeFile(blob.disk_path, { signal: abort.signal, userId })
     } catch (err) {
       // Shutting down: leave it pending — the next boot's recover() redoes it.
       if (closed) return

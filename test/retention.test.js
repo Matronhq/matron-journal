@@ -879,3 +879,66 @@ test('reap pass runs at boot when a user is over quota', async (t) => {
   const row = s.db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(dan.id, old.seq)
   assert.equal(JSON.parse(row.payload).expired, true)
 })
+
+// Chat voice notes the journal transcribed at upload (blob-transcripts.js):
+// same 7-day rule, clocked from blobs.transcribed_at.
+function seedChatVoiceNote(db, mediaDir, { userId, convoId = 'c1', bytes = 100, status = 'done', transcript = 'hello there', transcribedDaysAgo = 8 }) {
+  const blob = seedBlob(db, mediaDir, { userId, bytes, contentType: 'audio/mp4', fill: 5 })
+  db.prepare('UPDATE blobs SET transcript_status=?, transcript=?, transcribed_at=? WHERE id=?')
+    .run(status, status === 'done' ? transcript : null, status === 'done' ? Date.now() - transcribedDaysAgo * DAY : null, blob.id)
+  const payload = { blob_ref: blob.id, name: 'Voice.m4a', content_type: 'audio/mp4', size: bytes }
+  const r = append(db, { userId, convoId, sender: 'user:dan', type: 'file', payload, blobRef: blob.id })
+  return { blob, seq: r.seq }
+}
+const eventOf = (db, userId, seq) => db.prepare('SELECT payload, blob_ref FROM events WHERE user_id=? AND seq=?').get(userId, seq)
+
+test('runExpireVoiceNotes: a chat voice note transcribed at upload goes after `days`; the event keeps its fields and gains the words', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const old = seedChatVoiceNote(db, mediaDir, { userId: dan.id, transcribedDaysAgo: 8 })
+  const young = seedChatVoiceNote(db, mediaDir, { userId: dan.id, transcribedDaysAgo: 2 })
+  const r = runExpireVoiceNotes(db, { days: 7 })
+  assert.deepEqual(r, { expired: 1, bytesFreed: 100 })
+  const ev = eventOf(db, dan.id, old.seq)
+  assert.equal(ev.blob_ref, null)
+  assert.deepEqual(JSON.parse(ev.payload), { blob_ref: null, name: 'Voice.m4a', content_type: 'audio/mp4', size: 100, expired: true, transcript: 'hello there' })
+  assert.equal(getBlob(db, old.blob.id), undefined)
+  assert.equal(fs.existsSync(old.blob.diskPath), false)
+  assert.ok(getBlob(db, young.blob.id))
+  assert.ok(fs.existsSync(young.blob.diskPath))
+  assert.deepEqual(runExpireVoiceNotes(db, { days: 7 }), { expired: 0, bytesFreed: 0 }, 'second run is a no-op')
+})
+
+test('runExpireVoiceNotes: chat audio not transcribed here, failed, or shared with an item / another user / a non-attachment event stays', async () => {
+  const { db, dan } = await setup()
+  const pat = await createUser(db, 'pat', 'pw')
+  upsertConversation(db, { id: 'p1', ownerUserId: pat.id })
+  const mediaDir = tmpMediaDir()
+  const failed = seedChatVoiceNote(db, mediaDir, { userId: dan.id, status: 'failed' })
+  const bridgeDid = seedChatVoiceNote(db, mediaDir, { userId: dan.id, status: null })
+  const shared = seedChatVoiceNote(db, mediaDir, { userId: dan.id })
+  append(db, { userId: pat.id, convoId: 'p1', sender: 'user:pat', type: 'file', payload: { blob_ref: shared.blob.id }, blobRef: shared.blob.id })
+  const onText = seedChatVoiceNote(db, mediaDir, { userId: dan.id })
+  append(db, { userId: dan.id, convoId: 'c1', sender: 'user:dan', type: 'text', payload: { text: 'x' }, blobRef: onText.blob.id })
+  const inItem = seedChatVoiceNote(db, mediaDir, { userId: dan.id })
+  const it = createItem(db, { userId: dan.id, kind: 'task', title: 'T', originConvoId: 'c1', originDeviceId: 1, createdBy: 'agent' }).item
+  addComment(db, { userId: dan.id, itemId: it.id, author: 'user', deviceId: 1, body: '', attachments: [{ blob_ref: inItem.blob.id, mime: 'audio/mp4', name: 'v.m4a', size: 100 }] })
+  const orphan = seedBlob(db, mediaDir, { userId: dan.id, bytes: 100, contentType: 'audio/mp4', fill: 9 })
+  db.prepare("UPDATE blobs SET transcript_status='done', transcript='x', transcribed_at=? WHERE id=?").run(Date.now() - 30 * DAY, orphan.id)
+
+  assert.deepEqual(runExpireVoiceNotes(db, { days: 7 }), { expired: 0, bytesFreed: 0 })
+  for (const b of [failed.blob, bridgeDid.blob, shared.blob, onText.blob, inItem.blob, orphan]) assert.ok(getBlob(db, b.id), `blob ${b.id} must stay`)
+})
+
+test('runExpireVoiceNotes: a recording in both an item thread and a chat goes on the item clock, and the chat event becomes a tombstone with the words', async () => {
+  const { db, dan } = await setup()
+  const mediaDir = tmpMediaDir()
+  const v = seedVoiceNote(db, mediaDir, { userId: dan.id, transcript: 'from the item', transcribedDaysAgo: 8 })
+  const r0 = append(db, { userId: dan.id, convoId: 'c1', sender: 'user:dan', type: 'file', payload: { blob_ref: v.blob.id, name: 'Voice 1.m4a', content_type: 'audio/mp4', size: 100 }, blobRef: v.blob.id })
+  const r = runExpireVoiceNotes(db, { days: 7 })
+  assert.equal(r.expired, 1)
+  assert.equal(getBlob(db, v.blob.id), undefined)
+  const ev = eventOf(db, dan.id, r0.seq)
+  assert.equal(ev.blob_ref, null)
+  assert.deepEqual(JSON.parse(ev.payload), { blob_ref: null, name: 'Voice 1.m4a', content_type: 'audio/mp4', size: 100, expired: true, transcript: 'from the item' })
+})

@@ -145,6 +145,37 @@ the machine-checkable version of this page.
   size is known otherwise (the just-written file is deleted on rejection).
   Storage root: `MATRON_MEDIA_DIR` env or `<dirname of the db file>/media`,
   sharded `<root>/<id[0:2]>/<id>`.
+  When the journal has a cloud transcriber (below), a **user's** `audio/*`
+  upload is also sent for transcription at once and the response carries
+  `transcript_status:'pending'`; read the words with
+  `GET /media/:id/transcript`.
+- `GET /media/:id/transcript[?wait=N]` (Bearer) -> `{status, transcript?}`,
+  the upload-time transcript of a voice note. `status` is `'none'` (never
+  transcribed here: no cloud transcriber, not audio, an agent's upload, or
+  the backlog was full), `'pending'`, `'done'` (with `transcript`) or
+  `'failed'`. `wait` (seconds, capped at 30) holds a `pending` answer until
+  the job settles, so a caller asks once instead of polling. Same read rule
+  and same 404 for missing/not-yours as `GET /media/:id`. A bridge that gets
+  a chat voice note asks this first and falls back to its own whisper on
+  anything but `done` (or a 404 from an older journal).
+
+  **Cloud transcription** (`src/cloud-transcribe.js`): set
+  `MATRON_STT_AZURE_KEY` (or `MATRON_STT_AZURE_KEY_FILE`, a file holding it)
+  to an Azure Speech resource key. Requests go to Azure's fast transcription
+  API (`/speechtotext/transcriptions:transcribe`, api-version 2025-10-15) at
+  `MATRON_STT_AZURE_ENDPOINT` (default
+  `https://northeurope.api.cognitive.microsoft.com`) with model
+  `MATRON_STT_AZURE_MODEL` (default `MAI-Transcribe-2`; empty = Azure's
+  standard model) and locale `MATRON_STT_LOCALE` (default `en`, or `en-GB`
+  for the standard model). The audio is converted to 16 kHz mono FLAC with
+  `ffmpeg` (must be on `PATH`), and the phrase list is the whisper prompt's
+  vocabulary plus the user's device names. Up to 4 jobs run at once, and at
+  most 20 per user / 100 overall may be queued. A cloud transcriber also
+  does item voice notes (below), reusing an upload-time transcript rather
+  than sending the same audio twice. A chat voice note transcribed here has
+  its audio expired like an item's (`MATRON_VOICE_NOTE_TTL_DAYS` after
+  `blobs.transcribed_at`): its file events become tombstones carrying the
+  `transcript`. Without a key nothing changes.
 - `GET /media/:id` (Bearer) -> streams the blob with its Content-Type,
   Content-Length and a long-lived `Cache-Control` (ids are immutable random
   handles), plus `X-Content-Type-Options: nosniff` and
@@ -1584,7 +1615,8 @@ are never touched, and the item's `updated_at` is not bumped. Chat voice
 notes (`file` events) are outside this rule: the journal holds no transcript
 for them.
 
-**Journal-side transcription.** When the journal host has whisper configured
+**Journal-side transcription.** When the journal has a cloud transcriber
+(`MATRON_STT_AZURE_KEY`, see `POST /media`) or whisper configured
 (`MATRON_WHISPER_MODEL` — path to a whisper.cpp `ggml-*.bin`; optional
 `MATRON_WHISPER_CLI`, default `<model dir>/../build/bin/whisper-cli`;
 `MATRON_WHISPER_LANGUAGE`, default `en`; `ffmpeg` on `PATH`), a **user's**
