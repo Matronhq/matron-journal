@@ -1,6 +1,6 @@
 // HTTP surface of Coordinator routines (spec 2026-10-01 coordinator
 // routines): the list any device may read, the writes the user (a client
-// token) or the user's Coordinator may make, the delete only the user may,
+// token) or the user's Coordinator may make — create and delete included —
 // and `run`, which fires a routine now through the same path the sweep
 // uses (src/routines-sweep.js). Validation lives in routines.js; this layer
 // owns auth, the status mapping and the marker.
@@ -99,12 +99,14 @@ export async function handleRoutinesRoute(ctx, req, res, url, who) {
     return true
   }
   if (req.method === 'DELETE') {
-    // The user's list, the user's delete: an agent — the Coordinator
-    // included — may pause a routine, never remove it.
-    if (who.kind !== 'client') { json(res, 403, { error: 'forbidden' }); return true }
+    // The same gate as the other writes: the user, or the Coordinator
+    // naming its own conversation (Dan, 2 Oct: the Coordinator creates and
+    // deletes routines itself). The marker says who, as for a save.
+    const body = await readBody(req)
+    if (gate(db, who, res, body)) return true
     const routine = deleteRoutine(db, who.userId, key)
     if (!routine) return notFound(res)
-    emitRoutineMarker(ctx, who.userId, { routine, action: 'deleted', by: 'user', sender: senderOf(db, who) })
+    emitRoutineMarker(ctx, who.userId, { routine, action: 'deleted', by: byOf(who), sender: senderOf(db, who) })
     json(res, 200, { ok: true })
     return true
   }

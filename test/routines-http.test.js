@@ -65,7 +65,7 @@ test('GET /routines: any device kind reads the user\'s list; agents of another u
   assert.equal((await s.http('/routines/daily-sweep', { token: client })).json.routine.id, r.json.routine.id)
 })
 
-test('POST / PATCH / DELETE: the client may; an agent only as the Coordinator naming its own conversation; nobody but the user deletes', async (t) => {
+test('POST / PATCH / DELETE: the client may; an agent only as the Coordinator naming its own conversation', async (t) => {
   const { s, client, gene, coordDev } = await fleet(t, { connect: false })
   // Agent without convo_id, or naming a conversation it does not own, or the wrong one.
   assert.deepEqual(await s.http('/routines', { method: 'POST', token: coordDev.token, body: body() }), { status: 403, json: { error: 'forbidden', detail: 'not_coordinator' } })
@@ -90,15 +90,21 @@ test('POST / PATCH / DELETE: the client may; an agent only as the Coordinator na
   const p = await s.http('/routines/health', { method: 'PATCH', token: coordDev.token, body: { enabled: true, convo_id: 'coord' } })
   assert.equal(p.status, 200); assert.equal(p.json.routine.enabled, true); assert.ok(p.json.routine.next_at > Date.now())
   assert.equal((await s.http('/routines/health', { method: 'PATCH', token: client, body: { schedule: '*/5 * * * *' } })).status, 400, 'spacing rule on PATCH too')
-  // DELETE: agents 403 even as the Coordinator; the client 200 then 404.
-  assert.deepEqual(await s.http('/routines/health', { method: 'DELETE', token: coordDev.token, body: { convo_id: 'coord' } }), { status: 403, json: { error: 'forbidden' } })
-  assert.deepEqual(await s.http('/routines/health', { method: 'DELETE', token: client }), { status: 200, json: { ok: true } })
-  assert.equal((await s.http('/routines/health', { method: 'DELETE', token: client })).status, 404)
-  // Markers: saved (by agent), saved (by user), saved (patch), deleted — all into the Coordinator conversation, sender 'journal' for the row's own change.
+  // DELETE: the same Coordinator gate as the other writes (Dan, 2 Oct:
+  // the Coordinator creates and deletes routines itself).
+  assert.deepEqual(await s.http('/routines/health', { method: 'DELETE', token: coordDev.token }), { status: 403, json: { error: 'forbidden', detail: 'not_coordinator' } })
+  assert.deepEqual(await s.http('/routines/health', { method: 'DELETE', token: gene.token, body: { convo_id: 'g1' } }), { status: 403, json: { error: 'forbidden', detail: 'not_coordinator' } })
+  assert.equal((await s.http('/routines/health', { method: 'DELETE', token: gene.token, body: { convo_id: 'coord' } })).status, 404)
+  assert.deepEqual(await s.http('/routines/health', { method: 'DELETE', token: coordDev.token, body: { convo_id: 'coord' } }), { status: 200, json: { ok: true } })
+  assert.equal((await s.http('/routines/health', { method: 'DELETE', token: coordDev.token, body: { convo_id: 'coord' } })).status, 404)
+  assert.deepEqual(await s.http('/routines/daily-sweep', { method: 'DELETE', token: client }), { status: 200, json: { ok: true } })
+  assert.equal((await s.http('/routines/daily-sweep', { method: 'DELETE', token: client })).status, 404)
+  // Markers: saved (by agent), saved (by user), saved (patch), deleted by each — all into the Coordinator conversation, sender 'journal' for the row's own change.
   const m = markers(s)
   assert.deepEqual(m.map((x) => [x.convo_id, x.payload.name, x.payload.action, x.payload.by]), [
-    ['coord', 'daily-sweep', 'saved', 'agent'], ['coord', 'health', 'saved', 'user'], ['coord', 'health', 'saved', 'agent'], ['coord', 'health', 'deleted', 'user'],
+    ['coord', 'daily-sweep', 'saved', 'agent'], ['coord', 'health', 'saved', 'user'], ['coord', 'health', 'saved', 'agent'], ['coord', 'health', 'deleted', 'agent'], ['coord', 'daily-sweep', 'deleted', 'user'],
   ])
+  assert.equal(m[3].sender, 'agent:mavis'); assert.equal(m[4].sender, 'user:dan')
   assert.equal(m[0].sender, 'agent:mavis'); assert.equal(m[1].sender, 'user:dan')
   assert.equal(m[0].payload.routine_id, c.json.routine.id); assert.equal(m[0].payload.created, true); assert.equal(m[2].payload.created, false)
   // The cap: 409 blocked_by cap.
