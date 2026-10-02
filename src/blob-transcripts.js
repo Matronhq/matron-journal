@@ -11,7 +11,8 @@
 // too would put minutes of CPU per note on the journal host.
 //
 // Status on the row: NULL = never asked (the bridge does it, as before),
-// 'pending', 'done', 'failed'. Owner-scoped throughout: a job only ever
+// 'pending', 'done', 'failed'. 'done' stamps transcribed_at, from which
+// retention.js expires the audio (7 days by default), keeping the words. Owner-scoped throughout: a job only ever
 // reads the audio of the user who uploaded it.
 
 // Bounded backlog, per user and overall, so a burst of uploads cannot queue
@@ -64,7 +65,7 @@ export function makeBlobTranscripts({
   const perUser = new Map()
 
   const setPending = db.prepare("UPDATE blobs SET transcript_status='pending', transcript=NULL WHERE id=? AND owner_user_id=? AND transcript_status IS NULL")
-  const setDone = db.prepare("UPDATE blobs SET transcript_status='done', transcript=? WHERE id=? AND transcript_status='pending'")
+  const setDone = db.prepare("UPDATE blobs SET transcript_status='done', transcript=?, transcribed_at=? WHERE id=? AND transcript_status='pending'")
   const setFailed = db.prepare("UPDATE blobs SET transcript_status='failed', transcript=NULL WHERE id=? AND transcript_status='pending'")
 
   function pump() {
@@ -96,7 +97,7 @@ export function makeBlobTranscripts({
     }
     if (closed) return
     try {
-      if (text && String(text).trim()) setDone.run(String(text).trim(), blobId)
+      if (text && String(text).trim()) setDone.run(String(text).trim(), now(), blobId)
       else setFailed.run(blobId)
     } catch (err) {
       log.error(`blob-transcripts: write-back for ${blobId} failed`, err)

@@ -172,7 +172,10 @@ the machine-checkable version of this page.
   vocabulary plus the user's device names. Up to 4 jobs run at once, and at
   most 20 per user / 100 overall may be queued. A cloud transcriber also
   does item voice notes (below), reusing an upload-time transcript rather
-  than sending the same audio twice. Without a key nothing changes.
+  than sending the same audio twice. A chat voice note transcribed here has
+  its audio expired like an item's (`MATRON_VOICE_NOTE_TTL_DAYS` after
+  `blobs.transcribed_at`): its file events become tombstones carrying the
+  `transcript`. Without a key nothing changes.
 - `GET /media/:id` (Bearer) -> streams the blob with its Content-Type,
   Content-Length and a long-lived `Cache-Control` (ids are immutable random
   handles), plus `X-Content-Type-Options: nosniff` and

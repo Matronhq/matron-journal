@@ -78,6 +78,8 @@ test('a voice note is transcribed at upload; GET transcript waits for it and ret
   const done = await waiting
   assert.equal(done.status, 200)
   assert.deepEqual(done.json, { status: 'done', transcript: 'Deploy the journal' })
+  const stamped = s.db.prepare('SELECT transcribed_at FROM blobs WHERE id=?').get(up.media_id).transcribed_at
+  assert.ok(Number.isInteger(stamped) && Date.now() - stamped < 5000, 'done stamps transcribed_at (the 7-day audio clock)')
 })
 
 test('a failed transcription reads failed (the bridge then falls back to its own whisper)', async (t) => {
