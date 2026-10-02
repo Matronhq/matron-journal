@@ -258,18 +258,19 @@ export function runExpireVoiceNotes(db, { days = 7, now = Date.now() }) {
 //     reference": ws.js passes msg.blob_ref through unvalidated on text
 //     sends and agent publishes, so a broader exemption would let one stray
 //     blob_ref on a text event pin a blob out of the reaper forever;
-//   - item-thread attachments (item_comments.attachments names the blob, no
-//     event does) — not until Dan decides they may be pruned (tracker
-//     question of 2026-10-02); they ARE counted in the floor below and
-//     named in the warning, because on that date 803 MB of them were being
-//     reported as "tool logs / in-flight uploads";
+//   (Item-thread attachments — item_comments.attachments names the blob, no
+//   event does — ARE candidates, interleaved with chat attachments by the
+//   age of their oldest reference: Dan, 2026-10-02, "Reap items too". An
+//   entry is tombstoned in place: every field kept, blob_ref included since
+//   the apps decode it as a required string, plus expired:true; the item's
+//   updated_at is not bumped.)
 //   - FRESH orphan blobs — an upload sits orphaned between POST /media and
 //     the ws send or item comment that attaches it, so reaping it would
 //     corrupt an in-flight attachment. Orphans older than orphanGraceMs (a
 //     send that failed after its upload, a retried upload) are garbage no
 //     client can reach and go first, with no tombstone to write;
-//   - anything, when the un-reapable floor (tool_output blobs + item
-//     attachments + fresh orphans + blobs only non-attachment events name)
+//   - anything, when the un-reapable floor (tool_output blobs + fresh
+//     orphans + blobs only non-attachment events name)
 //     alone keeps the user at or above the low-water target: reaping can
 //     then never reach the target, so the pass must refuse and warn — with
 //     the floor broken down so the operator knows what to raise or shorten —
@@ -325,6 +326,23 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
      GROUP BY b.id
      ORDER BY oldestTs ASC`
   )
+  // Item-thread attachments: the blob's oldest comment, via one json_each
+  // pass over the owner's comments (item_comments is small: ~10k rows, ms).
+  // Entries already tombstoned (expired) name a deleted blob and fall out of
+  // the join by themselves.
+  const itemCandidates = db.prepare(
+    `WITH refs AS (
+       SELECT json_extract(j.value, '$.blob_ref') AS blob_ref, MIN(ic.created_at) AS ts
+       FROM item_comments ic, json_each(ic.attachments) j
+       WHERE ic.user_id = ? AND json_extract(j.value, '$.expired') IS NULL
+       GROUP BY 1)
+     SELECT b.id AS blobRef, r.ts AS oldestTs, b.size AS size
+     FROM blobs b JOIN refs r ON r.blob_ref = b.id
+     WHERE b.owner_user_id = ?
+       AND NOT EXISTS (SELECT 1 FROM events x WHERE x.blob_ref = b.id AND x.type = 'tool_output')`
+  )
+  const itemHolders = db.prepare(`SELECT id, attachments FROM item_comments WHERE user_id = ? AND attachments LIKE ?`)
+  const updateComment = db.prepare('UPDATE item_comments SET attachments=? WHERE id=?')
   // Orphans past the grace period: no event names the blob in its column
   // and no item comment names it in its attachments. The events probe is
   // the partial idx_events_blob_ref; the item probe materialises the CTE
@@ -344,8 +362,6 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
     `WITH ${ITEM_REFS_CTE}
      SELECT
        COALESCE(SUM(CASE WHEN EXISTS (SELECT 1 FROM events e WHERE e.blob_ref = b.id AND e.type = 'tool_output') THEN b.size END), 0) AS toolBytes,
-       COALESCE(SUM(CASE WHEN NOT EXISTS (SELECT 1 FROM events e WHERE e.blob_ref = b.id)
-                          AND EXISTS (SELECT 1 FROM item_refs r WHERE r.blob_ref = b.id) THEN b.size END), 0) AS itemBytes,
        COALESCE(SUM(CASE WHEN b.created_at >= ? AND NOT EXISTS (SELECT 1 FROM events e WHERE e.blob_ref = b.id)
                           AND NOT EXISTS (SELECT 1 FROM item_refs r WHERE r.blob_ref = b.id) THEN b.size END), 0) AS freshBytes
      FROM blobs b WHERE b.owner_user_id = ?`
@@ -361,15 +377,22 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
   const graceCutoff = now - orphanGraceMs
   for (const user of users) {
     const garbage = orphans.all(user.userId, graceCutoff)
-    const cands = candidates.all(user.userId)
+    // One list, oldest reference first, a blob once (a blob both a chat
+    // event and an item comment name keeps its older timestamp).
+    const byBlob = new Map()
+    for (const c of [...candidates.all(user.userId), ...itemCandidates.all(user.userId, user.userId)]) {
+      const prev = byBlob.get(c.blobRef)
+      if (!prev || c.oldestTs < prev.oldestTs) byBlob.set(c.blobRef, c)
+    }
+    const cands = [...byBlob.values()].sort((a, b) => a.oldestTs - b.oldestTs)
     const reapable = garbage.reduce((n, c) => n + c.size, 0) + cands.reduce((n, c) => n + c.size, 0)
     if (user.bytes - reapable >= target) {
       const floor = user.bytes - reapable
       const parts = floorParts.get(graceCutoff, user.userId)
-      const other = floor - parts.toolBytes - parts.itemBytes - parts.freshBytes
+      const other = floor - parts.toolBytes - parts.freshBytes
       console.warn(
         `retention: user ${user.userId} holds ${user.bytes} blob bytes but ${floor} are un-reapable ` +
-        `(${parts.toolBytes} in tool logs, ${parts.itemBytes} in item-thread attachments, ` +
+        `(${parts.toolBytes} in tool logs, ` +
         `${parts.freshBytes} in uploads under ${Math.round(orphanGraceMs / 3600000)}h old, ${other} named only by non-attachment events) ` +
         '— media reap skipped; raise the quota or shorten tool-log retention'
       )
@@ -415,6 +438,16 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
             expired: true,
           }
           updateEvent.run(JSON.stringify(tombstone), ref.user_id, ref.seq)
+        }
+        for (const h of itemHolders.all(user.userId, `%"blob_ref":"${cand.blobRef}"%`)) {
+          let atts
+          try { atts = JSON.parse(h.attachments) } catch { continue }
+          if (!Array.isArray(atts)) continue
+          let changed = false
+          for (const a of atts) {
+            if (a && a.blob_ref === cand.blobRef && !a.expired) { a.expired = true; changed = true }
+          }
+          if (changed) updateComment.run(JSON.stringify(atts), h.id)
         }
         deleteBlobRow.run(cand.blobRef)
       })()

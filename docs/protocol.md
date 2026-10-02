@@ -161,11 +161,14 @@ the machine-checkable version of this page.
   older than 24 h (no event and no item comment names the blob — a send that
   failed after its upload) and then their oldest `file`/`image` attachment
   blobs, until the footprint is back under `MATRON_MEDIA_REAP_LOW_PCT`
-  (default 70%). Never reaped: `tool_output` blobs, uploads under 24 h old
+  (default 70%). Item-thread attachments (`item_comments.attachments`) are
+  candidates alongside chat ones, ordered by the age of the blob's oldest
+  reference; a reaped entry is rewritten in place with every field kept
+  (`blob_ref` included) plus `expired: true`, and the item's `updated_at` is
+  not bumped. Never reaped: `tool_output` blobs and uploads under 24 h old
   (in flight between `POST /media` and the send or comment that attaches
-  them), and item-thread attachments (`item_comments.attachments`). When
-  those alone keep the user above the low-water mark the pass refuses and
-  logs the floor broken down by kind, deleting nothing. Attachment events
+  them). When those alone keep the user above the low-water mark the pass
+  refuses and logs the floor broken down by kind, deleting nothing. Attachment events
   are found through the `events.blob_ref` column, which agent `publish`
   frames of type `image`/`file` fill from `payload.blob_ref` when no
   top-level `blob_ref` is given (rows from before that fallback are
