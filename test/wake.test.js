@@ -341,6 +341,8 @@ test('the server remembers a refusal: roster and spawn_targets drop wakeable, a 
   spawn('s2')
   const err = await p.waitFor((f) => f.op === 'error' && f.ref === 'spawn_request')
   assert.equal(err.code, 'agent_unreachable')
+  // The refusal names the ask it refuses, not just the op.
+  assert.equal(err.request_id, 's2')
 })
 
 test('isWakeableDevice: a refusal stands for WAKE_REFUSAL_TTL_MS, then the box is tried again', () => {

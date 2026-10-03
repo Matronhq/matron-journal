@@ -171,6 +171,14 @@ const ROOM_OPS = new Set(['agent_invite', 'agent_join', 'agent_invite_ack', 'age
 // would pass loadRoom's own shape check; an invalid/oversized room_id is
 // raw inbound input and must never be reflected back. `msg` may be
 // absent/unparsed at the backstop, hence the null guard.
+// Same idea for request-keyed ops (spawn_request, spawn_targets…): `ref`
+// only names the op, so a bridge with two asks of one op in flight cannot
+// tell which one failed. Echoed only when it is a well-formed id.
+function requestIdEcho(msg) {
+  const rid = msg?.request_id
+  return typeof rid === 'string' && rid && rid.length <= RPC_ID_MAX_CHARS ? { request_id: rid } : {}
+}
+
 function roomIdEcho(msg) {
   const roomId = msg && ROOM_OPS.has(msg.op)
     && typeof msg.room_id === 'string' && msg.room_id && msg.room_id.length <= CONVO_ID_MAX_CHARS
@@ -643,7 +651,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
   const fail = (code, detail) => {
     conn.ws.send(JSON.stringify({
       kind: 'control', op: 'error', code, ref: msg.op,
-      ...roomIdEcho(msg), ...(detail ? { detail } : {}),
+      ...roomIdEcho(msg), ...requestIdEcho(msg), ...(detail ? { detail } : {}),
     }))
   }
   // Invite ops: validate a room id + load the row. Rooms are top-level
