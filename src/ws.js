@@ -14,7 +14,7 @@ import { expireContactAsks } from './contacts.js'
 import { expireGrantAsks } from './grants.js'
 import { onContactAskExpired, onGrantAskExpired } from './sharing-events.js'
 import { predictSpawnFallback } from './spawn-model.js'
-import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableBoxName } from './wake.js'
+import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableDevice } from './wake.js'
 import { coordinatorFor } from './coordinator.js'
 import { getMission } from './missions.js'
 import { sanitizeConvoStatus, upsertConvoStatus } from './convo-status.js'
@@ -1158,7 +1158,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // pending cap, not by hiding the box.
         const callerPrivate = isPrivateDevice(db, conn.deviceId)
         const boxes = db.prepare(
-          "SELECT id AS device_id, name, private FROM devices WHERE user_id=? AND kind='agent'"
+          "SELECT id AS device_id, name, private, wake_refused_at FROM devices WHERE user_id=? AND kind='agent'"
         ).all(conn.userId)
           .filter((d) => callerPrivate || d.private !== 1)
         const live = new Set(hub.connsOf(conn.userId).filter((c) => c.ws.readyState === 1).map((c) => c.deviceId))
@@ -1226,11 +1226,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             return {
               device_id: d.device_id, name: sanitizePeerText(d.name, PEER_NAME_CAP), online, folders,
               ...(d.device_id === conn.deviceId ? { self: true } : {}),
-              // Offline + a wake command configured + a name the command
-              // would take (wakeIfOffline's own rule) = asleep, not gone: a
-              // spawn or invite aimed at it starts the box (wake-before-
-              // spawn). Omitted when online or when nothing could wake it.
-              ...(!online && waker?.enabled && isWakeableBoxName(d.name) ? { wakeable: true } : {}),
+              // Offline + a wake command configured + a box the command
+              // would take and has not refused (wakeIfOffline's own rule) =
+              // asleep, not gone: a spawn or invite aimed at it starts the
+              // box (wake-before-spawn). Omitted when online or when nothing
+              // could wake it.
+              ...(!online && waker?.enabled && isWakeableDevice(d) ? { wakeable: true } : {}),
               // When the blocks below came from the journal's stored status
               // rather than a live reply (offline box), say how old they are.
               ...(reportedAt != null ? { reported_at: reportedAt } : {}),

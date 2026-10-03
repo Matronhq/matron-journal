@@ -104,9 +104,10 @@ export function revokeOwnedDevice(db, userId, deviceId) {
 
 // Cosmetic rename, owner-scoped like revokeOwnedDevice. Returns false when
 // the device is not this user's (or does not exist) — the caller cannot
-// distinguish the two, same anti-enumeration stance as revoke.
+// distinguish the two, same anti-enumeration stance as revoke. A remembered
+// wake refusal was for the old name, so it goes with it.
 export function renameOwnedDevice(db, userId, deviceId, name) {
-  return db.prepare('UPDATE devices SET name=? WHERE id=? AND user_id=?').run(name, deviceId, userId).changes > 0
+  return db.prepare('UPDATE devices SET name=?, wake_refused_at=NULL WHERE id=? AND user_id=?').run(name, deviceId, userId).changes > 0
 }
 
 // Tag-character twin of renameOwnedDevice: same owner scoping, same merged

@@ -24,6 +24,10 @@ const DEFAULT_DEBOUNCE_MS = 60000
 // other failure (ssh could not connect, killed) is treated as transient.
 const DEFAULT_FAIL_BACKOFF_MS = 10000
 const REFUSED_EXIT_CODE = 2
+// How long a remembered refusal stands. A Mac is refused again on the next
+// try and marked afresh; a dev VM refused by mistake (a host briefly down)
+// becomes wakeable again on its own instead of staying offline for good.
+export const WAKE_REFUSAL_TTL_MS = 24 * 60 * 60 * 1000
 // A box name is an incus instance name; the forced command on the far end
 // re-validates against live incus state, this is just the cheap local half.
 const BOX_NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/
@@ -31,10 +35,33 @@ const BOX_NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/
 // The local half of "can this device be woken at all": device names are
 // free text (a client may be called "Dan MacBook"), the wake command only
 // takes an incus instance name. wakeIfOffline and the roster/spawn_targets
-// `wakeable` flag share this so a listing never promises a wake the
-// command would refuse.
+// `wakeable` flag share this (via isWakeableDevice) so a listing never
+// promises a wake the command would refuse.
 export function isWakeableBoxName(name) {
   return typeof name === 'string' && BOX_NAME_RE.test(name)
+}
+
+// The full rule for a device row ({name, wake_refused_at}): a name the
+// command would take, AND the command has not already refused it. The name
+// check alone lets a Mac called `dan-mac` through, so a disconnected Mac
+// was listed asleep and spawns to it parked for a wake that never came;
+// the first refusal (exit 2) is remembered on the row (markWakeRefused)
+// and from then on the box is plainly offline.
+export function isWakeableDevice(dev, now = Date.now()) {
+  if (!dev || !isWakeableBoxName(dev.name)) return false
+  return dev.wake_refused_at == null || now - dev.wake_refused_at >= WAKE_REFUSAL_TTL_MS
+}
+
+// The waker only knows the box name, so its verdicts land on every agent
+// row with that name — the wake command sees nothing else either. Each
+// refusal restarts WAKE_REFUSAL_TTL_MS; a successful wake clears it (so does
+// a rename, see renameOwnedDevice).
+export function markWakeRefused(db, box) {
+  db.prepare("UPDATE devices SET wake_refused_at=? WHERE kind='agent' AND name=?").run(Date.now(), box)
+}
+
+export function clearWakeRefused(db, box) {
+  db.prepare("UPDATE devices SET wake_refused_at=NULL WHERE kind='agent' AND name=? AND wake_refused_at IS NOT NULL").run(box)
 }
 
 export function makeWaker({
@@ -42,6 +69,10 @@ export function makeWaker({
   debounceMs = DEFAULT_DEBOUNCE_MS,
   failBackoffMs = DEFAULT_FAIL_BACKOFF_MS,
   log = console,
+  // Told the command's verdict for a box: onRefused on exit 2, onWoken on
+  // exit 0 (server.js persists both on the device rows).
+  onRefused = null,
+  onWoken = null,
 } = {}) {
   const argv = (cmd || '').trim().split(/\s+/).filter(Boolean)
   const lastFired = new Map() // box -> ts of last spawn
@@ -65,6 +96,10 @@ export function makeWaker({
         child.stderr.on('data', (d) => { stderr += d })
         child.on('error', (err) => log.error(`wake: ${box}: spawn failed`, err))
         child.on('close', (code) => {
+          const verdict = code === 0 ? onWoken : code === REFUSED_EXIT_CODE ? onRefused : null
+          if (verdict) {
+            try { verdict(box) } catch (err) { log.error(`wake: ${box}: recording exit ${code} failed`, err) }
+          }
           if (code !== 0) {
             // Re-arm the debounce from the moment of failure: a transient
             // failure may retry after failBackoffMs, never on the very next
@@ -97,13 +132,13 @@ export function makeWaker({
 // spawn_request and approveSpawn use to decide whether waiting for the box
 // can ever pay off. False when it is already online, when no waker is
 // configured, or when the device is not a wakeable agent box (not an agent,
-// or a name the wake command would refuse — isWakeableBoxName).
+// or one the wake command would refuse or already has — isWakeableDevice).
 export function wakeIfOffline({ db, hub, waker }, userId, agentDeviceId) {
   if (!waker || !waker.enabled || !Number.isInteger(agentDeviceId)) return false
   const online = hub.connsOf(userId).some((c) => c.deviceId === agentDeviceId && c.ws.readyState === 1)
   if (online) return false
-  const dev = db.prepare('SELECT name, kind FROM devices WHERE id=? AND user_id=?').get(agentDeviceId, userId)
-  if (!dev || dev.kind !== 'agent' || !isWakeableBoxName(dev.name)) return false
+  const dev = db.prepare('SELECT name, kind, wake_refused_at FROM devices WHERE id=? AND user_id=?').get(agentDeviceId, userId)
+  if (!dev || dev.kind !== 'agent' || !isWakeableDevice(dev)) return false
   return waker.wake(dev.name) === true
 }
 

@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { makeWaker, wakeConvoAgent } from '../src/wake.js'
+import { makeWaker, wakeConvoAgent, wakeIfOffline, markWakeRefused, clearWakeRefused, isWakeableDevice, WAKE_REFUSAL_TTL_MS } from '../src/wake.js'
+import { deviceState } from '../src/consent.js'
 import { makeHub } from '../src/hub.js'
 import { openDb } from '../src/db.js'
 import { upsertConversation } from '../src/journal.js'
@@ -243,4 +244,109 @@ test('an agent publishing text into a room wakes an offline joined peer, and onl
   await client.waitFor((f) => f.kind === 'journal' && f.payload?.body === 'both of you: status?')
   await until(() => waker.calls.length === 2)
   assert.deepEqual(waker.calls, ['dev-b', 'dev-b'])
+})
+
+// --- refused boxes stay offline ---------------------------------------------
+//
+// A name check cannot tell a Mac called `dan-mac` from a dev VM, so a
+// disconnected Mac used to be listed asleep and spawns to it parked for a
+// wake the command refuses (exit 2). The refusal is now remembered on the
+// device row: listed offline, never woken, until a wake succeeds again.
+
+test('the waker reports exit 2 as refused and exit 0 as woken, nothing for other failures', async () => {
+  const seen = []
+  const mk = (code) => makeWaker({
+    cmd: `${process.execPath} -e process.exit(${code})`, log: quietLog,
+    onRefused: (box) => seen.push(['refused', box]),
+    onWoken: (box) => seen.push(['woken', box]),
+  })
+  mk(2).wake('dan-mac')
+  mk(1).wake('dev-x')
+  mk(0).wake('dev-j')
+  await until(() => seen.length === 2)
+  await settle()
+  assert.deepEqual(seen.sort(), [['refused', 'dan-mac'], ['woken', 'dev-j']])
+})
+
+test('a refused box is not wakeable until a wake succeeds, and the mark survives a reopened DB', async () => {
+  const dbPath = path.join(mkdtempSync(path.join(tmpdir(), 'wake-')), 'j.db')
+  let db = openDb(dbPath)
+  const hub = makeHub()
+  const dan = await createUser(db, 'dan', 'pw')
+  const mac = createAgent(db, dan.id, 'dan-mac')
+  const vm = createAgent(db, dan.id, 'dev-2')
+  const calls = []
+  const waker = { enabled: true, wake: (name) => { calls.push(name); return true } }
+
+  markWakeRefused(db, 'dan-mac')
+  assert.equal(wakeIfOffline({ db, hub, waker }, dan.id, mac.deviceId), false)
+  assert.equal(deviceState({ db, hub, waker }, dan.id, mac.deviceId), 'offline')
+  assert.equal(wakeIfOffline({ db, hub, waker }, dan.id, vm.deviceId), true, 'other boxes untouched')
+  assert.deepEqual(calls, ['dev-2'])
+
+  db.close()
+  db = openDb(dbPath)
+  assert.equal(wakeIfOffline({ db, hub, waker }, dan.id, mac.deviceId), false, 'remembered across a restart')
+
+  clearWakeRefused(db, 'dan-mac')
+  assert.equal(deviceState({ db, hub, waker }, dan.id, mac.deviceId), 'asleep')
+  assert.equal(wakeIfOffline({ db, hub, waker }, dan.id, mac.deviceId), true)
+  db.close()
+})
+
+test('the server remembers a refusal: roster and spawn_targets drop wakeable, a spawn fails agent_unreachable', async (t) => {
+  // The real wiring in server.js (makeWaker from MATRON_WAKE_CMD), with a
+  // wake command that refuses every box.
+  const prev = process.env.MATRON_WAKE_CMD
+  process.env.MATRON_WAKE_CMD = `${process.execPath} -e process.exit(2)`
+  let s
+  try { s = await startTestServer() } finally {
+    if (prev === undefined) delete process.env.MATRON_WAKE_CMD
+    else process.env.MATRON_WAKE_CMD = prev
+  }
+  t.after(() => s.close())
+  const dan = await createUser(s.db, 'dan', 'pw')
+  const mac = createAgent(s.db, dan.id, 'dan-mac')
+  const parent = createAgent(s.db, dan.id, 'eric')
+  const p = await makeWsClient(s.base, { token: parent.token, cursor: null })
+  await p.waitFor((f) => f.op === 'hello_ok')
+  t.after(() => p.close())
+  p.send({ op: 'convo_upsert', convo_id: 'parent-1', title: 'parent', session_state: 'running' })
+
+  const macOnRoster = async () => (await s.http('/roster', { token: parent.token })).json.agents.find((a) => a.device_id === mac.deviceId)
+  assert.equal((await macOnRoster()).wakeable, true, 'never refused yet: asleep')
+
+  // The first spawn still parks: nothing is known about the box until the
+  // command answers.
+  const spawn = (id) => p.send({
+    op: 'spawn_request', request_id: id, target_device_id: mac.deviceId,
+    from_convo_id: 'parent-1', workdir: '/Users/dan', task: 'do the thing',
+  })
+  spawn('s1')
+  const ack = await p.waitFor((f) => f.kind === 'spawn' && f.event === 'pending' && f.request_id === 's1')
+  assert.equal(ack.target_waking, true)
+  await until(() => s.db.prepare('SELECT wake_refused_at FROM devices WHERE id=?').get(mac.deviceId).wake_refused_at != null)
+
+  assert.equal((await macOnRoster()).wakeable, undefined, 'refused: offline')
+  // The caller is listed too and asked for its own folders: answer like a bridge.
+  p.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'recent_folders').then((req) => {
+    p.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { folders: [] } })
+  })
+  p.send({ op: 'spawn_targets', request_id: 'q1' })
+  const targets = await p.waitFor((f) => f.kind === 'spawn' && f.event === 'targets' && f.request_id === 'q1')
+  const box = targets.boxes.find((b) => b.device_id === mac.deviceId)
+  assert.equal(box.online, false)
+  assert.equal(box.wakeable, undefined)
+
+  spawn('s2')
+  const err = await p.waitFor((f) => f.op === 'error' && f.ref === 'spawn_request')
+  assert.equal(err.code, 'agent_unreachable')
+})
+
+test('isWakeableDevice: a refusal stands for WAKE_REFUSAL_TTL_MS, then the box is tried again', () => {
+  const now = 1_000_000_000_000
+  assert.equal(isWakeableDevice({ name: 'dan-mac', wake_refused_at: null }, now), true)
+  assert.equal(isWakeableDevice({ name: 'dan-mac', wake_refused_at: now - 1000 }, now), false)
+  assert.equal(isWakeableDevice({ name: 'dan-mac', wake_refused_at: now - WAKE_REFUSAL_TTL_MS }, now), true)
+  assert.equal(isWakeableDevice({ name: 'Dan MacBook', wake_refused_at: null }, now), false)
 })
