@@ -601,7 +601,7 @@ export function attachWs({
         if (!conn || !conn.registered) {
           ws.close()
         } else {
-          ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'internal', ref: msg && msg.op, ...roomIdEcho(msg) }))
+          ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'internal', ref: msg && msg.op, ...roomIdEcho(msg), ...requestIdEcho(msg) }))
         }
       }
     })
