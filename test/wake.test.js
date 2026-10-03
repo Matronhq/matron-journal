@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { makeWaker, wakeConvoAgent, wakeIfOffline, markWakeRefused, clearWakeRefused } from '../src/wake.js'
+import { makeWaker, wakeConvoAgent, wakeIfOffline, markWakeRefused, clearWakeRefused, isWakeableDevice, WAKE_REFUSAL_TTL_MS } from '../src/wake.js'
 import { deviceState } from '../src/consent.js'
 import { makeHub } from '../src/hub.js'
 import { openDb } from '../src/db.js'
@@ -341,4 +341,12 @@ test('the server remembers a refusal: roster and spawn_targets drop wakeable, a 
   spawn('s2')
   const err = await p.waitFor((f) => f.op === 'error' && f.ref === 'spawn_request')
   assert.equal(err.code, 'agent_unreachable')
+})
+
+test('isWakeableDevice: a refusal stands for WAKE_REFUSAL_TTL_MS, then the box is tried again', () => {
+  const now = 1_000_000_000_000
+  assert.equal(isWakeableDevice({ name: 'dan-mac', wake_refused_at: null }, now), true)
+  assert.equal(isWakeableDevice({ name: 'dan-mac', wake_refused_at: now - 1000 }, now), false)
+  assert.equal(isWakeableDevice({ name: 'dan-mac', wake_refused_at: now - WAKE_REFUSAL_TTL_MS }, now), true)
+  assert.equal(isWakeableDevice({ name: 'Dan MacBook', wake_refused_at: null }, now), false)
 })

@@ -24,6 +24,10 @@ const DEFAULT_DEBOUNCE_MS = 60000
 // other failure (ssh could not connect, killed) is treated as transient.
 const DEFAULT_FAIL_BACKOFF_MS = 10000
 const REFUSED_EXIT_CODE = 2
+// How long a remembered refusal stands. A Mac is refused again on the next
+// try and marked afresh; a dev VM refused by mistake (a host briefly down)
+// becomes wakeable again on its own instead of staying offline for good.
+export const WAKE_REFUSAL_TTL_MS = 24 * 60 * 60 * 1000
 // A box name is an incus instance name; the forced command on the far end
 // re-validates against live incus state, this is just the cheap local half.
 const BOX_NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/
@@ -43,16 +47,17 @@ export function isWakeableBoxName(name) {
 // was listed asleep and spawns to it parked for a wake that never came;
 // the first refusal (exit 2) is remembered on the row (markWakeRefused)
 // and from then on the box is plainly offline.
-export function isWakeableDevice(dev) {
-  return !!dev && isWakeableBoxName(dev.name) && dev.wake_refused_at == null
+export function isWakeableDevice(dev, now = Date.now()) {
+  if (!dev || !isWakeableBoxName(dev.name)) return false
+  return dev.wake_refused_at == null || now - dev.wake_refused_at >= WAKE_REFUSAL_TTL_MS
 }
 
 // The waker only knows the box name, so its verdicts land on every agent
-// row with that name — the wake command sees nothing else either. A refusal
-// keeps its first timestamp; a successful wake clears it (so does a rename,
-// see renameOwnedDevice).
+// row with that name — the wake command sees nothing else either. Each
+// refusal restarts WAKE_REFUSAL_TTL_MS; a successful wake clears it (so does
+// a rename, see renameOwnedDevice).
 export function markWakeRefused(db, box) {
-  db.prepare("UPDATE devices SET wake_refused_at=? WHERE kind='agent' AND name=? AND wake_refused_at IS NULL").run(Date.now(), box)
+  db.prepare("UPDATE devices SET wake_refused_at=? WHERE kind='agent' AND name=?").run(Date.now(), box)
 }
 
 export function clearWakeRefused(db, box) {
