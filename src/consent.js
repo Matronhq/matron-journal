@@ -9,7 +9,7 @@
 // consent-answer.js applies a decision, consent-http.js owns the routes.
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { getCoordinatorConvoId } from './coordinator.js'
-import { isWakeableBoxName } from './wake.js'
+import { isWakeableDevice } from './wake.js'
 import { predictSpawnFallback } from './spawn-model.js'
 
 export const CONSENT_REASON_MAX = 200
@@ -54,8 +54,8 @@ export function deviceState({ db, hub, waker }, userId, deviceId) {
   if (!Number.isInteger(deviceId)) return 'offline'
   const online = hub.connsOf(userId).some((c) => c.deviceId === deviceId && c.ws.readyState === 1)
   if (online) return 'online'
-  const dev = db.prepare('SELECT name, kind FROM devices WHERE id=? AND user_id=?').get(deviceId, userId)
-  if (waker?.enabled && dev && dev.kind === 'agent' && isWakeableBoxName(dev.name)) return 'asleep'
+  const dev = db.prepare('SELECT name, kind, wake_refused_at FROM devices WHERE id=? AND user_id=?').get(deviceId, userId)
+  if (waker?.enabled && dev && dev.kind === 'agent' && isWakeableDevice(dev)) return 'asleep'
   return 'offline'
 }
 

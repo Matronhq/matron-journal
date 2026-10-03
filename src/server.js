@@ -21,7 +21,7 @@ import { scheduleGithubRefresh } from './github-refresh.js'
 import { makeRpcBroker } from './rpc-broker.js'
 import { resolveWebDir, makeStaticHandler } from './static-http.js'
 import { makeWellKnown, parseList } from './well-known.js'
-import { makeWaker } from './wake.js'
+import { makeWaker, markWakeRefused, clearWakeRefused } from './wake.js'
 import { makeConfiguredTranscriber } from './cloud-transcribe.js'
 import { makeBlobTranscripts } from './blob-transcripts.js'
 import { makeItemTranscription } from './items-transcribe.js'
@@ -404,8 +404,13 @@ export function startServer({
   const hub = makeHub()
   const broker = makeRpcBroker()
   // Wake-on-message for idle-stopped agent boxes (src/wake.js). Off unless
-  // MATRON_WAKE_CMD is set (or a waker is injected by tests).
-  const resolvedWaker = waker || makeWaker()
+  // MATRON_WAKE_CMD is set (or a waker is injected by tests). Its verdicts
+  // are kept on the device rows, so a box the command refuses shows offline
+  // rather than asleep, across restarts.
+  const resolvedWaker = waker || makeWaker({
+    onRefused: (box) => markWakeRefused(db, box),
+    onWoken: (box) => clearWakeRefused(db, box),
+  })
   // A journal that cannot wake anything never waits for a wake — and its
   // orphan sweep TTL (derived in attachWs from this value) stays what it
   // always was, rather than growing by a window that can never be used.

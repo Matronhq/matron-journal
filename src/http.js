@@ -13,7 +13,7 @@ import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { searchMessages, searchChats, searchRecent, indexableBody } from './search.js'
 import { canReadConvo, canReadBlob } from './visibility.js'
 import { serveHelp } from './help.js'
-import { wakeIfOffline, isWakeableBoxName } from './wake.js'
+import { wakeIfOffline, isWakeableDevice } from './wake.js'
 import { handleItemsRoute } from './items-http.js'
 import { handleMissionsRoute } from './missions-http.js'
 import { handleSharingRoute } from './sharing-http.js'
@@ -399,17 +399,17 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
         const statuses = deviceStatuses(db, who.userId)
         const agents = db.prepare(
-          `SELECT id AS device_id, name, created_at, last_seen_at FROM devices
+          `SELECT id AS device_id, name, created_at, last_seen_at, wake_refused_at FROM devices
            WHERE user_id=? AND kind='agent'${filtered ? ' AND private=0' : ''} ORDER BY id`
-        ).all(who.userId).map((d) => ({
+        ).all(who.userId).map(({ wake_refused_at: wakeRefusedAt, ...d }) => ({
           ...d, connected: live.has(d.device_id),
           // A disconnected box is asleep, not gone, when this journal has a
-          // wake command AND the box's name is one the command would take
-          // (same rule wakeIfOffline applies): any message, invite or spawn
-          // aimed at it starts it again. Omitted (never false) when
-          // connected or unwakeable, so older readers see the shape they
-          // always did.
-          ...(!live.has(d.device_id) && waker?.enabled && isWakeableBoxName(d.name) ? { wakeable: true } : {}),
+          // wake command AND the box is one the command would take and has
+          // not refused (same rule wakeIfOffline applies): any message,
+          // invite or spawn aimed at it starts it again. Omitted (never
+          // false) when connected or unwakeable, so older readers see the
+          // shape they always did.
+          ...(!live.has(d.device_id) && waker?.enabled && isWakeableDevice({ name: d.name, wake_refused_at: wakeRefusedAt }) ? { wakeable: true } : {}),
           // Last capacity report (box_status), same shape as GET /devices.
           ...(statuses.has(d.device_id) ? { status: statuses.get(d.device_id) } : {}),
         }))

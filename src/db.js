@@ -591,6 +591,12 @@ export function openDb(path) {
   if (!deviceCols.some((c) => c.name === 'tag_char')) {
     db.exec('ALTER TABLE devices ADD COLUMN tag_char TEXT')
   }
+  // When the wake command last refused this box (exit 2: not a box it can
+  // start — a Mac, say). NULL = never refused, or woken since. See
+  // isWakeableDevice in src/wake.js.
+  if (!deviceCols.some((c) => c.name === 'wake_refused_at')) {
+    db.exec('ALTER TABLE devices ADD COLUMN wake_refused_at INTEGER')
+  }
   // An APNs token names a physical app install, so at most one device row may
   // hold it. Re-pairing creates a NEW device row, and until setApnsRegistration
   // learned to claim the token, every superseded row kept it: on dev-2 one Mac
