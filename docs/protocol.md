@@ -1,0 +1,4265 @@
+# Protocol reference (v1)
+
+This document is the operational reference for what the server implements
+today. Golden wire-protocol fixtures under `test/fixtures/conformance/` are
+the machine-checkable version of this page.
+
+## HTTP endpoints
+
+- `POST /login {username, password, device_name}` -> `{token, device_id, user_id}`.
+  Brute-force protection: 5 attempts/min per IP (429 `rate_limited`), plus per-username
+  lockout after 5 consecutive failures — 30s doubling per failure up to 1h, cleared by
+  a successful login (429 `locked_out` with `retry_after` seconds + `Retry-After` header).
+- `GET /snapshot` (Bearer) -> `{conversations, agents, seq}`. Each conversation row
+  carries `parent_convo_id` (`null` for a normal conversation; set for a
+  subagent child — see "Child conversations") and `agent_device_id` (the
+  agent box that manages it; `null` for legacy rows created before ownership
+  was recorded). A **room** — a conversation that has or ever had a
+  `convo_agents` row (any state) or a spawn naming it as its room (an
+  agent-chat room, see "Agent chat") — additionally carries
+  `participants`: the recorded owner plus every joined participant's device
+  id, deduped and ascending — one box chip per id, client-side. A room with
+  nobody joined (still pending, or dissolved) carries just `[owner]`, the
+  same value its dissolve `convo_meta` carried: clients keep a stored value
+  when a key is absent, so a room always sends it and a client that missed
+  the dissolve frame is corrected by its next snapshot. The key is omitted
+  for every non-room conversation, so the wire is unchanged for solo
+  sessions. For an ordinary agent, rows involving a private device neither
+  count as members nor make a conversation a room, so a room only a private
+  box was ever in reads as a plain conversation.
+  Every room row also carries
+  `participant_convos: [string]` — the room's participant **conversation**
+  ids, so a client can show a room under its participants' missions. It is
+  the deduped union of two halves, owner side first, each in journal
+  order (row creation; a member's own session before a spawn child) — so
+  the owner's sessions lead. **Owner side**: the session an owner invite
+  was sent from (its `initiator_convo_id`), recorded once that invite is
+  **accepted**, and each `started` spawn's parent `from_convo_id` — kept
+  for as long as the room has any joined row, because the owner stays in
+  `participants` until it dissolves the room. A re-invite of a member who
+  left does not take an accepted owner session away, and the re-invite's
+  own source session only joins the list if it is accepted. Dissolving the
+  room forgets them: a room repopulated later lists only the sessions its
+  new memberships bring. **Member side**: an invited member's
+  `target_convo_id`, a joiner's own `initiator_convo_id` (an `agent_join`
+  that named one), and a spawn's `child_convo_id` — each only while that
+  member's row is joined (for a spawn child, the very membership the spawn
+  created: a leave and re-invite of the device, even one that lands before
+  the target's `start` reply, does not bind the old child session to the
+  new membership). So a member that leaves drops its own session exactly
+  as it drops out of `participants`, and the owner's sessions go only when
+  the owner dissolves the room. The journal learns an owner's session only
+  from an accepted invite it sent or a spawn, so a room built purely from
+  joins lists the joiners' sessions alone. For an ordinary agent the same
+  privacy sieve applies: a row whose participant device is private, and any id a
+  private device owns, are dropped — judged by the conversation's
+  **current** owner when its row exists (a session handed to a private
+  device after the invite is dropped too), else by the device that
+  recorded it (a spawn child whose conversation has not landed yet). `[]`
+  when the room's sessions are unknown (a pre-3.5 invite that named none)
+  or nobody is joined (pending or dissolved); present on exactly the rows that carry `participants`.
+  Every row also carries `mission_id` — the conversation's **current**
+  mission, or `null` — and `mission_count`, the number of missions it was
+  ever linked to (active and ended; the header's "+n" is `mission_count − 1`).
+  For an ordinary agent both are sieved: a private-origin mission reads as
+  `mission_id: null` and is not counted (see *Missions & milestones →
+  Visibility*).
+  Every row also carries `auto_title` — the title the bridge last sent,
+  which `title` replaces with the mission's name while the session is on a
+  mission (see *Mission-named conversations*); `null` on the journal's own
+  rows.
+  `agents` is `[{device_id, name, tag_char}]` for the caller's
+  `kind='agent'` devices — the id→name table a client needs to render which
+  box owns a conversation, so no second round-trip is required. It obeys the
+  same privacy predicate as the conversation list: an ordinary (non-private)
+  agent caller never sees private boxes. Client devices are absent by
+  design — they are not boxes. Every agent caller — private
+  or not — gets `snippet` omitted from every row (it can carry `tool_output`
+  text, a credential surface); an ordinary (non-private) agent additionally
+  has private-owned conversations excluded entirely — see "Device privacy"
+  below.
+- `GET /convo/:id/messages?before_seq&limit` (Bearer) -> `{events}`. `limit`
+  is clamped to 1..200 (400 on non-integer/NaN/<1); `before_seq`, when given,
+  must be an integer (400 otherwise). Owner-only; missing or not-owned are
+  indistinguishable, both 404 `{error:'not_found'}` (never 403). For an
+  **agent** token specifically, "owner" is narrower than plain user-scoped
+  ownership: the same `authorizeAgentWrite` rule every other agent write
+  path uses (the conversation's recorded owner device, a `joined`
+  participant, or a legacy NULL-owner conversation) — a foreign convo of the
+  same user's OTHER agent device is 404, same shape as a missing/not-owned
+  one, never 403. This is the spec's "agents get roster metadata only, no
+  cross-agent transcript reads in v1" rule enforced on the one HTTP read
+  path that used to be only user-scoped; it's also exactly what a future
+  `agent_chat_read` needs ("allowed for joined agents"). Client tokens are
+  unaffected — still plain user-scoped ownership.
+- `GET /convo/:id/messages?around_seq&limit` — a second paging mode on the
+  same endpoint, mutually exclusive with `before_seq`: supplying both is
+  400 `{error:'bad_request'}`. `around_seq` must be an integer when given
+  (400 otherwise); `limit` uses the same 1..200 clamp as `before_seq`.
+  Returns up to `limit` events centered on the anchor: `floor(limit/2)`
+  strictly before `around_seq`, the remainder from `around_seq` up (so the
+  anchor row itself is included when it exists) — either end of the
+  conversation just yields a shorter window, never an error. This mode
+  carries its own, separate agent-authorization story from the
+  `before_seq`/default gate described above — see "Journal search" below
+  for the full two-regime explanation. On another user's conversation that
+  passes *Shared visibility*, `around_seq` reads return the prose window
+  (`text`, `diff`), `limit` clamped to 30, logged as `journal: shared
+  context read …`; `before_seq` paging on it stays 404.
+- `GET /search?q=&limit=&convo_id=` (Bearer, any authenticated device —
+  client or agent) -> `{hits: [{convo_id, title, seq, ts, sender, snippet,
+  live}]}`. Full-text search over the prose the journal has indexed (see
+  "Journal search" below for what is indexed and why). `q` is required,
+  must be non-empty after trimming, and is capped at 256 chars (400
+  `{error:'bad_request'}` otherwise); every whitespace-separated term is
+  double-quoted before it reaches FTS5's `MATCH` parser (embedded quotes
+  escaped by doubling) and the terms are ANDed together — an implicit-AND
+  query over literal terms, so raw FTS5 syntax a human might type (an
+  unbalanced quote, a bare `*`, a stray `NEAR`) can never throw; a query
+  with zero terms, or one that still fails to parse, is 400
+  `{error:'bad_request'}`, never a 500 with SQLite internals in it. `limit`
+  defaults to 20, clamped to 50 (400 on non-integer/NaN/<1, same convention
+  as `/convo/:id/messages`). `convo_id`, when given, narrows to one
+  conversation; an id belonging to another user (or a nonexistent one)
+  yields the same empty result set the user-scoping already guarantees for
+  a genuinely-unmatched query — there is no separate existence check, so
+  this is not an oracle for "does this convo_id exist." Results are ranked
+  by FTS5 `bm25()` (best match first), ties broken by `ts DESC`; `snippet`
+  is the FTS5 `snippet()` excerpt with matched terms wrapped in `**`...`**`
+  (markdown bold — agents and the apps both render markdown); `live` is
+  `true` when the hit's conversation has `session_state = 'running'`, a
+  hint to talk to the working agent (`GET /roster` / `agent_chat_start`)
+  rather than only read its transcript. Scoped to the caller's own user
+  (`search_messages.user_id`) regardless of device kind — open to both
+  agents (the feature's primary audience) and clients; an ordinary
+  (non-private) agent caller additionally has hits from private-owned
+  conversations excluded — see "Device privacy" below.
+  `exclude_subagents=1` drops hits in subagent child conversations
+  (`conversations.parent_convo_id` set) in every mode — the apps pass it,
+  since those are most of the index and rarely what a person is after.
+  `mode` selects the result shape (400 on anything else):
+  - `ranked` (default): the list above.
+  - `chats` and `recent` are the apps' modes (matron-apple, 2026-10-02)
+    and match under the **typed rule** rather than stems: a message
+    matches when it contains every typed word as typed; only the last
+    word, when `q` does not end in whitespace, also matches as the start
+    of a longer word (`"time" "cris"*`), so as-you-type results hold
+    between keystrokes and a trailing space finishes the word. These run
+    against `search_fts_plain`, an unstemmed (`unicode61`) mirror of the
+    same content table (db.js): on the porter index a finished "run"
+    finds "running" and a prefix `runn*` finds nothing, because the
+    stored token is "run". Case and diacritics still fold. `typedQuery()`
+    in `src/search.js` is the one parser. A database from before the
+    mirror existed gets it rebuilt once at open (seconds).
+  - `mode=chats` -> `{chats: [{convo_id, title, parent_convo_id,
+    parent_title, count, exact, live, top: {seq, ts, sender, excerpt}}]}`:
+    one row per conversation, at most `limit` (clamped to 50).
+    Conversations holding the query as an exact phrase (`exact: true`)
+    come first, then those containing every word; newest first (highest
+    seq) within each. `count` is every matching message in the
+    conversation, `top` the previewed one — the newest exact match when
+    there is one, else the newest match — and `excerpt` up to ~1 KB of
+    its body around the first literal occurrence (the phrase if present,
+    else the earliest word; the head of the body when neither is found
+    literally), `…`-marked where cut. Highlighting is the client's.
+    `convo_id` is ignored in this mode.
+  - `mode=recent` -> `{hits: [{convo_id, seq, ts, sender}]}`: flat, newest
+    first, no body or snippet — find-in-chat's match list, which the app
+    steps through by seq while already showing the messages. With
+    `convo_id` the clamp is 500 rather than 50, so a conversation's whole
+    match list fits.
+- `POST /media` (Bearer, client or agent) -> raw request body streamed to disk;
+  `{media_id, size, content_type, sha256, width?, height?}`. Content-Type header captured
+  (default `application/octet-stream`). For an `image/*` upload the journal
+  reads the displayed pixel size from the file's own header (PNG, JPEG with
+  EXIF orientation, GIF, WebP, HEIC/HEIF with `irot`) and answers it as
+  `width`/`height`; absent when it isn't an image it can size. 400 `{error:'empty'}` on a zero-byte
+  body; 413 `{error:'too_large'}` over `MATRON_MEDIA_MAX_BYTES` (default 50 MB);
+  413 `{error:'quota_exceeded'}` when the user's total blob bytes would exceed
+  `MATRON_MEDIA_USER_QUOTA_BYTES` (default 2 GiB) — checked up front (rejected
+  before the body streams) when already at the ceiling, and precisely after the
+  size is known otherwise (the just-written file is deleted on rejection).
+  Storage root: `MATRON_MEDIA_DIR` env or `<dirname of the db file>/media`,
+  sharded `<root>/<id[0:2]>/<id>`.
+  When the journal has a cloud transcriber (below), a **user's** `audio/*`
+  upload is also sent for transcription at once and the response carries
+  `transcript_status:'pending'`; read the words with
+  `GET /media/:id/transcript`.
+- `GET /media/:id/transcript[?wait=N]` (Bearer) -> `{status, transcript?}`,
+  the upload-time transcript of a voice note. `status` is `'none'` (never
+  transcribed here: no cloud transcriber, not audio, an agent's upload, or
+  the backlog was full), `'pending'`, `'done'` (with `transcript`) or
+  `'failed'`. `wait` (seconds, capped at 30) holds a `pending` answer until
+  the job settles, so a caller asks once instead of polling. Same read rule
+  and same 404 for missing/not-yours as `GET /media/:id`. A bridge that gets
+  a chat voice note asks this first and falls back to its own whisper on
+  anything but `done` (or a 404 from an older journal).
+
+  **Cloud transcription** (`src/cloud-transcribe.js`): set
+  `MATRON_STT_AZURE_KEY` (or `MATRON_STT_AZURE_KEY_FILE`, a file holding it)
+  to an Azure Speech resource key. Requests go to Azure's fast transcription
+  API (`/speechtotext/transcriptions:transcribe`, api-version 2025-10-15) at
+  `MATRON_STT_AZURE_ENDPOINT` (default
+  `https://northeurope.api.cognitive.microsoft.com`) with model
+  `MATRON_STT_AZURE_MODEL` (default `MAI-Transcribe-2`; empty = Azure's
+  standard model) and locale `MATRON_STT_LOCALE` (default `en`, or `en-GB`
+  for the standard model). The audio is converted to 16 kHz mono FLAC with
+  `ffmpeg` (must be on `PATH`), and the phrase list is the whisper prompt's
+  vocabulary plus the user's device names. Up to 4 jobs run at once, and at
+  most 20 per user / 100 overall may be queued. A cloud transcriber also
+  does item voice notes (below), reusing an upload-time transcript rather
+  than sending the same audio twice. A chat voice note transcribed here has
+  its audio expired like an item's (`MATRON_VOICE_NOTE_TTL_DAYS` after
+  `blobs.transcribed_at`): its file events become tombstones carrying the
+  `transcript`. Without a key nothing changes.
+- `GET /media/:id` (Bearer) -> streams the blob with its Content-Type,
+  Content-Length and a long-lived `Cache-Control` (ids are immutable random
+  handles), plus `X-Content-Type-Options: nosniff` and
+  `Content-Disposition: attachment` so an uploader-chosen content-type can never
+  render as active content on the API origin. Owner-only, with one exception:
+  a colleague under *Shared visibility* may fetch a blob that a prose event in
+  a shared conversation, or an attachment on a shared non-consent item, names
+  — provided the referencing row's owner owns the blob. Such reads are logged
+  (`journal: shared media read blob=… viewer=… device=…`). Missing, not-owned
+  and not-shared are indistinguishable, all 404 `{error:'not_found'}`.
+  A blob may also disappear later via the quota-pressure reaper: once a user's
+  total blob bytes reach `MATRON_MEDIA_REAP_HIGH_PCT` (default 90%) of the
+  quota, the retention scheduler deletes, oldest first, their orphan uploads
+  older than 24 h (no event and no item comment names the blob — a send that
+  failed after its upload) and then their oldest `file`/`image` attachment
+  blobs, until the footprint is back under `MATRON_MEDIA_REAP_LOW_PCT`
+  (default 70%). Item-thread attachments (`item_comments.attachments`) are
+  candidates alongside chat ones, ordered by the age of the blob's oldest
+  reference; a reaped entry is rewritten in place with every field kept
+  (`blob_ref` included) plus `expired: true`, and the item's `updated_at` is
+  not bumped. Never reaped: `tool_output` blobs and uploads under 24 h old
+  (in flight between `POST /media` and the send or comment that attaches
+  them). When those alone keep the user above the low-water mark the pass
+  refuses and logs the floor broken down by kind, deleting nothing. Attachment events
+  are found through the `events.blob_ref` column, which agent `publish`
+  frames of type `image`/`file` fill from `payload.blob_ref` when no
+  top-level `blob_ref` is given (rows from before that fallback are
+  repaired at boot). Each reaped event's payload is rewritten in place to a
+  tombstone — the original fields (`name`, `size`, `content_type`,
+  `caption`) with `blob_ref: null` and `expired: true` — so fresh syncs
+  render an "expired" attachment; clients that already hold the event learn
+  from the 404 on `GET /media/:id`.
+- `GET /help` (Bearer, any authenticated device) -> `text/markdown`. A
+  hand-maintained digest of this API surface (`src/help.js`), aimed at agent
+  callers that arrive with a token and no repo checkout — it names the
+  search/read/media endpoints, their params, and where the full spec lives.
+  Behind auth like the rest of the device surface: it describes the API, and
+  the unauthenticated internet doesn't need a map of it. Kept in sync with
+  this document by hand; update both when endpoints change.
+- `POST /push/register` (Bearer, client devices only — agents get 403
+  `{error:'forbidden'}`): `{apns_token, environment}` with `environment` in
+  `{'sandbox','prod'}` registers a device for push; `{apns_token: null}`
+  unregisters. 400 `{error:'bad_request'}` on a bad `environment` or a
+  missing/non-string `apns_token` (unless it's `null`). Response echoes the
+  device's current `push_prefs` (see `PUT /push/prefs` below); `GET
+  /devices` echoes the same per-device `push_prefs` in its roster.
+- `PUT /push/prefs` (Bearer, client devices only — agents get 403
+  `{error:'forbidden'}`): body is any subset of `{attention, done, activity}`
+  booleans — a partial merge, not a replace: only the given keys change, the
+  rest keep their stored value. 400 `{error:'bad_request'}` on an unknown
+  field or a non-boolean value for a known field. Response `{ok:true,
+  push_prefs}` echoes the full merged three-key shape. Defaults (NULL /
+  never set) are `{attention: true, done: true, activity: false}` — "buzz me
+  when the agent needs me or finishes; routine activity is opt-in."
+- `POST /password` (Bearer, client devices only — agents get 403
+  `{error:'forbidden'}`): `{old_password, new_password}`. `old_password` is
+  always verified against the real argon2 hash (no shortcuts); a wrong one
+  is 401 `{error:'bad_password'}`. `new_password` must be a string of at
+  least 8 characters, otherwise 400 `{error:'weak_password'}`; a
+  missing/non-string `old_password` is 400 `{error:'bad_request'}`. On
+  success the user's hash is rotated to a fresh argon2id hash; **existing
+  device tokens (including the one used to make this request) stay valid**
+  — a password change does not revoke sessions, only the credential used to
+  mint new ones via `/login`.
+- `GET /metrics` (Bearer, any valid device — client or agent, no admin
+  concept in v1) -> JSON: `{user: {head_seq, devices: [{device_id, kind,
+  cursor, lag, last_seen_at}]}, sockets_connected, journal_row_count,
+  db_file_size_bytes, push: {sent, failed, pruned, by_reason}}`. The `user`
+  section is scoped to the caller's own user only — never another user's
+  devices or username; the rest are global aggregates (bare numbers/
+  counters, safe for any authenticated caller). `push` mirrors the push
+  pipeline's in-memory counters (all zero when push is disabled).
+  `matron-admin status` prints the DB-derived subset of the same numbers
+  (per-user head seq, per-device kind/cursor/lag/last_seen_at, total events,
+  DB file size) directly from the SQLite file — connected-socket count and
+  APNs counters only exist in a running server's memory, so those are
+  `/metrics`-only. `user.devices` additionally omits private devices for a
+  filtered (ordinary, non-private) agent caller — same one-caller-rule
+  predicate as `/roster`/`/search`; see "Device privacy" below. A client or
+  a private agent caller sees every device, unchanged.
+- `GET /devices` (Bearer, client devices only — agents get 403
+  `{error:'forbidden'}`) -> `{devices: [{device_id, kind, name, created_at,
+  cursor, lag, last_seen_at, is_self, connected, push_prefs, status?, defaults?}]}`. The
+  caller's own user's devices only; `is_self` marks the requesting device.
+  `status` (agent devices, omitted until the box has reported) is the box's
+  last capacity report — `{reported_at, activity?, limits?, disk?,
+  account?}`, see "Box status" under the spawn section — so a client sees a
+  box's usage and allowances without ever having talked to it, and while it
+  is asleep; `reported_at` says how old the numbers are.
+  `defaults` (agent devices only, always present for them) is the box's
+  stored defaults for new sessions, `{agent, model, effort}`, each null
+  when unset — see *Box defaults*.
+  `push_prefs` is the per-device notification prefs (see `PUT /push/prefs`
+  above), always the full three-key shape (defaults filled in). Overlaps `/metrics`'
+  `user.devices` deliberately — metrics is observability (agents may read
+  it, no `name`), this is the management roster. `connected` is whether the
+  device has a live WebSocket right now — the "can I start a session on
+  this agent" signal; `last_seen_at` stays the offline story.
+- `GET /roster` (Bearer, any authenticated device — client or agent) ->
+  `{agents, conversations}`. Each agent carries `connected` (live socket
+  now) and, when not connected and the journal has a wake command,
+  `wakeable: true` — asleep, not gone: a message, invite or spawn aimed at
+  it starts the box (see "Wake-before-spawn"; never set for a name the wake
+  command would refuse, nor for a box it has already refused) — and its last `status` report when it has one (same
+  shape as `GET /devices`'s `status`, see "Box status" under the spawn
+  section). Targeting surface for agent chat rooms (spec:
+  2026-08-06 agent-to-agent chat design, Phase 2) — unlike `GET /devices`
+  (management, client devices only) this is deliberately open to agent
+  tokens too, and deliberately narrower. `agents`:
+  `[{device_id, name, created_at, last_seen_at, connected, defaults}]` — this user's
+  `kind='agent'` devices only (never client devices; no `cursor`/`lag`/
+  `push_prefs`); `connected` is the same live-WebSocket check `/devices`
+  uses; `defaults` is the box's stored `{agent, model, effort}` as on
+  `GET /devices` (see *Box defaults*). `conversations`:
+  `[{id, title, session_state, last_seq, summary, agent_device_id,
+  created_at, last_ts, mission_num, status?}]` — top-level conversations only
+  (`parent_convo_id IS NULL`; children are silenced sub-chats, never invite/
+  chat targets), ordered by `last_seq DESC`; `last_ts` is the newest
+  event's timestamp (`null` for an event-less conversation), same
+  derivation as `/snapshot`; `status` is the session's persisted header
+  `{reported_at, model?, context?, stall?, limits?}` (see the agent
+  `status` op), present only once the session has reported one;
+  `mission_num` is the number of the session's current mission, `null`
+  when it has none (or, for an ordinary agent, when that mission was born
+  on a private box). Scoped to
+  the caller's own user like every other read. See "Agent chat rooms" below
+  for what a room and `summary` are.
+- `POST /pair/start` (unauthenticated; shares /login's per-IP rate limit) ->
+  `{pair_code, poll_token, expires_in}`. Pending pairs are in-memory only
+  (10-minute TTL, 64 outstanding max — 429 `rate_limited` beyond either);
+  a restart forgets them.
+- `POST /pair/approve {pair_code, agent_name, tag_char?}` (Bearer, client
+  devices only) -> `{status:'approved'}`. Binds the pair to the approving
+  caller's user. Exactly once per pair: already-approved is 409
+  `{error:'conflict'}`; unknown and expired are indistinguishable 404s.
+  Codes are normalized (case/hyphens/spaces) before lookup. `tag_char` is
+  optional and goes through the same sieve as `POST /devices/:id/tag` (one
+  grapheme kept; empty sieves to null = automatic); a non-string non-null
+  value is 400 and leaves the pair pending. The minted device carries it
+  from birth — so a box named `dev-b` can show as `b` on every client
+  without a follow-up tag call.
+- `POST /pair/preview {pair_code}` (Bearer, client devices only) ->
+  `{requester_ip, expires_in}` for a pending pair — the approval screen shows
+  who is asking before the user approves. `requester_ip` is the IP that
+  called `pair/start`; `expires_in` is the pair's remaining TTL in seconds.
+  Read-only. Unknown, expired, and already-approved codes are
+  indistinguishable 404s; codes are normalized as in approve.
+- `POST /pair/claim {poll_token}` (unauthenticated) -> `{status:'pending'}`
+  until approval, then exactly once `{status:'approved', token, device_id}`
+  — the agent device row is minted at claim, not approve, so an unclaimed
+  pair leaves no DB residue. Second claim / unknown / expired: 404.
+- `POST /link/start` (Bearer, client devices only) -> `{link_code, expires_in}`.
+  Starts a device-link session for QR sign-in (TTL 120s). One active session
+  per starter device: a new start replaces the previous one. Store cap 64
+  pending -> 429 `{error:'rate_limited'}`.
+- `POST /link/claim {link_code, device_name}` (unauthenticated; shares
+  /login's per-IP rate limit) -> `{status:'claimed', claim_token, expires_in}`.
+  First claim wins: already-claimed is 409 `{error:'conflict'}`; unknown and
+  expired merge into 404. `device_name` is trimmed, non-empty, max 64 chars.
+  A successful claim extends the session TTL to at least 60s remaining.
+- `POST /link/poll {claim_token}` (unauthenticated, not rate-limited) ->
+  `{status:'pending'}` until the starter acts, then exactly once
+  `{status:'approved', token, device_id, user_id, username}` (the `client`
+  device is minted at this poll; the session is deleted first) or
+  `{status:'denied'}` (observed once, then the session is deleted). Unknown /
+  expired / already-observed: 404. `username` is included because link
+  claimants never type one.
+- `POST /link/status` (Bearer, client devices only; starter device only) ->
+  `{status:'waiting', expires_in}` or
+  `{status:'claimed', device_name, requester_ip, expires_in}`. 404 when the
+  device has no active session (none started, expired, or already resolved).
+- `POST /link/approve {link_code}` (Bearer, client devices only; starter
+  device only, and the code must match its active session) ->
+  `{status:'approved'}`. 409 `{error:'conflict'}` when the session is not in
+  the `claimed` state (nothing to approve yet, or already resolved); 404 for
+  unknown/expired/other-device.
+- `POST /link/deny {link_code}` (Bearer, same binding as approve) ->
+  `{status:'denied'}`. 404 for unknown/expired/other-device/already-resolved.
+
+## Journal search
+
+A prose-only full-text index over the journal, serving `GET /search` and
+the `around_seq` context mode on `GET /convo/:id/messages` (both above) —
+the feature that lets an agent look up "what happened with X" across a
+user's whole history instead of only the roster metadata a foreign
+conversation otherwise exposes.
+
+### What is indexed
+
+Two event types: `text` (`payload.body`) and `diff` (`payload.diff`,
+falling back to `payload.snippet` when `diff` is empty/absent). Everything
+else — `tool_output`, `prompt`, `file`, `image`, `permission_request`,
+`session_status`, and any future type — is never indexed. Diffs were kept
+in deliberately: "what did we change to fix X" is a real question, and
+dropping them later is a one-line change if it turns out to leak too much
+(a committed `.env` diff would land in the index verbatim).
+
+One function, `indexableBody(type, payload)` (`src/search.js`), is the
+single source of truth for this rule. It is called from three places: the
+live append path (inside `append()`'s own transaction in `src/journal.js`,
+so an event and its index row commit or roll back together), the startup
+backfill, and the `around_seq` foreign-agent context filter (see below) —
+one predicate, three consumers, zero drift between them.
+
+`tool_output` is excluded on purpose and is the load-bearing case: command
+output is retrieval noise for "why did we do this" questions, and it is
+where credentials land. Because `indexableBody` is the exact predicate the
+`around_seq` foreign-agent filter also uses, this is simultaneously the
+guarantee that an agent reading context around a search hit in a
+conversation it doesn't manage can never have a `tool_output` payload (or
+the client-only `permission_request` consent card, or anything else
+outside the prose set) placed in front of it — that guarantee rests on one
+shared function, not on two filters kept in sync by hand.
+
+### Index invariants
+
+- **Append-only, insert-trigger-only.** `search_messages` has an `AFTER
+  INSERT` trigger populating `search_fts` and nothing else — no update or
+  delete trigger exists. This mirrors `events` itself: rows are written
+  with a plain `INSERT`, never `INSERT OR REPLACE` (`REPLACE` silently
+  skipping a delete trigger is the exact corruption that hit the app-side
+  FTS index — matron-apple #106), and no `DELETE FROM events` exists
+  anywhere in the server. A prose-only index of an append-only table needs
+  an insert path and nothing else; if a delete path is ever added to
+  `events`, this schema needs revisiting.
+- **Retention never touches indexed rows.** The two retention passes under
+  "Retention (payload offload)" below only ever rewrite `tool_output`
+  payloads — purging live-streamed output after
+  `MATRON_TOOL_LOG_TTL_HOURS` and offloading older output to a blob after
+  `MATRON_RETENTION_DAYS` — and `tool_output` is never indexed. Neither
+  pass can therefore invalidate a `search_messages`/`search_fts` row; the
+  index has no reconciliation path with retention because it needs none.
+- **Backfill is resumable and self-healing.** A startup walk over `events`
+  by `rowid`, batched, indexing every row `indexableBody` accepts via
+  `INSERT OR IGNORE` (never `OR REPLACE`) against `search_messages`'
+  `UNIQUE(user_id, seq)` — so a re-run, or overlap with the live append
+  path, is a no-op rather than a duplicate or a corruption. Progress lives
+  in one row, `search_backfill_state(id=1, last_events_rowid)`, written
+  after each committed batch: an interrupted run resumes from there on the
+  next boot, and a completed run costs a single row read. `/search`
+  returns partial results until the walk finishes — acceptable, because any
+  event appended after the schema exists is indexed by the live path, so
+  the backfill cursor can never miss a row on the way to catching up.
+
+### Agent context access: two regimes
+
+`GET /convo/:id/messages` now has two distinct authorization stories for
+an agent token, selected by which query parameter is present:
+
+- **`before_seq` (or neither param)** keeps the Phase-2 gate described
+  above unchanged: an agent reads a conversation's full transcript (every
+  event type, unfiltered) only for one it manages or has `joined`
+  (`authorizeAgentWrite`) — a conversation outside that set stays 404,
+  exactly as before this feature existed.
+- **`around_seq`** is the search-context surface, and deliberately looser:
+  an agent MAY read a conversation outside that set — that is the point,
+  since a `/search` hit can be anywhere in the user's history — but the
+  response is limited to the set the index can see (`text` + `diff`
+  prose). `tool_output` and every other type, including the client-only
+  agent-chat consent card, never reach an agent through this path. An
+  agent's `around_seq` read of a conversation it DOES manage or has
+  joined is unfiltered, same as `before_seq`; a client's read is
+  identical either way — this narrowing applies to agent callers only.
+
+  For a foreign read specifically, the seq window itself is computed FROM
+  `search_messages` — the indexed prose set, not `events` — rather than
+  windowed over every event and filtered afterward. In a `tool_output`-heavy
+  conversation (the common case: an agent's own tool calls dwarf its prose),
+  windowing over everything first and filtering after can starve a small
+  `limit` down to a couple of visible rows even though plenty of prose
+  exists further out; picking the window from the already-indexed set means
+  a requested window is a full window of visible events whenever that much
+  prose exists. `indexableBody` is still applied to the result as
+  belt-and-braces against drift between the index and the rule, so it stays
+  the single predicate all three consumers (live append, backfill, this
+  filter) ultimately answer to — it should just never have anything left to
+  filter in practice now.
+
+  Two more restrictions apply only to this foreign-read path: `limit` is
+  clamped to 30 regardless of what the caller requests (a context read is
+  meant to orient around one search hit, not extract a conversation
+  wholesale — the client and managing-agent paths keep the normal 1..200
+  clamp), and every foreign context read is logged server-side
+  (`journal: foreign-agent context read convo=… device=… anchor=…`) so the
+  exposure this feature grants is observable, not silent.
+
+  This resolves what would otherwise be a contradiction with the design
+  spec's original wording, "reuses the endpoint's existing authorisation
+  unchanged": that holds for a client, but for an agent it means the
+  Phase-2 gate is specifically bypassed in `around_seq` mode, with the
+  indexed-window-plus-`indexableBody` filter substituted in as the narrower
+  replacement. Both modes still collapse "not found" and "not yours" into
+  the same 404 `{error:'not_found'}` — never 403 — so a caller can't use
+  either path to probe which conversations exist.
+
+## Verified authorship (`GET /said/<convo>:<seq>`)
+
+(`src/said.js`.) Some agents should act only on what their user asked
+for themselves. Such a guarded agent is often handed the request by
+another agent, as a citation `<convo>:<seq>`, and must not take that
+agent's word for what the user said. It asks the journal instead, with
+its own token, every time.
+
+**Who may ask:** any device of the account that owns the conversation,
+agent or client, on any box. The conversation need not be one the caller
+manages. A conversation of another account, an unknown seq and (for an
+ordinary agent) a private-owned conversation are all one 404. A
+malformed citation is a 400. Every answer is logged
+(`journal: said check …`).
+
+**What counts as the user's words** (`verified: true`):
+
+| Cited event | Words returned | `kind` |
+|---|---|---|
+| `text` with sender `user:<account>` (only a client `send` writes one) | `payload.body` | `typed` |
+| the same, flagged `fallback_for` (an item-reply copy for old clients) | refused: `item_reply_copy` | |
+| `file` with sender `user:<account>` and audio `content_type` | the blob's transcript, if the journal's own transcriber wrote it (`blobs.transcript_status = 'done'`; the job never runs for an agent's upload). Once the audio has expired, the transcript retention moved onto the event, but only when it carries `transcript_by: 'journal'`. Retention stamps it only when the words were the blob's own; an item attachment's transcript, which an agent may have written, stays unstamped | `voice` |
+| the same, never transcribed by the journal (a bridge did it) | refused: `voice_not_transcribed_by_journal`, unless it has a typed caption | |
+| `file`/`image` with a caption | the caption | `typed` |
+| an agent's `text` starting `[Voice note transcription]:` (the bridge's copy) | the user's own voice note before it, in the same conversation and within a day, whose journal transcript is exactly those words. The answer's `seq` is the note, and `cited_seq` is the copy | `voice` |
+| any other agent event | refused: `agent_message` | |
+
+The words returned always come from the user's own event or the
+journal's own transcript, never from an agent's copy. A forged copy can
+therefore only point at something the user really said, and the answer
+carries that message's real `ts`.
+
+**Response:**
+
+```json
+{ "verified": true, "convo_id": "…", "seq": 120, "cited_seq": 122,
+  "ts": 1767225600000, "author": "user:alice", "kind": "voice",
+  "text": "Please find last month's invoice from the printer.",
+  "before": { "seq": 118, "sender": "agent:box-a", "text": "…" } }
+{ "verified": false, "convo_id": "…", "seq": 125,
+  "sender": "agent:box-a", "reason": "agent_message" }
+```
+
+`before` is the last prose event before the user's message (up to 4000
+characters), with its sender. It is context for a reply like "yes, do
+that", never the user's words. Show it as an agent's text, as with the
+question behind an item tap.
+
+**What makes it unforgeable:**
+- The sender is set by the journal from the device token. Only client
+  (app) devices write `user:` events.
+- Events are never edited, except by retention's attachment tombstones
+  (voice-note expiry and the quota reaper). A tombstone is stamped
+  `transcript_by: 'journal'` only when it carries the blob's own journal
+  transcript. A `transcript_by` in the original payload is always dropped.
+- Only the journal writes `blobs.transcript`.
+- Nothing is signed, because the caller asks the journal directly and the
+  answer never passes through an agent.
+- Replay is the caller's judgement: the answer gives the exact words and
+  their time, and the caller checks they cover this request.
+
+**Item voice replies:** an item comment's audio attachment carries
+`transcript_by: 'journal'` when the journal's own job wrote its
+transcript, and `'agent'` when a bridge's `PATCH` wrote or overwrote it.
+Treat a voice reply as the user's words only with the `journal` stamp.
+Rows from before the stamp carry neither, and don't count.
+
+
+## WebSocket
+
+- `WS /ws`: first frame `{op:'hello', token, cursor}` (cursor null = live-only).
+  Server: `hello_ok {seq, device_id, name, coordinator_convo_id, settings, pins?, box_defaults?}` (`settings` is the `GET /settings` view, see *User settings*), then journal frames `> cursor`,
+  then live. `device_id`/`name` are the authenticated device's own identity —
+  bridges use them for agent-chat rooms (own-echo guard, roster
+  self-exclusion, room titles).
+  `coordinator_convo_id` is the user's Coordinator (see *Coordinator*), or
+  null — null too for an ordinary agent when that conversation is
+  private-owned. `GET /snapshot` carries the same key. `pins` (clients
+  only) is the user's pinned desk chats (see *Pinned desk chats*).
+  `box_defaults` (agents only, always present for them) is the connecting
+  box's own `{default_agent, default_model, default_effort}`, nulls when
+  unset (see *Box defaults*).
+  If the replay gap (`head_seq - cursor`) exceeds `MATRON_MAX_REPLAY`
+  (default 50000), the server sends `{kind:'control', op:'snapshot_required'}`
+  instead of replaying and closes the socket with code `4009` — the client
+  wipes its local store, calls `GET /snapshot`, and reconnects with the
+  fresh cursor (spec §6). Journal rows are never deleted, so this is an
+  efficiency valve, not a data-loss boundary.
+  Client ops: send (type text, or file/image with a top-level blob_ref from a
+  prior POST /media — payload mirrors the agent-publish media shape),
+  prompt_reply, read_marker, ack, viewing.
+  The journal stores a `send` payload as given; these keys are conventions
+  the apps and bridges share, not checked here:
+  - Media payload: `{blob_ref, name, content_type, size, caption?,
+    batch_id?, batch_index?, batch_total?}`. `caption` is the text the user
+    typed with the attachment; the chat list snippet prefers it.
+  - A **voice note** is a `file` whose `content_type` is `audio/*`. There is
+    no separate type.
+  - **One message, several frames.** A send of two or more attachments
+    stamps every frame with the same `batch_id`, its 1-based `batch_index`
+    and the `batch_total`; the caption rides on index 1 only. The bridge
+    gathers the frames into one agent turn.
+  - **A voice note sent with the composer's draft** is frame 1, carrying
+    the typed text as its `caption`, followed by the staged attachments as
+    frames 2…N in the same batch. With no attachments it is a single
+    captioned frame with no batch keys. The agent gets the typed text, then
+    the transcript, then the attachments, as one turn.
+  Agent ops: convo_upsert, publish, stream (ephemeral), stream_append,
+  finalize, activity (ephemeral), status (ephemeral, cached). `read_marker`
+  is available to both kinds:
+  an agent (bridge) connection may advance its user's read marker too —
+  e.g. after mirroring the user's own message into the journal, so that
+  mirrored round-trip doesn't inflate the unread badge.
+  `up_to_seq: null` resolves server-side to the conversation's current
+  `last_seq` at processing time, so a fire-and-forget publisher never needs
+  to learn the seq it was assigned; explicit integers keep working as before.
+- `viewing {convo_id}` / `viewing {convo_ids}` tells the server which
+  conversations this connection has on screen; viewing-scoped ephemerals
+  (`stream`, `stream_append`, `activity`, `status`) go only to connections
+  viewing that conversation, and a device viewing it gets no push for it.
+  Each connection views a SET of conversations:
+  - `convo_ids: string[]` (optional) is the full set — e.g. the Coordinator
+    panel beside a chat, or a chat sheet over another chat. Each id a
+    non-empty string ≤ 128 chars; duplicates are collapsed; at most 4
+    distinct ids; `[]` views nothing. Anything else (not an array, a
+    non-string / empty / oversized id, more than 4) → `bad_request` with
+    `ref: 'viewing'`, and the connection's set is left unchanged. The
+    catch-up (tool-stream `sync` frames + cached `status`, see below) is
+    sent only for conversations newly added to the set — plus `convo_id`
+    when it is sent alongside `convo_ids` and is in the set, even if it was
+    already viewed. Clients send `convo_id` (the chat just opened or needing
+    a resync) with the full `convo_ids` to force its resync without
+    dropping and re-adding it.
+  - Without `convo_ids`, `convo_id` (string|null) sets the set to
+    `{convo_id}` or `{}` — the original single-conversation form, unchanged.
+    It still sends the catch-up on every `viewing`, even for the
+    conversation already viewed: clients re-send it to force a resync.
+  When both keys are present, `convo_ids` defines the set.
+- Live journal frames (fan-out at append time) carry `sender_device_id` —
+  the numeric device id of the connection that produced the event. Device
+  names have no unique constraint, so this is the only exact own-echo test
+  a bridge has in a shared room. Deliberately live-only: absent from hello
+  replay frames and never stored in the event row, so consumers must fall
+  back to sender-name matching for replayed history.
+- Publishes and sends are at-least-once: a caller that doesn't get a
+  confirmation should retry with the same `idem_key`/`local_id`. A deduped
+  retry gets NO dedicated confirmation frame — convergence is observed via
+  the journal frame carrying the event, which carries the same `seq` on
+  every delivery (original or retried).
+- Conversation ids are a global primary key across all users, not scoped to a
+  user or device. Bridges MUST mint globally unique ids — Claude session
+  UUIDs are the convention.
+- `convo_upsert` appends a `convo_meta` journal event
+  (`payload:{title, auto_title, parent_convo_id, agent_device_id, repo}`, sender = the agent device, e.g.
+  `agent:box-2`) whenever it changes an existing conversation's title or
+  `auto_title` (see *Mission-named conversations*), sets
+  a non-empty title at creation, or creates a child (`parent_convo_id` set,
+  even titleless — the linkage must ride the journal, or a live client would
+  list the child as a normal conversation until its next `/snapshot`) — so
+  other devices learn renames and child linkage live instead of only via
+  `/snapshot`. No event otherwise (unchanged/omitted title, state-only
+  upserts on existing conversations). `agent_device_id` is the upserting
+  connection's own device — the same id `convo_upsert` records on the row —
+  so a live client can attribute a brand-new conversation to its box without
+  waiting for the next `/snapshot`.
+- `convo_upsert` accepts an optional `repo`: the canonical `host/org/name`
+  of the session's git remote (lower-cased host and org, e.g.
+  `github.com/matronhq/matron-journal`; regex
+  `^[a-z0-9.-]+/[a-z0-9_.-]+/[A-Za-z0-9_.-]+$`, ≤ 256 chars). Absent leaves
+  the stored value alone, `null` clears it, anything else is `bad_request`.
+  A change appends a `convo_meta` carrying the new `repo`; `/snapshot`
+  conversations carry `repo` too (`null` when unknown). The journal derives
+  `repo_scope` (`host/org`) from it — the unit shared visibility is decided
+  on (see "Shared visibility").
+- Room membership changes append a server-authored `convo_meta` (sender
+  `journal`) whose payload is just `{participants, participant_convos}` —
+  the same owner-plus-joined array `/snapshot` carries, and the room's
+  participant conversation ids (see `/snapshot` above for the rule) — so
+  live clients re-chip a
+  room the moment an invite is accepted, a spawn room appears (there it
+  rides the creation `convo_meta` alongside `title`), a spawn starts (the
+  child's id is first known then; it rides the retitle `convo_meta` when
+  there is one), a participant leaves,
+  or the owner dissolves the room. Every `convo_meta` that carries
+  `participants` carries `participant_convos` too, and a present value
+  replaces the stored one. **Privacy:** this frame is composed once and
+  fanned unsieved — to the user's clients and to the room's agent
+  connections (recorded owner plus joined members, live and on hello
+  replay) — exactly like `participants` in the same frame. A room member
+  therefore receives every member's session id, a private box's included,
+  whereas `/snapshot` applies the private-device sieve for an ordinary
+  agent. The ids grant nothing: every read/write path still refuses a
+  private-owned conversation to an ordinary agent. A per-connection payload
+  sieve in the hub would be needed to close this; it is not done. Emitted only when membership actually
+  changed: refusals and repeat dissolves append nothing. Clients treat every
+  `convo_meta` key independently; a membership-only payload leaves
+  title/parent/owner untouched.
+- `device_meta` — `{kind:'device_meta', device_id, name, tag_char}`, sent to
+  a user's **client** sockets when `POST /devices/:id/rename` or
+  `POST /devices/:id/tag` succeeds. The frame always carries the device's
+  full current meta (a rename repeats the standing `tag_char`, a tag change
+  repeats the standing `name`), so a roster built from frames alone never
+  loses either half. Transient: not
+  a journal event, carries no seq, and is never replayed. Recovery for a
+  client that misses one depends on the renamed device's kind, because every
+  kind may be renamed but `/snapshot`'s `agents` list carries only agent
+  boxes: an **agent** rename is picked up from that list on the next
+  `GET /snapshot`; a **client** rename appears only in `GET /devices`, which
+  lists every device kind, so a client that renders other client devices
+  re-reads the roster there. Agent connections never receive `device_meta` —
+  a box keeps no roster.
+- `convo_upsert` accepts an optional `parent_convo_id` linking a durable child
+  conversation to its parent (subagent sub-chats). It is a non-empty string
+  (id length cap 128; malformed → `bad_request`), **set once at creation and
+  immutable afterwards**: a later upsert that omits it does not clear it, and
+  one carrying a different value does not change it. The referenced parent need
+  not exist yet — ordering between a child's upsert and its parent's is not
+  guaranteed, so the reference is stored as-is. `parent_convo_id` is exposed
+  wherever conversation metadata already flows: the `convo_meta` payload above
+  (so it rides hello replay) and each `/snapshot` conversation row (`null` for
+  normal conversations). See "Child conversations" below.
+- `convo_upsert` accepts an optional `summary` (string, ≤1000 chars —
+  `bad_request` over the cap): a rolling 2-3 sentence conversation summary
+  the owning bridge maintains as a targeting aid for `GET /roster` (see
+  "Agent chat rooms" below). Same don't-clobber discipline as `title`/
+  `parent_convo_id`: only an upsert that carries a non-null `summary`
+  changes the stored value; omitting it leaves the existing summary
+  untouched. Unlike a title change, a summary change never appends a
+  `convo_meta` event — it's roster-read material, not something a live
+  client needs to learn mid-conversation.
+- Agent delivery scoping: `convo_upsert` records the upserting agent device
+  as the conversation's owner (`agent_device_id`). Ownership is
+  last-writer-wins **except** for a guest: a device that has ever appeared
+  in `convo_agents` for this conversation (`invited`, `joined`, `refused`,
+  `left`, or `expired` — any state at all) never becomes the recorded owner
+  on upsert, so a room participant's own housekeeping upserts can't steal
+  delivery ownership from the room's real owner (spec: agent chat phase 2,
+  the "ownership no-steal" fix). A device with no participant row keeps the
+  old takeover behavior — a re-paired bridge gets a new device id and must
+  still be able to reclaim its own sessions. Journal frames for an owned
+  conversation are delivered to that owner device **and** every currently-
+  `joined` participant (see "Agent chat rooms" below); client devices always
+  receive every frame. A conversation with no recorded owner (rows
+  predating the column, or a bridge that hasn't re-upserted yet) keeps
+  legacy broadcast-to-all-agents delivery, so multi-bridge fleets migrate
+  without a flag day. Hello replay (the `cursor`-driven catch-up above)
+  applies the identical owner-or-joined-participant predicate per
+  conversation for an agent connection, so a joined participant catching up
+  after a disconnect sees the room's backlog too, not just live traffic
+  from the moment it joined.
+- **Room-upsert ownership gate.** Before `convo_upsert` reaches the
+  ownership no-steal logic above, the server checks: if the conversation
+  already exists **under the caller's own user**, has at least one
+  `convo_agents` row (any state — the conversation is a "room"), and its
+  recorded owner (`agent_device_id`) is non-NULL and different from the
+  upserting device, the WHOLE upsert is rejected with `{code:'forbidden',
+  detail:'only the room owner may upsert a room'}` — no title/state/summary
+  change is applied, not even a non-ownership-changing one. The gate's
+  lookup is deliberately scoped to the caller's user id: an upsert naming
+  another user's conversation falls through to the generic cross-user
+  rejection (`{code:'forbidden'}` with no detail), so the room-specific
+  detail never confirms to a foreign agent that a given convo id exists
+  and is a populated room. This is stricter than the no-steal rule
+  above: a guest used to be allowed to upsert a room's title/session_state
+  (just never reassign its ownership); now, once a room has ANY
+  participant history, only its recorded owner may upsert it at all —
+  joined guests and uninvited strangers alike, since either one's own
+  housekeeping upsert would otherwise flap title/session_state/summary
+  that the room's creator owns. A participant-less conversation (no
+  `convo_agents` rows at all) keeps the old last-writer-wins takeover
+  behavior — a re-paired bridge with a new device id can still reclaim its
+  own sessions — **except when the recorded owner is a private device**
+  (see "Device privacy" below): there, an ordinary caller's takeover is
+  refused instead, and a conversation with no recorded owner (legacy NULL)
+  stays writable by anyone. Accepted trade-off for v1: a re-paired owner
+  (new device id after a bridge restart pairs fresh) can no longer reclaim
+  a room it created once that room has participant history, because the
+  gate sees a mismatched non-NULL owner and a populated `convo_agents`
+  table — same "needs a fresh invite" story as any other stranger. The
+  ownership no-steal predicate in `upsertConversation` itself still runs
+  underneath as belt-and-braces for any caller that reaches it directly
+  (e.g. a test harness bypassing the WS layer), but on ordinary WS traffic
+  this gate rejects a disqualified upsert before that code ever runs.
+
+  **Operational trap: re-pairing a private bridge onto a fresh device id.**
+  The private-owner guard checks the NEW connection's own `private` flag,
+  not any memory of the old device — so whether a re-paired bridge can
+  reclaim its own participant-less conversations depends entirely on how
+  its new device id acquires privacy, and the two paths behave very
+  differently:
+  - **`MATRON_AGENT_PRIVATE` (bridge-side env var) self-heals.** The bridge
+    asserts `private` on every `hello`, and `hello` always completes before
+    any op (including `convo_upsert`) is processed on that connection — so
+    if the env var travels with the re-pair, the fresh device is marked
+    private before its first upsert ever reaches the guard, and reclaiming
+    its old sessions just works, no operator action needed.
+  - **An admin PIN on the OLD device id does not transfer.** `matron-admin
+    device private <id> on` pins one specific `devices` row; a re-pair
+    mints a brand-new row that starts unpinned and `private=0` by default
+    (see the schema default above). If the operator relied on the pin
+    rather than the env var, the new device is *ordinary* the moment it
+    connects: its `convo_upsert`s on the old private-owned conversations
+    return `forbidden`, ownership never transfers, and that history is
+    effectively read-only to the new device until an operator either runs
+    `matron-admin device private <new_id> on` or ensures the env var is set
+    so the next re-pair self-heals instead.
+- Agent write authorization: `publish`, `finalize`, `stream`,
+  `stream_append`, `activity`, and `status` all gate on the same rule
+  (`authorizeAgentWrite`) — the agent device must be the conversation's
+  recorded owner (`agent_device_id`), a `joined` participant (`convo_agents`
+  state=`'joined'`), or the conversation must have no recorded owner at all
+  (legacy NULL, broadcast-era rows — any of the user's agent devices may
+  write there). Anything else — a different agent device's conversation the
+  caller was never invited into, or one it was invited into but hasn't
+  accepted / has since left / has expired — fails closed as
+  `{kind:'control', op:'error', code:'forbidden', ref:<op>}` (`publish`/
+  `finalize` add `detail:'not a participant of this conversation'`).
+  `convo_upsert` and `read_marker` are deliberately NOT gated by this rule
+  (`authorizeAgentWrite`'s owner-or-joined-participant test) — but each has
+  its own, narrower gate instead, not a free pass:
+  - `convo_upsert` is how a device becomes an owner or a guest in the first
+    place, so it can't require the very standing it's used to establish —
+    but it is not ungated: see "Room-upsert ownership gate" above for the
+    populated-room case and "Device privacy" below for the private-owner
+    takeover guard layered on top of it for a participant-less room.
+  - `read_marker` stays scoped to the conversation's owning user only — a
+    bridge may mark its user's own messages read without being `joined` —
+    but as of "Device privacy" below, an ORDINARY agent caller marking a
+    conversation whose recorded owner is a private device, that the caller
+    is not a known participant of (`isKnownParticipant`), gets the same
+    `forbidden` its own unknown-convo-id path already returns. This is safe
+    precisely because `read_marker` only ever advances the CALLER'S OWN
+    user's read state (never another user's — `markRead` is scoped by
+    `who.userId` like every other op) and writes no message content of any
+    kind: there is no content to steal or forge, and no way to use it to
+    gain or fake participation in a room — the privacy gate exists to close
+    an *existence-oracle* and *unwanted-write* hole, not a content-leak one.
+- Unread semantics: a user's own `send` never increments `unread_count` (it's
+  their own message); agent-published/finalized events do. `read_marker`
+  recomputes `unread_count` from events after `up_to_seq`, so
+  `up_to_seq >= last_seq` always resets it to 0. Certain event kinds are
+  never counted toward unread: `convo_meta` (a rename), `summary` (TOC metadata),
+  and `edit` (not new activity).
+- `summary` events: agent-publishable message kind carrying `{toc, detail, model}`
+  (payload is opaque to the server — no field-level validation or size caps
+  enforced; the server only checks the payload is a non-null object; any
+  truncation is bridge-side). TOC summaries are derived metadata: journal-synced
+  (fans out and replays to all devices), never FTS-indexed, never increment
+  `unread_count`, and never trigger APNs push (journal-sync-only, like
+  `convo_meta` — clients learn them from the replay, not from notifications).
+- Agent `publish` rejects any `idem_key` starting with `fin:` (reserved for
+  `finalize`'s internally composed `fin:<ref>` keys) with
+  `{op:'error', code:'bad_request', detail:'idem_key prefix fin: is
+  reserved'}`; nothing is appended.
+- Agent `stream {convo_id, message_ref, text?, replace_text?}` broadcasts a
+  live message overlay (never journaled). Same ownership rule as every other
+  agent write (missing/not-owned convo → `forbidden`); `text`/`replace_text`
+  must be strings when present (else `bad_request`). No separate byte cap — the
+  1 MiB WS frame limit bounds it and nothing is retained (transient,
+  latest-wins in the hub coalescer). Delivered as `{kind:'ephemeral', convo_id,
+  message_ref, text, replace_text}` to viewing clients.
+- Agent `activity {convo_id, state, detail?}` broadcasts a typing/tool-use
+  indicator: `state` must be one of `thinking`/`tool`/`idle` (else
+  `bad_request`); `detail` is an optional string, truncated (not rejected) at
+  200 chars. Same ownership rule as every other agent write (missing/not-owned
+  convo → `forbidden`). Delivered as `{kind:'ephemeral', convo_id,
+  activity:{state, detail}}` only to the owning user's client connections
+  currently `viewing` that conversation, via the same hub fan-out `stream`
+  uses — never written to the journal (no seq, no unread/push effects).
+- Agent `status {convo_id, status}` publishes the session's header data
+  (model, context-window gauge, rate limits — the shape is owned by the
+  bridge and passed through opaquely). Validated only as a non-null object
+  whose JSON encoding is ≤ 4096 bytes (else `bad_request`); ownership as
+  `activity` (`forbidden`); agent connections only. Delivered as
+  `{kind:'ephemeral', convo_id, status:{...}}` to viewing clients, same as
+  `activity` — never journaled. Unlike `activity`, the server caches the
+  last status per conversation (in-memory, bounded) and replays it to a
+  client immediately after it sends `viewing`, so headers populate on open
+  instead of waiting for the next turn end.
+  The server also **persists** a sanitised subset of each accepted frame —
+  `model` (≤ 64 chars), `context {tokens, window, pct}` (non-negative
+  integers, `pct` 0–100), `stall {kind:'usage_limit', model?, resets_at?,
+  since?}` and `limits` (the bare lines array a bridge sends, validated as
+  `spawn_targets`'s `limits` block with `as_of` stamped server-side) — per
+  conversation (`conversation_status`: JSON per row, cascades with the
+  conversation; `src/convo-status.js`). Latest wins, except that a frame
+  which omits `context` or `limits` keeps the stored ones — a bridge's
+  spawn/resume header carries no gauge yet, and must not wipe the one the
+  table exists to keep — while an omitted `stall` clears it (the bridge
+  clears a stall by leaving it out). Each block is validated all-or-nothing
+  and unknown keys are dropped; a frame with nothing persistable leaves the
+  row unchanged, and a failed persist never fails the op. This is what `GET /roster` and `GET /missions/:id` serve as a
+  conversation's `status`, so a session's model and context gauge are readable for a sleeping
+  box and across a journal restart.
+- Agent `stream_append {convo_id, message_ref, offset, chunk, meta?}` streams
+  live tool output (never journaled). `message_ref` is the tool_use_id;
+  `offset` is the UTF-8 byte position of `chunk` in the command's output.
+  The server holds a capped in-memory buffer per stream (1 MiB /
+  `MATRON_TOOL_STREAM_MAX_BYTES`; 64 buffers /
+  `MATRON_TOOL_STREAM_MAX_BUFFERS`; 30 min idle /
+  `MATRON_TOOL_STREAM_IDLE_MS`). `meta {tool, command}` is required on the
+  buffer-creating (offset-0) frame. Offset rules: `== end` appends, `< end`
+  trims the overlap (idempotent retries), `> end` (or unknown buffer at
+  offset > 0) draws `{kind:'control', op:'stream_resync', convo_id,
+  message_ref, have}` — resend from byte `have`. Ownership as `activity`
+  (`forbidden`); agent connections only.
+- Viewing clients receive tool-stream ephemerals distinguished by the
+  `tool_stream` key: `{event:'append', offset, chunk}` live (consecutive
+  appends coalesce by concatenation, not latest-wins); on starting to view,
+  one `{event:'sync', meta, offset, content, head_truncated}` per active
+  stream (full scrollback so far — clients trim any append whose offset
+  precedes their accumulated end); `{event:'end', reason:'stale'}` when the
+  idle sweep frees a buffer whose bridge died. Normal completion sends no
+  ephemeral: the durable `tool_output` event arrives with the same
+  `message_ref` in its payload and retires the live view. Because journal
+  frames bypass the hub's coalescing but ephemerals don't, a pending
+  `tool_stream` append can flush up to 200 ms after that completion frame —
+  clients must ignore `tool_stream` ephemerals for a `message_ref` already
+  retired by a durable event rather than re-opening a retired overlay.
+- `finalize` accepts an optional top-level `blob_ref` (same passthrough as
+  `publish`) and frees the matching live-stream buffer.
+
+## Child conversations
+
+A bridge may link a durable **child conversation** to a parent by sending
+`parent_convo_id` on the child's `convo_upsert` (subagent sub-chats — a
+subagent's turns land in their own conversation instead of interleaving into
+the parent's transcript). The linkage is a fixed structural fact:
+
+- **Immutable.** `parent_convo_id` is set once, at the child's creation. Later
+  upserts can never clear it (omitting the field) or repoint it (a different
+  value); both are ignored. A conversation created without a parent likewise
+  cannot gain one later.
+- **Silent, server-side.** A conversation with `parent_convo_id IS NOT NULL` is
+  exempt from both unread counting and APNs: an agent event in a child never
+  increments the owner's `unread_count` and never pushes a notification (of any
+  kind — alert, coalesced routine, or the read_marker background wake). The
+  short-circuit is enforced by the server, not the client, so stale app
+  versions stay silent for children too. The child's `last_seq`/`snippet` still
+  advance normally; only the unread and push side effects are suppressed.
+- **Delivery is unchanged.** Journal delivery is user-wide and every event is
+  tagged with its `convo_id`, so a child's events ride the same journal as any
+  other conversation's — no separate subscription. Clients discover the
+  parent/child relationship from `parent_convo_id` on the `/snapshot`
+  conversation row and the `convo_meta` payload.
+
+## Agent chat rooms
+
+A **room** is not a new entity — it's an ordinary top-level conversation
+(never a child; see "Child conversations" above) whose owner
+(`agent_device_id`) has drawn other agent devices of the same user into its
+lifecycle via the `convo_agents` table (spec: 2026-08-06 agent-to-agent chat
+design, Phase 2; consent gating: 2026-08-07 agent chat consent design). A
+`convo_agents` row is a **grant**, one per `(convo_id, agent_device_id)`,
+that moves through a small state machine:
+
+    awaiting_user -> invited -> joined
+         │              │      └─refuse──> refused
+         │              └─ttl──────────> expired
+         ├─deny────> denied
+         └─ttl─────> expired
+    joined  -> left
+
+`awaiting_user` and `invited` are the two pending states.
+`awaiting_user` means the request is parked awaiting the **user's**
+decision (see "Consent gating" below) — it is where every `agent_invite`/
+`agent_join` lands by default. `invited` means the user has decided and
+the target agent has yet to answer. `joined` is the only
+state that confers delivery and write rights (see "Agent write
+authorization" and "Agent delivery scoping" above). A row left in
+`refused`, `denied`, `left`, or `expired` is **renewable** — a fresh
+`agent_invite`/`agent_join` may reuse the same `(convo_id, agent_device_id)`
+pair and resets it to `awaiting_user`; a row already `awaiting_user`,
+`invited`, or `joined` is not
+— inviting/joining over one of those returns `{code:'conflict',
+detail:'already <state>'}` instead of silently resetting it (a
+double-invite is a caller bug worth surfacing, not a no-op; the same
+non-renewability keeps a still-pending `awaiting_user` ask from becoming a
+re-request loop against the user's attention — see the per-requester cap
+below).
+
+Every row also records `initiator_device_id` — whichever side asked (the
+room owner sending an invite, or the would-be participant sending a join
+request) — because the **other** side is the one entitled to answer: the
+initiator can never ack or answer its own invite
+(`{code:'forbidden', detail:'the initiator cannot answer its own invite'}`).
+
+### The five room ops
+
+All five are agent-connection-only (`{code:'forbidden'}` for a client
+connection) and all five require the connection to be past its own hello
+replay (`conn.registered`; `{code:'not_ready'}` otherwise — same stance as
+`agent_request`: a reply might need to reach this very socket, and
+mid-replay it's invisible to the hub's delivery scan). Every op resolves
+`room_id` the same way: `bad_request` for a missing/non-string/oversized
+(>128 char) id, `not_found` for an unknown id or one owned by another user,
+`bad_request` for a child conversation (`parent_convo_id` set — children
+can never be rooms). Error frames for these five ops also carry
+`room_id` — a bridge can have several rooms' ops in flight at once, and
+`ref` alone can't say which room an error is about — but only when the
+inbound `room_id` was a well-formed id (non-empty string, ≤128 chars); a
+malformed id is never echoed back. Other ops' error frames are unchanged.
+
+- **`agent_invite {room_id, target_device_id, target_convo_id?, from_convo_id?, topic?, justification}`** —
+  only the room's own owner (`agent_device_id === conn.deviceId`) may send
+  it (`forbidden` — "only the room owner may invite" — otherwise); a
+  target with no live connection is woken as the ask parks (see
+  "Wake-before-spawn" under the spawn section — same rule for
+  `agent_join`, which wakes the room's owner);
+  `target_device_id` must be a different agent device of the same user —
+  or a session another person shares with this user, see "Rooms between
+  people" —
+  (`not_found` for an unknown id, another user's device, or a client-kind
+  device — anti-enumeration, same stance as `agent_request`; `bad_request`
+  for inviting self). `topic` is optional (≤200 chars,
+  `INVITE_TOPIC_MAX_CHARS`), `justification` is required (1-1000 chars,
+  `INVITE_TEXT_MAX_CHARS`).
+
+  `target_convo_id` is optional and names **which of the target device's
+  conversations** the ask is for. A caller picks a conversation off
+  `/roster`, but the invite otherwise resolves down to that conversation's
+  owning device — and a receiving bridge running several sessions then
+  cannot tell which was meant. Where it is absent (a pre-3.5 caller) the
+  receiver falls back to a guess; where it is present it is **authorisation,
+  not a hint**: it must be a top-level conversation of this user that
+  `target_device_id` actually owns, else `not_found` — the same code the
+  unknown-device case gets, so a caller cannot probe for conversations it
+  can't see. Persisted on the `convo_agents` row (so it survives a park for
+  consent) and relayed verbatim on the `request` frame; **omitted, never
+  null**, when the caller sent none, so a receiver can tell "not addressed"
+  from "addressed to nothing".
+
+  `from_convo_id` is its mirror image: optional, and naming **which of the
+  requester's own conversations** is doing the asking, so the consent card
+  can say who is asking rather than just which device. Validated the same
+  way and for the same reason — a top-level conversation this connection's
+  own device owns, else `not_found`. Resolved to a title for the card, and
+  also persisted on the `convo_agents` row (`initiator_convo_id`) and
+  relayed verbatim as `from_convo_id` on the `request` frame — omitted,
+  never null, when the caller sent none. The receiving bridge keys its
+  one-room-per-pair lookup on the peer device plus the peer's conversation,
+  so without it the invited side could only record the device, and a guest
+  later calling the inviter back opened a second room in the other
+  direction.
+
+  Every ask parks: it creates/renews an `awaiting_user` row and the target
+  agent is sent **nothing** — the justification never leaves the journal
+  until the user approves it (see "Consent gating" below). The caller still
+  gets `{kind:'invite', event:'delivered', room_id, target_device_id}`
+  immediately — see "Consent gating" below for what `delivered` means here.
+- **`agent_join {room_id, justification, from_convo_id?}`** — the reverse direction: an
+  agent asks to join a room it doesn't own. The room must have a recorded
+  owner (`{code:'conflict', detail:'room has no recorded owner to ask'}`
+  otherwise) and the caller can't be that owner
+  (`{code:'bad_request', detail:'cannot join own room'}`). Same park as
+  `agent_invite`, with the caller as both the participant and the
+  initiator and the room's owner device as the target: it creates/renews
+  an `awaiting_user` row, and the caller gets `{kind:'invite',
+  event:'delivered', room_id, target_device_id:<owner>}` while the owner
+  is sent nothing until the user answers.
+
+  `from_convo_id` is optional and names **which of the joiner's own
+  conversations** is asking in — validated exactly like `agent_invite`'s
+  `from_convo_id` (a top-level conversation of this user that the caller's
+  own device owns, else `not_found`; a non-string or empty value is
+  `bad_request`). It is persisted as the row's `initiator_convo_id`, fills
+  the join card's `from_convo_id`/`from_convo_title`, and, once the join is
+  accepted, puts that conversation in the room's `participant_convos`.
+  Absent, the join behaves as before: no conversation is recorded and the
+  card's `from_convo_*` fields stay `''`.
+- **`agent_invite_ack {room_id, peer_device_id?, session_state}`** — a
+  non-committal status ping while an invite/join is still pending
+  (`invited`), sent by whichever side did NOT initiate. `session_state` must
+  be `'idle'` or `'busy'` (`bad_request` otherwise). `peer_device_id`
+  selects direction: present means the room owner is acking a join request
+  (naming the requesting participant device — only the owner may supply it,
+  `forbidden` otherwise); absent means a participant is acking an invite
+  addressed to itself. No pending `invited` row for the resolved device
+  (`{code:'conflict', detail:'no pending invite'}`) or the caller IS that
+  row's initiator (`forbidden`, see above) both fail closed. Delivered to
+  the initiator as
+  `{kind:'invite', event:'ack', room_id, from_device_id, session_state}` —
+  no journal entry, no state change.
+- **`agent_invite_answer {room_id, peer_device_id?, accept, reason?}`** —
+  resolves a pending `invited` row to `joined` (`accept:true`) or `refused`
+  (`accept:false`); same direction rule, pending-row check, and
+  initiator-can't-answer-itself check as `agent_invite_ack` above (a row
+  that stopped being `invited` between the check and the update — e.g. a
+  race with the expiry sweep — also surfaces as `{code:'conflict',
+  detail:'no pending invite'}`). `reason` is optional (≤1000 chars,
+  `INVITE_TEXT_MAX_CHARS` — a refusal justification, typically). Delivered
+  to the initiator as
+  `{kind:'invite', event:'answer', room_id, peer_device_id, accept,
+  from_device_id, reason?}` (`reason` omitted from the frame when
+  absent/empty). `from_device_id` is the device that actually sent this
+  `agent_invite_answer` — the room owner when answering a join request
+  (`peer_device_id` present, naming the joiner instead), or the invited
+  participant itself otherwise — so the initiator always learns who
+  answered, not just which row changed. Contrast with the expiry sweep's
+  synthetic `answer` frame below, which has no answering connection behind
+  it and so carries no `from_device_id`.
+- **`agent_leave {room_id}`** — a joined participant leaves (`joined` ->
+  `left`; `{code:'conflict', detail:'not a joined participant'}` if the
+  caller isn't currently joined). If the room has a recorded owner other
+  than the caller, that owner is told:
+  `{kind:'invite', event:'left', room_id, from_device_id}`. When the
+  caller IS the room's recorded owner (who has no `convo_agents` row of
+  its own) **and the conversation is actually a room** — it has at least
+  one `convo_agents` row, in any state — the room dissolves instead:
+  - Every *live* row (`joined`, still-pending `invited`, or parked
+    `awaiting_user`) flips to `left`. Terminal outcomes (`refused`,
+    `denied`, `expired`) are left alone: they are history, not membership.
+  - Each previously-**joined** participant is sent the same
+    `{kind:'invite', event:'left', room_id, from_device_id}` frame.
+  - Each pending `invited`/`awaiting_user` row that the *other* side
+    initiated — i.e. a `agent_join` request awaiting this owner's answer,
+    whether already relayed (`invited`) or still parked awaiting the
+    user's consent (`awaiting_user`, never delivered to any agent socket)
+    — gets that answer now, as
+    `{kind:'invite', event:'answer', room_id, peer_device_id, accept:false,
+    reason:'left'}`, delivered to the requester. Without it the requester
+    would wait forever: it is its own row's initiator, so it never sends
+    an `agent_invite_answer` that could surface a `conflict`, and the
+    dissolve puts the row out of reach of both the expiry sweep and the
+    awaiting-TTL sweep. Same synthetic shape as the sweep's expiry
+    `answer` (no `from_device_id`) — see "Expiry" below. A pending row the
+    *owner* initiated needs no frame: for an `invited` row the invitee was
+    never in the room and was not waiting on an answer; for an
+    `awaiting_user` row the target was never even told about the ask.
+    Either row's next answer attempt (`agent_invite_answer`, or
+    `POST /agent-chat/answer` for a parked one) surfaces `conflict`/`409`
+    instead.
+
+  Success is silent either way (no-error-means-success), which keeps
+  owner-leave idempotent: repeating it on an already-dissolved room (rows
+  exist, all `left`) succeeds silently again. A conversation with **no**
+  `convo_agents` rows at all is not a room — `convo_upsert` stamps the
+  creating device as `agent_device_id` on every agent-created
+  conversation, so this case is just an ordinary solo convo — and leaving
+  it is the usual `{code:'conflict', detail:'not a joined participant'}`.
+
+### Consent gating (`awaiting_user`)
+
+Every `agent_invite`/`agent_join` is a park, not a relay: the request lands
+in `awaiting_user` and the target agent is told nothing, every time — there
+is no way to pre-approve a directed pair. The requester's
+`justification` (an attacker-controlled string if the requesting agent has
+been prompt-injected) never reaches a sibling agent's context; it reaches a
+human first.
+
+**The card.** Parking appends a `permission_request` event to the **room
+conversation** — not the requester's or the target's own session
+conversation; the room is where the chat will actually happen if approved,
+and it is what the push notification below deep-links the user to.
+Payload:
+
+```json
+{
+  "kind": "agent_chat",
+  "request": "invite" | "join",
+  "room_id": "…",
+  "from_device_id": 7,
+  "from_name": "…",
+  "target_device_id": 12,
+  "topic": "…",
+  "justification": "…",
+  "from_convo_id": "…",
+  "from_convo_title": "…",
+  "to_name": "…",
+  "to_convo_id": "…",
+  "to_convo_title": "…"
+}
+```
+
+The last five are **display-only** and exist so the card can state who is
+asking whom. `to_name` is the device on the far end — the invitee for an
+`invite`, the room's **owner** for a `join` — and is always populated. The
+two id/title pairs identify the two sessions, and are `""` when the
+requesting bridge named no conversation (`from_convo_id` / `target_convo_id`
+omitted), so a client must treat a blank as "not stated" rather than
+rendering an empty quote. Note `to_name` deliberately does not track
+`target_device_id` on a join: the field below names the row to answer, while
+`to_name` names who is being asked.
+
+Both id and title are sent because neither alone identifies a session to a
+user. Bridges seed a session title with a `"<box>:<first two of the convo
+id>"` prefix, which is what the conversation list displays — but a room's
+title has no prefix, a retitle can drop one, and two sessions can share
+wording. Clients should render the short id from the **id** and, so the
+same characters do not appear twice, leave the title alone when it already
+carries that prefix. A title is a snapshot taken when the ask was made: the
+card is an immutable event, so a later retitle does not rewrite it.
+
+`from_convo_id` is authorisation, not decoration, exactly as
+`target_convo_id` is: the requester may only name a top-level conversation
+its own device owns, else `not_found`. A title is shown to the user as the
+asker's identity, so an unchecked one would let a requester borrow another
+session's name to be trusted by.
+
+`target_device_id` is **the parked row's own device** — the invitee for an
+`invite`, and the requester itself for a `join` (a join self-targets, so
+`from_device_id === target_device_id` there). It is the value
+`POST /agent-chat/answer` keys on, so a client can answer a card using
+nothing but the card's own fields. Do not confuse it with the ephemeral
+`{kind:'invite', event:'delivered', …, target_device_id:<owner>}` ack the
+joining agent gets, which reports who was asked rather than which row is
+pending.
+
+sent with `sender: "agent:<name>"`, same sender convention as any other
+agent-authored event. `from_name`, `topic`, and `justification` are all
+remote-agent-controlled text and are run through the journal's own
+sanitiser before storage/publish — control characters (including `\n`)
+become spaces, collapsed, trimmed to `INVITE_TOPIC_MAX_CHARS`/
+`INVITE_TEXT_MAX_CHARS` — the same treatment the bridge already applies to
+peer text it renders in its own voice, now applied journal-side because the
+journal is the one publishing this event. Apps must render `justification`
+as untrusted text (no markdown, no autolinking) — it is attacker-
+controlled content shown to a human about to make a security decision.
+
+**Tracker item.** (The spawn card's twin is described in full under *Agent-spawned sessions → Tracker item*, and every rule there applies here.) The moment the card is journaled, the journal also files a `question` item on the **room** conversation (`fileChatConsentItem`, `src/consent-items.js`) and the row remembers it (`convo_agents.item_id`; a renewed row — a fresh ask after a deny or expiry — gets a fresh item): awaiting the user, top of the open list, label `consent`, link `matron://consent/chat/<room_id>/<target_device_id>` (the row's key, i.e. the card's own `target_device_id` — the invitee, or the joiner itself), title `<from_name> asks to chat with <to_name> — <topic>` or `<from_name> asks to join <to_name>'s room`, body = both sides with their session titles when the card has them, the topic, the justification **verbatim in a fenced code block**, and how to answer. It is the user's alone (invisible to every agent; its markers carry `consent: 'chat'` and are client-only) and it is closed by whatever takes the row out of `awaiting_user`: `POST /agent-chat/answer` and `matron-admin agent-chat approve|deny` (`approved`/`denied` → `decided`, attributed to the answering client device when there is one), the awaiting-TTL sweep (`expired` → `cancelled`), and an owner's `agent_leave` dissolve (`left` → `cancelled`). Anything else that takes the row away (the invited device revoked, the row renewed) is caught by the reconcile sweep described under the spawn card's *Tracker item*. Filing and closing are best-effort: a tracker failure never costs the ask or its frames. The mirror's `created` and `closed` markers also name the ask, for the apps, whose chat card sits in the same room and is otherwise answered only over HTTP: `consent_ask: '<room_id>/<target_device_id>'` (the consent link's tail), and on the close `consent_outcome` (`approved`, `denied`, `expired`, `left`, `gone`) plus `decided_by: 'coordinator'` when the Coordinator answered. An app settles the card from these — decided on another device, on another box or by the Coordinator — rather than offering an Approve that can only answer 409. A close by hand (`POST /items/:id/close`) carries neither key and does not answer the ask; the reconcile sweep's close of an orphaned mirror carries `consent_outcome: 'gone'` without `consent_ask`.
+
+**It is a client-only event, load-bearing.** `permission_request` with
+`payload.kind === 'agent_chat'` is excluded from agent delivery — live
+fan-out, hello replay, and HTTP message pagination — by `isClientOnlyEvent`
+(`src/journal.js`), consulted at all three call sites so they can't drift
+apart. It also gates the write side: an agent's `publish`/`finalize` reject
+a payload shaped like the card outright, since it must only ever be minted
+by the server's own `agent_invite`/`agent_join` park path. This is enforced
+even against the room's own recorded owner: a naive fan-out would deliver
+to the owner first (it manages the room), which for an `agent_join` card
+is exactly the target the justification must stay hidden from. Contrast
+with the `kind:'invite'` frames in "Delivery" below, which are a different,
+unrelated mechanism (ephemeral, WS-only, agent-to-agent) that the card
+plays no part in.
+
+**Reading and answering the card.** Two client-gated (`who.kind !== 'client'`
+→ `403`) HTTP endpoints, since only a human may decide:
+
+- **`GET /agent-chat/pending`** → `{pending: [...]}`, one entry per
+  `awaiting_user` row owned by the caller's user:
+  `{convo_id, agent_device_id, initiator_device_id, justification, topic,
+  created_at, title, initiator_name, agent_name}` (`title` is the room's;
+  the two names are the devices', sanitised and capped exactly as the live
+  card's `from_name` is, and `null` if the device has since been revoked).
+  A durable inbox for a client that missed the live card or wants to review
+  every outstanding ask at once.
+- **`POST /agent-chat/answer`** `{room_id, target_device_id, decision:
+  "approve"|"deny"}` — `room_id`/`target_device_id` must
+  resolve to a **row belonging to the caller's own user**
+  (`conversations.owner_user_id`); an unknown room and one owned by another
+  user are indistinguishable (`404 {error:'not_found'}`, never `403` — same
+  anti-enumeration stance as `GET /convo/:id/messages`). The row must be
+  `state='awaiting_user'` or the call is `409 {error:'conflict'}` (already
+  answered, or never parked). A body carrying `always_allow` at all — any
+  value — is `400 {error:'bad_request'}`, not silently ignored: there is no
+  standing-consent grant left for it to mean, and a caller that believed it
+  had granted one would be worse off than a caller told plainly the field
+  is not accepted.
+  - **`deny`** flips the row to `denied` and, if the initiator is
+    reachable, sends it `{kind:'invite', event:'answer', room_id,
+    peer_device_id: target_device_id, accept:false, reason:'refused'}` —
+    `reason` is **`'refused'`, never `'denied'`**. A requesting agent must
+    never be able to tell "the human said no" from "the peer said no";
+    collapsing the two into one wire string is what keeps that true (the
+    distinct `denied` DB state exists for the user's own audit trail, not
+    for the requester).
+  - **`approve`** flips the row to `invited`, then calls the delivery pump
+    (see below) scoped to this row's own recipient, and the response is
+    `{ok:true, delivered}` where `delivered` is read back off the
+    just-answered row's own `delivered_at` (not a pump-wide "something got
+    sent" flag) — `true` if the target happened to be connected right now,
+    `false` if delivery is still owed.
+
+**`delivered` widens.** The requester's `{kind:'invite', event:'delivered',
+room_id, target_device_id}` frame arrives at parking time — before the
+human has even seen the card, let alone approved it. `delivered` does not
+mean "the target's socket got the frame"; it means "accepted into the
+system". The bridge's `agent_chat_start` tool copy already tolerates this
+(a `pending` result is documented as normal and not to be polled).
+
+**Delivery pump.** Approval alone cannot deliver — the room's target agent
+may be offline, and an approval made through `matron-admin` (a separate CLI
+process, not the running server) never touches the hub at all. A single
+function, `deliverPendingInvites(db, hub, {deviceId?})` (`src/invite-
+delivery.js`), owns delivery for every `state='invited' AND delivered_at IS
+NULL` row, and is called from three places: `POST /agent-chat/answer`
+(scoped to the just-answered row's recipient, for the fast path), an
+agent's `hello` registration (scoped to that device, catching up whatever
+was approved while it was offline), and the periodic sweep timer (unscoped
+catch-all — covers `matron-admin`-approved rows, and any row whose target
+was already connected at approval time so no hello would ever fire for
+it). `markDelivered`'s `delivered_at IS NULL` predicate makes the pump
+idempotent — a hello racing the sweep can double-*call* the pump but not
+double-*deliver* — and `matron-admin agent-chat approve` says as much in
+its own output, since the CLI itself has no path to the hub whatsoever and
+the delivery genuinely happens later, out of its hands.
+
+**Device revocation clears room membership.** Deleting a device deletes
+every `convo_agents` row where it is the participant, by way of
+`agent_device_id REFERENCES devices(id) ON DELETE CASCADE`. `devices.id` is
+a plain `INTEGER PRIMARY KEY`, so SQLite assigns `max(rowid)+1` and the
+device created after the newest one is revoked lands on exactly its id —
+without this, retiring an agent and registering its replacement would hand
+the replacement the retired agent's room memberships by number alone.
+
+The constraint carries this rather than the revoke sites, because there are
+two of them: `POST /devices/:id/revoke` used to do the cleanup itself and
+`matron-admin device revoke` did not, so the same operation left different
+state depending on which door it came through.
+
+`initiator_device_id` deliberately has no such constraint. It records who
+*asked*, and a parked ask outlives its requester: the row stays, and
+`/agent-chat/pending` reports a `null` name for the device that is gone.
+
+**Cap.** Outstanding `awaiting_user` rows per *requesting* device are
+capped at `MAX_AWAITING_PER_REQUESTER` (3); over the cap, `agent_invite`/
+`agent_join` fail `{code:'conflict', detail:'too many requests awaiting
+user approval'}` rather than queuing indefinitely against the user's
+attention.
+
+**`matron-admin agent-chat` — the operator approval surface.** The same
+decisions from the CLI, writing the DB directly — for an operator without
+a client device to hand, or a user whose apps predate the card UI:
+
+```
+matron-admin agent-chat pending <username>
+matron-admin agent-chat approve <username> <room_id> <device_id>
+matron-admin agent-chat deny <username> <room_id> <device_id>
+```
+
+`pending` lists one line per `awaiting_user` row for that user (room id,
+target device id/name, topic, justification, relative age). `approve`
+rejects a `--always-allow` flag outright — it exits non-zero with a message
+that the flag no longer exists and every agent-chat request now asks the
+user, rather than silently approving without it.
+`approve`/`deny` re-run the same room-ownership check `POST
+/agent-chat/answer` does (`conversations.owner_user_id` must match the
+named user) before touching the row — this is not skippable just because
+the CLI is a trusted operator surface; taking a username is precisely what
+makes the check meaningful. Because this CLI cannot reach the running
+server's hub, its output says so plainly both ways: an approval is relayed
+by the sweep-tick pump (or that agent's next hello), not by this command,
+within one sweep interval; a denial cannot push an answer frame to the
+requester at all — its waiter simply times out to pending, and the state
+change is only visible on its next attempt.
+
+### Expiry
+
+Two independent TTLs, on two different clocks, because they answer two
+different questions — "has the *target agent* gone quiet?" versus "has the
+*user* gone quiet?" — and the two must not be conflated (see "What the
+requester learns" below).
+
+A pending `invited` row older than the invite TTL (`inviteTtlMs`, default 30
+minutes — 1800000 ms, the `inviteTtlMs` parameter default in `attachWs`) is flipped to `expired` by the
+same periodic sweep that handles the tool-stream idle eviction and device
+revocation checks (see "Device revocation" below) — generous on purpose,
+because a busy responder is expected to report that honestly via
+`agent_invite_ack` rather than race the clock. This TTL clocks from
+`delivered_at`, **not** `created_at` — the 30-minute window is a window for
+the target to *answer*, so it must not start ticking before the target has
+actually seen the ask; a row that is `invited` but still undelivered
+(target offline, or approved-but-not-yet-pumped) is exempt and can never
+expire out from under a target that hasn't heard the ask yet. The initiator
+hears an expiry exactly like an explicit refusal:
+`{kind:'invite', event:'answer', room_id, peer_device_id:<agent_device_id>,
+accept:false, reason:'expired'}`. If the initiator is offline at sweep time
+it simply misses the frame, same as any other invite frame (see "Delivery"
+below) — its next roster read or invite/join attempt tells the same story
+(`state:'expired'` via a fresh, renewed invite). An expired row is
+renewable, same as `refused`/`left`.
+
+A parked `awaiting_user` row — the user, not the target agent, hasn't
+answered — has its own, much longer TTL: `AWAITING_USER_TTL_MS`, 24 hours,
+clocked from `created_at` (there is no delivery to wait for; the card was
+already published the moment the row was parked). Generous on purpose: an
+ask that arrives while the user is asleep must survive the night. The same
+sweep flips it to `expired` and notifies the initiator — but, unlike the
+`invited`-TTL case above, with `reason:'refused'`, **not** `'expired'`: a
+user who never looked at the card and a user who looked and said no must
+read identically to the requester (see "What the requester learns" in the
+consent design spec). `denied` (an explicit `POST /agent-chat/answer
+{decision:'deny'}` or `matron-admin agent-chat deny`) uses the same
+`reason:'refused'` wire string for the same reason — three different DB
+facts (`denied`, `refused`, this TTL's `expired`), one indistinguishable
+story on the wire.
+
+Owner-dissolve produces the same synthetic frame with `reason:'left'`
+instead (see `agent_leave` above): a pending join request that the room's
+dissolution has made unanswerable is closed the same way an expired one
+is, because the waiting initiator is in the same position either way. Both
+frames omit `from_device_id` — there is no answering connection behind
+them — so an initiator can handle the pair identically and read `reason`
+only to log *why*.
+
+### Delivery
+
+Every `kind:'invite'` frame — `request`, `join_request`, `delivered`,
+`ack`, `answer` (including the sweep's own expiry `answer`), and `left` —
+is an ephemeral relay, same stance as Agent RPC: **never appended to the
+journal** (no `seq`, no unread/push effects, no retention surface),
+**never pushed** (APNs never sees it), and **never sent to client
+devices** — only the two agent devices on either side of the invite ever
+see these frames. `delivered`/`request`/`join_request` use the
+single-socket `hub.sendRpcRequest` delivery rule (one most-recently-
+registered live connection; `offline` if none — non-idempotent, so it must
+never double-deliver). `ack`/`answer`/`left` use `hub.sendToDevice`
+(multicast to every live socket of that device) — these don't carry the
+same double-execution risk `sendRpcRequest` guards against, so every
+connection of a briefly-doubled-up (mid-reconnect) device hears them.
+
+Separately, ordinary journal fan-out and hello replay (see "Agent delivery
+scoping" above) now reach not just the recorded owner but every currently-
+`joined` participant too — that's the durable side of room membership (the
+room's actual conversation content), distinct from this section's ephemeral
+invite-lifecycle relay.
+
+## Agent-spawned sessions (`spawn`)
+
+A parent agent may ask a target agent to start a new session (child conversation) with a given prompt, parked across human latency while the user consents. The journal brokers the request and handles the consensus flow.
+
+### Operations
+
+**`spawn_request`:** A parent agent requests the user's consent to spawn a session on a target agent device.
+
+```json
+{
+  "op": "spawn_request",
+  "request_id": "string (UUID or similar)",
+  "from_convo_id": "string (conversation id the parent owns)",
+  "target_device_id": integer,
+  "workdir": "string (capped at 1024 chars)",
+  "task": "string (the child's seed prompt, capped at 2000 chars)",
+  "topic": "string (optional, title fragment for the card, capped at 200 chars)",
+  "model": "string (optional, the model the child should run, capped at 64 chars)",
+  "effort": "string (optional, the reasoning effort the child starts at, capped at 16 chars)",
+  "agent": "string (optional, \"claude\" | \"codex\" — the agent the child runs; absent = the target box's default)",
+  "link": "boolean (optional, default false — also open a chat room between the parent and the child)",
+  "mission_num": "integer (optional — the child joins this mission as soon as its conversation exists)"
+}
+```
+
+`link` is opt-in because a spawn is normally a clean break: the child gets the task and its provenance in its opening turn, the parent gets the outcome, and an automatic room only made the child narrate progress back to a parent that relayed it on. A parent that later needs a channel opens one with an ordinary `agent_chat_start` against the child (it is on the roster like any session). With `link: true` the approval also mints a room — see "Answering" below.
+
+Acknowledgement: `{kind:'spawn', event:'pending', request_id, spawn_id, target_waking?}` — the spawn row is now parked in `awaiting_user` state, and a `permission_request` event has been appended to the parent's conversation with `payload.kind: 'agent_spawn'` (client-only). A `question` item mirroring the card has also been filed on the parent conversation — see "Tracker item" below. `target_waking: true` (omitted otherwise) says the target box had no live connection and the journal has asked the infra layer to start it (**wake-before-spawn**, below): the session starts once the user approves *and* the box is up, which is a few minutes for a cold VM.
+
+**Errors.** `forbidden` for a client connection (agent-only, same stance as the room ops); `not_ready` if sent before this connection's own hello replay completes (mid-replay it's invisible to the delivery scan an outcome frame would need). `bad_request` covers: a missing/non-string/oversized `request_id` (≤128 chars, `RPC_ID_MAX_CHARS`); an empty or oversized `workdir` (≤1024 chars, `SPAWN_WORKDIR_MAX_CHARS`) or `task` (≤2000 chars, `SPAWN_TASK_MAX_CHARS`) — and the same check re-run *after* peer-text sanitisation, so an all-control-character string that sanitises down to empty is rejected too; an oversized `topic` when present (≤200 chars, `INVITE_TOPIC_MAX_CHARS`); a non-string or oversized `model` when present (≤64 chars, `SPAWN_MODEL_MAX_CHARS`); a non-string or oversized `effort` when present (≤16 chars, `SPAWN_EFFORT_MAX_CHARS`, `detail:'bad effort'`); an `agent` that is not `claude` or `codex` after trimming and lowercasing (`detail:'bad agent'`; absent, `null`, `""` and `"default"` all mean "the box's default"); a non-boolean `link` when present; a non-integer `target_device_id`; and a missing/empty `from_convo_id`. `not_found` covers: an unknown `target_device_id`, one belonging to another user, a client-kind device, or a private device seen by a non-private caller — all indistinguishable, anti-enumeration, same stance as `agent_invite`'s `target_device_id`; and a `from_convo_id` that doesn't resolve to a top-level conversation this device owns (foreign, unknown, or a child conversation — `parent_convo_id` set), mirroring `agent_invite`'s `from_convo_id` check. `agent_unreachable` — the target box has no live registered connection right now **and cannot be woken** (no `MATRON_WAKE_CMD`, or the wake command refused the box); checked, and refused, **before** the consent card is published, so the user's tap is never spent on an ask that cannot work. When a wake *is* possible the ask is not refused: see "Wake-before-spawn" below. `conflict` (`detail:'too many requests awaiting user approval'`) — the requesting device already has `MAX_AWAITING_PER_REQUESTER` (3) rows in `awaiting_user`, counted jointly with agent-chat's pending asks (see "Pending-ask cap" below). With `mission_num`: `bad_request` (`detail:'bad mission_num'`) unless it is a positive integer; `no_mission` when no mission with that number is visible to both the asker and the target box (unknown and hidden are indistinguishable); `mission_closed` when it is closed. All three are checked before the wake and before the card, so nothing is parked or woken for them. The card payload carries `mission_num` and `mission_title` (both omitted when absent) and the consent item says "Joins mission #N — <title>".
+
+**`spawn_targets`:** A parent agent queries what other agent boxes are available for spawning.
+
+```json
+{
+  "op": "spawn_targets",
+  "request_id": "string (UUID or similar)"
+}
+```
+
+Reply: `{kind:'spawn', event:'targets', request_id, boxes: [{device_id, name, online, wakeable?, folders: [{path, last_used}], activity?, limits?, defaults?}]}`. `defaults` is `{agent, model, effort}` a new session on the box starts with when the ask names none: the bridge's own effective block (the live `recent_folders` reply's `defaults`, else its last `box_status` one), else the journal's stored box defaults; omitted when neither says anything (see *Box defaults*). Each box carries whether it is currently online and — if reachable — a list of recent working directories it has reported. `wakeable: true` (omitted when online, or when the journal has no `MATRON_WAKE_CMD`) marks an offline box as asleep rather than gone: a `spawn_request`, `agent_invite` or `agent_join` aimed at it starts the box; it is also omitted for a box whose name the wake command would refuse (device names are free text, the command takes an incus instance name — `isWakeableBoxName` in `src/wake.js`, the same rule `wakeIfOffline` applies), so the flag never promises a wake that cannot happen. Nor can a name check tell a Mac called `alice-mac` from a dev VM, so the journal also remembers the wake command's own verdict: when it exits 2 ("not a box I can start") the device row is marked (`devices.wake_refused_at`, matched by name, persistent), and from then on the box is listed without `wakeable`, `wakeIfOffline` skips it and a spawn to it fails `agent_unreachable` at once. The mark stands for a day (`WAKE_REFUSAL_TTL_MS`), after which the box is tried again and re-marked if refused again, so a dev VM refused by mistake recovers on its own; a later exit 0 for that name, or renaming the device, clears it at once. The first wake to a box never refused before is still attempted, so that one spawn parks until the refusal comes back (`isWakeableDevice` in `src/wake.js`). Self (the requesting device) **is** listed, flagged `self: true` — the user may want the new session on the box they are already talking to; targeting self in `spawn_request` is allowed and goes through the same consent card. Private devices are hidden from non-private agents.
+
+Folder discovery rides the RPC broker: for each *online* box the journal itself issues a **journal-originated** `recent_folders` RPC (see "Journal-originated requests" under "Agent RPC" below — `from_device_id: 0`, answered with `to_device_id: 0`) and waits up to `spawnFoldersTimeoutMs` for the reply. A bridge that never learns to answer this method will simply time out to `folders: []` for every request rather than erroring; offline boxes are listed with no RPC attempted at all — but with their last stored `activity`/`limits`/`disk` blocks and a `reported_at` when the box has ever reported (see "Box status" below), so a sleeping box still shows its last known usage.
+
+**Box status (`box_status`).** The same capacity blocks, reported by a bridge about its *own* box — `{op:'box_status', activity?, limits?, disk?, account?: {email}, defaults?: {agent, model, effort, source?}}` (agent connections only; `forbidden` for a client, `bad_request` when no block validates). Validated with the same all-or-nothing sanitisers as below (`sanitizeBoxStatus` in `src/spawns.js`: a malformed block is dropped, the rest kept), then **persisted per device** (`device_status`, latest report wins) and fanned as `{kind:'box_status', device_id, reported_at, ...blocks}` to the user's live *client* sockets only — it is not a conversation event, nothing is appended or replayed. The stored report is what `GET /devices` and `GET /roster` serve as `status` and what `spawn_targets` lists an *offline* box with (its blocks plus `reported_at`), so usage, allowances and reset times are the journal's to answer for every box, including one that is asleep or that a given client has never fanned out to. A live `spawn_targets` reply that carries capacity blocks is *merged* into the stored report — the blocks it carries are refreshed, the ones it omits are kept, so a `recent_folders` reply (which never carries `account`) cannot erase what the box's own `box_status` said; only `box_status` itself replaces the whole row. A `box_status` that lands while a box's `recent_folders` RPC is in flight is the newer of the two: the listing carries that row and the delayed reply is not merged over it. The row goes with the device: revoking a box drops its report (`ON DELETE CASCADE`), so a later box that reuses the id starts with no `status`. Bridges send it on every `hello_ok`, after each usage-limits refresh, and on shutdown (a box's last numbers land before the host idle-stops it).
+
+**Defaults block (optional).** `defaults` is what a new session on the box starts with as the bridge resolves it — the journal's box defaults, else its own `MATRON_DEFAULT_*` env — with `source` saying which (e.g. `journal`, `env`). `agent` is required (`claude` | `codex`); `model` is null or a plain token (≤64 chars, `[A-Za-z0-9._[\]-]`); `effort` null or a short lowercase word (≤16; Codex has levels Claude lacks); `source` optional, `[a-z_]`, ≤32. All-or-nothing like the other blocks (`sanitizeBoxDefaults` in `src/spawns.js`); a report carrying only this block is valid. A `recent_folders` reply may carry it too.
+
+**Capacity blocks (optional).** A bridge may additionally report its current load in the same `recent_folders` reply, as `activity: {live_sessions, last_hour: [{path, sessions}]}` (capped to 20 `last_hour` entries) and `limits: {as_of, lines: [{id, label, percent, resets?, resets_at?}]}` (capped to 12 `lines`; `resets`/`resets_at` are per-line and each independently optional). Both are validated all-or-nothing (`sanitizeSpawnActivity`/`sanitizeSpawnLimits` in `src/spawns.js`): any malformed entry drops the whole block from that box's reply, but never the box itself — a bridge that predates these fields, or whose reply fails validation, simply shows up with folders and no `activity`/`limits` keys (omitted, not null).
+
+### Consent card
+
+A `permission_request` event with `payload.kind: 'agent_spawn'` is appended to the **parent conversation** — the conversation the parent owns and is asking from, named `from_convo_id` in the operation. The payload includes:
+
+```json
+{
+  "kind": "agent_spawn",
+  "request_id": "the spawn row's id",
+  "from_device_id": 7,
+  "from_name": "the parent device's name",
+  "from_convo_id": "the parent conversation's id",
+  "from_convo_title": "the parent conversation's title",
+  "target_device_id": 12,
+  "target_name": "the target device's name",
+  "workdir": "string",
+  "task": "string (the child's seed prompt, also the card's text)",
+  "topic": "string (optional, title fragment for the card)",
+  "agent": "string (optional, claude | codex — the agent the child will run)",
+  "agent_source": "explicit | box_default (with agent)",
+  "model": "string (optional, the model the child will run — omitted, not empty, when neither the ask nor the box names one)",
+  "model_source": "explicit | box_default (with model)",
+  "effort": "string (optional, the effort the child starts at)",
+  "effort_source": "explicit | box_default (with effort)",
+  "dropped_model": "string (optional — a Claude model the ask named that a Codex box will ignore)",
+  "dropped_effort": "string (optional — a Claude-only effort, max, that a Codex box will ignore)",
+  "fallback_model": "opus (optional, see Fable-limit fallback)",
+  "fallback_reason": "fable_limit (with fallback_model)",
+  "link": "true (optional — present only when the ask requested a chat room; a detached ask carries no key)"
+}
+```
+
+Like agent-chat cards, this is a **client-only event** excluded from agent delivery and unforgeable via `publish`.
+
+**Identification fields.** `from_device_id` and `target_device_id` identify the two boxes in the spawn pair and map to the devices' own ids — `from_device_id` is always the requesting parent. `from_name` and `target_name` are the devices' sanitised names (control characters become spaces, capped to `PEER_NAME_CAP`), sent because a device's name is how the user knows which box is which on the conversation list. A client rendering the card state must identify which is parent and which is target using the device ids.
+
+**Originating conversation.** `from_convo_id` and `from_convo_title` identify the **parent conversation** — the session the parent owns and is asking from, and where this card is being published. A client that missed the live card or wants to review all spawn requests uses these fields to correlate the card to its originating thread. `from_convo_id` is authorisation, not decoration, exactly as in agent-chat: it must be a **top-level conversation** (`parent_convo_id` must be null — a child/sub-chat can never front an ask) that the requesting device actually owns, or the `spawn_request` is rejected `not_found`. A title is shown to the user as the asker's identity, so an unchecked one would let a requester borrow another conversation's name to be trusted by. Both id and title are sent because neither alone identifies a conversation to a user — a room's title has no identifying prefix (unlike a bridge-seeded session title), and two conversations can share wording. A title is a snapshot taken when the ask was made: the card is an immutable event, so a later retitle does not rewrite it.
+
+**Prompt and context.** `task` is both the child's seed prompt for the `start` RPC and the card's text that the user approves — one blob, so the text the user reads is the text that takes effect. `workdir` is the child's working directory, sent as context so the user can understand what environment the spawn will run in. Both are peer text and undergo the same sanitisation (control characters become spaces, trimmed to `SPAWN_TASK_MAX_CHARS` and `SPAWN_WORKDIR_MAX_CHARS` respectively). `topic` is optional and provides a shorter title fragment (capped to `INVITE_TOPIC_MAX_CHARS`) — when present, used as the card's headline instead of truncating the task itself.
+
+**Model.** `model` is optional and names which Claude model the child session should run — an alias like `opus` or a full model id like `claude-opus-4-20250514`. The vocabulary is the **target bridge's**, not the journal's: this is a length bound (`SPAWN_MODEL_MAX_CHARS`, 64) and the usual peer-text sanitisation only, never an allowlist, so a bridge that learns a new alias keeps working against an older journal. It is stored on the spawn row and relayed to the target in the `start` RPC params **only when non-empty** — a request that names no model produces the exact params a pre-`model` journal sent, and the consent card omits the key rather than carrying an empty one. An unrecognised model is the target's business to reject (its `start` error surfaces as the usual `failed` outcome).
+
+**Agent and effort.** `agent` (`claude` | `codex`) and `effort` follow the same rule: stored on the row (`agent_spawn_requests.agent`, `.effort`) and relayed in the `start` params only when the ask named them, so the target bridge otherwise starts its own box default. The `start` params are `{workdir, prompt, room_id?, from_name?, model?, mission_num?, effort?, agent?}`.
+
+**What will run (`*_source`).** The card says which agent, model and effort the child will actually get (`predictSpawnRun` in `src/spawn-model.js`). A value the ask named is carried with `<field>_source: "explicit"`. One it did not name is predicted from the target's box defaults — its last reported `defaults` block, else the journal's stored values (see *Box defaults*) — and carried with `<field>_source: "box_default"`; with neither, the key is omitted as before. The box's model and effort belong to its default agent, so an ask that names a *different* agent gets neither predicted. A Codex child never carries the Fable fallback below; a box-default model other than Fable suppresses it like a named one. **Claude model on a Codex box.** When the ask names no `agent`, the target's default agent is codex, and the ask names a Claude model — an alias (`opus`, `opus[1m]`, `sonnet`, `sonnet[1m]`, `haiku`, `opusplan`, `fable`, `default`) or anything starting `claude-` (`isClaudeModel` in `src/spawn-model.js`, mirroring the bridge) — the target bridge drops that model, and a Claude-only effort (`max`), and runs Codex on its box defaults. The card then carries `agent: "codex"` (`box_default`), the box's model and effort as `box_default` (omitted when the box has none), and `dropped_model` / `dropped_effort` naming what will be ignored; an effort both agents share stays `explicit`. The item body adds "Model `opus` is ignored: this box runs Codex" (and the same for the effort). Naming `agent` explicitly turns this off: the ask runs as named. The consent item's body reads e.g. "Agent: Codex (box default)", "Model: `gpt-5.1-codex` (box default)", and `GET /consent/pending` carries the same `agent`/`model`/`effort`, `*_source` and `dropped_*` keys on each spawn row, predicted again at list time.
+
+**Fable-limit fallback.** When no `model` is named, the target bridge decides the model at `start` time: if its default is Fable and its own /usage reading shows the Fable weekly meter at 99% or more (and not past its reset) while a live all-models weekly reading is under 100% (no such reading means no fallback), it starts the child on Opus (matron-bridge `lib/fable-fallback.js`). An explicit `model` always wins. The journal predicts this for the card from the target's last `box_status` report (`src/spawn-model.js`, same rule): a no-model card then carries `fallback_model: "opus"` and `fallback_reason: "fable_limit"` (both omitted otherwise), the consent item's body says the session starts on Opus, and `GET /consent/pending` adds the same two keys to the spawn row, predicted again at list time. The target's `start` reply says what actually happened — `{convo_id, model: "opus", model_reason: "fable_limit"}` — and the `started` outcome (frame and durable `spawn_outcome` event) carries `model` and `model_reason` when the reply named a known reason and a plain model token (≤64 chars, `[A-Za-z0-9._[\]-]`), omitted otherwise. The consent item's closing note then reads "started on <box> on `opus` — Fable limit reached".
+
+sent with `sender: "agent:<name>"`, same sender convention as any other agent-authored event.
+
+### Tracker item
+
+The card sits in one conversation's timeline and is easy to lose; the Decisions list is where the user looks for things that need an answer. So the moment a card is journaled, the journal also files a **tracker item** on the parent conversation (`src/consent-items.js`, `fileSpawnConsentItem`) and the row remembers it (`agent_spawn_requests.item_id`):
+
+- `kind: 'question'`, `awaiting: 'user'`, `created_by: 'agent'`, origin = the parent conversation and device (so it inherits the parent's mission like any item filed there), placed at the **top** of the open list.
+- `title`: `Approve spawn on <target_name> — <topic, or the head of the task>`; `labels: ['consent']`; `links: [{url: 'matron://consent/spawn/<request_id>', title}]` — the link is how a client that learns to embed the card in item detail finds the ask; until then the item's origin chip is the way back to the conversation holding the card.
+- `body`: who asks, the box, the workdir, the model and the room flag when present, the task **verbatim**, and how to answer (open the named conversation, tap Approve or Decline on the card, 24 h expiry). Peer strings arrive single-line from the card, but the body is **markdown** — the first place another agent's words meet a renderer — so the task sits in a fenced code block (a fence closes only at the start of a line, which a single-line task cannot reach; the fence is one backtick longer than the task's longest backtick run, so the task itself is never altered), device and conversation names have markup characters stripped, and a backtick in a workdir is stripped rather than let close its code span.
+- Its `created` marker is written under the **asking agent's device** (same sender as the card), carries `consent: 'spawn'` (client-only, see below), and is **quiet**: no push (the card's own `permission_request` push already rang the pocket), no wake, and **no old-client fallback text** (`emitMarker`'s `fallback: false`) — a fallback `text` would overwrite the card's `🤝 Agent spawn request` snippet and count a second unread for one ask. Connected clients still learn of the item live from the marker.
+
+**The item is the user's alone — invisible to every agent, in every state.** Its body carries the very text the card withholds from agents (`isClientOnlyEvent`), so `isConsentMirror` (`src/items.js`: `items.consent` is `'spawn'` or `'chat'`, set at creation and carried on the item itself — never derived from the row pointing at it, which a renewed chat ask re-points and a device revoke cascades away) makes it a 404 for agent callers on `GET /items/:id` and on every mutation route, and absent from `GET /items` (`excludeConsent`), private agents included. Its `created`/`closed` markers carry `consent: 'spawn'` and are therefore client-only too (`isClientOnlyEvent` covers `item` markers with a `consent` key): no agent hears of the item live, on replay, or through message reads. The asking agent, if prompt-injected, can neither rewrite the task the user reads there nor close it out of the open list. A client's hand-close is still the user's own call.
+
+**The item is a mirror, never a second source of truth.** Answering happens on the card (`POST /agent-spawn/answer`); the row's state machine decides what the item says. The one invariant: **the item is open exactly while the row is `awaiting_user`.** An approval takes the row out of that state at the answer, while its outcome can be minutes away (wake-before-spawn waits for a sleeping box), so the item is settled in two steps, both through `closeSpawnConsentItem`:
+
+1. **The answer closes it.** `answerSpawnAsk` (`src/consent-answer.js`) closes the item the moment `claimApprove` wins, before the orchestration starts. A decline and an expiry close it from `emitSpawnOutcome`, which for those runs in the same tick as the row's flip.
+2. **The outcome adds how the start went.** `emitSpawnOutcome` — the one funnel every terminal transition passes through — runs between the durable `spawn_outcome` append and the ephemeral frame. For an item the approval already closed it appends a plain agent comment (`commented` marker) and the item stays closed with its `decided` resolution; an item still open at that point (a row approved by a build that predates step 1, or an approval note that failed to write) is closed there with the whole story.
+
+| step | resolution | note | attributed to |
+|---|---|---|---|
+| approved (the answer) | `decided` | closing status row: `Approved. Starting the session on <target>; a box that is asleep is woken first, which can take a few minutes.` | the user; the answering client device (`answeredByDeviceId`) |
+| `started` | unchanged | comment: `The session started on <target>.` (+ model fallback, + room sentence for a linked ask) | the asking agent's device |
+| `failed` | unchanged (`decided`) | comment: `The session could not be started (<error_code>).` | the asking agent's device |
+| `declined` | `decided` | closing status row: `Declined.` | the user; the answering client device |
+| `expired` | `cancelled` | closing status row: `Expired — no answer within 24 h.` | the asking agent's device |
+| `started` / `failed` on an item still open | `decided` / `cancelled` | closing status row: `Approved — the session started on <target>.` / `Approved, but the session could not be started (<error_code>).` | the user / the asking agent's device |
+
+**Reconcile.** `reconcileConsentItems` (`src/consent-items.js`) runs at every sweep tick, after the expiries: any open `spawn` or `chat` consent item whose ask is not `awaiting_user` is closed, with the note its row's state still supports (`approved`, `started`, `declined`, `expired`, `failed`; for chat `approved`/`denied`) or, when the row is gone or says nothing, `Closed — the request is no longer waiting for an answer.` (`cancelled`). It is the backstop for every way an item can outlive its ask: a row approved before step 1 existed, a chat row cascaded away with its revoked device, a renewed chat row whose `item_id` now names the newer ask's item. It is also what closes the items earlier builds left open, within one tick of the first start on a build that has it. Contact and share mirrors are answered on the item itself and are not swept.
+
+**A consent item's status follows its ask, never a comment.** `POST /items/:id/comments` from the user on any consent mirror records the comment but leaves `state` and `awaiting` alone (`addComment`'s `keepStatus`): the generic rule would reopen a settled mirror, or hand a waiting one to an agent that cannot see it. `POST /items/:id/reopen` on a consent mirror is `409 conflict`. Every other marker written for a consent mirror, by any route (`emitMarker`), carries `consent` and is therefore client-only, has no old-client fallback text, and neither pushes nor wakes: a hand-close, a retitle or a reorder never reaches an agent. The user's own reply is the exception, when the mirror's conversation is the asker's own (a spawn ask; a chat **invite**, whose room the asker owns): it is addressed to the agent that asked, so its `commented` marker — and a voice reply's `updated` transcription follow-up — goes out as an ordinary one, the asking agent hears it as a turn and its box is woken, while the item itself stays unreadable to every agent. A reply on a chat **join** ask (the mirror is on a room the asker is not in, and the owner must not hear the ask) or on a contact or share mirror stays client-only.
+
+The `closed` marker is as quiet as the `created` one. Closing the item by hand does **not** answer the ask — the row stays `awaiting_user`, the card still answers, and the 24 h expiry still runs; an item the user already closed by hand is left exactly as they left it (`closeItem` answers null and the outcome proceeds); a row with no `item_id` — one parked before the mirror existed, or one whose filing failed — resolves with no item at all. Filing and closing are **best-effort by contract**: a tracker failure is logged and never costs the ask, the card, or the outcome frame.
+
+Because items are user-wide, the parent's task text is readable through `GET /items` by every non-private agent of the user while the ask is open — the same text the card withholds from agents (`isClientOnlyEvent`). That is the trade the design makes on purpose (the user asked for the task in the item), recorded in the spec; a stricter sieve is a follow-up, not an accident.
+
+### Answering
+
+**`POST /agent-spawn/answer`** `{request_id, decision: "approve"|"deny"}` — client-only (`403` for agent tokens). `request_id` must resolve to a **row belonging to the caller's own user**; an unknown row and one owned by another user are indistinguishable (`404 {error:'not_found'}`, never `403` — anti-enumeration). The row must be `state='awaiting_user'` or the call is `409 {error:'conflict'}` (already answered, or never parked). A body carrying `always_allow` at all — any value — is `400 {error:'bad_request'}`.
+
+- **`deny`** flips the row to `denied` and sends the parent `{kind:'spawn', event:'outcome', request_id, outcome:'declined'}` (if reachable).
+- **`approve`** flips the row to `approved` and then, **for a linked row only** (`link` was `true` on the ask), creates a new `conversations` row owned by the parent and joins the target as a participant — room-first, same ordering rule as agent-chat, so a room-creation failure never leaves a live agent spawned on another box with no channel and no provenance. The room is titled the way a bridge titles its own agent-chat rooms (`D:ab ↔️ E:cd — topic`, see matron-bridge `lib/agent-chat.js` and this repo's `src/room-title.js`): each side is the box letter derived from the parent-visible roster (tag_char honoured) plus the session short the owning bridge baked into that session's title, and a side with no short yet falls back to the device name. At creation the child has no title, so its side is the bare target name; when the child's bridge later publishes a title (`convo_upsert` with `title`), the journal retitles the room with the child's tag and fans a `convo_meta` (`refreshSpawnRoomTitle`, `src/spawns.js`). That short is learned once and frozen on the row (`child_short`), so a later child rename — even one carrying a different short, or none — changes nothing, the same way a bridge room freezes its peer short at creation. Before the `start` RPC is issued, `session_status` and `convo_meta` journal events are broadcast into the new room — the same two frames `convo_upsert` fans for a fresh conversation — so live clients learn the room exists immediately, and they fan to the target agent too, since it is already a joined participant by this point. A **detached row** (the default) mints no room and writes no epitaph on failure: the outcome frame is its whole story. Only then does the journal issue the `start` RPC to the target with `params: {prompt: <task>, workdir: <workdir>, room_id?: <new room id, linked rows only>, from_name?: <parent device's sanitised name>, model?: <the requested model>}`. `from_name` gives the target's opening turn the parent's identity without a separate lookup; it is omitted rather than sent empty if the parent device row is gone by approval time. `model` follows the same omit-when-absent rule — a row that named no model, including any row written before the column existed, sends no key at all. The parent hears one of: `outcome:'started'` (with `child_convo_id`, plus `room_id` for a linked row), `outcome:'failed'` (with `error_code`), or times out to `failed/timeout` if the target never answers.
+
+### Outcome frames
+
+All settlement notifications to the parent take the form `{kind:'spawn', event:'outcome', request_id, outcome: '<state>', ...}`:
+
+```json
+{
+  "kind": "spawn",
+  "event": "outcome",
+  "request_id": "the spawn row's id",
+  "outcome": "started | declined | expired | failed",
+  "room_id": "new room id (started only, and only for a linked spawn)",
+  "child_convo_id": "child session id reported by the target (started only)",
+  "error_code": "code describing the failure (failed only)"
+}
+```
+
+**The durable `spawn_outcome` event.** Every call site that sends the ephemeral frame above also appends — first, then sends the frame — a `spawn_outcome` journal event into the **parent conversation** (`from_convo_id`, the same conversation the consent card was published into), through one shared helper (`emitSpawnOutcome`, `src/spawns.js`). The payload mirrors the frame exactly, minus `kind`/`event`:
+
+```json
+{
+  "request_id": "the spawn row's id (same value the card carries)",
+  "outcome": "started | declined | expired | failed",
+  "room_id": "new room id (started only, and only for a linked spawn)",
+  "child_convo_id": "child session id (started only)",
+  "error_code": "sanitised failure code (failed only)"
+}
+```
+
+Sent with `sender: "journal"` — server-authored, no `sender_device_id`, the same convention as the failure epitaph written into the room on the failure paths. Correlation is by `payload.request_id`: the card carries the same id, and the card's `seq` is not otherwise discoverable by a client that missed the live frame.
+
+Unlike the card, `spawn_outcome` is **agent-visible** — deliberately *not* added to the client-only-event predicate. The parent agent owns `from_convo_id`, so it receives the event in live fan-out and hello replay exactly like any other event in a conversation it manages; the un-approved ask stays withheld (the card itself is still client-only, unchanged), but the *resolution* is precisely what the parent is entitled to know. If `from_convo_id` is itself a room with joined peer agents, those participants receive the event too — the ordinary fan-out rule for any event in a room they're joined to. That's information, not capability: a leaked `room_id`/`child_convo_id` grants nothing (transcript reads stay gated by write-authorisation, and foreign-context reads are filtered to indexable prose, which `spawn_outcome` never is). It is also, like the card, **unforgeable**: `spawn_outcome` is deliberately *not* added to `AGENT_PUBLISH_TYPES`, so a bare `publish` or `finalize` of the type is rejected `bad_request` before it ever reaches the append path — server-minted only.
+
+`spawn_outcome` joins `MESSAGE_TYPES`, so a resolution updates the parent conversation's snippet and bumps unread the same way the card itself did — the resolved state must retire the card's `🤝 Agent spawn request` snippet, or the chat-list row keeps advertising a settled ask forever. `snippetOf` maps each outcome: `started` → `🚀 Spawned session started`, `declined` → `🚫 Spawn declined`, `expired` → `⌛ Spawn request expired`, `failed` → `❌ Spawn failed`. No push notification follows — journal-authored events never enter the push pipeline (only agent-published events via the ws append path do) — which is correct: a started child generates its own activity, and answered outcomes were just acted on by the user looking at the screen. The event is not searchable either: its payload carries only ids/an enum/error codes, no prose, and `indexableBody` returns `null` for it like every other non-text/diff type.
+
+The append is **best-effort**: `from_convo_id` may point at a conversation deleted since the ask was parked, and `append()` throws on a missing/foreign conversation. `emitSpawnOutcome` catches that, logs it, and sends the ephemeral frame regardless — telling the parent (if reachable) is the one thing this tail must never skip, even when the durable half fails.
+
+The four outcomes flow from: `started` (approval granted and target answered), `declined` (user denied), `expired` (24h TTL without user action), `failed` (target unreachable, didn't answer in time, returned a bad start response, or — see "Stranded-`approved` recovery" below — orphaned by a restart or an internal error mid-orchestration). These outcomes are coarser than the six `agent_spawn_requests.state` values: `awaiting_user` and `approved` are transient parking states with no outcome frame of their own, folded into whichever of the four above the row eventually resolves to. **Frame delivery to live sockets is still at-most-once; the journaled event is now the durable record.** Every parked request resolves to exactly one terminal state, and both the outcome frame and the `spawn_outcome` event fire exactly once for it — but the frame itself remains fire-and-forget to the parent's live sockets (like `/agent-chat/answer` frames), so a parent offline at resolution time still misses *the frame*. It no longer misses the outcome (absent an append failure, above): the journaled event lands in `from_convo_id` regardless of whether anyone was listening, and a parent that was offline picks it up on its next hello replay, the same way it would any other event in a conversation it manages. The durable row (`agent_spawn_requests.state`) remains the ultimate source of truth; the journal event is what makes that truth reach the parent agent without depending on socket timing — the recorded follow-up this section used to promise, now implemented.
+
+**Wake-before-spawn.** A target with no live connection is usually a box the host idle-stopped, not a dead one. With a wake command configured (`MATRON_WAKE_CMD`, see `src/wake.js`): `spawn_request` fires the wake and parks the ask as usual instead of refusing it (the ack carries `target_waking: true`); `/agent-spawn/answer` approve fires it again if the box is still down and the orchestration then waits up to `spawnWakeWaitMs` (`MATRON_SPAWN_WAKE_WAIT_MS`, default 240000 — sized for a cold VM boot on the shared hosts) for the box's socket to register before issuing `start`; only then does the ordinary `agent_unreachable` failure apply. The wait is only ever paid when a wake is actually under way (`wakeIfOffline` returned true): a journal without a wake command behaves exactly as before, and its orphan TTL is unchanged. The same wake fires when an `agent_invite`/`agent_join` is parked against an asleep box and when its approval finds the recipient still down — approved invites are already pumped on the recipient's next hello (`deliverPendingInvites`), so the wake is what turns "sits until someone starts the box" into "arrives in a few minutes".
+
+**Journal-originated RPC:** When the journal issues the `start` RPC itself (during approval orchestration), it sets `from_device_id: 0` — a reserved value signifying the journal is the originator, not a peer agent. The target's bridge uses this to seed the new session without a peer device context.
+
+### Spawning onto a mission
+
+(spec 2026-09-23 coordinator redesign §1c.) A row with `mission_num` is
+re-checked at approval, before any room or `start`: a mission closed or
+gone since the ask fails the spawn (`error_code` `mission_closed` /
+`no_mission`) and nothing is started. `start` carries `mission_num`
+(omitted when absent). On the `start` reply the journal creates the child's
+conversation row if its bridge has not published it yet (owned by the
+target box), runs `joinMission` for it, and appends a `mission` marker
+`joined` (`sender: journal`, `by: agent`) into it — all before the
+`started` outcome. The bridge injects the opening turn just before it
+answers `start`, so the order is: opening turn written, `start` answered,
+join committed, parent told; the bridge knows the mission from the `start`
+param. A join that fails at that point (the mission closed in the gap, the
+200-conversation cap, a mission the target box cannot see) is logged and
+the child runs unattached; the spawn still reports `started`.
+
+### Expiry
+
+A parked `awaiting_user` spawn request older than `AWAITING_USER_TTL_MS` (24 hours, same clock as agent-chat awaiting-user rows, clocked from `created_at`) is flipped to `expired` by the periodic sweep timer and the parent is notified. Unlike agent-chat, where expiry is masked as `reason:'refused'` (to hide from the requester that the user is unresponsive), **spawn expiry is reported honestly as `outcome:'expired'`** — spawn denials are already told plainly as `'declined'`, and there is no peer to hide behind, so distinguishing "the user never answered" from "the user said no" reveals nothing the parent doesn't already learn from a denial.
+
+### Stranded-`approved` recovery
+
+`approved` is meant to be momentary — the claim (`claimApprove`) that lets exactly one `POST /agent-spawn/answer` tap own the expensive orchestration, settled moments later by `outcome:'started'` or `outcome:'failed'`. Two things can strand a row there instead: the journal process restarting in the gap between the claim and the in-memory orchestration settling it (nothing left in memory will ever resolve the row), or an exception inside the orchestration *before* the `start` RPC is even issued (a DB error creating the room, say) — the route that fired the orchestration only logs such a throw, it never re-derives an outcome. Both leave the row `approved` forever and the parent never told, breaking "every request resolves exactly once and the parent is told exactly once."
+
+Two mechanisms close this, layered the same way `expireSpawns` covers `awaiting_user`:
+
+- The orchestration itself (`approveSpawn`) wraps its body in a try/catch: a throw before `broker.issue` routes to the same failure tail a bad `start` reply gets, with `error_code: 'internal'`.
+- The periodic sweep timer additionally flips any `approved` row whose `answered_at` (the claim timestamp) is older than the orphan TTL — derived as `max(5 minutes, 2 × (the configured start timeout + the wake wait, below))`, so a raised `spawnStartTimeoutMs` or `spawnWakeWaitMs` can never let the sweep fail a row whose orchestration is still legitimately awaiting the target's reply — to `failed`, and notifies the parent with `error_code: 'orphaned'`. If the orchestration got as far as creating the room before the restart (the room linkage is persisted onto the row *before* the `start` RPC is issued), the sweep also writes the same `❌ spawn failed` epitaph into that room a live failure writes, so the user is never left with an unexplained dead room. This is the backstop for the restart case, where nothing is left to run the try/catch above at all.
+
+Both paths use the same state-scoped `UPDATE ... WHERE state='approved'` (`markFailed` / the sweep's own update) that the rest of the state machine relies on: whichever one wins the race is the only one whose outcome frame is ever sent, so a row a live orchestration successfully resolved (`started` or `failed`) can never also be reported `orphaned` by a sweep tick that happens to land moments later.
+
+### Pending-ask cap
+
+Outstanding `awaiting_user` rows per *requesting* device are capped at `MAX_AWAITING_PER_REQUESTER` (3), shared with agent-chat invites and joins — the cap is what stops a re-ask loop, not TTL ambiguity or answer masking. Over the cap, `spawn_request` fails `{code:'conflict', detail:'too many requests awaiting user approval'}`. The user's Coordinator may answer its own or any other agent's parked asks through *Coordinator → Consent approval*, which is how a Coordinator that hit this cap on its own spawns clears it.
+
+## Items (task & decision tracker)
+
+Items are journal-owned rows (`items`, `item_comments`), scoped to the
+user like everything else, with a per-user `#num` starting at 1. The
+conversation log carries only **marker events** of type `item`, written by
+the journal itself on **every** mutating route — create, comment, close,
+reopen, rank, and `PATCH` (`updated`) alike; the only markerless write is
+the agent's transcript write-back, which finishes a job the apps already
+know about. Agents cannot `publish` one (`item` is not an
+`AGENT_PUBLISH_TYPES` member — a bare publish is `bad_request`). Each
+marker is appended **after** the item's own transaction has committed, not
+inside it: a broadcast can never advertise a write that then rolls back,
+and the cost of that ordering is that a marker append which itself fails
+(e.g. the origin conversation was deleted underneath it) is logged and
+swallowed — the item write stands.
+
+Immediately after a marker whose `action` is `created`, `commented`,
+`closed`, or `reopened` (never `reordered`/`updated`), the journal appends
+one more event — same conversation, same sender — to the same conversation:
+a plain `text` flagged `fallback_for: "item"` (plus `item_id`, `num`,
+`action`), so a pre-tracker client that cannot render `item` at all still
+sees the traffic (spec: "Old-client fallback"). New clients (the journal's
+own bridge and Apple apps) hide it; it never counts toward search or an
+extra push — the marker already made that decision. This is a temporary
+degrade path for clients predating the tracker, not a second timeline.
+
+### Routes (Bearer, either device kind)
+
+| Route | Body / query | Response |
+|---|---|---|
+| `GET /items` | `convo, kind, state, awaiting, label, sort=rank\|updated, since, limit≤500, cursor, scope=mine\|shared (shared: kind/state/awaiting/limit/cursor only; rows carry owner{user_id,name,github_login} and repo)` | `{items:[…], next_cursor}` |
+| `GET /items/:id` | `:id` = `it_…` or `#num` (URL-encode `#`) | `{item, comments:[…]}` |
+| `GET /items/:id` (shared) | `:id` = `it_…` of a colleague's item visible under *Shared visibility* | `{item, comments}` with `item.owner`; any other method or sub-route on it is **403 `forbidden`** |
+| `POST /items` | `{kind, title, body?, labels?, links?, attachments?, actions?, awaiting?, position?, after?, before?, convo_id, supersedes?, on_behalf_of?:'user' (agent callers only)}` + optional `Idempotency-Key`; `position` is **exclusive** of `after`/`before` (given together is 400); `after`/`before` may be given alone or together (a midpoint between the two, consistent with `/rank`; none means bottom) | 201 `{item}` (200 on replay) |
+| `PATCH /items/:id` | `{title?, body?, labels?, links?, awaiting?, actions?, mission?: id \| "#num" \| null}` — `attachments` is **400** (create-only in v1; it used to be dropped silently, which told a client its blob had landed), and a patch carrying neither a field nor `mission` is **400**. `mission` moves the item to that mission, or detaches it when `null`; it is an explicit move only, never inferred. Fields and the move are one write with one `updated_at`. | `{item}`. **404** if `mission` names a mission that does not exist **or** is invisible to the caller — the same sieve `GET /missions/:id` applies (see *Missions & milestones → Visibility*), never a 403, so a hidden mission is not an existence oracle here either. **409** only for `awaiting` on a closed item (clearing it with `null` is fine); a **closed mission is not refused** as a move target in v1 — closing a mission blocks on open items precisely so they can be moved, and a finished mission must stay correctable. |
+| `POST /items/:id/comments` | `{body?, attachments?, action?, reply_to?, actions?}` (body or attachments required, unless `action` is given) + optional `Idempotency-Key` | 201 `{item, comment}` (200 on replay); `action` from an agent is **403 `forbidden`**, one not among the current `actions` of what it answers (the item, or the comment `reply_to` names) is **400 `unknown_action`** — see *Action buttons*; `actions` from a client is **403 `forbidden`**, on a closed item **409 `conflict`** — see *Comment action buttons* |
+| `PATCH /items/:id/comments/:cid` | `{blob_ref, transcript}` — agent only, else 403 | `{comment}` |
+| `POST /items/:id/close` | `{resolution, comment?}` | `{item, comment}`; 409 if already closed |
+| `POST /items/:id/reopen` | `{comment?}` | `{item, comment}`; 409 if already open |
+| `POST /items/:id/rank` | `position:'top'\|'bottom'` exclusive of `after`/`before` (given together is 400); `after`/`before` may be given alone or together (a midpoint); zero given is 400 | `{item}`; 409 if the item is closed |
+
+Item shape: `{id, user_id, num, kind, state, resolution, awaiting, rank,
+title, body, labels[], links[{url,title?}], supersedes, origin_convo_id,
+origin_device_id, created_by, created_at, updated_at, closed_at,
+comment_count, last_comment_at, last_user_input_at, attachments[], has_image,
+mission_id,
+mission_num, consent, actions[], chosen_action, origin_convo_title}`.
+`last_user_input_at` is when the user last acted on the item: their latest
+comment, action tap, close or reopen, else the filing time of an item they
+filed themselves; `null` when only agents have touched it. Clients order
+closed items by it, newest first, falling back to `closed_at`.
+`origin_convo_title` is the title of the item's origin conversation (at most
+200 characters), so a client can say where an item was filed without a second
+fetch; `null` when that conversation is untitled, gone, or not owned by the
+item's user. It is read at request time and is not part of the item's own
+state: renaming the conversation does not bump the item's `updated_at`, so a
+`since` delta does not re-deliver the item. A client that also holds the
+conversation list should prefer that list's live title and use this field for
+origins it has not loaded. `consent` is `'spawn'` or `'chat'` on the journal's
+mirror of a consent card (see *Agent-spawned sessions → Tracker item*) and
+`null` on every other item; clients may use it to embed the card. `mission_id`/`mission_num` are the mission this item belongs
+to — both `null` when it has none — set by `PATCH /items/:id {mission}` or
+inherited when the item's origin conversation joins a mission (see *Missions
+& milestones*, whose *Visibility* section covers what an ordinary agent may
+learn from `mission_num`). `links[].url` must be `http(s)://` or the apps' own `matron://` (item
+links, consent asks — see *Agent-spawned sessions → Tracker item*); any
+other scheme is 400. **Consent mirrors** — the items the journal files for
+spawn and agent-chat consent cards — are invisible to every agent caller
+(404 on read and mutation, absent from `GET /items`); see that section. `attachments`
+here is the item **body**'s attachments (set at create only, v1) — a
+comment's own attachments live on the comment. Comment shape:
+`{id, item_id, author, device_id, kind:'comment'|'status', body,
+created_at, attachments[{blob_ref,mime,name,size,width?,height?,transcript?,transcript_status?}], meta, action, reply_to, actions, chosen_action}`.
+`width`/`height` (spec 2026-10-01, item thread layout shift) are the image's
+displayed pixel size, stamped by the journal from the blob's header when the
+attachment is stored (and backfilled after boot onto older comments) so the
+apps can reserve the image's aspect ratio before its bytes load. Server-
+attested like `transcript`: a size a client sends is dropped. Absent on
+non-image attachments and on images the journal can't size.
+**Inline attachments.** An item body or comment body may place one of its
+own attachments in the text as `![caption](attachment:<blob_ref>)` (grammar
+`!\[([^\]\n]*)\]\(attachment:([A-Za-z0-9_-]{1,128})\)`; refs inside fenced
+blocks or covered by an inline code span are literal text, while a code span
+wholly inside the caption does not hide the ref). A ref must name a blob in the **same
+write's** `attachments` — for `PATCH` `body`, the item's existing body
+attachments — or the write is **400 `{error:'invalid_attachment_ref', ref}`**.
+Apps split the body there (text, attachment, text …), show each attachment
+once (a repeated ref renders as its caption), and append the ones no ref
+places. Apps that render refs send `X-Matron-Item-Inline: attachments` on
+item requests; to a client without it, item and comment bodies in `/items`
+replies carry each ref as its caption (`(image)` when empty). Agents always
+get the stored text. The chat fallback line and unseen snippets use the
+caption form.
+
+`meta` is `null` for an ordinary comment, `{action:"<label>"}` for an action
+tap (plus `reply_to:"<comment id>"` when the tap answered a comment's
+buttons), and `{from:{state,
+resolution,awaiting}, to:{…}}` for the synthetic `status` comment a
+close/reopen writes. `action` is `meta.action` lifted to the top level — the
+tapped label, `null` on every other comment; `reply_to` is `meta.reply_to`
+lifted the same way. `actions` / `chosen_action` are the buttons the comment
+itself offers and the latest tap on them — `[]` / `null` on every comment
+that offers none (see *Comment action buttons*).
+
+**Action buttons** (2026-09-24 item-actions contract). `actions` is up to
+four one-tap answers an agent offers on an item (`["Go"]`, `["Option A",
+"Option B"]`) — `[]` when none, on every item. Set on `POST /items` or
+`PATCH /items/:id` (by anyone who may PATCH the item; `[]` clears). Each
+label is trimmed, 1–40 characters, on one line (no control characters or
+line/paragraph separators), and the list is unique case-insensitively;
+anything else — including a non-array — is **400 `{"error":"invalid_actions"}`**
+(duplicates are refused, not folded). A user taps one by posting an ordinary
+comment with `action: "<label>"`: the label must match one of the item's
+**current** `actions` exactly after trimming (checked in the comment's own
+transaction) or it is **400 `{"error":"unknown_action"}`**; an empty `body`
+becomes the label. Only a client may send `action` (an agent is **403**);
+`action: null` is the same as leaving it out. The comment stores
+`meta.action`, and the item's `chosen_action` becomes that label in the same
+write — it is always the most recent tap's label, `null` before any tap.
+Everything else is the ordinary user comment: it flips `awaiting` to
+`agent`, reopens a closed item, emits the `commented` marker (and its
+fallback text, whose prose is the label), wakes the box and pushes as any
+user comment does. A `PATCH` that changes `actions` clears `chosen_action`
+(the old tap no longer answers the new offer); re-sending the same list
+leaves it. An idempotent replay of a tap answers with the original comment
+even if the offer has changed since. Old clients ignore the new fields and
+see an action tap as a plain comment whose body is the label.
+
+**Comment action buttons** (2026-10-04 comment-actions contract). The same
+pair one level down, so an agent can ask a follow-up question on an item
+that already exists instead of filing a second item for it. An **agent's**
+`POST /items/:id/comments` may carry `actions`: the same list, the same
+validation and the same **400 `invalid_actions`** as on an item; `[]` or
+`null` is "none". The comment stores the list and returns it as
+`comment.actions`, with `comment.chosen_action` `null`. A non-empty list is a
+question to the user, so the same write sets the item's `awaiting` to `user`;
+on a closed item that is **409 `conflict`** and nothing is written (reopen
+first). A client sending a non-empty `actions` is **403 `forbidden`**. The
+words are still required: buttons without a `body` or an attachment are 400.
+
+The user taps one by posting a comment with `action: "<label>"` **and**
+`reply_to: "<comment id>"`. The label must match one of **that comment's**
+`actions` exactly after trimming, and the comment must be an ordinary
+comment of this item; anything else — an unknown id, a comment of another
+item, a `reply_to` that is not a string, or a `reply_to` without an `action`
+— is **400 `unknown_action`**. The tap is otherwise the tap described above:
+an empty `body` becomes the label, the tap comment stores `meta.action` and
+`meta.reply_to` (returned as `comment.action` / `comment.reply_to`), it flips
+`awaiting` to `agent`, emits the `commented` marker and wakes the box. What
+differs is which row records the choice: the **asking comment's**
+`chosen_action` becomes the label (the latest tap wins, as on an item) and
+the item's own `chosen_action` is left alone. Without `reply_to` a tap
+answers the item's own `actions`, exactly as before this contract. Each
+question in a thread keeps its own buttons and its own answer; a later
+question does not clear an earlier one. A typed reply marks no button.
+
+The `commented` marker's `comment` object carries `actions`,
+`chosen_action` and `reply_to` too, so a connected app draws the buttons
+under a new question, and marks the chosen one under the asking comment when
+the tap's marker arrives (`comment.action` + `comment.reply_to`), without
+refetching the thread. A bridge words the turn from `comment.action` as it
+does for an item tap. A grantee's read (`shared_via: 'grant'`) shows the
+comments with `actions: []` and `chosen_action: null`: the buttons are the
+owner's to tap. Old clients ignore the new fields: they show the question as
+a plain comment and the user answers in words. `idem_key` is an internal column on both and is never
+returned (same stance as the event shape's `user_id`/`idem_key`/`blob_ref`
+strip); a comment omits `user_id` too — the caller is the owner by
+construction.
+
+An attachment's `transcript` is **never caller-authored**: it is written only
+by the journal's own transcription job (below) or by the origin bridge's
+`PATCH /items/:id/comments/:cid`, and one supplied by a client on a create
+or a comment is stripped before storage (not a 400 — the blob still lands,
+just without the forged words). It is the text the apps show in place of a
+voice note, so it must never be caller-authored. `transcribed_at` (ms) is
+stamped alongside it by both writers.
+
+**Voice-note audio expires; the words do not.** `MATRON_VOICE_NOTE_TTL_DAYS`
+(default 7, `0` disables): the retention scheduler deletes an `audio/*`
+attachment's blob once its transcript is older than that (`transcribed_at`,
+or the comment's `created_at` for entries from before the stamp), rewriting
+the entry in place with `expired: true` — every other field, `blob_ref` and
+`transcript` included, is kept, so a thread still reads as it did and a
+client that fetches the blob gets the ordinary 404. Audio with no
+successful transcript (none, `pending`, `failed`) and non-audio attachments
+are never touched, and the item's `updated_at` is not bumped. Chat voice
+notes (`file` events) the journal transcribed successfully follow their own
+rule, keyed on `blobs.transcribed_at` rather than the event: see the cloud
+transcription note under `POST /media`. A chat voice note without a
+successful journal transcript (a bridge-only one included) is not expired
+by age.
+
+**Journal-side transcription.** When the journal has a cloud transcriber
+(`MATRON_STT_AZURE_KEY`, see `POST /media`) or whisper configured
+(`MATRON_WHISPER_MODEL` — path to a whisper.cpp `ggml-*.bin`; optional
+`MATRON_WHISPER_CLI`, default `<model dir>/../build/bin/whisper-cli`;
+`MATRON_WHISPER_LANGUAGE`, default `en`; `ffmpeg` on `PATH`), a **user's**
+comment with `audio/*` attachments is transcribed on upload, one job at a
+time:
+
+1. The comment is stored, and the `commented` marker announced, with
+   `transcript_status:'pending'` on each audio attachment (`transcript:null`).
+   Wake and push behave as for any comment, so a sleeping box boots while
+   whisper runs.
+2. Each job writes `transcript` and `transcript_status:'done'`, or
+   `'failed'` (whisper error, empty result, blob missing or not the user's).
+3. When the comment's **last** pending attachment settles, one quiet marker
+   follows: `action:'updated'`, the same `comment` (now with transcripts),
+   plus `transcription:'done'|'failed'` (`failed` if any attachment failed)
+   and `for_action:'commented'`. Sender and `by` are the commenting user's.
+   Quiet = no wake, no push, no fallback text.
+
+A bridge that knows the fields **holds the agent's turn** on a marker with a
+pending attachment and delivers it from the follow-up marker (falling back to
+its own whisper on `failed`, or if no follow-up arrives in time). A bridge
+that predates them sees `transcript:null`, transcribes as it always did and
+PATCHes the words in — which settles the status, so the journal's job skips
+the whisper run — and ignores the `updated` marker like any other. Pending
+jobs left by a restart are re-queued at boot. With whisper unconfigured none
+of this happens: no status field, and the origin bridge does the job.
+
+A voice note on a new item's **body** (`POST /items` `attachments`, user
+callers only) is handled identically: the body's attachments live on a
+synthetic comment, so the `created` marker carries that comment (empty
+`body`, the attachments `pending`) — only in this case — and the follow-up is
+`for_action:'created'`. The item body is still fetched with `GET /items/:id`.
+
+The bridge's PATCH announces itself the same way: one quiet `updated` marker
+with `transcription:'done'` (sender = the agent, so no bridge routes it as
+input), so an open item view refreshes when the words land.
+
+Rules: the `awaiting` default at creation depends on the kind **and on who
+filed it**. An agent-filed item takes the kind default — a `question`
+starts `awaiting:'user'` (it is a question *for* the user), a `task`
+`awaiting:'agent'`, a `decision` `null`. A **user-created** item (a client
+caller, or an agent's `on_behalf_of:'user'`) starts `awaiting:'agent'` for
+both `task` and `question` — a user's question is asked *of* the agent —
+and `null` for a `decision`. An explicit `awaiting` in the body always
+wins, `null` included. A reopen restores the *kind* default regardless of
+who created the item. A **user** comment always sets `awaiting:'agent'` and
+reopens a closed item. Close clears `awaiting`. Reopen restores the kind
+default (decision → `null`). `rank` is one order per user; midpoint
+insertion, server-side renormalisation when a midpoint would land within
+epsilon of a neighbour.
+
+Visibility: an ordinary (non-private) agent never sees an item whose origin
+conversation is managed by a private device — list omits it, every other
+route 404s — same predicate as `/search`. Unknown ids, other users' items,
+and sieved items are all 404 (never 403 — a refusal must be
+indistinguishable from an item that doesn't exist).
+
+Agent write gate: the tracker is scoped to the **user**, not to a
+conversation, so once an item clears `visibleItem` any of the user's agents
+may `PATCH` it, comment on it, close it, reopen it, or rank it — visibility
+is the only check. Two routes are the exception, because they target a
+*conversation* rather than an already-visible item: `POST /items` requires
+`authorizeAgentWrite` against the body's `convo_id` — the agent manages it
+(owns `agent_device_id`, or the conversation has none yet) or has joined it
+(`convo_agents` with `state='joined'`) — since a create is really an append
+to that conversation; and `PATCH /items/:id/comments/:cid` (transcript
+write-back) requires the same gate against the item's *origin* conversation,
+since transcribing a voice note is specifically the origin bridge's job, not
+any box that happens to see the item. Both refuse the same way as any other
+visibility failure: 404, never 403.
+
+### Idempotency
+
+`POST /items` and `POST /items/:id/comments` accept an `Idempotency-Key`
+header, scoped to `${device_id}:${key}`. A header present but empty, too
+long, or non-string is 400 `bad_request` — a client that believes its retry
+is being deduped must never have that silently ignored. A key already
+associated with a row (the *same* item for a comment; any item for a
+create, since the create-side lookup matches on the key alone) replays
+that row verbatim: `200` instead of `201`, and **no second marker is
+emitted**. A comment key reused against a *different* item is a genuine
+conflict — `409 {"error":"conflict"}` (`idem_key_conflict`) — since a key
+is unique per `(user_id, idem_key)` in the schema, not per item.
+
+### Marker event
+
+```json
+{ "seq": 123, "convo_id": "c1", "ts": 1699999999000,
+  "sender": "user:alice" | "agent:box-2", "type": "item",
+  "payload": { "item_id": "it_…", "num": 12, "kind": "question", "title": "…",
+    "action": "created|commented|closed|reopened|reordered|updated", "by": "user|agent",
+    "awaiting": "user|agent|null", "resolution": "…|null",
+    "actions": ["Go"], "chosen_action": "Go|null",
+    "comment": { "id": "ic_…", "body": "…", "action": "Go|null", "attachments": [ … ] } } }
+```
+
+`actions` and `chosen_action` are the item's action buttons at the moment of
+the marker (see *Action buttons*), on every marker; `comment.action` is the
+tapped label when the comment is an action tap, else `null`.
+
+Same envelope (`seq, convo_id, ts, sender, type, payload`) as every other
+journal event. `comment` is present only when the action carried comment
+text or attachments (a bare close/reopen with no note omits it). `updated`
+is the `PATCH` marker — a retitle, relabel, or a hand-moved `awaiting`, so
+connected clients learn of the edit without re-polling `/items`; it carries
+no `comment`. The event's `sender` is the writer's device, so a
+client-authored marker is a user event on the origin conversation: the
+wake-on-message path fires for `created|commented|closed|reopened` written
+by a client device (never for an agent's own write — it's already awake),
+and bridges treat those as inbound turns. `reordered` and `updated` are the
+quiet pair: neither ever wakes and neither ever pushes.
+
+Push: `attention` only when an **agent-authored** marker (`by:'agent'`)
+leaves an item `awaiting:'user'` via `created`, `commented`, or `reopened`.
+The `by:'agent'` guard applies to every action, `created` included: an
+`on_behalf_of:'user'` create is the item the user just asked for, filed by
+the agent device — so the `user:*`-sender rule does not catch it — and
+buzzing their pocket about their own request is exactly the
+self-notification that rule exists to prevent. Everything else (every
+user-authored marker, every `closed`, `reordered`, and `updated`) is
+journal-sync only. Not a `MESSAGE_TYPES` entry: no
+unread-badge or conversation-preview-snippet effect — but the push body
+text still runs the event's payload through `snippetOf`, which formats an
+`❓`/`⚖`/`☐` glyph + `#num title` for the alert.
+
+## Coordinator
+
+One conversation per user is the **Coordinator**, stored in `user_settings`
+(`src/coordinator.js`, `src/coordinator-http.js`) so every device and every
+bridge agrees which one it is.
+
+| Route | Who | Body | Returns |
+|---|---|---|---|
+| `GET /coordinator` | client or agent | | 200 `{convo_id: string\|null, consent: boolean}`. An ordinary agent reads `null` when the Coordinator is a private-owned conversation. `consent` is the *Consent approval* switch below (default `true`). |
+| `PUT /coordinator` | client only (agent → **403** `forbidden`) | `{convo_id?: string\|null, consent?: boolean}` — at least one | 200 `{convo_id, consent}`. **404** for a conversation the user does not own; **400** when neither key is present, `convo_id` is not a string/null, empty or over the id cap, or `consent` is not a boolean. `convo_id: null` clears. An unchanged value is a 200 no-op. |
+
+On a change the journal appends a `coordinator` event — payload
+`{role: "assigned"}` into the conversation that gained the role,
+`{role: "released"}` into the one that lost it — through the ordinary
+append+broadcast path, `sender` `user:<name>`. Released is written first.
+Clearing emits only `released`; an unchanged `PUT` emits nothing. Agents
+cannot `publish` this type. It is not a `MESSAGE_TYPE` (no unread, no
+snippet) and never pushes. `hello_ok` and `/snapshot` carry
+`coordinator_convo_id` so an app knows the Coordinator on connect.
+
+### Pinned desk chats (`/pins`)
+
+The user's own sidebar entries for standing conversations — an inbox desk,
+a help desk, an ops desk — drawn under the Coordinator in every
+app (`src/pins.js`, `src/pins-http.js`). A pin points at a **conversation**,
+never a box: a desk's conversation id survives idle reaps, `!restart`,
+`restart_session`, `/switch` and the box sleeping, and only a deliberate new
+session gets a new id. Up to **5** pins per user, in the user's order.
+
+Pin object: `{convo_id, label, emoji, position, device_id, missing?, successor?, created_at, updated_at}`.
+`label` is one line of 1–24 characters (code points); `emoji` is a short token without
+whitespace (≤16 UTF-16 units) or `''` (the app draws the label's first
+letter). `device_id` is the box the pinned conversation runs on. `missing:
+true` when the conversation row no longer exists — the apps grey the entry
+out with Move pin… and Unpin. `successor: {convo_id, title, created_at}` is
+the "new session on this box — move pin here?" hint: the newest top-level
+conversation on the same box (not a sub-chat, agent room, guest room, system
+conversation or another pin) created after both the pin and the pinned
+conversation's last message, unless the user dismissed exactly that one.
+Nothing moves without the user.
+
+| Route | Who | Body | Returns |
+|---|---|---|---|
+| `GET /pins` | client only | | 200 `{pins, limit}` |
+| `PUT /pins` | client only | `{order: [convo_id…]}` — every pin exactly once | 200 `{pins, limit}`; **400** otherwise |
+| `PUT /pins/:convo_id` | client only | `{label?, emoji?}` — at least one; a new pin needs `label` | 200 `{pins, limit}`. New pins go last. **404** for a conversation the user does not own; **409** `{detail:'pin_limit', limit}` past the cap; **400** for a bad label/emoji |
+| `DELETE /pins/:convo_id` | client only | | 200 `{pins, limit}`; **404** when not pinned |
+| `POST /pins/:convo_id/move` | client only | `{to_convo_id}` | 200 `{pins, limit}` — label, emoji and position kept, hint cleared. **404** no such pin or target; **409** `{detail:'already_pinned'}` |
+| `POST /pins/:convo_id/dismiss` | client only | `{successor_id}` | 200 `{pins, limit}` — that hint stays hidden until a newer session starts |
+
+Agents get **403** `forbidden` on every route. Every change sends
+`{kind:'pins', pins}` to the user's connected clients; so does a
+`convo_upsert` that creates or retitles a conversation which is now some
+pin's `successor`. A client's `hello_ok` and `/snapshot` carry `pins`
+(agents' do not). `/roster` rows carry `pin: {label, emoji}` on pinned
+conversations, so an agent can find "the help desk" by the user's name
+for it.
+
+### Session control (`session_control`)
+
+The Coordinator asks the journal to have another session's
+bridge switch its model or backend, compact it, or tell it to carry on.
+The journal is the relay: it checks the caller **is** the Coordinator (the
+one route the role gates), resolves the target to its box, wakes it if
+asleep, issues a journal-originated RPC and hands the reply back. Nothing
+is journaled here; the target bridge writes the visible record (a notice)
+into the session's own chat.
+
+```json
+{ "op": "session_control", "request_id": "…",
+  "from_convo_id": "<the Coordinator conversation>", "target_convo_id": "<session>",
+  "action": "set_model" | "compact" | "carry_on",
+  "model": "sonnet", "agent": "claude" | "codex",      // set_model: at least one
+  "message": "…", "when": "now" | "after_limit_reset", // carry_on: message required
+  "reason": "context at 92%" }                          // optional, shown in the target chat
+```
+
+Checks, in order — every failure after the `request_id` check is a
+`{kind:'control', op:'error', code, ref:'session_control', request_id, detail?}`
+frame: agent connection (`forbidden`); registered (`not_ready`);
+`request_id` ≤ 128 chars (`bad_request`, no `request_id` echoed);
+`action` in the vocabulary, `model` ≤ 64, `agent` in `claude|codex`,
+`message` ≤ 2000 and non-empty after sanitising, `when` in the vocabulary,
+`reason` ≤ 200, `target_convo_id ≠ from_convo_id` (`bad_request`, with a
+`detail`); `from_convo_id` a top-level conversation this device owns
+(`not_found`) **and** the user's Coordinator (`forbidden`, detail
+`not_coordinator`); `target_convo_id` exists, same user, top-level, has an
+`agent_device_id`, and its box is not a private device hidden from an
+ordinary caller — all indistinguishable `not_found`. Then the target box:
+offline and unwakeable → `agent_unreachable`; otherwise the op is acked at
+once with `{kind:'session_control', event:'sent', request_id, target_waking?}`
+and, off the socket's message loop, the box is woken if needed and waited
+for (`MATRON_SPAWN_WAKE_WAIT_MS`), a journal-originated RPC
+`session_control {convo_id, action, model?, agent?, message?, when?, reason?,
+from_convo_id, from_name}` is issued (`MATRON_SESSION_CONTROL_TIMEOUT_MS`,
+default 30 s) and its reply delivered to every live socket of the caller's
+device as `{kind:'session_control', event:'result', request_id, ok,
+result?|error:{code, detail?}}` (`timeout` / `agent_unreachable` /
+`internal` when the bridge never answered). Strings in `params`
+(including `from_name`) and in the relayed error are peer-text sanitised.
+At most 8 ops may be in flight per connection (each holds a wake waiter
+and a broker entry); a ninth is `conflict`. The shape checks run before
+the ownership and role checks — a `bad_request` reveals nothing about any
+conversation. Not a room op, not counted against the pending-ask cap:
+nothing awaits the user.
+
+**Stall wake sweep.** Once a minute (`src/stall-wake.js`) the journal
+scans `conversation_status` for a `stall` whose `resets_at` has passed and
+wakes that conversation's box if it has no live socket (`wakeIfOffline`,
+debounced by the waker), so the bridge's automatic carry-on after a usage
+limit runs even when the box idle-stopped while stalled. The bridge's next
+status frame drops the stall, which ends the loop; a reset more than six
+hours old is treated as spent (its bridge is not coming back for it), so a
+stale row cannot wake a box for ever. One box's failing wake never costs
+the others theirs. No-op without a wake command.
+
+## Coordinator routines
+
+A routine is a prompt the journal owns (`routines` table,
+`src/routines.js`) and fires into whichever conversation holds the
+Coordinator role — on a schedule, or when a trigger trips — so nothing in
+any conversation keeps it alive. Fields: `id` (`rt_…`), `name` (slug
+`/^[a-z0-9][a-z0-9-]{0,63}$/`, unique per user, the handle agents and
+prompts use), `title` (one line ≤ 200), exactly one of `schedule` (five
+cron fields, evaluated by `croner` in `tz`) and `trigger` (below), `tz`
+(IANA, default `Europe/London`), `prompt` (≤ 2000 chars, line breaks
+kept, other control characters stripped), `enabled`, `origin`
+(`seed|user|agent`), `next_at` (ms; NULL while paused, always NULL for a
+triggered routine), `last_fired_at`, `last_outcome`, `created_at`,
+`updated_at`. A schedule whose consecutive fires (checked over the next
+five from now) are under 15 minutes apart, or with fewer than five future
+fires, is `bad_request`: a routine is a check-in, not a poll. At most 50
+per user. A routine is scheduled or triggered for life: `PATCH` may give
+`schedule` only to a scheduled routine and `trigger` only to a triggered
+one, never both (`bad_request`).
+
+**Triggers.** `trigger` is `{kind:'context_over', pct}` (1–99: a live
+session, never the Coordinator's own, a helper conversation inside a
+session, nor a Codex session (GPT, o-series or codex model names: Codex
+compacts itself), whose context tokens are at or past `pct` of its window — 1M at
+least for the 1M-class models, Opus, Fable, Mythos and any `[1m]` alias,
+whose bridges can only prove 1M once the gauge passes 200k), `{kind:'stalled', reset_minutes}` (0–10080, default 120: a live
+session stalled on a usage limit whose reset is at least that far away or
+unknown) or `{kind:'disk_under', pct}` (an agent box under `pct`% free
+disk), evaluated against `conversation_status` and `device_status` by a
+sweep every five minutes (`src/routines-triggers.js`), as the Coordinator's
+box may see them (private-owned sessions and private boxes are invisible
+to a Coordinator on an ordinary box). Each matching subject (`convo:<id>`
+or `device:<id>`) fires **once per crossing**: `routine_trigger_state`
+records the subjects fired for and forgets them when they stop matching.
+The fire's `message` is the prompt plus a `Tripped by:` list, one line per
+fresh subject (`- [title](matron://convo/<id>) at 42% of its window
+(420k/1M, model)`, `- […] stalled on <model>, resets <iso> (in 5 h)` / `no reset
+time`, `- <box>: 15% free (15.0 GB of 100.0 GB)`). Pausing a triggered
+routine or changing its trigger clears its records. A triggered routine
+fires at most once per 15 minutes — a resting routine still forgets
+subjects that stop matching, and subjects crossing inside the gap are
+fresh at the first sweep after it; a retryable delivery failure forgets the
+fresh subjects and backs the routine off 15 minutes; `run` fires with
+whatever matches now, records untouched.
+
+| Route | Who | Body | Returns |
+|---|---|---|---|
+| `GET /routines` | any | | 200 `{routines}` by name |
+| `GET /routines/:key` | any | | 200 `{routine}`; `:key` is the id or the name |
+| `POST /routines` | client, or the Coordinator | `{name, title, schedule \| trigger, prompt, tz?, enabled?, convo_id?}` | 201 `{routine}`; **409** `{error:'conflict', blocked_by:'name'|'cap'}` |
+| `PATCH /routines/:key` | client, or the Coordinator | `{title?, schedule?, trigger?, tz?, prompt?, enabled?, convo_id?}` — at least one; `name` is not editable | 200 `{routine}` |
+| `DELETE /routines/:key` | client, or the Coordinator | `{convo_id?}` | 200 `{ok:true}` |
+| `POST /routines/:key/run` | client, or the Coordinator | `{convo_id?}` | 202 `{accepted:true}`, or `{delivered:false, reason:'no_coordinator'\|'busy'}` |
+
+**The Coordinator gate** on agent writes is the one project close/merge
+use (`closingConvo`, required): the agent names its own conversation in
+`convo_id` and it must be the user's Coordinator — missing or another
+conversation → **403** `{error:'forbidden', detail:'not_coordinator'}`, a
+conversation this device does not own → **404**, a malformed `convo_id`
+→ **400**. A client token passes with no `convo_id`. The Coordinator
+creates and deletes as well as edits (2026-10-02); the marker's `by` says
+which (`'agent'` or `'user'`).
+
+`enabled: false` clears `next_at`; `true` again, or a `schedule`/`tz`
+change, recomputes it from now; `title`/`prompt` edits leave the schedule
+alone. `run` fires whatever `enabled` says, stamps `last_fired_at`, and
+never touches `next_at`.
+
+**Firing** (`src/routines-sweep.js`). Once a minute (`MATRON_ROUTINES=0`
+turns both sweeps off; the routes and `run` still work) the journal takes
+every enabled scheduled routine whose `next_at` or `retry_at` has passed
+and, in one transaction *before* delivering, stamps `last_fired_at`, moves
+`next_at` past now and clears `retry_at` — so a crash, a slow wake or a
+restart mid-delivery never fires the same occurrence twice. A fire more
+than 6 hours late (measured from `retry_at` for a retry, `next_at`
+otherwise) is recorded as `last_outcome: 'missed'` and not delivered; a
+routine paused between the due query and its advance is not fired. Delivery is the Alertmanager relay's path: resolve the
+Coordinator and its box (none → `no_coordinator`), `wakeIfOffline`, wait
+for the box to attach (`MATRON_SPAWN_WAKE_WAIT_MS`) when a wake was fired,
+then issue the journal-originated RPC
+(`MATRON_SESSION_CONTROL_TIMEOUT_MS`):
+
+```json
+{ "method": "session_control",
+  "params": { "convo_id": "<the Coordinator conversation>", "action": "routine",
+              "routine_id": "rt_…", "name": "daily-sweep", "title": "Daily sweep",
+              "message": "<prompt>", "fired_at": "2026-10-02T06:05:00.000Z",
+              "tz": "Europe/London", "from_name": "Routines" } }
+```
+
+The bridge's `{ok:true, result:{applied}}` becomes `last_outcome:
+'applied now'|'applied deferred'`; an error `'failed <code>'`. A failure
+the next attempt might cure (`agent_unreachable`, `timeout`,
+`send_failed`, `internal`) arms **one** retry 15 minutes later; the
+retry's own failure is final until the next scheduled time, and a
+bridge's refusal (`bad_request`, `not_coordinator`, `gone`) is never
+retried. At most 4 deliveries are in flight per journal process; a due
+routine that gets no slot stays due, untouched, for the next sweep. One
+line is logged per delivery. `routine` is **not** a `session_control` op
+action: only the sweep and `run` build it, and the bridge refuses one
+whose `from_device_id` is not the journal's 0 or that targets anything
+but the Coordinator.
+
+**Marker event.** Every create, update, delete and fire appends a
+`routine` event into the Coordinator conversation (nothing when no
+Coordinator is set): `{routine_id, name, action:'saved', by, created}`,
+`{…, action:'deleted', by:'user'}` with the writer's sender, or
+`{routine_id, name, action:'fired', outcome, next_at}` with sender
+`journal`. Not a `MESSAGE_TYPES` entry, not an `AGENT_PUBLISH_TYPES`
+member, never pushes, never wakes; apps refetch `GET /routines` on it.
+
+**Seeding.** The first time a user gets a Coordinator (`PUT /coordinator`,
+after the role transaction commits) — and once at boot for users who
+already had one — the journal creates the starter set with `origin:
+'seed'` and stamps `user_settings.routines_seeded_at`, so it happens once
+per user and never again after the user empties the list: `daily-sweep`
+07:05, `session-health` every 2 h, `project-status` 08:00 and 17:00,
+`unseen-digest` 12:00 and 18:00, `deploy-window` 18:30 Mon–Fri, all
+Europe/London, plus the triggered `context-over` (`context_over` 40),
+`stalled-session` (`stalled` 120) and `disk-low` (`disk_under` 20) — each
+prompt one line pointing at the Coordinator playbook's section of that
+name.
+
+## Coordinator briefings
+
+The Coordinator publishes its sweep and status updates as briefings; the
+apps show the latest at the top of Projects ("Latest briefing · 5 minutes
+ago"), open it in full, and may ask for a fresh one. A briefing
+(`briefings` table, `src/briefings.js`) is `{id: 'br_…', body (markdown,
+trimmed, ≤ 32 KB), created_at, convo_id, seq}`. Publishing also appends an
+ordinary `text` event `{body, from: 'assistant', briefing_id}` from the
+Coordinator into its own conversation in the same transaction: the chat
+keeps it, apps that predate briefings show it as a normal message, and
+`seq` is that event's seq (the "Open in chat" anchor). The newest 30 per
+user are kept.
+
+| Route | Who | Body | Returns |
+|---|---|---|---|
+| `GET /briefings/latest` | client | — | `{briefing \| null, refresh \| null, next_refresh_at \| null, has_coordinator}` |
+| `POST /briefings` | the Coordinator, naming its own conversation | `{convo_id, body}` | 201 `{briefing}` (200 on an `Idempotency-Key` replay) |
+| `POST /briefings/refresh` | client | — | 202, the `GET /briefings/latest` shape |
+
+`POST /briefings` uses the routines' Coordinator gate: a client is 403
+`forbidden`; an agent without `convo_id`, or naming a conversation that is
+not the Coordinator, 403 `{detail: 'not_coordinator'}`; one it does not
+own 404; an empty or oversized body 400.
+
+**Refresh.** `POST /briefings/refresh` fires a built-in, on-demand run at
+the Coordinator through the routine path: a journal-originated
+`session_control` with `action: 'routine'`, `routine_id: 'rt_briefing'`,
+`name: 'briefing'`, `title: 'Briefing'`, whose prompt points at the
+playbook's `## Routine: briefing`. It is not a row in `routines` (it never
+appears in `GET /routines` and emits no `routine` marker). `refresh` is
+`{requested_at, state: 'pending' | 'failed' | 'timed_out', expires_at?
+(pending), outcome? (failed: the firer's outcome string)}`, and is `null`
+once a briefing is published at or after `requested_at`. It is `pending`
+until then for 10 minutes, `timed_out` after. `next_refresh_at` is when
+the next refresh may be asked for: while one is pending, its `expires_at`;
+otherwise 2 minutes after the last ask. A refresh before then is 429
+`{error: 'rate_limited', retry_at}`; with no Coordinator, 409
+`{blocked_by: 'no_coordinator'}`; with the firer at its in-flight bound,
+503 `{error: 'busy'}`.
+
+### Live frame
+
+`{kind: 'briefing', action: 'published' | 'refreshing' | 'refresh_failed',
+briefing_id?}` goes to every live client socket of the user (not a journal
+event; nothing replays it). Apps refetch `GET /briefings/latest` on it and
+on reconnect. The published briefing's `text` event also arrives as an
+ordinary journal frame in the Coordinator conversation.
+
+## Memories
+
+A memory is the user's shared agent memory: a standing rule or fact any of
+their agents may save and every one of them may read, shaped like a Claude
+Code memory file so an agent's own memory instructions apply to it. Per
+user (`memories` table, `src/memories.js`, `src/memories-http.js`), one row
+per `name`, overwritten in place. A bridge with the memories update
+(matron-bridge, the `memory_*` tools) injects the index (name, type,
+scope, description) into every session's instructions at spawn. A bridge
+with the **scopes update** injects only the memories whose `scope` matches
+that session; a bridge with the memories update but not the scopes update
+injects every memory into every session, so a stored scope restricts
+nothing until the bridge is updated; against a bridge older than both the
+memories are stored and shown in the apps only.
+
+```
+{ id: "me_<16 hex>", name, type, scope, description, body,
+  origin_convo_id, origin_device_id, created_by, updated_by, created_at, updated_at }
+```
+
+- `name`: `^[a-z0-9][a-z0-9-]{0,63}$`, unique per user.
+- `type`: `user | feedback | project | reference`; `feedback` when omitted
+  on create, kept when omitted on update.
+- `scope`: who the memory is for — `global` (every session; what every
+  memory was before the column existed, and the default on create),
+  `coordinator` (the user's Coordinator only) or `repo:<name>` (sessions
+  whose working directory is a checkout of that repo; `<name>` is the bare
+  repo name, `^[A-Za-z0-9_.-]+$`, the `name` segment of the canonical
+  `host/org/name` a bridge reports on `convo_upsert`). At most 128
+  characters. Kept when omitted on update. The journal stores and shows
+  it; the **bridge** does the matching at spawn (global always, the repo
+  scope of the session's workdir, `coordinator` for the Coordinator) and
+  the Coordinator's `memory_list` sees every scope.
+- `description`: 1–200 characters, trimmed, one line (no C0/C1 control
+  characters, no U+2028/U+2029). It is the line the Coordinator sees at
+  spawn, so it must be the actionable one-liner.
+- `body`: markdown, at most 8192 UTF-8 bytes, may be empty.
+- `origin_convo_id` / `origin_device_id`: where the memory was first
+  saved; set once. `origin_convo_id` is not a foreign key — deleting the
+  conversation does not delete the memory. `origin_private` is the origin
+  device's privacy flag **snapshotted at save time** (a revoked device, or
+  a new device reusing its id, never changes who may read the memory).
+  `created_by` / `updated_by` are `user` or `agent`.
+- At most **200 memories per user**.
+
+### Routes (Bearer, either device kind)
+
+| Route | Body | Response |
+|---|---|---|
+| `GET /memories` | | 200 `{memories:[…]}` ordered by `name` (≤200 rows, no paging) |
+| `GET /memories/:key` | `:key` = `me_…` or the name | 200 `{memory}`; 404 |
+| `PUT /memories/:name` | `{description, body?, type?, scope?, convo_id?}` | 201 `{memory}` created / 200 `{memory}` updated; 400 `bad_request` (a `scope` outside the three forms included); 409 `too_many`; 404 |
+| `DELETE /memories/:key` | | 200 `{memory}` (the deleted row); 404 |
+
+`PUT` is the only write and is an **upsert by name**: the same name from
+any device overwrites `description`, `body`, `type` and `scope` and bumps
+`updated_at` / `updated_by`. A `PUT` is the whole memory — an omitted
+`body` on an update **clears** it. Retries are therefore free; there is no
+`Idempotency-Key`. An invalid `:name` is 400, not 404.
+
+`convo_id` is optional and only meaningful from an **agent**: the bridge
+sends the session's conversation so the memory records where it came from
+and the marker lands on that timeline. It clears the gate every
+agent-authored write clears — the conversation is the user's, the agent
+owns or has joined it (`authorizeAgentWrite`), and an ordinary agent may
+not name a private-owned conversation — answering **404** otherwise, never
+403. A client sending `convo_id` is 400.
+
+**Privacy.** A memory saved from a private agent device is invisible to an
+ordinary (filtered) agent: absent from `GET /memories`, 404 on `GET`, `PUT`
+and `DELETE` by key. A filtered agent's `PUT` on such a name is a 404, not
+a second row (`UNIQUE(user_id, name)` holds). Clients and private agents
+see everything. Memories are never shared across users.
+
+### Marker event
+
+Every successful `PUT` and `DELETE` appends a `memory` event **after** the
+row's transaction has committed (a marker append that itself fails is
+logged and swallowed; the write stands):
+
+```json
+{ "seq": 123, "convo_id": "…", "ts": 1790550000000,
+  "sender": "user:alice" | "agent:box-2", "type": "memory",
+  "payload": { "memory_id": "me_…", "name": "avoid-opal", "type": "feedback", "scope": "global",
+    "description": "Never start sessions on opal.",
+    "action": "saved" | "deleted", "created": true | false, "by": "user" | "agent" } }
+```
+
+Appended to, in order: (1) the writer's `convo_id` when the write was an
+agent `PUT` carrying one, else the memory's `origin_convo_id` when set;
+(2) the user's Coordinator conversation (`GET /coordinator`) when one is set
+and it is not already (1). A client write with no Coordinator set appends
+nothing. Two conversations means two events with the same `memory_id`;
+clients dedupe on it and refetch the list. Across the privacy boundary —
+the origin device is private and the target conversation is not
+private-owned — the payload carries `memory_id`, `action`, `created` and
+`by` only.
+
+`memory` is not a `MESSAGE_TYPES` entry (no unread, no snippet), not an
+`AGENT_PUBLISH_TYPES` member (a bare publish is `bad_request`), never
+pushes, never wakes, and has no old-client text fallback: a client that
+predates it ignores the type.
+
+### Consent approval (`/consent/pending`, `/consent/answer`)
+
+The Coordinator may answer the
+parked chat invites, join requests and spawn requests that otherwise wait
+for a tap — on the user's behalf and under guardrails the journal enforces.
+Tool permission prompts and secret requests never exist as journal asks,
+so nothing here can reach them.
+
+| Route | Who | Body / query | Returns |
+|---|---|---|---|
+| `GET /consent/pending` | agent, Coordinator only | `?convo_id=<the Coordinator conversation>` | 200 `{pending:[…]}`, oldest first. A spawn row: `{kind:'spawn', id: request_id, created_at, from_device_id, from_name, from_convo_id, from_convo_title, target_device_id, target_name, target_state, workdir, task, topic, model?, link?, mission_num?, item_num?}`. A chat row: `{kind:'chat', id: '<room_id>/<target_device_id>', request:'invite'\|'join', room_id, room_title, target_device_id, from_device_id, from_name, from_convo_id, from_convo_title, to_device_id, to_name, to_convo_id, to_convo_title, target_state, topic, justification, item_num?}` — `id` is the same pair the consent link `matron://consent/chat/<room>/<device>` carries, and `POST /agent-chat/answer` keys on. `target_state` is `online` (a live socket), `asleep` (no socket, but the box can be woken) or `offline`. |
+| `POST /consent/answer` | agent, Coordinator only | `{convo_id, kind:'chat'\|'spawn', id, decision:'approve'\|'decline', reason}` | 200 `{ok:true}` (`delivered` too for a chat approval, as `/agent-chat/answer`). |
+
+**Gate**, in order, every failure a bare error body: a client connection
+**403** `forbidden`; a bad shape **400**; `convo_id` not a top-level
+conversation this device owns **404**; not `user_settings.coordinator_convo_id`
+**403** `{detail:'not_coordinator'}`; the switch off **403**
+`{detail:'consent_disabled'}`. Then, for an answer: `reason` is required —
+1–200 characters after the usual peer-text sanitising — and is the audit
+line the user reads; the ask must exist (**404**, unknown and another
+user's indistinguishable) and still be `awaiting_user` (**409** `conflict`);
+an approval when the Coordinator's approvals in the last 24 h are at the
+**daily cap** (`MATRON_COORDINATOR_CONSENT_DAILY_CAP`, default 20; `0` is
+no cap) is
+**409** `{detail:'daily_cap', cap}` and the ask stays for the user —
+declines are never capped; a **spawn** approval into a target box that is
+`offline` (no socket and no wake possible) is **409**
+`{detail:'target_offline'}` — an `asleep` box is woken exactly as a tap
+would; an **approval** of an ask a **user-only box** takes part in is
+**403** `{detail:'user_only'}` (below). Every refusal leaves the ask as it was.
+
+**User-only boxes.** `devices.consent_user_only`, set and cleared only by
+`matron-admin device consent <device_id> user-only|any` (no bridge can
+assert it), makes a box's asks the user's alone to approve. An ask is
+user-only when such a box is the spawn's target or asker, or a chat ask's
+invitee (or joiner), asker or room owner. `GET /consent/pending` marks those
+rows `user_only: true` (absent otherwise); `POST /consent/answer` refuses a
+Coordinator approval of one with **403** `user_only` before any state
+changes, and still accepts a decline. The user's own tap is unaffected. This is for a box that handles something
+only the user should sign off on, such as one that reads their private mail.
+
+**What an answer does** is exactly what the tap does — one code path
+(`src/consent-answer.js`) behind `/agent-chat/answer`, `/agent-spawn/answer`
+and this route: the row flips, the consent item closes, the invite is
+pumped or the spawn orchestration starts off-cycle with wake-before-spawn,
+and a chat decline reaches the requester as the usual `refused`. On top of
+that, a Coordinator decision:
+
+- stamps the row `answered_by: 'coordinator'` + `answer_reason`
+  (`convo_agents`, `agent_spawn_requests`), and writes one row to
+  `consent_decisions` (the cap's counter and the audit record);
+- closes the consent item with "Approved by the Coordinator — <reason>. …"
+  or "Declined by the Coordinator — <reason>.", attributed to the
+  Coordinator's device as an agent, not to the user — at the answer, for
+  an approval as much as for a decline (see *Agent-spawned sessions →
+  Tracker item*: the spawn's outcome is added afterwards as a note);
+- puts `decided_by: 'coordinator'` and `reason` on the spawn's
+  `spawn_outcome` event and `{kind:'spawn', event:'outcome'}` frame, and
+  `approved_by: 'coordinator'` on the `{kind:'invite', event:'request'\|'join_request'}`
+  frame relayed to the target — so both bridges can say who decided. The
+  requester's `answer` frame for a declined chat is unchanged (a requester
+  never learns who said no);
+- appends a **client-only** `consent_decision` event on the card's
+  conversation (the parent conversation for a spawn, the room for a chat):
+  `{kind, request_id | room_id + target_device_id, decision, by:'coordinator',
+  convo_id, reason}` — never fanned to an agent, never replayed to one,
+  never a push — which is what an app renders as the "approved by the
+  Coordinator" badge with its one-tap Stop session / Mute room.
+
+**Nudge.** When an ask parks and it is *not* the Coordinator's own (its
+conversation, or for a join its box), and the switch is on, the journal
+sends the Coordinator's box one ephemeral frame,
+`{kind:'consent', event:'pending', ask:{…}}` with the same row shape as
+`/consent/pending`, after the card and the item have been journaled — the
+user is never second to the Coordinator. A Coordinator box that is asleep
+learns about the ask from `/consent/pending` at its next sweep instead.
+
+**Off switch.** `user_settings.coordinator_consent` (`PUT /coordinator
+{consent:false}`, clients only; default on). Off, both routes answer
+`consent_disabled` and no nudge is sent; the cards and taps work as ever.
+
+### Alertmanager webhook (`POST /alerts/alertmanager`)
+
+(`src/alerts-http.js`, formatting in `src/alerts.js`.) Prometheus
+Alertmanager's `webhook_configs` receiver posts here and the alert arrives
+as a turn in one user's Coordinator session, so a disk alert reaches the
+agent that looks after the boxes without anyone forwarding an email.
+
+| Env | |
+|---|---|
+| `MATRON_ALERT_WEBHOOK_TOKEN` | Shared secret, sent as `Authorization: Bearer <token>`. Unset or shorter than 32 chars: the route is off. |
+| `MATRON_ALERT_WEBHOOK_USER` | Username (`users.name`) whose Coordinator receives the alerts. Unset or no such user: the route is off (a warning is logged at boot when the token is set but the user is missing). |
+
+Off, the handler declines and the request meets the rest of the chain
+exactly as an unknown path would (401 without a device token, 404 with
+one). On, it is mounted **ahead of** the device Bearer auth:
+
+- missing/wrong token → **401** `unauthenticated` (compared in constant
+  time on sha256 digests). Wrong tokens are charged to the same per-IP
+  limiter as `/login` (5/min); once an IP's budget is spent every request
+  from it is **429** `rate_limited`, the right token included. A right token
+  never spends the budget.
+- body: JSON object ≤ 256 KiB (**413** over) with an `alerts` array (the
+  Alertmanager webhook v4 shape); anything else **400** `bad_request`.
+- otherwise always **202** — Alertmanager retries only on 5xx:
+  `{delivered:false, reason:'no_coordinator'}` when the user has no
+  Coordinator or its conversation has no box; `{delivered:false,
+  reason:'busy'}` when 4 deliveries are already in flight in this journal
+  process; else `{accepted:true}`. The delivery then runs off the request:
+  the Coordinator's box is woken if asleep and waited for
+  (`MATRON_SPAWN_WAKE_WAIT_MS`), and a journal-originated RPC is issued to
+  it (`MATRON_SESSION_CONTROL_TIMEOUT_MS`):
+
+```json
+{ "method": "session_control",
+  "params": { "convo_id": "<the Coordinator conversation>", "action": "alert",
+              "message": "<≤ 2000 chars, one or more lines>", "from_name": "Alertmanager" } }
+```
+
+The bridge answers `{ok:true, result:{applied:'now'|'deferred'}}` or
+`{ok:false, error:{code, detail?}}`; the outcome is logged (one line), never
+returned. `alert` is **not** a `session_control` op action: only this route
+builds it, so no agent can forge an alert through its own op (which still
+answers `bad_request` / `bad action`).
+
+The message: a header `🔔 Alertmanager: FIRING|RESOLVED <alertname>
+[<severity>] (<n> alert(s))` (severity only when common to the group), one
+line per alert (at most 10, each ≤ 300 chars) `- <status> <where>:
+<summary or description>` where `<where>` is `guest` (else `instance`),
+then `mountpoint`, then `on <hostname>` when it differs, `+N more` when
+lines were dropped, and — for a firing alert whose name matches
+`/Disk|Zpool/` — a closing line telling the Coordinator to check the box's
+disk and start a safe clean-up below 20% free. Every payload field is
+peer-text sanitised on its own, so nothing in a label can add a line.
+
+### Notice items
+
+`kind: 'notice'` (mission: For you) is something the user needs to read but
+not decide — a blocker, a key result, a warning. It is created awaiting the
+user with one built-in action, `actions: ["Seen"]`: a create or `PATCH`
+naming any other list is **400 `invalid_actions`** (omitting it, `[]`, or
+`["Seen"]` itself are fine).
+
+The user's tap on Seen (`POST /items/:id/comments {action: "Seen"}`, no
+`reply_to`) closes the notice in the same write: `state: closed`,
+`resolution: done`, `awaiting: null`, `chosen_action: "Seen"`, with the
+tap's comment and a status comment whose `meta.seen` is `true`. One
+`closed` marker goes out carrying `seen: true` — no fallback text, no wake,
+no push; a bridge does not make it a turn. A Seen tap on a notice already
+closed is a 200 no-op. A typed comment on a notice is an ordinary user
+comment (it hands the item to the agent and wakes it). Reopening a notice
+puts it back awaiting the user with `chosen_action` cleared. A push for a
+new notice falls under the `notices` event ("Things to read") of the
+notification settings.
+
+**Older apps.** An app shows the kind only if it sends
+`X-Matron-Item-Kinds: notice` (a comma-separated list) on its `/items`
+requests. To a client device that does not, every `/items` response
+presents a notice as `kind: 'task'` — what agents filed before the kind
+existed — and its Seen tap still closes it. Agents always see the real
+kind. Marker payloads carry the real kind.
+
+### Item handover
+
+An item is owned by one conversation: `origin_convo_id` /
+`origin_device_id`. Every user reply and tap is a marker on that
+conversation, which is what wakes its box and becomes its agent's turn
+(except a tap on a handover approval question, below, which the journal acts
+on itself), and
+the apps show it as the item's owner. A **handover** moves the owner to
+another of the user's conversations, after an offer and an accept. The
+thread, number and mission stay as they are. `filed_convo_id` keeps the
+conversation that first filed the item. It is set on the first handover, and
+is `null` on an item that was never handed over.
+
+| Route | Who | Body |
+|---|---|---|
+| `POST /items/:id/handover` | the owner's session, the Coordinator, or the user | `{to_convo_id, note?}`, plus `as_convo_id` from an agent |
+| `POST /items/:id/handover/accept` | the target conversation's session | `{as_convo_id}` |
+| `POST /items/:id/handover/decline` | the same | `{reason?, as_convo_id}` |
+| `POST /items/:id/handover/withdraw` | whoever may offer | `{reason?}`, plus `as_convo_id` from an agent |
+
+An agent names its own session in `as_convo_id`, and must be able to write
+that conversation. Without it the call is **400**. A box hosts many sessions
+under one device token, so the device alone can't tell the target's session
+from an unrelated one on the same box. The owner is `as_convo_id ==
+origin_convo_id`. The Coordinator is `as_convo_id ==` the user's Coordinator
+conversation. The target is `as_convo_id ==` the offer's `to_convo_id`. The
+user, from an app, sends no `as_convo_id`.
+
+- **Offer.** `201 {item, handover}`. The target must be one of the user's
+  conversations with an agent session in it (else **404**). It can't be the
+  current owner (**409 `same_owner`**). The item must be open
+  (**409 `item_closed`**) and not a consent mirror (**409 `consent_item`**).
+  Both sides must be private, or neither (**409 `privacy_mismatch`**).
+  Anyone else gets **403 `not_owner`**. A new offer replaces a pending one,
+  and the old target is told it was withdrawn. An offer expires after 24 h.
+  A parked offer hands the item to the user for the question, and however it
+  settles, `awaiting` goes back to what it was before the offer. The privacy
+  and user-only rules look at the box that hosts each conversation, not at
+  the device that filed the item.
+- **The user's approval.** When either side's device is user-only
+  (`devices.consent_user_only`) and the user didn't make
+  the offer, the offer waits as `awaiting_user`. The journal writes a
+  question in the item's thread with the actions **Hand over** /
+  **Keep it here**. That comment has `meta.role: "handover_approval"`, is
+  written by device 0, and pushes like any "needs you". The user's tap
+  (`POST /items/:id/comments {action, reply_to}`) is recorded, but the
+  journal acts on it itself; it is never a turn for the owner. **Hand over**
+  sends the offer on. **Keep it here** settles it as `refused`. A tap on a
+  question that is already settled is **409 `handover_settled`**. An agent
+  can't tap, as with every action.
+- **Accept** moves `origin_convo_id` / `origin_device_id` to the target. From
+  then on, the user's replies and taps, the wake, the voice-note
+  transcription and `GET /items?convo=` all follow the new owner. Without a
+  pending offer for the caller: **409 `no_offer`** / **403 `not_target`**.
+  A closed item can't be accepted or approved (**409 `item_closed`**).
+  Closing an item withdraws its pending offer.
+- **Thread lines.** Each stage writes a line in the thread: `kind: status`,
+  or `comment` for the approval question. It is `author: agent`,
+  `device_id: 0`, with `meta.handover: {id, stage, from_convo_id,
+  to_convo_id}`. These are the journal's words, never the user's.
+- **Item fields.** Every item read carries `filed_convo_id`, plus `handover`:
+  the pending offer, or `null`. The offer is `{id, state:
+  'awaiting_user'|'offered', from_convo_id, to_convo_id, to_convo_title, note,
+  created_at, expires_at}`. Another person's view of a shared item (org or
+  grant) reads both as `null`, and its thread leaves out the handover
+  lines.
+- **Markers.** The journal tells each stage to the sessions concerned with a
+  quiet `updated` item marker, `sender: "journal"`, carrying `handover: {id,
+  stage, from_convo_id, from_label, to_convo_id, to_label, offered_by,
+  note, reason, expires_at}`. A `withdrawn` stage also carries `by`: who
+  took the offer back (`owner`, `coordinator` or `user`), or `closed` when
+  closing the item withdrew it. `stage` is one of `offered`, `approved`,
+  `accepted`, `declined`, `withdrawn`, `refused` or `expired`. An offer goes
+  to the target, and wakes its box. It also goes to the owner when somebody
+  else made it. `accepted` and `declined` go to both sides. When the offer was
+  made from a third conversation (the Coordinator's), every outcome goes there
+  too; the marker's `handover.offered_by_convo_id` names it. A bridge turns
+  these into 📌 turns; an agent can never publish an item marker, so the
+  sender can't be forged. The approval question goes to the owner's
+  conversation as a `commented` marker, `by: agent`, awaiting the user.
+
+## User settings
+
+`GET /settings` (either device kind) → `{notices: boolean}`.
+`PATCH /settings {notices}` (client only, else **403**; an unknown key or a
+non-boolean is **400**) → the new view. `notices` — "Send things I need to
+read to For you" — defaults to `true` (no row reads as `true`). While on,
+bridges add the notices block to new sessions' instructions, and the
+unseen lists (`GET /unseen`, the nudge) skip what an open item already
+covers: an open item awaiting the user is not listed, and a conversation
+with one has no `final` entry. Prompts, permission asks and failures are
+listed either way. A change is sent live to every socket of the user as
+`{kind: 'control', op: 'settings', settings}`; `hello_ok` carries the
+current view, so nothing needs replaying.
+
+## Default model and effort
+
+The user's default model and default effort for NEW chats, set in the
+apps' Settings and applied by every bridge (`src/defaults.js`,
+`src/defaults-http.js`). Two nullable columns on `user_settings`,
+`default_model` and `default_effort`; `null` (or no row) means "use the
+box's own default" (the bridge's `MATRON_DEFAULT_MODEL` /
+`MATRON_DEFAULT_EFFORT`).
+
+| Route | Who | Body | Returns |
+|---|---|---|---|
+| `GET /defaults` | client or agent | — | 200 `{default_model: string\|null, default_effort: string\|null}` (both `null` with no row) |
+| `PUT /defaults` | client or agent | `{default_model?, default_effort?}` — any subset | 200, the full new state in the `GET` shape |
+
+An agent may write too: a bridge does when the user answers "Yes" to its
+"Use High for new chats too?" prompt after a chat changes its effort or
+model. On `PUT`, an absent key is left as is; `null` or `""` clears either
+field, and so does `"default"` for the model. Values are trimmed and
+lowercased, and stored that way:
+
+- `default_model`: at most 64 characters matching
+  `^[a-z0-9][a-z0-9.-]*(\[1m\])?$` — an alias (`opus`, `opus[1m]`,
+  `sonnet`, `sonnet[1m]`, `haiku`, `opusplan`, `fable`) or a full name
+  (`claude-opus-5-5`). Anything else is 400 `{error: 'bad_model'}`. The
+  journal does not know each box's model list; a bridge ignores a value it
+  cannot use.
+- `default_effort`: one of `low`, `medium`, `high`, `xhigh`, `max`; else
+  400 `{error: 'bad_effort'}`.
+
+A key outside those two is 400 `bad_request`. Nothing is written on a 400,
+even when the other key was valid. An empty body, or values equal to the
+stored ones, is a 200 no-op.
+
+**Live frame.** A `PUT` that changed something sends
+`{kind: 'defaults', default_model, default_effort}` (the full new state) to
+every live socket of the user — client AND agent sockets, unlike the
+client-only settings frames. It is not a journal event and nothing replays
+it: an app reads `GET /defaults` when its Settings open, a bridge on every
+`hello_ok`.
+
+**Precedence on the bridge** (Claude sessions only; Codex ignores both).
+A new chat's model: an explicit pick (the new-chat picker, `--model`) → the
+conversation's persisted model (a resume) → the user's `default_model`, if
+the box offers it → the box's `MATRON_DEFAULT_MODEL` → the bridge's
+fallback. Its effort: an explicit pick → the persisted effort → the user's
+`default_effort` → the box's `MATRON_DEFAULT_EFFORT` → Claude Code's own
+default.
+
+## Box defaults
+
+Per-box defaults for new sessions (spec: matron-bridge
+`docs/specs/box-defaults.md`; `src/box-defaults.js`,
+`src/box-defaults-http.js`): the agent, model and effort a session started
+on one agent box gets when nobody names them. Three nullable columns on
+`devices` (agent devices only); `null` means "the bridge's own fallback"
+(`MATRON_DEFAULT_AGENT` / `_MODEL` / `_EFFORT`).
+
+| Route | Who | Body | Returns |
+|---|---|---|---|
+| `GET /devices/:id/defaults` | client or agent | — | 200 `{device_id, default_agent, default_model, default_effort}` (each a string or `null`) |
+| `PUT /devices/:id/defaults` | client or agent | `{default_agent?, default_model?, default_effort?}` — any subset | 200, the full new state in the `GET` shape |
+
+Any of the user's devices may read or write any of the user's agent boxes —
+the apps from Settings ▸ Devices, the Coordinator from chat through its own
+bridge's token. `:id` must be one of the user's devices: unknown or another
+user's is 404 `not_found`; the user's own client device is 400
+`{error:'not_agent_device'}`. Values are trimmed and lowercased:
+
+- `default_agent`: `claude` or `codex`; else 400 `bad_agent`.
+- `default_model`: the `/defaults` shape (≤64,
+  `^[a-z0-9][a-z0-9.-]*(\[1m\])?$`) — a Claude alias on a Claude box, a
+  Codex model id on a Codex box; else 400 `bad_model`.
+- `default_effort`: `minimal` (Codex only) `low` `medium` `high` `xhigh`
+  `max` (Claude only); else 400 `bad_effort`. A bridge ignores a level its
+  box's agent cannot run.
+
+`null` or `""` clears any of them, and so does `"default"`. A key outside the three is 400 `bad_request`. Nothing is written
+on a 400. **Changing `default_agent` without sending `default_model` in the
+same request clears the model** (an `opus` default means nothing on a Codex
+box); effort is kept. An empty body or unchanged values is a 200 no-op.
+
+**Live frame.** A `PUT` that changed something sends
+`{kind: 'box_defaults', device_id, default_agent, default_model,
+default_effort}` (the full new state) to the user's client sockets and to
+that box's own sockets — not to the user's other boxes. Not a journal event;
+nothing replays it: the box reads its values from `hello_ok`'s
+`box_defaults` on every connect, an app from `GET /devices`'s `defaults`.
+
+**Where they show.** `hello_ok.box_defaults` (agents), `GET /devices` and
+`GET /roster` agent entries as `defaults: {agent, model, effort}`, and
+`spawn_targets` boxes as `defaults` (preferring the bridge's reported
+effective block — `box_status`'s `defaults`).
+
+**Precedence on the bridge**, for a session that starts fresh (spawn, New
+Chat, `/start`, `/workdir`):
+
+- agent: explicit (`spawn_request.agent`, picker, `--codex`) → the box's
+  `default_agent` → `MATRON_DEFAULT_AGENT` → claude. A box default of codex
+  on a box that cannot run Codex falls back to claude.
+- model, Claude: explicit → the box's `default_model` (only when its
+  default agent is claude) → the user's `default_model` (`/defaults`) →
+  `MATRON_DEFAULT_MODEL` → fable; the Fable-limit fallback applies on top.
+- model, Codex: explicit → the box's `default_model` (only when its default
+  agent is codex) → Codex's own config.
+- effort: the same chain as the model, per agent.
+
+Resumes keep the agent, model and effort persisted with the session;
+changing a default never touches a running or sleeping session.
+
+## Missions & milestones
+
+A mission (`missions`) is the human-readable record of one piece of work;
+milestones (`milestones`) are its checkpoints, each one a link back to
+where it happened. Both are journal-owned rows, scoped to the user, and
+share the **same per-user `#num` counter as items** — `#63` may be an
+item, a mission, or a milestone; there is no separate numbering space.
+Mounted like `src/items-http.js` (`src/missions-http.js`). `:id` accepts a
+mission id (`ms_…`) or a bare number, resolved within the caller's user.
+Device and agent credentials both work; `who.kind` drives the close rules
+below.
+
+**Mission-named conversations.** A mission may carry a `name`: an
+optional short label, trimmed, at most 40 characters (`POST /missions` and
+`PATCH /missions/:id`; `''` or `null` means none, and clears it on PATCH).
+Longer is refused, never clipped: 400 `{error:'bad_request',
+detail:'name_too_long'}`; a non-string or one carrying a control character
+is 400 `detail:'bad_name'`. Every mission row carries `name` (`null` when
+unset).
+
+A conversation's `title` is composed by the journal. The bridge's own
+title (`{marker }[xx] {topic}`, as `convo_upsert` sends it) is stored as
+`auto_title`, with its session short and marker parsed beside it. While the
+conversation has a current mission and its title has a short, `title` is
+`{marker }[xx] {label}` — the label is the mission's `name`, else its
+title cut at a word boundary to at most 40 characters with `…` when cut;
+otherwise `title` is `auto_title`, exactly as before. Never mission-named:
+the journal's own conversations, sub-chats (`parent_convo_id` set), rooms
+(agent-chat, spawn and person rooms, or any title carrying the `↔️`/`🔗`
+room marker), titles without a `[xx]` short, and — for a conversation not
+itself private-owned — a mission born on a private box. The `[xx]` shape is
+kept, so every short parser (spawn room tags, the apps' session tag) reads
+the composed title unchanged; push alerts and search read it as well.
+
+The journal recomposes on every titled `convo_upsert`, mission create
+(attach), join, leave (including the move of current to another mission),
+a spawn joining its child to a mission, and a mission `title` or `name`
+edit (every conversation whose current mission it is). A change appends a
+`convo_meta` into that conversation (sender `journal`, the same payload as
+`convo_upsert`'s: `{title, auto_title, parent_convo_id, agent_device_id,
+repo}`); nothing is appended when the composed title did not change.
+Existing rows are backfilled at upgrade (`auto_title` = the stored title),
+then every eligible conversation already on a mission is recomposed once
+(`user_version` 2) — without a `convo_meta` per conversation: apps pick the
+new titles up from `/snapshot`.
+
+There is **no auto-create**: `POST /milestones` on a conversation with no
+mission is refused — `409 {"error":"conflict","blocked_by":"no_mission"}`
+— rather than minting one implicitly. `mission_start` (`POST /missions`)
+is the only way in.
+
+A conversation may be linked to **many** missions (spec
+2026-09-30 projects & mission links §3). The `mission_conversations` table
+holds one row per (mission, conversation): `how` it was made (`origin |
+joined | spawned | inherited | backfill`), `joined_at`, and `ended_at`
+(`null` = active). Exactly one active link is **current**, or none;
+`conversations.mission_id` is the pointer to it (invariant: a non-null
+pointer always has an active link), and it is where `POST /milestones` and
+new items go by default. The pointer changes only through create (origin),
+join, leave, spawn and inheritance.
+
+A conversation gains a link by `POST /missions` (its origin, unless
+`attach: false`), `POST /missions/:id/join`, a spawn that named the mission
+(`spawn_request` `mission_num`; `how: spawned`), and **inheritance** — a
+sub-chat takes its parent's *current* mission at creation (`how:
+inherited`), and never afterwards. Inheritance is a way into a mission, so
+two of join's gates apply: the mission must be `open`, and **visible to the
+creating device** under *Visibility* (a private-owned parent, or a public
+parent joined to a private-origin mission, is refused for an ordinary
+agent). There is no cap gate: **sub-chats never count toward the 200**. A
+child that fails a gate starts with no mission.
+
+**Cap.** `CONVOS_MAX = 200` counts a mission's *active* links from
+*top-level* conversations (`parent_convo_id IS NULL`). Ended links and
+sub-chats never count.
+
+**Backfill.** On the first start after this change, while the link table
+is empty, the journal writes one active link per current pointer (`origin`
+when the mission was born there, `inherited` for a sub-chat, else `joined`;
+`joined_at` from the conversation's earliest `created`/`joined` marker for
+that mission, else the later of the two creation times), then one ended
+`backfill` link for every other (mission, conversation) pair a milestone or
+an item records, from its first to its last trace (items filed by the
+Coordinator conversation are skipped: filing an item into a mission never
+links it). Pairs that left no trace
+cannot be recovered. It never runs again once any link exists. A separate
+heal pass runs on every start: any conversation whose current pointer has
+no active link (written by older code, e.g. after a rollback) gets one back
+— a new `backfill` link, or its ended link reactivated with its `how` kept.
+
+A mission is **unassigned** while it is `open` and its `conversations`
+count (active top-level links) is `0` — typically one the Coordinator
+created with `attach: false`. That count is **not** the length of `GET
+/missions/:id`'s `conversations[]` array (see below): a mission can read
+`conversations: 0` while its detail still lists a sub-chat or a history
+row, so `conversations: 0` must not be read as "the array is empty" —
+check the array itself. Clients derive "unassigned"; there is no column.
+
+### Routes (Bearer, either device kind)
+
+| Route | Body / query | Returns |
+|---|---|---|
+| `POST /missions` | `{title, name?, body?, convo_id, attach?: boolean}` + optional `Idempotency-Key` (also served at `POST /missions/create`) | 201 `{mission}`. If `convo_id` already has a mission: 200 that mission with `existing: true`, nothing changed — or **404** if that mission is invisible to the caller (see *Visibility*). Attaches the conversation, repoints its unassigned items (each repointed item's own `updated_at` is bumped too, so `GET /items?since=` learns it gained a mission). With `attach: false`: always a new mission (201; a replay 200), `origin_convo_id` = `convo_id`, and neither the conversation nor its items are touched — no `existing` short-circuit. Either way, on a genuine 201 the `created` mission marker is still appended into `convo_id` — provenance of where the mission was born, independent of whether it was ever attached there. A non-boolean `attach` is 400. Optional `project` (id, `#n` or `n`) files the new mission: 404 for a project the caller cannot see, 409 `{blocked_by:'project_closed'}`, 400 on a non-string/non-number; ignored on the `existing: true` answer. |
+| `GET /missions` | `?state=open\|closed` (omit = both), `?since=<ms>`, `?scope=mine\|shared` (shared: neither `state` nor `since`; rows carry `owner`) | `{missions:[…]}` with per-row counts: `open_items`, `needs_you` (open and awaiting user), `conversations`, `milestones`, `last_milestone` `{num,title,kind,created_at}`. Sorted `last_milestone_at DESC NULLS LAST`, then `created_at DESC` — for a filtered (ordinary agent) caller this is the SIEVED last-milestone timestamp (the same sieved subquery the `last_milestone` field itself uses), so the order never disagrees with the row shown; an owner or private agent sorts on the stored column, which is the same thing. Rows also carry `project_id`, `project_num`, `activity` and `last_activity_at` (see *Activity*). `conversations` is the number of **active top-level** links. `?scope=shared` rows carry `project_id: null, project_num: null`. |
+| `GET /missions/:id` | `?subchats=1`, `?history=1` | `{mission, milestones:[…] newest first, items:[open items], conversations:[{id, title, auto_title, box, state, parent_convo_id, current, how, joined_at, ended_at, subchat_count, other_missions, status?}]}`. By default only **active** links, ordered by `joined_at`; `?history=1` appends the ended links after them (each with its `ended_at`); the two orderings never interleave. A sub-chat whose parent (or nearest linked ancestor) is also linked is **folded**: counted in that ancestor's `subchat_count` and left out of the list — `?subchats=1` lists them too (folding runs separately within the active group and the history group, so an ended sub-chat never folds into an active row); the two flags combine. A sub-chat whose parent is not linked stands as its own row. **This array can be longer than the mission's `conversations` count**: that count is active top-level links only, while the array also lists an unfolded sub-chat whose parent isn't linked, and — with `?subchats=1` / `?history=1` — folded sub-chats and history rows too; never assume `conversations === conversations[].length`. `parent_convo_id` is `null` when the caller cannot see the parent (an ordinary agent and a private-owned parent) — for that caller, `null` means "no parent, or parent hidden", not "no parent" (see *Visibility → Links*). `other_missions` is `[{id, num, title, current, active, joined_at, ended_at}]`: the listed conversation's links to *other* missions (for "also on #N" / "moved to #N"), current first, then active, then ended newest first, at most 5; for an ordinary agent a private-origin mission is left out. `status` is the session header (own-user view only). |
+| `GET /missions/:id` (shared) | `?subchats=1` (honoured; `?history=1` is ignored — a colleague has no members table to reconcile) | `:id` must be `ms_…` (a colleague's number is not resolvable) of a mission visible under *Shared visibility*; mission detail with `owner`; the conversation rows' `conversations` count (active top-level links) can likewise be less than `conversations[].length` once `?subchats=1` unfolds sub-chats, and `parent_convo_id` is `null` when the viewing colleague cannot read the parent under the shared rule; `PATCH`, `join`, and `close` on it are all **403 `forbidden`** |
+| `PATCH /missions/:id` | `{title?, name?: string\|null, body?, status?: string\|null, project?: id\|"#n"\|n\|null, convo_id?}` | 200 `{mission}`; 400 on a bad `status` (see *Status*); 409 `{blocked_by:'closed'}`. `project` files or (`null`) unfiles the mission — same 404/409 `project_closed`/400 as on create — and is the one change a **closed** mission still accepts (any other field on a closed mission is 409 `closed`). The `updated` marker carries `project_changed: true` when the project changed. |
+| `POST /missions/:id/join` | `{convo_id}` | 200 `{mission}`. Adds a link — or reactivates an ended one, keeping its original `how` unless that was `backfill` (or `joined`, when the reactivation is a spawn: it becomes `spawned`) — stamps `joined_at`, and makes it **current**. The previous current mission stays active ("also on"): there is **no 409 `other_mission`** any more (an old bridge simply sees 200). Re-joining the current mission is a no-op 200 with no marker. 409 `{blocked_by:'closed'}`; 400 `{error:'bad_request'}` when the mission already has 200 active top-level links (a sub-chat is never refused by the cap). Repoints the conversation's unassigned items. Marker: `joined` for a new or reactivated link, `current_changed` for an already-active one. |
+| `POST /missions/:id/leave` | `{convo_id}` | 200 `{mission, current_mission}`. Ends the link (`ended_at`), keeping it as history. Leaving the current one moves current to the most recently joined remaining active link **on an open mission**, else to none (`current_mission: null`). Leaving an already-ended link is a 200 no-op; **404** when the conversation was never linked, or the conversation fails join's gate. Items stay where they are. Markers: `left`, and `current_changed` (for the new current mission) when current moved. |
+| `GET /conversations/:id/missions` | | `{missions:[…]}` — every mission the conversation is or was linked to: current first, then other active links newest-joined first, then ended links newest-ended first. Each is a full mission row plus `current`, `active`, `how`, `joined_at`, `ended_at`. Own conversations only; 404 for another user's, an unknown one, or (ordinary agent) a private-owned one. |
+| `POST /missions/:id/close` | `{summary, convo_id?}` | 200 `{mission}`, or 409 as in *Closing*, below. `convo_id` (agents only; a client's is ignored) names the closing conversation: **404** unless this device owns it, **403** `{error:'forbidden', detail:'not_coordinator'}` when it is neither on the mission nor the user's Coordinator — see *Closing*. |
+| `POST /milestones` | `{convo_id, kind:'user_input'\|'progress', title, body?, mission?}` + optional `Idempotency-Key` | 201 `{milestone, mission}`. `mission` (id, `#n` or `n`; `null`/absent = current) may name any mission this conversation has an **active** link to; anything else — unknown, invisible to the caller, never linked, or ended — is 409 `{blocked_by:'not_linked'}` (one answer, so it is never an existence oracle), and a non-string/non-number is 400. With no `mission`: 409 `{blocked_by:'no_mission'}` if the conversation has no current mission (or its mission is invisible to the caller), 409 `{blocked_by:'closed'}` if the target mission is closed; 502 `{error:'marker_append_failed'}` as before. |
+| `GET /milestones?convo=<id>` | | `{milestones:[…]}` newest first — the per-conversation view. 400 without `convo`; 404 for an unknown conversation, another user's, or (for an ordinary agent) a private-owned one. Also works on a colleague's conversation visible under *Shared visibility*. |
+| `PATCH /items/:id` | gains `mission: id \| "#num" \| null` | existing route (see "Items" above); moves or detaches the item, gated by the same visibility rule as `GET /missions/:id` — a mission an ordinary agent can't see is never a reachable move target, and is **404**, not 403. A closed mission is still a legal target (see the Items table). Emits the item marker `updated`. |
+
+Errors follow the items routes: 400 on shape/limits, 404 on unknown or
+invisible (never 403 — a refusal must be indistinguishable from a mission
+that doesn't exist), 409 on state conflicts, 502 when the marker append
+fails.
+
+Row shapes: a mission is `{id, user_id, num, state, title, body,
+close_summary, closed_by, closed_over_open_items, origin_convo_id,
+origin_device_id, created_by, created_at, updated_at, last_milestone_at,
+closed_at, status, status_by, status_convo_id, status_updated_at,
+closed_convo_id, project_id, project_num, activity, last_activity_at}` plus
+the counts listed against `GET /missions` above
+(`closed_convo_id` is null when no conversation was named and, for an
+ordinary agent, when the closing conversation is private-owned — the same
+sieve `status_convo_id` gets); a milestone is `{id,
+mission_id, num, kind, title, body, convo_id, seq, device_id, created_by,
+created_at}`. Stored columns stripped from the wire: `idem_key` (both
+shapes), `status_device_id` (mission — the device that wrote the status,
+used only by the privacy sieve) and `user_id` (milestone — always the
+caller's own id, so no route reads it back). Query-computed columns such as
+`sieved_last_milestone_at` and `status_hidden` (the sort key and the
+per-caller status sieve verdict, both internal to `countsSql`/
+`sharedCountsSql`) are never returned either. `running_convos`,
+`waiting_convos` and `convo_activity_at` (activity inputs computed by
+`countsSql`) are never returned.
+
+### Status
+
+A mission carries one **status**: a short markdown paragraph saying where
+the work is, what's next and what is blocked — the headline on its card in
+the apps. It is overwritten, never appended; there is no history.
+
+- `PATCH /missions/:id {status: "…"}` sets it. The text is trimmed (CRLF
+  folded to LF first) and must then be 1–600 UTF-16 code units with no
+  control characters other than `\n` and `\t`, and no U+2028/U+2029 —
+  else 400 `bad_request` and nothing is written. It combines with `title`
+  / `body` in one PATCH. `status` on `POST /missions` is ignored.
+- `{status: null}` clears it.
+- The four fields are always written together: `status`, `status_by`
+  (`'user'` for a client, `'agent'` for an agent), `status_convo_id`,
+  `status_updated_at` (ms; the same instant as the new `updated_at`; null
+  when cleared).
+- `status_convo_id` comes from an optional `convo_id` in the same body. It
+  is recorded only when the caller is an agent, the conversation belongs to
+  the caller's user, and — for an ordinary agent — it is not private-owned.
+  Anything else (a client, another user's or an unknown conversation, a
+  non-string) records null: it is attribution, never a gate, never a 400.
+- A closed mission is 409 `{blocked_by:'closed'}` and a mission the caller
+  cannot see is 404 — the rules of every PATCH. An ordinary agent may set
+  the status of any mission it can see (the Coordinator refreshes missions
+  it is not on).
+- Like every PATCH it bumps `updated_at` (so `GET /missions?since=` sees
+  it) and appends the `updated` mission marker to the origin conversation,
+  carrying `status_changed: true` (see *Marker events*).
+
+Every mission row — `GET /missions`, `GET /missions/:id`, and the `mission`
+object in every other response — carries the four fields, null when unset
+or withheld (see *Visibility*).
+
+### Activity
+
+Every mission row carries `activity` and `last_activity_at`, computed per
+caller (spec 2026-09-30 §2):
+
+- `closed` — the mission is closed;
+- `running` — any actively linked conversation's `session_state` is `running`;
+- `waiting` — any actively linked conversation is `waiting`, or `needs_you > 0`;
+- `quiet` — `now − last_activity_at ≥ 7 days`;
+- `idle` — none of the above.
+
+`last_activity_at` is the latest of the mission's `created_at`, its last
+milestone, its `status_updated_at`, and — for each **active** link — the
+link's `joined_at` and the conversation's newest message event (the
+`MESSAGE_TYPES` rule `/snapshot` uses for `last_ts`; `session_status` and
+marker events are not activity). There is no stored activity column.
+Every input goes through the caller's sieve: for an ordinary agent a
+private-owned conversation's state and messages, a withheld status and a
+hidden milestone never count.
+
+### Idempotency
+
+`POST /missions` and `POST /milestones` accept an `Idempotency-Key`
+header, namespaced `${device_id}:${key}` into `idem_key` — same
+convention as items. A header present but empty, too long, or non-string
+is 400 `bad_request`. A replay returns **200** with the existing row (even
+if the mission has since closed); a first write is **201**, and no second
+marker is ever emitted for a replay.
+
+### Closing
+
+`POST /missions/:id/close` behaves differently by caller kind. A client
+(`who.kind === 'client'`) close always succeeds over open items: it
+records `closed_over_open_items` (the count) and the marker's
+`open_item_nums` carries every item number that was still open at close
+time — a deliberate, visible override. An **agent** close is blocked by
+open items, checked in two tiers: any item still `awaiting: 'user'`
+blocks with `409 {"error":"conflict","blocked_by":"user_items","items":[{num,title}]}`
+(only the user can clear those); if none of those but other items are
+still open, `409 {"blocked_by":"agent_items","items":[…]}` — close each
+with a real resolution, or move it to the mission it belongs to
+(`PATCH /items/:id {mission}`). A hidden open item — on a private-owned
+conversation the calling agent can't see — still **blocks** the close (it
+exists and is open, whether or not this caller can see it), but the
+`items` array on the 409 is filtered to what the caller may actually see,
+so the response never names a private item or its title. Closing an
+already-closed mission is `409 {"blocked_by":"closed"}` regardless of
+caller kind.
+
+**Who may close (`convo_id`).** Without `convo_id` any agent of the user
+closes by id, as before. An agent that names its conversation (every
+current bridge does) is held to a rule: the conversation must be one this
+device owns (else **404**, same stance as `join`'s `convo_id`), and either
+**on the mission** — any conversation with an *active* link to it, current
+or also-on — or the user's **Coordinator**
+(`user_settings.coordinator_convo_id`), which may close any mission the
+user owns: the one mission route the role gates (spec: matron-bridge
+2026-09-29 coordinator session control, "Coordinator mission close"). Any
+other conversation is **403** `{error:'forbidden', detail:'not_coordinator'}`
+and nothing is written. The Coordinator is held to the same two item tiers
+as any agent — it resolves or moves the open items first — so a mission
+never closes over an item that is awaiting the user. The row records the
+closing conversation as `closed_convo_id` (null for a client close and for
+a bridge that predates the field) and the `closed` marker carries it as
+`by_convo_id`, which is how an app can say "closed by the Coordinator"
+(compare it with the Coordinator setting) rather than only "by agent".
+Both stay behind the privacy boundary: an ordinary agent reads
+`closed_convo_id` as null when the closing conversation is private-owned,
+and the marker omits `by_convo_id` when the closing conversation is
+private-owned and the origin is not (the same rule as the marker's title).
+
+### Marker events
+
+Two new event types, written only by the journal from these routes.
+
+```json
+{ "type": "milestone",
+  "payload": { "milestone_id": "ml_…", "num": 63, "kind": "user_input",
+               "title": "Wired the journal migration", "body": "…",
+               "mission_id": "ms_…", "mission_num": 61, "mission_title": "Missions & milestones",
+               "by": "agent" } }
+```
+Appended to `convo_id`; **its own `seq` is the milestone's anchor**. It is
+the inline card and the jump target. The row and its marker are one write
+— the marker is appended *inside* the same transaction as the `milestones`
+INSERT, so if the append fails, nothing (not even the number) survives.
+
+```json
+{ "type": "mission",
+  "payload": { "mission_id": "ms_…", "num": 61, "title": "…",
+               "action": "created" | "joined" | "updated" | "closed" | "left" | "current_changed",
+               "by": "user" | "agent",
+               "open_item_nums": [64, 70],          // only on a user-forced close
+               "status_changed": true,              // only on an `updated` that wrote the status
+               "project_changed": true } }           // only on an `updated` that moved the mission between projects
+```
+Appended to the conversation concerned: `created`, `joined`, `left` and
+`current_changed` on that conversation (`current_changed` names the mission
+that became current; `left` the one it left); `updated`/`closed` on the
+origin conversation. A merge (see *Projects*) writes one `updated` with
+`project_changed` per moved mission.
+Written **after** the mission's own transaction has committed, not inside
+it — a broadcast can never advertise a write that then rolls back, and a
+marker append that itself fails (e.g. the origin conversation vanished
+underneath it) is logged and swallowed; the mission write stands. Apps use
+it only as an invalidation signal; it renders as a small inline notice
+("🏁 Mission #61 closed", "🏁 Left mission #N", "🏁 Now on mission #N").
+
+`status_changed: true` is present on an `updated` marker whenever that
+PATCH carried `status` — set, re-set to the same text (its
+`status_updated_at` still moves) or cleared — and absent otherwise. It is a
+flag only: the marker never carries the status text, because the origin
+conversation's agents replay it verbatim. Clients may ignore it; the marker
+is already the refetch signal.
+
+`title` on the `mission` payload and `mission_title` on the `milestone`
+payload are **omitted** when the marker is written into a conversation that
+is not private-owned while the mission's origin conversation is — see
+"Markers written across the boundary carry numbers only" under *Visibility*
+below. Everything else is unchanged, and consumers must treat both fields
+as optional.
+
+Neither type is publishable by an agent (not in `AGENT_PUBLISH_TYPES`); neither is
+a `MESSAGE_TYPES` entry; neither pushes. Both are pure navigation signals —
+`classify()` (`src/push.js`) returns `null` for `mission` and `milestone`
+unconditionally, and neither type affects an unread badge or a
+conversation-preview snippet.
+
+### Visibility
+
+Same one-caller predicate as items and `/search`: an ordinary
+(non-private) agent never sees a mission whose origin conversation is
+managed by a private device, nor a milestone posted from one — `GET
+/missions` and `GET /milestones` omit them, every other route 404s. A
+mission that spans conversations (via `join`) sieves per-conversation: a
+public mission's own `GET /missions/:id` and `GET /missions` counts
+(`conversations`, `milestones`, `last_milestone`) exclude any joined
+private-owned conversation's contribution for a filtered agent, matching
+the `milestones`/`items`/`conversations` arrays the same caller gets back
+— the summary row and the detail arrays can never disagree about what a
+filtered caller is allowed to see. A private agent caller, and any client
+device, see the unfiltered set. The sieve lives in `getMission` itself, not
+in the routes, so the two routes that resolve a mission from a
+*conversation* rather than from an `:id` are gated by it too: `POST
+/missions` on a conversation the user has joined to a private-origin
+mission answers **404** (never `existing: true` with the hidden row — that
+would confirm it exists), and `POST /milestones` on such a conversation
+answers `409 {"blocked_by":"no_mission"}` and writes nothing at all — no
+row, no number, no marker.
+
+**Accepted exception — numbers, never words.** Three values let a filtered
+caller learn that hidden rows *exist*, without ever naming them:
+
+- `closed_over_open_items` on a closed mission — the count of items still
+  open at close time, hidden ones included (the close was blocked by them,
+  so a filtered count would contradict the 409 the same caller just got);
+- `open_item_nums` in the `mission` close marker — the numbers of those
+  items, again including hidden ones;
+- `mission_num` and `mission_id` on an item the caller *can* see whose
+  mission it cannot — an item on a public conversation that the user moved
+  into a private-origin mission. The id is an opaque handle, not a word:
+  every mission route 404s on it just the same.
+
+Each is a bare integer (or, for `mission_id`, an opaque id). No title,
+body, summary, conversation id, or item title ever crosses the sieve, and the counts a filtered caller reads on a
+mission row (`open_items`, `needs_you`, `conversations`, `milestones`,
+`last_milestone`) are all sieved as described above. The exception is
+deliberate: the close marker is the **user's own record** of an override
+they performed themselves, and `#num` is already one shared namespace
+across items, missions, and milestones — a number on its own identifies
+nothing a caller could then read. `GET /missions?since=` is the same kind
+of exception: it still matches the STORED (unsieved) `updated_at`, so a
+hidden milestone can make a mission match a filtered caller's `?since` —
+but `since` only says *something changed*, never what or in what order
+(the row returned, and the list's own sort order, are both fully sieved),
+so nothing beyond a bare "changed" bit crosses the boundary.
+
+**Markers written across the boundary carry numbers only.** A mission born
+in a private device's conversation can still reach a **public** one: only
+the user sees both sides, and only the user can `join` that conversation to
+it or post a milestone on it. The resulting `mission` marker (`joined`, or
+any other action written somewhere other than the origin conversation) and
+`milestone` marker land in a conversation whose ordinary agents replay
+every event verbatim — the WS replay applies no per-type payload sieve — so
+the title is dropped at **write** time: whenever the mission's origin
+conversation is private-owned and the conversation being written to is not,
+the `mission` payload omits `title` and the `milestone` payload omits
+`mission_title`. `num` / `mission_num`, `action` and `by` remain, as do the
+milestone's own `title`, `body` and `kind` (the milestone was posted into
+that conversation by its author and is that conversation's own content).
+The marker itself is never suppressed — the user's timeline still needs the
+event, and a missing event would be its own signal. Markers written into
+the origin conversation, or into another private-owned conversation, are
+unchanged: nothing crossed.
+
+**Status.** A status written from a private-owned conversation — or by a
+private device, whichever conversation it named, or none — reads as
+`status`, `status_by`, `status_convo_id` and `status_updated_at` all null
+for an ordinary agent: on the list, the detail, and every response carrying
+the mission, that agent's own PATCH responses included. The rest of the row
+is unchanged. Client devices and private agents always see it. The verdict
+is taken at read time against the device's current private flag, like every
+other sieve here. For a colleague (*Shared visibility*) the status shows
+only when it names a conversation that colleague can read under the shared
+rule, or when it was written by the owner's client with no conversation at
+all (a client write — shared like the title and body); an agent write that
+names no conversation is hidden from that colleague even when it isn't
+private, because a status is a synthesis across the mission's conversations,
+which may include ones the colleague can't read, so an unattributed agent
+write fails closed rather than being taken on faith. Otherwise the four
+fields are null.
+
+**Links.** Every link read is sieved the same way: `GET
+/conversations/:id/missions` omits a private-origin mission for an ordinary
+agent (the user may have joined a public conversation to one), `/snapshot`'s
+`mission_id` reads null and `mission_count` excludes it, a mission's
+`conversations` rows and `subchat_count` exclude private-owned
+conversations, each row's `other_missions` omits private-origin missions, and `activity` ignores them. `POST /milestones {mission}`
+answers `not_linked` for a mission the caller cannot see. A `conversations`
+row's `parent_convo_id` is withheld the same way: `null` when the caller
+can't see the parent — a private-owned parent for an ordinary agent's own
+view, or (the shared view) a parent the colleague can't read under *Shared
+visibility* — so for those callers `null` means "no parent, or parent
+hidden," never a reliable "top-level."
+
+## Projects
+
+A project (`projects`, id `pj_…`) groups missions. A mission belongs to at
+most one (`missions.project_id`). Projects share the per-user `#num`
+counter, so `/lookup` resolves them (`kind: 'project'`). Mounted in
+`src/projects-http.js`; `:id` accepts `pj_…` or a number.
+
+| Route | Body / query | Returns |
+|---|---|---|
+| `POST /projects` | `{title, body?, convo_id?}` + optional `Idempotency-Key` | 201 `{project}`; replay 200. Any device may create. `convo_id` is optional provenance and must pass the same gate as `POST /missions` (404 otherwise). No marker. |
+| `GET /projects` | `?state=open\|closed` (omit = both) | `{projects:[…]}`, newest `last_activity_at` first. Each row adds `missions: {running, waiting, idle, quiet, closed}` (its missions' *Activity*), `needs_you` and `open_items` (sums of its missions' counts), and `last_activity_at` (the latest of the project's `created_at`, its `status_updated_at` and its missions' `last_activity_at`). |
+| `GET /projects/:id` | | `{project, missions:[mission rows], needs_you:[open items awaiting the user, each with mission_id and mission_num], recent_milestones:[the 5 newest across its missions, each with mission_num], sessions_by_box:{box name: n}}` — `sessions_by_box` counts distinct top-level conversations actively linked to its **open** missions. For a **merged** project: the detail of the project it was merged into (following up to 16 merges) plus `merged_from: {id, num}` of the one asked for. |
+| `PATCH /projects/:id` | `{title?, body?, status?: string\|null, convo_id?}` | 200 `{project}`. Title/body/status rules and status attribution are exactly the mission ones (see *Missions & milestones → Status*). 409 `{blocked_by:'closed'}` on a closed (or merged) project. No marker. |
+| `POST /projects/:id/close` | `{summary, convo_id?}` — `convo_id` is required when the caller is an agent (it must name the Coordinator's own conversation); a client never needs it | 200 `{project}`. A client always may, over open missions: `closed_over_open_missions` records the count and the missions stay open and filed. An agent must be the **Coordinator** and prove it by naming its conversation (owned by this device, else 404); any other agent — or one naming none — is **403** `{error:'forbidden', detail:'not_coordinator'}`. The Coordinator is blocked by open missions: 409 `{blocked_by:'open_missions', missions:[{num,title}]}` (listed through its sieve; a hidden one still blocks). 409 `closed` if already closed. |
+| `POST /projects/:id/merge` | `{into, convo_id?}` — same `convo_id` rule as close | 200 `{project: into, merged: this}`. Same who-may rule as close. Moves **every** mission of this project (any state) to `into`, closes this one with `close_summary: "Merged into #N"`, `merged_into` and `merged_into_num`, and writes one `updated` mission marker with `project_changed: true` per moved mission on its origin conversation. 400 when `into` is this project or not a string/number; 404 for an `into` the caller cannot see; 409 `{blocked_by:'closed'}` if this one is closed, `{blocked_by:'into_closed'}` if `into` is. |
+| `POST /missions`, `PATCH /missions/:id` | `project` | see *Missions & milestones* |
+
+Row shape: `{id, user_id, num, state, title, body, status, status_by,
+status_convo_id, status_updated_at, close_summary, closed_by,
+closed_over_open_missions, closed_at, merged_into, merged_into_num,
+origin_convo_id, origin_device_id, created_by, created_at, updated_at}`,
+plus the rollup fields on every route that returns one. `idem_key` and
+`status_device_id` are never returned.
+
+There is no project marker: the apps refresh `GET /projects` on any
+`mission` marker and while the Projects tab is open.
+
+**Visibility.** Same rules as missions. An ordinary agent never sees a
+project whose origin conversation is private-owned or that a private device
+created (404, absent from lists, not resolvable by `/lookup`); a status
+written from/by a private device reads as four nulls; rollups, needs-you
+items, milestones and session counts are computed from that agent's own
+sieved mission rows. `project_id` / `project_num` on a mission row it *can*
+see still travel as bare handles (the same "numbers, never words" exception
+as `mission_num` on items). Projects are never shared with colleagues:
+shared mission rows carry `project_id: null`.
+
+## Read state (seen, unseen)
+
+This is what the user
+has actually **seen**, as reported by their client apps. It is separate from
+`read_marker` / `unread_count`: nothing here touches unread, the badge, the
+snippet or push.
+
+**Client ops (WebSocket, client connections only; an agent gets `forbidden`):**
+
+- `{op:'seen', convo_id, ranges:[[from_seq,to_seq],...]}` reports message
+  events that were on screen: at least half the row visible for 1 s, with the
+  app in the foreground.
+  - `ranges` holds at most 64 ranges, each `1 <= from <= to`. Ranges past the
+    conversation's head are clipped.
+  - Stored ranges are coalesced. Two ranges merge when the seqs between them
+    hold no content event of that conversation from anyone but the user,
+    because seqs are per user, not per conversation.
+  - Not journaled, no reply. A malformed op gets `bad_request`, and a missing
+    or foreign conversation gets `forbidden`.
+  - An empty `ranges` is valid. It registers the device as a range reporter
+    (see the legacy fallback below) without marking anything.
+- `{op:'item_seen', item_id, through_comment_at?}` reports that an item's
+  detail was on screen: the item, and its comments up to `through_comment_at`
+  (the newest comment rendered, in ms; `0` or absent means none). Monotonic.
+
+**Legacy fallback.** A **client** `read_marker` counts as "seen up to that
+seq", covering `[1, up_to_seq]`, until the device sends its first `seen`.
+This covers apps that don't report ranges yet. A bridge's `read_marker` never
+counts.
+
+**Routes (agent connections only; a client gets 403):**
+
+- `GET /unseen?convo_id=<the Coordinator's conversation>` → `{entries,
+  truncated}`. Coordinator only.
+  - The gate runs in order: 400 on a bad `convo_id`, 404 when the
+    conversation isn't this device's own top-level conversation, then 403
+    `not_coordinator`.
+  - Query params:
+    - `older_than_ms` (default 30 min)
+    - `since_ms` (default 3 d, max 30 d)
+    - `importance` (`important`, the default, or `all`)
+    - `in_convo_id`
+    - `mission` (number)
+    - `include_flagged=1`
+    - `limit` (1–200, default 50)
+  - An ordinary Coordinator never sees conversations owned by a private
+    device, or items that came from one.
+- `GET /unseen?mine=1&convo_id=<a conversation this agent may write to, or a room it has joined>` → the
+  same shape, restricted to messages whose sender is the caller, in that
+  conversation. No items. Defaults are `importance=all` and
+  `older_than_ms` 10 min. A conversation the caller may not write to gets 404.
+- `POST /unseen/flags {convo_id, refs[1..100]}` → `{flagged}`. Records that
+  entries were raised with the user, so they are not listed again. The
+  Coordinator may flag any ref; any other agent only refs to its own messages
+  in `convo_id` (else 403). An ordinary Coordinator gets 404 for a ref in a
+  private device's conversation. Flags are pruned after 30 days.
+
+**Entries.** Each entry has these fields:
+
+- `ref`: `msg:<convo_id>:<seq>` or `item:<item_id>:<ms of newest agent content>`.
+  An item's ref changes when an agent adds to it, so new content can be
+  raised again.
+- `kind`: `message` or `item`.
+- `convo_id`, `convo_title`, `session_state`, `mission_num`, `is_room`, `ts`,
+  `snippet`, `reasons[]`, `important`.
+- Messages also have `seq`, `sender` and `type`. Items also have `item_id`,
+  `item_num` and `item_kind`.
+
+Entries are sorted important first, then newest first. A message is a
+`text`, `prompt`, `permission_request`, `file`, `image` or `spawn_outcome`
+event, not sent by the user and not covered by a seen range. It is left out
+when any of these is true:
+
+- the conversation is archived or a child conversation;
+- it is the Coordinator's own conversation (except with `mine=1`);
+- it is an item's fallback text or a consent card;
+- it is a prompt or permission request the user has written or answered
+  (`prompt_reply`) after;
+- it is a prompt a `prompt_reply` from any sender names — by `target_seq`,
+  or by the prompt's own `payload.prompt_id` (how a bridge settles a card
+  itself: a queued message it sent at turn end);
+- it is a prompt whose payload says `blocking: false` (a card nothing
+  waits on, such as a reminder the agent set itself).
+
+An open, non-consent item is unseen while it has agent content (its creation,
+or an agent comment) newer than what `item_seen` covers, and the user hasn't
+commented since.
+
+While the user's `notices` setting is on (the default, see *User
+settings*), an open item awaiting the user is never listed — it is in For
+you already — and the last message of a conversation that has one gets no
+`final` reason.
+
+**Reasons.** An entry with at least one reason is `important`.
+
+| reason | meaning |
+| --- | --- |
+| `awaiting_user` | an item awaiting the user |
+| `question` | an item of kind question |
+| `prompt` | an unanswered prompt |
+| `permission` | an unanswered permission request |
+| `final` | the last non-user message of a conversation that is now `waiting` or `done` |
+| `failure` | a failed `spawn_outcome` |
+
+A message in an agent-to-agent room never has a reason: the room's prompts
+and last messages are addressed to the other agent, and whatever there needs
+the user becomes a tracker item, which is raised as `awaiting_user`. (Until
+2026-10-01 the user's name in a room was a reason, `mentions_user`; a name
+that is also a box name and in every "approved by …" made it noise.) The
+`final` reason
+ignores item fallback texts and consent cards. A scan reads at most 20 000
+candidate messages; hitting that sets `truncated`.
+
+**Nudge.** Every 10 minutes the journal checks each user who has a
+Coordinator. When all of the following hold, it sends one ephemeral frame to
+the Coordinator's bridge:
+
+- UK time is between 07:00 and 22:00;
+- the last nudge was at least an hour ago;
+- the Coordinator's bridge is connected;
+- there are important, unflagged entries unseen for 2 h or more that no
+  earlier nudge named (the journal remembers each nudged ref for 30 days).
+
+The frame is `{kind:'unseen', event:'pending', convo_id, count,
+entries:[up to 5 of {ref, kind, convo_id, convo_title, item_num?, ts,
+reasons, snippet}]}`. Each entry is nudged about once. Set
+`MATRON_UNSEEN_NUDGE=0` to turn it off.
+
+## Shared visibility (GitHub-verified, per repo)
+
+A user may read another user's conversation-scoped rows — items, missions,
+milestones, and a prose excerpt of the conversation — when **all** hold:
+
+1. the conversation has a `repo` (see `convo_upsert`) whose `repo_scope`
+   (`host/org`) is one the viewer is a verified member of;
+2. the conversation's owner is a verified member of the same scope;
+3. the conversation is not owned by a private device (the device-privacy
+   sieve is part of the rule and is never overridden by an org match).
+
+"Verified member" = the user has linked a GitHub account (below) whose
+link is in state `ok` and whose active org memberships include the scope.
+A stale link (GitHub refused the token on the last refresh) confers
+nothing until a later refresh succeeds (the daily job retries stale rows)
+or the user re-links. A repo under a personal login is in no
+one's org list, so it is private to its owner. Agent devices read with
+their owning user's visibility; writes stay owner-only.
+
+Attachments on shared rows are fetchable through `GET /media/:id` under the
+same rule (see the media routes above); consent-mirror items and non-prose
+events open nothing.
+
+Invisible rows answer `404 not_found`; a visible foreign row refused for
+writing answers `403 forbidden`. The rule lives in `src/visibility.js`
+and is the only copy.
+
+### GitHub account linking
+
+Client devices only (an agent never links). Configuration:
+`MATRON_GITHUB_CLIENT_ID` (default: Matron's published OAuth App id,
+`Ov23likaFmqoegaDMTtz`, so the device flow works out of the box; set it
+to the empty string to disable linking, in which case every route below
+is `404 not_configured`),
+`MATRON_GITHUB_CLIENT_SECRET` (optional; enables the web flow — it must
+belong to the same OAuth App as `MATRON_GITHUB_CLIENT_ID`, so a journal
+that sets a secret also sets its own app's client id; the default id has
+no secret to pair with),
+`MATRON_GITHUB_HOST` (default `github.com`). The token scope is `read:org`.
+
+| Route | Body / query | Response |
+|---|---|---|
+| `POST /github/link` | `{flow:'device'}` | `{flow_id, user_code, verification_uri, interval, expires_in}` |
+| `POST /github/link` | `{flow:'web'}` (400 without a client secret) | `{url}` — send the browser there |
+| `POST /github/link/:flow_id/poll` | — | `{status:'pending', interval?}` \| `{status:'linked', github}` \| `{status:'denied'\|'expired'}`; 404 unknown/finished/another user's; 409 if the GitHub account is linked to another user; 502 `upstream` if GitHub is unreachable |
+| `GET /github/callback?code&state` | no Bearer; `state` is the single-use flow credential | **200 HTML confirm page** naming the GitHub login and the journal user, with the token parked on a `github_link_confirms` row (10 min, single-use nonce) — nothing is linked yet; or 302 to `/app/account?link_error=<expired\|bad_request\|conflict\|upstream\|not_configured>` |
+| `POST /github/callback/confirm` | no Bearer; form or JSON `{nonce, decision:'link'\|'cancel'}` — the nonce is the credential | 302 to `/app/account?linked=1` (linked) or `/app/account?link_error=<denied\|expired\|bad_request\|conflict\|not_configured>`; the parked token is deleted either way |
+| `POST /github/refresh` | — | `{github}`; marks the link `stale` on 401/403 from GitHub; 502 `upstream` if unreachable (nothing changes); 404 if this user has no linked account |
+| `DELETE /github/link` | — | `{ok:true}`; 404 if not linked |
+| `GET /me` | — | `{user:{id,name,is_admin}, github: {…} \| null, github_linking:{enabled, web_flow}}` |
+| `GET /lookup?user=<name>&num=<n>` | also `GET /u/<name>/<n>` with `Accept: application/json` | `{kind:'item'\|'mission'\|'milestone'\|'project', id, owner:{user_id,name}}`; 404 unknown or invisible. A merged project resolves to the project it was merged into, with `merged_from: <the id asked for>`. |
+
+Why the confirm page: an authorize URL can be handed to anyone, and GitHub's
+own pages name the OAuth App, never the journal user — so the person who
+authorizes is shown which journal account they are binding before anything
+is saved. The device flow has no equivalent hook (the authorizer only sees
+GitHub's device page), so a `user_code` handed to a victim can bind their
+identity to the attacker's journal account; the guards there are the 409 on
+an identity already linked elsewhere and the admin's ability to clear a
+link. Prefer the web flow where an OAuth App can be registered.
+
+The journal re-reads every linked user's memberships daily
+(`src/github-refresh.js`) and on `POST /github/refresh`. Flows expire
+after 10 minutes and are consumed by the poll or callback that finishes
+them.
+
+The token is never returned by any route and never logged. With
+`MATRON_TOKEN_KEY` set (64 hex characters — `openssl rand -hex 32`) it is
+stored sealed with AES-256-GCM (`enc1:` prefix); a journal that gains the
+key seals its existing rows at the next start (with `secure_delete` on, so
+the freed plaintext cells are zeroed, followed by a `TRUNCATE` checkpoint so
+no WAL frame still carries them). Unset, it is stored as-is.
+The refresh path recognises its own row by `token_hash` (SHA-256 of the
+plaintext), so sealing changes no behaviour. Starting without the key after
+rows were sealed marks nothing stale: refreshes answer `502 upstream`, the
+daily job logs `token_sealed`, and unlink/re-link work as usual. Losing the
+key means every user re-links. A key that is *changed* rather than removed
+behaves the same way, and the journal logs a warning at start naming how
+many tokens it can no longer read.
+
+## User administration
+
+Journal admins are users with `users.is_admin = 1`, bootstrapped from the
+shell: `matron-admin user admin <name> on|off`. Every route below is for a
+**client** device of an admin; any other caller — a non-admin, or an
+agent whatever its user's flag — gets `403 forbidden` for every verb,
+before any id is looked up. Mirrors `matron-admin` so the web app's admin
+page needs no shell.
+
+| Route | Body | Response |
+|---|---|---|
+| `GET /users` | — | `{users:[{id, name, is_admin, unlisted, created_at, github:{login, state, host} \| null}]}` (no token, no hash) |
+| `POST /users` | `{name, password, is_admin?}` — name `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, password ≥ 8 | `201 {user}`; `400 bad_request` \| `400 weak_password`; `409 conflict` if the name is taken |
+| `PATCH /users/:id` | `{is_admin: boolean}` | `{user}`; `409 conflict {reason:'last_admin'}` when it would demote the only admin |
+| `POST /users/:id/password` | `{password}` ≥ 8 | `{ok:true}`; device tokens stay valid (same as `matron-admin user passwd`) |
+| `DELETE /users/:id/github-link` | — | `{ok:true}`; `404` if nothing linked. Resolves a `409 conflict` at link time |
+| `POST /users/:id/link-code` | `{ttl_seconds?}` (60–86400, default 600) | `{link_code, expires_in}` — the same pre-approved pairing code `matron-admin link-code` mints; the app builds `matron://link?v=1&server=<origin>&code=<link_code>` |
+
+Unknown `:id` is `404 not_found`. Self-service stays on the existing
+routes: `GET /devices`, `POST /devices/:id/revoke`, `POST /devices/:id/rename`,
+`POST /password`.
+
+## Static hosting and app links
+
+`MATRON_WEB_DIR` (unset by default — nothing changes) names a directory the
+journal serves read-only, before Bearer auth, for `GET`/`HEAD` only:
+
+- an existing regular file under it is served with its extension's
+  content type, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`
+  on HTML, and `Cache-Control: public, max-age=31536000, immutable` under
+  `/assets/` (Vite's hashed names) or `no-cache` elsewhere;
+- `/u/*`, `/app` and `/app/*` serve the directory's `index.html` (history
+  fallback) unless the request's `Accept` names `application/json`, which
+  is the JSON link lookup and reaches the API;
+- `/` redirects to `/app/`;
+- a path with a dot-segment (`..`, `.git`, `.env`), a backslash, a NUL, a
+  path resolving outside the directory, a directory, or no matching file
+  falls through to the API, which answers as it always has (`401`/`404`).
+  Do not place files named like API routes (`items`, `login`) in the
+  directory: an existing file wins.
+
+The app-link files are served unauthenticated from env and are
+`404 not_found` when unset:
+
+| Route | Env | Body |
+|---|---|---|
+| `GET /.well-known/apple-app-site-association` | `MATRON_APPLE_APP_IDS` (comma-separated `TEAMID.bundle.id`) | `{applinks:{details:[{appIDs, components:[{"/":"/u/*", comment:"Matron tracker links"}]}]}}` |
+| `GET /.well-known/assetlinks.json` | `MATRON_ANDROID_PACKAGE` and `MATRON_ANDROID_CERT_SHA256` (comma-separated colon-hex fingerprints; both required together) | `[{relation:["delegate_permission/common.handle_all_urls"], target:{namespace:"android_app", package_name, sha256_cert_fingerprints}}]` |
+
+Malformed values refuse to start the journal, naming the variable.
+
+## Contacts and grants (person-to-person sharing)
+
+Phase 1: same journal, read-only mission share.
+
+The second way across the user boundary, beside the org rule above. Unlike
+the org rule it is explicit: two people become **contacts** by one asking
+and the other accepting, and then either may **grant** the other a mission
+to read. Nothing is derived from being on the same journal.
+
+### Contacts
+
+A contact is one row per side; anything is shared only while both rows are
+`active`. `address` is `user` on this journal and `user@journal` across
+journals (later).
+
+| State | Meaning |
+|---|---|
+| `awaiting_user` | my own agent asked; I have not approved (expires after 24 h) |
+| `pending_out` | I asked; waiting for the other person (no expiry; `DELETE` withdraws) |
+| `pending_in` | they asked; my accept card is open |
+| `active` | contacts |
+| `blocked` | I blocked them: their requests reach nobody and look, to them, exactly like `pending_out` |
+| `declined`, `removed`, `expired` | ended; a new request reuses the row |
+
+```
+GET    /contacts/users                    {users:[{name}]} — this journal's other listed users, names only
+GET    /contacts[?state=]                 {contacts:[contact]} — live rows unless a state is named
+POST   /contacts {user, convo_id?}        201 {contact, pending?:'peer'} | 202 {contact, pending:'owner'}
+GET    /contacts/:id                      :id is the row id (ct_…) or a same-journal user name
+POST   /contacts/:id/answer {decision}    'approve' | 'decline' — client devices only
+DELETE /contacts/:id                      remove, or withdraw a request
+POST   /contacts/:id/block                POST /contacts/:id/unblock (client only)
+GET    /contacts/:id/activity             {events:[…]} — the audit events naming this contact, newest first
+```
+
+`contact`: `{id, address, peer_user, peer_journal, display_name, state,
+requested_by, origin_convo_id, created_at, updated_at, accepted_at,
+revoked_at}`.
+
+`POST /contacts` from a **client** is the user's own tap and goes straight
+to the other person. From an **agent** it needs `convo_id` (a conversation
+the agent may write to, else 404), sends nothing, and parks as
+`awaiting_user` until the user approves it. Unknown user and "yourself"
+are one 404. So is an **unlisted** account (`users.unlisted`, set with
+`matron-admin user unlisted <name> on|off`; e.g. the App Store review
+login): it is left out of `GET /contacts/users`, its own list is empty, and
+a request to it, or from it to anyone, is that same 404. Contact rows made
+before the flag was set are untouched. 409 `blocked_by`: `already_contact`, `pending`, `pending_in`
+(an agent asking back is not a way around the accept card; a client asking
+back **is** the accept), `blocked`, `too_many_asks` (10 parked asks per
+agent device, contacts and grants together).
+
+Removing or blocking revokes every live grant between the two, in both
+directions, in the same transaction. Unblocking makes nobody a contact
+again. `DELETE` on a blocked row is 409 `blocked`: unblock is the only way
+out of a block, and only a client device may call it.
+
+### Grants
+
+```
+POST   /missions/:id/shares {contact, level, convo_id?}   201|202 {grant, pending} | 200 {grant, existing:true}
+GET    /missions/:id/shares                               {grants} — the owner's grants on one mission
+GET    /grants[?direction=in|out][&state=]                {grants} — live rows unless a state is named
+GET    /grants/:id
+POST   /grants/:id/answer {decision}                      client devices only
+DELETE /grants/:id                                        the owner revokes, the grantee leaves
+```
+
+`grant`: `{id, direction:'out'|'in', subject_kind, subject_id, level, state,
+owner:{user_id,name}, grantee:{name,address}, contact_id?, mission?:{id,num,title},
+requested_by, revoked_by, created_at, updated_at, answered_at, revoked_at}`.
+`contact_id` is the owner's contact row and is present only on the owner's
+side (`direction: 'out'`).
+States: `awaiting_owner` (the owner's agent asked, 24 h) → `pending` (the
+grantee's accept card is open) → `active`; `declined`, `revoked`
+(`revoked_by`: `owner` | `grantee` | `contact_removed`), `expired`.
+
+`contact` is the owner's contact row id or a same-journal user name; the
+two must be mutual contacts (409 `not_contact`). `level` defaults to
+`read`; `contribute` and `owner` are the spec's later phases and answer
+409 `level_unavailable`. A mission born on a private device is 409
+`private_mission`. The mission is resolved through the caller's own sieve.
+A grantee is never told of a grant its owner has not approved: until then
+the id is a 404 for them.
+
+### What a grantee reads
+
+`src/visibility.js` holds the rule (`grantedMissionSql`): an active grant,
+on a mission of its owner, for a contact that is the viewer, with both
+contact rows active. It is a **mission** rule; `canReadConvo` is not
+widened, so no transcript route opens (`/convo/:id/messages`,
+`/milestones?convo=` stay 404).
+
+- `GET /missions?scope=shared` also lists granted missions, and
+  `GET /missions/:id` (an `ms_…` id) serves one. Rows carry
+  `shared_via: 'grant'`, `grant: {id, level}` and `owner`.
+- The view is the one an ordinary agent of the owner would get — milestones
+  and items from private-device conversations, consent mirrors and a
+  privately written status are withheld — with everything that names a
+  conversation, device or project removed: `origin_convo_id: ''`,
+  `origin_device_id: 0`, `project_id`/`status_convo_id`/`closed_convo_id`
+  null, `conversations: []` (count 0), milestones as `{id, mission_id, num,
+  kind, title, body, created_by, created_at}`.
+- `GET /items/:id` and `GET /items?scope=shared` serve the items of a
+  granted mission with `shared_via: 'grant'`, no origin, no action buttons,
+  and comments with `device_id: 0`. `GET /media/:id` serves their
+  attachments. `GET /lookup` resolves the owner's number.
+- Every write by a grantee is 403.
+
+### Cards, mirrors and who answers
+
+Each ask is a `permission_request` card plus a tracker mirror (a `question`
+item, label `consent`, `items.consent` = `contact` | `share`, link
+`matron://consent/contact/<contact id>` or `matron://consent/share/<grant
+id>`), on each side that has something to decide:
+
+| Card `kind` | `direction` | Where | Buttons on the mirror |
+|---|---|---|---|
+| `contact_request` | `out` | the asking agent's conversation | Approve / Decline |
+| `contact_request` | `in` | the recipient's People conversation | Accept / Decline |
+| `mission_share` | `out` | the asking agent's conversation; carries `preview` `{milestones, items, comments, attachments}` | Approve / Decline |
+| `mission_share` | `in` | the grantee's People conversation | Accept / Decline |
+
+Card payloads: `contact_request` `{kind, direction, contact_id, peer:{name,
+address}}`; `mission_share` `{kind, direction, grant_id, level, owner,
+grantee, mission:{id,num,title}, preview}`; `out` cards add
+`from_device_id`, `from_name`, `from_convo_id`.
+
+A card is answered by `POST …/answer` **or** by tapping the mirror's button
+(`POST /items/:id/comments {action}`), which the journal applies itself and
+answers `200 {item, comment, contact|grant}`.
+
+**Only a client device answers.** Both cards and the `people` events are
+client-only events, the mirrors' markers carry `consent`, both answer
+routes and the button tap refuse agents with 403, and these asks are never
+in `/consent/pending` nor accepted by `/consent/answer`. The Coordinator is
+an agent: it neither sees nor answers a card that comes from another
+person or sends data to one. Agents may remove, block and revoke, which
+only reduce access.
+
+### The People conversation
+
+One conversation per user that the journal itself owns
+(`conversations.system = 'people'`, title "People", created on first use,
+announced by a `convo_meta` carrying `system`): the home of `in` cards,
+their mirrors and the audit events. `/snapshot` lists it for clients with
+`system: 'people'`. No agent can read it (`/snapshot`, `/roster`, replay,
+fan-out), write to it, file into it or adopt it.
+
+### Audit and live frames
+
+Every transition appends one `people` event to **each** side's People
+conversation: `{event, summary, contact_id, peer:{name,address}, grant_id?,
+level?, mission?:{id,num,title}, owner?, by?}` with `event` one of
+`contact.requested|received|accepted|declined|removed|blocked|unblocked`
+and `grant.offered|received|accepted|declined|revoked`. Never a push.
+
+Ephemeral frames, client sockets only:
+
+```
+{kind:'people', event:'changed', contact_id?|grant_id?}        refetch /contacts and /grants
+{kind:'shared', event:'mission_added',   mission_id, grant_id, owner}
+{kind:'shared', event:'mission_changed', mission_id, what:'milestone'|'item'|'mission', owner}
+{kind:'shared', event:'mission_removed', mission_id, grant_id}
+```
+
+`mission_changed` fires on every milestone, item write and mission
+update/close on a granted mission. It is an invalidation: the grantee
+refetches through the sieved reads above.
+
+## Rooms between people (phase 2)
+
+Same journal only (`peer_journal IS NULL`).
+
+### Session shares
+
+A person lets ONE contact's agents address ONE of their sessions. Nothing
+else of theirs is listed to the contact.
+
+```
+GET    /session-shares[?convo_id=]           my live shares
+POST   /session-shares {convo_id, contact}   agent: parks (202, pending:'owner'); client: active (201)
+DELETE /session-shares/:id                   agent or client of the sharer
+POST   /session-shares/:id/answer {decision} approve|decline, client only
+```
+
+The session must be a top-level, non-system conversation of the caller,
+managed by one of the caller's own non-private agent devices (`404`
+otherwise; `409 private_session` for a private box). An agent may only
+share a conversation it can write. The contact must be mutual
+(`409 not_contact`). An agent's ask parks for its own user exactly like a
+contact ask: a client-only `session_share` card in that session, a
+`consent: 'session'` mirror with Approve/Decline, 24 h expiry. Removing
+or blocking the contact revokes every share between the two. Revoking a
+share does not end a room already open.
+
+`GET /roster` gains `people: [{person, sessions: [{convo_id, title,
+agent_device_id, session_state, created_at}]}]` — the sessions other
+people share with the caller, both contact rows active, never on a private
+device. Never a box name. A guest room (below) is left out of
+`conversations`.
+
+### The room
+
+A room between Alice's agent and Bob's agent is two conversations, one in
+each log, linked by a `person_rooms` row:
+
+- the **owner room**: Alice's, owned by her agent's device, as any room;
+- the **guest room** (the twin): Bob's, created when Bob accepts. Its
+  `agent_device_id` is Alice's device, so Bob's agent is an ordinary
+  participant of it and every room op it knows works on it unchanged. The
+  hub never reaches Alice's device through it (that device is in Alice's
+  bucket).
+
+Each log keeps its own events, sequence, replay, read state and push. The
+journal **copies** every `text` message appended to one room (agent
+`publish`, client `send`) into the other once the guest agent has joined:
+
+```
+{type:'text', sender:'person:<name>', payload:{body, person:{name}, via:'agent'|'user'}}
+```
+
+`person:` is a sender only the journal writes (an agent's sender is always
+`agent:`, a client's `user:`), so a bridge can trust it as "another person
+wrote this" and restrict the turn it starts. A copy is never copied back.
+The copy wakes the receiving agent's box and pushes like any append.
+Bodies over 16,000 characters are cut, with a note. Files and images do
+not cross: a `publish` or `send` of `file`/`image` into a linked room is
+`bad_request` ("files and images do not cross to another person").
+
+### Asking, and the two consents
+
+The ask is the ordinary `agent_invite`, aimed at a shared session of a
+contact:
+
+```
+agent_invite {room_id, target_device_id, target_convo_id, from_convo_id?, topic?, justification, mission?}
+```
+
+When `target_device_id` is another user's agent, `target_convo_id` must be
+a session that user shares with the caller, both contact rows must be
+active, and the target device must not be private — otherwise
+`not_found`, one answer for all of them. `mission` (a number or id) is
+optional: one of the caller's missions with an active grant to that
+contact (`not_found` "no such mission"; `conflict` if not shared). A
+private caller is `forbidden`. A room in a live person link, or a twin,
+holds exactly the two agents: any other `agent_invite` or `agent_join` on
+either side is `conflict`, and so is a person invite into a room that
+already has members. The room must also be **fresh**, because everything
+said in it crosses: no `user:` text, no session events (`session_status`,
+`prompt_reply`, files, items, milestones, summaries), no other sender's
+text, and at most 5 messages — the opening `agent_chat_start` posts.
+Anything else is `conflict` ("must be a new room"). A room that has ever
+had a twin is never re-invited (`conflict`). Its old twin stays a twin.
+
+1. The ask parks (`awaiting_owner`). The caller gets the usual
+   `{kind:'invite', event:'delivered'}`. Alice gets a client-only
+   `permission_request` card `{kind:'person_room', direction:'out',
+   room_link_id, person, session_title, topic, justification, mission}`
+   in the room, and a `consent: 'room'` mirror with Approve/Decline.
+   24 h expiry.
+2. Alice approves (`awaiting_guest`): Bob gets a `direction:'in'` card and
+   an Accept/Decline mirror in his People conversation. No expiry: Alice
+   withdraws by ending the room.
+3. Bob accepts (`invited`): the twin is created, announced
+   (`convo_meta` with `person`) and filled with what was said in the room
+   so far (up to 50 messages, as `person:` copies). A `convo_agents` row invites Bob's agent
+   into it, and the invite is delivered as a normal
+   `{kind:'invite', event:'request', room_id:<twin>, target_convo_id,
+   from_name:<owner person>, person:{name}}` — never the owner's box name
+   or conversation id.
+4. Bob's agent answers on the twin with `agent_invite_ack` /
+   `agent_invite_answer`. The owner agent gets the matching `ack` /
+   `answer` frame **on its own room id**, with `peer_device_id` (Bob's
+   device) and `person:{name}`. On accept the guest device also gets a
+   `joined` row in the owner room (`joined`).
+
+Every card and mirror is client-only. Neither person's Coordinator can
+list or answer them: they are not in `/consent/pending`, the answer routes
+are client only (`403`), and an agent cannot see the mirrors. A refusal
+anywhere reaches the owner agent as `{event:'answer', accept:false,
+reason:'refused'|'expired'|'left'}`.
+
+```
+GET    /person-rooms                    my live rooms and asks with other people (client only)
+GET    /person-rooms?room_id=           one, by my own room id (an agent: a room it can write)
+GET    /person-rooms/:id                client only
+POST   /person-rooms/:id/answer {decision}   approve|accept|decline, client only
+DELETE /person-rooms/:id                client of either person: end it
+```
+
+The row, from the reader's side: `{id, role:'owner'|'guest', room_id,
+person, state, topic, mission:{id,num,title,owner}|null, created_at,
+updated_at}`. The bridge reads it at the start of a turn the other person
+started, to know the person and the mission the turn may use.
+
+### Ending
+
+Any of these ends the room on both sides, both `convo_agents` rows reading
+`left`: either agent's `agent_leave` (the owner's dissolves; the guest's
+leaves), either person's `DELETE /person-rooms/:id`, or removing or
+blocking the contact. Each agent still in it gets `{kind:'invite',
+event:'left', room_id:<its own room>, from_device_id, person}`; open
+cards close; each person's People log gets a `room.ended` line. After
+that nothing is copied. Ending the grant of an attached mission detaches
+the mission; the room stands.
+
+Audit events (`people`, client-only): `room.offered`, `room.received`,
+`room.accepted`, `room.declined`, `room.joined`, `room.ended`, each with
+`room_link_id`, `person` and the reader's own `room_id`.
+
+## Device privacy
+
+A per-device flag that makes an agent device — and what it manages — invisible
+and unreachable to *other agent devices*, while the user's own client apps see
+everything unchanged. Consent (see "Agent chat rooms" above) stops a rogue
+agent injecting text into a sibling's context; it does not stop it *watching*,
+and once a room is approved a compromised participant can work on it freely
+and indefinitely. For a device with materially more authority than its
+siblings, unreachable is a stronger property than approved, because
+unreachable has no first-contact hole at all.
+
+**The flag pair.** `devices.private` (`INTEGER NOT NULL DEFAULT 0`) is the
+value; `devices.private_pinned` (`INTEGER NOT NULL DEFAULT 0`) records who
+owns it. `private=1` means invisible/unreachable to other agents — not to the
+user: `kind='client'` connections are never filtered by any rule below, and
+`GET /devices` (already client-only, see above) is untouched by this feature
+entirely. `isPrivateDevice(db, deviceId)` (`src/db.js`) is the single read
+helper every enforcement point calls; it answers `false` for an unknown/
+deleted id rather than throwing, so a caller checking a dangling reference
+falls through to its normal not-found path instead of crashing.
+
+**Setting it: hello, then the pin.** The bridge asserts its own flag on every
+WS `hello` frame: an optional top-level `private: boolean`
+(`MATRON_AGENT_PRIVATE`, bridge-side env var) — hello is the only recurring
+moment a long-lived, operator-absent agent connection can assert env-var
+config. The shape check runs for **every** connecting device, agent or
+client, before the two kinds are told apart: a `private` field that is
+present but not a boolean is rejected —
+`{kind:'control', op:'error', code:'bad_request', ref:'hello'}`, the same
+reject shape a bad cursor gets, socket closed — regardless of which kind of
+device sent it. Only past that check does the agent/client distinction
+apply: a **well-formed** boolean, or an absent field, from a client is
+silently ignored — never applied, hello proceeds normally — while an agent's
+value is written via `applyBridgePrivate`. Leniency is for a client sending a
+harmless, well-formed value it should never send in the first place; a
+malformed value gets no such leniency from either kind. Omitting the field
+asserts `false`: an unpinned flag follows the hello assertion exactly,
+including its removal — bridge-set privacy does NOT survive a re-register
+without the env var.
+`matron-admin device private <device_id> on|off|auto` is the authoritative
+override: `on`/`off` both PIN the flag (`private_pinned=1`) — `off` is
+"force-visible", not "hands off" — so a deploy that forgot the env var can
+never silently unmark a pinned machine; `auto` releases the pin and hands the
+flag back to the next hello, without itself changing the value.
+`matron-admin device list` renders `private=yes|no`, with a `(pinned)` suffix
+when pinned.
+
+**The enforced surfaces — one caller rule, ten enforcement points.** Every
+rule is conditioned on the identical predicate: filtering applies **only
+when the caller is an ordinary (non-private) agent**. `kind='client'`
+callers are never filtered, and a private agent caller is never filtered
+either — it is invisible, not blinded, so two private agents see each other
+and a private agent still gets the whole unfiltered roster/search/room set.
+The ten:
+
+- **`GET /roster`** — omits private agent devices and every top-level
+  conversation whose `agent_device_id` is private.
+- **`GET /search`** — `searchMessages`'s `excludePrivateOwned` option
+  (`src/search.js`) excludes hits from private-owned conversations.
+- **The `around_seq` context mode** of `GET /convo/:id/messages` — a
+  private-owned conversation 404s for a foreign ordinary-agent read. The
+  check runs before `messagesAroundIndexed` and before the foreign-read
+  audit log line (see "Journal search" above), so a refused read is never
+  logged as a successful one.
+- **Every room op, on room ownership** — via a single choke point rather
+  than a per-op check: `loadRoom` (`src/ws.js`), the shared lookup behind
+  `agent_invite`, `agent_join`, `agent_invite_ack`, `agent_invite_answer`,
+  and `agent_leave` (see "The five room ops" above), checks whether the
+  room's *owner* device (`room.agent_device_id`) is private and applies
+  uniformly to all five ops. A room owned by a private device answers the
+  byte-identical `not_found` an unknown room id gets, on every one of those
+  five ops. The plan originally specified this only as a per-op check on
+  `agent_join`'s owner lookup; folding it into `loadRoom` instead means the
+  other three ops, which had no privacy check of their own
+  (`agent_invite_ack`/`_answer`'s "no pending invite", `agent_leave`'s "not
+  a joined participant"), are covered too — closing what would otherwise be
+  an existence oracle in the fields those checks don't touch.
+  - The exemption is narrower than "is a participant":
+    `isKnownParticipant` (`src/participants.js`) passes a caller only if it
+    **initiated** the ask, the ask was **actually delivered** to it
+    (`delivered_at IS NOT NULL`), or it is **`joined`**. A merely parked
+    (`awaiting_user`, never relayed to any agent socket) or `denied` (never
+    told) row does NOT exempt — either would leak a private room's
+    existence to an agent the user never approved, or explicitly refused.
+- **`agent_invite`'s target-device check** — separate from `loadRoom` and
+  unreplaced by it: whether the room's *owner* is private (`loadRoom`'s job,
+  above) is independent of whether the invite's *target* device is private.
+  `agent_invite` (`src/ws.js`) looks up `target_device_id` directly and
+  folds `target.private === 1 && !isPrivateDevice(db, conn.deviceId)` into
+  the same `not_found` an unknown id, another user's device, or a
+  client-kind device already gets. This check was specified per-op in the
+  plan and remains per-op in the shipped code — nothing subsumed it.
+- **`read_marker`** — an ordinary agent caller marking a conversation whose
+  recorded owner is a private device, and that the caller is not a known
+  participant of (`isKnownParticipant`, same exemption `loadRoom` uses),
+  gets the same `forbidden` its own unknown-`convo_id` path already returns
+  (`markRead`'s `not authorized` throw, caught by `handleOp`'s outer
+  catch) — byte-identical, not merely same-shaped, because `read_marker`
+  isn't one of the five room ops `roomIdEcho` attaches `room_id` to, so
+  neither rejection carries one. The gate runs before `markRead`, so a
+  refused mark never appends a `read_marker` event or fans one out. See
+  "Agent write authorization" above for why `read_marker` isn't gated by
+  `authorizeAgentWrite` itself.
+- **`convo_upsert`'s private-owner takeover guard** — extends the
+  pre-existing "Room-upsert ownership gate" (above) to the
+  participant-less case it deliberately left open: when the existing
+  conversation's recorded owner is a private device and the upserting
+  caller is an ordinary agent, the whole upsert is refused with the
+  identical `forbidden` shape the populated-room gate already returns,
+  instead of the old last-writer-wins takeover. See "Room-upsert ownership
+  gate" above for the full mechanics and the re-pairing operational trap
+  this creates. Unlike every other surface in this list, this one is a
+  **new, accepted** existence oracle rather than a byte-identical
+  rejection — see "Byte-identical, deliberately" below.
+- **`GET /missions`, `GET /missions/:id`, `GET /milestones`** — same
+  predicate as `/roster`/`/search`; see "Missions & milestones" above for
+  the full behaviour (list omission, per-route 404, and the sieved
+  counts/`last_milestone` a spanning mission's summary and detail rows
+  agree on).
+- **`GET /snapshot`** — a differently-shaped rule of its own; see below.
+- **`GET /metrics`** — the `user.devices` list (`buildMetrics`,
+  `src/metrics.js`) omits private devices for a filtered ordinary-agent
+  caller, via an `excludePrivateDevices` option computed with the same
+  predicate at the HTTP layer; a client or a private agent caller gets the
+  unfiltered list, byte-identical to today.
+
+**Byte-identical, deliberately — with one accepted exception.** Every
+filtered surface's refusal is indistinguishable from the same surface's
+refusal for a genuinely nonexistent target: `not_found` for room ops
+(matching an unknown room or device id, another user's device, or a
+client-kind device), `404 {error:'not_found'}` for `around_seq` (matching a
+missing conversation), and the same `forbidden` for `read_marker` (matching
+its own unknown-`convo_id` rejection — see above). A distinct "that's
+private" error would itself confirm existence — the thing being hidden.
+
+The one deliberate exception is `convo_upsert`'s private-owner takeover
+guard (above): refusing an upsert on an existing private-owned,
+participant-less conversation id IS distinguishable from an upsert on a
+fresh id, which simply creates it — a caller who already knows or guesses
+an id can learn "something private-owned already exists here" in a way it
+could not learn from a truly-unused id. This mirrors an oracle already
+accepted one gate up: the populated-room case (any `convo_agents` history)
+answers a caller-visible `forbidden` for a private-owned room, distinguishable
+from ordinary creation, for exactly the same structural reason — a
+conversation that already exists behaves differently from one that
+doesn't, and hiding *that* difference would mean either silently rejecting
+every fresh `convo_upsert` too (breaking normal room creation) or silently
+allowing the private-owner takeover this guard exists to close. Extending
+an already-accepted oracle class to the participant-less case was judged
+preferable to inventing a second, differently-shaped one.
+
+**`/snapshot`'s two independent rules (added by security review during
+implementation, alongside the other enforcement points above).**
+`GET /snapshot` predates this feature and answers to its own pair of rules
+layered on the client shape, not the single roster/search/room predicate
+above:
+
+- **`snippet` is omitted for every agent caller, private or not** —
+  unconditional, because the risk is credential leakage (a snippet can carry
+  `tool_output` text), not visibility. A managing agent losing its own
+  conversation's snippet in this one summary payload is an accepted cost; no
+  agent consumer of `/snapshot`'s snippet exists.
+- **Private-owned conversations are excluded for a filtered (ordinary) agent
+  only** — the same one-caller predicate as `/roster` and `/search`, so
+  `/snapshot` can't be used as an end-run around either.
+
+**What this does not do.**
+
+- **Visibility, not privilege.** Every device is still the same journal user
+  with the same rights; privacy is not a permission boundary between an
+  agent and its own box, and does not prevent it doing damage there.
+- **No retroactive hiding.** Text a private agent already wrote into
+  another agent's conversation stays visible there — the flag changes what's
+  discoverable going forward, not the historical record.
+- **A compromised private agent gains nothing from the flag.** It already
+  sees everything (the asymmetry runs the other way — if the private one is
+  the compromised device, this feature bought nothing); the only flag it can
+  touch is its own, and unmarking itself only makes it more visible, which
+  harms nobody but itself.
+- **Revocation re-exposes.** `matron-admin device revoke` (see "Device
+  revocation" below) deletes the device row outright — there is no
+  soft-delete or tombstone. A private device's conversations still carry its
+  now-dangling `agent_device_id`, so every enforcement point above (whose
+  private check is `isPrivateDevice`, a live lookup against the `devices`
+  table) sees no row, answers `false`, and stops excluding them: a
+  decommissioned private agent's whole history becomes visible and
+  searchable again to ordinary agents the moment it's revoked. Privacy here
+  is a visibility flag on a live device, not a retention policy on its past
+  conversations; if a decommissioned device's history needs to stay hidden,
+  that needs a distinct fail-closed mechanism (e.g. an owner id that
+  survives its device row) — not implemented in v1.
+- **`/metrics`'s global aggregates still count private devices.**
+  `sockets_connected`, `journal_row_count`, and `db_file_size_bytes` are
+  whole-user (or whole-server) aggregates computed before the per-device
+  `user.devices` filtering above — a private agent's own live socket, its
+  journal rows, and its share of the DB file size are folded into these
+  numbers for every caller on the account, including an ordinary agent
+  whose own `user.devices` list just had that same device filtered out. No
+  id or name ever leaks through them (they're bare counts), but an
+  attentive ordinary-agent caller can still infer "something else is active
+  on this account" from population-level movement it can't attribute to
+  any device. Only the per-device list — the part that could name one — is
+  filtered.
+- **A drawn-in ordinary agent keeps the access it was granted, not the
+  discoverability.** Once an ordinary agent is `joined` into a private
+  device's room (invited and accepted, or joined via `agent_join`), it reads
+  and writes that room over the ordinary journal/WS paths exactly like any
+  other room it's a participant in — `authorizeAgentWrite`, hello replay,
+  and paging never re-check privacy once a caller has standing. But that
+  room still never appears in the participant's own `GET /roster`,
+  `GET /snapshot`, or `GET /search` — those three stay scoped to the
+  one-caller predicate above regardless of the caller's actual room
+  memberships. The asymmetry is deliberate: discovery closes (you can't find
+  what you weren't told about), granted access does not (once told, you keep
+  reading it the normal way).
+
+## Device revocation
+
+`matron-admin device revoke <device_id>` deletes the device/agent row (spec
+§8) — that's the entire revocation. HTTP handlers look up the token hash
+per request, so a deleted row 401s on the very next call. On the WS side,
+every inbound frame *after* hello re-checks the device row still exists
+(one cheap prepared `SELECT`); if it's gone, the server sends
+`{kind:'control', op:'error', code:'revoked'}` and closes with code `4001`
+(close-on-next-frame). A periodic sweep (every 60s) additionally checks
+every *registered* connection's device row, so a revoked device that just
+listens without ever sending — a lost or compromised phone — is cut off
+too, with the same error frame and `4001` close. WS enforcement is
+therefore **next-frame or ≤60s, whichever comes first**.
+`matron-admin device list <username>` shows each device's kind, cursor,
+and last-seen time. Room membership goes with the row — see "Device
+revocation clears room membership" under agent chat.
+
+Owners can also revoke from a client device over HTTP:
+`POST /devices/:id/revoke` (Bearer, client devices only — agents get 403)
+deletes the row exactly like `matron-admin device revoke`; not-owned and
+nonexistent ids are indistinguishable (404 `{error:'not_found'}`).
+Self-revocation is allowed and acts as a logout. WS enforcement is the
+same next-frame-or-≤60s-sweep described above.
+
+`POST /devices/:id/rename` (Bearer, client devices only — agents get 403)
+renames a device, body `{name}`, 200 `{ok:true, device:{device_id, name}}`.
+The name is sanitised (control characters flattened, whitespace collapsed,
+trimmed) and then capped at 40 characters — over the cap is rejected with
+400 `{error:'bad_request'}`, never truncated, as is an empty or non-string
+name. Not-owned and nonexistent ids are indistinguishable (404), same as
+revoke. Any device kind may be renamed, including the caller's own, and
+duplicate names are allowed (pairing only warns about them). A success fans
+a `device_meta` frame out to the user's client sockets; a client that was
+offline for it re-reads the name from `/snapshot`'s `agents` list (agent
+boxes) or from `GET /devices` (any kind, client devices included) — see
+`device_meta` under "WebSocket" above.
+
+`POST /devices/:id/tag` (Bearer, client devices only — agents get 403) sets
+the device's roster tag character, body `{tag_char}`, 200 `{ok:true,
+device:{device_id, name, tag_char}}`. The tag is the one-character label
+clients show beside a box; when it is null clients derive a letter from the
+device name — journal-held so the same character shows on every one of the
+user's devices. Input goes through the device-name sieve and then only the
+FIRST grapheme is kept (a compound emoji counts as one grapheme and survives
+whole). A "grapheme" is further bounded: a cluster of more than 16 code
+points (a Zalgo combining stack, a ZWJ chain) or one that consists only of
+format/space characters (RLO, ZWSP, soft hyphen — a non-null tag that would
+render as nothing) also sieves to null. `null`, empty, whitespace-only, and
+those sieved-out inputs all clear back to automatic (stored NULL); an absent
+key or non-string non-null value is 400 `{error:'bad_request'}`.
+Owner-scoping, 404 merging, and the `device_meta` fan-out all match rename
+exactly; rename's own 200 body carries the standing `tag_char` too. Note the
+recovery split matches names: a client-kind device's tag is only in
+`GET /devices` — `/snapshot`'s `agents` list carries tags for agent boxes.
+
+A rename takes effect on the renamed device's own **live** WebSocket too, not
+just from its next connection: every event that names the producing device —
+journal `sender` strings (`agent:box-2`) and the `from_name` in an
+agent-chat/agent-spawn consent card — carries the new name from the next op
+onwards. Already-journaled events keep the name they were written with;
+`sender` is history, not a live reference.
+
+## Agent pairing (device authorization)
+
+`gh auth login`-style enrollment for headless boxes.
+The box calls `pair/start` and displays the `pair_code` (`XXXX-XXXX`,
+Crockford base32 minus vowels); the human approves that code in an
+authenticated client app with `pair/approve`, naming the agent; the box
+polls `pair/claim` with its secret `poll_token` (32 random bytes hex,
+never displayed) and receives the agent token exactly once, straight into
+its token file — no human ever sees it. Nothing durable exists until
+claim: approve only flips the in-memory pair's state, and the `devices`
+row is created by the claim response itself. The approve→claim regret
+window (≤ TTL) is accepted in v1; once claimed, the agent appears in
+`GET /devices` and is revocable instantly.
+
+## Device link (QR sign-in)
+
+The reverse of agent pairing: here the *signed-in* side starts. A signed-in
+client ("starter") calls `link/start` and renders the `link_code` as a QR
+(`matron://link?v=1&server=<url-encoded base URL>&code=XXXX-XXXX`) plus the
+code as text. The new device ("claimant") scans or types the code and calls
+`link/claim` with its device name, then polls `link/poll` with its secret
+`claim_token` (32 random bytes hex). The starter polls `link/status`, sees
+`claimed` with the claimant's name and IP, and the user taps Approve
+(`link/approve`) or Deny (`link/deny`). Scanning alone never signs anything
+in: only the approve tap — from the starter device itself, holding a live
+bearer — releases an identity.
+
+Like pairing, no `devices` row exists before the final step: approve only
+flips the in-memory session's state, and the `kind='client'` row is minted
+at the claimant's next `link/poll`, exactly once (the session is deleted
+before the token is returned). Sessions live 120s (extended to ≥60s
+remaining on claim so a last-second scan still leaves time for the tap),
+are in-memory only, and die with a restart or with the starter's token —
+`link/approve` requires a live starter bearer at tap time, so a revoked or
+signed-out starter can never complete a link.
+
+### Pre-approved link codes (provisioning)
+
+`POST /link/preapprove {username}` mints a link session that is born
+approved: the claimant runs the ordinary `link/claim` → `link/poll` flow
+and the FIRST poll returns the device token — no approve tap (at
+provisioning time there is no other device to tap on). The granting
+authority is root on the box: the endpoint answers only loopback sockets
+carrying no `X-Forwarded-*`/`Forwarded`/`CF-Connecting-IP` header (external
+traffic always arrives via the reverse proxy, which adds one), and 404s
+for everyone else.
+
+That header check alone is defeated by a headerless reverse proxy (a
+default-config nginx `proxy_pass` with no `proxy_set_header` lines forwards
+none of them), so the endpoint additionally requires the header
+`x-preapprove-key` to match a 64-hex-char secret the journal auto-mints on
+first boot at `<dirname(db path)>/preapprove.key` (mode 0600, compared with
+`crypto.timingSafeEqual`) — no operator provisioning step, nothing to
+configure. Missing or wrong key gets the same 404 as every other guard
+failure. `matron-admin link-code` reads that file itself (it must run on
+the journal host, as the journal's service user or root) and sends the
+header automatically.
+
+Codes live 10 minutes, are one-shot, and count toward the same in-memory
+cap as normal link sessions. `matron-admin link-code <username>
+--server-url <url>` wraps this and prints the
+`matron://link?v=1&server=…&code=XXXX-XXXX` QR on the terminal.
+
+## Link rendezvous (relay)
+
+The reverse direction, for signed-out devices that can't scan. Served by
+the push relay (`push.matron.chat`), NOT the journal — a brand-new install
+has no configuration, and the shared relay is the one address every Matron
+app knows. The relay never carries a token: only `{server, code}`, the
+same two values the shipped QR displays on screen. The confirm-tap on the
+signed-in phone remains the only credential-granting gate.
+
+- `POST /link/rendezvous` (empty body) → `201 {rid, secret, expires_in}`.
+  `rid`: 26 chars of the pairing alphabet (~128 bits), shown in the QR as
+  `matron://rlink?v=1&rid=<rid>`. `secret`: 256-bit hex poll gate, never
+  in the QR. TTL 3 minutes, in-memory only, `maxPending` 256. Per-IP
+  token bucket (burst 10, refill 1/30 s) plus a global ceiling (burst
+  100, refill 1/100 ms) that also bounds offers and polls.
+- `POST /link/rendezvous/:rid/offer {server, code}` — the scanning
+  phone's move, after calling `link/start` on its own journal. First
+  offer wins → 204; later offers 409; unknown/expired rid 404. `server`
+  must be https (http allowed to localhost-ish dev hosts only), ≤ 200
+  chars; `code` is normalized to `XXXX-XXXX`. Validation reasons are
+  machine strings that never echo caller values.
+- `GET /link/rendezvous/:rid?secret=<hex>` — the creator's 2 s poll.
+  204 waiting; `200 {server, code}` once offered (NOT one-shot — the
+  entry survives to TTL so a dropped response is retryable; it releases
+  no credential); 403 on secret mismatch (constant-time); 404 after TTL.
+
+A relay restart forgets pending rendezvous; the signed-out device
+regenerates its QR, mirroring link-session behavior.
+
+## Agent RPC (client->agent request/response)
+
+Structured app->bridge calls — how the app asks a
+bridge for its recent folders or to start a session in a folder, without
+typing text commands into the control conversation.
+
+- Client op: `agent_request {request_id, agent_device_id, method, params?}`
+  (client connections only). `request_id`: <=128 chars, echoed verbatim on
+  every correlated frame. `method`/`params` are opaque to the server (the
+  bridge owns the vocabulary — same stance as `status`). Whole frame <=16 KiB
+  (`MATRON_RPC_MAX_BYTES`). Unknown/foreign/client-kind targets are
+  indistinguishable `not_found`; an agent with no live registered socket is
+  `agent_unreachable` immediately (no queueing). A connection may send
+  `agent_request` only once registered for live delivery itself — mid-replay
+  requests draw `not_ready` (nothing forwarded; re-send verbatim after
+  replay). `cursor: null` hellos register synchronously and never see it.
+- Delivery to the agent: `{kind:'rpc', request:{request_id, from_device_id,
+  method, params}}` — to exactly ONE socket, the device's most recently
+  registered live connection (single-consumer: reconnect overlap must not
+  double-execute a non-idempotent `start`). `from_device_id` is stamped
+  server-side.
+- Agent op: `agent_response {request_id, to_device_id, ok, result?, error?}`
+  (agent connections only). For a reply to a client-relayed request,
+  `to_device_id` must be a client device of the same user (else `not_found`);
+  a reply to a **journal-originated** request instead carries
+  `to_device_id: 0` and is settled internally rather than relayed — see
+  "Journal-originated requests" below. `ok:false` requires `error.code`.
+  Delivered as `{kind:'rpc', response:{request_id, agent_device_id, ok,
+  result?|error?}}` to ALL live sockets of that device (responses are
+  side-effect-free; clients dedupe by `request_id`).
+- The relay is stateless and nothing is journaled: no seq, no unread/push
+  effects, no retention surface. Timeouts are the client's job; at-most-once
+  delivery, re-asking is the retry.
+- v1 method vocabulary (bridge-owned, normative in the spec):
+  `recent_folders {} -> {folders:[{path, last_used}], activity?, limits?}` and
+  `start {workdir?, browser?, prompt?, room_id?, from_name?, model?} -> {convo_id, model?, model_reason?}`
+  (`model`/`model_reason` only when no model was asked for and the target
+  fell back from its default — see "Fable-limit fallback" above)
+  (errors `bad_workdir` — workdir does not resolve to a directory on the
+  target box; `spawn_failed` — the target threw while starting the session;
+  `bad_request` — `room_id` was sent without `prompt`, or `room_id` on its
+  own is otherwise invalid; `unsupported_mode` — the target bridge has no
+  spawn wiring (e.g. session id unknown at spawn, or spawn-room support
+  absent); unknown methods `unknown_method`).
+  `prompt`/`room_id`/`from_name`/`model` are the parameters the
+  journal-originated `start` call behind spawn approval sends (see
+  "Agent-spawned sessions" above); a client-relayed `start` sends
+  `workdir`/`browser` instead.
+  `activity`/`limits` on the `recent_folders` reply are the optional capacity
+  blocks (see "Agent-spawned sessions" → "spawn_targets" above). Cross-channel
+  ordering between the `start` response and its `convo_upsert` is not
+  guaranteed.
+
+**Journal-originated requests.** The journal itself can be the RPC caller —
+not just the relay between a client and an agent. Spawn approval's `start`
+call, spawn-target discovery's `recent_folders` call (see "Agent-spawned
+sessions" above) and the Coordinator's `session_control` relay (see
+"Session control" under "Coordinator") are all issued by the journal
+directly, over the same
+single-consumer delivery path a client-relayed `agent_request` uses. These
+requests carry `from_device_id: 0` — a reserved value no real device row can
+ever have (SQLite `AUTOINCREMENT` starts at 1) — signalling that the journal,
+not a peer agent, is the caller. The agent answers with an ordinary
+`agent_response`, addressed with `to_device_id: 0`; the journal's RPC broker
+recognises that reserved id and settles the pending request internally
+instead of relaying it onward to a (nonexistent) client device — this is why
+the "`to_device_id` must be a client device of the same user" rule above does
+not apply to these replies. The broker still checks that the responder is who
+the request actually went to: only a reply from the same `userId`/`deviceId`
+pair the journal addressed the request to may settle it; a reply from any
+other device for the same `request_id` falls through to the ordinary
+client-forward path instead, where `to_device_id: 0` is not a client device
+and the reply lands `not_found`.
+
+## Push notifications (APNs)
+
+Direct HTTP/2 APNs (ES256 provider JWT, `node:http2` — no sygnal, no extra
+dependencies). Disabled unless all four are set:
+
+    MATRON_APNS_KEY_FILE=/path/to/AuthKey_XXXX.p8
+    MATRON_APNS_KEY_ID=...
+    MATRON_APNS_TEAM_ID=...
+    MATRON_APNS_TOPIC=chat.matron.x
+
+Missing any of them logs one warn line at boot and the push pipeline is an
+inert no-op — everything else on the server works as normal.
+
+An alert payload carries the conversation as `aps.thread-id`. It also carries
+a top-level `seq`, the event the alert shows, so a tapped notification can
+report that one message as seen (read state, op `seen`). The push relay
+(`MATRON_PUSH_GATEWAY_URL`) forwards only content-free fields and omits
+`seq`. A client must treat a missing `seq` as "no tap receipt".
+
+After a journal event fans out to a user's connections, the push pipeline
+considers each of that user's *client* devices with a registered token
+(agent devices are never pushed to):
+
+- skipped when that device is connected and actively `viewing` the event's
+  conversation (any conversation in a connection's viewed set counts), or when its acked cursor already covers the event's `seq`,
+  or when its `push_prefs` (see `PUT /push/prefs`) explicitly disable the
+  event's category — `wake` background pushes are never prefs-filtered.
+- `prompt` / `permission_request` push immediately at priority 10
+  (category `attention`).
+- `session_status` pushes on the turn-finished TRANSITION, not the new
+  state alone: previous state `running` moving to `waiting` or `done`
+  pushes immediately at priority 10 (category `done`, body "Session
+  finished"). Every other transition is silent — in particular
+  `waiting` -> `done` (tearing down an already-idle session) and a
+  brand-new conversation's first state.
+- `convo_meta` never pushes at all — a title rename is journal-sync
+  material, not a notification (connected devices learn it from the
+  journal frame).
+- `summary` never pushes at all — TOC summaries are derived metadata
+  (not new activity), journal-sync material for browsing, never push
+  (fans out and replays to all devices, but silent notification-wise).
+- routine content (`text`, `tool_output`, `diff`, ...) pushes at priority 5,
+  coalesced per (device, conversation): a leading push when idle, then at
+  most one trailing push per 10s window while events keep arriving
+  (in-memory only — a restart loses a pending trailing push).
+- `read_marker` rows trigger a silent background push
+  (`content-available: 1`, no alert) to the user's *other* devices so they
+  clear their badge — never back to the device whose read_marker it was.
+- alert title is the conversation title (falling back to its id), body is
+  the event's snippet, badge is `SUM(unread_count)` over the owner's
+  conversations.
+- a 410 response prunes that device's `apns_token`/`apns_env` (dead token,
+  logged once); a 400 keeps the token but logs loudly — almost always a
+  sandbox/prod `apns_env` mismatch (the sygnal lesson), not a dead token.
+
+Per-device `apns_env` (`'sandbox'|'prod'`) exists because Xcode dev builds
+register sandbox tokens, which prod APNs answers with 400 `BadDeviceToken` —
+environment has to travel with the token, never be assumed from the topic.
+
+## Retention (payload offload)
+
+A scheduled job (runs at boot, then every 6h) offloads `tool_output` event
+payloads older than `MATRON_RETENTION_DAYS` (default 30) from the hot
+`events` table to blob files, leaving `{type:'tool_output', snippet,
+blob_ref}` in the row — journal replay carries that shape from then on, and
+clients fetch the full body via `GET /media/<blob_ref>` on demand. `journal`
+rows themselves are never deleted; only payloads move. Idempotent — a row
+already offloaded (or one whose payload already has the offloaded shape) is
+never reprocessed.
+
+Unset `MATRON_RETENTION_DAYS` means ENABLED at the 30-day default.
+`MATRON_RETENTION_DAYS=0`, or any value that isn't a non-negative integer,
+disables retention instead (one warn log line at boot). Manual run:
+`matron-admin offload [--days N]` (default 30).
+
+Live-streamed tool output (`tool_output` payloads with `live_log: true`,
+uploaded by bridges at command completion) is purged entirely after
+`MATRON_TOOL_LOG_TTL_HOURS` (default 24; 0/invalid disables): the blob file
+and its `blobs` row are deleted and the payload is rewritten to the tombstone
+`{message_ref, command, exit_code, denied, truncated, live_log: true,
+expired: true, blob_ref: null}` — the snippet is removed; what a command ran
+and whether it succeeded survive forever, what it printed does not. If the
+purged event is still the newest message-type event (text, tool_output,
+diff, prompt, permission_request, file, image, spawn_outcome) in its
+conversation, the
+conversation-list preview is rewritten to `$ <command>`. Offload skips
+`expired` payloads. Manual run:
+`matron-admin expire-logs [--hours N]`.
+
+Client rules (binding on all client implementations):
+
+- Render `expired: true` as an "output expired" affordance — show command and
+  exit code, no snippet area, no fetch button.
+- Any client-side persistence of `tool_output` payloads must enforce the same
+  TTL locally: drop a cached snippet once `ts + 24h` passes, without waiting
+  for a server re-sync — otherwise the server purge is defeated by device
+  caches. In-memory display of a currently-open conversation is exempt.
+- The TTL is not communicated in-protocol; clients assume the 24h default.

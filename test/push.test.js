@@ -1,0 +1,864 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { openDb, setApnsRegistration, setPushPrefs } from '../src/db.js'
+import { makeHub } from '../src/hub.js'
+import { makePushPipeline, classify } from '../src/push.js'
+import { setNotifyPrefs, NOTIFY_EVENTS } from '../src/notify.js'
+import { createUser, createAgent } from '../src/auth.js'
+import { upsertConversation, append } from '../src/journal.js'
+import { handleOp } from '../src/ws.js'
+import { startTestServer, makeWsClient } from './helpers.js'
+
+// A stub apnsClient recording every send() call. `respond` maps a call to a
+// {status, reason} result (default: 200 success); tests override it to
+// simulate 410/400/etc. Never throws, matching the real client's contract.
+function makeStubApnsClient(respond = () => ({ status: 200, reason: null })) {
+  const calls = []
+  return {
+    calls,
+    send(opts) {
+      calls.push(opts)
+      return Promise.resolve(respond(opts))
+    },
+  }
+}
+
+// A fake WS connection registered directly with the hub (no real socket) —
+// hub.register/isViewing only touch userId/deviceId/viewingConvoIds/ws.readyState.
+function fakeConn({ userId, deviceId }) {
+  return { userId, deviceId, viewingConvoIds: new Set(), ws: { readyState: 1 } }
+}
+
+async function setup(t, { apnsClient, coalesceMs } = {}) {
+  const db = openDb(':memory:')
+  const hub = makeHub()
+  const alice = await createUser(db, 'alice', 'pw')
+  const stub = apnsClient || makeStubApnsClient()
+  const pipeline = makePushPipeline({ db, hub, apnsClient: stub, coalesceMs })
+  t.after(() => pipeline.close())
+  upsertConversation(db, { id: 'c1', ownerUserId: alice.id, title: 'convo one' })
+  // Most of this file predates the notification settings and exercises
+  // pipeline mechanics against a user who receives everything; the settings
+  // themselves are covered in test/notify.test.js.
+  setNotifyPrefs(db, alice.id, { mode: 'custom', events: Object.fromEntries(NOTIFY_EVENTS.map((k) => [k, true])) })
+  return { db, hub, alice, stub, pipeline }
+}
+
+// `prefs` defaults to all three explicitly on: most of this file's tests
+// predate per-device prefs and exercise unrelated behavior (coalescing,
+// origin exclusion, badge math, ...) against a device that should just
+// receive everything. Pass `prefs: null` to leave push_prefs NULL — i.e. to
+// exercise the real (activity-off) defaults, as the dedicated push_prefs
+// tests below do.
+function registerDevice(db, userId, name, { token = `${name}-token`, env = 'prod', prefs = { attention: true, done: true, activity: true } } = {}) {
+  const dev = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at) VALUES(?,'client',?,?,?)")
+    .run(userId, name, `${name}-hash`, Date.now())
+  const deviceId = dev.lastInsertRowid
+  setApnsRegistration(db, deviceId, { apnsToken: token, apnsEnv: env })
+  if (prefs) setPushPrefs(db, deviceId, prefs)
+  return deviceId
+}
+
+// Thin wrapper around `setup(t)` for tests that also need one registered
+// client push device: adds that device and exposes `stub.calls` as `sent`
+// (same recording the rest of this file inspects as `stub.calls`) plus the
+// convo id `setup` already creates ('c1').
+async function setupPipeline(t) {
+  const { db, hub, alice, stub, pipeline } = await setup(t)
+  const clientDeviceId = registerDevice(db, alice.id, 'phone')
+  return { db, hub, pipeline, sent: stub.calls, alice, convoId: 'c1', clientDevice: { id: clientDeviceId } }
+}
+
+test('disabled mode (no apnsClient) is inert', async (t) => {
+  const db = openDb(':memory:')
+  const hub = makeHub()
+  const alice = await createUser(db, 'alice', 'pw')
+  upsertConversation(db, { id: 'c1', ownerUserId: alice.id })
+  registerDevice(db, alice.id, 'phone')
+  const pipeline = makePushPipeline({ db, hub, apnsClient: undefined })
+  t.after(() => pipeline.close())
+
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'hi' } })
+  assert.doesNotThrow(() => pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body: 'hi' } }, null))
+  assert.equal(pipeline.counters.sent, 0)
+})
+
+test('agent devices are never pushed to', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t)
+  const agentDeviceId = (await Promise.resolve(createAgent(db, alice.id, 'bridge'))).deviceId
+  // Even if an agent device somehow had an apns_token set, kind='client' is
+  // what clientDevicesForPush filters on.
+  setApnsRegistration(db, agentDeviceId, { apnsToken: 'sneaky-token', apnsEnv: 'prod' })
+
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:bridge', type: 'text', payload: { body: 'hi' } })
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:bridge', type: 'text', payload: { body: 'hi' } }, null)
+  await new Promise((res) => setImmediate(res))
+  assert.equal(stub.calls.length, 0)
+})
+
+test('child conversations (parent_convo_id set) are silent: onAppend never pushes', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 50 })
+  registerDevice(db, alice.id, 'phone')
+  upsertConversation(db, { id: 'child', ownerUserId: alice.id, title: 'sub', parentConvoId: 'c1' })
+
+  // An alert-worthy event (prompt) in a child convo pushes nothing...
+  const r = append(db, { userId: alice.id, convoId: 'child', sender: 'agent:a', type: 'prompt', payload: { question: 'go?' } })
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'child', ts: r.ts, sender: 'agent:a', type: 'prompt', payload: { question: 'go?' } }, null)
+  // ...nor does a read_marker in a child trigger a background push.
+  const rm = append(db, { userId: alice.id, convoId: 'child', sender: 'user:alice', type: 'read_marker', payload: { convo_id: 'child', up_to_seq: r.seq } })
+  pipeline.onAppend(alice.id, { seq: rm.seq, convo_id: 'child', ts: rm.ts, sender: 'user:alice', type: 'read_marker', payload: { convo_id: 'child', up_to_seq: r.seq } }, null)
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(stub.calls.length, 0, 'no push of any kind for a child convo')
+
+  // Control: the same prompt in the normal parent convo DOES push.
+  const p = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'prompt', payload: { question: 'go?' } })
+  pipeline.onAppend(alice.id, { seq: p.seq, convo_id: 'c1', ts: p.ts, sender: 'agent:a', type: 'prompt', payload: { question: 'go?' } }, null)
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(stub.calls.length, 1)
+})
+
+test('type mapping: prompt/permission_request and turn-finished session_status push priority 10, others priority 5', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 50 })
+  registerDevice(db, alice.id, 'phone')
+
+  const send = (type, payload, hint) => {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type, payload })
+    pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type, payload }, null, hint)
+    return r
+  }
+
+  send('prompt', { question: 'go ahead?' })
+  send('permission_request', { description: 'write file' })
+  send('session_status', { state: 'done' }, { prevSessionState: 'running' })
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(stub.calls.length, 3, 'prompt/permission_request/session_status:done must not be coalesced')
+  for (const c of stub.calls) {
+    assert.equal(c.priority, 10)
+    assert.equal(c.pushType, 'alert')
+    assert.equal(c.collapseId, 'c1')
+  }
+
+  // A routine type is priority 5 and coalesced (leading send, since idle).
+  const before = stub.calls.length
+  send('text', { body: 'routine update' })
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(stub.calls.length, before + 1)
+  const routine = stub.calls[stub.calls.length - 1]
+  assert.equal(routine.priority, 5)
+  assert.equal(routine.pushType, 'alert')
+  assert.equal(routine.collapseId, 'c1')
+})
+
+test('convo_meta and non-turn-finished session_status never push at all (no alert, no background)', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 30 })
+  registerDevice(db, alice.id, 'phone')
+
+  const send = (type, payload, hint) => {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type, payload })
+    pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type, payload }, null, hint)
+  }
+
+  send('convo_meta', { title: 'renamed while you were away' })
+  send('session_status', { state: 'running' }, { prevSessionState: 'waiting' })
+  // waiting -> done: teardown of an already-idle session (idle reaper,
+  // /stop) — the user was already told the turn finished; silent.
+  send('session_status', { state: 'done' }, { prevSessionState: 'waiting' })
+  // No hint at all (a call site that can't know the previous state) fails
+  // closed for session_status, even at state 'done'.
+  send('session_status', { state: 'done' })
+  // Long enough for both an immediate send AND a would-be trailing
+  // coalesced push to have fired if these were (wrongly) classified routine.
+  await new Promise((res) => setTimeout(res, 80))
+  assert.equal(stub.calls.length, 0, 'convo_meta / non-turn-finished session_status are journal-sync material, not notifications')
+
+  // ...and they must not have claimed the coalescing slot either: a real
+  // routine event right after still gets its immediate leading push.
+  send('text', { body: 'actual content' })
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(stub.calls.length, 1)
+  assert.equal(stub.calls[0].payload.aps.alert.body, 'actual content')
+})
+
+test('summary events never push', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 30 })
+  registerDevice(db, alice.id, 'phone')
+
+  const send = (type, payload, hint) => {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type, payload })
+    pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type, payload }, null, hint)
+  }
+
+  send('summary', { toc: 'x', detail: 'y', model: 'm' })
+  // Long enough for both an immediate send AND a would-be trailing
+  // coalesced push to have fired if this were (wrongly) classified routine.
+  await new Promise((res) => setTimeout(res, 80))
+  assert.equal(stub.calls.length, 0, 'summary events are journal-sync material, not notifications')
+
+  // ...and they must not have claimed the coalescing slot either: a real
+  // routine event right after still gets its immediate leading push.
+  send('text', { body: 'actual content' })
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(stub.calls.length, 1)
+  assert.equal(stub.calls[0].payload.aps.alert.body, 'actual content')
+})
+
+test('a client "send" (sender user:*) never triggers an alert push, not even to the user\'s OTHER devices', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 30 })
+  const originDeviceId = registerDevice(db, alice.id, 'origin-phone')
+  const otherDeviceId = registerDevice(db, alice.id, 'other-laptop')
+
+  // A user's own words/actions must not ring ANY of their devices — origin
+  // exclusion alone isn't enough here (that only covers the SAME device);
+  // classify() must return null for a `user:*` sender outright. (T2)
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'user:alice', type: 'text', payload: { body: 'my own message' } })
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'user:alice', type: 'text', payload: { body: 'my own message' } }, originDeviceId)
+  // Long enough for both an immediate AND a would-be trailing coalesced push.
+  await new Promise((res) => setTimeout(res, 80))
+  assert.equal(stub.calls.length, 0, 'a user\'s own message must not alert-push any of their devices')
+
+  // ...and it must not have claimed the coalescing slot either: a real
+  // (agent-sourced) routine event right after still gets its leading push —
+  // to BOTH registered devices (two devices, two independent coalescing
+  // slots keyed by device id).
+  const r2 = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'actual content' } })
+  pipeline.onAppend(alice.id, { seq: r2.seq, convo_id: 'c1', ts: r2.ts, sender: 'agent:a', type: 'text', payload: { body: 'actual content' } }, null)
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(stub.calls.length, 2)
+  assert.ok(stub.calls.every((c) => c.payload.aps.alert.body === 'actual content'))
+  assert.deepEqual(stub.calls.map((c) => c.deviceToken).sort(), ['origin-phone-token', 'other-laptop-token'].sort())
+  void otherDeviceId
+})
+
+// Old-client fallback (spec: "Old-client fallback"): the marker already
+// decided whether this action pushes; the flagged text mirroring it must
+// not double it.
+test('classify: a flagged item fallback text never pushes, even from an agent sender', () => {
+  assert.equal(classify('text', { body: '📌 x', fallback_for: 'item' }, 'agent:box-2', undefined), null)
+})
+
+test('origin-device exclusion applies to every push type, not just read_marker (defensive: a push recipient device that is also the event\'s origin is skipped)', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t)
+  const originDeviceId = registerDevice(db, alice.id, 'origin-phone')
+  const otherDeviceId = registerDevice(db, alice.id, 'other-laptop')
+
+  // Hand-crafted: an alert-classified, agent-sourced event (so it's not
+  // suppressed by the user:* rule) whose originDeviceId happens to be a
+  // registered client push device. In practice today only read_marker's own
+  // device is ever also a push recipient, but the exclusion must hold
+  // uniformly for every push type — not asymmetrically special-cased to
+  // read_marker alone.
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'prompt', payload: { question: '?' } })
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'prompt', payload: { question: '?' } }, originDeviceId)
+  await new Promise((res) => setImmediate(res))
+
+  assert.equal(stub.calls.length, 1, 'only the non-origin device should be pushed to')
+  assert.equal(stub.calls[0].deviceToken, 'other-laptop-token')
+  void otherDeviceId
+})
+
+test('alert body: title falls back to convo id, body is the event snippet, badge is the owner unread sum', async (t) => {
+  const db = openDb(':memory:')
+  const hub = makeHub()
+  const alice = await createUser(db, 'alice', 'pw')
+  const stub = makeStubApnsClient()
+  const pipeline = makePushPipeline({ db, hub, apnsClient: stub })
+  t.after(() => pipeline.close())
+  upsertConversation(db, { id: 'no-title-convo', ownerUserId: alice.id }) // title stays ''
+  upsertConversation(db, { id: 'c2', ownerUserId: alice.id })
+  registerDevice(db, alice.id, 'phone')
+  setNotifyPrefs(db, alice.id, { mode: 'custom', events: { activity: true } })
+
+  append(db, { userId: alice.id, convoId: 'c2', sender: 'agent:a', type: 'text', payload: { body: 'unread elsewhere' } })
+  const r = append(db, { userId: alice.id, convoId: 'no-title-convo', sender: 'agent:a', type: 'text', payload: { body: 'hello there, this is the body' } })
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'no-title-convo', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body: 'hello there, this is the body' } }, null)
+  await new Promise((res) => setImmediate(res))
+
+  assert.equal(stub.calls.length, 1)
+  const call = stub.calls[0]
+  assert.equal(call.payload.aps.alert.title, 'no-title-convo')
+  assert.equal(call.payload.aps.alert.body, 'hello there, this is the body')
+  assert.equal(call.payload.aps['thread-id'], 'no-title-convo')
+  assert.equal(call.payload.seq, r.seq) // read state: a tap reports this message as seen
+  // both convos now have unread_count 1 (both messages from an agent sender)
+  assert.equal(call.payload.aps.badge, 2)
+})
+
+test('viewing suppression: a device connected and viewing the convo is skipped', async (t) => {
+  const { db, hub, alice, stub, pipeline } = await setup(t)
+  const deviceId = registerDevice(db, alice.id, 'phone')
+  const conn = fakeConn({ userId: alice.id, deviceId })
+  hub.register(conn)
+  conn.viewingConvoIds = new Set(['c1'])
+
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'hi' } })
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body: 'hi' } }, null)
+  await new Promise((res) => setImmediate(res))
+  assert.equal(stub.calls.length, 0)
+
+  // viewing a different convo: not suppressed
+  conn.viewingConvoIds = new Set(['somewhere-else'])
+  const r2 = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'hi again' } })
+  pipeline.onAppend(alice.id, { seq: r2.seq, convo_id: 'c1', ts: r2.ts, sender: 'agent:a', type: 'text', payload: { body: 'hi again' } }, null)
+  await new Promise((res) => setImmediate(res))
+  assert.equal(stub.calls.length, 1)
+})
+
+test('acked-past suppression: a device whose cursor already covers the event seq is skipped', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t)
+  const deviceId = registerDevice(db, alice.id, 'phone')
+
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'hi' } })
+  db.prepare('UPDATE devices SET cursor=? WHERE id=?').run(r.seq, deviceId) // already acked past
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body: 'hi' } }, null)
+  await new Promise((res) => setImmediate(res))
+  assert.equal(stub.calls.length, 0)
+
+  const r2 = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'hi2' } })
+  pipeline.onAppend(alice.id, { seq: r2.seq, convo_id: 'c1', ts: r2.ts, sender: 'agent:a', type: 'text', payload: { body: 'hi2' } }, null)
+  await new Promise((res) => setImmediate(res))
+  assert.equal(stub.calls.length, 1, 'a seq beyond the acked cursor must still push')
+})
+
+test('a 410 response prunes the device apns_token/apns_env; a 400 keeps it', async (t) => {
+  const respond = (opts) => (opts.deviceToken === 'dead-token' ? { status: 410, reason: 'Unregistered' } : { status: 400, reason: 'BadDeviceToken' })
+  const stub = makeStubApnsClient(respond)
+  const { db, alice, pipeline } = await setup(t, { apnsClient: stub })
+  const deadDeviceId = registerDevice(db, alice.id, 'dead-phone', { token: 'dead-token' })
+  const wrongEnvDeviceId = registerDevice(db, alice.id, 'wrong-env-phone', { token: 'wrong-env-token' })
+
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'hi' } })
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body: 'hi' } }, null)
+  await new Promise((res) => setTimeout(res, 10))
+
+  const dead = db.prepare('SELECT apns_token, apns_env FROM devices WHERE id=?').get(deadDeviceId)
+  assert.equal(dead.apns_token, null)
+  assert.equal(dead.apns_env, null)
+  assert.equal(pipeline.counters.pruned, 1)
+
+  const wrongEnv = db.prepare('SELECT apns_token, apns_env FROM devices WHERE id=?').get(wrongEnvDeviceId)
+  assert.equal(wrongEnv.apns_token, 'wrong-env-token')
+  assert.equal(wrongEnv.apns_env, 'prod')
+  assert.equal(pipeline.counters.failed, 2)
+})
+
+test('coalescing: two routine events within the window produce one leading push then one trailing push', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 100 })
+  registerDevice(db, alice.id, 'phone')
+
+  const send = (body) => {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body } })
+    pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body } }, null)
+  }
+
+  send('first') // idle -> leading send
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(stub.calls.length, 1)
+  assert.equal(stub.calls[0].payload.aps.alert.body, 'first')
+
+  send('second') // within window -> held
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(stub.calls.length, 1, 'a routine event within the coalescing window must not push immediately')
+
+  await new Promise((res) => setTimeout(res, 130)) // let the trailing timer fire
+  assert.equal(stub.calls.length, 2)
+  assert.equal(stub.calls[1].payload.aps.alert.body, 'second')
+})
+
+test('coalescing: a burst of routine events within the window collapses to exactly one trailing push (latest wins)', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 100 })
+  registerDevice(db, alice.id, 'phone')
+  const send = (body) => {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body } })
+    pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body } }, null)
+  }
+  send('e1')
+  await new Promise((res) => setTimeout(res, 5))
+  send('e2'); send('e3'); send('e4')
+  await new Promise((res) => setTimeout(res, 150))
+  assert.equal(stub.calls.length, 2)
+  assert.equal(stub.calls[0].payload.aps.alert.body, 'e1')
+  assert.equal(stub.calls[1].payload.aps.alert.body, 'e4')
+})
+
+test('coalescing state is evicted once a (device, convo) pair goes idle', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 40 })
+  registerDevice(db, alice.id, 'phone')
+  const send = (body) => {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body } })
+    pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body } }, null)
+  }
+
+  send('first')
+  assert.equal(pipeline._coalesceState.size, 1, 'a leading send should latch coalescing state for its window')
+
+  // Once the window elapses with nothing pending, the entry must be evicted —
+  // otherwise every (device, convo) pair ever pushed to accumulates forever.
+  await new Promise((res) => setTimeout(res, 120))
+  assert.equal(pipeline._coalesceState.size, 0, 'idle coalescing entries must be evicted, not retained forever')
+
+  // A later event on the same pair behaves like a fresh idle pair: immediate
+  // leading push again.
+  send('after idle')
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(stub.calls.length, 2)
+  assert.equal(stub.calls[1].payload.aps.alert.body, 'after idle')
+})
+
+test('coalesced/deferred pushes compute the badge at SEND time, not at the time the push was scheduled (avoids a stale badge)', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 60 })
+  registerDevice(db, alice.id, 'phone')
+
+  const send = (body) => {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body } })
+    pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body } }, null)
+    return r
+  }
+
+  send('first') // idle -> leading send, badge should be 1 (one unread event so far)
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(stub.calls.length, 1)
+  assert.equal(stub.calls[0].payload.aps.badge, 1)
+
+  send('second') // within window -> held as the pending trailing build (badge was 2 at this point)
+  await new Promise((res) => setTimeout(res, 10))
+  assert.equal(stub.calls.length, 1, 'still just the leading send so far')
+
+  // More unread activity arrives BEFORE the trailing push actually fires.
+  // The trailing push (built back when the badge was 2) must report the
+  // CURRENT badge (3) at the moment it is transmitted, not the value that
+  // was true when it was scheduled/built.
+  append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'third, arrives before trailing fires' } })
+
+  await new Promise((res) => setTimeout(res, 90)) // let the trailing timer fire
+  assert.equal(stub.calls.length, 2)
+  assert.equal(stub.calls[1].payload.aps.badge, 3, 'trailing push must report the badge as of send time, not schedule/build time')
+})
+
+test('read_marker triggers a background badge-clearing push to other devices, never back to the originating device', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t)
+  const originDeviceId = registerDevice(db, alice.id, 'origin-phone')
+  const otherDeviceId = registerDevice(db, alice.id, 'other-laptop')
+
+  const r = append(db, {
+    userId: alice.id, convoId: 'c1', sender: 'user:alice', type: 'read_marker',
+    payload: { convo_id: 'c1', up_to_seq: 0 },
+  })
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'user:alice', type: 'read_marker', payload: { convo_id: 'c1', up_to_seq: 0 } }, originDeviceId)
+  await new Promise((res) => setImmediate(res))
+
+  assert.equal(stub.calls.length, 1)
+  const call = stub.calls[0]
+  assert.equal(call.deviceToken, 'other-laptop-token')
+  assert.notEqual(call.deviceToken, 'origin-phone-token')
+  assert.equal(call.pushType, 'background')
+  assert.equal(call.priority, 5)
+  assert.equal(call.payload.aps['content-available'], 1)
+  assert.equal(call.payload.aps.alert, undefined)
+  void otherDeviceId
+})
+
+test('a device with a legacy apns_token but no apns_env (pre-migration row) is skipped, not crashed on', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t)
+  // Simulate a live-DB row from before this feature's migration: apns_token
+  // was already being written, apns_env did not exist yet.
+  const legacy = db.prepare("INSERT INTO devices(user_id, kind, name, token_hash, created_at, apns_token) VALUES(?,'client','legacy',?,?, 'legacy-token')")
+    .run(alice.id, 'legacy-hash', Date.now())
+  void legacy
+  registerDevice(db, alice.id, 'modern-phone')
+
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'hi' } })
+  assert.doesNotThrow(() => pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body: 'hi' } }, null))
+  await new Promise((res) => setImmediate(res))
+
+  assert.equal(stub.calls.length, 1, 'only the modern, fully-registered device should be pushed to')
+  assert.equal(stub.calls[0].deviceToken, 'modern-phone-token')
+})
+
+test('read_marker with no other devices pushes nothing (and never throws)', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t)
+  const originDeviceId = registerDevice(db, alice.id, 'only-phone')
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'user:alice', type: 'read_marker', payload: { convo_id: 'c1', up_to_seq: 0 } })
+  assert.doesNotThrow(() => pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'user:alice', type: 'read_marker', payload: { convo_id: 'c1', up_to_seq: 0 } }, originDeviceId))
+  await new Promise((res) => setImmediate(res))
+  assert.equal(stub.calls.length, 0)
+})
+
+test('counters track sent and failed pushes', async (t) => {
+  let call = 0
+  const stub = makeStubApnsClient(() => (call++ % 2 === 0 ? { status: 200 } : { status: 500, reason: 'InternalServerError' }))
+  const { db, alice, pipeline } = await setup(t, { apnsClient: stub, coalesceMs: 5 })
+  registerDevice(db, alice.id, 'a')
+  registerDevice(db, alice.id, 'b')
+
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:x', type: 'prompt', payload: { question: '?' } })
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:x', type: 'prompt', payload: { question: '?' } }, null)
+  await new Promise((res) => setTimeout(res, 10))
+
+  assert.equal(pipeline.counters.sent, 1)
+  assert.equal(pipeline.counters.failed, 1)
+  assert.equal(pipeline.counters.byReason.InternalServerError, 1)
+})
+
+test('a pipeline that throws in onAppend never surfaces an error frame after a successful append', async (t) => {
+  const db = openDb(':memory:')
+  const hub = makeHub()
+  const alice = await createUser(db, 'alice', 'pw')
+  upsertConversation(db, { id: 'c1', ownerUserId: alice.id })
+
+  // The publishing agent connection: capture everything sent back to it.
+  const agentFrames = []
+  const agentConn = {
+    ws: { readyState: 1, send: (s) => agentFrames.push(JSON.parse(s)) },
+    userId: alice.id, deviceId: 7, kind: 'agent', name: 'box-2', viewingConvoIds: new Set(), registered: true,
+  }
+  // A second (client) connection registered with the hub, to prove the
+  // broadcast itself still went out despite the pipeline blowing up.
+  const clientFrames = []
+  const clientConn = {
+    ws: { readyState: 1, send: (s) => clientFrames.push(JSON.parse(s)) },
+    userId: alice.id, deviceId: 8, viewingConvoIds: new Set(),
+  }
+  hub.register(clientConn)
+  t.after(() => hub.unregister(clientConn))
+
+  const throwingPipeline = { onAppend() { throw new Error('pipeline boom') } }
+  const mute = t.mock.method(console, 'error', () => {}) // the catch is expected to log
+
+  assert.doesNotThrow(() => handleOp({
+    db, hub, conn: agentConn, pushPipeline: throwingPipeline,
+    msg: { op: 'publish', convo_id: 'c1', type: 'text', payload: { body: 'still lands' } },
+  }))
+
+  // The append landed and was broadcast normally...
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM events WHERE type='text'").get().n, 1)
+  assert.equal(clientFrames.filter((f) => f.kind === 'journal' && f.type === 'text').length, 1)
+  // ...and the publisher got no spurious error frame for its successful op.
+  assert.deepEqual(agentFrames.filter((f) => f.kind === 'control' && f.op === 'error'), [])
+  assert.ok(mute.mock.callCount() >= 1, 'the swallowed pipeline error should still be logged')
+})
+
+test('end-to-end wiring: real WS ops reach the push pipeline through both ws.js fanOut call sites', async (t) => {
+  const stub = makeStubApnsClient()
+  const s = await startTestServer({ apnsClient: stub })
+  t.after(() => s.close())
+  const alice = await createUser(s.db, 'alice', 'pw')
+  const ag = createAgent(s.db, alice.id, 'box-2')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'phone' } })
+
+  const regPhone = await s.http('/push/register', { method: 'POST', token: login.json.token, body: { apns_token: 'phone-token', environment: 'prod' } })
+  assert.equal(regPhone.status, 200)
+  // This test's `text` publish below is a routine (activity) event, which
+  // is opt-in by default (see push_prefs defaults) — opt phone in so this
+  // wiring check isn't tangled up with prefs enforcement.
+  await s.http('/push/prefs', { method: 'PUT', token: login.json.token, body: { activity: true } })
+  // ...and the user-level switch (notification settings), off in both presets.
+  assert.equal((await s.http('/notify', { method: 'PUT', token: login.json.token, body: { mode: 'custom', events: { activity: true } } })).status, 200)
+
+  const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+  // The titled upsert fans out a convo_meta event — which must NOT push (and
+  // must not claim the coalescing slot); only the text publish below does.
+  agent.send({ op: 'convo_upsert', convo_id: 'wire-1', title: 'wiring test' })
+  agent.send({ op: 'publish', convo_id: 'wire-1', type: 'text', payload: { body: 'hello from agent' } })
+  await agent.waitFor((f) => f.kind === 'journal' && f.type === 'text')
+  await new Promise((res) => setTimeout(res, 50))
+
+  // appendAndFan choke point: the agent's publish reached the pipeline and
+  // pushed to the registered-but-disconnected phone device — exactly once
+  // (the convo_meta from the titled upsert produced no push of its own).
+  const publishCalls = stub.calls.filter((c) => c.deviceToken === 'phone-token' && c.payload.aps.alert)
+  assert.equal(publishCalls.length, 1)
+  assert.equal(publishCalls[0].payload.aps.alert.body, 'hello from agent')
+  assert.equal(publishCalls[0].payload.aps.alert.title, 'wiring test')
+
+  // Second device, registered but never connected — read_marker's fanOut
+  // call site (which bypasses appendAndFan entirely) must be wired too.
+  const login2 = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'laptop' } })
+  await s.http('/push/register', { method: 'POST', token: login2.json.token, body: { apns_token: 'laptop-token', environment: 'prod' } })
+
+  const phone = await makeWsClient(s.base, { token: login.json.token, cursor: 0 })
+  await phone.waitFor((f) => f.op === 'hello_ok')
+  phone.send({ op: 'read_marker', convo_id: 'wire-1', up_to_seq: null })
+  await phone.waitFor((f) => f.kind === 'journal' && f.type === 'read_marker')
+  await new Promise((res) => setTimeout(res, 50))
+
+  const laptopBackground = stub.calls.filter((c) => c.deviceToken === 'laptop-token' && c.pushType === 'background')
+  assert.equal(laptopBackground.length, 1, 'read_marker fanOut call site does not appear to be wired to the push pipeline')
+  const phoneBackground = stub.calls.filter((c) => c.deviceToken === 'phone-token' && c.pushType === 'background')
+  assert.equal(phoneBackground.length, 0, 'the originating device must never get a push about its own read_marker')
+
+  agent.close(); phone.close()
+})
+
+test('end-to-end wiring: a client "send" (own message, sender user:*) never triggers an alert push to any of the user\'s registered devices', async (t) => {
+  const stub = makeStubApnsClient()
+  const s = await startTestServer({ apnsClient: stub })
+  t.after(() => s.close())
+  const alice = await createUser(s.db, 'alice', 'pw')
+  upsertConversation(s.db, { id: 'wire-2', ownerUserId: alice.id })
+
+  const login1 = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'phone' } })
+  await s.http('/push/register', { method: 'POST', token: login1.json.token, body: { apns_token: 'phone-token', environment: 'prod' } })
+  const login2 = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'laptop' } })
+  await s.http('/push/register', { method: 'POST', token: login2.json.token, body: { apns_token: 'laptop-token', environment: 'prod' } })
+
+  const phone = await makeWsClient(s.base, { token: login1.json.token, cursor: null })
+  await phone.waitFor((f) => f.op === 'hello_ok')
+  phone.send({ op: 'send', convo_id: 'wire-2', payload: { body: 'hello from myself' } })
+  await phone.waitFor((f) => f.kind === 'journal' && f.type === 'text')
+  await new Promise((res) => setTimeout(res, 60))
+
+  const alerts = stub.calls.filter((c) => c.payload.aps.alert)
+  assert.equal(alerts.length, 0, 'a user\'s own "send" must not alert-push any device, including their own other ones')
+  phone.close()
+})
+
+test('category threading: classify kind reaches apnsClient.send as opts.category', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 50 })
+  const deviceId = registerDevice(db, alice.id, 'phone')
+
+  const send = (type, payload, hint) => {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type, payload })
+    pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type, payload }, null, hint)
+    return r
+  }
+
+  send('prompt', { question: 'go?' })                 // attention
+  send('permission_request', { description: 'write' }) // attention
+  send('session_status', { state: 'done' }, { prevSessionState: 'running' }) // done (turn finished)
+  send('text', { body: 'hi' })                          // activity (leading send)
+  await new Promise((res) => setImmediate(res))
+  assert.deepEqual(stub.calls.map((c) => c.category), ['attention', 'attention', 'done', 'activity'])
+
+  // read_marker background push carries category 'wake'. It must come from a
+  // DIFFERENT device so origin-device exclusion doesn't eat it.
+  const other = registerDevice(db, alice.id, 'ipad')
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'user:alice', type: 'read_marker', payload: { convo_id: 'c1', up_to_seq: 1 } })
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'user:alice', type: 'read_marker', payload: { convo_id: 'c1', up_to_seq: 1 } }, other)
+  await new Promise((res) => setImmediate(res))
+  const wake = stub.calls[stub.calls.length - 1]
+  assert.equal(wake.category, 'wake')
+  assert.equal(wake.pushType, 'background')
+})
+
+test('push_prefs: a disabled category skips that device only; wake is never filtered', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 50 })
+  const muted = registerDevice(db, alice.id, 'phone')
+  const open = registerDevice(db, alice.id, 'ipad', { token: 'ipad-token' })
+  setPushPrefs(db, muted, { attention: false, activity: false })
+
+  const fire = (type, payload, sender = 'agent:a', origin = null, hint = undefined) => {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender, type, payload })
+    pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender, type, payload }, origin, hint)
+  }
+
+  // attention off on `muted`: only `open` gets the prompt push.
+  fire('prompt', { question: 'go?' })
+  await new Promise((res) => setImmediate(res))
+  assert.deepEqual(stub.calls.map((c) => c.deviceToken), ['ipad-token'])
+
+  // done still on for both.
+  fire('session_status', { state: 'done' }, 'agent:a', null, { prevSessionState: 'running' })
+  await new Promise((res) => setImmediate(res))
+  assert.equal(stub.calls.length, 3)
+
+  // activity off on `muted`: routine event reaches only `open`.
+  fire('text', { body: 'hi' })
+  await new Promise((res) => setImmediate(res))
+  assert.equal(stub.calls.length, 4)
+  assert.equal(stub.calls[3].deviceToken, 'ipad-token')
+
+  // wake (read_marker from `open`) still reaches `muted` despite its prefs —
+  // badge sync is invisible to the user and never filtered.
+  fire('read_marker', { convo_id: 'c1', up_to_seq: 1 }, 'user:alice', open)
+  await new Promise((res) => setImmediate(res))
+  const wakes = stub.calls.filter((c) => c.category === 'wake')
+  assert.equal(wakes.length, 1)
+  assert.equal(wakes[0].deviceToken, 'phone-token')
+})
+
+test('push_prefs: a NULL-prefs device follows the user\'s synced switches (default: activity off), attention/done still send', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 50 })
+  registerDevice(db, alice.id, 'phone', { prefs: null }) // exercise the real defaults, not this file's fixture-level all-on override
+  // Back to the user defaults (no Coordinator set, so they behave as
+  // every-session: activity off, turns on).
+  db.prepare('UPDATE user_settings SET notify_prefs=NULL WHERE user_id=?').run(alice.id)
+
+  const fire = (type, payload, hint) => {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type, payload })
+    pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type, payload }, null, hint)
+  }
+
+  // activity: default off. Long enough for both an immediate AND a would-be
+  // trailing coalesced push.
+  fire('text', { body: 'routine update' })
+  await new Promise((res) => setTimeout(res, 80))
+  assert.equal(stub.calls.length, 0, 'a NULL-prefs device must not get routine activity pushes by default')
+
+  // attention: default on.
+  fire('prompt', { question: 'go?' })
+  await new Promise((res) => setImmediate(res))
+  assert.equal(stub.calls.length, 1)
+  assert.equal(stub.calls[0].category, 'attention')
+
+  // done: default on.
+  fire('session_status', { state: 'done' }, { prevSessionState: 'running' })
+  await new Promise((res) => setImmediate(res))
+  assert.equal(stub.calls.length, 2)
+  assert.equal(stub.calls[1].category, 'done')
+})
+
+test('push_prefs: {"activity": true} turns routine pushes back on for a NULL-prefs device', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 50 })
+  const deviceId = registerDevice(db, alice.id, 'phone', { prefs: null })
+  setPushPrefs(db, deviceId, { activity: true })
+
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'routine update' } })
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body: 'routine update' } }, null)
+  await new Promise((res) => setImmediate(res))
+  assert.equal(stub.calls.length, 1)
+  assert.equal(stub.calls[0].category, 'activity')
+})
+
+test('push_prefs: a kind unknown to the prefs object fails OPEN, not silently muted', async (t) => {
+  // classify() today only ever returns attention/done/activity, so a real
+  // "unknown kind" can't occur through the public onAppend surface — this
+  // stubs classify (an injectable seam, see makePushPipeline) to simulate a
+  // future category prefs hasn't caught up to yet.
+  const stubClassify = () => ({ priority: 5, coalesce: false, kind: 'some_future_kind' })
+  const db = openDb(':memory:')
+  const hub = makeHub()
+  const alice = await createUser(db, 'alice', 'pw')
+  const stub = makeStubApnsClient()
+  const pipeline = makePushPipeline({ db, hub, apnsClient: stub, classify: stubClassify })
+  t.after(() => pipeline.close())
+  upsertConversation(db, { id: 'c1', ownerUserId: alice.id })
+  registerDevice(db, alice.id, 'phone', { prefs: null }) // NULL prefs: {attention:true, done:true, activity:false} — has no 'some_future_kind' key
+
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'hi' } })
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body: 'hi' } }, null)
+  await new Promise((res) => setImmediate(res))
+  assert.equal(stub.calls.length, 1, 'a kind absent from prefs must fail open, not be silently filtered')
+  assert.equal(stub.calls[0].category, 'some_future_kind')
+})
+
+test('session_status pushes on the turn-finished TRANSITION, not the state alone', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 30 })
+  registerDevice(db, alice.id, 'phone')
+
+  const fire = (state, prevSessionState) => {
+    const payload = { state }
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'session_status', payload })
+    pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'session_status', payload },
+      null, { prevSessionState })
+  }
+
+  // running -> waiting: the agent finished its turn — push, kind 'done',
+  // with the fixed turn-finished body (matches the relay's 'done' string).
+  fire('waiting', 'running')
+  await new Promise((res) => setImmediate(res))
+  assert.equal(stub.calls.length, 1)
+  assert.equal(stub.calls[0].category, 'done')
+  assert.equal(stub.calls[0].priority, 10)
+  assert.equal(stub.calls[0].payload.aps.alert.body, 'Turn finished')
+
+  // running -> done (crash/stop mid-work): also a turn ending — push.
+  fire('done', 'running')
+  await new Promise((res) => setImmediate(res))
+  assert.equal(stub.calls.length, 2)
+  assert.equal(stub.calls[1].category, 'done')
+
+  // Silent transitions: teardown of an already-idle session, a turn
+  // starting, an idle no-op, and a brand-new convo's first state.
+  fire('done', 'waiting')
+  fire('running', 'waiting')
+  fire('waiting', 'waiting')
+  fire('waiting', undefined)
+  await new Promise((res) => setTimeout(res, 60))
+  assert.equal(stub.calls.length, 2, 'only turn-finished transitions may push')
+})
+
+test('end-to-end wiring: convo_upsert threads the previous session state into the push pipeline', async (t) => {
+  const stub = makeStubApnsClient()
+  const s = await startTestServer({ apnsClient: stub })
+  t.after(() => s.close())
+  const alice = await createUser(s.db, 'alice', 'pw')
+  const ag = createAgent(s.db, alice.id, 'box-2')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'phone' } })
+  await s.http('/push/register', { method: 'POST', token: login.json.token, body: { apns_token: 'phone-token', environment: 'prod' } })
+
+  const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+  const upsert = async (state) => {
+    agent.send({ op: 'convo_upsert', convo_id: 'wire-3', session_state: state })
+    await agent.waitFor((f) => f.kind === 'journal' && f.type === 'session_status' && f.payload.state === state)
+  }
+
+  // Creation (first state 'running') is not a finished turn.
+  await upsert('running')
+  await new Promise((res) => setTimeout(res, 30))
+  assert.equal(stub.calls.filter((c) => c.category === 'done').length, 0)
+
+  // running -> waiting: turn finished, exactly one 'done' push.
+  await upsert('waiting')
+  await new Promise((res) => setTimeout(res, 30))
+  const doneCalls = stub.calls.filter((c) => c.category === 'done')
+  assert.equal(doneCalls.length, 1, 'running -> waiting must push through the real convo_upsert path')
+  assert.equal(doneCalls[0].payload.aps.alert.body, 'Turn finished')
+
+  // waiting -> done: already-idle teardown, still exactly one.
+  await upsert('done')
+  await new Promise((res) => setTimeout(res, 30))
+  assert.equal(stub.calls.filter((c) => c.category === 'done').length, 1, 'waiting -> done must stay silent')
+
+  agent.close()
+})
+
+test('item markers: agent-created question pushes as attention; user-authored, non-awaiting, and reorder markers are silent', async (t) => {
+  // Use the same fixture setup as the test above this one: a user, a client
+  // device with an apns token, a conversation, and a pipeline with a fake
+  // APNs client that records `sent` payloads.
+  const { db, hub, pipeline, sent, alice, convoId, clientDevice } = await setupPipeline(t)
+  const base = { item_id: 'it_x', num: 1, kind: 'question', title: 'Which auth?', by: 'agent', awaiting: 'user', resolution: null }
+  pipeline.onAppend(alice.id, { seq: 10, convo_id: convoId, ts: 1, sender: 'agent:box-2', type: 'item', payload: { ...base, action: 'created' } }, 0)
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].payload.aps.alert.body, '❓ #1 Which auth?')
+  assert.equal(sent[0].category, 'attention')
+  pipeline.onAppend(alice.id, { seq: 11, convo_id: convoId, ts: 2, sender: 'agent:box-2', type: 'item', payload: { ...base, action: 'closed', awaiting: null, resolution: 'answered' } }, 0)
+  pipeline.onAppend(alice.id, { seq: 12, convo_id: convoId, ts: 3, sender: 'agent:box-2', type: 'item', payload: { ...base, action: 'reordered', awaiting: 'user' } }, 0)
+  // Isolates the `awaiting === 'user'` clause: a `created` marker NOT
+  // awaiting the user must stay silent even though `action` alone would
+  // otherwise satisfy the rule — deleting the awaiting check would wrongly
+  // push this one.
+  pipeline.onAppend(alice.id, { seq: 14, convo_id: convoId, ts: 5, sender: 'agent:box-2', type: 'item', payload: { ...base, action: 'created', awaiting: 'agent' } }, 0)
+  assert.equal(sent.length, 1, 'created but not awaiting the user must stay silent')
+  // Spec alignment (design spec ~:207-210, binding over the original brief):
+  // commented/reopened only push when by='agent' — a user-authored comment
+  // marker must not re-alert the user about their own words, even when
+  // awaiting='user' and the sender label alone (agent:box-2) would not
+  // otherwise silence it.
+  pipeline.onAppend(alice.id, { seq: 15, convo_id: convoId, ts: 6, sender: 'agent:box-2', type: 'item', payload: { ...base, action: 'commented', by: 'user', awaiting: 'user' } }, 0)
+  assert.equal(sent.length, 1, 'a commented marker authored by the user must stay silent even when awaiting the user')
+  // An agent-authored reopen that hands the item back to the user does push.
+  pipeline.onAppend(alice.id, { seq: 16, convo_id: convoId, ts: 7, sender: 'agent:box-2', type: 'item', payload: { ...base, action: 'reopened', by: 'agent', awaiting: 'user' } }, 0)
+  assert.equal(sent.length, 2, 'an agent-reopened marker left awaiting the user must push')
+  // The by='agent' guard covers `created` too: an on_behalf_of:'user' create
+  // is the item the user just asked for, filed by the agent device (so the
+  // user:* sender rule does NOT catch it) — buzzing their pocket about their
+  // own request is the self-notification that rule exists to prevent.
+  pipeline.onAppend(alice.id, { seq: 17, convo_id: convoId, ts: 8, sender: 'agent:box-2', type: 'item', payload: { ...base, action: 'created', by: 'user', awaiting: 'user' } }, 0)
+  assert.equal(sent.length, 2, 'a created marker authored by the user must stay silent even when awaiting the user')
+  // 'updated' (a PATCH) is journal-sync material like 'reordered': never a
+  // push, however the edit left `awaiting`.
+  pipeline.onAppend(alice.id, { seq: 18, convo_id: convoId, ts: 9, sender: 'agent:box-2', type: 'item', payload: { ...base, action: 'updated', by: 'agent', awaiting: 'user' } }, 0)
+  assert.equal(sent.length, 2, 'an updated marker must never push')
+  // The user-sender rule itself, isolated from origin-device exclusion: a
+  // push-worthy marker (created, awaiting user) sent with sender `user:*`
+  // must still be silenced by the early user-sender check. Origin device is
+  // 0 here — NOT clientDevice.id — so the only device is not excluded by
+  // being the event's origin; if the user-sender rule were removed, this
+  // event would otherwise push.
+  pipeline.onAppend(alice.id, { seq: 13, convo_id: convoId, ts: 4, sender: 'user:alice', type: 'item', payload: { ...base, action: 'created', awaiting: 'user' } }, 0)
+  assert.equal(sent.length, 2, 'a user-authored marker must never push, even when action/awaiting alone would qualify')
+  void hub; void db; void clientDevice
+})

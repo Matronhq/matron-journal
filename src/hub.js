@@ -1,0 +1,219 @@
+const byteLen = (s) => Buffer.byteLength(s, 'utf8')
+
+// Coalescing rule for one pending slot. Legacy ephemerals (text overlays,
+// activity) keep latest-wins — every frame carries full replacement state.
+// Tool-stream appends are DELTAS, so latest-wins would drop output: a
+// pending append (or sync) absorbs a contiguous next append by
+// concatenation instead. Anything else — end frames, a fresh sync, a
+// non-contiguous append (defensive; the store fans out contiguously) —
+// replaces the slot.
+export function mergeEphemeral(prev, frame) {
+  if (!prev) return frame
+  const p = prev.tool_stream
+  const f = frame.tool_stream
+  if (p && f && f.event === 'append') {
+    if (p.event === 'append' && p.offset + byteLen(p.chunk) === f.offset) {
+      return { ...prev, tool_stream: { ...p, chunk: p.chunk + f.chunk } }
+    }
+    if (p.event === 'sync' && p.offset + byteLen(p.content) === f.offset) {
+      return { ...prev, tool_stream: { ...p, content: p.content + f.chunk } }
+    }
+  }
+  return frame
+}
+
+// The agent visibility rule shared by every fan-out path: client devices
+// always receive, an agent device only when `agentTargets` is null (owner
+// unknown — legacy broadcast) or names it (recorded owner + joined room
+// participants; see agentTargetsFor in journal.js).
+function agentMayReceive(conn, agentTargets) {
+  return conn.kind !== 'agent' || agentTargets == null || agentTargets.has(conn.deviceId)
+}
+
+export function makeHub({ coalesceMs = 200 } = {}) {
+  const byUser = new Map() // userId -> Set<conn>
+  let regCounter = 0
+  // Registration waiters (wake-before-spawn): approveSpawn parks here while
+  // a woken box boots, and register() releases it the moment that device's
+  // socket lands. A waiter is a one-shot resolver; the timer is cleared on
+  // release so a settled wait never fires twice.
+  const deviceWaiters = new Set() // { userId, deviceId, release }
+  let closed = false
+  return {
+    register(conn) {
+      if (!byUser.has(conn.userId)) byUser.set(conn.userId, new Set())
+      byUser.get(conn.userId).add(conn)
+      for (const w of deviceWaiters) {
+        if (w.userId === conn.userId && w.deviceId === conn.deviceId) w.release(true)
+      }
+      // Monotonic registration stamp — sendRpcRequest's "most recently
+      // registered live socket" rule needs an order that survives Set
+      // deletion/re-insertion (insertion order alone doesn't).
+      conn._regSeq = ++regCounter
+      conn._pending = new Map() // ephemeral coalescing: key -> frame
+      conn._flushTimer = null
+    },
+    unregister(conn) {
+      byUser.get(conn.userId)?.delete(conn)
+      if (conn._flushTimer) clearTimeout(conn._flushTimer)
+    },
+    connsOf(userId) {
+      return [...(byUser.get(userId) || [])]
+    },
+    // Resolves true as soon as `deviceId` has a live registered socket —
+    // immediately if it already has one — or false after timeoutMs. The
+    // timer is ref'd on purpose (same stance as the RPC broker): an unref'd
+    // timer whose loop empties would abandon the awaited promise mid-flight,
+    // and the caller (approveSpawn) must always settle its row.
+    waitForDevice(userId, deviceId, timeoutMs) {
+      for (const c of byUser.get(userId) || []) {
+        if (c.deviceId === deviceId && c.ws.readyState === 1) return Promise.resolve(true)
+      }
+      if (!(timeoutMs > 0) || closed) return Promise.resolve(false)
+      return new Promise((resolve) => {
+        const w = {
+          userId, deviceId,
+          release(ok) {
+            clearTimeout(timer)
+            deviceWaiters.delete(w)
+            resolve(ok)
+          },
+        }
+        const timer = setTimeout(() => w.release(false), timeoutMs)
+        deviceWaiters.add(w)
+      })
+    },
+    // Shutdown: release every parked waiter with false so the orchestration
+    // awaiting it settles its row now (agent_unreachable, the box never
+    // attached) instead of a ref'd timer holding the process open for the
+    // whole wake window after startServer.close(). Later waits never park.
+    close() {
+      closed = true
+      for (const w of [...deviceWaiters]) w.release(false)
+    },
+    // Global connected-socket count across every user — a /metrics-only
+    // aggregate (no per-user scoping concern: it's just a number, not
+    // anyone's identity).
+    totalConnections() {
+      let n = 0
+      for (const set of byUser.values()) n += set.size
+      return n
+    },
+    // Every registered connection, across all users — the revocation
+    // sweep's input (see ws.js): it needs each conn's deviceId to compare
+    // against the devices table in one query.
+    allConns() {
+      const out = []
+      for (const set of byUser.values()) for (const c of set) out.push(c)
+      return out
+    },
+    // Per-device "is this device connected AND looking at this convo right
+    // now" — the push pipeline's suppression rule. A connection views a SET
+    // of convos (conn.viewingConvoIds, set by the `viewing` op). conn.deviceId
+    // is already carried on every registered connection (see ws.js hello).
+    isViewing(userId, deviceId, convoId) {
+      for (const c of byUser.get(userId) || []) {
+        if (c.deviceId === deviceId && c.viewingConvoIds?.has(convoId) && c.ws.readyState === 1) return true
+      }
+      return false
+    },
+    // agentTargets scopes delivery to agent connections: client devices
+    // always receive every frame, but an agent device only receives frames
+    // for conversations it manages or has joined (spec: agent chat phase 2
+    // room fan-out). null means "owner unknown" — legacy rows and
+    // convo-less frames keep the old broadcast-to-everyone behavior. The
+    // caller (ws.js fanOut / hello replay) computes the set: recorded
+    // owner + joined participants.
+    broadcastJournal(userId, frame, agentTargets = null) {
+      for (const c of byUser.get(userId) || []) {
+        if (!agentMayReceive(c, agentTargets)) continue
+        if (c.ws.readyState === 1) c.ws.send(JSON.stringify(frame))
+      }
+    },
+    // Viewing-scoped, coalesced ephemerals. Agent connections obey the same
+    // visibility rule as broadcastJournal: the `viewing` op
+    // refuses agents, so an agent never has a viewing set today — this is
+    // defence in depth, keeping a private box's or an unjoined room's live
+    // stream/activity/status off every other agent even if that changes.
+    // `resolveAgentTargets` returns broadcastJournal's agentTargets (see
+    // agentTargetsFor in journal.js); it is called lazily, at most once, and
+    // only when an agent connection is viewing — so the common all-clients
+    // case costs no DB read. Omitted = agents receive nothing (fail closed).
+    sendEphemeral(userId, convoId, frame, resolveAgentTargets = null) {
+      let agentTargets
+      for (const c of byUser.get(userId) || []) {
+        if (!c.viewingConvoIds?.has(convoId) || c.ws.readyState !== 1) continue
+        if (c.kind === 'agent') {
+          if (!resolveAgentTargets) continue
+          if (agentTargets === undefined) agentTargets = resolveAgentTargets()
+          if (!agentMayReceive(c, agentTargets)) continue
+        }
+        // One pending slot per (convo, message_ref, frame family): activity,
+        // status, and text/tool-stream overlays are distinct families that
+        // must not clobber each other inside one coalesce window — the
+        // bridge fires status AND idle-activity back-to-back at turn end.
+        const family = frame.activity ? 'activity' : frame.status ? 'status' : 'stream'
+        const key = `${frame.convo_id}:${frame.message_ref}:${family}`
+        c._pending.set(key, mergeEphemeral(c._pending.get(key), frame))
+        if (!c._flushTimer) {
+          c._flushTimer = setTimeout(() => {
+            c._flushTimer = null
+            for (const f of c._pending.values()) {
+              if (c.ws.readyState === 1) c.ws.send(JSON.stringify(f))
+            }
+            c._pending.clear()
+          }, coalesceMs)
+        }
+      }
+    },
+    // Agent-RPC request delivery (spec 2026-07-15-agent-rpc-design.md):
+    // exactly ONE socket — the most recently registered live connection of
+    // the target device. A device normally has one socket, but reconnect
+    // overlap can briefly leave two, and multicasting a request there would
+    // double-execute non-idempotent methods (`start` spawning two
+    // sessions). Direct send — RPC frames must never enter the ephemeral
+    // coalescer (latest-wins would drop them). Returns whether a socket
+    // took the frame, so the caller can answer `agent_unreachable`.
+    sendRpcRequest(userId, deviceId, frame) {
+      let newest = null
+      for (const c of byUser.get(userId) || []) {
+        if (c.deviceId !== deviceId || c.ws.readyState !== 1) continue
+        if (!newest || c._regSeq > newest._regSeq) newest = c
+      }
+      if (!newest) return false
+      newest.ws.send(JSON.stringify(frame))
+      return true
+    },
+    // Multicast to every live socket of one device — the generic form of
+    // what sendRpcResponse has always done (responses carry no side
+    // effects; a mid-reconnect device briefly has two sockets and both may
+    // hear). Also carries invite-lifecycle frames (agent chat phase 2).
+    // Every live CLIENT socket of one user — box-status fan-out: a box's
+    // capacity report is not about any conversation, so it rides neither
+    // the journal (nothing to replay) nor the per-convo ephemeral coalescer
+    // (keyed on convo_id). Agent sockets are skipped: they read box status
+    // through spawn_targets when they need it.
+    sendToClients(userId, frame) {
+      for (const c of byUser.get(userId) || []) {
+        if (c.kind === 'client' && c.ws.readyState === 1) c.ws.send(JSON.stringify(frame))
+      }
+    },
+    // Every live socket of one user, clients AND agents — for a per-user
+    // setting both sides act on (the default model and effort: the apps show
+    // it, every bridge applies it to its next new chat). Not for anything
+    // about a conversation: that is broadcastJournal's agent visibility rule.
+    sendToUser(userId, frame) {
+      for (const c of byUser.get(userId) || []) {
+        if (c.ws.readyState === 1) c.ws.send(JSON.stringify(frame))
+      }
+    },
+    sendToDevice(userId, deviceId, frame) {
+      for (const c of byUser.get(userId) || []) {
+        if (c.deviceId === deviceId && c.ws.readyState === 1) c.ws.send(JSON.stringify(frame))
+      }
+    },
+    sendRpcResponse(userId, deviceId, frame) {
+      this.sendToDevice(userId, deviceId, frame)
+    },
+  }
+}

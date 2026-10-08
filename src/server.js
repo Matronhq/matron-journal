@@ -1,0 +1,582 @@
+import http from 'node:http'
+import { realpathSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { openDb } from './db.js'
+import { makeLoginGuard, makeRateLimiter } from './auth.js'
+import { makeHttpHandler } from './http.js'
+import { ensurePreapproveKey } from './preapprove-key.js'
+import { makePairStore } from './pairing.js'
+import { makeLinkStore } from './link.js'
+import { makeHub } from './hub.js'
+import { attachWs } from './ws.js'
+import { makeToolStreamStore } from './tool-stream.js'
+import { makeApnsClient } from './apns.js'
+import { makeGatewayClient } from './gateway.js'
+import { makePushPipeline } from './push.js'
+import { resolveMediaDir } from './media.js'
+import { runOffload, runExpireLogs, runReapMedia, runExpireVoiceNotes } from './retention.js'
+import { backfillSearchIndex } from './search.js'
+import { backfillImageDims } from './items.js'
+import { scheduleGithubRefresh } from './github-refresh.js'
+import { makeRpcBroker } from './rpc-broker.js'
+import { resolveWebDir, makeStaticHandler } from './static-http.js'
+import { makeWellKnown, parseList } from './well-known.js'
+import { makeWaker, markWakeRefused, clearWakeRefused } from './wake.js'
+import { makeConfiguredTranscriber } from './cloud-transcribe.js'
+import { makeBlobTranscripts } from './blob-transcripts.js'
+import { makeItemTranscription } from './items-transcribe.js'
+import { emitTranscriptionMarker } from './items-http.js'
+import { makeGithub, DEFAULT_GITHUB_CLIENT_ID } from './github.js'
+import { makeTokenBox } from './token-box.js'
+import { startUnseenNudge } from './unseen-nudge.js'
+import { makeRoutineFirer, startRoutinesSweep } from './routines-sweep.js'
+import { seedRoutines } from './routines.js'
+import { startStallWakeSweep } from './stall-wake.js'
+import { sealStoredTokens } from './github-accounts.js'
+import { CONSENT_DAILY_CAP_DEFAULT } from './consent.js'
+import { warnAlertWebhookConfig } from './alerts-http.js'
+
+export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
+// Per-user total blob budget (all uploads + retention-offloaded payloads for a
+// user, summed). Unlike tool_output, user-uploaded media has no TTL, so without
+// a ceiling a single valid device token could fill the disk. 2 GiB is ~75x the
+// busiest user's footprint on a production deployment — generous headroom, not a squeeze.
+export const DEFAULT_MEDIA_USER_QUOTA_BYTES = 2147483648 // 2 GiB
+export const DEFAULT_MAX_REPLAY = 50000
+const DEFAULT_RETENTION_DAYS = 30
+const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
+const DEFAULT_TOOL_LOG_TTL_HOURS = 24
+const DEFAULT_VOICE_NOTE_TTL_DAYS = 7 // audio goes a week after its transcript
+
+// Shared validator for small numeric env knobs that guard a size/gap check
+// (`size > mediaMaxBytes`, `gap > maxReplay`): an unset var is the normal,
+// expected "use the default" case (no warning). But an unparseable or
+// non-positive value must never silently become NaN and disable the check
+// it guards — `x > NaN` is always false, so e.g. a garbage
+// MATRON_MEDIA_MAX_BYTES would make the upload size cap accept anything,
+// and a garbage MATRON_MAX_REPLAY would make the snapshot_required valve
+// never fire. Fails closed to `defaultValue` instead, with one warn log
+// naming the var, so a misconfiguration is loud rather than invisible.
+export function resolveNumericEnv(name, raw, defaultValue) {
+  if (raw === undefined) return defaultValue
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n <= 0) {
+    console.warn(`${name}=${JSON.stringify(raw)} is invalid (must be a positive integer) — using default ${defaultValue}`)
+    return defaultValue
+  }
+  return n
+}
+
+// The consent cap is the one knob where 0 is a value, not garbage: it means
+// "no cap" — the operator has decided the reason on every decision and the
+// audit trail are guardrail enough. Anything else is validated like every other numeric knob.
+export function resolveConsentDailyCap(raw, defaultValue = CONSENT_DAILY_CAP_DEFAULT) {
+  if (typeof raw === 'string' && raw.trim() === '0') return 0
+  return resolveNumericEnv('MATRON_COORDINATOR_CONSENT_DAILY_CAP', raw, defaultValue)
+}
+
+// `override` is startServer's `retentionDays` opt — when given, it takes
+// precedence over the env var (this is how tests disable/shrink the window
+// without touching process.env), but BOTH sources run through the same
+// validation: unset means ENABLED at the 30-day default; `0` disables; and
+// anything that isn't a non-negative integer disables with one log line —
+// fails closed. (A raw pass-through of a negative override would compute a
+// FUTURE cutoff and offload every payload including brand-new ones.)
+// Returns the window in days, or null when retention is disabled.
+function resolveRetentionDays(override) {
+  const fromEnv = override === undefined
+  const raw = fromEnv ? process.env.MATRON_RETENTION_DAYS : override
+  if (raw === undefined) return DEFAULT_RETENTION_DAYS
+  const name = fromEnv ? 'MATRON_RETENTION_DAYS' : 'retentionDays'
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 0) {
+    console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid — retention disabled`)
+    return null
+  }
+  if (n === 0) {
+    console.warn(`retention: ${name}=0 — retention disabled`)
+    return null
+  }
+  return n
+}
+
+// `override` is startServer's `toolLogTtlHours` opt — mirrors
+// resolveRetentionDays exactly (same precedence, same fail-closed
+// validation): unset means ENABLED at the 24h default; `0` disables; and
+// anything that isn't a non-negative integer disables with one log line.
+// Returns the TTL window in hours, or null when the TTL pass is disabled.
+function resolveToolLogTtlHours(override) {
+  const fromEnv = override === undefined
+  const raw = fromEnv ? process.env.MATRON_TOOL_LOG_TTL_HOURS : override
+  if (raw === undefined) return DEFAULT_TOOL_LOG_TTL_HOURS
+  const name = fromEnv ? 'MATRON_TOOL_LOG_TTL_HOURS' : 'toolLogTtlHours'
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 0) {
+    console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid — retention disabled`)
+    return null
+  }
+  if (n === 0) {
+    console.warn(`retention: ${name}=0 — retention disabled`)
+    return null
+  }
+  return n
+}
+
+// `override` is startServer's `voiceNoteTtlDays` opt — same precedence and
+// fail-closed validation as the two above: unset means ENABLED at 7 days;
+// `0` disables; anything else that isn't a non-negative integer disables
+// with one log line. Returns the window in days, or null when disabled.
+function resolveVoiceNoteTtlDays(override) {
+  const fromEnv = override === undefined
+  const raw = fromEnv ? process.env.MATRON_VOICE_NOTE_TTL_DAYS : override
+  if (raw === undefined) return DEFAULT_VOICE_NOTE_TTL_DAYS
+  const name = fromEnv ? 'MATRON_VOICE_NOTE_TTL_DAYS' : 'voiceNoteTtlDays'
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 0) {
+    console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid — voice-note expiry disabled`)
+    return null
+  }
+  if (n === 0) {
+    console.warn(`retention: ${name}=0 — voice-note expiry disabled`)
+    return null
+  }
+  return n
+}
+
+export const DEFAULT_MEDIA_REAP_HIGH_PCT = 90
+export const DEFAULT_MEDIA_REAP_LOW_PCT = 70
+
+// High/low-water marks for the quota-pressure attachment reaper
+// (runReapMedia), as integer percentages of the per-user media quota.
+// Overrides (startServer's `mediaReapHighPct`/`mediaReapLowPct` opts) beat
+// the env vars per-knob, mirroring the other retention resolvers. Fail
+// closed means DISABLED here — this pass deletes user data, so an
+// unparseable value, 0, a percentage over 100, or an inverted pair
+// (low >= high would make the reap loop's stop condition unreachable on
+// entry) must all turn the reaper off with one warn line, never run it
+// with surprise thresholds. Returns { highPct, lowPct } or null.
+export function resolveReapPcts({ mediaReapHighPct, mediaReapLowPct } = {}) {
+  const resolveOne = (override, envName, optName, defaultValue) => {
+    const fromEnv = override === undefined
+    const raw = fromEnv ? process.env[envName] : override
+    if (raw === undefined) return defaultValue
+    const name = fromEnv ? envName : optName
+    const n = Number(raw)
+    if (!Number.isInteger(n) || n < 0 || n > 100) {
+      console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid — media reaper disabled`)
+      return null
+    }
+    if (n === 0) {
+      // JSON.stringify(raw), not `0`: Number('') is 0, so an empty env
+      // assignment lands here too and "=0" would misdirect the diagnosis.
+      console.warn(`retention: ${name}=${JSON.stringify(raw)} resolves to 0 — media reaper disabled`)
+      return null
+    }
+    return n
+  }
+  const highPct = resolveOne(mediaReapHighPct, 'MATRON_MEDIA_REAP_HIGH_PCT', 'mediaReapHighPct', DEFAULT_MEDIA_REAP_HIGH_PCT)
+  const lowPct = resolveOne(mediaReapLowPct, 'MATRON_MEDIA_REAP_LOW_PCT', 'mediaReapLowPct', DEFAULT_MEDIA_REAP_LOW_PCT)
+  if (highPct === null || lowPct === null) return null
+  if (lowPct >= highPct) {
+    console.warn(`retention: media reap low-water ${lowPct}% >= high-water ${highPct}% — media reaper disabled`)
+    return null
+  }
+  return { highPct, lowPct }
+}
+
+// Runs at boot (called after `server.listen` succeeds) and every 6h
+// thereafter (unref'd — never keeps the process alive on its own). Runs the
+// live-log TTL pass BEFORE the offload pass (opposite of declaration order
+// above) so that even a mis-configured-then-re-enabled system tombstones a
+// stale inline live_log row before offload ever gets a chance to see it —
+// runOffload's `blob_ref IS NULL` scan can't otherwise distinguish a
+// long-overdue live_log row from a genuinely-inline one, and offloading it
+// would permanently exempt it from the TTL pass (see runOffload's live_log
+// skip). The two passes remain independent knobs otherwise — either can be
+// disabled on its own (see resolveRetentionDays / resolveToolLogTtlHours)
+// without affecting the other — each with its own try/catch so one pass
+// failing (e.g. a disk error) never prevents the other from running on this
+// tick or being scheduled for the next. The quota-pressure media reaper runs
+// LAST: the offload pass just before it converts inline payloads into new
+// blobs, so reaping after offload sees the user's honest post-offload
+// footprint instead of triggering one tick late. Returns the interval handle
+// (for close()) or null only when ALL passes are disabled.
+function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes }) {
+  const days = resolveRetentionDays(retentionDays)
+  const ttlHours = resolveToolLogTtlHours(toolLogTtlHours)
+  const voiceDays = resolveVoiceNoteTtlDays(voiceNoteTtlDays)
+  const reapPcts = resolveReapPcts({ mediaReapHighPct, mediaReapLowPct })
+  if (days === null && ttlHours === null && voiceDays === null && reapPcts === null) return null
+  const run = () => {
+    if (ttlHours !== null) {
+      try {
+        const r = runExpireLogs(db, { hours: ttlHours, mediaDir })
+        if (r.expired > 0) console.log(`retention: purged ${r.expired} live_log payload(s) older than ${ttlHours}h`)
+      } catch (err) {
+        console.error('retention: expire-logs run failed', err)
+      }
+    }
+    // Voice-note audio before offload/reap, so the reaper sees the user's
+    // footprint without recordings whose words have already outlived them.
+    if (voiceDays !== null) {
+      try {
+        const r = runExpireVoiceNotes(db, { days: voiceDays })
+        if (r.expired > 0) console.log(`retention: expired ${r.expired} voice-note recording(s) transcribed more than ${voiceDays}d ago, ${r.bytesFreed} bytes`)
+      } catch (err) {
+        console.error('retention: voice-note expiry run failed', err)
+      }
+    }
+    if (days !== null) {
+      try {
+        const r = runOffload(db, { days, mediaDir })
+        if (r.offloaded > 0) console.log(`retention: offloaded ${r.offloaded} tool_output payload(s) older than ${days}d`)
+      } catch (err) {
+        console.error('retention: offload run failed', err)
+      }
+    }
+    if (reapPcts !== null) {
+      try {
+        const r = runReapMedia(db, { quotaBytes: mediaUserQuotaBytes, highPct: reapPcts.highPct, lowPct: reapPcts.lowPct })
+        if (r.reaped > 0) console.log(`retention: reaped ${r.reaped} attachment blob(s), ${r.bytesFreed} bytes, from user(s) over ${reapPcts.highPct}% of the media quota`)
+      } catch (err) {
+        console.error('retention: media reap run failed', err)
+      }
+    }
+  }
+  run()
+  const interval = setInterval(run, retentionIntervalMs ?? RETENTION_INTERVAL_MS)
+  interval.unref()
+  return interval
+}
+
+// The explicit-checkpoint half of the WAL mitigation (the pragma half —
+// wal_autocheckpoint=0 + journal_size_limit — lives in openDb; measured
+// rationale in docs/wal-checkpoint-profile.md). PASSIVE never blocks readers
+// or the writer, and on an empty WAL it is sub-ms, so a 1s cadence costs
+// nothing when idle; under load it keeps backfills small and the WAL bounded
+// (~4.8MiB worst observed vs unbounded growth without it, since autockpt is
+// now off). It still runs the fsync on this thread — profiled cost p99 46ms,
+// max 59ms per pass under load — but appends themselves no longer carry it.
+// Unref'd like the retention timer; cleared in close().
+const WAL_CHECKPOINT_INTERVAL_MS = 1000
+
+function scheduleWalCheckpoint(db, walCheckpointIntervalMs) {
+  const run = () => {
+    try {
+      db.pragma('wal_checkpoint(PASSIVE)')
+    } catch (err) {
+      // A failed passive pass is retried by the next tick; log once per tick
+      // rather than crash — the DB itself is still healthy (busy/locked are
+      // expected transient outcomes).
+      console.error('wal-checkpoint: passive pass failed', err)
+    }
+  }
+  const interval = setInterval(run, walCheckpointIntervalMs ?? WAL_CHECKPOINT_INTERVAL_MS)
+  interval.unref()
+  return interval
+}
+
+// Push client selection, in strict priority order:
+//   1. injected (tests) — caller owns its lifecycle.
+//   2. all four MATRON_APNS_* set → direct APNs (full-content
+//      alerts, exactly the pre-relay behavior).
+//   3. MATRON_PUSH_GATEWAY_URL set → the push.matron.chat relay (self-hosted
+//      journals with no APNs key; generic alert text, content never leaves
+//      the box — see src/gateway.js).
+//   4. neither → push disabled, one warn log at boot, pipeline is inert.
+// Exported for the selection-order tests only.
+export function resolveApnsClient(injected) {
+  if (injected) return { client: injected, owned: false }
+  const { MATRON_APNS_KEY_FILE, MATRON_APNS_KEY_ID, MATRON_APNS_TEAM_ID, MATRON_APNS_TOPIC, MATRON_PUSH_GATEWAY_URL } = process.env
+  if (MATRON_APNS_KEY_FILE && MATRON_APNS_KEY_ID && MATRON_APNS_TEAM_ID && MATRON_APNS_TOPIC) {
+    const client = makeApnsClient({
+      keyFile: MATRON_APNS_KEY_FILE, keyId: MATRON_APNS_KEY_ID,
+      teamId: MATRON_APNS_TEAM_ID, topic: MATRON_APNS_TOPIC,
+    })
+    return { client, owned: true }
+  }
+  if (MATRON_PUSH_GATEWAY_URL) {
+    // A typo'd URL (e.g. missing scheme) degrades to push-disabled like the
+    // other misconfigurations — new URL() in makeGatewayClient would
+    // otherwise throw and take the whole journal down at boot.
+    if (URL.canParse('/push', MATRON_PUSH_GATEWAY_URL)) {
+      return { client: makeGatewayClient({ url: MATRON_PUSH_GATEWAY_URL }), owned: true }
+    }
+    console.warn(`push: disabled — MATRON_PUSH_GATEWAY_URL is not a valid URL: ${MATRON_PUSH_GATEWAY_URL}`)
+    return { client: undefined, owned: false }
+  }
+  console.warn('push: disabled — set all four MATRON_APNS_* vars (direct APNs) or MATRON_PUSH_GATEWAY_URL (relay) to enable')
+  return { client: undefined, owned: false }
+}
+
+// The per-IP rate limiter and the pairing "who's asking" IP both trust the
+// `cf-connecting-ip` header (see http.js). That is only sound because the sole
+// route to this process is the cloudflared tunnel to a LOOPBACK bind —
+// Cloudflare overwrites the header, so it can't be spoofed. If the process is
+// ever bound to a non-loopback address, that header becomes attacker-supplied
+// and both defenses are defeated. Warn loudly at boot rather than silently
+// weakening them. Not a hard refuse — a deliberate reverse-proxy setup that
+// sets cf-connecting-ip itself is legitimate — but it must be a conscious choice.
+function warnIfBindTrustsSpoofableIp(bind) {
+  const loopback = bind === '127.0.0.1' || bind === '::1' || bind === 'localhost'
+  if (!loopback) {
+    console.warn(
+      `SECURITY: MATRON_BIND=${JSON.stringify(bind)} is not loopback. The cf-connecting-ip ` +
+      'header is only trustworthy when the sole ingress is the cloudflared tunnel; on a ' +
+      'directly-reachable bind a client can spoof it, defeating the per-IP rate limiter and ' +
+      'the pairing requester-IP display. Ensure a trusted proxy sets cf-connecting-ip and the ' +
+      'port is firewalled off from untrusted networks.'
+    )
+  }
+}
+
+export function startServer({
+  dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
+  retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
+  toolLogTtlHours, voiceNoteTtlDays, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
+  // How long an approved spawn waits for a woken target box to attach
+  // before issuing `start` (wake-before-spawn). Sized for a cold VM boot:
+  // incus start + bridge start + journal dial is ~3 minutes on the shared
+  // hosts (the infra's timer_wake_lead_minutes). Only ever waited when a
+  // wake is actually under way, so a journal without MATRON_WAKE_CMD never
+  // pays it.
+  spawnWakeWaitMs = resolveNumericEnv('MATRON_SPAWN_WAKE_WAIT_MS', process.env.MATRON_SPAWN_WAKE_WAIT_MS, 240000),
+  sessionControlTimeoutMs = resolveNumericEnv('MATRON_SESSION_CONTROL_TIMEOUT_MS', process.env.MATRON_SESSION_CONTROL_TIMEOUT_MS, 30000),
+  // Coordinator consent approvals per rolling 24 h (spec: 2026-09-29
+  // coordinator consent); beyond it the ask stays for the user. 0 = no cap.
+  consentDailyCap = resolveConsentDailyCap(process.env.MATRON_COORDINATOR_CONSENT_DAILY_CAP),
+  stallWakeIntervalMs = null,
+  // The unseen nudge (src/unseen-nudge.js). MATRON_UNSEEN_NUDGE=0 turns it off.
+  unseenNudgeIntervalMs = null,
+  unseenNudge = process.env.MATRON_UNSEEN_NUDGE !== '0',
+  // Coordinator routines (src/routines-sweep.js). MATRON_ROUTINES=0 stops
+  // the sweep (the routes and `run` still work).
+  routinesSweepIntervalMs = null,
+  routinesTriggerIntervalMs = null,
+  routinesSweep = process.env.MATRON_ROUTINES !== '0',
+  mediaReapHighPct, mediaReapLowPct, waker, transcriber, github, githubRefreshIntervalMs, webDir,
+  appleAppIds, androidPackage, androidCertSha256, tokenKey,
+  // Alertmanager webhook (src/alerts-http.js): {token, username}. The
+  // option is the test seam; env otherwise. Off unless both are usable.
+  alertWebhook,
+} = {}) {
+  warnIfBindTrustsSpoofableIp(bind)
+  const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
+  const db = openDb(resolvedDbPath)
+  // Token encryption at rest (spec 2026-09-23 tracker web/teams). The
+  // option is the test seam; env otherwise. A key that appears after rows
+  // exist seals them here, once.
+  const tokenBox = makeTokenBox(tokenKey !== undefined ? tokenKey : process.env.MATRON_TOKEN_KEY)
+  const sealed = sealStoredTokens(db, tokenBox)
+  if (sealed.sealed) console.log(`github: sealed ${sealed.sealed} stored token(s) under MATRON_TOKEN_KEY`)
+  if (sealed.unreadable) console.warn(`github: ${sealed.unreadable} stored token(s) are sealed under a different or missing MATRON_TOKEN_KEY; those users must re-link`)
+  // WAL-checkpoint tail mitigation, server half (docs/wal-checkpoint-profile.md;
+  // journal_size_limit lives in openDb). With synchronous=NORMAL the
+  // auto-checkpoint is the only steady-state fsync and it runs INLINE in
+  // whichever append COMMIT crosses the 1000-page mark: 69/69 profiled
+  // event-loop blockages >=20ms carried that fingerprint, worst 1.22s under
+  // real disk contention (GC max 6.2ms — exonerated). Disabling it here and
+  // checkpointing from scheduleWalCheckpoint's 1s PASSIVE timer instead moves
+  // the fsync out of append COMMITs: matched-window A/B improved append p99
+  // 9.7->3.1ms, contended-round max 1221.7->26.8ms, zero >100ms stall events
+  // in every mitigated run, WAL bounded <=4.8MB. Server-only on purpose — a
+  // standalone opener (admin CLI) has no timer and keeps the stock inline
+  // auto-checkpoint (see openDb).
+  db.pragma('wal_autocheckpoint = 0')
+  const rateLimiter = makeRateLimiter()
+  const loginGuard = makeLoginGuard()
+  const resolvedPairs = pairs || makePairStore()
+  const resolvedLinks = links || makeLinkStore({ db })
+  const resolvedMediaDir = resolveMediaDir(resolvedDbPath, mediaDir)
+  // Finding 1 hardening (Bugbot, PR #29): /link/preapprove's loopback +
+  // no-forwarding-header guard alone is defeated by a headerless reverse
+  // proxy (default nginx `proxy_pass` adds nothing). This key is the
+  // second, independent factor — auto-minted next to the DB, never
+  // operator-provisioned (see src/preapprove-key.js). `preapproveKey` lets
+  // a caller (tests) inject a known value directly with zero disk I/O;
+  // otherwise it's read from (or minted into) the file at `preapproveKeyPath`
+  // (or its default, derived from resolvedDbPath).
+  const resolvedPreapproveKey = preapproveKey || ensurePreapproveKey(resolvedDbPath, preapproveKeyPath)
+  const resolvedMediaMaxBytes = mediaMaxBytes ?? resolveNumericEnv('MATRON_MEDIA_MAX_BYTES', process.env.MATRON_MEDIA_MAX_BYTES, DEFAULT_MEDIA_MAX_BYTES)
+  const resolvedMediaUserQuotaBytes = mediaUserQuotaBytes ?? resolveNumericEnv('MATRON_MEDIA_USER_QUOTA_BYTES', process.env.MATRON_MEDIA_USER_QUOTA_BYTES, DEFAULT_MEDIA_USER_QUOTA_BYTES)
+  const resolvedMaxReplay = maxReplay ?? resolveNumericEnv('MATRON_MAX_REPLAY', process.env.MATRON_MAX_REPLAY, DEFAULT_MAX_REPLAY)
+  const hub = makeHub()
+  const broker = makeRpcBroker()
+  // Wake-on-message for idle-stopped agent boxes (src/wake.js). Off unless
+  // MATRON_WAKE_CMD is set (or a waker is injected by tests). Its verdicts
+  // are kept on the device rows, so a box the command refuses shows offline
+  // rather than asleep, across restarts.
+  const resolvedWaker = waker || makeWaker({
+    onRefused: (box) => markWakeRefused(db, box),
+    onWoken: (box) => clearWakeRefused(db, box),
+  })
+  // A journal that cannot wake anything never waits for a wake — and its
+  // orphan sweep TTL (derived in attachWs from this value) stays what it
+  // always was, rather than growing by a window that can never be used.
+  const effectiveWakeWaitMs = resolvedWaker.enabled ? spawnWakeWaitMs : 0
+  // Stall wake sweep (src/stall-wake.js): a box whose stalled session's
+  // usage-limit reset has passed is woken so its bridge can carry on. No-op
+  // without a waker; stopped in close().
+  const stallWakeSweep = startStallWakeSweep({ db, hub, waker: resolvedWaker, ...(stallWakeIntervalMs ? { intervalMs: stallWakeIntervalMs } : {}) })
+  const unseenNudgeSweep = startUnseenNudge({ db, hub, enabled: unseenNudge, ...(unseenNudgeIntervalMs ? { intervalMs: unseenNudgeIntervalMs } : {}) })
+  // Coordinator routines (spec 2026-10-01): one firer per process (the
+  // sweep and POST /routines/:key/run share its in-flight bound), the
+  // once-a-minute sweep, and the one-off seed for users who already have a
+  // Coordinator (new assignments seed in coordinator-http.js).
+  const routineFirer = makeRoutineFirer({ db, hub, broker, waker: resolvedWaker, wakeWaitMs: effectiveWakeWaitMs, timeoutMs: sessionControlTimeoutMs })
+  const routinesSweeper = startRoutinesSweep({ db, firer: routineFirer, enabled: routinesSweep, ...(routinesSweepIntervalMs ? { intervalMs: routinesSweepIntervalMs } : {}), ...(routinesTriggerIntervalMs ? { triggerIntervalMs: routinesTriggerIntervalMs } : {}) })
+  try {
+    for (const { user_id: userId } of db.prepare('SELECT user_id FROM user_settings WHERE coordinator_convo_id IS NOT NULL AND routines_seeded_at IS NULL').all()) {
+      const n = seedRoutines(db, userId)
+      if (n > 0) console.log(`routines: seeded ${n} starter routine(s) for user ${userId}`)
+    }
+  } catch (err) { console.error('routines: boot seeding failed', err) }
+  const toolStreams = makeToolStreamStore({
+    maxBytes: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BYTES', process.env.MATRON_TOOL_STREAM_MAX_BYTES, 1048576),
+    maxBuffers: resolveNumericEnv('MATRON_TOOL_STREAM_MAX_BUFFERS', process.env.MATRON_TOOL_STREAM_MAX_BUFFERS, 64),
+    idleMs: resolveNumericEnv('MATRON_TOOL_STREAM_IDLE_MS', process.env.MATRON_TOOL_STREAM_IDLE_MS, 1800000),
+    ...(toolStreamOpts || {}),
+  })
+  const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
+  const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient })
+  // A consent-card push whose 30 s hold a restart swallowed still goes out.
+  try { pushPipeline.resumeHeldConsent() } catch (err) { console.error('push: consent resume failed', err) }
+  // Voice notes are transcribed here when the journal has a transcriber: a
+  // cloud one (MATRON_STT_AZURE_KEY; src/cloud-transcribe.js), or whisper
+  // (MATRON_WHISPER_MODEL; src/transcribe.js). Neither: off, and the origin
+  // bridge does it as before. `transcriber` is the test seam; `null` forces
+  // it off.
+  const resolvedTranscriber = transcriber === undefined
+    ? makeConfiguredTranscriber({ deviceNames: (userId) => db.prepare('SELECT DISTINCT name FROM devices WHERE user_id=? ORDER BY name').all(userId).map((r) => r.name) })
+    : transcriber
+  // Chat voice notes, at upload: cloud only (src/blob-transcripts.js).
+  const blobTranscripts = makeBlobTranscripts({ db, transcriber: resolvedTranscriber })
+  const itemTranscription = makeItemTranscription({
+    db,
+    transcriber: resolvedTranscriber,
+    blobTranscripts,
+    onSettled: (out) => emitTranscriptionMarker({ db, hub, pushPipeline, waker: resolvedWaker }, out),
+  })
+  // GitHub account linking (spec 2026-09-23 tracker web/teams). `github` is
+  // the test seam; env otherwise. An empty client id disables the routes.
+  const resolvedGithub = github !== undefined ? github : makeGithub({
+    clientId: process.env.MATRON_GITHUB_CLIENT_ID ?? DEFAULT_GITHUB_CLIENT_ID,
+    clientSecret: process.env.MATRON_GITHUB_CLIENT_SECRET || null,
+    host: (process.env.MATRON_GITHUB_HOST || 'github.com').toLowerCase(),
+  })
+  // Static hosting of the web app (spec 2026-09-23 tracker web/teams). The
+  // option is the test seam; env otherwise; unset serves nothing.
+  const resolvedWebDir = resolveWebDir(webDir !== undefined ? webDir : process.env.MATRON_WEB_DIR)
+  const handleStatic = makeStaticHandler({ webDir: resolvedWebDir })
+  // App-link well-known files (spec 2026-09-23 tracker web/teams). The
+  // options are the test seam; env otherwise; unset claims nothing (404).
+  const handleWellKnown = makeWellKnown({
+    appleAppIds: appleAppIds !== undefined ? appleAppIds : parseList(process.env.MATRON_APPLE_APP_IDS),
+    androidPackage: androidPackage !== undefined ? androidPackage : (process.env.MATRON_ANDROID_PACKAGE || null),
+    androidCertSha256: androidCertSha256 !== undefined ? androidCertSha256 : parseList(process.env.MATRON_ANDROID_CERT_SHA256),
+  })
+  const resolvedAlertWebhook = alertWebhook !== undefined ? alertWebhook : {
+    token: process.env.MATRON_ALERT_WEBHOOK_TOKEN || null,
+    username: process.env.MATRON_ALERT_WEBHOOK_USER || null,
+  }
+  if (resolvedAlertWebhook) warnAlertWebhookConfig(db, resolvedAlertWebhook)
+  const server = http.createServer(makeHttpHandler({
+    db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
+    mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
+    hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
+    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap,
+    github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
+    sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer,
+  }))
+  const wss = attachWs({
+    server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
+    // 55s: under the common 60s proxy idle-timeout defaults, and a 2.75x
+    // cut in heartbeat radio wakes for idle phone clients vs the old 20s.
+    pingMs: resolveNumericEnv('MATRON_WS_PING_MS', process.env.MATRON_WS_PING_MS, 55000),
+    rpcMaxBytes: resolveNumericEnv('MATRON_RPC_MAX_BYTES', process.env.MATRON_RPC_MAX_BYTES, 16384),
+    ...(revocationSweepMs !== undefined ? { revocationSweepMs } : {}),
+    ...(inviteTtlMs !== undefined ? { inviteTtlMs } : {}),
+    // spawnStartTimeoutMs rides along so the orphan sweep's TTL can never
+    // undercut a configured start timeout (attachWs derives the TTL).
+    broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, sessionControlTimeoutMs, waker: resolvedWaker,
+  })
+  let retentionInterval = null
+  let walCheckpointInterval = null
+  let githubRefreshInterval = null
+  let closing = false
+  return new Promise((resolve) => {
+    server.listen(port, bind, () => {
+      retentionInterval = scheduleRetention(db, {
+        mediaDir: resolvedMediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays,
+        mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
+      })
+      walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
+      githubRefreshInterval = scheduleGithubRefresh(db, resolvedGithub, { intervalMs: githubRefreshIntervalMs, box: tokenBox })
+      // Whatever a previous process left mid-transcription: a bridge is
+      // holding a turn for each, so finish them (or fail them) now.
+      itemTranscription.recover()
+      blobTranscripts.recover()
+      // Fire-and-forget: search serves partial results until this finishes
+      // (self-healing — spec). shouldStop lets close() end the walk cleanly
+      // instead of racing a closed DB handle.
+      const searchBackfill = backfillSearchIndex(db, {
+        log: (l) => console.log(l),
+        shouldStop: () => closing,
+      }).catch((err) => { console.error('search backfill failed', err) })
+      // Same shape: older item comments get their images' sizes stamped on.
+      const imageDimsBackfill = backfillImageDims(db, {
+        log: (l) => console.log(l),
+        shouldStop: () => closing,
+      }).catch((err) => { console.error('image size backfill failed', err) })
+      resolve({
+        port: server.address().port,
+        db,
+        server,
+        hub,
+        broker,
+        toolStreams,
+        pushPipeline,
+        itemTranscription,
+        blobTranscripts,
+        preapproveKey: resolvedPreapproveKey,
+        searchBackfill,
+        imageDimsBackfill,
+        unseenNudge: unseenNudgeSweep,
+        routinesSweep: routinesSweeper,
+        routineFirer,
+        github: resolvedGithub,
+        close: () => new Promise((r) => {
+          closing = true
+          if (retentionInterval) clearInterval(retentionInterval)
+          if (walCheckpointInterval) clearInterval(walCheckpointInterval)
+          if (githubRefreshInterval) clearInterval(githubRefreshInterval)
+          stallWakeSweep.stop()
+          unseenNudgeSweep.stop()
+          routinesSweeper.stop()
+          // Wake-before-spawn waiters (hub.waitForDevice) hold ref'd timers
+          // of up to spawnWakeWaitMs; release them before the sockets go so
+          // each approveSpawn settles its row while the DB is still open.
+          hub.close()
+          wss.close()
+          for (const c of wss.clients) c.terminate()
+          pushPipeline.close()
+          if (ownsApnsClient) resolvedApnsClient.close()
+          // The transcription queue touches the DB between awaits: abort its
+          // child and let it drain before the handle closes.
+          const transcriptionDone = Promise.all([itemTranscription.close(), blobTranscripts.close()])
+          server.close(() => { Promise.all([searchBackfill, imageDimsBackfill, transcriptionDone]).then(() => { db.close(); r() }) })
+        }),
+      })
+    })
+  })
+}
+
+let isMain = false
+try {
+  isMain = !!process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)
+} catch { /* argv[1] missing or unresolvable: not the entrypoint */ }
+if (isMain) {
+  const port = Number(process.env.MATRON_PORT || 9810)
+  const bind = process.env.MATRON_BIND || '127.0.0.1'
+  startServer({ port, bind }).then((s) => console.log(`matron-journal listening on ${bind}:${s.port}`))
+}

@@ -1,0 +1,214 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { makeHub, mergeEphemeral } from '../src/hub.js'
+
+const ts = (obj) => ({ kind: 'ephemeral', convo_id: 'c1', message_ref: 'r1', tool_stream: obj })
+
+test('mergeEphemeral: contiguous appends concatenate; sync absorbs a contiguous append', () => {
+  const a = ts({ event: 'append', offset: 0, chunk: 'ab' })
+  const b = ts({ event: 'append', offset: 2, chunk: 'cd' })
+  assert.deepEqual(mergeEphemeral(a, b).tool_stream, { event: 'append', offset: 0, chunk: 'abcd' })
+  const sync = ts({ event: 'sync', meta: { tool: 'Bash', command: 'x' }, offset: 0, content: 'ab', head_truncated: false })
+  const merged = mergeEphemeral(sync, b)
+  assert.equal(merged.tool_stream.event, 'sync')
+  assert.equal(merged.tool_stream.content, 'abcd')
+})
+
+test('mergeEphemeral: byte-based contiguity (multi-byte chars)', () => {
+  const a = ts({ event: 'append', offset: 0, chunk: 'é' }) // 2 utf-8 bytes
+  const b = ts({ event: 'append', offset: 2, chunk: '!' })
+  assert.equal(mergeEphemeral(a, b).tool_stream.chunk, 'é!')
+})
+
+test('mergeEphemeral: end/sync/legacy/non-contiguous fall back to latest-wins', () => {
+  const a = ts({ event: 'append', offset: 0, chunk: 'ab' })
+  const end = ts({ event: 'end', reason: 'stale' })
+  assert.equal(mergeEphemeral(a, end).tool_stream.event, 'end')
+  const gap = ts({ event: 'append', offset: 99, chunk: 'z' })
+  assert.equal(mergeEphemeral(a, gap).tool_stream.chunk, 'z')
+  const act = { kind: 'ephemeral', convo_id: 'c1', activity: { state: 'thinking' } }
+  const act2 = { kind: 'ephemeral', convo_id: 'c1', activity: { state: 'idle' } }
+  assert.deepEqual(mergeEphemeral(act, act2), act2)
+  assert.deepEqual(mergeEphemeral(null, a), a)
+})
+
+test('sendEphemeral flush delivers concatenated appends; text overlays still latest-wins', async () => {
+  const hub = makeHub({ coalesceMs: 20 })
+  const sent = []
+  const conn = { userId: 1, deviceId: 7, kind: 'client', viewingConvoIds: new Set(['c1']), ws: { readyState: 1, send: (d) => sent.push(JSON.parse(d)) } }
+  hub.register(conn)
+  hub.sendEphemeral(1, 'c1', ts({ event: 'append', offset: 0, chunk: 'ab' }))
+  hub.sendEphemeral(1, 'c1', ts({ event: 'append', offset: 2, chunk: 'cd' }))
+  hub.sendEphemeral(1, 'c1', { kind: 'ephemeral', convo_id: 'c1', message_ref: 'txt', replace_text: 'one' })
+  hub.sendEphemeral(1, 'c1', { kind: 'ephemeral', convo_id: 'c1', message_ref: 'txt', replace_text: 'two' })
+  await new Promise((r) => setTimeout(r, 60))
+  assert.equal(sent.length, 2)
+  assert.deepEqual(sent[0].tool_stream, { event: 'append', offset: 0, chunk: 'abcd' })
+  assert.equal(sent[1].replace_text, 'two')
+  hub.unregister(conn)
+})
+
+function rpcConn(userId, deviceId, kind) {
+  const sent = []
+  return { userId, deviceId, kind, sent, ws: { readyState: 1, send: (s) => sent.push(JSON.parse(s)) } }
+}
+
+test('sendRpcRequest delivers to the most recently registered live socket only', () => {
+  const hub = makeHub()
+  const older = rpcConn(1, 7, 'agent')
+  const newer = rpcConn(1, 7, 'agent')
+  hub.register(older)
+  hub.register(newer)
+  const delivered = hub.sendRpcRequest(1, 7, { kind: 'rpc', request: { request_id: 'r1' } })
+  assert.equal(delivered, true)
+  assert.equal(older.sent.length, 0)
+  assert.equal(newer.sent.length, 1)
+  assert.equal(newer.sent[0].request.request_id, 'r1')
+})
+
+test('sendRpcRequest falls back to an older live socket when the newest is closed', () => {
+  const hub = makeHub()
+  const older = rpcConn(1, 7, 'agent')
+  const newer = rpcConn(1, 7, 'agent')
+  hub.register(older)
+  hub.register(newer)
+  newer.ws.readyState = 3
+  assert.equal(hub.sendRpcRequest(1, 7, { x: 1 }), true)
+  assert.equal(older.sent.length, 1)
+  assert.equal(newer.sent.length, 0)
+})
+
+test('sendRpcRequest returns false when no live socket matches the device', () => {
+  const hub = makeHub()
+  const wrongDevice = rpcConn(1, 8, 'agent')
+  hub.register(wrongDevice)
+  assert.equal(hub.sendRpcRequest(1, 7, { x: 1 }), false)   // no such device
+  assert.equal(hub.sendRpcRequest(2, 8, { x: 1 }), false)   // wrong user
+  assert.equal(wrongDevice.sent.length, 0)
+})
+
+test('sendRpcResponse multicasts to every live socket of the device, skipping closed ones', () => {
+  const hub = makeHub()
+  const a = rpcConn(1, 5, 'client')
+  const b = rpcConn(1, 5, 'client')
+  const closed = rpcConn(1, 5, 'client')
+  const otherDevice = rpcConn(1, 6, 'client')
+  for (const c of [a, b, closed, otherDevice]) hub.register(c)
+  closed.ws.readyState = 3
+  hub.sendRpcResponse(1, 5, { kind: 'rpc', response: { request_id: 'r1' } })
+  assert.equal(a.sent.length, 1)
+  assert.equal(b.sent.length, 1)
+  assert.equal(closed.sent.length, 0)
+  assert.equal(otherDevice.sent.length, 0)
+})
+
+test('broadcastJournal with a target set delivers to clients and only the named agents', () => {
+  const hub = makeHub()
+  const sent = []
+  const conn = (kind, deviceId) => ({ userId: 1, kind, deviceId, ws: { readyState: 1, send: (d) => sent.push([deviceId, JSON.parse(d)]) } })
+  const client = conn('client', 10)
+  const agentA = conn('agent', 1)
+  const agentB = conn('agent', 2)
+  const agentC = conn('agent', 3)
+  for (const c of [client, agentA, agentB, agentC]) hub.register(c)
+  hub.broadcastJournal(1, { kind: 'journal', seq: 1 }, new Set([1, 3]))
+  const got = sent.map(([id]) => id).sort((a, b) => a - b)
+  assert.deepEqual(got, [1, 3, 10])
+})
+
+test('broadcastJournal with null targets keeps legacy broadcast to every agent', () => {
+  const hub = makeHub()
+  const sent = []
+  const conn = (kind, deviceId) => ({ userId: 1, kind, deviceId, ws: { readyState: 1, send: (d) => sent.push(deviceId) } })
+  for (const c of [conn('client', 10), conn('agent', 1), conn('agent', 2)]) hub.register(c)
+  hub.broadcastJournal(1, { kind: 'journal', seq: 1 }, null)
+  assert.deepEqual(sent.sort((a, b) => a - b), [1, 2, 10])
+})
+
+test('sendToDevice multicasts to every live socket of exactly that device', () => {
+  const hub = makeHub()
+  const sent = []
+  const conn = (deviceId, ready = 1) => ({ userId: 1, kind: 'agent', deviceId, ws: { readyState: ready, send: (d) => sent.push(deviceId) } })
+  hub.register(conn(1))
+  hub.register(conn(1))
+  hub.register(conn(2))
+  hub.register(conn(1, 3)) // closed socket — skipped
+  hub.sendToDevice(1, 1, { kind: 'invite' })
+  assert.deepEqual(sent, [1, 1])
+})
+
+test('waitForDevice: true at once for a live socket, true on registration, false on timeout', async () => {
+  const hub = makeHub()
+  const live = { userId: 1, deviceId: 7, kind: 'agent', ws: { readyState: 1 } }
+  hub.register(live)
+  assert.equal(await hub.waitForDevice(1, 7, 1000), true)
+  // Not yet registered: resolves when it lands.
+  const p = hub.waitForDevice(1, 8, 1000)
+  const t0 = Date.now()
+  setTimeout(() => hub.register({ userId: 1, deviceId: 8, kind: 'agent', ws: { readyState: 1 } }), 30)
+  assert.equal(await p, true)
+  assert.ok(Date.now() - t0 < 900, 'released by registration, not by the timer')
+  // Same device id on ANOTHER user never releases the waiter.
+  const other = hub.waitForDevice(2, 9, 120)
+  hub.register({ userId: 3, deviceId: 9, kind: 'agent', ws: { readyState: 1 } })
+  assert.equal(await other, false)
+  // Zero/negative wait never parks.
+  assert.equal(await hub.waitForDevice(1, 10, 0), false)
+})
+
+test('close: every parked waiter is released with false at once, and its timer is gone', async () => {
+  const hub = makeHub()
+  const a = hub.waitForDevice(1, 7, 600000)
+  const b = hub.waitForDevice(2, 8, 600000)
+  const t0 = Date.now()
+  hub.close()
+  assert.deepEqual(await Promise.all([a, b]), [false, false])
+  assert.ok(Date.now() - t0 < 500, 'released by close(), not by the timers')
+  // A registration after close() finds nothing to release, and a fresh
+  // wait no longer parks (the hub is shut).
+  hub.register({ userId: 1, deviceId: 7, kind: 'agent', ws: { readyState: 1 } })
+  assert.equal(await hub.waitForDevice(1, 9, 600000), false)
+})
+
+// Defence in depth: even if an agent connection somehow
+// has a viewing set (the `viewing` op refuses agents), sendEphemeral applies
+// broadcastJournal's agent visibility rule — recorded owner + joined
+// participants, null = legacy broadcast — and fails CLOSED for agents when
+// the caller supplies no resolver.
+test('sendEphemeral scopes agent connections like broadcastJournal; clients unaffected', async () => {
+  const hub = makeHub({ coalesceMs: 10 })
+  const viewing = (deviceId, kind) => ({ ...rpcConn(1, deviceId, kind), viewingConvoIds: new Set(['c1']) })
+  const client = viewing(1, 'client')
+  const member = viewing(2, 'agent')
+  const outsider = viewing(3, 'agent')
+  for (const c of [client, member, outsider]) hub.register(c)
+  const frame = (n) => ({ kind: 'ephemeral', convo_id: 'c1', message_ref: `r${n}`, replace_text: 'x' })
+  const flush = () => new Promise((r) => setTimeout(r, 40))
+  const counts = () => [client.sent.length, member.sent.length, outsider.sent.length]
+
+  let resolved = 0
+  hub.sendEphemeral(1, 'c1', frame(1), () => { resolved++; return new Set([2]) })
+  await flush()
+  assert.deepEqual(counts(), [1, 1, 0], 'only the member agent, plus every client')
+  assert.equal(resolved, 1, 'targets resolved once per send, not per connection')
+
+  hub.sendEphemeral(1, 'c1', frame(2), () => null)
+  await flush()
+  assert.deepEqual(counts(), [2, 2, 1], 'null targets = legacy broadcast, as in broadcastJournal')
+
+  hub.sendEphemeral(1, 'c1', frame(3))
+  await flush()
+  assert.deepEqual(counts(), [3, 2, 1], 'no resolver: agents get nothing (fail closed), clients still do')
+
+  for (const c of [client, member, outsider]) hub.unregister(c)
+})
+
+test('sendEphemeral never resolves agent targets when no agent is viewing', async () => {
+  const hub = makeHub({ coalesceMs: 10 })
+  const client = { ...rpcConn(1, 1, 'client'), viewingConvoIds: new Set(['c1']) }
+  hub.register(client)
+  hub.sendEphemeral(1, 'c1', { kind: 'ephemeral', convo_id: 'c1', activity: { state: 'thinking' } }, () => { throw new Error('resolved needlessly') })
+  await new Promise((r) => setTimeout(r, 40))
+  assert.equal(client.sent.length, 1)
+  hub.unregister(client)
+})

@@ -1,0 +1,212 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { startTestServer, makeWsClient } from './helpers.js'
+import { createUser, createAgent } from '../src/auth.js'
+
+async function setup(t, opts = {}) {
+  const s = await startTestServer(opts)
+  t.after(() => s.close())
+  const alice = await createUser(s.db, 'alice', 'pw')
+  const ag = createAgent(s.db, alice.id, 'box-2')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'mac' } })
+  const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
+  const client = await makeWsClient(s.base, { token: login.json.token, cursor: 0 })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+  await client.waitFor((f) => f.op === 'hello_ok')
+  agent.send({ op: 'convo_upsert', convo_id: 'sess-ts' })
+  // barrier: convo_upsert applied once a subsequent journalled op round-trips
+  agent.send({ op: 'read_marker', convo_id: 'sess-ts', up_to_seq: null })
+  await agent.waitFor((f) => f.kind === 'journal' && f.type === 'read_marker')
+  return { s, alice, ag, agent, client }
+}
+
+test('append fans out to the viewing client only; chunks reach it live', async (t) => {
+  const { agent, client } = await setup(t)
+  client.send({ op: 'viewing', convo_id: 'sess-ts' })
+  // barrier: viewing applied once a journalled op on the same conn round-trips
+  client.send({ op: 'read_marker', convo_id: 'sess-ts', up_to_seq: null })
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'read_marker' && f.sender === 'user:alice')
+
+  agent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tu1', offset: 0, chunk: '$ npm test\n', meta: { tool: 'Bash', command: 'npm test' } })
+  const f1 = await client.waitFor((f) => f.tool_stream?.event === 'append')
+  assert.equal(f1.message_ref, 'tu1')
+  assert.equal(f1.tool_stream.offset, 0)
+  assert.equal(f1.tool_stream.chunk, '$ npm test\n')
+
+  agent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tu1', offset: 11, chunk: 'ok\n' })
+  await client.waitFor((f) => f.tool_stream?.event === 'append' && f.tool_stream.chunk.includes('ok'))
+})
+
+test('gap triggers stream_resync with have; unknown buffer at offset>0 asks from 0', async (t) => {
+  const { agent } = await setup(t)
+  agent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tu2', offset: 0, chunk: 'abc', meta: { tool: 'Bash', command: 'x' } })
+  agent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tu2', offset: 999, chunk: 'zzz' })
+  const rs = await agent.waitFor((f) => f.op === 'stream_resync')
+  assert.deepEqual({ ref: rs.message_ref, have: rs.have }, { ref: 'tu2', have: 3 })
+  agent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'never-seen', offset: 50, chunk: 'x' })
+  const rs2 = await agent.waitFor((f) => f.op === 'stream_resync' && f.message_ref === 'never-seen')
+  assert.equal(rs2.have, 0)
+})
+
+test('validation and authz: client forbidden; non-owned convo forbidden; bad frames bad_request', async (t) => {
+  const { s, agent, client } = await setup(t)
+  client.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tu3', offset: 0, chunk: 'x', meta: { tool: 'Bash', command: 'x' } })
+  await client.waitFor((f) => f.op === 'error' && f.code === 'forbidden' && f.ref === 'stream_append')
+
+  const eve = await createUser(s.db, 'eve', 'pw2')
+  const evag = createAgent(s.db, eve.id, 'box-9')
+  const evilAgent = await makeWsClient(s.base, { token: evag.token, cursor: null })
+  await evilAgent.waitFor((f) => f.op === 'hello_ok')
+  evilAgent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tu3', offset: 0, chunk: 'x', meta: { tool: 'Bash', command: 'x' } })
+  await evilAgent.waitFor((f) => f.op === 'error' && f.code === 'forbidden')
+  evilAgent.close()
+
+  for (const bad of [
+    { op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tu4', offset: -1, chunk: 'x', meta: { tool: 'Bash', command: 'x' } },
+    { op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tu4', offset: 0, chunk: 42, meta: { tool: 'Bash', command: 'x' } },
+    { op: 'stream_append', convo_id: 'sess-ts', offset: 0, chunk: 'x', meta: { tool: 'Bash', command: 'x' } },
+    { op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tu4', offset: 0, chunk: 'x' }, // creating frame, no meta
+  ]) agent.send(bad)
+  await agent.waitFor((f) =>
+    agent.frames.filter((x) => x.op === 'error' && x.code === 'bad_request' && x.ref === 'stream_append').length >= 4)
+  assert.equal(agent.ws.readyState, 1)
+})
+
+test('chunks never touch the journal', async (t) => {
+  const { s, agent } = await setup(t)
+  agent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tu5', offset: 0, chunk: 'secret-live-bytes', meta: { tool: 'Bash', command: 'x' } })
+  await new Promise((r) => setTimeout(r, 100))
+  const rows = s.db.prepare("SELECT COUNT(*) AS n FROM events WHERE payload LIKE '%secret-live-bytes%'").get()
+  assert.equal(rows.n, 0)
+})
+
+test('a client that starts viewing mid-command gets a sync frame with full scrollback', async (t) => {
+  const { agent, client } = await setup(t)
+  agent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tu6', offset: 0, chunk: 'line one\n', meta: { tool: 'Bash', command: 'make build' } })
+  agent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tu6', offset: 9, chunk: 'line two\n' })
+  // barrier on the agent conn: a journalled op round-trips → both appends applied
+  agent.send({ op: 'read_marker', convo_id: 'sess-ts', up_to_seq: null })
+  await agent.waitFor((f) => f.kind === 'journal' && f.type === 'read_marker')
+
+  client.send({ op: 'viewing', convo_id: 'sess-ts' })
+  const sync = await client.waitFor((f) => f.tool_stream?.event === 'sync')
+  assert.equal(sync.message_ref, 'tu6')
+  assert.deepEqual(sync.tool_stream.meta, { tool: 'Bash', command: 'make build' })
+  assert.equal(sync.tool_stream.offset, 0)
+  assert.equal(sync.tool_stream.content, 'line one\nline two\n')
+  assert.equal(sync.tool_stream.head_truncated, false)
+})
+
+test('viewing a convo with no active streams sends no sync frames', async (t) => {
+  const { client } = await setup(t)
+  client.send({ op: 'viewing', convo_id: 'sess-ts' })
+  await new Promise((r) => setTimeout(r, 150))
+  assert.equal(client.frames.some((f) => f.tool_stream), false)
+})
+
+test('finalize retires the stream: buffer freed, blob_ref column set, overlay retired by journal frame', async (t) => {
+  const { s, agent, client } = await setup(t)
+  client.send({ op: 'viewing', convo_id: 'sess-ts' })
+  client.send({ op: 'read_marker', convo_id: 'sess-ts', up_to_seq: null })
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'read_marker' && f.sender === 'user:alice')
+
+  agent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tu7', offset: 0, chunk: 'building...\n', meta: { tool: 'Bash', command: 'make' } })
+  await client.waitFor((f) => f.tool_stream?.event === 'append')
+
+  agent.send({
+    op: 'finalize', convo_id: 'sess-ts', message_ref: 'tu7', type: 'tool_output',
+    blob_ref: 'blob-123',
+    payload: { message_ref: 'tu7', command: 'make', exit_code: 0, denied: false, truncated: false, snippet: 'building...', blob_ref: 'blob-123', live_log: true },
+  })
+  const done = await client.waitFor((f) => f.kind === 'journal' && f.type === 'tool_output')
+  assert.equal(done.payload.message_ref, 'tu7')
+  assert.equal(done.payload.exit_code, 0)
+
+  // the events row carries the blob_ref COLUMN (retention scans key on it)
+  const row = s.db.prepare("SELECT blob_ref FROM events WHERE type='tool_output'").get()
+  assert.equal(row.blob_ref, 'blob-123')
+
+  // buffer is gone: a fresh viewing yields no sync frame for tu7
+  assert.deepEqual(s.toolStreams.buffersFor(1, 'sess-ts'), [])
+})
+
+test('idle sweep frees stale buffers and notifies viewers with end{stale}', async (t) => {
+  const { agent, client } = await setup(t, {
+    revocationSweepMs: 50,
+    toolStreamOpts: { idleMs: 1 }, // everything is stale immediately
+  })
+  client.send({ op: 'viewing', convo_id: 'sess-ts' })
+  client.send({ op: 'read_marker', convo_id: 'sess-ts', up_to_seq: null })
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'read_marker' && f.sender === 'user:alice')
+
+  agent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tu8', offset: 0, chunk: 'zzz', meta: { tool: 'Bash', command: 'sleep 999' } })
+  const end = await client.waitFor((f) => f.tool_stream?.event === 'end')
+  assert.equal(end.message_ref, 'tu8')
+  assert.equal(end.tool_stream.reason, 'stale')
+})
+
+test('producer disconnect cascade-closes ITS open streams with end{disconnected} + frees buffers; other producers untouched', async (t) => {
+  const { s, alice, agent, client } = await setup(t)
+  // A second producer connection (own convo) — the "untouched" control.
+  const ag2 = createAgent(s.db, alice.id, 'box-3')
+  const agent2 = await makeWsClient(s.base, { token: ag2.token, cursor: null })
+  await agent2.waitFor((f) => f.op === 'hello_ok')
+  agent2.send({ op: 'convo_upsert', convo_id: 'sess-ts2' })
+  agent2.send({ op: 'read_marker', convo_id: 'sess-ts2', up_to_seq: null })
+  await agent2.waitFor((f) => f.kind === 'journal' && f.type === 'read_marker')
+
+  client.send({ op: 'viewing', convo_id: 'sess-ts' })
+  client.send({ op: 'read_marker', convo_id: 'sess-ts', up_to_seq: null })
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'read_marker' && f.sender === 'user:alice')
+
+  // Producer 1 opens TWO live streams; producer 2 opens one on its own convo.
+  agent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tuA', offset: 0, chunk: 'aaa', meta: { tool: 'Bash', command: 'sleep 1' } })
+  agent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tuB', offset: 0, chunk: 'bbb', meta: { tool: 'Bash', command: 'sleep 2' } })
+  agent2.send({ op: 'stream_append', convo_id: 'sess-ts2', message_ref: 'tuC', offset: 0, chunk: 'ccc', meta: { tool: 'Bash', command: 'sleep 3' } })
+  // Barrier: producer 1's second stream round-trips to the viewing client → both applied.
+  await client.waitFor((f) => f.tool_stream?.event === 'append' && f.message_ref === 'tuB')
+  await new Promise((r) => setTimeout(r, 50)) // let producer 2's frame settle too
+  assert.equal(s.toolStreams.buffersFor(alice.id, 'sess-ts').length, 2)
+  assert.equal(s.toolStreams.buffersFor(alice.id, 'sess-ts2').length, 1)
+
+  agent.close() // producer 1 drops — no finalize ever arrives
+
+  // The viewing client gets an end{disconnected} for EACH of producer 1's streams.
+  const endA = await client.waitFor((f) => f.tool_stream?.event === 'end' && f.message_ref === 'tuA')
+  const endB = await client.waitFor((f) => f.tool_stream?.event === 'end' && f.message_ref === 'tuB')
+  assert.equal(endA.tool_stream.reason, 'disconnected')
+  assert.equal(endB.tool_stream.reason, 'disconnected')
+
+  // Producer 1's buffers are freed; producer 2's buffer is untouched.
+  assert.deepEqual(s.toolStreams.buffersFor(alice.id, 'sess-ts'), [])
+  assert.equal(s.toolStreams.buffersFor(alice.id, 'sess-ts2').length, 1)
+})
+
+test('a producer with no open tool streams closing is a clean no-op (no end frame)', async (t) => {
+  const { agent, client } = await setup(t)
+  client.send({ op: 'viewing', convo_id: 'sess-ts' })
+  client.send({ op: 'read_marker', convo_id: 'sess-ts', up_to_seq: null })
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'read_marker' && f.sender === 'user:alice')
+
+  agent.close()
+  await new Promise((r) => setTimeout(r, 120))
+  assert.equal(client.frames.some((f) => f.tool_stream), false)
+})
+
+test('a stream finalized before producer close does not double-emit an end frame', async (t) => {
+  const { s, alice, agent, client } = await setup(t)
+  client.send({ op: 'viewing', convo_id: 'sess-ts' })
+  client.send({ op: 'read_marker', convo_id: 'sess-ts', up_to_seq: null })
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'read_marker' && f.sender === 'user:alice')
+
+  agent.send({ op: 'stream_append', convo_id: 'sess-ts', message_ref: 'tuF', offset: 0, chunk: 'work\n', meta: { tool: 'Bash', command: 'make' } })
+  await client.waitFor((f) => f.tool_stream?.event === 'append')
+  agent.send({ op: 'finalize', convo_id: 'sess-ts', message_ref: 'tuF', type: 'tool_output', payload: { message_ref: 'tuF', exit_code: 0 } })
+  await client.waitFor((f) => f.kind === 'journal' && f.type === 'tool_output')
+  assert.deepEqual(s.toolStreams.buffersFor(alice.id, 'sess-ts'), []) // finalize freed it
+
+  agent.close() // producer drops AFTER finalize
+  await new Promise((r) => setTimeout(r, 120))
+  // The only stream retirement was the finalize journal frame — no end ephemeral, and none now.
+  assert.equal(client.frames.some((f) => f.tool_stream?.event === 'end'), false)
+})

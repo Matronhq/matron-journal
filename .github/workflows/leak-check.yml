@@ -1,0 +1,16 @@
+name: leak-check
+on:
+  # pull_request_target runs this file from the base branch with the
+  # organisation secret, so fork pull requests are checked too; the reusable
+  # workflow only reads the pull request's files, it never runs them.
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened]
+  push:
+    branches: [master]
+permissions:
+  contents: read
+jobs:
+  leak-check:
+    uses: Matronhq/.github/.github/workflows/leak-check.yml@main
+    secrets:
+      LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}

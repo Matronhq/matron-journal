@@ -1,0 +1,596 @@
+import { authorize } from './auth.js'
+import { isPrivateDevice } from './db.js'
+import { indexableBody } from './search.js'
+import { getMission, ORIGIN_SIEVE } from './missions.js'
+import { activateLink } from './mission-links.js'
+import { privateOwnedConvo } from './privacy.js'
+import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
+import { joinedAgentIds, participantConvosByRoom } from './participants.js'
+import { parseRepo } from './repo-identity.js'
+import { autoTitleColumns, convoMetaPayload, recomputeConvoTitle } from './convo-title.js'
+import { MESSAGE_TYPES, MESSAGE_TYPES_SQL } from './message-types.js'
+import { pinHintBeforeAppend, sendPinsFrame } from './pins.js'
+export { MESSAGE_TYPES, MESSAGE_TYPES_SQL }
+
+// Cap for a convo id wherever one arrives from outside the process —
+// ws.js's parent_convo_id/room_id validation and spawns.js's approveSpawn
+// capping the bridge-returned `start` rpc's convo_id — same 128-char id
+// ceiling as RPC request ids. Convo ids are conventionally Claude session
+// UUIDs (36 chars); this is a defensive upper bound, not a format
+// assertion. Lives here (not ws.js, where it originated) because spawns.js
+// needs it too and importing it from ws.js would be circular (ws.js already
+// imports from spawns.js).
+export const CONVO_ID_MAX_CHARS = 128
+
+// Events that must never reach an agent device, live or replayed. The
+// agent-chat approval card carries a peer agent's justification — the whole
+// consent design exists to keep that text away from agents until the user
+// approves, and the target agent MANAGES the room conversation the card sits
+// in, so the default fan-out would hand it straight over. The agent-spawn
+// card is the same story from the other side: it carries the child's seed
+// prompt as task text the user has not yet approved, published into the
+// PARENT's own conversation — a parent agent must not read back its own
+// unapproved ask, any more than a chat target may read an invite it hasn't
+// accepted. One predicate, consumed by ws.js fanOut, ws.js hello replay, and
+// http.js message reads — inlining the check at each site is how they drift
+// apart.
+//
+// The tracker mirror of either card (spec 2026-09-22 consent-items) is
+// announced by an `item` marker carrying `consent: 'spawn'|'chat'` — the
+// same rule applies to it: its title names the ask, and the room owner
+// hearing "dev-b asks to join" is exactly what parking exists to prevent.
+//
+// The two cards of person-to-person sharing (spec 2026-10-02
+// matron-to-matron sharing) are client-only for a stronger reason still:
+// they come from, or send data to, ANOTHER PERSON, and only a tap on the
+// user's own device may answer them — no agent, the Coordinator included,
+// ever hears of one.
+const CLIENT_ONLY_CARD_KINDS = new Set(['agent_chat', 'agent_spawn', 'contact_request', 'mission_share', 'person_room', 'session_share'])
+export const PEOPLE_EVENT_TYPE = 'people'
+
+export function isClientOnlyEvent(type, payload) {
+  if (!payload || typeof payload !== 'object') return false
+  if (type === 'permission_request') return CLIENT_ONLY_CARD_KINDS.has(payload.kind)
+  // Contact and grant audit events (sharing-events.js) name another person
+  // and what was shared with them: the user's business, never an agent's.
+  if (type === PEOPLE_EVENT_TYPE) return true
+  if (type === 'item') return typeof payload.consent === 'string' && payload.consent !== ''
+  // The Coordinator's answer to a consent card (spec: 2026-09-29 coordinator
+  // consent): the apps' "approved by the Coordinator" badge, never an
+  // agent's business — least of all the requester's.
+  if (type === 'consent_decision') return true
+  return false
+}
+
+export function snippetOf(type, payload) {
+  // Tolerate whatever an agent hands us — null/undefined/a bare string or
+  // number — rather than crashing on `payload.body` etc. A malformed
+  // payload just yields an empty/placeholder snippet, never a thrown error.
+  const p = payload && typeof payload === 'object' ? payload : {}
+  if (type === 'permission_request' && isClientOnlyEvent(type, payload)) {
+    if (p.kind === 'contact_request') return '🤝 Contact request'
+    if (p.kind === 'mission_share') return '🤝 Mission share request'
+    if (p.kind === 'person_room') return '🤝 Room with another person'
+    if (p.kind === 'session_share') return '🤝 Session share request'
+    return p.kind === 'agent_spawn' ? '🤝 Agent spawn request' : '🤝 Agent chat request'
+  }
+  if (type === PEOPLE_EVENT_TYPE) return `👥 ${String(p.summary || 'Contacts updated')}`.slice(0, 120)
+  if (type === 'text') return String(p.body || '').slice(0, 120)
+  if (type === 'prompt') return `? ${String(p.question || '').slice(0, 110)}`
+  if (type === 'permission_request') return `permission: ${String(p.description || '').slice(0, 100)}`
+  // A captioned attachment reads better in the chat list as what the user
+  // actually said than as a bare `[image]`. Ahead of the generic `p.snippet`
+  // rule because a caption is the user's own words about this specific
+  // attachment — the most specific description available.
+  if ((type === 'image' || type === 'file') && p.caption) return String(p.caption).slice(0, 120)
+  if (type === 'spawn_outcome') {
+    // Object.hasOwn, not `m[p.outcome]`: p.outcome is agent-authored (the
+    // bridge's `start` reply flows into it via the error path), so a value
+    // like 'constructor' or 'toString' must not resolve to an inherited
+    // Object.prototype value instead of falling through to the placeholder.
+    const m = { started: '🚀 Spawned session started', declined: '🚫 Spawn declined', expired: '⌛ Spawn request expired', failed: '❌ Spawn failed' }
+    return Object.hasOwn(m, p.outcome) ? m[p.outcome] : '[spawn_outcome]'
+  }
+  if (type === 'item') {
+    const glyph = p.kind === 'question' ? '❓' : p.kind === 'decision' ? '⚖' : p.kind === 'notice' ? '👁' : '☐'
+    return `${glyph} #${Number(p.num) || 0} ${String(p.title || '')}`.slice(0, 120)
+  }
+  if (type === 'milestone') {
+    const glyph = p.kind === 'user_input' ? '🚩' : '🏁'
+    return `${glyph} #${Number(p.num) || 0} ${String(p.title || '')}`.slice(0, 120)
+  }
+  if (type === 'mission') {
+    // The title is absent whenever the marker crossed the privacy boundary
+    // (missions-marker.js's withTitle) as well as when the payload is
+    // malformed — the snippet falls back to the number, which is exactly what
+    // the boundary allows through.
+    const n = Number(p.num) || 0
+    if (p.action === 'closed') return `🏁 Mission #${n} closed`
+    if (p.action === 'created') return (p.title ? `🏁 Mission #${n} started: ${String(p.title)}` : `🏁 Mission #${n} started`).slice(0, 120)
+    if (p.action === 'joined') return `🏁 Joined mission #${n}`
+    if (p.action === 'left') return `🏁 Left mission #${n}`
+    if (p.action === 'current_changed') return `🏁 Now on mission #${n}`
+    return `🏁 Mission #${n} updated`
+  }
+  if (p.snippet) return String(p.snippet).slice(0, 120)
+  if (type === 'tool_output' && p.command) return `$ ${String(p.command)}`.slice(0, 120)
+  // Matches the relay's fixed 'done'-category alert (see relay.js
+  // APS_ALERTS) — push.js's classify() only ever pushes a session_status
+  // event for a turn-finished transition (running -> waiting or -> done).
+  // "Turn", not "session": the session usually lives on after the turn
+  // ends, and calling it finished read wrong.
+  if (type === 'session_status') return 'Turn finished'
+  return `[${type}]`
+}
+
+// Missions (spec 2026-09-10): the mission a spawned conversation inherits
+// from its parent at creation — or null. Inheritance is a way INTO a
+// mission, so `join`'s own gates apply to it (final review, I1), all three
+// of them:
+//
+//   1. the mission must be VISIBLE to the creator, through the very sieve
+//      `getMission` applies for `GET /missions/:id` and `join` — an
+//      ordinary (non-private) agent must not be attached to a mission it
+//      can never read or write, whether it reached it through a
+//      private-owned PARENT or through a public parent the user had joined
+//      to a private-ORIGIN mission (both are ways around the sieve, and
+//      the second is invisible from the parent row alone);
+//   2. the mission must be OPEN — a closed mission accepts no joins.
+//
+// Sub-chats are never counted toward CONVOS_MAX (spec 2026-09-30 §3), so
+// there is no cap gate: a full mission still takes its sub-chats.
+//
+// A child that fails any gate simply starts with no mission. A creator with
+// no device id (an internal or test upsert) counts as unfiltered, like
+// every other privacy predicate.
+function inheritableMission(db, { parentConvoId, ownerUserId, agentDeviceId }) {
+  const missionId = db.prepare('SELECT mission_id FROM conversations WHERE id=? AND owner_user_id=?')
+    .get(parentConvoId, ownerUserId)?.mission_id ?? null
+  if (!missionId) return null
+  const filtered = agentDeviceId != null && !isPrivateDevice(db, agentDeviceId)
+  if (filtered && privateOwnedConvo(db, parentConvoId)) return null
+  const mission = getMission(db, ownerUserId, missionId, { excludePrivateOwned: filtered })
+  if (!mission || mission.state !== 'open') return null
+  return missionId
+}
+
+// Returns the conversation row plus `metaChanged` and `prevSessionState`.
+// `title` is the bridge's own title: it lands in auto_title (plus its parsed
+// short and marker) and `title` is recomposed from it and the current
+// mission (src/convo-title.js).
+// `metaChanged`: true when this call set metadata other devices must learn
+// live — an existing convo's display title or auto_title changed, a brand-new convo was
+// created with a non-empty title, or a child was created (parent_convo_id
+// set: the linkage must ride the journal even titleless, or a live client
+// would list the child as a normal conversation until its next /snapshot).
+// Callers (ws.js) use the flag to decide whether to fan out a `convo_meta`
+// journal event; no event on an unchanged title, an absent title, or a
+// state-only upsert.
+// `prevSessionState`: the session_state as it stood BEFORE this call
+// (undefined for a brand-new convo). Purely an in-memory hint for the push
+// pipeline's turn-finished detection (see push.js classify()) — never
+// stored or broadcast, so it carries no wire/protocol weight.
+export function upsertConversation(db, { id, ownerUserId, title, sessionState, agentDeviceId, parentConvoId, sessionOutcome, summary, repo }) {
+  // repo: undefined = unchanged, null = clear, string = canonical host/org/name.
+  let repoCols = null // { repo, scope } to write, or null to leave alone
+  if (repo === null) repoCols = { repo: null, scope: null }
+  else if (repo !== undefined) {
+    const p = parseRepo(repo)
+    if (!p) throw new Error('bad repo')
+    repoCols = { repo: p.repo, scope: p.scope }
+  }
+  const existing = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
+  const prevSessionState = existing ? existing.session_state : undefined
+  let metaChanged = false
+  if (existing) {
+    if (existing.owner_user_id !== ownerUserId) throw new Error('not authorized: convo owned by another user')
+    // The journal's own conversations (people-convo.js) are never an
+    // agent's to title, adopt or re-state.
+    if (existing.system != null) throw new Error('not authorized: system conversation')
+    if (title != null && title !== existing.auto_title) metaChanged = true
+    if (repoCols && (existing.repo ?? null) !== repoCols.repo) metaChanged = true
+    // agent_device_id: last upsert wins — the device currently managing the
+    // session owns delivery (see hub.js). An absent agentDeviceId leaves the
+    // recorded owner untouched.
+    // parent_convo_id is set once at creation and IMMUTABLE thereafter — it is
+    // deliberately never written on the update path, so a later upsert that
+    // omits it does not clear it and one carrying a different value does not
+    // change it (child linkage is a fixed structural fact of the conversation).
+    // session_outcome is the opposite: it is genuinely mutable (a run reaches
+    // its terminal outcome long after the row exists) and follows the same
+    // COALESCE-last-write-wins rule as session_state, so a bridge re-emitting
+    // outcomes after a reconnect is idempotent and an upsert that omits it
+    // leaves the recorded outcome alone.
+
+    // Ownership no-steal (spec: agent chat phase 2, the "last-writer-wins
+    // ownership flap" fix): a device that appears in convo_agents for this
+    // conversation — any state — is categorically a guest; its upsert keeps
+    // title/state fresh but never reassigns delivery ownership. A device
+    // with NO participant row keeps the takeover behavior (a re-paired
+    // bridge gets a new device id and must be able to reclaim its own
+    // sessions).
+    const guest = agentDeviceId != null
+      && existing.agent_device_id != null
+      && existing.agent_device_id !== agentDeviceId
+      && !!db.prepare('SELECT 1 FROM convo_agents WHERE convo_id=? AND agent_device_id=?').get(id, agentDeviceId)
+
+    db.prepare(
+      'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id), session_outcome=COALESCE(?, session_outcome), summary=COALESCE(?, summary) WHERE id=?'
+    ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), sessionOutcome ?? null, summary ?? null, id)
+    if (repoCols) db.prepare('UPDATE conversations SET repo=?, repo_scope=? WHERE id=?').run(repoCols.repo, repoCols.scope, id)
+    if (title != null) {
+      db.prepare('UPDATE conversations SET auto_title=@auto_title, session_short=@session_short, title_marker=@title_marker WHERE id=@id')
+        .run({ id, ...autoTitleColumns(title) })
+      recomputeConvoTitle(db, id)
+    }
+  } else {
+    const initialTitle = title || ''
+    // Missions (spec 2026-09-10): a spawned conversation inherits its
+    // parent's mission at creation, subject to the gates in
+    // inheritableMission above. Set once here and never on the update path
+    // — same immutability as parent_convo_id.
+    const inheritedMission = parentConvoId ? inheritableMission(db, { parentConvoId, ownerUserId, agentDeviceId }) : null
+    const createdAt = Date.now()
+    // The row and its inherited link are one write: the invariant "a
+    // non-null mission_id has an active link" must hold from birth.
+    db.transaction(() => {
+      db.prepare(
+        'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, mission_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)'
+      ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', inheritedMission, createdAt)
+      db.prepare('UPDATE conversations SET auto_title=@auto_title, session_short=@session_short, title_marker=@title_marker WHERE id=@id')
+        .run({ id, ...autoTitleColumns(initialTitle) })
+      if (inheritedMission) activateLink(db, { missionId: inheritedMission, convoId: id, userId: ownerUserId, how: 'inherited', ts: createdAt })
+      recomputeConvoTitle(db, id)
+    })()
+    if (initialTitle || parentConvoId) metaChanged = true
+    if (repoCols && repoCols.repo) {
+      db.prepare('UPDATE conversations SET repo=?, repo_scope=? WHERE id=?').run(repoCols.repo, repoCols.scope, id)
+      metaChanged = true
+    }
+  }
+  const convo = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
+  if (existing && convo.title !== existing.title) metaChanged = true
+  return { ...convo, metaChanged, prevSessionState }
+}
+
+// Fan a convo_meta for each conversation the journal itself retitled — a
+// mission change recomposed it (src/convo-title.js). Same payload shape as
+// convo_upsert's rename fan. Best-effort: the titles are committed and
+// /snapshot serves them, so a failed fan logs and moves on.
+export function fanRetitled(db, hub, convos) {
+  for (const c of convos ?? []) {
+    try {
+      appendAndBroadcast(db, hub, { userId: c.owner_user_id, convoId: c.id, sender: 'journal', type: 'convo_meta', payload: convoMetaPayload(c) })
+    } catch (err) {
+      console.error('convo title: retitle fan failed (title already committed)', err)
+    }
+  }
+}
+
+const nextSeq = (db, userId) =>
+  db.prepare(
+    'INSERT INTO user_seq(user_id, seq) VALUES(?,1) ON CONFLICT(user_id) DO UPDATE SET seq=seq+1 RETURNING seq'
+  ).get(userId).seq
+
+export function append(db, { userId, convoId, sender, type, payload, blobRef = null, idemKey = null }) {
+  return db.transaction(() => {
+    const convo = db.prepare('SELECT owner_user_id, parent_convo_id FROM conversations WHERE id=?').get(convoId)
+    if (!convo || convo.owner_user_id !== userId) throw new Error('not authorized: convo missing or not owned')
+    if (idemKey) {
+      const dup = db.prepare('SELECT seq, ts FROM events WHERE user_id=? AND convo_id=? AND idem_key=?').get(userId, convoId, idemKey)
+      if (dup) return { seq: dup.seq, ts: dup.ts, duplicate: true }
+    }
+    const seq = nextSeq(db, userId)
+    const ts = Date.now()
+    // JSON.stringify(undefined) is the JS value `undefined`, not a string —
+    // binding that would hit the payload column's NOT NULL constraint as a
+    // raw SQLite error. A caller that omits `payload` entirely gets `null`
+    // stored instead, so this always fails at the same clean layer as an
+    // explicit null/non-object payload (see the guards below).
+    const payloadJson = JSON.stringify(payload === undefined ? null : payload)
+    db.prepare(
+      'INSERT INTO events(user_id, seq, convo_id, ts, sender, type, payload, blob_ref, idem_key) VALUES(?,?,?,?,?,?,?,?,?)'
+    ).run(userId, seq, convoId, ts, sender, type, payloadJson, blobRef, idemKey)
+    // Search index feed (spec: agent journal search) — same transaction as
+    // the event row, so the index can never hold a row the journal doesn't
+    // (or vice versa). Plain INSERT, never OR REPLACE/OR IGNORE: a duplicate
+    // (user_id, seq) is impossible for a freshly-minted seq, and failing
+    // loudly beats silently corrupting the external-content FTS pair.
+    const searchBody = indexableBody(type, payload)
+    if (searchBody != null) {
+      db.prepare(
+        'INSERT INTO search_messages(user_id, convo_id, seq, ts, sender, body) VALUES(?,?,?,?,?,?)'
+      ).run(userId, convoId, seq, ts, sender, searchBody)
+    }
+    if (type === 'session_status') {
+      // Guard against a malformed agent payload (null/undefined/non-object,
+      // or an object with no string `state`) reaching the DB as a raw
+      // bind-type or CHECK-constraint crash — fail with one clear, expected
+      // error instead (still rolls back the whole transaction).
+      const state = payload && typeof payload === 'object' ? payload.state : undefined
+      if (typeof state !== 'string') throw new Error('invalid session_status payload: state must be a string')
+      db.prepare('UPDATE conversations SET last_seq=?, session_state=? WHERE id=?')
+        .run(seq, state, convoId)
+    } else if (MESSAGE_TYPES.includes(type)) {
+      // A user's own message (sender `user:*`) never inflates their own unread
+      // badge — only content from someone/something else (an agent, mirroring
+      // a bridge's remote participant) counts as unread. Keep this predicate in
+      // sync with the recompute query in markRead() below.
+      // Child conversations (parent_convo_id set) are silent: a subagent's
+      // sub-chat rides the journal for durability but must never bump the
+      // owner's unread badge (server-side "silent children", mirrored by the
+      // push pipeline's short-circuit in push.js). last_seq/snippet still
+      // advance — only the unread increment is exempt.
+      const sql = sender.startsWith('user:') || convo.parent_convo_id != null
+        ? 'UPDATE conversations SET last_seq=?, snippet=? WHERE id=?'
+        : 'UPDATE conversations SET last_seq=?, unread_count=unread_count+1, snippet=? WHERE id=?'
+      db.prepare(sql).run(seq, snippetOf(type, payload), convoId)
+    } else {
+      db.prepare('UPDATE conversations SET last_seq=? WHERE id=?').run(seq, convoId)
+    }
+    return { seq, ts, duplicate: false }
+  })()
+}
+
+// Append + fan for JOURNAL-authored events (spawn-room lines, room meta) —
+// the ws.js fanOut lives inside a connection closure this caller doesn't
+// have. Same agent-targeting rules as fanOut: client-only events reach no
+// agent; otherwise the recorded owner + joined participants. Differences,
+// both deliberate: no sender_device_id (there is no producing connection)
+// and no push pipeline (a journal-authored room line is not an
+// attention-worthy push).
+export function appendAndBroadcast(db, hub, { userId, convoId, sender, type, payload }) {
+  const hinted = pinHintBeforeAppend(db, userId, convoId, type)
+  const r = append(db, { userId, convoId, sender, type, payload })
+  if (r.duplicate) return r
+  broadcastAppended(db, hub, { userId, convoId, seq: r.seq, ts: r.ts, sender, type, payload })
+  if (hinted) sendPinsFrame(db, hub, userId)
+  return r
+}
+
+// The fan-out half of appendAndBroadcast, for callers that must append
+// INSIDE their own transaction (a milestone's marker seq is the row's
+// anchor) and broadcast only after it commits. Same targeting rules.
+export function broadcastAppended(db, hub, { userId, convoId, seq, ts, sender, type, payload }) {
+  const frame = { kind: 'journal', ...toEventShape({ seq, convo_id: convoId, ts, sender, type, payload }) }
+  const targets = isClientOnlyEvent(type, payload) ? new Set() : agentTargetsFor(db, convoId)
+  hub.broadcastJournal(userId, frame, targets)
+}
+
+// The agent devices allowed to see a conversation's traffic — hub's
+// agentTargets (spec: agent chat phase 2 room fan-out): the recorded owner
+// plus joined participants. null = no recorded owner (legacy row), which
+// the hub treats as broadcast-to-every-agent. A private box's convos and an
+// unjoined room therefore never reach another agent. Shared by live journal
+// fan-out, hello replay, and ephemeral delivery so the rule lives once.
+export function agentTargetsFor(db, convoId) {
+  const row = db.prepare('SELECT agent_device_id, system FROM conversations WHERE id=?').get(convoId)
+  // A system conversation (people-convo.js) has no owner on purpose, and
+  // that must not read as the legacy "unknown owner, tell every agent".
+  if (row?.system != null) return new Set()
+  const ownerId = row?.agent_device_id ?? null
+  return ownerId == null ? null : new Set([ownerId, ...joinedAgentIds(db, convoId)])
+}
+
+const parseRow = (r) => ({ ...r, payload: JSON.parse(r.payload) })
+
+// Single source of truth for the public event shape shared by WS journal frames
+// and HTTP pagination — strips internal columns (user_id, idem_key, blob_ref).
+export const toEventShape = ({ seq, convo_id, ts, sender, type, payload }) =>
+  ({ seq, convo_id, ts, sender, type, payload })
+
+// `opts` (spec: agent visibility & privacy, task 8) — both default off, so
+// the one existing call site (http.js /snapshot) is the only caller that
+// opts in and every other hypothetical caller keeps the original shape:
+//   - omitSnippet: never hand back the `snippet` column. snippetOf() can
+//     surface tool_output text (where credentials land — see its `p.snippet`
+//     branch), so this must apply to EVERY agent caller, not just filtered
+//     ones. Mirrors /roster's deliberate snippet omission (same reason).
+//   - excludePrivateOwned: same predicate shape as the roster's conversations
+//     query — a private device's conversations are dropped unless
+//     agent_device_id is NULL (never private-owned). Only for the "ordinary
+//     agent" caller; clients and private agents pass this false.
+export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned = false, excludeSystem = false } = {}) {
+  // last_ts: timestamp of the conversation's newest MESSAGE event, so a
+  // client can show a correct "last activity" time from a snapshot alone.
+  // Without it, a client refreshing via /snapshot after missing frames
+  // advanced the snippet but kept a stale timestamp. Message types only:
+  // session_status (the reaper winding a session down), convo_meta (renames,
+  // membership fans) and read_marker rows also land in `events` with fresh
+  // timestamps, and counting them resurfaced hour-old chats as "8m ago"
+  // after every snapshot refresh — the exact phantom-aliveness bug the
+  // clients' live path already filters against. NULL when a conversation
+  // has no message events (just created, or history pruned by retention) —
+  // clients fall back to created_at. The (convo_id, seq) index keeps the
+  // subquery a backwards seek to the first message row.
+  // mission_id / mission_count (spec 2026-09-30 §3): the header chip without
+  // a fetch — the current mission and how many missions this conversation
+  // ever touched; a filtered caller never counts or names a private-origin
+  // mission.
+  const conversations = db.prepare(
+    `SELECT id, title, auto_title, session_state, session_outcome, last_seq, unread_count,
+            ${omitSnippet ? 'NULL' : 'snippet'} AS snippet,
+            parent_convo_id, summary, repo, created_at, agent_device_id, system,
+            ${excludePrivateOwned
+              ? `(CASE WHEN EXISTS (SELECT 1 FROM missions m WHERE m.id = conversations.mission_id AND ${ORIGIN_SIEVE}) THEN conversations.mission_id END)`
+              : 'mission_id'} AS mission_id,
+            (SELECT COUNT(*) FROM mission_conversations l JOIN missions m ON m.id = l.mission_id
+              WHERE l.convo_id = conversations.id${excludePrivateOwned ? ` AND ${ORIGIN_SIEVE}` : ''}) AS mission_count,
+            (SELECT ts FROM events e WHERE e.convo_id = conversations.id
+             AND e.type IN (${MESSAGE_TYPES_SQL})
+             ORDER BY e.seq DESC LIMIT 1) AS last_ts
+     FROM conversations WHERE owner_user_id=?${excludeSystem ? ' AND system IS NULL' : ''}${excludePrivateOwned
+       ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
+              SELECT 1 FROM devices d WHERE d.id=conversations.agent_device_id AND d.private=1))`
+       : ''}
+     ORDER BY last_seq DESC`
+  ).all(userId)
+  // Room membership, so a client can chip every participating box, not just
+  // the recorded owner (spec: multi-agent room tags), and place a room under
+  // its participants' missions (spec: 2026-10-01 rooms under missions).
+  // Every ROOM row carries both keys; every other row omits both, so the wire
+  // stays byte-identical for solo sessions:
+  //   - `participants`: owner + joined device ids, deduped, ascending — the
+  //     array membership convo_meta frames carry (participantIds);
+  //   - `participant_convos`: the room's participant sessions
+  //     (participantConvoIds in participants.js), [] when unknown or when
+  //     nobody is joined.
+  // A room is any conversation that has, or ever had, a convo_agents row or
+  // a spawn naming it as its room — so a dissolved room still carries
+  // `participants: [owner]` and `participant_convos: []`, the same values its
+  // dissolve convo_meta carried. Clients keep a stored value when the key is
+  // absent, so omitting it there would strand a client that missed the
+  // dissolve frame with the old membership forever. Same private-device
+  // sieve as the `agents` list below: a filtered caller must not learn a
+  // private box's id from a membership array, nor that a room exists only
+  // because a private box was in it — rows involving a private device
+  // neither count as members nor make a conversation a room.
+  const sieve = (col) => excludePrivateOwned
+    ? ` AND NOT EXISTS(SELECT 1 FROM devices d WHERE d.id=${col} AND d.private=1)`
+    : ''
+  const roomIds = new Set(db.prepare(
+    `SELECT ca.convo_id AS id FROM convo_agents ca
+     JOIN conversations c ON c.id = ca.convo_id
+     WHERE c.owner_user_id=?${sieve('ca.agent_device_id')}${sieve('ca.initiator_device_id')}
+     UNION
+     SELECT s.room_id FROM agent_spawn_requests s
+     JOIN conversations c ON c.id = s.room_id
+     WHERE c.owner_user_id=?${sieve('s.from_device_id')}${sieve('s.target_device_id')}`
+  ).all(userId, userId).map((r) => r.id))
+  const joinedRows = db.prepare(
+    `SELECT ca.convo_id, ca.agent_device_id FROM convo_agents ca
+     JOIN conversations c ON c.id = ca.convo_id
+     WHERE c.owner_user_id=? AND ca.state='joined'${sieve('ca.agent_device_id')}`
+  ).all(userId)
+  const joinedByConvo = new Map()
+  for (const r of joinedRows) {
+    if (!joinedByConvo.has(r.convo_id)) joinedByConvo.set(r.convo_id, [])
+    joinedByConvo.get(r.convo_id).push(r.agent_device_id)
+  }
+  const convosByRoom = participantConvosByRoom(db, userId, { excludePrivateOwned })
+  for (const c of conversations) {
+    // `system` rides only the journal's own conversations (people-convo.js);
+    // every other row keeps the shape it always had.
+    if (c.system == null) delete c.system
+    if (!roomIds.has(c.id)) continue
+    const ids = new Set(joinedByConvo.get(c.id) ?? [])
+    if (c.agent_device_id != null) ids.add(c.agent_device_id)
+    c.participants = [...ids].sort((a, b) => a - b)
+    c.participant_convos = convosByRoom.get(c.id) ?? []
+  }
+  // id -> name for the user's agent boxes, so a client can render the
+  // owning box of each conversation without a second round-trip. Same
+  // privacy predicate as the conversation filter above: a filtered
+  // (ordinary agent) caller must not learn private boxes exist. Client
+  // devices are deliberately absent — they are not boxes.
+  // Names go out through the same sieve /devices uses: pairing predates the
+  // rename endpoint's validation, so a stored name can still carry newlines
+  // or control characters.
+  const agents = db.prepare(
+    `SELECT id AS device_id, name, tag_char FROM devices
+     WHERE user_id=? AND kind='agent'${excludePrivateOwned ? ' AND private=0' : ''} ORDER BY id`
+  ).all(userId).map((a) => ({
+    device_id: a.device_id,
+    name: a.name == null ? null : sanitizePeerText(a.name, PEER_NAME_CAP),
+    // tag_char is born validated (the /tag and /pair/approve sieves are the
+    // only writers), so it goes out as stored — no pairing-era legacy here.
+    tag_char: a.tag_char ?? null,
+  }))
+  const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)
+  return { conversations, agents, seq: head ? head.seq : 0 }
+}
+
+export function eventsAfter(db, userId, cursor, limit = 500) {
+  return db.prepare(
+    'SELECT * FROM events WHERE user_id=? AND seq>? ORDER BY seq LIMIT ?'
+  ).all(userId, cursor, limit).map(parseRow)
+}
+
+export function messagesBefore(db, userId, convoId, { beforeSeq = null, limit = 50 } = {}) {
+  if (!authorize(db, userId, convoId)) throw new Error('not authorized')
+  const rows = beforeSeq == null
+    ? db.prepare('SELECT * FROM events WHERE convo_id=? ORDER BY seq DESC LIMIT ?').all(convoId, limit)
+    : db.prepare('SELECT * FROM events WHERE convo_id=? AND seq<? ORDER BY seq DESC LIMIT ?').all(convoId, beforeSeq, limit)
+  return rows.reverse().map(parseRow)
+}
+
+// Context window for a search hit (spec: agent journal search, around_seq).
+// floor(limit/2) rows strictly before the anchor, the remainder from the
+// anchor up — so the anchor row itself is included when it exists, and
+// either end of the conversation just yields a short window, never an
+// error. Ascending order, same authorize() gate as messagesBefore.
+export function messagesAround(db, userId, convoId, { aroundSeq, limit = 30 } = {}) {
+  if (!authorize(db, userId, convoId)) throw new Error('not authorized')
+  const before = Math.floor(limit / 2)
+  const after = limit - before
+  const rows = [
+    ...db.prepare('SELECT * FROM events WHERE convo_id=? AND seq<? ORDER BY seq DESC LIMIT ?')
+      .all(convoId, aroundSeq, before).reverse(),
+    ...db.prepare('SELECT * FROM events WHERE convo_id=? AND seq>=? ORDER BY seq LIMIT ?')
+      .all(convoId, aroundSeq, after),
+  ]
+  return rows.map(parseRow)
+}
+
+// Same window shape as messagesAround, but the seq set is picked FROM
+// search_messages — exactly the indexable (prose) set, indexed by
+// (convo_id, seq) — instead of windowing over every event and filtering
+// after. In a tool_output-heavy conversation, windowing over ALL events
+// first can starve a small limit down to a couple of prose rows before the
+// caller ever gets to filter; picking the window from the already-indexed
+// set means every row returned is one the caller can see. The seqs found
+// are then re-fetched from `events` (search_messages doesn't carry the full
+// payload) and mapped through the same parseRow as every other reader.
+export function messagesAroundIndexed(db, userId, convoId, { aroundSeq, limit = 30 } = {}) {
+  if (!authorize(db, userId, convoId)) throw new Error('not authorized')
+  const before = Math.floor(limit / 2)
+  const after = limit - before
+  const seqs = [
+    ...db.prepare('SELECT seq FROM search_messages WHERE convo_id=? AND seq<? ORDER BY seq DESC LIMIT ?')
+      .all(convoId, aroundSeq, before).map((r) => r.seq).reverse(),
+    ...db.prepare('SELECT seq FROM search_messages WHERE convo_id=? AND seq>=? ORDER BY seq LIMIT ?')
+      .all(convoId, aroundSeq, after).map((r) => r.seq),
+  ]
+  if (seqs.length === 0) return []
+  const placeholders = seqs.map(() => '?').join(',')
+  const rows = db.prepare(
+    `SELECT * FROM events WHERE convo_id=? AND seq IN (${placeholders}) ORDER BY seq`
+  ).all(convoId, ...seqs)
+  return rows.map(parseRow)
+}
+
+// `sender` defaults to the caller's own `user:<name>` identity (the original
+// client-only behavior) but callers may pass an explicit identity string —
+// ws.js does, so an agent connection marking read on behalf of its user gets
+// `agent:<name>` instead (see the read_marker op handler).
+//
+// `upToSeq: null` means "resolve to this conversation's current last_seq at
+// processing time" — a bridge mirroring a user's own messages publishes
+// fire-and-forget and never learns the seq it was assigned, so it can't pass
+// an explicit cursor. Resolution happens inside this transaction so it's
+// consistent with the recompute below.
+export function markRead(db, userId, convoId, upToSeq, sender = null) {
+  return db.transaction(() => {
+    const convo = db.prepare('SELECT owner_user_id, last_seq FROM conversations WHERE id=?').get(convoId)
+    if (!convo || convo.owner_user_id !== userId) throw new Error('not authorized: convo missing or not owned')
+    const resolvedUpToSeq = upToSeq == null ? convo.last_seq : upToSeq
+    const finalSender = sender ?? `user:${db.prepare('SELECT name FROM users WHERE id=?').get(userId).name}`
+    const r = append(db, {
+      userId, convoId, sender: finalSender, type: 'read_marker',
+      payload: { convo_id: convoId, up_to_seq: resolvedUpToSeq },
+    })
+    const placeholders = MESSAGE_TYPES.map(() => '?').join(',')
+    // Mirrors append()'s unread predicate: only non-`user:*`-sender messages
+    // count as unread, so a recompute after read never resurrects the
+    // reader's own messages as unread — and silent children
+    // (parent_convo_id set) are skipped entirely, so a partial read_marker
+    // can never resurrect a positive count append() would not have made.
+    db.prepare(
+      `UPDATE conversations SET unread_count=(
+         SELECT COUNT(*) FROM events e WHERE e.convo_id=? AND e.seq>? AND e.type IN (${placeholders})
+           AND e.sender NOT LIKE 'user:%'
+       ) WHERE id=? AND parent_convo_id IS NULL`
+    ).run(convoId, resolvedUpToSeq, ...MESSAGE_TYPES, convoId)
+    return { ...r, upToSeq: resolvedUpToSeq }
+  })()
+}

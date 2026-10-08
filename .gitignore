@@ -1,0 +1,8 @@
+node_modules/
+# …and as a symlink (a worktree borrowing the main checkout's install)
+/node_modules
+*.db
+*.db-wal
+*.db-shm
+/media/
+preapprove.key

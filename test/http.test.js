@@ -1,0 +1,659 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { startTestServer } from './helpers.js'
+import { createUser, createAgent } from '../src/auth.js'
+import { upsertConversation, append } from '../src/journal.js'
+import { inviteParticipant, answerInvite } from '../src/participants.js'
+import { saveGithubIdentity, markGithubStale } from '../src/github-accounts.js'
+import { createItem } from '../src/items.js'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { pinDevicePrivate } from '../src/db.js'
+
+test('login → snapshot → pagination over HTTP', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const alice = await createUser(s.db, 'alice', 'hunter22')
+  upsertConversation(s.db, { id: 'c1', ownerUserId: alice.id, title: 'T' })
+  append(s.db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: 'hi' } })
+
+  const bad = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'no', device_name: 'x' } })
+  assert.equal(bad.status, 403)
+  const ok = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'hunter22', device_name: 'mac' } })
+  assert.equal(ok.status, 200)
+
+  assert.equal((await s.http('/snapshot', {})).status, 401)
+  const snap = await s.http('/snapshot', { token: ok.json.token })
+  assert.equal(snap.json.seq, 1)
+  assert.equal(snap.json.conversations.length, 1)
+
+  const page = await s.http('/convo/c1/messages?limit=10', { token: ok.json.token })
+  assert.equal(page.json.events[0].payload.body, 'hi')
+  // pagination shape must match the WS journal frame shape (minus `kind`) and must not
+  // leak internal columns like user_id, idem_key, blob_ref
+  assert.deepEqual(Object.keys(page.json.events[0]).sort(), ['convo_id', 'payload', 'sender', 'seq', 'ts', 'type'])
+
+  await createUser(s.db, 'pat', 'pw')
+  const pat = await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'x' } })
+  // Unauthorized and missing are indistinguishable: both 404, same body as
+  // GET /media/:id's unknown-id response — never 403 (that would leak that
+  // the convo id exists at all).
+  const forbidden = await s.http('/convo/c1/messages', { token: pat.json.token })
+  assert.equal(forbidden.status, 404)
+  assert.deepEqual(forbidden.json, { error: 'not_found' })
+  const unknown = await s.http('/convo/does-not-exist/messages', { token: ok.json.token })
+  assert.equal(unknown.status, 404)
+  assert.deepEqual(unknown.json, { error: 'not_found' })
+})
+
+test('GET /convo/:id/messages validates limit, before_seq, and percent-encoding', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const alice = await createUser(s.db, 'alice', 'pw')
+  upsertConversation(s.db, { id: 'c1', ownerUserId: alice.id })
+  for (let i = 0; i < 5; i++) {
+    append(s.db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: `m${i}` } })
+  }
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'mac' } })
+  const token = login.json.token
+
+  for (const limit of ['0', '-1', 'abc', '1.5', 'NaN']) {
+    const r = await s.http(`/convo/c1/messages?limit=${limit}`, { token })
+    assert.equal(r.status, 400, `limit=${limit} should be 400`)
+    assert.deepEqual(r.json, { error: 'bad_request' })
+  }
+  // over 200 is clamped, not rejected
+  const clamped = await s.http('/convo/c1/messages?limit=500', { token })
+  assert.equal(clamped.status, 200)
+  const atCap = await s.http('/convo/c1/messages?limit=200', { token })
+  assert.equal(atCap.status, 200)
+
+  for (const beforeSeq of ['abc', '1.5', 'Infinity']) {
+    const r = await s.http(`/convo/c1/messages?before_seq=${beforeSeq}`, { token })
+    assert.equal(r.status, 400, `before_seq=${beforeSeq} should be 400`)
+    assert.deepEqual(r.json, { error: 'bad_request' })
+  }
+  const validBeforeSeq = await s.http('/convo/c1/messages?before_seq=3', { token })
+  assert.equal(validBeforeSeq.status, 200)
+
+  // malformed percent-encoding in the convo id path segment
+  const badEncoding = await fetch(s.base + '/convo/%zz/messages', { headers: { authorization: `Bearer ${token}` } })
+  assert.equal(badEncoding.status, 400)
+  assert.deepEqual(await badEncoding.json(), { error: 'bad_request' })
+})
+
+test('GET /convo/:id/messages: agent tokens are gated by authorizeAgentWrite (owner/joined only), never a bare same-user check; client tokens are unchanged', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const alice = await createUser(s.db, 'alice', 'pw')
+  const owner = createAgent(s.db, alice.id, 'owner')
+  const stranger = createAgent(s.db, alice.id, 'stranger')
+  const guest = createAgent(s.db, alice.id, 'guest')
+  upsertConversation(s.db, { id: 'room', ownerUserId: alice.id, title: 'room', sessionState: 'running', agentDeviceId: owner.deviceId })
+  append(s.db, { userId: alice.id, convoId: 'room', sender: 'agent:owner', type: 'text', payload: { body: 'hi' } })
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'mac' } })
+
+  // A same-user agent that is neither the owner nor a joined participant is
+  // rejected — this is the whole point of the fix: pre-fix, any agent token
+  // of the user could read any other agent's conversation transcript.
+  const foreign = await s.http('/convo/room/messages', { token: stranger.token })
+  assert.equal(foreign.status, 404)
+  assert.deepEqual(foreign.json, { error: 'not_found' })
+
+  // The recorded owner reads fine.
+  const ownerRes = await s.http('/convo/room/messages', { token: owner.token })
+  assert.equal(ownerRes.status, 200)
+  assert.equal(ownerRes.json.events.length, 1)
+  assert.equal(ownerRes.json.events[0].payload.body, 'hi')
+
+  // A joined participant reads fine too (this is what agent_chat_read's
+  // "allowed for joined agents" needs).
+  inviteParticipant(s.db, { convoId: 'room', agentDeviceId: guest.deviceId, initiatorDeviceId: owner.deviceId, justification: 'x' })
+  answerInvite(s.db, { convoId: 'room', agentDeviceId: guest.deviceId, accept: true })
+  const guestRes = await s.http('/convo/room/messages', { token: guest.token })
+  assert.equal(guestRes.status, 200)
+  assert.equal(guestRes.json.events.length, 1)
+
+  // A client token of the same user is unaffected — still just user-scoped
+  // ownership, same as before this fix.
+  const clientRes = await s.http('/convo/room/messages', { token: login.json.token })
+  assert.equal(clientRes.status, 200)
+  assert.equal(clientRes.json.events.length, 1)
+})
+
+test('POST /login and /push/register reject a non-object JSON body (null, array, bare primitive) with 400, not 500', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'alice', 'pw')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'mac' } })
+  const token = login.json.token
+
+  // Each /login attempt gets its own cf-connecting-ip so this loop doesn't
+  // trip the 5/min per-IP rate limiter (unrelated to what's under test here).
+  let nextIp = 1
+  const postRaw = (path, rawBody, tok) => fetch(s.base + path, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'cf-connecting-ip': `10.9.9.${nextIp++}`,
+      ...(tok ? { authorization: `Bearer ${tok}` } : {}),
+    },
+    body: rawBody,
+  })
+
+  for (const rawBody of ['null', '"a string"', '42', 'true', '[1,2,3]']) {
+    const r1 = await postRaw('/login', rawBody)
+    assert.equal(r1.status, 400, `/login body=${rawBody}`)
+    assert.deepEqual(await r1.json(), { error: 'bad_request' })
+
+    const r2 = await postRaw('/push/register', rawBody, token)
+    assert.equal(r2.status, 400, `/push/register body=${rawBody}`)
+    assert.deepEqual(await r2.json(), { error: 'bad_request' })
+  }
+  // genuinely malformed JSON syntax also 400s at the same shared guard, not 500
+  const r3 = await postRaw('/login', '{not json')
+  assert.equal(r3.status, 400)
+  assert.deepEqual(await r3.json(), { error: 'bad_request' })
+})
+
+test('POST /login rejects structurally invalid bodies with 400 bad_request, never 500', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'alice', 'hunter22')
+
+  // Each attempt gets its own cf-connecting-ip so this test never trips the
+  // 5/min per-IP rate limiter (unrelated to what's under test here).
+  let nextIp = 1
+  const postRaw = (rawBody) => fetch(s.base + '/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'cf-connecting-ip': `10.8.8.${nextIp++}` },
+    body: rawBody,
+  })
+
+  const malformed = [
+    ['{}', 'empty object'],
+    ['{"username":"alice"}', 'missing password'],
+    ['{"password":"hunter22"}', 'missing username'],
+    ['{"username":42,"password":"hunter22"}', 'non-string username'],
+    ['{"username":"alice","password":42}', 'non-string password'],
+    ['{"username":"","password":"hunter22"}', 'empty-string username'],
+    ['{"username":"alice","password":""}', 'empty-string password'],
+    ['{"username":null,"password":null}', 'null fields'],
+    ['{not json', 'unparseable body'],
+    ['', 'empty body'],
+  ]
+  for (const [rawBody, label] of malformed) {
+    const r = await postRaw(rawBody)
+    assert.equal(r.status, 400, `${label} (body=${JSON.stringify(rawBody)}) should be 400`)
+    assert.deepEqual(await r.json(), { error: 'bad_request' }, `${label} body`)
+  }
+
+  // Malformed attempts must not have fed the per-username login guard: a
+  // real login for the username they named still succeeds immediately.
+  const ok = await postRaw(JSON.stringify({ username: 'alice', password: 'hunter22', device_name: 'mac' }))
+  assert.equal(ok.status, 200)
+
+  // Regression: a well-formed body with wrong credentials keeps its existing
+  // semantics — 403 bad_credentials, not 400.
+  const wrong = await postRaw(JSON.stringify({ username: 'alice', password: 'wrong', device_name: 'mac' }))
+  assert.equal(wrong.status, 403)
+  assert.deepEqual(await wrong.json(), { error: 'bad_credentials' })
+
+  // device_name: optional, but when present it must be a string (or null).
+  // A non-primitive here used to reach issueDevice's INSERT bind and 500 —
+  // with VALID credentials. A numeric one used to bind fine and return 200;
+  // that is now deliberately tightened to 400 (junk shape).
+  const objDevice = await postRaw(JSON.stringify({ username: 'alice', password: 'hunter22', device_name: { a: 1 } }))
+  assert.equal(objDevice.status, 400, 'object device_name should be 400')
+  assert.deepEqual(await objDevice.json(), { error: 'bad_request' })
+  const numDevice = await postRaw(JSON.stringify({ username: 'alice', password: 'hunter22', device_name: 42 }))
+  assert.equal(numDevice.status, 400, 'numeric device_name should be 400')
+  assert.deepEqual(await numDevice.json(), { error: 'bad_request' })
+  // absent and null device_name stay valid logins (default device name)
+  const absentDevice = await postRaw(JSON.stringify({ username: 'alice', password: 'hunter22' }))
+  assert.equal(absentDevice.status, 200, 'absent device_name should be 200')
+  const nullDevice = await postRaw(JSON.stringify({ username: 'alice', password: 'hunter22', device_name: null }))
+  assert.equal(nullDevice.status, 200, 'null device_name should be 200')
+})
+
+test('an unexpected internal error responds 500 with a generic body only, no message leak, and the server stays up', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const alice = await createUser(s.db, 'alice', 'pw')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'mac' } })
+  const mute = t.mock.method(console, 'error', () => {}) // the catch is expected to log; keep test output clean
+  s.db.exec('DROP TABLE conversations')
+  const r = await s.http('/snapshot', { token: login.json.token })
+  assert.equal(r.status, 500)
+  assert.deepEqual(r.json, { error: 'internal' })
+  assert.ok(mute.mock.callCount() >= 1, 'expected the error to be logged server-side')
+  // server keeps answering other requests after an internal error
+  assert.equal((await s.http('/snapshot', {})).status, 401)
+})
+
+test('login for an unknown username still gets the normal rejection, not a 500', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const r = await s.http('/login', { method: 'POST', body: { username: 'nobody-here', password: 'x', device_name: 'y' } })
+  assert.equal(r.status, 403)
+  assert.deepEqual(r.json, { error: 'bad_credentials' })
+})
+
+test('POST /push/register: client devices can register/unregister an apns token; agents get 403', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const alice = await createUser(s.db, 'alice', 'pw')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'phone' } })
+  const token = login.json.token
+  const deviceId = login.json.device_id
+
+  const reg = await s.http('/push/register', { method: 'POST', token, body: { apns_token: 'abc123', environment: 'sandbox' } })
+  assert.equal(reg.status, 200)
+  let row = s.db.prepare('SELECT apns_token, apns_env FROM devices WHERE id=?').get(deviceId)
+  assert.equal(row.apns_token, 'abc123')
+  assert.equal(row.apns_env, 'sandbox')
+
+  // {apns_token: null} unregisters (both columns cleared)
+  const unreg = await s.http('/push/register', { method: 'POST', token, body: { apns_token: null } })
+  assert.equal(unreg.status, 200)
+  row = s.db.prepare('SELECT apns_token, apns_env FROM devices WHERE id=?').get(deviceId)
+  assert.equal(row.apns_token, null)
+  assert.equal(row.apns_env, null)
+
+  // bad environment -> 400, nothing stored
+  const badEnv = await s.http('/push/register', { method: 'POST', token, body: { apns_token: 'abc123', environment: 'staging' } })
+  assert.equal(badEnv.status, 400)
+  assert.deepEqual(badEnv.json, { error: 'bad_request' })
+
+  // missing/non-string apns_token -> 400
+  const missingToken = await s.http('/push/register', { method: 'POST', token, body: { environment: 'prod' } })
+  assert.equal(missingToken.status, 400)
+  const numericToken = await s.http('/push/register', { method: 'POST', token, body: { apns_token: 12345, environment: 'prod' } })
+  assert.equal(numericToken.status, 400)
+
+  // still unregistered after all the rejected attempts
+  row = s.db.prepare('SELECT apns_token, apns_env FROM devices WHERE id=?').get(deviceId)
+  assert.equal(row.apns_token, null)
+
+  // agent (kind='agent') devices are forbidden, not just unauthenticated
+  const ag = createAgent(s.db, alice.id, 'bridge')
+  const agentReg = await s.http('/push/register', { method: 'POST', token: ag.token, body: { apns_token: 'xyz', environment: 'prod' } })
+  assert.equal(agentReg.status, 403)
+  assert.deepEqual(agentReg.json, { error: 'forbidden' })
+
+  // no bearer token -> 401
+  const noAuth = await s.http('/push/register', { method: 'POST', body: { apns_token: 'x', environment: 'prod' } })
+  assert.equal(noAuth.status, 401)
+})
+
+test('POST /password: happy path, all three rejects, agent 403, and the old device token stays valid after change', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const alice = await createUser(s.db, 'alice', 'hunter22')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'hunter22', device_name: 'mac' } })
+  const token = login.json.token
+
+  // missing/non-string old_password -> 400 bad_request, nothing changed
+  const noOld = await s.http('/password', { method: 'POST', token, body: { new_password: 'newlongpw1' } })
+  assert.equal(noOld.status, 400)
+  assert.deepEqual(noOld.json, { error: 'bad_request' })
+
+  // weak/missing new_password -> 400 weak_password
+  const weak = await s.http('/password', { method: 'POST', token, body: { old_password: 'hunter22', new_password: 'short' } })
+  assert.equal(weak.status, 400)
+  assert.deepEqual(weak.json, { error: 'weak_password' })
+  const missingNew = await s.http('/password', { method: 'POST', token, body: { old_password: 'hunter22' } })
+  assert.equal(missingNew.status, 400)
+  assert.deepEqual(missingNew.json, { error: 'weak_password' })
+
+  // wrong old_password -> 401, after a real verify (not an oracle shortcut)
+  const badOld = await s.http('/password', { method: 'POST', token, body: { old_password: 'nope-wrong', new_password: 'newlongpw1' } })
+  assert.equal(badOld.status, 401)
+  assert.deepEqual(badOld.json, { error: 'bad_password' })
+
+  // agent tokens are forbidden outright, even with valid old/new passwords
+  const ag = createAgent(s.db, alice.id, 'bridge')
+  const agentAttempt = await s.http('/password', { method: 'POST', token: ag.token, body: { old_password: 'hunter22', new_password: 'newlongpw1' } })
+  assert.equal(agentAttempt.status, 403)
+  assert.deepEqual(agentAttempt.json, { error: 'forbidden' })
+
+  // no bearer token -> 401
+  const noAuth = await s.http('/password', { method: 'POST', body: { old_password: 'hunter22', new_password: 'newlongpw1' } })
+  assert.equal(noAuth.status, 401)
+
+  // none of the rejects actually changed the password
+  const stillOld = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'hunter22', device_name: 'x' } })
+  assert.equal(stillOld.status, 200)
+
+  // happy path
+  const ok = await s.http('/password', { method: 'POST', token, body: { old_password: 'hunter22', new_password: 'newlongpw1' } })
+  assert.equal(ok.status, 200)
+  assert.deepEqual(ok.json, { ok: true })
+
+  // the old password no longer logs in, the new one does
+  const oldFails = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'hunter22', device_name: 'x' } })
+  assert.equal(oldFails.status, 403)
+  const newWorks = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'newlongpw1', device_name: 'x' } })
+  assert.equal(newWorks.status, 200)
+
+  // the device token used to change the password stays valid (documented:
+  // existing device tokens are unaffected by a password change)
+  const stillAuthed = await s.http('/snapshot', { token })
+  assert.equal(stillAuthed.status, 200)
+})
+
+test('login rate limit returns 429', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'alice', 'pw')
+  for (let i = 0; i < 5; i++) {
+    await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'wrong', device_name: 'x' } })
+  }
+  const r = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'x' } })
+  assert.equal(r.status, 429)
+})
+
+test('login rate limit keys on cf-connecting-ip, not the tunnel-shared socket address', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'alice', 'pw')
+  await createUser(s.db, 'pat', 'pw2')
+
+  const loginAs = (cfIp, username, password) => fetch(s.base + '/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'cf-connecting-ip': cfIp },
+    body: JSON.stringify({ username, password, device_name: 'x' }),
+  })
+
+  // Behind the tunnel every request arrives from the same socket (127.0.0.1), so
+  // without per-header keying this would lock out every client after 5 bad logins
+  // from any one of them. Exhaust the limit for client A...
+  for (let i = 0; i < 5; i++) await loginAs('1.1.1.1', 'alice', 'wrong')
+  const blockedA = await loginAs('1.1.1.1', 'alice', 'wrong')
+  assert.equal(blockedA.status, 429)
+
+  // ...client B, a different cf-connecting-ip, must still be able to log in.
+  // B is a different user: alice is per-username locked at this point regardless of IP.
+  const okB = await loginAs('2.2.2.2', 'pat', 'pw2')
+  assert.equal(okB.status, 200)
+})
+
+test('per-username lockout blocks distributed brute force across IPs', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'alice', 'pw')
+  await createUser(s.db, 'pat', 'pw2')
+
+  const loginAs = (cfIp, username, password) => fetch(s.base + '/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'cf-connecting-ip': cfIp },
+    body: JSON.stringify({ username, password, device_name: 'x' }),
+  })
+
+  // 5 failures against one username from 5 DIFFERENT IPs: each IP is used once,
+  // so the per-IP limiter never trips - only per-username tracking can catch this.
+  for (let i = 0; i < 5; i++) {
+    assert.equal((await loginAs(`10.0.0.${i}`, 'alice', 'wrong')).status, 403)
+  }
+  // 6th attempt from a fresh IP is locked out - even with the CORRECT password
+  // (the guard runs before the verify, so a locked username gives no oracle).
+  const blocked = await loginAs('10.0.0.99', 'alice', 'pw')
+  assert.equal(blocked.status, 429)
+  const body = await blocked.json()
+  assert.equal(body.error, 'locked_out')
+  assert.ok(body.retry_after >= 1)
+  assert.ok(Number(blocked.headers.get('retry-after')) >= 1)
+  // other usernames are unaffected by alice's lockout
+  assert.equal((await loginAs('10.0.0.99', 'pat', 'pw2')).status, 200)
+})
+
+test('successful login resets the per-username failure count', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'alice', 'pw')
+  const loginAs = (cfIp, password) => fetch(s.base + '/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'cf-connecting-ip': cfIp },
+    body: JSON.stringify({ username: 'alice', password, device_name: 'x' }),
+  })
+  // 4 failures (below the threshold of 5), then a success...
+  for (let i = 0; i < 4; i++) await loginAs(`10.0.1.${i}`, 'wrong')
+  assert.equal((await loginAs('10.0.1.50', 'pw')).status, 200)
+  // ...4 more failures: without the reset these would be failures 5-8 and lock
+  // the account; with it the count restarted from zero.
+  for (let i = 0; i < 4; i++) await loginAs(`10.0.2.${i}`, 'wrong')
+  assert.equal((await loginAs('10.0.2.50', 'pw')).status, 200)
+})
+
+test('oversized login body gets 413 and server stays responsive', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const big = JSON.stringify({ username: 'x'.repeat(1_100_000), password: 'y', device_name: 'z' })
+  const r = await fetch(s.base + '/login', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: big,
+  }).catch(() => null)
+  if (r) assert.equal(r.status, 413)
+  const after = await s.http('/snapshot', {})
+  assert.equal(after.status, 401)
+})
+
+test('server stops consuming an oversized streaming body', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const { request } = await import('node:http')
+  const bytesWritten = await new Promise((resolve) => {
+    const req = request(s.base + '/login', { method: 'POST', headers: { 'content-type': 'application/json' } })
+    let written = 0
+    let done = false
+    const finish = () => { if (!done) { done = true; resolve(written) } }
+    const chunk = 'x'.repeat(65536)
+    req.on('error', finish)
+    req.on('response', (res) => { res.resume(); res.on('end', () => setTimeout(finish, 100)) })
+    setTimeout(finish, 4000)
+    const pump = () => {
+      while (written < 32e6 && !done) {
+        written += chunk.length
+        if (!req.write(chunk)) { req.once('drain', pump); return }
+      }
+      if (!done) req.end()
+    }
+    pump()
+  })
+  assert.ok(bytesWritten < 16e6, `client managed to write ${bytesWritten} bytes — server still consuming`)
+})
+
+test('PUT /push/prefs merges partial updates and echoes everywhere', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'alice', 'password1')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'password1', device_name: 'phone' } })
+  const token = login.json.token
+
+  // Defaults echo from GET /devices: attention/done on, activity off.
+  const before = await s.http('/devices', { token })
+  assert.deepEqual(before.json.devices[0].push_prefs, { attention: true, done: true, activity: false })
+
+  // Partial update merges, including turning the default-off activity key
+  // back on.
+  const r1 = await s.http('/push/prefs', { method: 'PUT', token, body: { activity: true } })
+  assert.equal(r1.status, 200)
+  assert.deepEqual(r1.json.push_prefs, { attention: true, done: true, activity: true })
+  const r2 = await s.http('/push/prefs', { method: 'PUT', token, body: { done: false } })
+  assert.deepEqual(r2.json.push_prefs, { attention: true, done: false, activity: true })
+
+  // Echoed from /devices and /push/register.
+  const after = await s.http('/devices', { token })
+  assert.deepEqual(after.json.devices[0].push_prefs, { attention: true, done: false, activity: true })
+  const reg = await s.http('/push/register', { method: 'POST', token, body: { apns_token: 'ab'.repeat(32), environment: 'prod' } })
+  assert.equal(reg.status, 200)
+  assert.deepEqual(reg.json.push_prefs, { attention: true, done: false, activity: true })
+})
+
+test('PUT /push/prefs validation: unknown fields, non-boolean values, agent devices', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'alice', 'password1')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'password1' } })
+  const token = login.json.token
+
+  assert.equal((await s.http('/push/prefs', { method: 'PUT', token, body: { wake: false } })).status, 400)
+  assert.equal((await s.http('/push/prefs', { method: 'PUT', token, body: { attention: 'no' } })).status, 400)
+  assert.equal((await s.http('/push/prefs', { method: 'PUT', token, body: {} })).status, 200, 'an empty body is a valid no-op')
+
+  const agent = createAgent(s.db, login.json.user_id, 'bridge')
+  assert.equal((await s.http('/push/prefs', { method: 'PUT', token: agent.token, body: { attention: false } })).status, 403)
+})
+
+test('GET /roster: agent token gets agent devices + top-level conversation metadata', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const alice = await createUser(s.db, 'alice', 'pw')
+  const eve = await createUser(s.db, 'eve', 'pw')
+  const agA = createAgent(s.db, alice.id, 'dev-a')
+  const agB = createAgent(s.db, alice.id, 'dev-b')
+  createAgent(s.db, eve.id, 'dev-eve')
+  await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'mac' } })
+  upsertConversation(s.db, { id: 'top', ownerUserId: alice.id, title: 'work', sessionState: 'running', agentDeviceId: agA.deviceId, summary: 'fixing CI' })
+  upsertConversation(s.db, { id: 'child', ownerUserId: alice.id, title: 'sub', sessionState: 'running', agentDeviceId: agA.deviceId, parentConvoId: 'top' })
+  upsertConversation(s.db, { id: 'evetop', ownerUserId: eve.id, title: 'secret', sessionState: 'running' })
+
+  const r = await s.http('/roster', { token: agB.token })
+  assert.equal(r.status, 200)
+  // Agent devices only — client devices are management surface (/devices,
+  // client-gated) and never enumerable by an agent.
+  assert.deepEqual(r.json.agents.map((d) => d.name).sort(), ['dev-a', 'dev-b'])
+  const ids = r.json.conversations.map((c) => c.id)
+  assert.ok(ids.includes('top'))
+  assert.ok(!ids.includes('child'), 'sub-chats are not roster targets')
+  assert.ok(!ids.includes('evetop'), 'other users invisible')
+  const top = r.json.conversations.find((c) => c.id === 'top')
+  assert.equal(top.summary, 'fixing CI')
+  assert.equal(top.agent_device_id, agA.deviceId)
+})
+
+test('GET /roster works for client tokens too and requires auth', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'alice', 'pw')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'mac' } })
+  const ok = await s.http('/roster', { token: login.json.token })
+  assert.equal(ok.status, 200)
+  const anon = await s.http('/roster')
+  assert.equal(anon.status, 401)
+})
+
+test('GET /snapshot exposes each convo agent_device_id and the agents id->name list', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const alice = await createUser(s.db, 'alice', 'hunter22')
+  const agent = createAgent(s.db, alice.id, 'dev-y')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'hunter22', device_name: 'mac' } })
+
+  s.db.prepare('INSERT INTO conversations(id, owner_user_id, title, created_at, agent_device_id) VALUES(?,?,?,?,?)')
+    .run('c-owned', alice.id, 'Fix the parser', Date.now(), agent.deviceId)
+  s.db.prepare('INSERT INTO conversations(id, owner_user_id, title, created_at) VALUES(?,?,?,?)')
+    .run('c-orphan', alice.id, 'No box yet', Date.now())
+
+  const r = await s.http('/snapshot', { token: login.json.token })
+  assert.equal(r.status, 200)
+  const owned = r.json.conversations.find((c) => c.id === 'c-owned')
+  const orphan = r.json.conversations.find((c) => c.id === 'c-orphan')
+  assert.equal(owned.agent_device_id, agent.deviceId)
+  assert.equal(orphan.agent_device_id, null)
+  // agents: agent devices only — the client device is not a box
+  assert.deepEqual(r.json.agents, [{ device_id: agent.deviceId, name: 'dev-y', tag_char: null }])
+
+  // a stored tag character rides the same list
+  s.db.prepare('UPDATE devices SET tag_char=? WHERE id=?').run('y', agent.deviceId)
+  const tagged = await s.http('/snapshot', { token: login.json.token })
+  assert.deepEqual(tagged.json.agents, [{ device_id: agent.deviceId, name: 'dev-y', tag_char: 'y' }])
+})
+
+test('GET /convo/:id/messages?around_seq on a colleague\'s shared conversation: prose only, clamped, logged; private-owned stays 404 unlogged (review focus 5)', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const logs = []
+  const origLog = console.log
+  console.log = (...a) => { logs.push(a.join(' ')); origLog(...a) }
+  t.after(() => { console.log = origLog })
+  const alice = await createUser(s.db, 'alice', 'pw'); const pat = await createUser(s.db, 'pat', 'pw')
+  const box = createAgent(s.db, alice.id, 'alice-box'); const priv = createAgent(s.db, alice.id, 'alice-private')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  for (const [u, gid] of [[alice, 1], [pat, 2]]) saveGithubIdentity(s.db, { userId: u.id, host: 'github.com', identity: { github_id: gid, login: u.name, scopes: ['github.com/matronhq'] }, token: `t${gid}`, now: 1 })
+  upsertConversation(s.db, { id: 'c1', ownerUserId: alice.id, title: 'C1', agentDeviceId: box.deviceId, repo: 'github.com/matronhq/x' })
+  upsertConversation(s.db, { id: 'pv', ownerUserId: alice.id, title: 'PV', agentDeviceId: priv.deviceId, repo: 'github.com/matronhq/x' })
+  for (let i = 0; i < 40; i++) {
+    append(s.db, { userId: alice.id, convoId: 'c1', sender: 'user:alice', type: 'text', payload: { body: `m${i}` } })
+    append(s.db, { userId: alice.id, convoId: 'c1', sender: 'agent:alice-box', type: 'tool_output', payload: { text: 'SECRET' } })
+  }
+  append(s.db, { userId: alice.id, convoId: 'pv', sender: 'user:alice', type: 'text', payload: { body: 'private words' } })
+  const patTok = (await s.http('/login', { method: 'POST', body: { username: 'pat', password: 'pw', device_name: 'mac' } })).json.token
+  const r = await s.http('/convo/c1/messages?around_seq=40&limit=200', { token: patTok })
+  assert.equal(r.status, 200)
+  assert.ok(r.json.events.length <= 30 && r.json.events.length > 0)
+  assert.ok(r.json.events.every((e) => e.type === 'text'))
+  assert.ok(!JSON.stringify(r.json).includes('SECRET'))
+  assert.ok(logs.some((l) => /shared context read convo=c1 viewer=/.test(l)))
+  assert.equal((await s.http('/convo/c1/messages?before_seq=40', { token: patTok })).status, 404, 'paging stays owner-only')
+  const before = logs.length
+  const pv = await s.http('/convo/pv/messages?around_seq=1', { token: patTok })
+  assert.equal(pv.status, 404)
+  assert.equal(logs.filter((l) => /context read convo=pv/.test(l)).length, 0, 'a refused read is never logged as a read')
+  assert.equal(logs.length, before)
+  const patAgent = createAgent(s.db, pat.id, 'pat-box')
+  assert.equal((await s.http('/convo/c1/messages?around_seq=40', { token: patAgent.token })).status, 200, 'an agent reads with its user\'s visibility')
+})
+
+test('GET /media/:id on a colleague\'s blob: only via a shared prose event or a shared non-consent item that its owner filed; logged; owner path unchanged', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-shared-media-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const s = await startTestServer({ dbPath: path.join(dir, 'j.db') })
+  t.after(() => s.close())
+  const logs = []
+  const origLog = console.log
+  console.log = (...a) => { logs.push(a.join(' ')); origLog(...a) }
+  t.after(() => { console.log = origLog })
+  const alice = await createUser(s.db, 'alice', 'pw'); const pat = await createUser(s.db, 'pat', 'pw'); const sam = await createUser(s.db, 'sam', 'pw')
+  const box = createAgent(s.db, alice.id, 'alice-box'); const priv = createAgent(s.db, alice.id, 'alice-private')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  for (const [u, gid] of [[alice, 1], [pat, 2], [sam, 3]]) saveGithubIdentity(s.db, { userId: u.id, host: 'github.com', identity: { github_id: gid, login: u.name, scopes: ['github.com/matronhq'] }, token: `t${gid}`, now: 1 })
+  upsertConversation(s.db, { id: 'c1', ownerUserId: alice.id, title: 'C1', agentDeviceId: box.deviceId, repo: 'github.com/matronhq/x' })
+  upsertConversation(s.db, { id: 'pv', ownerUserId: alice.id, title: 'PV', agentDeviceId: priv.deviceId, repo: 'github.com/matronhq/x' })
+  const tok = async (name) => (await s.http('/login', { method: 'POST', body: { username: name, password: 'pw', device_name: 'mac' } })).json.token
+  const aliceTok = await tok('alice'); const patTok = await tok('pat'); const samTok = await tok('sam')
+  const upload = async (token, text) => {
+    const up = await fetch(`${s.base}/media`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: Buffer.from(text) })
+    return (await up.json()).media_id
+  }
+  const get = (token, id) => fetch(`${s.base}/media/${id}`, { headers: { authorization: `Bearer ${token}` } })
+  const b = {}
+  for (const k of ['prose', 'tool', 'item', 'consent', 'priv', 'loose']) b[k] = await upload(aliceTok, `blob ${k}`)
+  append(s.db, { userId: alice.id, convoId: 'c1', sender: 'user:alice', type: 'text', payload: { body: 'see attached' }, blobRef: b.prose })
+  append(s.db, { userId: alice.id, convoId: 'c1', sender: 'agent:alice-box', type: 'tool_output', payload: { text: 'x' }, blobRef: b.tool })
+  const att = (ref) => [{ blob_ref: ref, mime: 'image/png', name: 'a.png', size: 3 }]
+  const file = (extra) => createItem(s.db, { userId: alice.id, kind: 'task', title: 'T', originConvoId: 'c1', originDeviceId: box.deviceId, createdBy: 'agent', ...extra })
+  file({ attachments: att(b.item) })
+  file({ attachments: att(b.consent), consent: 'spawn', awaiting: 'user' })
+  file({ attachments: att(b.priv), originConvoId: 'pv', originDeviceId: priv.deviceId })
+  // Laundering: alice's item pointing at pat's blob opens it to nobody else.
+  const patBlob = await upload(patTok, 'pats file')
+  file({ attachments: att(patBlob) })
+
+  assert.equal((await get(patTok, b.prose)).status, 200, 'referenced by a prose event in a shared conversation')
+  assert.equal((await get(patTok, b.item)).status, 200, 'attached to an item on a shared conversation')
+  assert.equal((await get(patTok, b.tool)).status, 404, 'tool output is not prose')
+  assert.equal((await get(patTok, b.consent)).status, 404, 'consent mirrors never cross the boundary')
+  assert.equal((await get(patTok, b.priv)).status, 404, 'private device')
+  assert.equal((await get(patTok, b.loose)).status, 404, 'unreferenced')
+  assert.equal((await get(samTok, patBlob)).status, 404, 'a reference by someone other than the blob owner opens nothing')
+  assert.equal((await get(patTok, patBlob)).status, 200, 'the owner is unaffected')
+  const shared = logs.filter((l) => /^journal: shared media read blob=/.test(l))
+  assert.equal(shared.length, 2)
+  assert.match(shared[0], new RegExp(`blob=${b.prose} viewer=${pat.id} device=\\d+$`))
+  // A stale link confers nothing, and the owner's own reads are untouched.
+  markGithubStale(s.db, pat.id)
+  assert.equal((await get(patTok, b.item)).status, 404)
+  assert.equal((await get(aliceTok, b.tool)).status, 200)
+  assert.equal((await get(aliceTok, b.consent)).status, 200)
+})
