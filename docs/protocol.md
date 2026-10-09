@@ -1676,10 +1676,10 @@ degrade path for clients predating the tracker, not a second timeline.
 | `GET /items/:id` (shared) | `:id` = `it_…` of a colleague's item visible under *Shared visibility* | `{item, comments}` with `item.owner`; any other method or sub-route on it is **403 `forbidden`** |
 | `POST /items` | `{kind, title, body?, labels?, links?, attachments?, actions?, awaiting?, position?, after?, before?, convo_id, supersedes?, on_behalf_of?:'user' (agent callers only)}` + optional `Idempotency-Key`; `position` is **exclusive** of `after`/`before` (given together is 400); `after`/`before` may be given alone or together (a midpoint between the two, consistent with `/rank`; none means bottom) | 201 `{item}` (200 on replay) |
 | `PATCH /items/:id` | `{title?, body?, labels?, links?, awaiting?, actions?, mission?: id \| "#num" \| null}` — `attachments` is **400** (create-only in v1; it used to be dropped silently, which told a client its blob had landed), and a patch carrying neither a field nor `mission` is **400**. `mission` moves the item to that mission, or detaches it when `null`; it is an explicit move only, never inferred. Fields and the move are one write with one `updated_at`. | `{item}`. **404** if `mission` names a mission that does not exist **or** is invisible to the caller — the same sieve `GET /missions/:id` applies (see *Missions & milestones → Visibility*), never a 403, so a hidden mission is not an existence oracle here either. **409** only for `awaiting` on a closed item (clearing it with `null` is fine); a **closed mission is not refused** as a move target in v1 — closing a mission blocks on open items precisely so they can be moved, and a finished mission must stay correctable. |
-| `POST /items/:id/comments` | `{body?, attachments?, action?, reply_to?, actions?}` (body or attachments required, unless `action` is given) + optional `Idempotency-Key` | 201 `{item, comment}` (200 on replay); `action` from an agent is **403 `forbidden`**, one not among the current `actions` of what it answers (the item, or the comment `reply_to` names) is **400 `unknown_action`** — see *Action buttons*; `actions` from a client is **403 `forbidden`**, on a closed item **409 `conflict`** — see *Comment action buttons* |
+| `POST /items/:id/comments` | `{body?, attachments?, action?, reply_to?, actions?, as_convo_id?}` (body or attachments required, unless `action` is given) + optional `Idempotency-Key` | 201 `{item, comment}` (200 on replay); `action` from an agent is **403 `forbidden`**, one not among the current `actions` of what it answers (the item, or the comment `reply_to` names) is **400 `unknown_action`** — see *Action buttons*; `actions` from a client is **403 `forbidden`**, on a closed item **409 `conflict`** — see *Comment action buttons* |
 | `PATCH /items/:id/comments/:cid` | `{blob_ref, transcript}` — agent only, else 403 | `{comment}` |
-| `POST /items/:id/close` | `{resolution, comment?}` | `{item, comment}`; 409 if already closed |
-| `POST /items/:id/reopen` | `{comment?}` | `{item, comment}`; 409 if already open |
+| `POST /items/:id/close` | `{resolution, comment?, as_convo_id?}` | `{item, comment}`; 409 if already closed |
+| `POST /items/:id/reopen` | `{comment?, as_convo_id?}` | `{item, comment}`; 409 if already open |
 | `POST /items/:id/rank` | `position:'top'\|'bottom'` exclusive of `after`/`before` (given together is 400); `after`/`before` may be given alone or together (a midpoint); zero given is 400 | `{item}`; 409 if the item is closed |
 
 Item shape: `{id, user_id, num, kind, state, resolution, awaiting, rank,
@@ -1713,7 +1713,24 @@ spawn and agent-chat consent cards — are invisible to every agent caller
 here is the item **body**'s attachments (set at create only, v1) — a
 comment's own attachments live on the comment. Comment shape:
 `{id, item_id, author, device_id, kind:'comment'|'status', body,
-created_at, attachments[{blob_ref,mime,name,size,width?,height?,transcript?,transcript_status?}], meta, action, reply_to, actions, chosen_action}`.
+created_at, attachments[{blob_ref,mime,name,size,width?,height?,transcript?,transcript_status?}], meta, action, reply_to, actions, chosen_action, device_name, convo_id, convo_title}`.
+**Comment author.** `device_name`, `convo_id` and `convo_title` say who wrote
+an agent's comment: the name of the box (`device_id`'s device) and the
+conversation its session writes from, so a thread several sessions post in
+can show which one said what. An agent names its session with `as_convo_id`
+on `POST /items/:id/comments`, `/close` and `/reopen` (the same field the
+handover routes take). It labels and does not authorise: a conversation the
+caller could not write to is dropped and the comment is stored without it;
+a value that is not a non-empty string of at most 128 characters is 400. A
+client's `as_convo_id` is ignored. All three are `null` on a user's comment
+and on the journal's own lines; `convo_id` and `convo_title` are `null` when
+the bridge sent none (and on every comment from before the field).
+An ordinary agent gets `null` for all three on a private box's comment, and
+`null` for `convo_id` and `convo_title` when the conversation named is one a
+private box hosts (a public box that joined it may name it; its own
+`device_name` still shows). The sieve applies to the thread read and to every
+comment a write hands back. Another person's view of a thread (*Shared
+visibility*, a granted mission) never carries them.
 `width`/`height` (spec 2026-10-01, item thread layout shift) are the image's
 displayed pixel size, stamped by the journal from the blob's header when the
 attachment is stored (and backfilled after boot onto older comments) so the

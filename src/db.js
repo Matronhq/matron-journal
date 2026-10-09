@@ -1051,6 +1051,14 @@ export function openDb(path) {
   if (!commentActionCols.some((c) => c.name === 'chosen_action')) {
     db.exec('ALTER TABLE item_comments ADD COLUMN chosen_action TEXT')
   }
+  // Comment author: the conversation (session) an agent's comment was
+  // written from. device_id already names the box; a box hosts many
+  // sessions, so the conversation is what tells two of them apart in one
+  // thread. NULL = unknown (a row from before the column, a bridge that does
+  // not send it, the user's own comments, the journal's own lines).
+  if (!commentActionCols.some((c) => c.name === 'convo_id')) {
+    db.exec('ALTER TABLE item_comments ADD COLUMN convo_id TEXT')
+  }
   // Notice items (mission: For you): kind 'notice' widens the items CHECK.
   // SQLite cannot ALTER a CHECK, so a database from before it is rebuilt once
   // from its OWN stored definition (every column added by the ALTERs above

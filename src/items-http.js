@@ -11,7 +11,7 @@ import { idemKeyOf, senderOf, badRequest, notFound, conflict } from './http-who.
 import {
   ITEM_KINDS, NOTICE_ACTIONS, AWAITING, RESOLUTIONS, BODY_MAX, validateItemFields, createItem, getItem, listItems, listComments,
   updateItem, addComment, setAttachmentTranscript, closeItem, reopenItem, rerankItem,
-  markTranscriptsPending, isAudioAttachment, isConsentMirror, listSharedItems, getSharedItem, listGrantedComments, listSharedComments,
+  markTranscriptsPending, isAudioAttachment, isConsentMirror, hidePrivateAuthors, listSharedItems, getSharedItem, listGrantedComments, listSharedComments,
 } from './items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE, ITEM_ACTIONS, itemFallbackText, FALLBACK_ACTIONS } from './items-marker.js'
 import { visibleMission } from './missions-http.js'
@@ -461,7 +461,11 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
   // voice-note attachment is specifically the origin bridge's job.
 
   if (!sub) {
-    if (req.method === 'GET') { replyItems(who, res, 200, { item, comments: listComments(db, item.id) }); return true }
+    if (req.method === 'GET') {
+      const comments = listComments(db, item.id)
+      replyItems(who, res, 200, { item, comments: filteredAgent(db, who) ? hidePrivateAuthors(db, comments) : comments })
+      return true
+    }
     if (req.method === 'PATCH') return handlePatch(ctx, req, res, who, item)
     return false
   }
@@ -481,9 +485,27 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
   // shares. There is no on_behalf_of on a comment: the caller's own device
   // kind is the author, full stop.
   const author = who.kind === 'agent' ? 'agent' : 'user'
+  // `as_convo_id` (the handover routes' field): the conversation an agent's
+  // session writes from, stored on the comment so a thread several sessions
+  // post in says who wrote what. A box hosts many sessions under one token,
+  // so the device alone cannot tell them apart. It labels, it does not
+  // authorise: one the caller could not write to is dropped, and the comment
+  // is stored without it rather than refused. undefined = malformed.
+  const asConvo = (body) => {
+    const v = body.as_convo_id
+    if (who.kind !== 'agent' || v == null) return null
+    if (typeof v !== 'string' || !v || v.length > 128) return undefined
+    return authorizeAgentWrite(db, who.userId, who.deviceId, v) ? v : null
+  }
+
+  // Every comment an ordinary agent is handed back goes through the same
+  // author sieve as the thread it reads (GET /items/:id).
+  const seenBy = (c) => (c && filteredAgent(db, who) ? hidePrivateAuthors(db, [c])[0] : c)
 
   if (sub === 'comments' && subId == null && req.method === 'POST') {
     const body = await readBody(req)
+    const convoId = asConvo(body)
+    if (convoId === undefined) return badRequest(res)
     const idemKey = idemKeyOf(req, who)
     if (idemKey === undefined) return badRequest(res)
     // Action tap (2026-09-24 item-actions contract): `action` is the label of
@@ -550,7 +572,7 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       // generic rule, a reply on one would reopen it (or take it out of the
       // user's Decisions list while the ask still waits) with no agent able
       // to see the item, let alone close it again.
-      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, body: text, attachments, action, replyTo, actions: v.value.actions ?? [], idemKey, keepStatus: item.consent != null })
+      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, convoId, body: text, attachments, action, replyTo, actions: v.value.actions ?? [], idemKey, keepStatus: item.consent != null })
     } catch (err) {
       if (answerKnownError(res, err)) return true
       throw err
@@ -574,7 +596,7 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
         for (const blobRef of audioBlobs) ctx.itemTranscription.enqueue({ commentId: out.comment.id, userId: who.userId, blobRef })
       }
     }
-    replyItems(who, res, out.duplicate ? 200 : 201, { item: out.item, comment: out.comment })
+    replyItems(who, res, out.duplicate ? 200 : 201, { item: out.item, comment: seenBy(out.comment) })
     return true
   }
 
@@ -601,7 +623,7 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     // announces with (emitTranscriptionMarker) — including `for_action`: the
     // item body's synthetic comment belongs to the `created` turn.
     emitMarker(ctx, who, { item: getItem(db, who.userId, item.id) ?? item, action: 'updated', comment: c, extra: { transcription: 'done', for_action: c.meta?.role === 'body' ? 'created' : 'commented' } })
-    json(res, 200, { comment: c })
+    json(res, 200, { comment: seenBy(c) })
     return true
   }
 
@@ -610,14 +632,16 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     if (!RESOLUTIONS.includes(body.resolution)) return badRequest(res)
     if (!okNote(body.comment)) return badRequest(res)
     if (strayRef(res, body.comment, [])) return true
-    const out = closeItem(db, { userId: who.userId, itemId: item.id, resolution: body.resolution, author, deviceId: who.deviceId, comment: body.comment ?? '' })
+    const convoId = asConvo(body)
+    if (convoId === undefined) return badRequest(res)
+    const out = closeItem(db, { userId: who.userId, itemId: item.id, resolution: body.resolution, author, deviceId: who.deviceId, convoId, comment: body.comment ?? '' })
     // The item was visible a statement ago, so the only real cause is that
     // it is already closed — a state conflict, not a missing item.
     if (!out) return conflict(res)
     // As for a notice's Seen close above: the offer goes first.
     out.item = withdrawOnClose(ctx, who.userId, item.id) ?? out.item
     emitMarker(ctx, who, { item: out.item, action: 'closed', comment: out.comment })
-    replyItems(who, res, 200, { item: out.item, comment: out.comment })
+    replyItems(who, res, 200, { item: out.item, comment: seenBy(out.comment) })
     return true
   }
 
@@ -628,10 +652,12 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     // A consent mirror is open exactly while its ask waits for an answer;
     // reopening one would offer the user a decision that can only fail.
     if (item.consent != null) return conflict(res)
-    const out = reopenItem(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, comment: body.comment ?? '' })
+    const convoId = asConvo(body)
+    if (convoId === undefined) return badRequest(res)
+    const out = reopenItem(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, convoId, comment: body.comment ?? '' })
     if (!out) return conflict(res) // already open
     emitMarker(ctx, who, { item: out.item, action: 'reopened', comment: out.comment })
-    replyItems(who, res, 200, { item: out.item, comment: out.comment })
+    replyItems(who, res, 200, { item: out.item, comment: seenBy(out.comment) })
     return true
   }
 

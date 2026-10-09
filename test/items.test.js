@@ -17,7 +17,7 @@ test('schema: items, item_comments, item_counters exist with the expected column
     'idem_key', 'created_at', 'updated_at', 'closed_at', 'mission_id', 'consent', 'actions', 'chosen_action', 'filed_convo_id',
   ])
   assert.deepEqual(cols('item_comments'), [
-    'id', 'item_id', 'user_id', 'author', 'device_id', 'kind', 'body', 'attachments', 'meta', 'idem_key', 'created_at', 'actions', 'chosen_action',
+    'id', 'item_id', 'user_id', 'author', 'device_id', 'kind', 'body', 'attachments', 'meta', 'idem_key', 'created_at', 'actions', 'chosen_action', 'convo_id',
   ])
   assert.deepEqual(cols('item_counters'), ['user_id', 'next_num'])
   // (user_id, num) is unique
@@ -116,7 +116,7 @@ test('rowToItem / rowToComment do not expose internal columns', async () => {
   assert.ok(!('idem_key' in c), 'comment shape must not carry idem_key')
   assert.ok(!('user_id' in c), 'comment shape must not carry user_id')
   assert.equal(db.prepare('SELECT idem_key FROM item_comments WHERE id=?').get(c.id).idem_key, 'c1')
-  assert.deepEqual(Object.keys(c).sort(), ['action', 'actions', 'attachments', 'author', 'body', 'chosen_action', 'created_at', 'device_id', 'id', 'item_id', 'kind', 'meta', 'reply_to'])
+  assert.deepEqual(Object.keys(c).sort(), ['action', 'actions', 'attachments', 'author', 'body', 'chosen_action', 'convo_id', 'convo_title', 'created_at', 'device_id', 'device_name', 'id', 'item_id', 'kind', 'meta', 'reply_to'])
 })
 
 test('createItem idempotency returns the original row', async () => {
