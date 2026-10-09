@@ -244,3 +244,188 @@ test('a send whose stream errors mid-flight resolves transport failure without t
   const result = await client.send({ deviceToken: 'a'.repeat(64), env: 'prod', payload: {}, priority: 5, pushType: 'alert' })
   assert.deepEqual(result, { status: 0, reason: 'transport' })
 })
+
+// Fake session whose streams behave per `mode` ('ok' responds 200, 'close'
+// tears the stream down with no response, 'hang' never answers). It records
+// destroy() and answers ping() per `ping` ('ack', 'error', 'silent').
+function makeScriptedSession({ mode = 'ok', ping = 'ack' } = {}) {
+  const session = new EventEmitter()
+  session.destroyed = false
+  session.closed = false
+  session.requests = 0
+  session.pings = 0
+  session.request = () => {
+    session.requests += 1
+    const stream = new EventEmitter()
+    stream.setEncoding = () => {}
+    stream.write = () => {}
+    stream.close = () => {}
+    stream.end = () => {
+      if (mode === 'ok') {
+        queueMicrotask(() => { stream.emit('response', { ':status': 200 }); stream.emit('end') })
+      } else if (mode === 'close') {
+        queueMicrotask(() => stream.emit('close'))
+      }
+    }
+    return stream
+  }
+  session.ping = (cb) => {
+    session.pings += 1
+    if (ping === 'ack') queueMicrotask(() => cb(null, 1))
+    else if (ping === 'error') queueMicrotask(() => cb(new Error('ERR_HTTP2_PING_CANCEL')))
+    return true
+  }
+  session.close = () => { session.closed = true }
+  session.destroy = () => { session.destroyed = true; session.emit('close') }
+  return session
+}
+
+const PUSH = { deviceToken: 'a'.repeat(64), env: 'prod', payload: {}, priority: 5, pushType: 'alert' }
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+test('a transport failure on a reused session retries the push once on a fresh session', async () => {
+  const { keyFile } = makeTestKey()
+  const first = makeScriptedSession()
+  const fresh = makeScriptedSession()
+  const sessions = [first, fresh]
+  let connectCount = 0
+  const client = makeApnsClient({
+    keyFile, keyId: 'k', teamId: 't', topic: 'chat.matron.x', pingIntervalMs: 0,
+    connect: () => sessions[connectCount++],
+  })
+
+  assert.equal((await client.send(PUSH)).status, 200)
+  // The connection dies under the next request without the session noticing.
+  first.request = makeScriptedSession({ mode: 'close' }).request
+
+  const result = await client.send(PUSH)
+  assert.equal(result.status, 200, 'the retry on a fresh session should deliver the push')
+  assert.equal(connectCount, 2)
+  assert.equal(first.destroyed, true, 'the dead session must be discarded')
+  assert.equal(fresh.requests, 1)
+})
+
+test('a transport failure on a session opened for the send is not retried', async () => {
+  const { keyFile } = makeTestKey()
+  let connectCount = 0
+  const client = makeApnsClient({
+    keyFile, keyId: 'k', teamId: 't', topic: 'chat.matron.x', pingIntervalMs: 0,
+    connect: () => { connectCount += 1; return makeScriptedSession({ mode: 'close' }) },
+  })
+
+  assert.deepEqual(await client.send(PUSH), { status: 0, reason: 'transport' })
+  assert.equal(connectCount, 1)
+})
+
+test('a retry that also fails returns transport failure and stops', async () => {
+  const { keyFile } = makeTestKey()
+  const first = makeScriptedSession()
+  let connectCount = 0
+  const client = makeApnsClient({
+    keyFile, keyId: 'k', teamId: 't', topic: 'chat.matron.x', pingIntervalMs: 0,
+    connect: () => (connectCount++ === 0 ? first : makeScriptedSession({ mode: 'close' })),
+  })
+
+  await client.send(PUSH)
+  first.request = makeScriptedSession({ mode: 'close' }).request
+  assert.deepEqual(await client.send(PUSH), { status: 0, reason: 'transport' })
+  assert.equal(connectCount, 2, 'exactly one retry')
+})
+
+test('a timed-out request discards the session so the next send reconnects', async () => {
+  const { keyFile } = makeTestKey()
+  const stalled = makeScriptedSession({ mode: 'hang' })
+  const fresh = makeScriptedSession()
+  const sessions = [stalled, fresh]
+  let connectCount = 0
+  const client = makeApnsClient({
+    keyFile, keyId: 'k', teamId: 't', topic: 'chat.matron.x', requestTimeoutMs: 50, pingIntervalMs: 0,
+    connect: () => sessions[connectCount++],
+  })
+
+  const keepAlive = setTimeout(() => {}, 5000) // the request timer is unref'd
+  try {
+    assert.deepEqual(await client.send(PUSH), { status: 0, reason: 'timeout' })
+  } finally {
+    clearTimeout(keepAlive)
+  }
+  assert.equal(stalled.destroyed, true)
+  assert.equal((await client.send(PUSH)).status, 200)
+  assert.equal(connectCount, 2)
+})
+
+test('keepalive: an unanswered ping discards the session', async () => {
+  const { keyFile } = makeTestKey()
+  const silent = makeScriptedSession({ ping: 'silent' })
+  const fresh = makeScriptedSession()
+  const sessions = [silent, fresh]
+  let connectCount = 0
+  const client = makeApnsClient({
+    keyFile, keyId: 'k', teamId: 't', topic: 'chat.matron.x', pingIntervalMs: 20, pingTimeoutMs: 20,
+    connect: () => sessions[connectCount++],
+  })
+  try {
+    await client.send(PUSH)
+    await sleep(100)
+    assert.ok(silent.pings >= 1)
+    assert.equal(silent.destroyed, true, 'a session that ignores pings must be discarded')
+    assert.equal((await client.send(PUSH)).status, 200)
+    assert.equal(connectCount, 2)
+  } finally {
+    client.close()
+  }
+})
+
+test('keepalive: a ping error discards the session; answered pings keep it', async () => {
+  const { keyFile } = makeTestKey()
+  const failing = makeScriptedSession({ ping: 'error' })
+  const healthy = makeScriptedSession({ ping: 'ack' })
+  const sessions = [failing, healthy]
+  let connectCount = 0
+  const client = makeApnsClient({
+    keyFile, keyId: 'k', teamId: 't', topic: 'chat.matron.x', pingIntervalMs: 20, pingTimeoutMs: 20,
+    connect: () => sessions[connectCount++],
+  })
+  try {
+    await client.send(PUSH)
+    await sleep(60)
+    assert.equal(failing.destroyed, true)
+    await client.send(PUSH)
+    await sleep(80)
+    assert.ok(healthy.pings >= 2)
+    assert.equal(healthy.destroyed, false, 'a session that answers pings must be kept')
+  } finally {
+    client.close()
+  }
+})
+
+test('close() stops the keepalive timers', async () => {
+  const { keyFile } = makeTestKey()
+  const session = makeScriptedSession()
+  const client = makeApnsClient({
+    keyFile, keyId: 'k', teamId: 't', topic: 'chat.matron.x', pingIntervalMs: 20,
+    connect: () => session,
+  })
+  await client.send(PUSH)
+  client.close()
+  const pingsAtClose = session.pings
+  await sleep(70)
+  assert.equal(session.pings, pingsAtClose)
+})
+
+test('keepalive pings a real http2 session and keeps it while it answers', async (t) => {
+  const { keyFile } = makeTestKey()
+  const { server, port } = await makeFakeApnsServer(() => ({ status: 200 }))
+  t.after(() => server.close())
+  let connectCount = 0
+  const client = makeApnsClient({
+    keyFile, keyId: 'k', teamId: 't', topic: 'chat.matron.x', pingIntervalMs: 20, pingTimeoutMs: 200,
+    connect: () => { connectCount += 1; return http2.connect(`http://127.0.0.1:${port}`) },
+  })
+  t.after(() => client.close())
+
+  assert.equal((await client.send(PUSH)).status, 200)
+  await sleep(120)
+  assert.equal((await client.send(PUSH)).status, 200)
+  assert.equal(connectCount, 1, 'a session answering pings must not be replaced')
+})
