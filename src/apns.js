@@ -161,6 +161,10 @@ export function makeApnsClient({
       req.setEncoding('utf8')
       req.on('data', (chunk) => { body += chunk })
       req.on('end', () => {
+        // A stream the server resets (RST_STREAM NO_ERROR or CANCEL) before
+        // sending headers ends cleanly with no 'response': nothing was
+        // delivered, so it is a transport failure, not a status.
+        if (status === null) return settle({ status: 0, reason: 'transport' })
         let reason = null
         if (body) {
           try { reason = JSON.parse(body).reason || null } catch { /* non-JSON body: no reason */ }

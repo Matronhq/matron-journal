@@ -246,7 +246,8 @@ test('a send whose stream errors mid-flight resolves transport failure without t
 })
 
 // Fake session whose streams behave per `mode` ('ok' responds 200, 'close'
-// tears the stream down with no response, 'hang' never answers). It records
+// tears the stream down with no response, 'reset' ends it with no response
+// as a server RST_STREAM NO_ERROR/CANCEL does, 'hang' never answers). It records
 // destroy() and answers ping() per `ping` ('ack', 'error', 'silent').
 function makeScriptedSession({ mode = 'ok', ping = 'ack' } = {}) {
   const session = new EventEmitter()
@@ -267,6 +268,8 @@ function makeScriptedSession({ mode = 'ok', ping = 'ack' } = {}) {
         queueMicrotask(() => { stream.emit('response', { ':status': 200 }); stream.emit('end') })
       } else if (mode === 'close') {
         queueMicrotask(() => stream.emit('close'))
+      } else if (mode === 'reset') {
+        queueMicrotask(() => { stream.emit('end'); stream.emit('close') })
       }
     }
     return stream
@@ -325,6 +328,52 @@ test('a transport failure on a session opened for the send is not retried, but t
   assert.equal(opened[0].destroyed, true)
   assert.equal((await client.send(PUSH)).status, 200)
   assert.equal(opened.length, 2, 'the next send must not reuse the failed session')
+})
+
+test('a stream reset with no response on a reused session is a transport failure: discarded and retried once', async () => {
+  const { keyFile } = makeTestKey()
+  const first = makeScriptedSession()
+  const fresh = makeScriptedSession()
+  const sessions = [first, fresh]
+  let connectCount = 0
+  const client = makeApnsClient({
+    keyFile, keyId: 'k', teamId: 't', topic: 'chat.matron.x', pingIntervalMs: 0,
+    connect: () => sessions[connectCount++],
+  })
+
+  assert.equal((await client.send(PUSH)).status, 200)
+  first.request = makeScriptedSession({ mode: 'reset' }).request
+
+  assert.equal((await client.send(PUSH)).status, 200, 'the retry on a fresh session should deliver the push')
+  assert.equal(first.destroyed, true, 'the session that reset the stream must be discarded')
+  assert.equal(fresh.requests, 1)
+})
+
+test('a real http2 RST_STREAM before the response headers is retried on a new connection', async (t) => {
+  const { keyFile } = makeTestKey()
+  const server = http2.createServer()
+  let streams = 0
+  server.on('stream', (stream) => {
+    stream.on('error', () => {})
+    streams += 1
+    // The second request of the first connection is reset, as APNs does.
+    if (streams === 2) return stream.close(http2.constants.NGHTTP2_NO_ERROR)
+    stream.respond({ ':status': 200 })
+    stream.end()
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => server.close())
+  let connectCount = 0
+  const client = makeApnsClient({
+    keyFile, keyId: 'k', teamId: 't', topic: 'chat.matron.x', pingIntervalMs: 0,
+    connect: () => { connectCount += 1; return http2.connect(`http://127.0.0.1:${server.address().port}`) },
+  })
+  t.after(() => client.close())
+
+  assert.equal((await client.send(PUSH)).status, 200)
+  assert.equal((await client.send(PUSH)).status, 200, 'the reset push must be delivered by the retry')
+  assert.equal(connectCount, 2, 'the retry must use a new connection')
+  assert.equal(streams, 3)
 })
 
 test('a retry that also fails returns transport failure and stops', async () => {
