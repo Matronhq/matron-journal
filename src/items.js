@@ -4,7 +4,7 @@
 // wake: those are src/items-http.js's job.
 import { randomBytes } from 'node:crypto'
 import { sharedConvoSql, grantedMissionSql } from './visibility.js'
-import { blobImageDims } from './db.js'
+import { blobImageDims, isPrivateDevice } from './db.js'
 
 export const ITEM_KINDS = ['task', 'question', 'decision', 'notice']
 // A notice (mission: For you) is something the user needs to read but not
@@ -167,9 +167,17 @@ export function rowToItem(row) {
 // tap answered the item's own buttons. `actions` / `chosen_action` are the
 // buttons this comment itself offers and the user's latest tap on them
 // (2026-10-04 comment-actions contract): [] / null on every other comment.
+// `device_name` / `convo_id` / `convo_title` say who wrote an agent's comment:
+// the box, and the conversation (session) on it when the bridge named one.
+// All null on a user's comment, on the journal's own lines, and wherever the
+// reader may not learn them (hidePrivateAuthors, listSharedComments).
 export function rowToComment(row) {
   if (!row) return null
   const { attachments, meta, actions, idem_key: _idemKey, user_id: _userId, ...rest } = row
+  const agent = rest.author === 'agent'
+  rest.device_name = agent ? rest.device_name ?? null : null
+  rest.convo_id = agent ? rest.convo_id ?? null : null
+  rest.convo_title = agent ? rest.convo_title ?? null : null
   const m = meta == null ? null : parseJson(meta, null)
   const action = typeof m?.action === 'string' ? m.action : null
   const replyTo = typeof m?.reply_to === 'string' ? m.reply_to : null
@@ -328,7 +336,7 @@ export function createItem(db, {
     // `bodyComment`: the synthetic row above, so the caller can queue its
     // voice notes for transcription exactly like a comment's (null without
     // attachments, and on a duplicate — a replay queues nothing).
-    const bodyComment = bodyCommentId ? rowToComment(db.prepare('SELECT * FROM item_comments WHERE id=?').get(bodyCommentId)) : null
+    const bodyComment = bodyCommentId ? commentById(db, bodyCommentId) : null
     return { item: getItem(db, userId, id), bodyComment, duplicate: false }
   })()
 }
@@ -381,12 +389,31 @@ export function getItem(db, userId, idOrNum) {
   return rowToItem(row)
 }
 
+// Every comment read goes through this SELECT so the author's names ride on
+// the row. Same-user guards and the title bound as ITEM_DECOR's
+// origin_convo_title: a stale id reused by another user discloses nothing.
+const COMMENT_SELECT = `SELECT c.*,
+  (SELECT d.name FROM devices d WHERE d.id = c.device_id AND d.user_id = c.user_id AND d.kind = 'agent') AS device_name,
+  (SELECT NULLIF(substr(cv.title, 1, 200), '') FROM conversations cv
+     WHERE cv.id = c.convo_id AND cv.owner_user_id = c.user_id) AS convo_title
+  FROM item_comments c`
+const commentById = (db, id) => rowToComment(db.prepare(`${COMMENT_SELECT} WHERE c.id=?`).get(id))
+
+// An ordinary agent may not learn a private box's name or its conversations
+// (privacy.js): to it, a private box's comment has an author it cannot name.
+export function hidePrivateAuthors(db, comments) {
+  const priv = new Map()
+  const isPriv = (id) => { if (!priv.has(id)) priv.set(id, isPrivateDevice(db, id)); return priv.get(id) }
+  return comments.map((c) => (c.device_name != null || c.convo_id != null) && isPriv(c.device_id)
+    ? { ...c, device_name: null, convo_id: null, convo_title: null } : c)
+}
+
 export function listComments(db, itemId) {
   // rowid (not id) as the tiebreaker: id is random hex, so two rows written
   // in the same millisecond (e.g. a comment immediately followed by a
   // close's status row) would otherwise come back in nondeterministic
   // order. rowid reflects actual insertion order for this ordinary table.
-  return db.prepare("SELECT * FROM item_comments WHERE item_id=? AND NOT (kind='status' AND meta LIKE '%\"role\":\"body\"%') ORDER BY created_at ASC, rowid ASC")
+  return db.prepare(`${COMMENT_SELECT} WHERE c.item_id=? AND NOT (c.kind='status' AND c.meta LIKE '%"role":"body"%') ORDER BY c.created_at ASC, c.rowid ASC`)
     .all(itemId).map(rowToComment)
 }
 
@@ -499,9 +526,11 @@ export function listGrantedComments(db, itemId) {
 }
 
 // Another person's view of a thread: the handover lines (src/item-handover.js)
-// are dropped — they name the user's conversations and boxes.
+// are dropped — they name the user's conversations and boxes — and so are
+// the author's box and conversation on every comment.
 export function listSharedComments(db, itemId) {
   return listComments(db, itemId).filter((c) => !c.meta?.handover)
+    .map((c) => ({ ...c, device_name: null, convo_id: null, convo_title: null }))
 }
 
 export function listSharedItems(db, viewerUserId, { kind = null, state = null, awaiting = null, limit = 100, cursor = null } = {}) {
@@ -547,13 +576,13 @@ export function withImageDims(db, attachments) {
   })
 }
 
-export function insertComment(db, { itemId, userId, author, deviceId, kind, body, attachments, meta, actions = [], idemKey, now }) {
+export function insertComment(db, { itemId, userId, author, deviceId, convoId = null, kind, body, attachments, meta, actions = [], idemKey, now }) {
   attachments = withImageDims(db, attachments)
   const id = newId('ic')
-  db.prepare(`INSERT INTO item_comments(id,item_id,user_id,author,device_id,kind,body,attachments,meta,idem_key,created_at,actions)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(id, itemId, userId, author, deviceId, kind, body, JSON.stringify(attachments ?? []), meta == null ? null : JSON.stringify(meta), idemKey, now, JSON.stringify(actions ?? []))
-  return rowToComment(db.prepare('SELECT * FROM item_comments WHERE id=?').get(id))
+  db.prepare(`INSERT INTO item_comments(id,item_id,user_id,author,device_id,convo_id,kind,body,attachments,meta,idem_key,created_at,actions)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(id, itemId, userId, author, deviceId, author === 'agent' ? convoId : null, kind, body, JSON.stringify(attachments ?? []), meta == null ? null : JSON.stringify(meta), idemKey, now, JSON.stringify(actions ?? []))
+  return commentById(db, id)
 }
 
 const ownedRow = (db, userId, itemId) => db.prepare('SELECT * FROM items WHERE id=? AND user_id=?').get(itemId, userId)
@@ -578,7 +607,7 @@ const ownedRow = (db, userId, itemId) => db.prepare('SELECT * FROM items WHERE i
 // `keepStatus` is for a consent mirror (isConsentMirror): its status belongs
 // to the ask it mirrors, so a user's comment is recorded but neither hands
 // the item to an agent (none can see it) nor reopens it.
-export function addComment(db, { userId, itemId, author, deviceId, body = '', attachments = [], action = null, replyTo = null, actions = [], idemKey = null, keepStatus = false, now = Date.now() }) {
+export function addComment(db, { userId, itemId, author, deviceId, convoId = null, body = '', attachments = [], action = null, replyTo = null, actions = [], idemKey = null, keepStatus = false, now = Date.now() }) {
   return db.transaction(() => {
     const row = ownedRow(db, userId, itemId)
     if (!row) return null
@@ -589,7 +618,7 @@ export function addComment(db, { userId, itemId, author, deviceId, body = '', at
       // under B's id. Below, the INSERT itself catches that cross-item
       // reuse via the UNIQUE constraint and reports it as a conflict.
       const dup = db.prepare('SELECT * FROM item_comments WHERE user_id=? AND item_id=? AND idem_key=?').get(userId, itemId, idemKey)
-      if (dup) return { item: getItem(db, userId, itemId), comment: rowToComment(dup), duplicate: true }
+      if (dup) return { item: getItem(db, userId, itemId), comment: commentById(db, dup.id), duplicate: true }
     }
     const asks = actions.length > 0
     if (asks && row.state === 'closed') throw new Error('item_closed')
@@ -612,7 +641,7 @@ export function addComment(db, { userId, itemId, author, deviceId, body = '', at
     const meta = action == null ? null : (asked ? { action, reply_to: asked.id } : { action })
     let comment
     try {
-      comment = insertComment(db, { itemId, userId, author, deviceId, kind: 'comment', body, attachments, meta, actions, idemKey, now })
+      comment = insertComment(db, { itemId, userId, author, deviceId, convoId, kind: 'comment', body, attachments, meta, actions, idemKey, now })
     } catch (err) {
       if (idemKey && err.code === 'SQLITE_CONSTRAINT_UNIQUE') throw new Error('idem_key_conflict')
       throw err
@@ -646,18 +675,18 @@ export function addComment(db, { userId, itemId, author, deviceId, body = '', at
 
 const statusOf = (row) => ({ state: row.state, resolution: row.resolution, awaiting: row.awaiting })
 
-export function closeItem(db, { userId, itemId, resolution, author, deviceId, comment = '', now = Date.now() }) {
+export function closeItem(db, { userId, itemId, resolution, author, deviceId, convoId = null, comment = '', now = Date.now() }) {
   return db.transaction(() => {
     const row = ownedRow(db, userId, itemId)
     if (!row || row.state === 'closed') return null
     const to = { state: 'closed', resolution, awaiting: null }
     db.prepare("UPDATE items SET state='closed', resolution=?, awaiting=NULL, closed_at=?, updated_at=? WHERE id=?").run(resolution, now, now, itemId)
-    const c = insertComment(db, { itemId, userId, author, deviceId, kind: 'status', body: comment, attachments: [], meta: { from: statusOf(row), to }, idemKey: null, now })
+    const c = insertComment(db, { itemId, userId, author, deviceId, convoId, kind: 'status', body: comment, attachments: [], meta: { from: statusOf(row), to }, idemKey: null, now })
     return { item: getItem(db, userId, itemId), comment: c }
   })()
 }
 
-export function reopenItem(db, { userId, itemId, author, deviceId, comment = '', now = Date.now() }) {
+export function reopenItem(db, { userId, itemId, author, deviceId, convoId = null, comment = '', now = Date.now() }) {
   return db.transaction(() => {
     const row = ownedRow(db, userId, itemId)
     if (!row || row.state === 'open') return null
@@ -666,7 +695,7 @@ export function reopenItem(db, { userId, itemId, author, deviceId, comment = '',
     db.prepare("UPDATE items SET state='open', resolution=NULL, awaiting=?, closed_at=NULL, updated_at=? WHERE id=?").run(awaiting, now, itemId)
     // A reopened notice is unread again: its Seen button goes back live.
     if (row.kind === 'notice') db.prepare('UPDATE items SET chosen_action=NULL WHERE id=?').run(itemId)
-    const c = insertComment(db, { itemId, userId, author, deviceId, kind: 'status', body: comment, attachments: [], meta: { from: statusOf(row), to }, idemKey: null, now })
+    const c = insertComment(db, { itemId, userId, author, deviceId, convoId, kind: 'status', body: comment, attachments: [], meta: { from: statusOf(row), to }, idemKey: null, now })
     return { item: getItem(db, userId, itemId), comment: c }
   })()
 }
@@ -728,7 +757,7 @@ export function setAttachmentTranscript(db, { userId, itemId, commentId, blobRef
     }
     db.prepare('UPDATE item_comments SET attachments=? WHERE id=?').run(JSON.stringify(atts), commentId)
     touch(db, itemId, now)
-    return rowToComment(db.prepare('SELECT * FROM item_comments WHERE id=?').get(commentId))
+    return commentById(db, commentId)
   })()
 }
 
@@ -786,7 +815,7 @@ export function finishAttachmentTranscript(db, { commentId, blobRef, transcript,
       // The synthetic body row of createItem: its voice notes belong to the
       // `created` turn, not to a reply.
       isItemBody: parseJson(c.meta, null)?.role === 'body',
-      comment: rowToComment(db.prepare('SELECT * FROM item_comments WHERE id=?').get(commentId)),
+      comment: commentById(db, commentId),
       item: getItem(db, c.user_id, c.item_id),
     }
   })()
