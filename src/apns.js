@@ -39,6 +39,7 @@ export function makeApnsClient({
 
   const sessions = {} // env -> live http2 session, lazily connected
   const pingTimers = new Map() // session -> keepalive interval
+  const pingDeadlines = new Map() // session -> pending ping's deadline
 
   function teardown(env, session) {
     if (sessions[env] === session) delete sessions[env]
@@ -46,6 +47,11 @@ export function makeApnsClient({
     if (timer) {
       clearInterval(timer)
       pingTimers.delete(session)
+    }
+    const deadline = pingDeadlines.get(session)
+    if (deadline) {
+      clearTimeout(deadline)
+      pingDeadlines.delete(session)
     }
   }
 
@@ -62,20 +68,28 @@ export function makeApnsClient({
   // dead, so it is discarded before a push has to find out.
   function startKeepalive(env, session) {
     if (!pingIntervalMs || typeof session.ping !== 'function') return
+    // Only a session still under keepalive may be discarded by it: after
+    // teardown (including close(), which lets in-flight streams finish) a
+    // late deadline or ping callback must leave the session alone.
+    const live = () => pingTimers.has(session)
     const timer = setInterval(() => {
       if (session.destroyed || session.closed) return teardown(env, session)
-      let answered = false
-      const deadline = setTimeout(() => { if (!answered) discard(env, session) }, pingTimeoutMs)
+      if (pingDeadlines.has(session)) return // previous ping still pending
+      const deadline = setTimeout(() => {
+        pingDeadlines.delete(session)
+        if (live()) discard(env, session)
+      }, pingTimeoutMs)
       deadline.unref()
-      try {
-        session.ping((err) => {
-          answered = true
-          clearTimeout(deadline)
-          if (err) discard(env, session)
-        })
-      } catch {
+      pingDeadlines.set(session, deadline)
+      const settlePing = (failed) => {
         clearTimeout(deadline)
-        discard(env, session)
+        pingDeadlines.delete(session)
+        if (failed && live()) discard(env, session)
+      }
+      try {
+        session.ping((err) => settlePing(Boolean(err)))
+      } catch {
+        settlePing(true)
       }
     }, pingIntervalMs)
     timer.unref()
@@ -105,7 +119,7 @@ export function makeApnsClient({
   // that simply never arrives resolves {status: 0, reason: 'timeout'} after
   // requestTimeoutMs — a permanently-pending promise here would leak the
   // stream and silently skew the pipeline's counters.
-  function requestOnce(session, { deviceToken, topic: pushTopic, payload, collapseId, priority, pushType }) {
+  function requestOnce(session, { deviceToken, topic: pushTopic, payload, collapseId, priority, pushType, apnsId }) {
     return new Promise((resolve) => {
       let settled = false
       let req = null
@@ -130,6 +144,7 @@ export function makeApnsClient({
         'apns-expiration': '0',
       }
       if (collapseId) headers['apns-collapse-id'] = collapseId
+      if (apnsId) headers['apns-id'] = apnsId
 
       try {
         req = session.request(headers)
@@ -164,36 +179,32 @@ export function makeApnsClient({
 
   // Resolves {status, reason} — never rejects.
   //
-  // A timeout discards the session: a connection that swallowed a request
-  // without answering would swallow the next one too.
+  // Any request that ends in a timeout or a transport failure discards its
+  // session: a connection that swallowed or dropped one request is not
+  // trusted with the next.
   //
-  // A transport failure on a REUSED session means that connection died under
-  // the request, so the session is discarded and the push is retried once on
-  // a fresh one. A failure on a session opened for this send is returned as
-  // is, so there is never more than one retry.
+  // A transport failure on a REUSED session means that connection died
+  // between pushes, so the push is retried once on a fresh session. A failure
+  // on a session opened for this send is not retried, so there is never more
+  // than one retry. Both attempts carry the same apns-id, as Apple asks for a
+  // notification sent more than once.
   async function send({ deviceToken, env, topic: pushTopic, payload, collapseId, priority, pushType }) {
-    const push = { deviceToken, topic: pushTopic, payload, collapseId, priority, pushType }
-    let session
-    let reused
-    try {
-      reused = Boolean(sessions[env]) && !sessions[env].destroyed && !sessions[env].closed
-      session = sessionFor(env)
-    } catch {
-      return { status: 0, reason: 'transport' }
-    }
-    const result = await requestOnce(session, push)
-    if (result.reason === 'timeout') {
-      discard(env, session)
+    const push = { deviceToken, topic: pushTopic, payload, collapseId, priority, pushType, apnsId: crypto.randomUUID() }
+    const attempt = async () => {
+      let session
+      try {
+        session = sessionFor(env)
+      } catch {
+        return { status: 0, reason: 'transport' }
+      }
+      const result = await requestOnce(session, push)
+      if (result.status === 0) discard(env, session)
       return result
     }
-    if (result.status !== 0 || result.reason !== 'transport' || !reused) return result
-    discard(env, session)
-    try {
-      session = sessionFor(env)
-    } catch {
-      return { status: 0, reason: 'transport' }
-    }
-    return requestOnce(session, push)
+    const reused = Boolean(sessions[env]) && !sessions[env].destroyed && !sessions[env].closed
+    const result = await attempt()
+    if (result.reason !== 'transport' || !reused) return result
+    return attempt()
   }
 
   function close() {
