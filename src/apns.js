@@ -17,7 +17,10 @@ const base64url = (buf) => buf.toString('base64').replace(/\+/g, '-').replace(/\
 // node:http2 client sessions, one per environment host. `connect` is
 // injectable so tests can run against an in-process fake h2 server instead
 // of Apple.
-export function makeApnsClient({ keyFile, keyId, teamId, topic, connect = http2.connect, requestTimeoutMs = 30000 }) {
+export function makeApnsClient({
+  keyFile, keyId, teamId, topic, connect = http2.connect, requestTimeoutMs = 30000,
+  pingIntervalMs = 60000, pingTimeoutMs = 10000,
+}) {
   const privateKey = crypto.createPrivateKey(fs.readFileSync(keyFile, 'utf8'))
 
   let cachedJwt = null
@@ -35,9 +38,62 @@ export function makeApnsClient({ keyFile, keyId, teamId, topic, connect = http2.
   }
 
   const sessions = {} // env -> live http2 session, lazily connected
+  const pingTimers = new Map() // session -> keepalive interval
+  const pingDeadlines = new Map() // session -> pending ping's deadline
 
   function teardown(env, session) {
     if (sessions[env] === session) delete sessions[env]
+    const timer = pingTimers.get(session)
+    if (timer) {
+      clearInterval(timer)
+      pingTimers.delete(session)
+    }
+    const deadline = pingDeadlines.get(session)
+    if (deadline) {
+      clearTimeout(deadline)
+      pingDeadlines.delete(session)
+    }
+  }
+
+  // A connection can die without the socket ever closing (a peer or a
+  // middlebox drops it silently). Nothing then fires 'close', so every send
+  // reuses it and times out. Destroying it on that evidence lets the next
+  // send reconnect.
+  function discard(env, session) {
+    teardown(env, session)
+    try { if (!session.destroyed) session.destroy() } catch { /* already gone */ }
+  }
+
+  // Keepalive: a ping that errors or goes unanswered means the connection is
+  // dead, so it is discarded before a push has to find out.
+  function startKeepalive(env, session) {
+    if (!pingIntervalMs || typeof session.ping !== 'function') return
+    // Only a session still under keepalive may be discarded by it: after
+    // teardown (including close(), which lets in-flight streams finish) a
+    // late deadline or ping callback must leave the session alone.
+    const live = () => pingTimers.has(session)
+    const timer = setInterval(() => {
+      if (session.destroyed || session.closed) return teardown(env, session)
+      if (pingDeadlines.has(session)) return // previous ping still pending
+      const deadline = setTimeout(() => {
+        pingDeadlines.delete(session)
+        if (live()) discard(env, session)
+      }, pingTimeoutMs)
+      deadline.unref()
+      pingDeadlines.set(session, deadline)
+      const settlePing = (failed) => {
+        clearTimeout(deadline)
+        pingDeadlines.delete(session)
+        if (failed && live()) discard(env, session)
+      }
+      try {
+        session.ping((err) => settlePing(Boolean(err)))
+      } catch {
+        settlePing(true)
+      }
+    }, pingIntervalMs)
+    timer.unref()
+    pingTimers.set(session, timer)
   }
 
   function connectEnv(env) {
@@ -47,6 +103,7 @@ export function makeApnsClient({ keyFile, keyId, teamId, topic, connect = http2.
     session.on('goaway', () => teardown(env, session))
     session.on('close', () => teardown(env, session))
     sessions[env] = session
+    startKeepalive(env, session)
     return session
   }
 
@@ -62,7 +119,7 @@ export function makeApnsClient({ keyFile, keyId, teamId, topic, connect = http2.
   // that simply never arrives resolves {status: 0, reason: 'timeout'} after
   // requestTimeoutMs — a permanently-pending promise here would leak the
   // stream and silently skew the pipeline's counters.
-  function requestOnce(session, { deviceToken, topic: pushTopic, payload, collapseId, priority, pushType }) {
+  function requestOnce(session, { deviceToken, topic: pushTopic, payload, collapseId, priority, pushType, apnsId }) {
     return new Promise((resolve) => {
       let settled = false
       let req = null
@@ -87,6 +144,7 @@ export function makeApnsClient({ keyFile, keyId, teamId, topic, connect = http2.
         'apns-expiration': '0',
       }
       if (collapseId) headers['apns-collapse-id'] = collapseId
+      if (apnsId) headers['apns-id'] = apnsId
 
       try {
         req = session.request(headers)
@@ -119,23 +177,40 @@ export function makeApnsClient({ keyFile, keyId, teamId, topic, connect = http2.
     })
   }
 
-  // Resolves {status, reason} — never rejects, never retries the push
-  // itself. A send that finds a dead session reconnects exactly once before
-  // giving up (no unbounded retry loop).
+  // Resolves {status, reason} — never rejects.
+  //
+  // Any request that ends in a timeout or a transport failure discards its
+  // session: a connection that swallowed or dropped one request is not
+  // trusted with the next.
+  //
+  // A transport failure on a REUSED session means that connection died
+  // between pushes, so the push is retried once on a fresh session. A failure
+  // on a session opened for this send is not retried, so there is never more
+  // than one retry. Both attempts carry the same apns-id, as Apple asks for a
+  // notification sent more than once.
   async function send({ deviceToken, env, topic: pushTopic, payload, collapseId, priority, pushType }) {
-    let session
-    try {
-      session = sessionFor(env)
-    } catch {
-      return { status: 0, reason: 'transport' }
+    const push = { deviceToken, topic: pushTopic, payload, collapseId, priority, pushType, apnsId: crypto.randomUUID() }
+    const attempt = async () => {
+      let session
+      try {
+        session = sessionFor(env)
+      } catch {
+        return { status: 0, reason: 'transport' }
+      }
+      const result = await requestOnce(session, push)
+      if (result.status === 0) discard(env, session)
+      return result
     }
-    return requestOnce(session, { deviceToken, topic: pushTopic, payload, collapseId, priority, pushType })
+    const reused = Boolean(sessions[env]) && !sessions[env].destroyed && !sessions[env].closed
+    const result = await attempt()
+    if (result.reason !== 'transport' || !reused) return result
+    return attempt()
   }
 
   function close() {
     for (const env of Object.keys(sessions)) {
       const s = sessions[env]
-      delete sessions[env]
+      teardown(env, s)
       try { s.close() } catch { /* already gone */ }
     }
   }
