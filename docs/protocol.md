@@ -1725,9 +1725,12 @@ a value that is not a non-empty string of at most 128 characters is 400. A
 client's `as_convo_id` is ignored. All three are `null` on a user's comment
 and on the journal's own lines; `convo_id` and `convo_title` are `null` when
 the bridge sent none (and on every comment from before the field).
-An ordinary agent reading a thread gets `null` for all three on a private
-box's comment, and another person's view of a thread (*Shared visibility*,
-a granted mission) never carries them.
+An ordinary agent gets `null` for all three on a private box's comment, and
+`null` for `convo_id` and `convo_title` when the conversation named is one a
+private box hosts (a public box that joined it may name it; its own
+`device_name` still shows). The sieve applies to the thread read and to every
+comment a write hands back. Another person's view of a thread (*Shared
+visibility*, a granted mission) never carries them.
 `width`/`height` (spec 2026-10-01, item thread layout shift) are the image's
 displayed pixel size, stamped by the journal from the blob's header when the
 attachment is stored (and backfilled after boot onto older comments) so the

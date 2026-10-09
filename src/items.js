@@ -401,11 +401,22 @@ const commentById = (db, id) => rowToComment(db.prepare(`${COMMENT_SELECT} WHERE
 
 // An ordinary agent may not learn a private box's name or its conversations
 // (privacy.js): to it, a private box's comment has an author it cannot name.
+// The conversation is sieved on its own as well: a public box that has
+// joined a private box's conversation may name it on its comment, and that
+// conversation's id and title are no more an ordinary agent's to read than
+// the items filed in it. The public box's own name still shows.
 export function hidePrivateAuthors(db, comments) {
-  const priv = new Map()
-  const isPriv = (id) => { if (!priv.has(id)) priv.set(id, isPrivateDevice(db, id)); return priv.get(id) }
-  return comments.map((c) => (c.device_name != null || c.convo_id != null) && isPriv(c.device_id)
-    ? { ...c, device_name: null, convo_id: null, convo_title: null } : c)
+  const privDevice = new Map()
+  const privConvo = new Map()
+  const memo = (map, key, probe) => { if (!map.has(key)) map.set(key, probe(key)); return map.get(key) }
+  const hostIsPrivate = db.prepare(`SELECT 1 FROM conversations c JOIN devices d ON d.id = c.agent_device_id
+    WHERE c.id = ? AND d.private = 1`)
+  return comments.map((c) => {
+    if (c.device_name == null && c.convo_id == null) return c
+    if (memo(privDevice, c.device_id, (id) => isPrivateDevice(db, id))) return { ...c, device_name: null, convo_id: null, convo_title: null }
+    if (c.convo_id != null && memo(privConvo, c.convo_id, (id) => !!hostIsPrivate.get(id))) return { ...c, convo_id: null, convo_title: null }
+    return c
+  })
 }
 
 export function listComments(db, itemId) {

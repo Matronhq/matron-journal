@@ -498,6 +498,10 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     return authorizeAgentWrite(db, who.userId, who.deviceId, v) ? v : null
   }
 
+  // Every comment an ordinary agent is handed back goes through the same
+  // author sieve as the thread it reads (GET /items/:id).
+  const seenBy = (c) => (c && filteredAgent(db, who) ? hidePrivateAuthors(db, [c])[0] : c)
+
   if (sub === 'comments' && subId == null && req.method === 'POST') {
     const body = await readBody(req)
     const convoId = asConvo(body)
@@ -592,7 +596,7 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
         for (const blobRef of audioBlobs) ctx.itemTranscription.enqueue({ commentId: out.comment.id, userId: who.userId, blobRef })
       }
     }
-    replyItems(who, res, out.duplicate ? 200 : 201, { item: out.item, comment: out.comment })
+    replyItems(who, res, out.duplicate ? 200 : 201, { item: out.item, comment: seenBy(out.comment) })
     return true
   }
 
@@ -619,7 +623,7 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     // announces with (emitTranscriptionMarker) — including `for_action`: the
     // item body's synthetic comment belongs to the `created` turn.
     emitMarker(ctx, who, { item: getItem(db, who.userId, item.id) ?? item, action: 'updated', comment: c, extra: { transcription: 'done', for_action: c.meta?.role === 'body' ? 'created' : 'commented' } })
-    json(res, 200, { comment: c })
+    json(res, 200, { comment: seenBy(c) })
     return true
   }
 
@@ -637,7 +641,7 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     // As for a notice's Seen close above: the offer goes first.
     out.item = withdrawOnClose(ctx, who.userId, item.id) ?? out.item
     emitMarker(ctx, who, { item: out.item, action: 'closed', comment: out.comment })
-    replyItems(who, res, 200, { item: out.item, comment: out.comment })
+    replyItems(who, res, 200, { item: out.item, comment: seenBy(out.comment) })
     return true
   }
 
@@ -653,7 +657,7 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     const out = reopenItem(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, convoId, comment: body.comment ?? '' })
     if (!out) return conflict(res) // already open
     emitMarker(ctx, who, { item: out.item, action: 'reopened', comment: out.comment })
-    replyItems(who, res, 200, { item: out.item, comment: out.comment })
+    replyItems(who, res, 200, { item: out.item, comment: seenBy(out.comment) })
     return true
   }
 

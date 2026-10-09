@@ -7,6 +7,7 @@ import { startTestServer } from './helpers.js'
 import { openDb, pinDevicePrivate } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
+import { recordJoined } from '../src/participants.js'
 import { createItem, addComment, closeItem, listComments, listSharedComments, listGrantedComments } from '../src/items.js'
 
 const who = (c) => [c.device_name, c.convo_id, c.convo_title]
@@ -84,6 +85,24 @@ test('a private box\'s comment is unnamed to an ordinary agent, named to the use
   assert.deepEqual(await last(a.token), [null, null, null])
   assert.deepEqual(await last(client), ['private-box', 'secret', 'Secret work'])
   assert.deepEqual(await last(priv.token), ['private-box', 'secret', 'Secret work'])
+})
+
+test('a public box naming a private box\'s conversation: the conversation is hidden from an ordinary agent, the box is not', async (t) => {
+  const { s, alice, a, b, client, id, post } = await fleet(t)
+  const priv = createAgent(s.db, alice.id, 'private-box')
+  pinDevicePrivate(s.db, priv.deviceId, true)
+  upsertConversation(s.db, { id: 'secret', ownerUserId: alice.id, title: 'Secret work', agentDeviceId: priv.deviceId })
+  // box-b has joined the private box's conversation, so it may write there
+  // and may name it on its comment.
+  recordJoined(s.db, { convoId: 'secret', agentDeviceId: b.deviceId, initiatorDeviceId: priv.deviceId })
+  const made = await post(b.token, { body: 'from inside the room', as_convo_id: 'secret' })
+  assert.equal(made.status, 201)
+  const last = async (token) => who((await s.http(`/items/${id}`, { token })).json.comments.at(-1))
+  assert.deepEqual(await last(a.token), ['box-b', null, null])
+  assert.deepEqual(await last(client), ['box-b', 'secret', 'Secret work'])
+  assert.deepEqual(await last(priv.token), ['box-b', 'secret', 'Secret work'])
+  // The write's own response goes through the same sieve.
+  assert.deepEqual(who(made.json.comment), ['box-b', null, null])
 })
 
 test('item_comments gains convo_id on open', async () => {
