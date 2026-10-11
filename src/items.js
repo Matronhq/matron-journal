@@ -142,9 +142,14 @@ const parseJson = (s, fallback) => { try { return JSON.parse(s) } catch { return
 // `idem_key` is an internal column (same stance as toEventShape in
 // journal.js): the caller sent the key, so handing it back tells it nothing,
 // and echoing another device's key would be a small leak.
-export function rowToItem(row) {
+export function rowToItem(row, now = Date.now()) {
   if (!row) return null
-  const { labels, links, attachments, actions, idem_key: _idemKey, ...rest } = row
+  const {
+    labels, links, attachments, actions, idem_key: _idemKey,
+    turn_requested_at: turnRequestedAt, owner_session_state: sessionState,
+    owner_turn_started_at: turnStartedAt, owner_turn_ended_at: turnEndedAt,
+    ...rest
+  } = row
   const out = {
     ...rest,
     labels: parseJson(labels, []),
@@ -156,7 +161,56 @@ export function rowToItem(row) {
   if ('handover' in out) out.handover = out.handover == null ? null : parseJson(out.handover, null)
   if ('comment_count' in out) out.comment_count = Number(out.comment_count)
   if ('has_image' in out) out.has_image = !!out.has_image
+  // Only a decorated row knows its owning conversation's state.
+  if ('owner_session_state' in row) out.working = itemWorking({ sessionState, turnStartedAt, turnEndedAt, turnRequestedAt }, now)
   return out
+}
+
+// How long an ask may sit `queued` with no turn starting before the item
+// stops saying so: long enough for a sleeping box to be started and its
+// session resumed, short enough that an ask nobody will pick up (the box is
+// gone, the session is stalled) does not look alive for long.
+export const WORKING_QUEUED_TTL_MS = 10 * 60 * 1000
+// An ask that landed while a turn was in flight is delivered when that turn
+// ends, as the next turn. Between the two the session reads idle for a
+// moment; `queued` covers the gap for this long after the turn end, and no
+// longer — the reply may equally have been taken into the turn that ended.
+export const WORKING_HANDOFF_GRACE_MS = 15 * 1000
+
+// An item's `working` block: is the session that owns it busy? What an item
+// thread shows a working indicator from, the way a chat does from its own
+// conversation's state. Pure, so the rule is testable without a clock.
+//   running — the owning conversation is mid-turn (session_state 'running'),
+//             whether or not the turn is about this item.
+//   queued  — the user said something on the item that reaches the agent as a
+//             turn (turnRequestedAt), and no turn has started since: the box
+//             is being woken, the session resumed, or the reply is waiting
+//             behind the turn in flight.
+// `since` is when that state began (null when unknown); `until` is when a
+// queued state lapses if nothing else happens — a client drops the indicator
+// then without asking again. null = nothing to show.
+export function itemWorking({ sessionState, turnStartedAt, turnEndedAt, turnRequestedAt }, now = Date.now()) {
+  if (sessionState == null) return null
+  if (sessionState === 'running') return { state: 'running', since: turnStartedAt ?? null, until: null }
+  if (turnRequestedAt == null) return null
+  if (turnStartedAt != null && turnStartedAt > turnRequestedAt) return null
+  let until = turnRequestedAt + WORKING_QUEUED_TTL_MS
+  if (turnEndedAt != null && turnEndedAt >= turnRequestedAt) until = Math.min(until, turnEndedAt + WORKING_HANDOFF_GRACE_MS)
+  return now < until ? { state: 'queued', since: turnRequestedAt, until } : null
+}
+
+// Record that the user just asked the item's session for a turn, and answer
+// with the item's `working` as it now stands. Called from the one place that
+// decides a write wakes the agent (items-http.js emitMarker), so "queued"
+// means exactly "a turn is on its way".
+export function requestTurn(db, itemId, now = Date.now()) {
+  db.prepare('UPDATE items SET turn_requested_at=? WHERE id=?').run(now, itemId)
+  const row = db.prepare(`SELECT i.turn_requested_at, ${WORKING_DECORATE} FROM items i WHERE i.id=?`).get(itemId)
+  if (!row) return null
+  return itemWorking({
+    sessionState: row.owner_session_state, turnStartedAt: row.owner_turn_started_at,
+    turnEndedAt: row.owner_turn_ended_at, turnRequestedAt: row.turn_requested_at,
+  }, now)
 }
 
 // Same internal-column strip as rowToItem, plus `user_id`: every comment
@@ -341,7 +395,15 @@ export function createItem(db, {
   })()
 }
 
-const DECORATE = `
+// The owning conversation's state, for `working` (itemWorking). Same-user
+// guard as origin_convo_title below: a stale id reused by another user
+// discloses nothing. rowToItem folds these into `working` and drops them.
+const WORKING_DECORATE = `
+  (SELECT cv.session_state FROM conversations cv WHERE cv.id = i.origin_convo_id AND cv.owner_user_id = i.user_id) AS owner_session_state,
+  (SELECT cv.turn_started_at FROM conversations cv WHERE cv.id = i.origin_convo_id AND cv.owner_user_id = i.user_id) AS owner_turn_started_at,
+  (SELECT cv.turn_ended_at FROM conversations cv WHERE cv.id = i.origin_convo_id AND cv.owner_user_id = i.user_id) AS owner_turn_ended_at`
+
+const DECORATE = `${WORKING_DECORATE},
   (SELECT COUNT(*) FROM item_comments c WHERE c.item_id = i.id AND c.kind='comment') AS comment_count,
   (SELECT MAX(created_at) FROM item_comments c WHERE c.item_id = i.id AND c.kind='comment') AS last_comment_at,
   -- When the user last acted on the item: their latest comment, action tap,
@@ -520,6 +582,8 @@ function rowToSharedItem(row) {
   // Item handover (src/item-handover.js) names conversations that need not
   // pass the sharing rule themselves: never shown to another person.
   Object.assign(item, { filed_convo_id: null, handover: null })
+  // Whether the owner's session is busy is the owner's to see.
+  delete item.working
   if (orgShared === 0) {
     Object.assign(item, {
       shared_via: 'grant', origin_convo_id: '', origin_device_id: 0, origin_convo_title: null, repo: null,

@@ -199,7 +199,10 @@ export function acceptHandover(db, { userId, itemId, now = Date.now() }) {
     // The owner moved some other way while the offer waited: the offer was
     // made on behalf of a conversation that no longer holds the item.
     if (row.origin_convo_id !== h.from_convo_id) fail('no_offer')
-    db.prepare(`UPDATE items SET origin_convo_id=?, origin_device_id=?, filed_convo_id=COALESCE(filed_convo_id, origin_convo_id), updated_at=? WHERE id=?`)
+    // turn_requested_at goes with the old owner: an ask made of that session
+    // says nothing about when the new one will start a turn (items.js
+    // itemWorking would read it against the new conversation's stamps).
+    db.prepare(`UPDATE items SET origin_convo_id=?, origin_device_id=?, filed_convo_id=COALESCE(filed_convo_id, origin_convo_id), turn_requested_at=NULL, updated_at=? WHERE id=?`)
       .run(h.to_convo_id, target.agent_device_id, now, itemId)
     db.prepare("UPDATE item_handovers SET state='accepted', to_device_id=?, updated_at=? WHERE id=?").run(target.agent_device_id, now, h.id)
     const from = convoLabel(db, userId, h.from_convo_id)

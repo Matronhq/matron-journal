@@ -217,6 +217,14 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     db.prepare(
       'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id), session_outcome=COALESCE(?, session_outcome), summary=COALESCE(?, summary) WHERE id=?'
     ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), sessionOutcome ?? null, summary ?? null, id)
+    // When the session last entered and last left 'running' — a turn's start
+    // and end, for an item thread's working indicator (items.js itemWorking).
+    // Stamped on a real transition only: a bridge that repeats a state, or
+    // moves an idle session from 'waiting' to 'done', starts and ends nothing.
+    if (sessionState != null && sessionState !== existing.session_state) {
+      if (sessionState === 'running') db.prepare('UPDATE conversations SET turn_started_at=? WHERE id=?').run(Date.now(), id)
+      else if (existing.session_state === 'running') db.prepare('UPDATE conversations SET turn_ended_at=? WHERE id=?').run(Date.now(), id)
+    }
     if (repoCols) db.prepare('UPDATE conversations SET repo=?, repo_scope=? WHERE id=?').run(repoCols.repo, repoCols.scope, id)
     if (title != null) {
       db.prepare('UPDATE conversations SET auto_title=@auto_title, session_short=@session_short, title_marker=@title_marker WHERE id=@id')
@@ -235,8 +243,9 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     // non-null mission_id has an active link" must hold from birth.
     db.transaction(() => {
       db.prepare(
-        'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, mission_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)'
-      ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', inheritedMission, createdAt)
+        'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, mission_id, created_at, turn_started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)'
+      ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', inheritedMission, createdAt,
+        (sessionState || 'running') === 'running' ? createdAt : null)
       db.prepare('UPDATE conversations SET auto_title=@auto_title, session_short=@session_short, title_marker=@title_marker WHERE id=@id')
         .run({ id, ...autoTitleColumns(initialTitle) })
       if (inheritedMission) activateLink(db, { missionId: inheritedMission, convoId: id, userId: ownerUserId, how: 'inherited', ts: createdAt })
