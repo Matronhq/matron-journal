@@ -108,6 +108,8 @@ test('requestTurn: queued at once, running when the turn starts, cleared when it
   const w = requestTurn(db, item.id, T0)
   assert.deepEqual(w, { state: 'queued', since: T0, until: T0 + WORKING_QUEUED_TTL_MS })
   assert.equal(getItem(db, alice.id, item.id).working, null, 'T0 is long past: the stored ask has expired by the real clock')
+  // The list reads the same clock (a row's index must never stand in for it).
+  assert.equal(listItems(db, alice.id, {}).items[0].working, null)
   const now = Date.now()
   requestTurn(db, item.id, now)
   assert.equal(getItem(db, alice.id, item.id).working.state, 'queued')

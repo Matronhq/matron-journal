@@ -142,7 +142,9 @@ const parseJson = (s, fallback) => { try { return JSON.parse(s) } catch { return
 // `idem_key` is an internal column (same stance as toEventShape in
 // journal.js): the caller sent the key, so handing it back tells it nothing,
 // and echoing another device's key would be a small leak.
-export function rowToItem(row, now = Date.now()) {
+// No `now` parameter: this is mapped over row arrays (`rows.map(rowToItem)`),
+// where a second positional argument would be the row's index.
+export function rowToItem(row) {
   if (!row) return null
   const {
     labels, links, attachments, actions, idem_key: _idemKey,
@@ -162,7 +164,7 @@ export function rowToItem(row, now = Date.now()) {
   if ('comment_count' in out) out.comment_count = Number(out.comment_count)
   if ('has_image' in out) out.has_image = !!out.has_image
   // Only a decorated row knows its owning conversation's state.
-  if ('owner_session_state' in row) out.working = itemWorking({ sessionState, turnStartedAt, turnEndedAt, turnRequestedAt }, now)
+  if ('owner_session_state' in row) out.working = itemWorking({ sessionState, turnStartedAt, turnEndedAt, turnRequestedAt })
   return out
 }
 
