@@ -232,3 +232,17 @@ test('a handover takes the ask with the old owner: the new session is not shown 
   assert.equal(acc.status, 200); assert.equal(acc.json.item.origin_convo_id, 'c2')
   assert.equal((await s.http(`/items/${item.id}`, { token: client })).json.item.working, null)
 })
+
+test('an app that is not viewing the conversation still hears its turns start and end: what an item view re-reads on', async (t) => {
+  const { s, client, setState } = await fleet(t)
+  const app = await makeWsClient(s.base, { token: client, cursor: null })
+  t.after(() => app.close())
+  await app.waitFor((f) => f.op === 'hello_ok')
+  const seen = (state) => app.waitFor((f) => f.kind === 'journal' && f.type === 'session_status' && f.convo_id === 'c1' && f.payload.state === state && f.live !== false && f.seq > mark)
+  let mark = Math.max(0, ...app.journal().map((f) => f.seq))
+  await setState('running')
+  await seen('running')
+  mark = Math.max(0, ...app.journal().map((f) => f.seq))
+  await setState('waiting')
+  await seen('waiting')
+})
