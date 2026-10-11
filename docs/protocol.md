@@ -1687,7 +1687,7 @@ title, body, labels[], links[{url,title?}], supersedes, origin_convo_id,
 origin_device_id, created_by, created_at, updated_at, closed_at,
 comment_count, last_comment_at, last_user_input_at, attachments[], has_image,
 mission_id,
-mission_num, consent, actions[], chosen_action, origin_convo_title}`.
+mission_num, consent, actions[], chosen_action, origin_convo_title, working}`.
 `last_user_input_at` is when the user last acted on the item: their latest
 comment, action tap, close or reopen, else the filing time of an item they
 filed themselves; `null` when only agents have touched it. Clients order
@@ -1751,6 +1751,36 @@ item requests; to a client without it, item and comment bodies in `/items`
 replies carry each ref as its caption (`(image)` when empty). Agents always
 get the stored text. The chat fallback line and unseen snippets use the
 caption form.
+
+**Working indicator.** `working` says whether the session that owns the item
+(`origin_convo_id`) is busy, so an item thread can show the indicator a chat
+shows for its own conversation. It is `null` when there is nothing to show,
+else `{state, since, until}`:
+
+- `state: "running"`: the owning conversation's `session_state` is `running`,
+  whether or not the turn is about this item. `since` is when that turn
+  started (`null` when not recorded); `until` is `null`.
+- `state: "queued"`: the user wrote something on the item that reaches the
+  agent as a turn (a comment, an action tap, a close, a reopen, or filing the
+  item; the same writes that wake the box, so never a notice's Seen tap and
+  never a reply that stays on a consent card), and no turn has started since.
+  The box is being started, the session resumed, or the reply is waiting
+  behind the turn in flight. `since` is when the user wrote; `until` is when
+  the state lapses if nothing else happens: 10 minutes after the write, or 15
+  seconds after the end of a turn that was already running when the user
+  wrote (the reply either starts the next turn at once or was taken into the
+  one that ended). A client stops showing the indicator at `until` without
+  asking again.
+
+It is derived at read time from the item's last such write and the
+conversation's last turn start and end, like `origin_convo_title`: a turn
+starting or ending does not bump the item's `updated_at`. An open item view
+follows it by re-reading the item when a `session_status` event arrives for
+`origin_convo_id`, as well as on the item's own markers. The reply to the
+write that queues the turn (`POST /items`, `/comments`, `/close`, `/reopen`)
+already carries the new `working`. An accepted handover drops the pending
+write, which was addressed to the previous owner. Another person's view of an
+item (*Shared visibility*, a granted mission) never carries the field.
 
 `meta` is `null` for an ordinary comment, `{action:"<label>"}` for an action
 tap (plus `reply_to:"<comment id>"` when the tap answered a comment's

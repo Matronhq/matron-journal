@@ -12,6 +12,7 @@ import {
   ITEM_KINDS, NOTICE_ACTIONS, AWAITING, RESOLUTIONS, BODY_MAX, validateItemFields, createItem, getItem, listItems, listComments,
   updateItem, addComment, setAttachmentTranscript, closeItem, reopenItem, rerankItem,
   markTranscriptsPending, isAudioAttachment, isConsentMirror, hidePrivateAuthors, listSharedItems, getSharedItem, listGrantedComments, listSharedComments,
+  requestTurn,
 } from './items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE, ITEM_ACTIONS, itemFallbackText, FALLBACK_ACTIONS } from './items-marker.js'
 import { visibleMission } from './missions-http.js'
@@ -197,7 +198,18 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
   // Wake keys off the WRITER's device kind, not `by`: an agent filing on
   // behalf of the user is already awake. Keyed off the MARKER only — the
   // fallback text never independently wakes anything.
-  if (!mirror && who.kind !== 'agent' && WAKE_ACTIONS.has(action) && !extra?.seen) wakeConvoAgent({ db, hub, waker }, who.userId, item.origin_convo_id)
+  if (!mirror && who.kind !== 'agent' && WAKE_ACTIONS.has(action) && !extra?.seen) {
+    // The same write is what an item thread shows as "queued" until the
+    // agent's turn starts. `item` is the object the route answers with, and
+    // it was read before this point, so it is brought up to date in place:
+    // the app that just tapped sees the indicator from the reply alone.
+    try {
+      item.working = requestTurn(db, item.id)
+    } catch (err) {
+      console.error('items: turn request stamp failed', err)
+    }
+    wakeConvoAgent({ db, hub, waker }, who.userId, item.origin_convo_id)
+  }
   // A write on an item of a mission someone has been granted: their shared
   // view follows it live (spec 2026-10-02 matron-to-matron sharing). Never
   // for a consent mirror — the grantee's reads do not show one.

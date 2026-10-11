@@ -1076,6 +1076,19 @@ export function openDb(path) {
   if (!itemHandoverCols.some((c) => c.name === 'filed_convo_id')) {
     db.exec('ALTER TABLE items ADD COLUMN filed_convo_id TEXT')
   }
+  // An item's `working` block (items.js itemWorking): whether the session
+  // that owns the item is busy, for the indicator at the foot of an item
+  // thread. turn_requested_at is when the user last said something on the
+  // item that reaches the agent as a turn; the conversation's two stamps are
+  // when its session_state last entered and last left 'running'. All NULL
+  // until the first such write. Placed after the notice rebuild, like
+  // filed_convo_id.
+  if (!itemHandoverCols.some((c) => c.name === 'turn_requested_at')) {
+    db.exec('ALTER TABLE items ADD COLUMN turn_requested_at INTEGER')
+  }
+  const turnCols = db.prepare('PRAGMA table_info(conversations)').all()
+  if (!turnCols.some((c) => c.name === 'turn_started_at')) db.exec('ALTER TABLE conversations ADD COLUMN turn_started_at INTEGER')
+  if (!turnCols.some((c) => c.name === 'turn_ended_at')) db.exec('ALTER TABLE conversations ADD COLUMN turn_ended_at INTEGER')
   // One row per offer. 'awaiting_user' = parked for the user's tap (a
   // user-only device on either side), 'offered' = with the target session;
   // the rest are settled. At most one pending offer per item.
