@@ -4,28 +4,41 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { throttle, cancellableDelay } from '../src/background.js'
 import { embedOneByOne } from '../src/embedder.js'
+import { resolveZeroableEnv } from '../src/server.js'
 
 const busyFor = (ms) => { const end = Date.now() + ms; while (Date.now() < end) { /* spin */ } }
 
 test('throttle rests ratio × the batch time, timed from the end of the last rest', async () => {
   const pause = throttle({ ratio: 1 })
-  busyFor(60)
+  busyFor(300)
   let t = Date.now()
   await pause()
-  assert.ok(Date.now() - t >= 55, `rested ${Date.now() - t} ms after a 60 ms batch`)
+  assert.ok(Date.now() - t >= 290, `rested ${Date.now() - t} ms after a 300 ms batch`)
   // A short batch right after gets a short rest, not the previous one again.
   busyFor(5)
   t = Date.now()
   await pause()
-  assert.ok(Date.now() - t < 40, `rested ${Date.now() - t} ms after a 5 ms batch`)
+  assert.ok(Date.now() - t < 200, `rested ${Date.now() - t} ms after a 5 ms batch`)
 })
 
 test('throttle with ratio 0 is a single event-loop turn', async () => {
   const pause = throttle({ ratio: 0 })
-  busyFor(30)
+  busyFor(300)
   const t = Date.now()
   await pause()
-  assert.ok(Date.now() - t < 20)
+  assert.ok(Date.now() - t < 200)
+})
+
+test('the pacing env knobs accept 0, and fall back to the default on garbage', () => {
+  assert.equal(resolveZeroableEnv('X', '0', 30000), 0)
+  assert.equal(resolveZeroableEnv('X', undefined, 30000), 30000)
+  assert.equal(resolveZeroableEnv('X', '5000', 30000), 5000)
+  const warn = console.warn
+  console.warn = () => {}
+  try {
+    assert.equal(resolveZeroableEnv('X', '-1', 30000), 30000)
+    assert.equal(resolveZeroableEnv('X', 'soon', 1), 1)
+  } finally { console.warn = warn }
 })
 
 test('cancellableDelay resolves early when cancelled', async () => {

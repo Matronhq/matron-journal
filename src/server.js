@@ -79,6 +79,13 @@ export function resolveConsentDailyCap(raw, defaultValue = CONSENT_DAILY_CAP_DEF
   return resolveNumericEnv('MATRON_COORDINATOR_CONSENT_DAILY_CAP', raw, defaultValue)
 }
 
+// The background pacing knobs take 0 too: no startup delay, and no rest
+// beyond one event-loop turn. Anything else is validated as above.
+export function resolveZeroableEnv(name, raw, defaultValue) {
+  if (typeof raw === 'string' && raw.trim() === '0') return 0
+  return resolveNumericEnv(name, raw, defaultValue)
+}
+
 // `override` is startServer's `retentionDays` opt — when given, it takes
 // precedence over the env var (this is how tests disable/shrink the window
 // without touching process.env), but BOTH sources run through the same
@@ -373,8 +380,8 @@ export function startServer({
   // long after listening before starting them, so a restart's reconnect
   // burst is served first, and then rest `backgroundPace`× each batch's
   // time between batches. Tests pass 0 and 0.
-  backgroundDelayMs = resolveNumericEnv('MATRON_BACKGROUND_DELAY_MS', process.env.MATRON_BACKGROUND_DELAY_MS, 30000),
-  backgroundPace = resolveNumericEnv('MATRON_BACKGROUND_PACE', process.env.MATRON_BACKGROUND_PACE, 1),
+  backgroundDelayMs = resolveZeroableEnv('MATRON_BACKGROUND_DELAY_MS', process.env.MATRON_BACKGROUND_DELAY_MS, 30000),
+  backgroundPace = resolveZeroableEnv('MATRON_BACKGROUND_PACE', process.env.MATRON_BACKGROUND_PACE, 1),
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
