@@ -357,7 +357,7 @@ for (const file of files) {
     // Unified search's similar tier (spec 2026-10-12 §5): default to no
     // embedder, same as test/helpers.js, so a conformance run never loads
     // or downloads a real model; a fixture can still override it.
-    const serverCfg = { embedder: null, ...(fixture.server || {}) }
+    const serverCfg = { embedder: null, backgroundDelayMs: 0, backgroundPace: 0, ...(fixture.server || {}) }
     let tmpDir = null
     if (serverCfg.tmpDb) {
       delete serverCfg.tmpDb

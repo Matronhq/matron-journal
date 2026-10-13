@@ -4,6 +4,7 @@
 // "pending" is simply "a doc with no vector": an anti-join against this
 // table's primary key, with no per-doc hashing on the idle path.
 import { createHash } from 'node:crypto'
+import { yieldTurn } from './background.js'
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS search_vectors(
@@ -63,7 +64,7 @@ const purgedFor = new WeakMap()
 // `skipped` holds the ids of docs the embedder failed on; pass the same Set
 // to every pass in a process so such a doc is tried once per process run,
 // not on every sweep.
-export async function runVectorIndexer(db, embedder, { batchSize = 32, shouldStop = () => false, log = () => {}, onWrite = () => {}, skipped = new Set() } = {}) {
+export async function runVectorIndexer(db, embedder, { batchSize = 32, shouldStop = () => false, pause = yieldTurn, log = () => {}, onWrite = () => {}, skipped = new Set() } = {}) {
   ensureHashFn(db)
   // Vectors from another model are never read, and keeping them would make
   // "pending" need a model comparison per doc; dropping them makes those
@@ -120,7 +121,7 @@ export async function runVectorIndexer(db, embedder, { batchSize = 32, shouldSto
     embedded += written.length
     if (written.length) onWrite(written)
     log(`vector index: embedded ${embedded}`)
-    await new Promise((r) => setImmediate(r))
+    await pause()
   }
   return { embedded }
 }

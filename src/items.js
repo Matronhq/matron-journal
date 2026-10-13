@@ -5,6 +5,7 @@
 import { randomBytes } from 'node:crypto'
 import { sharedConvoSql, grantedMissionSql } from './visibility.js'
 import { blobImageDims, isPrivateDevice } from './db.js'
+import { yieldTurn } from './background.js'
 
 export const ITEM_KINDS = ['task', 'question', 'decision', 'notice']
 // A notice (mission: For you) is something the user needs to read but not
@@ -952,7 +953,7 @@ export function isConsentMirror(db, itemId) {
 // whose blob can't be sized) is left as it is, and a re-run after a restart
 // mid-walk just finds less to do. Each blob's header is read at most once
 // ever (blobImageDims caches the answer on the blob row).
-export async function backfillImageDims(db, { batchSize = 50, log = () => {}, shouldStop = () => false } = {}) {
+export async function backfillImageDims(db, { batchSize = 50, log = () => {}, shouldStop = () => false, pause = yieldTurn } = {}) {
   const select = db.prepare(`SELECT rowid, id, attachments FROM item_comments
     WHERE rowid>? AND attachments LIKE '%"mime":"image/%' ORDER BY rowid LIMIT ?`)
   const update = db.prepare('UPDATE item_comments SET attachments=? WHERE id=?')
@@ -977,7 +978,7 @@ export async function backfillImageDims(db, { batchSize = 50, log = () => {}, sh
       }
     })()
     cursor = rows[rows.length - 1].rowid
-    await new Promise((r) => setImmediate(r))
+    await pause()
   }
   if (updated > 0) log(`items: stamped image sizes on ${updated} comment(s)`)
   return { updated }

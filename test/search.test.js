@@ -746,3 +746,56 @@ test('backfillIsDiff: a database whose search_messages table is new over pre-exi
   assert.equal(db.prepare('SELECT is_diff FROM search_messages WHERE seq=1').get().is_diff, 0)
   db.close()
 })
+
+test('backfillIsDiff: a restart resumes after the last saved batch instead of starting over', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'search-isdiff-resume-'))
+  const dbPath = path.join(dir, 'r.db')
+  try {
+    let db = openDb(dbPath)
+    seedUserAndConvo(db)
+    for (let i = 1; i <= 10; i++) insertRawEvent(db, { userId: 1, convoId: 'c1', seq: i, type: 'diff', payload: { diff: `+change ${i}` } })
+    await backfillSearchIndex(db)
+    db.prepare('UPDATE search_messages SET is_diff=0').run()
+    db.prepare('UPDATE search_isdiff_state SET last_rowid=0').run()
+    let batches = 0
+    const r1 = await backfillIsDiff(db, { batchSize: 4, shouldStop: () => ++batches > 1 })
+    assert.equal(r1.scanned, 4)
+    db.close() // the process dies here
+
+    db = openDb(dbPath)
+    const lines = []
+    const r2 = await backfillIsDiff(db, { batchSize: 4, log: (l) => lines.push(l) })
+    assert.equal(r2.scanned, 6, 'only the rows after the saved cursor are walked again')
+    assert.match(lines[0], /resuming after events rowid 4/)
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM search_messages WHERE is_diff=1').get().n, 10)
+    db.close()
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('startServer starts the background backfills only after backgroundDelayMs, and close() does not wait it out', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'search-bg-delay-'))
+  const dbPath = path.join(dir, 'd.db')
+  try {
+    const seedDb = openDb(dbPath)
+    seedUserAndConvo(seedDb)
+    insertRawEvent(seedDb, { userId: 1, convoId: 'c1', seq: 1, type: 'text', payload: { body: 'waits its turn' } })
+    seedDb.close()
+    const indexed = (s) => s.db.prepare('SELECT COUNT(*) n FROM search_messages').get().n
+
+    const s = await startTestServer({ dbPath, backgroundDelayMs: 300 })
+    await new Promise((r) => setTimeout(r, 100))
+    assert.equal(indexed(s), 0, 'nothing runs during the delay')
+    await s.searchBackfill
+    assert.equal(indexed(s), 1)
+    await s.close()
+
+    const s2 = await startTestServer({ dbPath, backgroundDelayMs: 60_000 })
+    const t = Date.now()
+    await s2.close()
+    assert.ok(Date.now() - t < 5000, 'close() cancels the startup delay')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})

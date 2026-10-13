@@ -1,5 +1,6 @@
 import { ORIGIN_SIEVE } from './missions.js'
 import { parseQuery } from './search-query.js'
+import { yieldTurn } from './background.js'
 
 // Single source of truth for what the search index can see (prose only).
 // Called by BOTH the live append path (journal.js, inside the append
@@ -330,9 +331,10 @@ export function excerpt(body, typed) {
 //     synchronous, and a multi-GB history must not starve the server's
 //     sockets while it indexes. Search returns partial results until the
 //     walk finishes — acceptable and self-healing (spec).
-export async function backfillSearchIndex(db, { batchSize = 1000, log = () => {}, shouldStop = () => false } = {}) {
+export async function backfillSearchIndex(db, { batchSize = 1000, log = () => {}, shouldStop = () => false, pause = yieldTurn } = {}) {
   const state = db.prepare('SELECT last_events_rowid FROM search_backfill_state WHERE id=1').get()
   let cursor = state ? state.last_events_rowid : 0
+  if (cursor > 0) log(`search backfill: resuming after events rowid ${cursor}`)
   const saveCursor = db.prepare(
     'INSERT INTO search_backfill_state(id, last_events_rowid) VALUES(1, ?) ' +
     'ON CONFLICT(id) DO UPDATE SET last_events_rowid=excluded.last_events_rowid'
@@ -372,7 +374,7 @@ export async function backfillSearchIndex(db, { batchSize = 1000, log = () => {}
     })()
     scanned += ids.length
     log(`search backfill: scanned ${scanned} events, indexed ${indexed}`)
-    await new Promise((r) => setImmediate(r))
+    await pause()
   }
   log(`search backfill complete: scanned ${scanned}, indexed ${indexed}`)
   return { scanned, indexed }
@@ -399,9 +401,10 @@ export async function backfillSearchIndex(db, { batchSize = 1000, log = () => {}
 // run after is a single cheap SELECT with zero rows — the live path
 // (journal.js append()) already sets is_diff correctly for every row a
 // fresh database will ever see.
-export async function backfillIsDiff(db, { batchSize = 1000, log = () => {}, shouldStop = () => false } = {}) {
+export async function backfillIsDiff(db, { batchSize = 1000, log = () => {}, shouldStop = () => false, pause = yieldTurn } = {}) {
   const state = db.prepare('SELECT last_rowid FROM search_isdiff_state WHERE id=1').get()
   let cursor = state ? state.last_rowid : 0
+  if (cursor > 0) log(`search is_diff backfill: resuming after events rowid ${cursor}`)
   const saveCursor = db.prepare(
     'INSERT INTO search_isdiff_state(id, last_rowid) VALUES(1, ?) ' +
     'ON CONFLICT(id) DO UPDATE SET last_rowid=excluded.last_rowid'
@@ -429,7 +432,7 @@ export async function backfillIsDiff(db, { batchSize = 1000, log = () => {}, sho
     })()
     scanned += ids.length
     log(`search is_diff backfill: scanned ${scanned} events, updated ${updated}`)
-    await new Promise((r) => setImmediate(r))
+    await pause()
   }
   log(`search is_diff backfill complete: scanned ${scanned}, updated ${updated}`)
   return { scanned, updated }
