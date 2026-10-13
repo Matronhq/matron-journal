@@ -5,7 +5,9 @@ export async function startTestServer(opts = {}) {
   // Unified search's similar tier (spec 2026-10-12 §5): default to no
   // embedder so the suite never tries to load (or download) a real model;
   // a test that wants the tier passes its own (e.g. `fakeEmbedder()`).
-  const s = await startServer({ dbPath: ':memory:', port: 0, embedder: null, ...opts })
+  // Background work starts at once and runs unpaced, so tests that await
+  // it don't sit out the production startup delay.
+  const s = await startServer({ dbPath: ':memory:', port: 0, embedder: null, backgroundDelayMs: 0, backgroundPace: 0, ...opts })
   const base = `http://127.0.0.1:${s.port}`
   return {
     ...s,

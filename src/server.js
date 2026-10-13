@@ -38,6 +38,7 @@ import { startStallWakeSweep } from './stall-wake.js'
 import { sealStoredTokens } from './github-accounts.js'
 import { CONSENT_DAILY_CAP_DEFAULT } from './consent.js'
 import { warnAlertWebhookConfig } from './alerts-http.js'
+import { throttle, cancellableDelay } from './background.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
@@ -76,6 +77,13 @@ export function resolveNumericEnv(name, raw, defaultValue) {
 export function resolveConsentDailyCap(raw, defaultValue = CONSENT_DAILY_CAP_DEFAULT) {
   if (typeof raw === 'string' && raw.trim() === '0') return 0
   return resolveNumericEnv('MATRON_COORDINATOR_CONSENT_DAILY_CAP', raw, defaultValue)
+}
+
+// The background pacing knobs take 0 too: no startup delay, and no rest
+// beyond one event-loop turn. Anything else is validated as above.
+export function resolveZeroableEnv(name, raw, defaultValue) {
+  if (typeof raw === 'string' && raw.trim() === '0') return 0
+  return resolveNumericEnv(name, raw, defaultValue)
 }
 
 // `override` is startServer's `retentionDays` opt — when given, it takes
@@ -368,6 +376,12 @@ export function startServer({
   // model. Undefined (the production default) means "resolve for real",
   // gated by MATRON_SEMANTIC_SEARCH below.
   embedder,
+  // Startup backfills and vector indexing (src/background.js): wait this
+  // long after listening before starting them, so a restart's reconnect
+  // burst is served first, and then rest `backgroundPace`× each batch's
+  // time between batches. Tests pass 0 and 0.
+  backgroundDelayMs = resolveZeroableEnv('MATRON_BACKGROUND_DELAY_MS', process.env.MATRON_BACKGROUND_DELAY_MS, 30000),
+  backgroundPace = resolveZeroableEnv('MATRON_BACKGROUND_PACE', process.env.MATRON_BACKGROUND_PACE, 1),
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
@@ -527,6 +541,7 @@ export function startServer({
   let closing = false
   return new Promise((resolve) => {
     server.listen(port, bind, () => {
+      const startDelay = cancellableDelay(backgroundDelayMs)
       retentionInterval = scheduleRetention(db, {
         mediaDir: resolvedMediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays,
         mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
@@ -537,26 +552,26 @@ export function startServer({
       // holding a turn for each, so finish them (or fail them) now.
       itemTranscription.recover()
       blobTranscripts.recover()
-      // Fire-and-forget: search serves partial results until this finishes
-      // (self-healing — spec). shouldStop lets close() end the walk cleanly
-      // instead of racing a closed DB handle.
-      const searchBackfill = backfillSearchIndex(db, {
-        log: (l) => console.log(l),
-        shouldStop: () => closing,
-      }).catch((err) => { console.error('search backfill failed', err) })
-      // Same fire-and-forget shape, for search_messages.is_diff on rows
-      // written before the column existed (spec 2026-10-12 unified
-      // search) — ranked search answers with whatever is fixed up so far
-      // meanwhile, self-healing like the index backfill above.
-      const isDiffBackfill = backfillIsDiff(db, {
-        log: (l) => console.log(l),
-        shouldStop: () => closing,
-      }).catch((err) => { console.error('search is_diff backfill failed', err) })
-      // Same shape: older item comments get their images' sizes stamped on.
-      const imageDimsBackfill = backfillImageDims(db, {
-        log: (l) => console.log(l),
-        shouldStop: () => closing,
-      }).catch((err) => { console.error('image size backfill failed', err) })
+      // Background work, one job at a time and only after the startup
+      // delay: the message index backfill, the is_diff fix-up, image sizes,
+      // then the embedder load and the first vector pass. Each walk saves
+      // its place per batch, so a restart picks up where the last process
+      // stopped. Search serves partial results meanwhile (self-healing —
+      // spec). shouldStop lets close() end a walk cleanly instead of racing
+      // a closed DB handle, and close() cancels the delay. Each walk gets a
+      // fresh throttle, which times a batch from the end of the last rest,
+      // so the gap before a walk starts never counts as work.
+      const bg = () => ({ log: (l) => console.log(l), shouldStop: () => closing, pause: throttle({ ratio: backgroundPace }) })
+      const searchBackfill = startDelay.promise.then(() => (closing ? null : backfillSearchIndex(db, bg())))
+        .catch((err) => { console.error('search backfill failed', err) })
+      // search_messages.is_diff on rows written before the column existed
+      // (spec 2026-10-12 unified search) — ranked search answers with
+      // whatever is fixed up so far meanwhile.
+      const isDiffBackfill = searchBackfill.then(() => (closing ? null : backfillIsDiff(db, bg())))
+        .catch((err) => { console.error('search is_diff backfill failed', err) })
+      // Older item comments get their images' sizes stamped on.
+      const imageDimsBackfill = isDiffBackfill.then(() => (closing ? null : backfillImageDims(db, bg())))
+        .catch((err) => { console.error('image size backfill failed', err) })
       // Unified search (spec 2026-10-12 §5): tracker docs are indexed by
       // trigger; vectors come from a local model loaded in the background.
       // Off by env, by a missing optional package, or by a failed load —
@@ -566,12 +581,14 @@ export function startServer({
       // whether or not an embedder ends up loading.
       ensureVectorSchema(db)
       const semanticOff = process.env.MATRON_SEMANTIC_SEARCH === 'off'
-      const embedderReady = embedder !== undefined
-        ? Promise.resolve(embedder)
-        : (semanticOff ? Promise.resolve(null) : loadEmbedder({
-            modelDir: process.env.MATRON_SEMANTIC_MODEL_DIR || path.join(path.dirname(resolvedDbPath), 'models'),
-            allowDownload: !process.env.MATRON_SEMANTIC_MODEL_DIR,
-          }))
+      const embedderReady = imageDimsBackfill.then(() => {
+        if (closing) return null
+        if (embedder !== undefined) return embedder
+        return semanticOff ? null : loadEmbedder({
+          modelDir: process.env.MATRON_SEMANTIC_MODEL_DIR || path.join(path.dirname(resolvedDbPath), 'models'),
+          allowDownload: !process.env.MATRON_SEMANTIC_MODEL_DIR,
+        })
+      })
       embedderReady.then(async (loadedEmbedder) => {
         if (!loadedEmbedder || closing) return
         semantic.embedder = loadedEmbedder
@@ -588,7 +605,7 @@ export function startServer({
         // instead of flickering to `'indexing'` every 30 seconds.
         const reindex = async (trackIndexing) => {
           try {
-            await runVectorIndexer(db, loadedEmbedder, { shouldStop: () => closing, onWrite: (rows) => semantic.store.upsertVectors(rows), skipped: skippedDocs, log: (l) => console.log(l) })
+            await runVectorIndexer(db, loadedEmbedder, { ...bg(), onWrite: (rows) => semantic.store.upsertVectors(rows), skipped: skippedDocs })
           } catch (err) {
             // Never reject: semanticInFlight is awaited both here and by
             // close() (alongside the other background work) — a rejection
@@ -639,6 +656,7 @@ export function startServer({
         github: resolvedGithub,
         close: () => new Promise((r) => {
           closing = true
+          startDelay.cancel()
           if (retentionInterval) clearInterval(retentionInterval)
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
           if (githubRefreshInterval) clearInterval(githubRefreshInterval)
@@ -667,7 +685,7 @@ export function startServer({
           // embed call could otherwise still be mid-write when db.close()
           // below fires. Waiting for it here, alongside the other
           // background work, keeps that from racing a closed db handle.
-          server.close(() => { Promise.all([searchBackfill, isDiffBackfill, imageDimsBackfill, transcriptionDone, semanticInFlight]).then(() => { db.close(); r() }) })
+          server.close(() => { Promise.all([searchBackfill, isDiffBackfill, imageDimsBackfill, embedderReady.catch(() => {}), transcriptionDone, semanticInFlight]).then(() => { db.close(); r() }) })
         }),
       })
     })

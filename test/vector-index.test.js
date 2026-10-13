@@ -318,3 +318,21 @@ test('when every doc in a failed batch fails alone too, nothing is skipped and t
   down = false
   assert.equal((await runVectorIndexer(db, flaky, { batchSize: 3, skipped })).embedded, 6, 'the next pass heals')
 })
+
+test('a stopped pass keeps what it embedded; the next pass embeds only the rest, pausing between batches', async () => {
+  const db = seed(); ensureVectorSchema(db)
+  moreConvos(db, 5)
+  for (let i = 0; i < 6; i++) createMission(db, { userId: 1, deviceId: 1, createdBy: 'agent', convoId: `c${i + 1}`, title: `mission ${i}` })
+  const total = db.prepare('SELECT COUNT(*) n FROM search_docs').get().n
+  const emb = fakeEmbedder()
+  let batches = 0
+  const r1 = await runVectorIndexer(db, emb, { batchSize: 2, shouldStop: () => ++batches > 1 })
+  assert.equal(r1.embedded, 2)
+  let pauses = 0
+  const embeddedTexts = []
+  const counting = { ...emb, embedDocs: async (texts) => { embeddedTexts.push(...texts); return emb.embedDocs(texts) } }
+  const r2 = await runVectorIndexer(db, counting, { batchSize: 2, pause: async () => { pauses++ } })
+  assert.equal(r2.embedded, total - 2)
+  assert.equal(embeddedTexts.length, total - 2, 'nothing embedded twice')
+  assert.equal(pauses, Math.ceil((total - 2) / 2))
+})
