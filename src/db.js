@@ -4,6 +4,7 @@ import { autoTitleColumns, recomputeConvoTitle } from './convo-title.js'
 import { imageSizeFromFile } from './image-size.js'
 import { backfillMissionLinks, healMissionLinks } from './mission-links.js'
 import { backfillDefaultProjects } from './default-project.js'
+import { installSearchDocs } from './search-docs.js'
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users(
@@ -224,6 +225,13 @@ CREATE INDEX IF NOT EXISTS idx_milestones_convo ON milestones(convo_id, seq);
 -- (external-content FTS corrupts when content rows change without the
 -- matching fts delete — matron-apple #106). Never INSERT OR REPLACE into
 -- search_messages for the same reason.
+--
+-- \`backfillIsDiff\` (src/search.js) does run an UPDATE against this table,
+-- which does not violate the above: it only ever sets \`is_diff\`, a plain
+-- column FTS5 never sees. The two virtual tables only index \`body\` (the
+-- \`content=\` declaration below), so a column the FTS schema doesn't read
+-- can be updated in place with no desync risk. \`body\` itself must still
+-- never be UPDATEd — only ever inserted — or this reasoning breaks.
 CREATE TABLE IF NOT EXISTS search_messages(
   rowid     INTEGER PRIMARY KEY,
   user_id   INTEGER NOT NULL,
@@ -232,6 +240,7 @@ CREATE TABLE IF NOT EXISTS search_messages(
   ts        INTEGER NOT NULL,
   sender    TEXT NOT NULL,
   body      TEXT NOT NULL,
+  is_diff   INTEGER NOT NULL DEFAULT 0,
   UNIQUE(user_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_search_messages_convo ON search_messages(convo_id, seq);
@@ -262,6 +271,21 @@ END;
 CREATE TABLE IF NOT EXISTS search_backfill_state(
   id INTEGER PRIMARY KEY CHECK(id=1),
   last_events_rowid INTEGER NOT NULL
+);
+-- is_diff backfill cursor (spec 2026-10-12 unified search). Same shape as search_backfill_state, but over
+-- \`events\` rowids again — search_messages carries no \`type\`, so fixing up
+-- is_diff for history written before the column existed means re-walking
+-- events for 'diff' rows. openDb seeds the initial row (see below): 0 for a
+-- database that already had search_messages (its pre-existing rows may be
+-- wrongly defaulted), or the current max events rowid for a table just
+-- created now (every row it will ever hold gets is_diff set correctly at
+-- insert time — by journal.js append() for a row written from here on, or
+-- by backfillSearchIndex's own INSERT for a pre-existing events history
+-- this table is only now catching up on — so there is nothing to fix, and
+-- the first run is a no-op).
+CREATE TABLE IF NOT EXISTS search_isdiff_state(
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  last_rowid INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS device_status(
   device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
@@ -633,8 +657,32 @@ export function openDb(path) {
   // database that predates it has rows to index. 'rebuild' reads the
   // content table (seconds for a few hundred thousand prose rows).
   const hadPlainFts = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_fts_plain'").get()
+  // Same "was this table already here" probe, for the is_diff migration
+  // below — taken before SCHEMA runs, since CREATE TABLE IF NOT EXISTS
+  // makes that the only moment a pre-existing search_messages can still be
+  // told apart from a table this call is creating for the first time.
+  const hadSearchMessages = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_messages'").get()
   db.exec(SCHEMA)
   if (!hadPlainFts) db.exec("INSERT INTO search_fts_plain(search_fts_plain) VALUES('rebuild')")
+  // search_messages.is_diff (spec 2026-10-12 unified search): a
+  // pre-existing table predates the column and needs the ALTER; SCHEMA's
+  // CREATE TABLE IF NOT EXISTS already includes it for a brand new one.
+  // Seed search_isdiff_state's cursor the first time either way (see the
+  // table's own comment above for the fresh-vs-migrated rule): 0 for an
+  // old table whose rows may be wrongly defaulted, or the current max
+  // events rowid for a table just created now — every row it will ever
+  // hold gets is_diff set correctly at insert time, live or via
+  // backfillSearchIndex's own INSERT, so there is nothing to fix.
+  const searchMessageCols = db.prepare('PRAGMA table_info(search_messages)').all()
+  if (!searchMessageCols.some((c) => c.name === 'is_diff')) {
+    db.exec('ALTER TABLE search_messages ADD COLUMN is_diff INTEGER NOT NULL DEFAULT 0')
+  }
+  if (!db.prepare('SELECT 1 FROM search_isdiff_state WHERE id=1').get()) {
+    const seedCursor = hadSearchMessages
+      ? 0
+      : db.prepare('SELECT COALESCE(MAX(rowid),0) AS r FROM events').get().r
+    db.prepare('INSERT INTO search_isdiff_state(id, last_rowid) VALUES(1, ?)').run(seedCursor)
+  }
   // Older live DBs predate apns_env (only apns_token existed) — in-place
   // migration, never a destructive rebuild. Sygnal lesson: environment
   // ('sandbox'|'prod') has to be tracked per device, not assumed from topic.
@@ -1411,6 +1459,12 @@ export function openDb(path) {
       db.pragma('user_version = 2')
     })()
   }
+  // Unified search's tracker mirror (spec 2026-10-12 unified search §1).
+  // Must stay LAST: it reads columns added by every migration above (e.g.
+  // missions.name), and its triggers must be reinstalled after any table
+  // rebuild in this function (rebuildItemsForNotice drops and recreates
+  // items, which drops its triggers with it).
+  installSearchDocs(db)
   return db
 }
 

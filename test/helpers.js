@@ -2,7 +2,10 @@ import WebSocket from 'ws'
 import { startServer } from '../src/server.js'
 
 export async function startTestServer(opts = {}) {
-  const s = await startServer({ dbPath: ':memory:', port: 0, ...opts })
+  // Unified search's similar tier (spec 2026-10-12 §5): default to no
+  // embedder so the suite never tries to load (or download) a real model;
+  // a test that wants the tier passes its own (e.g. `fakeEmbedder()`).
+  const s = await startServer({ dbPath: ':memory:', port: 0, embedder: null, ...opts })
   const base = `http://127.0.0.1:${s.port}`
   return {
     ...s,

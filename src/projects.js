@@ -13,15 +13,22 @@ const now = () => Date.now()
 // private-owned conversation, or created by a private device, is invisible
 // to an ordinary agent — the origin sieve — and a status written from/by
 // one reads as four nulls — the status sieve. Read-time, current flags.
-const PROJECT_ORIGIN_SIEVE = `(
+export const PROJECT_ORIGIN_SIEVE = `(
   NOT EXISTS (SELECT 1 FROM devices od WHERE od.id = p.origin_device_id AND od.private = 1)
   AND NOT EXISTS (SELECT 1 FROM conversations oc JOIN devices od ON od.id = oc.agent_device_id
                   WHERE oc.id = p.origin_convo_id AND od.private = 1)
 )`
-const PROJECT_STATUS_PRIVATE = statusPrivateSql('p')
-
+// Evaluated lazily (inside the function, not a module-top-level constant):
+// search-docs.js now imports PROJECT_ORIGIN_SIEVE from this module, and
+// this module imports statusPrivateSql from missions.js, which itself pulls
+// in items.js -> db.js -> search-docs.js — a cycle. A top-level
+// `statusPrivateSql('p')` call could run before missions.js's own export is
+// initialized, depending on which module happens to be the entry point
+// (ReferenceError: Cannot access 'statusPrivateSql' before initialization).
+// Calling it only when selectSql() itself runs — always after the whole
+// module graph has finished loading — sidesteps the ordering hazard.
 const selectSql = (excludePrivateOwned) => `SELECT p.*,
-    ${excludePrivateOwned ? PROJECT_STATUS_PRIVATE : '0'} AS status_hidden,
+    ${excludePrivateOwned ? statusPrivateSql('p') : '0'} AS status_hidden,
     (SELECT q.num FROM projects q WHERE q.id = p.merged_into) AS merged_into_num
   FROM projects p`
 

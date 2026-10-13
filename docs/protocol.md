@@ -106,37 +106,62 @@ the machine-checkable version of this page.
   passes *Shared visibility*, `around_seq` reads return the prose window
   (`text`, `diff`), `limit` clamped to 30, logged as `journal: shared
   context read …`; `before_seq` paging on it stays 404.
-- `GET /search?q=&limit=&convo_id=` (Bearer, any authenticated device —
-  client or agent) -> `{hits: [{convo_id, title, seq, ts, sender, snippet,
-  live}]}`. Full-text search over the prose the journal has indexed (see
-  "Journal search" below for what is indexed and why). `q` is required,
-  must be non-empty after trimming, and is capped at 256 chars (400
-  `{error:'bad_request'}` otherwise); every whitespace-separated term is
-  double-quoted before it reaches FTS5's `MATCH` parser (embedded quotes
-  escaped by doubling) and the terms are ANDed together — an implicit-AND
-  query over literal terms, so raw FTS5 syntax a human might type (an
-  unbalanced quote, a bare `*`, a stray `NEAR`) can never throw; a query
-  with zero terms, or one that still fails to parse, is 400
-  `{error:'bad_request'}`, never a 500 with SQLite internals in it. `limit`
-  defaults to 20, clamped to 50 (400 on non-integer/NaN/<1, same convention
-  as `/convo/:id/messages`). `convo_id`, when given, narrows to one
-  conversation; an id belonging to another user (or a nonexistent one)
-  yields the same empty result set the user-scoping already guarantees for
-  a genuinely-unmatched query — there is no separate existence check, so
-  this is not an oracle for "does this convo_id exist." Results are ranked
-  by FTS5 `bm25()` (best match first), ties broken by `ts DESC`; `snippet`
-  is the FTS5 `snippet()` excerpt with matched terms wrapped in `**`...`**`
-  (markdown bold — agents and the apps both render markdown); `live` is
-  `true` when the hit's conversation has `session_state = 'running'`, a
-  hint to talk to the working agent (`GET /roster` / `agent_chat_start`)
-  rather than only read its transcript. Scoped to the caller's own user
-  (`search_messages.user_id`) regardless of device kind — open to both
-  agents (the feature's primary audience) and clients; an ordinary
-  (non-private) agent caller additionally has hits from private-owned
-  conversations excluded — see "Device privacy" below.
-  `exclude_subagents=1` drops hits in subagent child conversations
-  (`conversations.parent_convo_id` set) in every mode — the apps pass it,
-  since those are most of the index and rarely what a person is after.
+- `GET /search?q=&limit=&convo_id=&exclude_subagents=` (Bearer, any
+  authenticated device — client or agent) -> `{hits: [{convo_id, title,
+  seq, ts, sender, snippet, live, mission_num, why}]}`. Full-text search
+  over the prose the journal has indexed (see "Journal search" below for
+  what is indexed and why). `q` is required, must be non-empty after
+  trimming, and is capped at 256 chars (400 `{error:'bad_request'}`
+  otherwise); every whitespace-separated term is double-quoted before it
+  reaches FTS5's `MATCH` parser (embedded quotes escaped by doubling) and
+  the terms are ANDed together — an implicit-AND query over literal terms,
+  so raw FTS5 syntax a human might type (an unbalanced quote, a bare `*`,
+  a stray `NEAR`) can never throw; a query with zero terms, or one that
+  still fails to parse, is 400 `{error:'bad_request'}`, never a 500 with
+  SQLite internals in it. `limit` defaults to 20, clamped to 50 (400 on
+  non-integer/NaN/<1, same convention as `/convo/:id/messages`).
+  `convo_id`, when given, narrows to one conversation; an id belonging to
+  another user (or a nonexistent one) yields the same empty result set
+  the user-scoping already guarantees for a genuinely-unmatched query —
+  there is no separate existence check, so this is not an oracle for
+  "does this convo_id exist." Results are ranked by `sm.is_diff` first (a
+  `diff` hit ranks below every prose hit matching the same terms — a code
+  change is rarely what "why did we do this" means), then FTS5 `bm25()`
+  (best match first), ties broken by `ts DESC`; `snippet` is the FTS5
+  `snippet()` excerpt with matched terms wrapped in `**`...`**` (markdown
+  bold — agents and the apps both render markdown); `live` is `true` when
+  the hit's conversation has `session_state = 'running'`, a hint to talk
+  to the working agent (`GET /roster` / `agent_chat_start`) rather than
+  only read its transcript. `mission_num` is the number of the hit's
+  conversation's current mission (same pointer `mode=chats` reports, see
+  below), sieved the same way for an ordinary agent caller, or `null` when
+  it isn't on one. `why` is `'words'` when the hit matched every query
+  term, or `'some_words'` when it is part of the fallback described next.
+  Fewer than 5 `'words'` hits, with `q` carrying 2+ terms, runs the same
+  query again matching ANY term (still FTS-quoted, same ordering, same
+  privacy and subagent filters) for up to the remaining `limit`, excluding
+  seqs already returned, and tags those `'some_words'` — ranked search
+  never goes from a handful of exact hits to nothing just because no
+  single message happened to contain every word. This fallback is skipped
+  entirely for a **literal** query — quoted, carrying a digit, an id-like
+  token, or a single word, the exact rule `GET /search/all` uses
+  (`parseQuery` in `src/search-query.js`, shared rather than
+  re-implemented): someone who quoted their query or typed an id wanted an
+  exact match, not loose noise, so a literal query that falls short of 5
+  `'words'` hits simply returns fewer than 5 hits rather than padding them
+  out. Scoped to the caller's own user (`search_messages.user_id`)
+  regardless of device kind — open to both agents (the feature's primary
+  audience) and clients; an ordinary (non-private) agent caller
+  additionally has hits from private-owned conversations excluded — see
+  "Device privacy" below.
+  `exclude_subagents=1`/`=0` drops/keeps hits in subagent child
+  conversations (`conversations.parent_convo_id` set); in `chats` and
+  `recent` mode it defaults to off (the apps pass it explicitly), for
+  every caller. In `ranked` mode it defaults to **on** for every agent
+  caller, private agents included — subagent transcripts are most of the
+  index and rarely what "why did we do this" is asking about, for any
+  agent hunting old work — and off for a client; pass it explicitly to
+  override either default.
   `mode` selects the result shape (400 on anything else):
   - `ranked` (default): the list above.
   - `chats` and `recent` are the apps' modes (matron-apple, 2026-10-02)
@@ -152,22 +177,100 @@ the machine-checkable version of this page.
     in `src/search.js` is the one parser. A database from before the
     mirror existed gets it rebuilt once at open (seconds).
   - `mode=chats` -> `{chats: [{convo_id, title, parent_convo_id,
-    parent_title, count, exact, live, top: {seq, ts, sender, excerpt}}]}`:
-    one row per conversation, at most `limit` (clamped to 50).
-    Conversations holding the query as an exact phrase (`exact: true`)
-    come first, then those containing every word; newest first (highest
-    seq) within each. `count` is every matching message in the
+    parent_title, mission_num, count, exact, live, top: {seq, ts, sender,
+    excerpt}}]}`: one row per conversation, at most `limit` (clamped to
+    50). Conversations holding the query as an exact phrase (`exact:
+    true`) come first, then those containing every word; newest first
+    (highest seq) within each. `count` is every matching message in the
     conversation, `top` the previewed one — the newest exact match when
     there is one, else the newest match — and `excerpt` up to ~1 KB of
     its body around the first literal occurrence (the phrase if present,
     else the earliest word; the head of the body when neither is found
     literally), `…`-marked where cut. Highlighting is the client's.
+    `mission_num` is the number of the conversation's current mission
+    (`conversations.mission_id`, the same pointer `POST
+    /missions/:id/join` maintains), or `null` when it isn't on one.
     `convo_id` is ignored in this mode.
-  - `mode=recent` -> `{hits: [{convo_id, seq, ts, sender}]}`: flat, newest
-    first, no body or snippet — find-in-chat's match list, which the app
-    steps through by seq while already showing the messages. With
-    `convo_id` the clamp is 500 rather than 50, so a conversation's whole
-    match list fits.
+  - `mode=recent` -> `{hits: [{convo_id, seq, ts, sender, mission_num}]}`:
+    flat, newest first, no body or snippet — find-in-chat's match list,
+    which the app steps through by seq while already showing the
+    messages. `mission_num` is the same sieved mission pointer as above.
+    With `convo_id` the clamp is 500 rather than 50, so a conversation's
+    whole match list fits.
+- `GET /search/all?q=&limit=&kinds=&chats=&semantic=` (Bearer, any
+  authenticated device — client or agent) -> `{results, chats?,
+  semantic}`. Unified tracker search (spec 2026-10-12): one tiered,
+  cross-kind lookup over missions, items, memories and projects, instead
+  of listing each separately and intersecting by eye. `q` and `limit`
+  follow the exact same rules as `GET /search` above (required, trimmed
+  non-empty, capped at 256 chars; `limit` defaults to 20, clamped to 50;
+  both 400 `{error:'bad_request'}` on violation). `kinds` is a
+  comma-separated subset of `mission`, `item`, `memory`, `project` (400
+  on anything else); omitted or empty means all four.
+
+  Results are rolled up to the entity a person is actually looking for —
+  a hit on a milestone or a status line is reported as its mission, a hit
+  on a comment as its item, a hit on a mission's own auto-created project
+  as that mission — and tiered strict-to-loose, each result carrying the
+  first (best) tier it was found in as `why`, in this order:
+  1. `exact` — every query term together, in order, as a phrase.
+  2. `words` — every query term present, any order, over an unstemmed index.
+  3. `stemmed` — every query term present, any order, over a stemmed index
+     (so "exporting" matches a doc that only says "export").
+  4. `similar` — meaning-based, from a local embedding model (below);
+     only tried when `semantic=0` was not passed, `semantic` is
+     `'ready'`, and the strict tiers found fewer than `limit` results.
+  5. `some_words` — any query term present; only tried when the stricter
+     word-match tiers (`exact`, `words`, `stemmed`) together found fewer
+     than five results, measured before `similar` adds anything.
+
+  `similar` sits below every strict word match (`exact`, `words`,
+  `stemmed`) but above the any-word fallback (`some_words`): a result the
+  stricter tiers already found outranks a meaning-based guess, but a
+  meaning-based guess outranks an unrelated any-word match.
+
+  A **literal query** — a single word, a quoted phrase, or any token
+  containing a digit or otherwise looking like an id — never reaches the
+  `some_words` or `similar` tiers: a short, exact-looking query is
+  answered literally or not at all, never padded out with loosely-related
+  guesses.
+
+  `results` is `[{kind, id, num, name, title, state, updated_at,
+  mission_num, why, field, snippet, score?}]`, best match first, capped
+  at `limit`; `score` (the embedding's cosine similarity, 0-1) is present
+  only on a `similar` hit. `chats` is present unless `chats=0` is passed
+  or the chat query fails, in which case it is left out and the tracker
+  `results` still answer. It is the same typed-match conversation
+  grouping `GET /search`'s `mode=chats` returns (see "Journal search" below), over the same `q`,
+  capped at `min(limit, 10)`, with subagent conversations excluded.
+
+  `semantic` is `'off'`, `'indexing'` or `'ready'`. `'off'` means the
+  similar tier was skipped this request — because `semantic=0` was
+  passed, `MATRON_SEMANTIC_SEARCH=off` is set, the optional local
+  embedding package isn't installed, or the model failed to load — and
+  the request still answers 200 with the lexical tiers only; a disabled
+  or failed model is never a 500 or a failed boot. `'indexing'` means a
+  model has loaded but the first full vector index pass hasn't finished
+  yet; that pass is journal-wide, over every user's tracker docs, so it
+  reports `'indexing'` to every user until it ends. Results are
+  lexical-only meanwhile. `'ready'`
+  means that first pass has finished. Once `'ready'`, the similar tier
+  runs over whatever is already indexed, even while a later periodic
+  sweep (picking up new or edited docs) is in flight — `semantic` does
+  not flicker back to `'indexing'` for that ongoing, incremental work; it
+  only ever reports `'indexing'` for the first pass.
+  `MATRON_SEMANTIC_MODEL_DIR`, when set, names a directory of pre-seeded
+  model files so the model loads from disk only, never over the network;
+  left unset, the model is downloaded once on first boot and cached in
+  `<db dir>/models` (the directory holding `MATRON_DB`).
+
+  Same privacy statement as `GET /search`: scoped to the caller's own
+  user, open to both device kinds; an ordinary (non-private) agent caller
+  additionally has private-owned results excluded, exactly as `GET
+  /search` does (see "Device privacy" below) — and, independently, a
+  consent card's tracker mirror (a pending spawn or chat ask) is hidden
+  from every agent caller, private ones included, the same as `GET
+  /items` hides it.
 - `POST /media` (Bearer, client or agent) -> raw request body streamed to disk;
   `{media_id, size, content_type, sha256, width?, height?}`. Content-Type header captured
   (default `application/octet-stream`). For an `image/*` upload the journal
@@ -455,6 +558,24 @@ shared function, not on two filters kept in sync by hand.
   returns partial results until the walk finishes — acceptable, because any
   event appended after the schema exists is indexed by the live path, so
   the backfill cursor can never miss a row on the way to catching up.
+- **`search_messages.is_diff`, and its own backfill.** `is_diff` marks
+  which indexed row came from a `diff` event (set at insert time by both
+  the live append path and `backfillSearchIndex`'s own `INSERT`) — ranked
+  search orders by it first (prose before a diff hitting the same terms).
+  A row indexed before this column existed defaults to `0` and needs its
+  own fixup: `backfillIsDiff(db, {batchSize, log, shouldStop})`, started
+  fire-and-forget at boot next to `backfillSearchIndex` and stopped the
+  same way on close, walks `events` again for `type='diff'` rows in
+  batches and flips the matching `search_messages` row by `(user_id,
+  seq)` — the correct key, since `events`' own primary key is
+  `(user_id, seq)` and `user_seq` hands out a seq that is unique per user.
+  Its cursor, `search_isdiff_state(id=1, last_rowid)`, is seeded once by
+  `openDb`: `0` for a database that already had a `search_messages` table
+  (pre-existing rows may be wrongly defaulted and need the full walk), or
+  the current max `events` rowid for one just created fresh (every row it
+  will ever hold was, or will be, inserted with `is_diff` already correct
+  by the live path or by `backfillSearchIndex`'s corrected `INSERT` — so
+  there is nothing to fix, and the first run costs one cheap `SELECT`).
 
 ### Agent context access: two regimes
 

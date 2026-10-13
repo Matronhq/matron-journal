@@ -308,8 +308,8 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
     const searchBody = indexableBody(type, payload)
     if (searchBody != null) {
       db.prepare(
-        'INSERT INTO search_messages(user_id, convo_id, seq, ts, sender, body) VALUES(?,?,?,?,?,?)'
-      ).run(userId, convoId, seq, ts, sender, searchBody)
+        'INSERT INTO search_messages(user_id, convo_id, seq, ts, sender, body, is_diff) VALUES(?,?,?,?,?,?,?)'
+      ).run(userId, convoId, seq, ts, sender, searchBody, type === 'diff' ? 1 : 0)
     }
     if (type === 'session_status') {
       // Guard against a malformed agent payload (null/undefined/non-object,

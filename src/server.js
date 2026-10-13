@@ -1,4 +1,5 @@
 import http from 'node:http'
+import path from 'node:path'
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
@@ -15,7 +16,9 @@ import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
 import { runOffload, runExpireLogs, runReapMedia, runExpireVoiceNotes } from './retention.js'
-import { backfillSearchIndex } from './search.js'
+import { backfillSearchIndex, backfillIsDiff } from './search.js'
+import { loadEmbedder } from './embedder.js'
+import { ensureVectorSchema, runVectorIndexer, createVectorStore } from './vector-index.js'
 import { backfillImageDims } from './items.js'
 import { scheduleGithubRefresh } from './github-refresh.js'
 import { makeRpcBroker } from './rpc-broker.js'
@@ -359,6 +362,12 @@ export function startServer({
   // Alertmanager webhook (src/alerts-http.js): {token, username}. The
   // option is the test seam; env otherwise. Off unless both are usable.
   alertWebhook,
+  // Unified search's similar tier (spec 2026-10-12 §5): the test seam — an
+  // injected embedder (incl. `null` to force the tier off) bypasses
+  // loadEmbedder entirely, so the suite never loads or downloads a real
+  // model. Undefined (the production default) means "resolve for real",
+  // gated by MATRON_SEMANTIC_SEARCH below.
+  embedder,
 } = {}) {
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
@@ -480,13 +489,25 @@ export function startServer({
     username: process.env.MATRON_ALERT_WEBHOOK_USER || null,
   }
   if (resolvedAlertWebhook) warnAlertWebhookConfig(db, resolvedAlertWebhook)
+  // Unified search's similar tier (spec 2026-10-12 §5). `semantic.store`/
+  // `.embedder` start null — /search/all answers `semantic: 'off'` until
+  // (if ever) the embedder loads and the first index pass finishes, below.
+  // Declared before the handler is built so both it and close() share the
+  // same mutable record. `semanticTimer` is the periodic reindex sweep;
+  // `semanticInFlight` is whichever reindex pass (initial or periodic) is
+  // currently running, so close() can wait for it instead of racing a
+  // write against a closing db handle.
+  const semantic = { store: null, embedder: null }
+  let semanticTimer = null
+  let indexingNow = false
+  let semanticInFlight = Promise.resolve()
   const server = http.createServer(makeHttpHandler({
     db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap,
     github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
-    sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer,
+    sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
@@ -523,11 +544,81 @@ export function startServer({
         log: (l) => console.log(l),
         shouldStop: () => closing,
       }).catch((err) => { console.error('search backfill failed', err) })
+      // Same fire-and-forget shape, for search_messages.is_diff on rows
+      // written before the column existed (spec 2026-10-12 unified
+      // search) — ranked search answers with whatever is fixed up so far
+      // meanwhile, self-healing like the index backfill above.
+      const isDiffBackfill = backfillIsDiff(db, {
+        log: (l) => console.log(l),
+        shouldStop: () => closing,
+      }).catch((err) => { console.error('search is_diff backfill failed', err) })
       // Same shape: older item comments get their images' sizes stamped on.
       const imageDimsBackfill = backfillImageDims(db, {
         log: (l) => console.log(l),
         shouldStop: () => closing,
       }).catch((err) => { console.error('image size backfill failed', err) })
+      // Unified search (spec 2026-10-12 §5): tracker docs are indexed by
+      // trigger; vectors come from a local model loaded in the background.
+      // Off by env, by a missing optional package, or by a failed load —
+      // search answers lexically meanwhile. ensureVectorSchema runs
+      // unconditionally (idempotent, CREATE ... IF NOT EXISTS) so the
+      // search_vectors table exists before the indexer ever touches it,
+      // whether or not an embedder ends up loading.
+      ensureVectorSchema(db)
+      const semanticOff = process.env.MATRON_SEMANTIC_SEARCH === 'off'
+      const embedderReady = embedder !== undefined
+        ? Promise.resolve(embedder)
+        : (semanticOff ? Promise.resolve(null) : loadEmbedder({
+            modelDir: process.env.MATRON_SEMANTIC_MODEL_DIR || path.join(path.dirname(resolvedDbPath), 'models'),
+            allowDownload: !process.env.MATRON_SEMANTIC_MODEL_DIR,
+          }))
+      embedderReady.then(async (loadedEmbedder) => {
+        if (!loadedEmbedder || closing) return
+        semantic.embedder = loadedEmbedder
+        semantic.store = createVectorStore(db, loadedEmbedder)
+        // Docs the embedder failed on, kept for this process run so a
+        // sweep doesn't retry them every 30 seconds.
+        const skippedDocs = new Set()
+        // `trackIndexing`: the store
+        // already starts `indexing` (createVectorStore's own default), so
+        // `'indexing'` naturally covers this first pass without an extra
+        // call. Only this initial call flips it back to `'ready'` when
+        // done — a later 30s sweep pass runs with `trackIndexing: false`,
+        // so `semantic` stays `'ready'` between boot and the next edit
+        // instead of flickering to `'indexing'` every 30 seconds.
+        const reindex = async (trackIndexing) => {
+          try {
+            await runVectorIndexer(db, loadedEmbedder, { shouldStop: () => closing, onWrite: (rows) => semantic.store.upsertVectors(rows), skipped: skippedDocs, log: (l) => console.log(l) })
+          } catch (err) {
+            // Never reject: semanticInFlight is awaited both here and by
+            // close() (alongside the other background work) — a rejection
+            // (e.g. a write that lost its race with a closing db handle)
+            // would otherwise stop close() from ever reaching db.close().
+            console.error('vector index: reindex pass failed', err)
+          } finally {
+            if (trackIndexing) semantic.store.setIndexing(false)
+          }
+        }
+        semanticInFlight = reindex(true)
+        await semanticInFlight
+        // Closed while that first pass ran: don't arm a sweep nothing will
+        // ever clear (close() below only clears a timer it can already see).
+        if (closing) return
+        // New and edited docs: a periodic sweep. An edited body drops its
+        // vector by trigger, so an idle pass is one anti-join of search_docs
+        // against search_vectors' primary key — no hashing, no embedding —
+        // that finds nothing pending. unref'd like the
+        // other background timers — never keeps the process alive on its own.
+        // Runs with trackIndexing:false — the similar tier still answers
+        // from whatever is already indexed while a sweep is in flight.
+        semanticTimer = setInterval(() => {
+          if (!indexingNow) {
+            indexingNow = true
+            semanticInFlight = reindex(false).finally(() => { indexingNow = false })
+          }
+        }, 30_000)
+        semanticTimer.unref()
+      }).catch((err) => console.error('semantic search setup failed', err))
       resolve({
         port: server.address().port,
         db,
@@ -540,6 +631,7 @@ export function startServer({
         blobTranscripts,
         preapproveKey: resolvedPreapproveKey,
         searchBackfill,
+        isDiffBackfill,
         imageDimsBackfill,
         unseenNudge: unseenNudgeSweep,
         routinesSweep: routinesSweeper,
@@ -550,6 +642,11 @@ export function startServer({
           if (retentionInterval) clearInterval(retentionInterval)
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
           if (githubRefreshInterval) clearInterval(githubRefreshInterval)
+          // No new reindex pass can start after this: the only other
+          // starter is embedderReady's own `.then`, which re-checks
+          // `closing` right after its first pass (above) before ever
+          // arming the timer this clears.
+          if (semanticTimer) clearInterval(semanticTimer)
           stallWakeSweep.stop()
           unseenNudgeSweep.stop()
           routinesSweeper.stop()
@@ -564,7 +661,13 @@ export function startServer({
           // The transcription queue touches the DB between awaits: abort its
           // child and let it drain before the handle closes.
           const transcriptionDone = Promise.all([itemTranscription.close(), blobTranscripts.close()])
-          server.close(() => { Promise.all([searchBackfill, imageDimsBackfill, transcriptionDone]).then(() => { db.close(); r() }) })
+          // semanticInFlight: whichever reindex pass (initial or periodic)
+          // is running right now — runVectorIndexer's own shouldStop only
+          // re-checks between batches, so a pass already inside an awaited
+          // embed call could otherwise still be mid-write when db.close()
+          // below fires. Waiting for it here, alongside the other
+          // background work, keeps that from racing a closed db handle.
+          server.close(() => { Promise.all([searchBackfill, isDiffBackfill, imageDimsBackfill, transcriptionDone, semanticInFlight]).then(() => { db.close(); r() }) })
         }),
       })
     })
