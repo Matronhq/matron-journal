@@ -90,6 +90,7 @@ transcribing is the origin bridge's job); those 404 on refusal.
 
 - \`GET /items?convo=&kind=&state=&awaiting=&label=&sort=rank|updated&since=&limit=&cursor=\`
   — one ranked list per user; \`{items, next_cursor}\`, limit ≤ 500.
+  \`kind\` takes one kind or several, comma-separated.
 - \`GET /items/:id\` — \`{item, comments}\` (comments oldest first).
 - \`POST /items\` \`{kind, title, body?, labels?, links?, attachments?,
   actions?, awaiting?, convo_id, supersedes?, on_behalf_of?:'user', and at most one of
