@@ -77,7 +77,8 @@ function answerKnownError(res, err) {
 }
 
 // A validateItemFields failure: its own named error when it carries one
-// (`invalid_actions`), the generic 400 otherwise.
+// (`invalid_actions`, `too_many_attachments` with its `max`), the generic
+// 400 otherwise.
 // An inline ref (src/inline-refs.js) may only place one of the same write's
 // own attachments: anything else would render as bare caption text, so it is
 // an agent's mistake to hear about now rather than a silent gap later.
@@ -89,7 +90,7 @@ function strayRef(res, body, attachments) {
 }
 
 function badFields(res, v) {
-  if (v.error) { json(res, 400, { error: v.error }); return true }
+  if (v.error) { json(res, 400, { error: v.error, ...(v.max !== undefined && { max: v.max }) }); return true }
   return badRequest(res)
 }
 
