@@ -93,7 +93,6 @@ install -d -o matron-demo -g matron-demo -m 750 /var/lib/matron-demo
 # --- app install ---------------------------------------------------------------
 cd "$REPO_DIR"
 # Semantic search runs on the CPU: never fetch onnxruntime's CUDA libraries
-# (also set in .npmrc; the env var does not depend on npm passing that on).
 ONNXRUNTIME_NODE_INSTALL_CUDA=skip npm ci --omit=dev --no-audit --no-fund
 
 # --- env files (created once; never overwritten — they hold secrets/ids) -----

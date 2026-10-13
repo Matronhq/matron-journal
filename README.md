@@ -20,13 +20,14 @@ TestFlight (iPhone / Mac) and Play Store testing (Android) — see
 
 ## Run
 
-    npm install
+    ONNXRUNTIME_NODE_INSTALL_CUDA=skip npm install
     MATRON_DB=./matron.db MATRON_PORT=9810 npm start
 
 Semantic search uses the optional `@huggingface/transformers` dependency.
-The committed `.npmrc` stops its `onnxruntime-node` dependency downloading
-CUDA libraries (about 340 MB) at install time. If you install with a
-different npm config, set `ONNXRUNTIME_NODE_INSTALL_CUDA=skip` instead. Use
+Its `onnxruntime-node` dependency downloads CUDA libraries (about 340 MB)
+at install time unless `ONNXRUNTIME_NODE_INSTALL_CUDA=skip` is set; search
+runs on the CPU, so the install line above sets it, as does
+`deploy/vps/setup.sh`. Use
 `npm install --omit=optional` to leave semantic search out entirely. See
 `MATRON_SEMANTIC_SEARCH` below for memory use and the first-boot model
 download.
