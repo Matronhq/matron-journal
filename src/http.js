@@ -11,6 +11,7 @@ import { buildMetrics } from './metrics.js'
 import { listAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { searchMessages, searchChats, searchRecent, indexableBody } from './search.js'
+import { searchAll } from './search-all.js'
 import { canReadConvo, canReadBlob } from './visibility.js'
 import { parseCitation, verifySaid } from './said.js'
 import { serveHelp } from './help.js'
@@ -106,7 +107,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, itemTranscription = null, blobTranscripts = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, itemTranscription = null, blobTranscripts = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null } }) {
   // Alertmanager webhook (src/alerts-http.js): built once so its in-flight
   // bound is per process. Off (declines every request) without config.
   const handleAlerts = makeAlertsHandler({
@@ -584,7 +585,16 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         // most of the index and almost never what a person is looking for).
         const mode = url.searchParams.get('mode') || 'ranked'
         if (!['ranked', 'chats', 'recent'].includes(mode)) return json(res, 400, { error: 'bad_request' })
-        const excludeSubagents = url.searchParams.get('exclude_subagents') === '1'
+        // exclude_subagents: ANY agent caller's unscoped ranked call
+        // defaults to excluding subagent child conversations — private
+        // agents included, since subagent chats are noise for any agent
+        // hunting old work — unless it says otherwise. A call scoped to one
+        // conversation by convo_id asked for that conversation, so the
+        // default never applies there. The app modes (chats, recent) keep
+        // their existing default (off unless the caller passes it).
+        const excludeSubagents = url.searchParams.has('exclude_subagents')
+          ? url.searchParams.get('exclude_subagents') === '1'
+          : (mode === 'ranked' && who.kind === 'agent' && convoId == null)
         if (mode === 'chats') {
           const r = searchChats(db, who.userId, { query: q, limit, excludeSubagents, excludePrivateOwned: filtered })
           if (r.badQuery) return json(res, 400, { error: 'bad_request' })
@@ -601,6 +611,47 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         const r = searchMessages(db, who.userId, { query: q, limit, convoId, excludePrivateOwned: filtered, excludeSubagents })
         if (r.badQuery) return json(res, 400, { error: 'bad_request' })
         return json(res, 200, { hits: r.hits })
+      }
+      if (req.method === 'GET' && url.pathname === '/search/all') {
+        // Unified tracker search (spec 2026-10-12): missions, items, memories,
+        // projects — tiered, each result says why it matched. Same q/limit
+        // rules and the same ordinary-agent privacy filter as /search.
+        const q = url.searchParams.get('q')
+        if (typeof q !== 'string' || !q.trim() || q.length > 256) return json(res, 400, { error: 'bad_request' })
+        const rawLimit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : 20
+        if (!Number.isInteger(rawLimit) || rawLimit < 1) return json(res, 400, { error: 'bad_request' })
+        const limit = Math.min(rawLimit, 50)
+        const kinds = url.searchParams.get('kinds')?.split(',').filter(Boolean) ?? null
+        if (kinds && kinds.some((k) => !['mission', 'item', 'memory', 'project'].includes(k))) return json(res, 400, { error: 'bad_request' })
+        // Same one-caller-rule predicate /search uses: an ORDINARY agent
+        // caller only, never clients or private agents.
+        const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
+        // excludeConsent (independent of the above): a
+        // consent-mirror item is hidden from EVERY agent caller, private
+        // ones included — the same rule items-http.js applies
+        // (`excludeConsent: who.kind === 'agent'`), mirrored here so an
+        // agent can never find a consent card's tracker mirror by text.
+        const excludeConsent = who.kind === 'agent'
+        // semantic=0 opts this request out of the similar tier entirely,
+        // including the reported status: a caller that asked for it off
+        // sees 'off', never 'ready'/'indexing' for a tier it didn't use —
+        // simpler for clients than cross-referencing the request they made against the answer.
+        // While the first index pass runs the tier is reported as
+        // 'indexing' and answers stay lexical-only: a half-built index
+        // would rank whatever happens to be embedded so far.
+        const semanticRequested = url.searchParams.get('semantic') !== '0'
+        const semanticStatus = semanticRequested && semantic.store ? semantic.store.status() : 'off'
+        const r = await searchAll(db, who.userId, {
+          query: q, limit, kinds, excludePrivateOwned: filtered, excludeConsent,
+          similar: semanticStatus === 'ready' ? { store: semantic.store, embedder: semantic.embedder } : null,
+        })
+        if (r.badQuery) return json(res, 400, { error: 'bad_request' })
+        const out = { results: r.results, semantic: semanticStatus }
+        if (url.searchParams.get('chats') !== '0') {
+          const c = searchChats(db, who.userId, { query: q, limit: Math.min(limit, 10), excludeSubagents: true, excludePrivateOwned: filtered })
+          if (!c.badQuery) out.chats = c.chats
+        }
+        return json(res, 200, out)
       }
       const dm = url.pathname.match(/^\/devices\/(\d+)\/revoke$/)
       if (req.method === 'POST' && dm) {
