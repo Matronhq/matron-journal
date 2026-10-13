@@ -213,6 +213,14 @@ the machine-checkable version of this page.
   on a comment as its item, a hit on a mission's own auto-created project
   as that mission — and tiered strict-to-loose, each result carrying the
   first (best) tier it was found in as `why`, in this order:
+  0. `number` — the query is nothing but a tracker number, with or
+     without a leading `#` (`412`, `#412`), and the caller's own item,
+     mission, milestone or project carries that number. At most one
+     result, always first; rows that only mention the number follow in
+     the tiers below. A milestone is reported as its mission (`field:
+     'milestone'`); a project is reported as itself even when it is a
+     mission's auto-created twin, since its own number was asked for.
+     Clients must treat an unknown `why` as a plain match.
   1. `exact` — every query term together, in order, as a phrase.
   2. `words` — every query term present, any order, over an unstemmed index.
   3. `stemmed` — every query term present, any order, over a stemmed index
@@ -3497,7 +3505,7 @@ no secret to pair with),
 | `POST /github/refresh` | — | `{github}`; marks the link `stale` on 401/403 from GitHub; 502 `upstream` if unreachable (nothing changes); 404 if this user has no linked account |
 | `DELETE /github/link` | — | `{ok:true}`; 404 if not linked |
 | `GET /me` | — | `{user:{id,name,is_admin}, github: {…} \| null, github_linking:{enabled, web_flow}}` |
-| `GET /lookup?user=<name>&num=<n>` | also `GET /u/<name>/<n>` with `Accept: application/json` | `{kind:'item'\|'mission'\|'milestone'\|'project', id, owner:{user_id,name}}`; 404 unknown or invisible. A merged project resolves to the project it was merged into, with `merged_from: <the id asked for>`. |
+| `GET /lookup?user=<name>&num=<n>` | also `GET /u/<name>/<n>` with `Accept: application/json` | `{kind:'item'\|'mission'\|'milestone'\|'project', id, num, title, owner:{user_id,name}}`; 404 unknown or invisible. `num` and `title` are the row's own, so a "go to number" field or a search box can label the hit without a second read. A milestone also carries `mission: {id, num}`, the mission it sits on, when the caller may read that mission. A merged project resolves to the project it was merged into, with `merged_from: <the id asked for>`. |
 
 Why the confirm page: an authorize URL can be handed to anyone, and GitHub's
 own pages name the OAuth App, never the journal user — so the person who

@@ -425,3 +425,48 @@ test('a vector-store failure during the similar tier falls back to the lexical r
   assert.equal(r.results[0].title, 'lemur migration notes')
   assert.ok(mute.mock.callCount() >= 1, 'expected the failure to be logged')
 })
+
+// One per-user counter numbers items, missions, milestones and projects, so
+// a bare number names at most one row; that row leads the results and the
+// rows that only mention the number follow.
+test('a bare number, with or without #, puts the row carrying that number first', async () => {
+  const db = seed()
+  moreConvos(db, 1)
+  const { mission } = createMission(db, { userId: 1, deviceId: 1, createdBy: 'agent', convoId: 'c1', title: 'paint the heron boat' })
+  const { item } = createItem(db, { userId: 1, deviceId: 1, originDeviceId: 1, originConvoId: 'c1', createdBy: 'agent', kind: 'task', title: 'order kelp rope' })
+  // A second mission that merely mentions the item's number in its text.
+  createMission(db, { userId: 1, deviceId: 1, createdBy: 'agent', convoId: 'c2', title: `follow up on ${item.num} next week` })
+  for (const q of [String(item.num), `#${item.num}`, `  #${item.num} `]) {
+    const r = (await searchAll(db, 1, { query: q })).results
+    assert.equal(r[0].kind, 'item', q); assert.equal(r[0].id, item.id); assert.equal(r[0].why, 'number'); assert.equal(r[0].num, item.num)
+    assert.ok(r.slice(1).some((x) => x.kind === 'mission' && x.why !== 'number'), 'mentions follow')
+    assert.equal(r.filter((x) => x.id === item.id).length, 1, 'never listed twice')
+  }
+  const m = (await searchAll(db, 1, { query: `#${mission.num}` })).results[0]
+  assert.equal(m.kind, 'mission'); assert.equal(m.id, mission.id); assert.equal(m.why, 'number')
+})
+
+test('a milestone number finds its mission; a default project number finds the project itself', async () => {
+  const db = seed()
+  const { mission } = createMission(db, { userId: 1, deviceId: 1, createdBy: 'agent', convoId: 'c1', title: 'weave the kelp basket' })
+  const { milestone } = createMilestone(db, { userId: 1, deviceId: 1, createdBy: 'agent', convoId: 'c1', kind: 'progress', title: 'first row woven', appendMarker: () => ({ seq: 1 }) })
+  const viaMilestone = (await searchAll(db, 1, { query: String(milestone.num) })).results[0]
+  assert.equal(viaMilestone.kind, 'mission'); assert.equal(viaMilestone.id, mission.id)
+  assert.equal(viaMilestone.why, 'number'); assert.equal(viaMilestone.field, 'milestone')
+  const projectNum = db.prepare('SELECT num FROM projects WHERE id=?').get(mission.project_id).num
+  const viaProject = (await searchAll(db, 1, { query: `#${projectNum}` })).results[0]
+  assert.equal(viaProject.kind, 'project'); assert.equal(viaProject.id, mission.project_id); assert.equal(viaProject.why, 'number')
+})
+
+test('the number tier keeps to kinds and visibility, and leaves other queries alone', async () => {
+  const db = seed()
+  const { item } = createItem(db, { userId: 1, deviceId: 1, originDeviceId: 1, originConvoId: 'c1', createdBy: 'agent', kind: 'task', title: 'gibbon consent ask', consent: 'spawn' })
+  assert.equal((await searchAll(db, 1, { query: String(item.num) })).results[0].why, 'number')
+  assert.deepEqual((await searchAll(db, 1, { query: String(item.num), excludeConsent: true })).results, [], 'hidden from agents like every other tier')
+  assert.deepEqual((await searchAll(db, 1, { query: String(item.num), kinds: ['mission'] })).results, [])
+  assert.deepEqual((await searchAll(db, 1, { query: '987654' })).results, [], 'unknown number')
+  assert.ok((await searchAll(db, 1, { query: `gibbon ${item.num}` })).results.every((x) => x.why !== 'number'), 'only a bare number')
+  // Another user's row with the same number is never reached.
+  db.prepare("INSERT INTO users(id, name, password_hash, created_at) VALUES(2,'bob','x',0)").run()
+  assert.deepEqual((await searchAll(db, 2, { query: String(item.num) })).results, [])
+})

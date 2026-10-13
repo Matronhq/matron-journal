@@ -6,7 +6,7 @@ import { parseQuery, matchExact, matchAll, matchAny } from './search-query.js'
 import { docVisibilitySql, missionOk } from './search-docs.js'
 import { ORIGIN_SIEVE } from './missions.js'
 
-export const TIERS = ['exact', 'words', 'stemmed', 'similar', 'some_words']
+export const TIERS = ['number', 'exact','words', 'stemmed', 'similar', 'some_words']
 const KINDS = ['mission', 'item', 'memory', 'project']
 const THIN = 5 // fewer strict results than this → some_words tier runs
 const MAX_PAGES = 4 // per tier; see runTier
@@ -43,6 +43,36 @@ function tierStmt(db, { table, visibility, kindSql }) {
     WHERE ${table} MATCH ? AND d.user_id = ? AND ${kindSql} AND ${visibility}
     ORDER BY score, d.updated_at DESC
     LIMIT ? OFFSET ?`)
+}
+
+// A query that is just a tracker number, with or without the leading '#'.
+// Tracker numbers are positive and fit a safe integer.
+const NUMBER_QUERY = /^#?(\d{1,15})$/
+
+// The `number` tier: the one row of the user's that carries this number.
+// Items, missions, milestones and projects share a per-user counter, so at
+// most one source table answers. The row is reached through its own
+// search_docs doc, so the same per-field visibility as every other tier
+// applies. A milestone's primary doc is its text; the others' is the
+// title-bearing field.
+const NUMBER_SOURCES = [
+  { kind: 'item', table: 'items', field: 'text' },
+  { kind: 'mission', table: 'missions', field: 'title' },
+  { kind: 'milestone', table: 'milestones', field: 'text' },
+  { kind: 'project', table: 'projects', field: 'title' },
+]
+function numberDocs(db, userId, num, { visibility, kindSql }) {
+  for (const s of NUMBER_SOURCES) {
+    const row = db.prepare(`SELECT id FROM ${s.table} WHERE user_id=? AND num=?`).get(userId, num)
+    if (!row) continue
+    const doc = db.prepare(`
+      SELECT d.id, d.kind, d.ref_id, d.field, d.updated_at, substr(d.body, 1, 200) AS snippet
+      FROM search_docs d
+      WHERE d.user_id = ? AND d.kind = ? AND d.ref_id = ? AND d.field = ? AND ${kindSql} AND ${visibility}`)
+      .get(userId, s.kind, row.id, s.field)
+    return doc ? [doc] : []
+  }
+  return []
 }
 
 // Doc → the entity a person is looking for (spec §4), and the entity's own
@@ -92,7 +122,9 @@ function makeLookups(db, { excludePrivateOwned, want }) {
   const missionOriginOk = db.prepare(`SELECT ${missionOk('?')} AS ok`)
   const rollupEnabled = want.has('mission')
 
-  function entityKey(doc) {
+  // `own`: report a project as itself even when it is a mission's default
+  // twin — the number tier asked for that project's own number.
+  function entityKey(doc, { own = false } = {}) {
     if (doc.kind === 'milestone') {
       const m = milestoneMission.get(doc.ref_id)
       return m && { kind: 'mission', id: m.mission_id }
@@ -101,7 +133,7 @@ function makeLookups(db, { excludePrivateOwned, want }) {
       const c = commentItem.get(doc.ref_id)
       return c && { kind: 'item', id: c.item_id }
     }
-    if (doc.kind === 'project' && rollupEnabled) {
+    if (doc.kind === 'project' && rollupEnabled && !own) {
       const d = defaultProjectMission.get(doc.ref_id)
       if (d && (!excludePrivateOwned || missionOriginOk.get(d.mission_id).ok)) {
         return { kind: 'mission', id: d.mission_id }
@@ -150,10 +182,10 @@ export async function searchAll(db, userId, { query, limit = 20, kinds = null, e
   // skipped (wrong kind, or an entity a stricter tier already found) — so a
   // caller that needs the entry it added (the similar tier, to stamp a
   // score) doesn't have to re-derive it with an O(n) `.at(-1)`.
-  const take = (why, docs) => {
+  const take = (why, docs, opts) => {
     let added
     for (const doc of docs) {
-      const key = entityKey(doc)
+      const key = entityKey(doc, opts)
       if (!key || !want.has(key.kind)) continue
       const k = `${key.kind}:${key.id}`
       if (byEntity.has(k)) continue
@@ -183,6 +215,10 @@ export async function searchAll(db, userId, { query, limit = 20, kinds = null, e
   }
   let strictCount
   try {
+    // A bare number names one tracker row exactly; it goes first, ahead of
+    // every row that merely mentions the number in its text.
+    const numbered = String(query).trim().match(NUMBER_QUERY)
+    if (numbered) take('number', numberDocs(db, userId, Number(numbered[1]), { visibility, kindSql }), { own: true })
     for (const [why, table, match] of tiers) {
       if (match) runTier(why, table, match)
     }
