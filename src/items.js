@@ -39,7 +39,10 @@ const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArr
 // which is exactly the text the apps display in place of the audio.
 function validateAttachments(list, { allowTranscript = false } = {}) {
   if (list === undefined) return { ok: true, value: [] }
-  if (!Array.isArray(list) || list.length > ATTACHMENTS_MAX) return { ok: false }
+  if (!Array.isArray(list)) return { ok: false }
+  // Named, so a client can say why and split the files across comments
+  // rather than show a bare "bad request".
+  if (list.length > ATTACHMENTS_MAX) return { ok: false, error: 'too_many_attachments' }
   const out = []
   for (const a of list) {
     if (!isPlainObject(a)) return { ok: false }
@@ -133,7 +136,7 @@ export function validateItemFields(fields, { partial = false, allowTranscript = 
     value.actions = actions
   }
   const att = validateAttachments(fields.attachments, { allowTranscript })
-  if (!att.ok) return { ok: false }
+  if (!att.ok) return att.error ? { ok: false, error: att.error, max: ATTACHMENTS_MAX } : { ok: false }
   if (fields.attachments !== undefined) value.attachments = att.value
   return { ok: true, value }
 }

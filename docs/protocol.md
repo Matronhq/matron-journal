@@ -1873,6 +1873,9 @@ blocks or covered by an inline code span are literal text, while a code span
 wholly inside the caption does not hide the ref). A ref must name a blob in the **same
 write's** `attachments` — for `PATCH` `body`, the item's existing body
 attachments — or the write is **400 `{error:'invalid_attachment_ref', ref}`**.
+**Attachment limit.** An item create or a comment carries at most 20
+attachments; more is **400 `{error:'too_many_attachments', max: 20}`** and
+nothing is stored. Clients split a larger set across several comments.
 Apps split the body there (text, attachment, text …), show each attachment
 once (a repeated ref renders as its caption), and append the ones no ref
 places. Apps that render refs send `X-Matron-Item-Inline: attachments` on

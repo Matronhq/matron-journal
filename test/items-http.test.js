@@ -735,3 +735,24 @@ test('a colleague reading a shared item never sees a handover: no pending offer,
   const list = await s.http('/items?scope=shared', { token: patClient })
   assert.equal(list.json.items[0].handover, null)
 })
+
+test('more than 20 attachments on a comment or a create is a named 400, and nothing is stored', async (t) => {
+  const { s, client } = await fleet(t)
+  const files = (n) => Array.from({ length: n }, (_, i) => ({ blob_ref: `b${i}`, mime: 'text/csv', name: `f${i}.csv`, size: 1 }))
+  const tooMany = await mkItem(s, client, { attachments: files(21) })
+  assert.equal(tooMany.status, 400)
+  assert.deepEqual(tooMany.json, { error: 'too_many_attachments', max: 20 })
+  const created = await mkItem(s, client, { attachments: files(20) })
+  assert.equal(created.status, 201)
+  const id = created.json.item.id
+  const before = (await s.http(`/items/${id}`, { token: client })).json.comments.length
+  const r = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { body: 'exports', attachments: files(42) } })
+  assert.equal(r.status, 400)
+  assert.deepEqual(r.json, { error: 'too_many_attachments', max: 20 })
+  assert.equal((await s.http(`/items/${id}`, { token: client })).json.comments.length, before, 'the refused comment stored nothing')
+  const ok = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { body: 'exports', attachments: files(20) } })
+  assert.equal(ok.status, 201)
+  // A malformed list is still the generic 400.
+  const bad = await s.http(`/items/${id}/comments`, { method: 'POST', token: client, body: { body: 'x', attachments: 'nope' } })
+  assert.deepEqual([bad.status, bad.json], [400, { error: 'bad_request' }])
+})
