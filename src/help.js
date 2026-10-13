@@ -50,7 +50,8 @@ docs/protocol.md in the matron-journal repo ("Journal search" for the index).
   read one such row; every write to it is 403. \`GET /milestones?convo=<id>\`
   works on a shared conversation.
 - \`GET /lookup?user=<name>&num=<n>\` — resolves a shareable link
-  (\`https://<journal>/u/<name>/<n>\`) to \`{kind, id, owner}\`; 404 when
+  (\`https://<journal>/u/<name>/<n>\`) to \`{kind, id, num, title, owner}\` (a milestone also names its
+  \`mission\`); 404 when
   unknown or not visible to you.
 - \`GET /said/<convo>:<seq>\` — did your user really write this? For an
   agent checking a \`<convo>:<seq>\` citation another agent gave it, on any box's
