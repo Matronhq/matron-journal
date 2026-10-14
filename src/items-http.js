@@ -234,16 +234,25 @@ export function emitTranscriptionMarker(ctx, { item, comment, failed, userId, de
 // null = absent, undefined = present but not in `list` (i.e. reject).
 const oneOf = (v, list) => (v == null ? null : (list.includes(v) ? v : undefined))
 
+// `kind` names one kind or several, comma-separated ("question,decision,notice"
+// is a client's closed list without the tasks). null = absent, undefined =
+// present but not all known kinds (i.e. reject); otherwise the kinds, once each.
+function kindsOf(v) {
+  if (v == null) return null
+  const kinds = [...new Set(v.split(','))]
+  return kinds.every((k) => ITEM_KINDS.includes(k)) ? kinds : undefined
+}
+
 function handleList(db, res, url, who) {
   const q = url.searchParams
-  const kind = oneOf(q.get('kind'), ITEM_KINDS)
+  const kind = kindsOf(q.get('kind'))
   const state = oneOf(q.get('state'), STATES)
   const awaiting = oneOf(q.get('awaiting'), AWAITING)
   const sort = q.has('sort') ? oneOf(q.get('sort'), SORTS) : 'rank'
   if (kind === undefined || state === undefined || awaiting === undefined || sort === undefined) return badRequest(res)
   // An app that predates notices is shown them as tasks (replyItems), so
   // its kind=task filter has to find them too — on either scope.
-  const kindFilter = kind === 'task' && who.knowsNotice === false ? ['task', 'notice'] : kind
+  const kindFilter = kind && kind.includes('task') && who.knowsNotice === false && !kind.includes('notice') ? [...kind, 'notice'] : kind
   const scope = q.has('scope') ? oneOf(q.get('scope'), SCOPES) : 'mine'
   if (scope === undefined) return badRequest(res)
   if (scope === 'shared') {
