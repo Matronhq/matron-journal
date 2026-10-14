@@ -22,6 +22,7 @@
 // 0), never as the user: src/said.js, and any agent checking what the user
 // said, must not mistake one for the user's words.
 import { newId, getItem, insertComment } from './items.js'
+import { isPrivateDevice } from './db.js'
 
 export const HANDOVER_TTL_MS = 24 * 60 * 60 * 1000
 export const HANDOVER_NOTE_MAX = 2000
@@ -80,7 +81,8 @@ export function needsUserTap(db, userId, fromDeviceId, toDeviceId) {
 // Moving one across that line would either show a private item to every
 // agent or hide an ordinary one from them, so both sides must agree.
 export function privacyMatches(db, userId, fromDeviceId, toDeviceId) {
-  const p = (d) => !!deviceRow(db, userId, d)?.private
+  // isPrivateDevice, not the live row: a revoked private box's items stay private.
+  const p = (d) => Number.isInteger(d) && isPrivateDevice(db, d)
   return p(fromDeviceId) === p(toDeviceId)
 }
 

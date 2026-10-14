@@ -477,8 +477,8 @@ export function hidePrivateAuthors(db, comments) {
   const privDevice = new Map()
   const privConvo = new Map()
   const memo = (map, key, probe) => { if (!map.has(key)) map.set(key, probe(key)); return map.get(key) }
-  const hostIsPrivate = db.prepare(`SELECT 1 FROM conversations c JOIN devices d ON d.id = c.agent_device_id
-    WHERE c.id = ? AND d.private = 1`)
+  const hostIsPrivate = db.prepare(`SELECT 1 FROM conversations c JOIN private_devices d ON d.id = c.agent_device_id
+    WHERE c.id = ?`)
   return comments.map((c) => {
     if (c.device_name == null && c.convo_id == null) return c
     if (memo(privDevice, c.device_id, (id) => isPrivateDevice(db, id))) return { ...c, device_name: null, convo_id: null, convo_title: null }
@@ -524,8 +524,8 @@ export function listItems(db, userId, {
     // item filed against a conversation owned by a private device is
     // invisible to an ordinary agent caller. NULL-owner conversations are
     // never private-owned.
-    where.push(`NOT EXISTS (SELECT 1 FROM conversations cv JOIN devices d ON d.id = cv.agent_device_id
-      WHERE cv.id = i.origin_convo_id AND d.private = 1)`)
+    where.push(`NOT EXISTS (SELECT 1 FROM conversations cv JOIN private_devices d ON d.id = cv.agent_device_id
+      WHERE cv.id = i.origin_convo_id)`)
   }
   if (excludeConsent) where.push('i.consent IS NULL') // the user's alone (isConsentMirror)
   const cur = cursor ? decCursor(cursor) : null
@@ -563,11 +563,11 @@ const OWNER_DECORATE = `
 // the grantee's mission view applies (missions.js grantedMissionDetail).
 const GRANTED_ITEM = `(i.mission_id IS NOT NULL AND EXISTS (
     SELECT 1 FROM missions m WHERE m.id = i.mission_id AND m.user_id = i.user_id
-      AND NOT EXISTS (SELECT 1 FROM conversations mo JOIN devices md ON md.id = mo.agent_device_id
-                      WHERE mo.id = m.origin_convo_id AND md.private = 1)
+      AND NOT EXISTS (SELECT 1 FROM conversations mo JOIN private_devices md ON md.id = mo.agent_device_id
+                      WHERE mo.id = m.origin_convo_id)
       AND ${grantedMissionSql('m')})
-  AND NOT EXISTS (SELECT 1 FROM conversations pc JOIN devices pd ON pd.id = pc.agent_device_id
-                  WHERE pc.id = i.origin_convo_id AND pd.private = 1))`
+  AND NOT EXISTS (SELECT 1 FROM conversations pc JOIN private_devices pd ON pd.id = pc.agent_device_id
+                  WHERE pc.id = i.origin_convo_id))`
 // LEFT JOIN: a granted item is readable even when its origin conversation's
 // row is gone; the org rule (which needs the row) is false for it either way.
 const SHARED_OR_GRANTED_FROM = `FROM items i

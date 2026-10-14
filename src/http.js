@@ -469,7 +469,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
            FROM conversations WHERE owner_user_id=? AND parent_convo_id IS NULL AND system IS NULL
              AND NOT EXISTS(SELECT 1 FROM person_rooms pr WHERE pr.guest_room_id = conversations.id)${filtered
              ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
-                    SELECT 1 FROM devices d WHERE d.id=conversations.agent_device_id AND d.private=1))`
+                    SELECT 1 FROM private_devices d WHERE d.id=conversations.agent_device_id))`
              : ''}
            ORDER BY last_seq DESC`
         ).all(who.userId)

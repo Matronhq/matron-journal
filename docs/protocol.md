@@ -3917,9 +3917,11 @@ owns it. `private=1` means invisible/unreachable to other agents — not to the
 user: `kind='client'` connections are never filtered by any rule below, and
 `GET /devices` (already client-only, see above) is untouched by this feature
 entirely. `isPrivateDevice(db, deviceId)` (`src/db.js`) is the single read
-helper every enforcement point calls; it answers `false` for an unknown/
-deleted id rather than throwing, so a caller checking a dangling reference
-falls through to its normal not-found path instead of crashing.
+helper every enforcement point calls (SQL sieves read the same
+`private_devices` view it does); it answers `true` for a revoked private
+device (see "Revocation keeps it private" below) and `false` for any other
+unknown/deleted id rather than throwing, so a caller checking a dangling
+reference falls through to its normal not-found path instead of crashing.
 
 **Setting it: hello, then the pin.** The bridge asserts its own flag on every
 WS `hello` frame: an optional top-level `private: boolean`
@@ -4079,18 +4081,19 @@ above:
   the compromised device, this feature bought nothing); the only flag it can
   touch is its own, and unmarking itself only makes it more visible, which
   harms nobody but itself.
-- **Revocation re-exposes.** `matron-admin device revoke` (see "Device
-  revocation" below) deletes the device row outright — there is no
-  soft-delete or tombstone. A private device's conversations still carry its
-  now-dangling `agent_device_id`, so every enforcement point above (whose
-  private check is `isPrivateDevice`, a live lookup against the `devices`
-  table) sees no row, answers `false`, and stops excluding them: a
-  decommissioned private agent's whole history becomes visible and
-  searchable again to ordinary agents the moment it's revoked. Privacy here
-  is a visibility flag on a live device, not a retention policy on its past
-  conversations; if a decommissioned device's history needs to stay hidden,
-  that needs a distinct fail-closed mechanism (e.g. an owner id that
-  survives its device row) — not implemented in v1.
+- **Revocation keeps it private.** Revoking a device (see "Device
+  revocation" below) deletes its row, but a private device leaves a
+  tombstone: an `AFTER DELETE` trigger on `devices` copies its id and user
+  into `revoked_private_devices`, whatever deleted the row. Every
+  enforcement point reads privacy through the `private_devices` view (the
+  live `private=1` rows plus the tombstones) — `isPrivateDevice` and every
+  SQL sieve alike — so the conversations, milestones, items, mission and
+  project statuses a private box wrote stay hidden from ordinary agents
+  after it is revoked, and an ordinary agent cannot take its conversations
+  over. Device ids are reusable rowids, so a tombstoned id is never handed
+  out again: new devices are numbered above both tables, and a trigger
+  refuses any insert that reuses one. A device revoked before tombstones
+  existed left none; its history is judged as before (not private).
 - **`/metrics`'s global aggregates still count private devices.**
   `sockets_connected`, `journal_row_count`, and `db_file_size_bytes` are
   whole-user (or whole-server) aggregates computed before the per-device
@@ -4131,7 +4134,9 @@ too, with the same error frame and `4001` close. WS enforcement is
 therefore **next-frame or ≤60s, whichever comes first**.
 `matron-admin device list <username>` shows each device's kind, cursor,
 and last-seen time. Room membership goes with the row — see "Device
-revocation clears room membership" under agent chat.
+revocation clears room membership" under agent chat. A private device's
+privacy does not: it leaves a tombstone (see "Revocation keeps it private"
+under Device privacy).
 
 Owners can also revoke from a client device over HTTP:
 `POST /devices/:id/revoke` (Bearer, client devices only — agents get 403)

@@ -430,7 +430,7 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
              ORDER BY e.seq DESC LIMIT 1) AS last_ts
      FROM conversations WHERE owner_user_id=?${excludeSystem ? ' AND system IS NULL' : ''}${excludePrivateOwned
        ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
-              SELECT 1 FROM devices d WHERE d.id=conversations.agent_device_id AND d.private=1))`
+              SELECT 1 FROM private_devices d WHERE d.id=conversations.agent_device_id))`
        : ''}
      ORDER BY last_seq DESC`
   ).all(userId)
@@ -455,7 +455,7 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   // because a private box was in it — rows involving a private device
   // neither count as members nor make a conversation a room.
   const sieve = (col) => excludePrivateOwned
-    ? ` AND NOT EXISTS(SELECT 1 FROM devices d WHERE d.id=${col} AND d.private=1)`
+    ? ` AND NOT EXISTS(SELECT 1 FROM private_devices d WHERE d.id=${col})`
     : ''
   const roomIds = new Set(db.prepare(
     `SELECT ca.convo_id AS id FROM convo_agents ca
