@@ -231,6 +231,43 @@ test('listItems filters, sorts, pages, and decorates', async () => {
   assert.equal(listItems(db, alice.id, { state: 'closed' }).items.length, 0)
 })
 
+test("listItems state=done sort=acted: the user's last action first, answered open items included", async () => {
+  const { db, alice } = await seed()
+  const q = (title, now, o = {}) => createItem(db, base({ userId: alice.id, kind: 'question', title, now, ...o })).item
+  // Closed long ago by an agent, never touched by the user: falls back to closed_at.
+  const old = q('old', 1)
+  closeItem(db, { userId: alice.id, itemId: old.id, resolution: 'cancelled', author: 'agent', deviceId: 1, now: 10 })
+  // Answered by the user at 20, closed by its agent much later at 90.
+  const answered = q('answered', 2)
+  addComment(db, { userId: alice.id, itemId: answered.id, author: 'user', deviceId: 1, body: 'yes', now: 20 })
+  closeItem(db, { userId: alice.id, itemId: answered.id, resolution: 'answered', author: 'agent', deviceId: 1, now: 90 })
+  // Tapped just now (50) and still open, waiting on its agent.
+  const tapped = q('tapped', 3)
+  addComment(db, { userId: alice.id, itemId: tapped.id, author: 'user', deviceId: 1, body: 'Go', now: 50 })
+  // Still waiting on the user: never in Done.
+  q('waiting', 4)
+  // Open and waiting on the agent, but the user never acted on it: not done.
+  q('agents', 5, { awaiting: 'agent' })
+  // A seen notice, closed by the user's tap at 40.
+  const notice = createItem(db, base({ userId: alice.id, kind: 'notice', title: 'notice', now: 6 })).item
+  addComment(db, { userId: alice.id, itemId: notice.id, author: 'user', deviceId: 1, body: 'Seen', action: 'Seen', now: 40 })
+  // An agent comment on a closed item later still does not lift it.
+  addComment(db, { userId: alice.id, itemId: old.id, author: 'agent', deviceId: 1, body: 'fyi', now: 95 })
+
+  const titles = (r) => r.items.map((i) => i.title)
+  const all = listItems(db, alice.id, { state: 'done', sort: 'acted', kind: ['question', 'decision', 'notice'] })
+  assert.deepEqual(titles(all), ['tapped', 'notice', 'answered', 'old'])
+  assert.equal(all.items[0].state, 'open')
+  assert.equal(all.items[0].last_user_input_at, 50)
+  // Pages by the same key.
+  const p1 = listItems(db, alice.id, { state: 'done', sort: 'acted', limit: 3 })
+  assert.deepEqual(titles(p1), ['tapped', 'notice', 'answered'])
+  const p2 = listItems(db, alice.id, { state: 'done', sort: 'acted', limit: 3, cursor: p1.next_cursor })
+  assert.deepEqual(titles(p2), ['old']); assert.equal(p2.next_cursor, null)
+  // updated_at order, for contrast, puts the agent's late comment first.
+  assert.equal(listItems(db, alice.id, { state: 'closed', sort: 'updated' }).items[0].title, 'old')
+})
+
 test('listItems limit is clamped and coerced (default 100, max 500, min 1)', async () => {
   const { db, alice } = await seed()
   createItem(db, base({ userId: alice.id, title: 'A' }))
