@@ -215,16 +215,18 @@ CREATE INDEX IF NOT EXISTS idx_milestones_mission ON milestones(mission_id, crea
 CREATE INDEX IF NOT EXISTS idx_milestones_convo ON milestones(convo_id, seq);
 -- Search index (spec: agent journal search). Deliberately INSERT-trigger
 -- only: \`events\` is append-only — plain INSERT in journal.js append(), no
--- DELETE anywhere, and the only paths that rewrite an event's payload are
--- retention's tool_output offload/expire passes and the media reaper's
--- file/image tombstones (runReapMedia) — all three touch only types that
--- indexableBody never indexes (it reads text/prompt/prompt_reply bodies) —
--- so no update/delete trigger can ever be needed. If a delete/update path
--- for an INDEXED type is ever added to \`events\`, or indexableBody grows to
--- read file/image captions or tool_output, this schema must be revisited
--- (external-content FTS corrupts when content rows change without the
--- matching fts delete — matron-apple #106). Never INSERT OR REPLACE into
--- search_messages for the same reason.
+-- DELETE anywhere. Retention's tool_output offload/expire passes and the
+-- media reaper's file/image tombstones (runReapMedia) rewrite payloads only
+-- of types that indexableBody never indexes (it reads text and diff
+-- bodies). The one path that rewrites an INDEXED event is the per-device
+-- content expiry (runExpireDeviceContent), and it deletes the event's
+-- search_messages row itself, issuing the FTS5 'delete' command to both
+-- mirrors with the old body first, in the same transaction. Any other
+-- delete/update path for an indexed type, or indexableBody growing to read
+-- file/image captions or tool_output, must do the same or revisit this
+-- schema (external-content FTS corrupts when content rows change without
+-- the matching fts delete — matron-apple #106). Never INSERT OR REPLACE
+-- into search_messages for the same reason.
 --
 -- \`backfillIsDiff\` (src/search.js) does run an UPDATE against this table,
 -- which does not violate the above: it only ever sets \`is_diff\`, a plain

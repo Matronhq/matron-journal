@@ -88,6 +88,7 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_RETENTION_DAYS` | `30` | Offload `tool_output` payloads older than this (`0` disables) |
 | `MATRON_TOOL_LOG_TTL_HOURS` | `24` | Delete offloaded tool-log blobs older than this |
 | `MATRON_VOICE_NOTE_TTL_DAYS` | `7` | Delete an item voice note's audio this many days after its transcript landed; the transcript stays (`0` disables) |
+| `MATRON_DEVICE_RETENTION` | unset (off) | Comma-separated `<deviceId>:<days>` (e.g. `4:30,9:7`): expire the content of each device's sessions and rooms once older than that many days — payloads become tombstones, search rows and unshared blobs are deleted. Any invalid entry disables the whole setting. See docs/protocol.md *Per-device content expiry* |
 | `MATRON_WS_PING_MS` | `55000` | WebSocket heartbeat interval (kept under common 60s proxy idle timeouts) |
 | `MATRON_RPC_MAX_BYTES` | `16384` | Max inbound WebSocket RPC frame size |
 | `MATRON_TOOL_STREAM_MAX_BYTES` | `1048576` | Max bytes per live tool-output stream buffer |
