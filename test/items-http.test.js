@@ -144,6 +144,10 @@ test('GET /items: query validation, updated sort, cursor paging', async (t) => {
   assert.equal(page2.json.next_cursor, null)
   const byUpdated = await s.http('/items?sort=updated', { token: client })
   assert.deepEqual(byUpdated.json.items.map((i) => i.num), [3, 2, 1])
+  // For you's Done view and the user's-last-action order (own list only).
+  const done = await s.http('/items?state=done&sort=acted&kind=question,decision,notice&limit=50', { token: client })
+  assert.equal(done.status, 200); assert.deepEqual(done.json.items, [])
+  assert.equal((await s.http('/items?scope=shared&state=done', { token: client })).status, 400)
 })
 
 test('privacy sieve: an ordinary agent cannot see items born in a private device\'s convo; clients and private agents can', async (t) => {

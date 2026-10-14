@@ -23,9 +23,12 @@ import { notifyGrantees } from './sharing-events.js'
 import { inlineRefsToText, knowsInlineRefs, strayInlineRef } from './inline-refs.js'
 import { handleHandoverRoute, approvalQuestionOf, handleApprovalTap, withdrawOnClose } from './item-handover-http.js'
 
-const SORTS = ['rank', 'updated']
+const SORTS = ['rank', 'updated', 'acted']
 const SCOPES = ['mine', 'shared']
 const STATES = ['open', 'closed']
+// `done` is For you's Done view (listItems): closed, or answered and no
+// longer waiting on the user. Own list only.
+const LIST_STATES = [...STATES, 'done']
 const POSITIONS = ['top', 'bottom']
 const ID_MAX = 128
 // Notice items (mission: For you) reach an app only when it says it knows
@@ -246,7 +249,7 @@ function kindsOf(v) {
 function handleList(db, res, url, who) {
   const q = url.searchParams
   const kind = kindsOf(q.get('kind'))
-  const state = oneOf(q.get('state'), STATES)
+  const state = oneOf(q.get('state'), LIST_STATES)
   const awaiting = oneOf(q.get('awaiting'), AWAITING)
   const sort = q.has('sort') ? oneOf(q.get('sort'), SORTS) : 'rank'
   if (kind === undefined || state === undefined || awaiting === undefined || sort === undefined) return badRequest(res)
@@ -259,6 +262,7 @@ function handleList(db, res, url, who) {
     // Own-list-only filters (convo, label, sort, since) are meaningless
     // across users and are rejected rather than ignored.
     for (const k of ['convo', 'label', 'sort', 'since']) if (q.has(k)) return badRequest(res)
+    if (state === 'done') return badRequest(res)
     const sharedLimit = q.has('limit') ? Number(q.get('limit')) : 100
     if (!Number.isInteger(sharedLimit) || sharedLimit < 1) return badRequest(res)
     const r = listSharedItems(db, who.userId, { kind: kindFilter, state, awaiting, limit: sharedLimit, cursor: q.get('cursor') })

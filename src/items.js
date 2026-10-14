@@ -409,6 +409,23 @@ const WORKING_DECORATE = `
   (SELECT cv.turn_started_at FROM conversations cv WHERE cv.id = i.origin_convo_id AND cv.owner_user_id = i.user_id) AS owner_turn_started_at,
   (SELECT cv.turn_ended_at FROM conversations cv WHERE cv.id = i.origin_convo_id AND cv.owner_user_id = i.user_id) AS owner_turn_ended_at`
 
+// When the user last acted on item `i` (see last_user_input_at below).
+const LAST_USER_INPUT = `COALESCE((SELECT MAX(created_at) FROM item_comments c WHERE c.item_id = i.id AND c.author='user'),
+    CASE WHEN i.created_by='user' THEN i.created_at END)`
+
+// For you's Done view (state='done'): closed items, and open ones the user
+// has answered that no longer wait on them (a question they tapped Go on,
+// still open until its agent closes it). Without the open ones, an item the
+// user has just acted on was in neither Needs you nor Done. Only an agent's
+// item counts while open: one the user filed is work they handed out, not
+// something they answered.
+const DONE_VIEW = `(i.state = 'closed' OR (i.created_by = 'agent' AND i.awaiting IS NOT 'user' AND ${LAST_USER_INPUT} IS NOT NULL))`
+
+// sort='acted': the user's own last action first, falling back to the close
+// time, then the last update — so whatever they just tapped, answered or
+// closed tops the list, however long its agent takes to close it.
+const ACTED_AT = `COALESCE(${LAST_USER_INPUT}, i.closed_at, i.updated_at)`
+
 const DECORATE = `${WORKING_DECORATE},
   (SELECT COUNT(*) FROM item_comments c WHERE c.item_id = i.id AND c.kind='comment') AS comment_count,
   (SELECT MAX(created_at) FROM item_comments c WHERE c.item_id = i.id AND c.kind='comment') AS last_comment_at,
@@ -418,8 +435,7 @@ const DECORATE = `${WORKING_DECORATE},
   -- only agents have touched. Lets a client order closed items by the
   -- user's own last input rather than by when an agent closed them. Every
   -- one of those writes also bumps updated_at, so a since delta carries it.
-  COALESCE((SELECT MAX(created_at) FROM item_comments c WHERE c.item_id = i.id AND c.author='user'),
-    CASE WHEN i.created_by='user' THEN i.created_at END) AS last_user_input_at,
+  ${LAST_USER_INPUT} AS last_user_input_at,
   (SELECT COALESCE(attachments,'[]') FROM item_comments c WHERE c.item_id = i.id AND c.kind='status' AND c.meta LIKE '%"role":"body"%' LIMIT 1) AS attachments,
   EXISTS(SELECT 1 FROM item_comments c WHERE c.item_id = i.id AND c.attachments LIKE '%"mime":"image/%') AS has_image,
   (SELECT num FROM missions m WHERE m.id = i.mission_id) AS mission_num,
@@ -515,7 +531,8 @@ export function listItems(db, userId, {
   // finds them under kind=task (items-http.js handleList).
   if (Array.isArray(kind)) { where.push(`i.kind IN (${kind.map(() => '?').join(',')})`); args.push(...kind) }
   else if (kind != null) { where.push('i.kind = ?'); args.push(kind) }
-  if (state != null) { where.push('i.state = ?'); args.push(state) }
+  if (state === 'done') where.push(DONE_VIEW)
+  else if (state != null) { where.push('i.state = ?'); args.push(state) }
   if (awaiting != null) { where.push('i.awaiting = ?'); args.push(awaiting) }
   if (label != null) { where.push('EXISTS (SELECT 1 FROM json_each(i.labels) WHERE value = ?)'); args.push(label) }
   if (since != null) { where.push('i.updated_at >= ?'); args.push(since) }
@@ -530,6 +547,20 @@ export function listItems(db, userId, {
   if (excludeConsent) where.push('i.consent IS NULL') // the user's alone (isConsentMirror)
   const cur = cursor ? decCursor(cursor) : null
   if (cursor && !cur) return { badCursor: true }
+  if (sort === 'acted') {
+    if (cur) { where.push(`(${ACTED_AT} < ? OR (${ACTED_AT} = ? AND i.num < ?))`); args.push(cur[0], cur[0], cur[1]) }
+    // The page is picked on the bare rows first: decorating every candidate
+    // before the sort would run DECORATE's subqueries over the user's whole
+    // history (thousands of closed items) for one page.
+    const rows = db.prepare(`SELECT i.*, ${DECORATE}, p.acted_at FROM
+      (SELECT i.id, i.num, ${ACTED_AT} AS acted_at FROM items i WHERE ${where.join(' AND ')}
+        ORDER BY acted_at DESC, i.num DESC LIMIT ?) p
+      JOIN items i ON i.id = p.id ORDER BY p.acted_at DESC, p.num DESC`).all(...args, limit + 1)
+    const page = rows.slice(0, limit)
+    const last = page[page.length - 1]
+    const next_cursor = rows.length > limit && last ? encCursor([last.acted_at, last.num]) : null
+    return { items: page.map(({ acted_at: _, ...row }) => rowToItem(row)), next_cursor }
+  }
   let order
   if (sort === 'updated') {
     order = 'i.updated_at DESC, i.num DESC'
