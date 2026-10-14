@@ -540,21 +540,25 @@ shared function, not on two filters kept in sync by hand.
 ### Index invariants
 
 - **Append-only, insert-trigger-only.** `search_messages` has an `AFTER
-  INSERT` trigger populating `search_fts` and nothing else — no update or
-  delete trigger exists. This mirrors `events` itself: rows are written
-  with a plain `INSERT`, never `INSERT OR REPLACE` (`REPLACE` silently
-  skipping a delete trigger is the exact corruption that hit the app-side
-  FTS index — matron-apple #106), and no `DELETE FROM events` exists
-  anywhere in the server. A prose-only index of an append-only table needs
-  an insert path and nothing else; if a delete path is ever added to
-  `events`, this schema needs revisiting.
-- **Retention never touches indexed rows.** The two retention passes under
+  INSERT` trigger populating `search_fts` and `search_fts_plain` and
+  nothing else — no update or delete trigger exists. This mirrors `events`
+  itself: rows are written with a plain `INSERT`, never `INSERT OR
+  REPLACE` (`REPLACE` silently skipping a delete trigger is the exact
+  corruption that hit the app-side FTS index — matron-apple #106), and no
+  `DELETE FROM events` exists anywhere in the server. The one path that
+  removes index rows is the per-device content expiry (below), which
+  issues the FTS5 `'delete'` command to both mirrors with the old body
+  before deleting the `search_messages` row, in the same transaction as
+  the event rewrite. Any other path that changes an indexed event must do
+  the same.
+- **Retention and the index.** The tool-log TTL and offload passes under
   "Retention (payload offload)" below only ever rewrite `tool_output`
-  payloads — purging live-streamed output after
-  `MATRON_TOOL_LOG_TTL_HOURS` and offloading older output to a blob after
-  `MATRON_RETENTION_DAYS` — and `tool_output` is never indexed. Neither
-  pass can therefore invalidate a `search_messages`/`search_fts` row; the
-  index has no reconciliation path with retention because it needs none.
+  payloads, which are never indexed, and the media reaper only `file` and
+  `image` ones, also never indexed; none of them touches the index. The
+  per-device content expiry rewrites `text` and `diff` events too, and
+  deletes their index rows as it does; its tombstone has no indexable body
+  (`indexableBody` returns `null` for it), so neither the live path nor the
+  backfill can index it again.
 - **Backfill is resumable and self-healing.** A startup walk over `events`
   by `rowid`, batched, indexing every row `indexableBody` accepts via
   `INSERT OR IGNORE` (never `OR REPLACE`) against `search_messages`'
@@ -4442,3 +4446,93 @@ Client rules (binding on all client implementations):
   for a server re-sync — otherwise the server purge is defeated by device
   caches. In-memory display of a currently-open conversation is exempt.
 - The TTL is not communicated in-protocol; clients assume the 24h default.
+
+### Per-device content expiry
+
+Some agent devices handle third-party content that should not be kept for
+ever, and quote it in what they write. `MATRON_DEVICE_RETENTION` (or
+startServer's `deviceRetention` option) is a comma-separated list of
+`<deviceId>:<days>`, e.g. `4:30,9:7`: for each device, the content of the
+conversations it has a hand in is expired once it is older than that many
+days. Unset or empty is off. An entry that is not two positive integers,
+or a device named twice, disables the whole setting with one warn line at
+boot; the active rules are logged once at boot. The pass
+(`runExpireDeviceContent`, `src/retention.js`) runs on the retention
+schedule (at boot, then every 6 h), first of the retention passes.
+
+**Which conversations.** For device D:
+
+- D's own sessions and the rooms D owns: `conversations.agent_device_id =
+  D` (the column records a session's managing device and a room's owner
+  alike);
+- every room D is or was a member of: a `convo_agents` row for D in any
+  state (a renewed row overwrites the state it had, so a device that
+  joined, left and was re-invited may read `refused` though it spoke
+  there);
+- D's sessions recorded in `room_owner_convos`, unless another device has
+  since taken the session over;
+- the sub-chats (`parent_convo_id`) under any of these.
+
+A room between two people has a twin in the guest's log; the owner device
+is recorded on both rooms and a guest device has a membership row on both,
+so either rule reaches both copies. No other conversation is touched.
+Rules name device ids: a box that is re-paired gets a new id (and takes
+its sessions over), and revoking a device deletes its membership rows, so
+review the setting when a device changes.
+
+**Which events.** In those conversations, every event older than the
+cutoff (`ts < now - days × 24 h`) of type `text`, `tool_output`, `diff`,
+`prompt`, `prompt_reply`, `permission_request`, `file`, `image`,
+`spawn_outcome`, `edit` or `summary` that is not already a content
+tombstone. Earlier tombstones that still carry words (an attachment's
+caption or transcript, a tool log's command) are included. Markers
+(`item`, `milestone`, `mission`, …), `convo_meta`, `session_status` and
+`read_marker` are not; tracker content lives in the tracker.
+
+**The tombstone.** The payload is rewritten in place (the event row, its
+`seq`, `ts`, `sender` and `type` stay):
+
+- strings under these keys are kept, because they are ids or enums that
+  clients route by and never prose: `type`, `kind`, `fallback_for`,
+  `mode`, `request`, `outcome`, `error_code`, `action`, `state`,
+  `consent`, `message_ref`, `request_id`, `spawn_id`, `room_id`,
+  `prompt_id`, `item_id`, `batch_id`, `convo_id`, `from_convo_id`,
+  `to_convo_id`, `target_convo_id`, `child_convo_id`, `content_type`,
+  `tool_name`, `tool`;
+- every other string becomes `''` (so `body`, `text`, `diff`, `snippet`,
+  `command`, `question`, `description`, `caption`, `name`, `transcript`,
+  `justification`, `task`, … — and any key not listed above);
+- arrays become `[]` and objects `{}`;
+- numbers, booleans and `null` are kept (sizes, exit codes, counts, seqs,
+  flags);
+- `blob_ref: null`, `expired: true` and `content_expired: true` are set.
+
+Keys are emptied rather than removed so a decoder that requires one still
+finds a value of the right type. `expired: true` is what clients already
+render for an expired attachment, tool log or diff; `content_expired: true`
+says the whole payload's content is gone and should be rendered as an
+expired message. A payload that is not a JSON object becomes `{blob_ref:
+null, expired: true, content_expired: true}`. Example, a `text` event:
+`{body: '', blob_ref: null, expired: true, content_expired: true}`.
+
+**Everything else that held the words.**
+
+- The event's `search_messages` row is deleted (with the FTS5 `'delete'`
+  command to `search_fts` and `search_fts_plain` first), in the same
+  transaction as the rewrite.
+- The blob the event named (`events.blob_ref`: an offloaded tool log, an
+  attachment) is deleted, row and file, when, after the rewrite, no event
+  still names it, no item comment's attachments name it, and the event's
+  own user owns it. Otherwise the blob stays and only this event lets go
+  of it. The file is unlinked after commit.
+- If the conversation's latest message-type event was tombstoned, its
+  preview (`snippet`) is recomputed from the tombstone and its rolling
+  `summary` is blanked. Titles are not changed.
+
+Work is batched per conversation (500 events a transaction), so a first
+run over a long history never holds the write lock for long; the pass is
+idempotent (`content_expired` marks a row done). Like the other passes it
+covers the journal's own store and search only: a client that already
+synced an event keeps its local copy until it re-syncs, and a bridge's
+echo of a room message into another session's conversation (and that
+session's own transcript) carries no room id, so it is not reached.

@@ -15,7 +15,7 @@ import { makeApnsClient } from './apns.js'
 import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
-import { runOffload, runExpireLogs, runReapMedia, runExpireVoiceNotes } from './retention.js'
+import { runOffload, runExpireLogs, runReapMedia, runExpireVoiceNotes, runExpireDeviceContent } from './retention.js'
 import { backfillSearchIndex, backfillIsDiff } from './search.js'
 import { loadEmbedder } from './embedder.js'
 import { ensureVectorSchema, runVectorIndexer, createVectorStore } from './vector-index.js'
@@ -154,6 +154,41 @@ function resolveVoiceNoteTtlDays(override) {
   return n
 }
 
+// `override` is startServer's `deviceRetention` opt and beats
+// MATRON_DEVICE_RETENTION, as with the other retention resolvers. The value
+// is a comma-separated list of `<deviceId>:<days>` (e.g. `4:30,9:7`):
+// expire the content of that device's conversations and rooms older than
+// that many days (runExpireDeviceContent). Unset or empty is OFF — unlike
+// the passes above there is no default, it names devices. Fail closed means
+// DISABLED, for the whole setting: this pass deletes user data, so an entry
+// that isn't two positive integers, a device named twice or a non-string
+// override turns it off with one warn line rather than running whatever
+// part of it parsed. Returns [{deviceId, days}] or null.
+export function resolveDeviceRetention(override) {
+  const fromEnv = override === undefined
+  const raw = fromEnv ? process.env.MATRON_DEVICE_RETENTION : override
+  if (raw === undefined) return null
+  const name = fromEnv ? 'MATRON_DEVICE_RETENTION' : 'deviceRetention'
+  const invalid = (why) => {
+    console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid (${why}; want <deviceId>:<days>,...) — device content expiry disabled`)
+    return null
+  }
+  if (typeof raw !== 'string') return invalid('not a string')
+  if (raw.trim() === '') return null
+  const rules = []
+  for (const entry of raw.split(',')) {
+    const m = /^\s*(\d+)\s*:\s*(\d+)\s*$/.exec(entry)
+    if (!m) return invalid(`entry ${JSON.stringify(entry)}`)
+    const deviceId = Number(m[1])
+    const days = Number(m[2])
+    if (!Number.isSafeInteger(deviceId) || deviceId <= 0) return invalid(`device id ${JSON.stringify(m[1])}`)
+    if (!Number.isSafeInteger(days) || days <= 0) return invalid(`days ${JSON.stringify(m[2])} for device ${deviceId}`)
+    if (rules.some((r) => r.deviceId === deviceId)) return invalid(`device ${deviceId} named twice`)
+    rules.push({ deviceId, days })
+  }
+  return rules
+}
+
 export const DEFAULT_MEDIA_REAP_HIGH_PCT = 90
 export const DEFAULT_MEDIA_REAP_LOW_PCT = 70
 
@@ -210,15 +245,34 @@ export function resolveReapPcts({ mediaReapHighPct, mediaReapLowPct } = {}) {
 // tick or being scheduled for the next. The quota-pressure media reaper runs
 // LAST: the offload pass just before it converts inline payloads into new
 // blobs, so reaping after offload sees the user's honest post-offload
-// footprint instead of triggering one tick late. Returns the interval handle
-// (for close()) or null only when ALL passes are disabled.
-function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes }) {
+// footprint instead of triggering one tick late. The per-device content
+// expiry runs FIRST: what it tombstones the later passes skip, so an old
+// tool log of such a device is never offloaded to a blob only to be
+// deleted, and the reaper sees the bytes it freed. Its rules are logged
+// once, here, at boot. Returns the interval handle (for close()) or null
+// only when ALL passes are disabled.
+function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, deviceRetention }) {
   const days = resolveRetentionDays(retentionDays)
   const ttlHours = resolveToolLogTtlHours(toolLogTtlHours)
   const voiceDays = resolveVoiceNoteTtlDays(voiceNoteTtlDays)
   const reapPcts = resolveReapPcts({ mediaReapHighPct, mediaReapLowPct })
-  if (days === null && ttlHours === null && voiceDays === null && reapPcts === null) return null
+  const deviceRules = resolveDeviceRetention(deviceRetention)
+  if (deviceRules) {
+    console.log(`retention: device content expiry on — ${deviceRules.map((r) => `device ${r.deviceId} after ${r.days}d`).join(', ')}`)
+  }
+  if (days === null && ttlHours === null && voiceDays === null && reapPcts === null && deviceRules === null) return null
   const run = () => {
+    if (deviceRules !== null) {
+      try {
+        const r = runExpireDeviceContent(db, { rules: deviceRules })
+        if (r.expired > 0 || r.blobsDeleted > 0) {
+          console.log(`retention: expired content of ${r.expired} event(s) for ${deviceRules.length} device rule(s), ` +
+            `${r.blobsDeleted} blob(s), ${r.bytesFreed} bytes, ${r.searchRowsDeleted} search row(s)`)
+        }
+      } catch (err) {
+        console.error('retention: device content expiry run failed', err)
+      }
+    }
     if (ttlHours !== null) {
       try {
         const r = runExpireLogs(db, { hours: ttlHours, mediaDir })
@@ -344,7 +398,7 @@ function warnIfBindTrustsSpoofableIp(bind) {
 export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
-  toolLogTtlHours, voiceNoteTtlDays, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
+  toolLogTtlHours, voiceNoteTtlDays, deviceRetention, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
   // How long an approved spawn waits for a woken target box to attach
   // before issuing `start` (wake-before-spawn). Sized for a cold VM boot:
   // incus start + bridge start + journal dial is ~3 minutes on the shared
@@ -544,7 +598,7 @@ export function startServer({
       const startDelay = cancellableDelay(backgroundDelayMs)
       retentionInterval = scheduleRetention(db, {
         mediaDir: resolvedMediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays,
-        mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
+        mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes, deviceRetention,
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
       githubRefreshInterval = scheduleGithubRefresh(db, resolvedGithub, { intervalMs: githubRefreshIntervalMs, box: tokenBox })
