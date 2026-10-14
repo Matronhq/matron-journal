@@ -10,5 +10,5 @@
 // untouched here — this export is for NEW call sites (search-docs.js) so
 // the SQL is imported, not copied, going forward; it does not retrofit the
 // existing ones.
-export const privateConvoSql = (col) => `EXISTS (SELECT 1 FROM conversations pc JOIN devices pd ON pd.id = pc.agent_device_id
-  WHERE pc.id = ${col} AND pd.private = 1)`
+export const privateConvoSql = (col) => `EXISTS (SELECT 1 FROM conversations pc JOIN private_devices pd ON pd.id = pc.agent_device_id
+  WHERE pc.id = ${col})`

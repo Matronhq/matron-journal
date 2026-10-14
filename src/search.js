@@ -80,7 +80,7 @@ function rankedSql({ convoId, excludeSubagents, excludePrivateOwned, excludeSeqs
     ${excludeSubagents ? 'AND c.parent_convo_id IS NULL' : ''}
     ${excludePrivateOwned
       ? `AND (c.agent_device_id IS NULL OR NOT EXISTS(
-            SELECT 1 FROM devices d WHERE d.id=c.agent_device_id AND d.private=1))`
+            SELECT 1 FROM private_devices d WHERE d.id=c.agent_device_id))`
       : ''}
     ${excludeSeqsCount ? `AND sm.seq NOT IN (${Array(excludeSeqsCount).fill('?').join(',')})` : ''}
     ORDER BY sm.is_diff, bm25(search_fts), sm.ts DESC
@@ -182,7 +182,7 @@ function typedWhere({ match, userId, convoId, excludeSubagents, excludePrivateOw
   if (excludeSubagents) clauses.push('c.parent_convo_id IS NULL')
   if (excludePrivateOwned) {
     clauses.push(`(c.agent_device_id IS NULL OR NOT EXISTS(
-      SELECT 1 FROM devices d WHERE d.id=c.agent_device_id AND d.private=1))`)
+      SELECT 1 FROM private_devices d WHERE d.id=c.agent_device_id))`)
   }
   return { sql: clauses.join(' AND '), args }
 }

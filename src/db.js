@@ -715,6 +715,38 @@ export function openDb(path) {
   if (!deviceCols.some((c) => c.name === 'private_pinned')) {
     db.exec('ALTER TABLE devices ADD COLUMN private_pinned INTEGER NOT NULL DEFAULT 0')
   }
+  // Revoked private devices keep a tombstone. Revocation deletes the
+  // devices row (the cascades and the token check depend on that), but the
+  // conversations, milestones, items, mission and project statuses a private
+  // box wrote outlive it, and every read-time sieve asks "is this device
+  // private?" by its id. Without the tombstone the answer turns to "no" the
+  // moment the row goes, and everything the box wrote becomes readable by
+  // ordinary agents. The trigger writes the tombstone whatever deletes the
+  // row (the HTTP route, the admin CLI), and the view is what every sieve
+  // reads: the live flag for devices that exist, the tombstone for those
+  // that do not. Ids are reusable rowids, so a tombstoned id must never be
+  // handed to a new device (it would inherit the private flag, and with it
+  // an ordinary box would read everything private): issueDevice (auth.js)
+  // allocates above both tables, and the second trigger refuses anything
+  // else that tries.
+  db.exec(`CREATE TABLE IF NOT EXISTS revoked_private_devices(
+    id         INTEGER PRIMARY KEY,
+    user_id    INTEGER NOT NULL,
+    revoked_at INTEGER NOT NULL
+  )`)
+  db.exec(`CREATE TRIGGER IF NOT EXISTS devices_private_tombstone AFTER DELETE ON devices WHEN OLD.private = 1
+    BEGIN
+      INSERT OR REPLACE INTO revoked_private_devices(id, user_id, revoked_at)
+        VALUES(OLD.id, OLD.user_id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END`)
+  db.exec(`CREATE TRIGGER IF NOT EXISTS devices_no_tombstone_reuse AFTER INSERT ON devices
+    WHEN EXISTS (SELECT 1 FROM revoked_private_devices WHERE id = NEW.id)
+    BEGIN
+      SELECT RAISE(ABORT, 'device id belongs to a revoked private device');
+    END`)
+  db.exec(`CREATE VIEW IF NOT EXISTS private_devices AS
+    SELECT id FROM devices WHERE private = 1
+    UNION ALL SELECT id FROM revoked_private_devices`)
   // User-chosen roster tag character (spec: box tag characters). ONE grapheme,
   // NULL = automatic (clients derive a letter from the name). Journal-held so
   // the same letter shows on every device — it used to live in each app's
@@ -1638,11 +1670,13 @@ export function deviceStatuses(db, userId) {
   return out
 }
 
-// The privacy flag, read side. False for unknown ids: a caller checking a
+// The privacy flag, read side. True for a revoked private device (its
+// tombstone, see private_devices): what it wrote stays private after the
+// row is gone. False for any other unknown id: a caller checking a
 // dangling/deleted device must fall through to the normal not_found path,
 // not crash.
 export function isPrivateDevice(db, deviceId) {
-  return !!db.prepare('SELECT 1 FROM devices WHERE id=? AND private=1').get(deviceId)
+  return !!db.prepare('SELECT 1 FROM private_devices WHERE id=?').get(deviceId)
 }
 
 export function setDeviceConsentUserOnly(db, deviceId, on) {

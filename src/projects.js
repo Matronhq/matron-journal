@@ -14,9 +14,9 @@ const now = () => Date.now()
 // to an ordinary agent — the origin sieve — and a status written from/by
 // one reads as four nulls — the status sieve. Read-time, current flags.
 export const PROJECT_ORIGIN_SIEVE = `(
-  NOT EXISTS (SELECT 1 FROM devices od WHERE od.id = p.origin_device_id AND od.private = 1)
-  AND NOT EXISTS (SELECT 1 FROM conversations oc JOIN devices od ON od.id = oc.agent_device_id
-                  WHERE oc.id = p.origin_convo_id AND od.private = 1)
+  NOT EXISTS (SELECT 1 FROM private_devices od WHERE od.id = p.origin_device_id)
+  AND NOT EXISTS (SELECT 1 FROM conversations oc JOIN private_devices od ON od.id = oc.agent_device_id
+                  WHERE oc.id = p.origin_convo_id)
 )`
 // Evaluated lazily (inside the function, not a module-top-level constant):
 // search-docs.js now imports PROJECT_ORIGIN_SIEVE from this module, and
@@ -215,7 +215,7 @@ export function listProjects(db, userId, { state = null, excludePrivateOwned = f
 // (ORIGIN_SIEVE) are dropped from items, milestones and session counts.
 export function projectDetail(db, userId, project, { excludePrivateOwned = false } = {}) {
   const missions = listMissions(db, userId, { projectId: project.id, excludePrivateOwned })
-  const convoSieve = excludePrivateOwned ? 'AND NOT EXISTS (SELECT 1 FROM devices pd WHERE pd.id = c.agent_device_id AND pd.private = 1)' : ''
+  const convoSieve = excludePrivateOwned ? 'AND NOT EXISTS (SELECT 1 FROM private_devices pd WHERE pd.id = c.agent_device_id)' : ''
   const originSieve = excludePrivateOwned ? `AND ${ORIGIN_SIEVE}` : ''
   const needsYou = db.prepare(`SELECT i.id, i.num, i.kind, i.state, i.awaiting, i.title, i.origin_convo_id, i.updated_at,
       i.mission_id, m.num AS mission_num
