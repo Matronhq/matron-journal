@@ -1068,6 +1068,13 @@ export function openDb(path) {
   if (!spawnCols.some((c) => c.name === 'mission_num')) {
     db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN mission_num INTEGER')
   }
+  // 1 when mission_num was not named by the asker but inherited from the
+  // parent conversation's current mission (spawns.js inheritedSpawnMission).
+  // An inherited mission that closes before the tap drops off the row
+  // instead of failing the spawn: the asker never asked for it.
+  if (!spawnCols.some((c) => c.name === 'mission_inherited')) {
+    db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN mission_inherited INTEGER NOT NULL DEFAULT 0')
+  }
   // Consent items (spec 2026-09-22 consent-items): the tracker item that
   // mirrors this ask, NULL for rows predating the mirror (they resolve
   // without one). Not a foreign key — same stance as mission_id.

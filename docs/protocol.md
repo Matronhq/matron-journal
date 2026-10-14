@@ -1574,13 +1574,13 @@ A parent agent may ask a target agent to start a new session (child conversation
   "effort": "string (optional, the reasoning effort the child starts at, capped at 16 chars)",
   "agent": "string (optional, \"claude\" | \"codex\" — the agent the child runs; absent = the target box's default)",
   "link": "boolean (optional, default false — also open a chat room between the parent and the child)",
-  "mission_num": "integer (optional — the child joins this mission as soon as its conversation exists)"
+  "mission_num": "integer (optional — the child joins this mission as soon as its conversation exists; absent = the parent conversation's current mission, when it can be inherited)"
 }
 ```
 
 `link` is opt-in because a spawn is normally a clean break: the child gets the task and its provenance in its opening turn, the parent gets the outcome, and an automatic room only made the child narrate progress back to a parent that relayed it on. A parent that later needs a channel opens one with an ordinary `agent_chat_start` against the child (it is on the roster like any session). With `link: true` the approval also mints a room — see "Answering" below.
 
-Acknowledgement: `{kind:'spawn', event:'pending', request_id, spawn_id, target_waking?}` — the spawn row is now parked in `awaiting_user` state, and a `permission_request` event has been appended to the parent's conversation with `payload.kind: 'agent_spawn'` (client-only). A `question` item mirroring the card has also been filed on the parent conversation — see "Tracker item" below. `target_waking: true` (omitted otherwise) says the target box had no live connection and the journal has asked the infra layer to start it (**wake-before-spawn**, below): the session starts once the user approves *and* the box is up, which is a few minutes for a cold VM.
+Acknowledgement: `{kind:'spawn', event:'pending', request_id, spawn_id, target_waking?, mission_num?, mission_inherited?}` — the spawn row is now parked in `awaiting_user` state, and a `permission_request` event has been appended to the parent's conversation with `payload.kind: 'agent_spawn'` (client-only). A `question` item mirroring the card has also been filed on the parent conversation — see "Tracker item" below. `target_waking: true` (omitted otherwise) says the target box had no live connection and the journal has asked the infra layer to start it (**wake-before-spawn**, below): the session starts once the user approves *and* the box is up, which is a few minutes for a cold VM. `mission_num` (omitted when none) is the mission the child will join, and `mission_inherited: true` (omitted otherwise) says it was not named but inherited from the parent conversation — see "Spawning onto a mission" below.
 
 **Errors.** `forbidden` for a client connection (agent-only, same stance as the room ops); `not_ready` if sent before this connection's own hello replay completes (mid-replay it's invisible to the delivery scan an outcome frame would need). `bad_request` covers: a missing/non-string/oversized `request_id` (≤128 chars, `RPC_ID_MAX_CHARS`); an empty or oversized `workdir` (≤1024 chars, `SPAWN_WORKDIR_MAX_CHARS`) or `task` (≤2000 chars, `SPAWN_TASK_MAX_CHARS`) — and the same check re-run *after* peer-text sanitisation, so an all-control-character string that sanitises down to empty is rejected too; an oversized `topic` when present (≤200 chars, `INVITE_TOPIC_MAX_CHARS`); a non-string or oversized `model` when present (≤64 chars, `SPAWN_MODEL_MAX_CHARS`); a non-string or oversized `effort` when present (≤16 chars, `SPAWN_EFFORT_MAX_CHARS`, `detail:'bad effort'`); an `agent` that is not `claude` or `codex` after trimming and lowercasing (`detail:'bad agent'`; absent, `null`, `""` and `"default"` all mean "the box's default"); a non-boolean `link` when present; a non-integer `target_device_id`; and a missing/empty `from_convo_id`. `not_found` covers: an unknown `target_device_id`, one belonging to another user, a client-kind device, or a private device seen by a non-private caller — all indistinguishable, anti-enumeration, same stance as `agent_invite`'s `target_device_id`; and a `from_convo_id` that doesn't resolve to a top-level conversation this device owns (foreign, unknown, or a child conversation — `parent_convo_id` set), mirroring `agent_invite`'s `from_convo_id` check. `agent_unreachable` — the target box has no live registered connection right now **and cannot be woken** (no `MATRON_WAKE_CMD`, or the wake command refused the box); checked, and refused, **before** the consent card is published, so the user's tap is never spent on an ask that cannot work. When a wake *is* possible the ask is not refused: see "Wake-before-spawn" below. `conflict` (`detail:'too many requests awaiting user approval'`) — the requesting device already has `MAX_AWAITING_PER_REQUESTER` (3) rows in `awaiting_user`, counted jointly with agent-chat's pending asks (see "Pending-ask cap" below). With `mission_num`: `bad_request` (`detail:'bad mission_num'`) unless it is a positive integer; `no_mission` when no mission with that number is visible to both the asker and the target box (unknown and hidden are indistinguishable); `mission_closed` when it is closed. All three are checked before the wake and before the card, so nothing is parked or woken for them. The card payload carries `mission_num` and `mission_title` (both omitted when absent) and the consent item says "Joins mission #N — <title>".
 
@@ -1750,6 +1750,23 @@ join committed, parent told; the bridge knows the mission from the `start`
 param. A join that fails at that point (the mission closed in the gap, the
 200-conversation cap, a mission the target box cannot see) is logged and
 the child runs unattached; the spawn still reports `started`.
+
+**Inherited.** A `spawn_request` that names no `mission_num` takes the
+parent conversation's (`from_convo_id`'s) *current* mission, so a session
+started on another box stays on the work it was started for. The child is
+still a top-level conversation (no `parent_convo_id`): the mission rides
+the row as `mission_num` and joins exactly as a named one does (`how:
+spawned`, counted toward the cap). It is inherited only through these
+gates, and failing one is not an error — the child simply starts with no
+mission: the parent conversation is not private-owned unless the target is
+private too; the mission is visible to both ends (the same sieve a named
+`mission_num` goes through) and `open`; and it is under `CONVOS_MAX`. The
+row records `mission_inherited = 1`, the card and consent item show the
+mission like a named one, and the ack says `mission_inherited: true`. One
+difference at approval: an inherited mission that has closed or gone since
+the ask is dropped from the row and the child starts unattached, rather than
+failing the spawn with `mission_closed` / `no_mission` — the asker never
+named it.
 
 ### Expiry
 
@@ -2958,9 +2975,10 @@ join, leave, spawn and inheritance.
 
 A conversation gains a link by `POST /missions` (its origin, unless
 `attach: false`), `POST /missions/:id/join`, a spawn that named the mission
-(`spawn_request` `mission_num`; `how: spawned`), and **inheritance** — a
-sub-chat takes its parent's *current* mission at creation (`how:
-inherited`), and never afterwards. Inheritance is a way into a mission, so
+(`spawn_request` `mission_num`, named or — when none is named —
+inherited from the asking conversation; `how: spawned`, see "Spawning onto
+a mission"), and **inheritance** — a sub-chat takes its parent's *current*
+mission at creation (`how: inherited`), and never afterwards. Inheritance is a way into a mission, so
 two of join's gates apply: the mission must be `open`, and **visible to the
 creating device** under *Visibility* (a private-owned parent, or a public
 parent joined to a private-origin mission, is refused for an ordinary
