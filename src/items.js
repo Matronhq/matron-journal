@@ -416,8 +416,10 @@ const LAST_USER_INPUT = `COALESCE((SELECT MAX(created_at) FROM item_comments c W
 // For you's Done view (state='done'): closed items, and open ones the user
 // has answered that no longer wait on them (a question they tapped Go on,
 // still open until its agent closes it). Without the open ones, an item the
-// user has just acted on was in neither Needs you nor Done.
-const DONE_VIEW = `(i.state = 'closed' OR (i.awaiting IS NOT 'user' AND ${LAST_USER_INPUT} IS NOT NULL))`
+// user has just acted on was in neither Needs you nor Done. Only an agent's
+// item counts while open: one the user filed is work they handed out, not
+// something they answered.
+const DONE_VIEW = `(i.state = 'closed' OR (i.created_by = 'agent' AND i.awaiting IS NOT 'user' AND ${LAST_USER_INPUT} IS NOT NULL))`
 
 // sort='acted': the user's own last action first, falling back to the close
 // time, then the last update — so whatever they just tapped, answered or

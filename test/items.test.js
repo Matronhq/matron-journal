@@ -248,6 +248,8 @@ test("listItems state=done sort=acted: the user's last action first, answered op
   q('waiting', 4)
   // Open and waiting on the agent, but the user never acted on it: not done.
   q('agents', 5, { awaiting: 'agent' })
+  // Filed by the user and waiting on an agent: handed out, not answered.
+  q('filed', 7, { awaiting: 'agent', createdBy: 'user' })
   // A seen notice, closed by the user's tap at 40.
   const notice = createItem(db, base({ userId: alice.id, kind: 'notice', title: 'notice', now: 6 })).item
   addComment(db, { userId: alice.id, itemId: notice.id, author: 'user', deviceId: 1, body: 'Seen', action: 'Seen', now: 40 })
