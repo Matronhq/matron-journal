@@ -756,6 +756,15 @@ Rows from before the stamp carry neither, and don't count.
   `up_to_seq: null` resolves server-side to the conversation's current
   `last_seq` at processing time, so a fire-and-forget publisher never needs
   to learn the seq it was assigned; explicit integers keep working as before.
+  Agent `text` payloads may carry `notice: {kind, icon, summary}` — a
+  convention between bridges and apps, not checked here. A bridge sets it
+  on the notice it publishes beside a turn it injected into the session
+  (a consent request, a routine or alert fire, a room message, a spawn
+  outcome, a reminder): `summary` is one line, `icon` one emoji, `kind` a
+  short tag (`consent`, `routine`, `room`, `spawn`, …). Apps that know the
+  key render the event as a one-line row that expands to `body`; apps that
+  don't show `body` as usual. A tombstoned event's `notice` becomes `{}`
+  (see *Per-device content expiry*), which apps treat as no tag.
 - `viewing {convo_id}` / `viewing {convo_ids}` tells the server which
   conversations this connection has on screen; viewing-scoped ephemerals
   (`stream`, `stream_append`, `activity`, `status`) go only to connections
