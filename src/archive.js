@@ -84,7 +84,8 @@ export const isAutoArchiveDays = (v) => Number.isInteger(v) && v >= 0 && v <= AU
 // a system conversation, not archived, idle for `days` (no message, no
 // creation, no unarchive since the cutoff), and none of the exemptions —
 // a session still running or waiting, the Coordinator, a pin, an open
-// tracker item filed from it, or any link to an open mission.
+// tracker item filed from it, any link to an open mission, or a sub-chat
+// still running or with a message since the cutoff (its parent's work).
 export function autoArchiveCandidates(db, userId, days, now = Date.now()) {
   if (!days) return []
   const cutoff = now - days * DAY_MS
@@ -102,7 +103,11 @@ export function autoArchiveCandidates(db, userId, days, now = Date.now()) {
                      WHERE l.convo_id=c.id AND m.state='open')
       AND NOT EXISTS(SELECT 1 FROM missions m WHERE m.id=c.mission_id AND m.state='open')
       AND COALESCE((SELECT e.ts FROM events e WHERE e.convo_id=c.id AND e.type IN (${MESSAGE_TYPES_SQL})
-                    ORDER BY e.seq DESC LIMIT 1), 0) < ?`).all(userId, cutoff, cutoff, cutoff).map((r) => r.id)
+                    ORDER BY e.seq DESC LIMIT 1), 0) < ?
+      AND NOT EXISTS(SELECT 1 FROM conversations k WHERE k.parent_convo_id=c.id
+                     AND (k.session_state IN ('running','waiting')
+                          OR EXISTS(SELECT 1 FROM events e WHERE e.convo_id=k.id AND e.ts >= ?
+                                    AND e.type IN (${MESSAGE_TYPES_SQL}))))`).all(userId, cutoff, cutoff, cutoff, cutoff).map((r) => r.id)
 }
 
 // One pass over every user. Returns {userId: changes} for users with any.

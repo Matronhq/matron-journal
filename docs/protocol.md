@@ -2246,8 +2246,9 @@ readable from the apps' Archived view.
   unarchive within that many days. Never archived automatically: sub-chats,
   system conversations, sessions whose state is `running` or `waiting`, the
   Coordinator, pinned conversations, a conversation that filed a still-open
-  tracker item, and a conversation linked to an open mission (current or
-  earlier link). `MATRON_AUTO_ARCHIVE=0` stops the sweep on a journal.
+  tracker item, a conversation linked to an open mission (current or
+  earlier link), and a parent whose sub-chat is still running or has had a
+  message within the window. `MATRON_AUTO_ARCHIVE=0` stops the sweep on a journal.
 - An unarchive restarts the idle clock, so a conversation the user brought
   back is not archived again by the next sweep.
 

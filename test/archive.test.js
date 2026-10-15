@@ -71,6 +71,12 @@ test('auto-archive: idle conversations only, with every exemption', async () => 
   assert.deepEqual(autoArchiveCandidates(db, alice.id, 30, NOW), ['old'])
   // A recent message keeps it; so does a recent unarchive.
   at(db, 'fresh', Date.now() + 100 * DAY) // keep it out of the real-clock checks below
+  // A sub-chat still working, or recently active, keeps its parent.
+  db.prepare("UPDATE conversations SET session_state='running' WHERE id='child'").run()
+  assert.deepEqual(autoArchiveCandidates(db, alice.id, 30, NOW), [])
+  db.prepare("UPDATE conversations SET session_state='done' WHERE id='child'").run()
+  append(db, { userId: alice.id, convoId: 'child', sender: 'agent:1', type: 'text', payload: { body: 'sub' } })
+  assert.deepEqual(autoArchiveCandidates(db, alice.id, 30, Date.now() + DAY), [])
   append(db, { userId: alice.id, convoId: 'old', sender: 'agent:1', type: 'text', payload: { body: 'hi' } })
   assert.deepEqual(autoArchiveCandidates(db, alice.id, 30, Date.now() + DAY), [])
   assert.deepEqual(autoArchiveCandidates(db, alice.id, 30, Date.now() + 31 * DAY), ['old'])
