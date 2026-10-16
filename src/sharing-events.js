@@ -24,6 +24,7 @@ import { ensurePeopleConvo, PEOPLE_TITLE, PEOPLE_SYSTEM } from './people-convo.j
 import { setContactItem, peerRowOf } from './contacts.js'
 import { setGrantItem, sharePreview, activeGranteeIds, askOf, getGrantRaw } from './grants.js'
 import { handoverPreview } from './handover.js'
+import { handoverChoices, pickableBoxes } from './handover-session.js'
 import { getMission } from './missions.js'
 import { MISSION_EVENT_TYPE, missionMarkerPayload } from './missions-marker.js'
 import { getItem, insertComment } from './items.js'
@@ -525,7 +526,15 @@ function handoverCardPayload(db, g, direction) {
   }
   if (direction === 'out') return { ...base, preview: p }
   const excluded = new Set(g.exclude_media ? JSON.parse(g.exclude_media) : [])
-  return { ...base, preview: { missions: p.missions, milestones: p.milestones, items: p.items, comments: p.comments, attachments: p.attachments.filter((a) => !excluded.has(a.media_id)).length } }
+  // The recipient's choices, as a talk request's card offers them: Accept,
+  // New session (on their Coordinator's box), Pick a box, Decline — with the
+  // boxes "Pick a box" offers, so an app can show its own picker.
+  return {
+    ...base,
+    preview: { missions: p.missions, milestones: p.milestones, items: p.items, comments: p.comments, attachments: p.attachments.filter((a) => !excluded.has(a.media_id)).length },
+    choices: handoverChoices(db, g.grantee_user_id),
+    pick_options: pickableBoxes(db, g.grantee_user_id),
+  }
 }
 
 const handoverOwnerAsk = asking('hand-over approval card', (ctx, who, g) => {
@@ -575,9 +584,9 @@ const handoverGranteeAsk = asking('hand-over offer card', (ctx, g) => {
       '',
       quoteBrief(g.brief),
       '',
-      '**To answer:** tap **Accept** or **Decline**.',
+      `**To answer:** tap **Accept** or **Decline**.${payload.choices.includes('New session') ? ' **New session** also starts a fresh session on the box that runs your Coordinator, on the new mission, to read the brief and carry on.' : ''}${payload.choices.includes('Pick a box') ? ' **Pick a box** lets you choose the box for that session.' : ''}`,
     ].join('\n'),
-    link: handoverLink(g.id), actions: PEER_ACTIONS, idemKey: `consent:handover:${g.id}:grantee:${askStamp(g)}`,
+    link: handoverLink(g.id), actions: payload.choices, idemKey: `consent:handover:${g.id}:grantee:${askStamp(g)}`,
   })
   if (item) setGrantItem(db, g.id, 'grantee', item.id)
 })
@@ -623,15 +632,6 @@ function announceHandover(ctx, g, h) {
   for (const r of h.reverse) {
     safely('shared frame', () => hub.sendToClients(owner, { kind: 'shared', event: 'mission_added', mission_id: r.missionId, grant_id: r.id, owner: { user_id: g.grantee_user_id, name: g.grantee_name } }))
   }
-}
-
-// The journal cannot start a session for the new owner yet: there is no
-// journal-started "new session" spawn to hand the request to. An accept
-// that asks for one ({device_id, workdir?}) is answered
-// {status: 'unavailable'} and the copy stands; this is the one place to
-// wire it when that spawn exists.
-export function startSessionOnCopy(_ctx, _who, _g, _request) {
-  return { status: 'unavailable' }
 }
 
 // Why a hand-over can no longer happen, in a sentence's words.

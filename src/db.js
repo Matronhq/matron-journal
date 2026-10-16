@@ -1553,6 +1553,10 @@ export function openDb(path) {
   // them. `pending_by` / `pending_at` are a raise's own asker and time, so
   // the share's requested_by and updated_at stay as its grantee knows them
   // while a raise waits. Added together; the backfill runs once, with them.
+  // `pick_options`: the boxes a hand-over's "Pick a box" offered its
+  // recipient (label -> device id), for the follow-up tap to resolve
+  // (src/handover-session.js), as person_rooms.pick_options does for a talk.
+  if (!grantCols.some((c) => c.name === 'pick_options')) db.exec('ALTER TABLE grants ADD COLUMN pick_options TEXT')
   if (!grantCols.some((c) => c.name === 'sent_at')) {
     db.transaction(() => {
       db.exec('ALTER TABLE grants ADD COLUMN sent_at INTEGER')

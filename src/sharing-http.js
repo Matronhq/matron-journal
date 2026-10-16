@@ -35,7 +35,9 @@ import {
 } from './contacts.js'
 import { grantRow, getGrantRaw, shareMission, shareProject, answerGrant, revokeGrant, listGrants, GRANT_LEVELS, GRANT_STATES } from './grants.js'
 import { validBrief, validExcludeMedia } from './handover.js'
-import { onContactOutcome, onContactEnded, onContactUnblocked, onGrantOutcome, onGrantRevoked, startSessionOnCopy } from './sharing-events.js'
+import { onContactOutcome, onContactEnded, onContactUnblocked, onGrantOutcome, onGrantRevoked } from './sharing-events.js'
+import { HANDOVER_CHOICE, beginHandoverSession, pickableBoxes, cardLine } from './handover-session.js'
+import { talkQuestionActions, recordFollowUpTap } from './talk-requests-events.js'
 import { visibleMission, writableConvo } from './missions-http.js'
 import { getProject } from './projects.js'
 import { filteredAgent } from './privacy.js'
@@ -232,9 +234,10 @@ async function handleShareCreate(ctx, req, res, who, subject) {
   return true
 }
 
-// `excludeMedia` (the owner's approval of a hand-over) and `startSession`
-// (the recipient's accept) only come from POST /grants/:id/answer; a tap on
-// the mirror sends neither.
+// `excludeMedia` (the owner's approval of a hand-over) only comes from POST
+// /grants/:id/answer. `startSession` (the recipient's accept) is the
+// answer's {device_id, workdir?}, or 'coordinator' for the card's New
+// session button (src/handover-session.js).
 export function applyGrantAnswer(ctx, who, grantId, decision, { excludeMedia, startSession = null } = {}) {
   const { db } = ctx
   let out
@@ -251,7 +254,9 @@ export function applyGrantAnswer(ctx, who, grantId, decision, { excludeMedia, st
   if (out.outcome === 'expired') return { status: 409, body: { error: 'conflict', blocked_by: 'expired' }, closed }
   if (out.outcome === 'unavailable') return { status: 409, body: { error: 'conflict', blocked_by: 'not_contact' }, closed }
   if (out.outcome === 'refused') return { status: 409, body: { error: 'conflict', blocked_by: out.reason }, closed }
-  const session = out.outcome === 'handed_over' && startSession ? { start_session: startSessionOnCopy(ctx, who, out.grant, startSession) } : {}
+  const session = out.outcome === 'handed_over' && startSession
+    ? { start_session: beginHandoverSession(ctx, { g: out.grant, h: out.handover, request: startSession, itemId: out.before?.grantee_item_id ?? null }) }
+    : {}
   return { status: 200, body: { grant: grantRow(out.grant, who.userId), ...session }, closed }
 }
 
@@ -318,8 +323,50 @@ async function handleGrantRoute(ctx, req, res, url, who) {
 // Called by items-http.js ahead of the generic comment path, for a client
 // only. The reply has the comment route's shape: the closed item and the
 // status row that closed it.
-export function handleConsentTap(ctx, res, who, item, action) {
+// The recipient's hand-over card (src/handover-session.js): Accept, New
+// session, Pick a box (a follow-up question with their boxes) and Decline;
+// a follow-up's tap carries `reply_to`.
+function handleHandoverTap(ctx, res, who, item, action, replyTo, grantId) {
   const { db } = ctx
+  let decision = 'approve'
+  let startSession = null
+  if (replyTo != null) {
+    const offered = talkQuestionActions(db, item.id, replyTo)
+    if (!offered || !offered.includes(action)) { json(res, 400, { error: 'unknown_action' }); return true }
+    if (action === HANDOVER_CHOICE.decline) decision = 'decline'
+    else {
+      let picks = {}
+      try { picks = JSON.parse(db.prepare('SELECT pick_options FROM grants WHERE id=?').get(grantId)?.pick_options ?? '{}') } catch { /* none */ }
+      if (!Number.isInteger(picks[action])) { json(res, 400, { error: 'unknown_action' }); return true }
+      startSession = { device_id: picks[action] }
+    }
+  } else {
+    if (!item.actions.includes(action)) { json(res, 400, { error: 'unknown_action' }); return true }
+    if (action === HANDOVER_CHOICE.pick) {
+      const options = pickableBoxes(db, who.userId)
+      if (!Object.keys(options).length) { json(res, 409, { error: 'conflict', blocked_by: 'not_available' }); return true }
+      db.prepare('UPDATE grants SET pick_options=? WHERE id=?').run(JSON.stringify(options), grantId)
+      const q = cardLine(ctx, { userId: who.userId, itemId: item.id, body: 'Which box should start the session?', actions: [...Object.keys(options), HANDOVER_CHOICE.decline] })
+      json(res, 200, { item: getItem(db, who.userId, item.id) ?? item, comment: q?.comment ?? null })
+      return true
+    }
+    if (action === HANDOVER_CHOICE.decline) decision = 'decline'
+    if (action === HANDOVER_CHOICE.new) startSession = 'coordinator'
+  }
+  const r = applyGrantAnswer(ctx, who, grantId, decision, { startSession })
+  if (r.status !== 200) { json(res, r.status, r.body); return true }
+  if (replyTo != null) recordFollowUpTap(ctx, who, item.id, action, replyTo)
+  json(res, 200, { item: getItem(db, who.userId, item.id) ?? item, comment: r.closed?.comment ?? null, ...r.body })
+  return true
+}
+
+export function handleConsentTap(ctx, res, who, item, action, replyTo = null) {
+  const { db } = ctx
+  if (item.consent === 'handover') {
+    const recipient = db.prepare('SELECT id FROM grants WHERE grantee_item_id=?').get(item.id)
+    if (recipient) return handleHandoverTap(ctx, res, who, item, action, replyTo, recipient.id)
+  }
+  if (replyTo != null) { json(res, 400, { error: 'unknown_action' }); return true }
   if (!item.actions.includes(action)) { json(res, 400, { error: 'unknown_action' }); return true }
   const decision = action === 'Decline' ? 'decline' : 'approve'
   let r

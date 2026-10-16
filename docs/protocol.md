@@ -3998,17 +3998,66 @@ reason. The mirror's status does not change.
 ```
 {kind:'mission_handover', direction:'in', grant_id, level:'owner',
  owner:{user_id,name}, grantee:{name,address}, subject:{kind, title}, brief,
- preview:{missions, milestones, items, comments, attachments}}
+ preview:{missions, milestones, items, comments, attachments},
+ choices:['Accept', 'New session'?, 'Pick a box'?, 'Decline'],
+ pick_options:{<box label>: <device id>}}
 ```
 
 `attachments` here is the count that will arrive. The card carries no
 number, box or conversation of the owner's. (As for a read share, the
 recipient's `GET /grants/:id` and their audit events do name the owner's
 mission or project number, in `mission`/`project`; a number names nothing
-the recipient can open.) The recipient answers `POST /grants/:id/answer
-{decision, start_session?}`; `start_session: {device_id, workdir?}` asks for
-a session on the copy and is answered `start_session: {status:
-'unavailable'}` until the journal can start one (the copy is made either way).
+the recipient can open.)
+
+**Starting a session on it.** The recipient's accept can also start a new
+session on the copy: the same journal-started "New session" spawn a talk
+request uses (*Talk requests* below), with the same rules. `choices` are
+the mirror's buttons, as a talk request's card offers them, each only when
+available:
+
+- **Accept** — the copy, no session;
+- **New session** — the copy, and a fresh Claude session on the box that
+  runs the recipient's Coordinator (offered when that conversation is on
+  one of their own non-private agent boxes);
+- **Pick a box** — the journal adds a comment on the same item offering up
+  to 3 of the recipient's agent boxes, most recently seen first, never a
+  private one (labels are the box names, at most 40 characters, made
+  unique), and **Decline**. Tapping a box is a comment-action tap with
+  `reply_to`: the copy, and a session on that box. `pick_options` on the
+  card is the same list, label to device id, for an app that shows its own
+  picker;
+- **Decline**.
+
+Over HTTP: `POST /grants/:id/answer {decision:'approve', start_session:
+{device_id, workdir?}}`. `device_id` may be any of the recipient's own
+agent boxes — a private one too, since the recipient named it; that is the
+only way a session starts on a private box. A malformed `start_session` is
+400 and nothing happens; it is ignored on anything but a hand-over accept.
+
+The recipient's tap (or answer) is the consent: there is no spawn card, and
+no agent, their Coordinator included, can ask for one. The journal sends
+the box the spawn `start` RPC with `{prompt, agent: 'claude', mission_num:
+<the copy's number>, workdir}` — no model; with no `workdir` named,
+`workdir: ''` and `talk: true`, so the bridge starts it in the box's
+default directory. The task tells the session it was started to carry on
+the handed-over mission (for a project, its first copied mission) and to
+read the brief first — the copy's first milestone. When the box answers
+with the new conversation, the journal joins it to the copy (`how:
+'spawned'`, a `mission` `joined` marker in it) and says "Started a new
+session on <box> …" on the recipient's card.
+
+The answer carries `start_session`, at once:
+
+| `start_session` | when |
+|---|---|
+| `{status:'starting', device_id}` | the start was sent |
+| `{status:'refused', reason:'not_your_box'}` | `device_id` is not an agent box of the recipient's |
+| `{status:'refused', reason:'no_coordinator'}` | **New session**, but no Coordinator box is available any more |
+| `{status:'unavailable', reason:'no_spawner'}` | this journal cannot start sessions |
+
+None of these undoes the accept: the copy is made. A start that fails later
+leaves a line on the card ("Couldn't start a session: <code>. …"), and the
+mission stays the recipient's to start a session on from their apps.
 
 **On accept**, in one transaction (all of it or nothing):
 
