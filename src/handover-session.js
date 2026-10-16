@@ -136,10 +136,13 @@ async function startHandoverSession(ctx, { g, copy, target, itemId }) {
     console.error('hand-over session: start threw', err)
     code = 'internal'
   }
-  // The reply must name a conversation of the recipient's on that box (or
-  // one the journal does not know yet): anything else is a bad start.
-  const cur = convoId ? db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(convoId) : null
-  if (cur && (cur.owner_user_id !== userId || (cur.agent_device_id != null && cur.agent_device_id !== target.deviceId))) { convoId = null; code = 'bad_start_reply' }
+  // The reply must name a new session: one the journal does not know yet,
+  // or a top-level conversation of the recipient's already announced from
+  // exactly that box. A system conversation (People), a session on another
+  // box, or a conversation with no box is a bad start, and joins nothing.
+  const cur = convoId ? db.prepare('SELECT owner_user_id, agent_device_id, system, parent_convo_id FROM conversations WHERE id=?').get(convoId) : null
+  if (cur && (cur.owner_user_id !== userId || cur.agent_device_id !== target.deviceId || cur.system != null || cur.parent_convo_id != null
+      || db.prepare('SELECT 1 FROM mission_conversations WHERE convo_id=?').get(convoId))) { convoId = null; code = 'bad_start_reply' }
   if (!convoId) {
     cardLine(ctx, { userId, itemId, body: `Couldn't start a session: ${code}. The ${g.subject_kind} is yours; start one from your apps when you like.` })
     return 'failed'

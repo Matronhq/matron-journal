@@ -164,3 +164,31 @@ test('refusals stay graceful: the copy is made and the answer says why no sessio
   const agent = await w.s.http(`/grants/${third.g.id}/answer`, { method: 'POST', token: w.tokens.bobCoord, body: { decision: 'approve', start_session: { device_id: w.ids.bobCoord } } })
   assert.equal(agent.status, 403)
 })
+
+test('a start reply that names no fresh session of bob\'s on that box joins nothing', async (t) => {
+  const w = await world(t)
+  // The People conversation: bob's own, but no box's session.
+  const people = w.s.db.prepare("SELECT id FROM conversations WHERE owner_user_id=? AND system='people'").get(w.bob.id)
+  for (const convoId of [people?.id, 'bobwork']) {
+    assert.ok(convoId)
+    w.ws.bobCoord.frames.length = 0
+    const { mirror } = await offered(w)
+    const tap = await w.bobPhone(`/items/${mirror.id}/comments`, post({ action: 'New session' }))
+    assert.equal(tap.json.grant.state, 'active')
+    await startRpc(w.ws.bobCoord, { ok: true, result: { convo_id: convoId } })
+    await settle()
+    assert.match((await w.bobPhone(`/items/${mirror.id}`)).json.comments.at(-1).body, /Couldn't start a session: bad_start_reply/, convoId)
+    const linked = (await w.bobPhone(`/conversations/${convoId}/missions`)).json.missions ?? []
+    assert.ok(!linked.some((m) => m.id === tap.json.grant.copy_id), `${convoId} is not put on the copy`)
+  }
+})
+
+test('Pick a box on a card already answered is a conflict, and offers nothing', async (t) => {
+  const w = await world(t)
+  const { g, mirror } = await offered(w)
+  assert.equal((await w.bobPhone(`/grants/${g.id}/answer`, post({ decision: 'approve' }))).status, 200)
+  const r = await w.bobPhone(`/items/${mirror.id}/comments`, post({ action: 'Pick a box' }))
+  assert.equal(r.status, 409)
+  assert.equal(r.json.blocked_by, 'not_pending')
+  assert.equal(w.s.db.prepare('SELECT pick_options FROM grants WHERE id=?').get(g.id).pick_options, null)
+})

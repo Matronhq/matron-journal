@@ -343,6 +343,11 @@ function handleHandoverTap(ctx, res, who, item, action, replyTo, grantId) {
   } else {
     if (!item.actions.includes(action)) { json(res, 400, { error: 'unknown_action' }); return true }
     if (action === HANDOVER_CHOICE.pick) {
+      // Only while the hand-over still waits on the recipient.
+      const g = getGrantRaw(db, grantId)
+      if (!g || g.grantee_user_id !== who.userId || g.sent_at == null || (g.pending_state ?? g.state) !== 'pending' || (g.pending_level ?? g.level) !== 'owner') {
+        json(res, 409, { error: 'conflict', blocked_by: 'not_pending' }); return true
+      }
       const options = pickableBoxes(db, who.userId)
       if (!Object.keys(options).length) { json(res, 409, { error: 'conflict', blocked_by: 'not_available' }); return true }
       db.prepare('UPDATE grants SET pick_options=? WHERE id=?').run(JSON.stringify(options), grantId)

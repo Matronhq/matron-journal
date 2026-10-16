@@ -4022,7 +4022,8 @@ available:
 - **Pick a box** — the journal adds a comment on the same item offering up
   to 3 of the recipient's agent boxes, most recently seen first, never a
   private one (labels are the box names, at most 40 characters, made
-  unique), and **Decline**. Tapping a box is a comment-action tap with
+  unique), and **Decline** — only while the hand-over still waits on the
+  recipient (else 409 `not_pending`). Tapping a box is a comment-action tap with
   `reply_to`: the copy, and a session on that box. `pick_options` on the
   card is the same list, label to device id, for an app that shows its own
   picker;
@@ -4042,7 +4043,10 @@ the box the spawn `start` RPC with `{prompt, agent: 'claude', mission_num:
 default directory. The task tells the session it was started to carry on
 the handed-over mission (for a project, its first copied mission) and to
 read the brief first — the copy's first milestone. When the box answers
-with the new conversation, the journal joins it to the copy (`how:
+with the new conversation — one the journal does not know yet, or a
+top-level conversation of the recipient's already announced from exactly
+that box and on no mission (anything else is `bad_start_reply` and joins
+nothing) — the journal joins it to the copy (`how:
 'spawned'`, a `mission` `joined` marker in it) and says "Started a new
 session on <box> …" on the recipient's card.
 
