@@ -21,7 +21,7 @@ import { wakeIfOffline, wakeConvoAgent } from './wake.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { consentLink } from './consent-items.js'
 import { card, fileMirror, closeMirror, audit, changed, peopleConvo, OWNER_ACTIONS, PEER_ACTIONS } from './sharing-events.js'
-import { guestSees, linkOfRoom, setRoomItem, setShareItem, getPersonRoom, endPersonRoom, linksBetween, linksOnGrant, detachMission, PERSON_SENDER_PREFIX } from './person-rooms.js'
+import { linkOfRoom, setRoomItem, setShareItem, getPersonRoom, endPersonRoom, linksBetween, linksOnGrant, detachMission, PERSON_SENDER_PREFIX } from './person-rooms.js'
 
 export const ROOM_CARD_KIND = 'person_room'
 export const SESSION_SHARE_CARD_KIND = 'session_share'
@@ -288,9 +288,14 @@ export function onPersonRoomEnded(ctx, before, by) {
     }
   }
   roomAudit(ctx, l.owner_user_id, l, 'owner', 'room.ended', words('owner'))
-  if (l.state !== 'awaiting_owner' && guestSees(ctx.db, l)) roomAudit(ctx, l.guest_user_id, l, 'guest', 'room.ended', words('guest'))
+  // Only a guest who was ever told of the link hears that it ended: not
+  // before the owner's approval, and not a talk request held back because
+  // the guest had blocked the owner (it never reached them; a frame naming
+  // it would be the first they hear of it).
+  const guestWasTold = l.state !== 'awaiting_owner' && (l.kind !== 'talk' || l.guest_item_id != null || l.guest_room_id != null)
+  if (guestWasTold) roomAudit(ctx, l.guest_user_id, l, 'guest', 'room.ended', words('guest'))
   changed(ctx, l.owner_user_id, { room_link_id: l.id })
-  changed(ctx, l.guest_user_id, { room_link_id: l.id })
+  if (guestWasTold) changed(ctx, l.guest_user_id, { room_link_id: l.id })
 }
 
 export function endAndNotify(ctx, linkId, by, to = 'left') {

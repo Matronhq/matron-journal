@@ -13,8 +13,8 @@ import { TALK_GUEST_TTL_MS } from '../src/talk-requests.js'
 const settle = (ms = 120) => new Promise((r) => setTimeout(r, ms))
 const post = (body) => ({ method: 'POST', body })
 
-async function world(t) {
-  const s = await startTestServer()
+async function world(t, opts = {}) {
+  const s = await startTestServer(opts)
   t.after(() => s.close())
   const alice = await createUser(s.db, 'alice', 'pw')
   const bob = await createUser(s.db, 'bob', 'pw')
@@ -441,4 +441,18 @@ test('the existing session invite path keeps working beside talk requests', asyn
   assert.deepEqual(own.actions, ['Approve', 'Decline'])
   const row = w.s.db.prepare("SELECT kind FROM person_rooms WHERE owner_room_id='room'").get()
   assert.equal(row.kind, 'session')
+})
+
+test('a talk held back by a block ends without a word to the person who blocked', async (t) => {
+  const w = await world(t)
+  const { bobContact } = await makeContacts(w)
+  assert.equal((await w.bobPhone(`/contacts/${bobContact}/block`, post({}))).status, 200)
+  await askAndSend(w)
+  const link = talkRow(w)
+  await settle()
+  w.ws.bobPhone.frames.length = 0
+  assert.equal((await w.alicePhone(`/person-rooms/${link.id}`, { method: 'DELETE' })).status, 200)
+  await settle()
+  assert.equal(w.ws.bobPhone.frames.filter((f) => f.kind === 'people').length, 0)
+  assert.equal(w.ws.bobPhone.journal().filter((f) => JSON.stringify(f).includes(link.id)).length, 0)
 })
