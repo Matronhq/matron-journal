@@ -200,8 +200,10 @@ export function onTalkGuestOutcome(ctx, who, out) {
 
 // Ask the guest's Coordinator box to start a fresh Claude session for this
 // talk (the spawn broker's `start` RPC, as an approved spawn issues it): no
-// model, the box's default directory (an empty workdir), a fixed task. The
-// seam is `ctx.broker`; without one the start fails like any other.
+// model, the box's default directory (an empty workdir), a fixed task.
+// `talk: true` marks it as a talk spawn, the only kind a bridge starts with
+// an empty workdir. The seam is `ctx.broker`; without one the start fails
+// like any other.
 export async function startTalkSession(ctx, l, target, spawnId, who) {
   const { db, hub, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0 } = ctx
   let code = null
