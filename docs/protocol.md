@@ -3693,7 +3693,7 @@ DELETE /grants/:id                                        the owner revokes, the
 
 `grant`: `{id, direction:'out'|'in', subject_kind, subject_id, level, state,
 owner:{user_id,name}, grantee:{name,address}, contact_id?, mission?:{id,num,title},
-project?:{id,num,title}, pending_level, pending_state, brief?, exclude_media?, copy_id?,
+project?:{id,num,title}, pending_level, pending_state, pending_requested_by?, brief?, exclude_media?, copy_id?,
 requested_by, revoked_by, created_at, updated_at, answered_at, revoked_at}`.
 `contact_id` and `exclude_media` are the owner's and are present only on the
 owner's side (`direction: 'out'`). `brief` is present on a hand-over;
@@ -3706,8 +3706,12 @@ second row: the row stays `active` at its old level and carries the ask in
 the same two yeses and the same cards. Only the grantee's accept raises it;
 a decline, a withdrawal or the 24 h expiry clears the two fields and leaves
 the grant as it was. Until the owner has approved, the grantee reads both
-fields as null and no `brief`, and cannot answer (404). Asking for the
-level the contact already has, or a lower one, is `200 {existing:true}`.
+fields as null and no `brief`, and cannot answer (404). While a raise
+waits for the owner, the share's own `requested_by` and `updated_at` do not
+change; the owner's side shows the raise's asker as `pending_requested_by`.
+A raise that ends before the owner approves leaves the grantee's view of
+the grant exactly as it was. Asking for the level the contact already has,
+or a lower one, is `200 {existing:true}`.
 States: `awaiting_owner` (the owner's agent asked, 24 h) → `pending` (the
 grantee's accept card is open) → `active`; `declined`, `revoked`
 (`revoked_by`: `owner` | `grantee` | `contact_removed`), `expired`.
@@ -3717,8 +3721,13 @@ two must be mutual contacts (409 `not_contact`). `level` defaults to
 `read`; `contribute` lets the grantee write (*Contributors*, below);
 `owner` is a hand-over (*Hand-over*, below). A mission born on a private device is 409
 `private_mission`. The mission is resolved through the caller's own sieve.
-A grantee is never told of a grant its owner has not approved: until then
-the id is a 404 for them.
+A grantee is never told of a grant its owner has not approved: until the
+owner's yes sends it to them, the id is a 404 for them, and it stays one if
+the ask ends first (the owner declines or revokes it, or it expires). Such
+a row is in none of their `GET /grants` lists, whatever `state` is named,
+and nothing about it reaches their People log or their sockets. The journal
+records the send (`grants.sent_at`); a row sent once stays the grantee's to
+read whatever becomes of it, until the row is renewed by a new ask.
 
 ### What a grantee reads
 

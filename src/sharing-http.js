@@ -279,10 +279,11 @@ async function handleGrantRoute(ctx, req, res, url, who) {
   if (!m) return false
   let id
   try { id = decodeURIComponent(m[1]) } catch { return badRequest(res) }
-  // Not a party — or the grantee of an ask its owner has not approved yet —
-  // is the same 404 as an unknown id.
+  // Not a party — or the grantee of a row never sent to them: an ask its
+  // owner has not approved yet, or one that ended before they did — is the
+  // same 404 as an unknown id.
   const g = getGrantRaw(db, id)
-  const party = g && (g.owner_user_id === who.userId || (g.grantee_user_id === who.userId && g.state !== 'awaiting_owner'))
+  const party = g && (g.owner_user_id === who.userId || (g.grantee_user_id === who.userId && g.sent_at != null))
   if (!party) return notFound(res)
   if (!m[2]) {
     if (req.method === 'GET') { json(res, 200, { grant: grantRow(g, who.userId) }); return true }

@@ -296,6 +296,9 @@ export function onContactUnblocked(ctx, out) {
 
 // --- Grants -----------------------------------------------------------------
 
+// What makes a card's mirror a new one: the ask's own time (a raise keeps
+// the share's updated_at while it waits, so it has its own).
+const askStamp = (g) => (g.pending_state ? g.pending_at ?? g.updated_at : g.updated_at)
 const shareLink = (id) => ({ url: consentLink('share', id), title: 'Mission share' })
 const ownerContact = (db, g) => db.prepare('SELECT * FROM contacts WHERE id=?').get(g.contact_id)
 
@@ -341,7 +344,7 @@ const shareOwnerAsk = asking('share approval card', (ctx, who, g) => {
       '',
       `**To answer:** tap **Approve** or **Decline**. If you approve, ${to} gets a card to accept. Unanswered, the request expires 24 h after it was made and nothing is shared.`,
     ].join('\n'),
-    link: shareLink(g.id), actions: OWNER_ACTIONS, idemKey: `consent:share:${g.id}:owner:${g.updated_at}`,
+    link: shareLink(g.id), actions: OWNER_ACTIONS, idemKey: `consent:share:${g.id}:owner:${askStamp(g)}`,
   })
   if (item) setGrantItem(db, g.id, 'owner', item.id)
 })
@@ -365,7 +368,7 @@ const shareGranteeAsk = asking('share offer card', (ctx, g) => {
       '',
       '**To answer:** tap **Accept** or **Decline**.',
     ].join('\n'),
-    link: shareLink(g.id), actions: PEER_ACTIONS, idemKey: `consent:share:${g.id}:grantee:${g.updated_at}`,
+    link: shareLink(g.id), actions: PEER_ACTIONS, idemKey: `consent:share:${g.id}:grantee:${askStamp(g)}`,
   })
   if (item) setGrantItem(db, g.id, 'grantee', item.id)
 })
@@ -400,7 +403,7 @@ export function onGrantOutcome(ctx, who, out) {
       break
     case 'sent':
       closed = ownerTap(`Approved — ${to} has been asked to accept.`)
-      audit(ctx, g.owner_user_id, { event: 'grant.offered', summary: `You offered ${to} ${missionWords(g)} to ${verb(g)}`, contact: oc, grant: g, by: g.requested_by })
+      audit(ctx, g.owner_user_id, { event: 'grant.offered', summary: `You offered ${to} ${missionWords(g)} to ${verb(g)}`, contact: oc, grant: g, by: g.pending_by ?? g.requested_by })
       shareGranteeAsk(ctx, g)
       audit(ctx, g.grantee_user_id, { event: 'grant.received', summary: `${from} offered you ${missionWordsFor(g)} to ${verb(g)}`, contact: gc, grant: g })
       changed(ctx, g.grantee_user_id, { grant_id: g.id })
@@ -463,8 +466,8 @@ export function onGrantRevoked(ctx, before, by, who = null) {
   if (ask.state === 'pending') {
     closeMirror(ctx, { userId: g.grantee_user_id, itemId: before.grantee_item_id, consent, resolution: 'cancelled', comment: by === 'grantee' ? 'Declined.' : `${from} withdrew the offer.`, ...actor('grantee') })
   }
-  // The grantee was never told of an ask its owner had not approved.
-  if (state !== 'awaiting_owner') {
+  // The grantee was never told of a row that was never sent to them.
+  if (before.sent_at != null) {
     audit(ctx, g.grantee_user_id, {
       event: 'grant.revoked', contact: gc, grant: g, by: by === 'grantee' ? 'you' : 'peer',
       summary: by === 'grantee' ? `You ended the share of ${subjectWordsFor(g)} from ${from}` : `${from} ended the share of ${subjectWordsFor(g)}`,
@@ -548,7 +551,7 @@ const handoverOwnerAsk = asking('hand-over approval card', (ctx, who, g) => {
       '',
       `**To answer:** tap **Approve** or **Decline**. To decline with a reason, decline and reply here: your agent hears it. If you approve, ${to} gets a card to accept. Unanswered, the request expires 24 h after it was made and nothing is sent.`,
     ].join('\n'),
-    link: handoverLink(g.id), actions: OWNER_ACTIONS, idemKey: `consent:handover:${g.id}:owner:${g.updated_at}`,
+    link: handoverLink(g.id), actions: OWNER_ACTIONS, idemKey: `consent:handover:${g.id}:owner:${askStamp(g)}`,
   })
   if (item) setGrantItem(db, g.id, 'owner', item.id)
 })
@@ -574,7 +577,7 @@ const handoverGranteeAsk = asking('hand-over offer card', (ctx, g) => {
       '',
       '**To answer:** tap **Accept** or **Decline**.',
     ].join('\n'),
-    link: handoverLink(g.id), actions: PEER_ACTIONS, idemKey: `consent:handover:${g.id}:grantee:${g.updated_at}`,
+    link: handoverLink(g.id), actions: PEER_ACTIONS, idemKey: `consent:handover:${g.id}:grantee:${askStamp(g)}`,
   })
   if (item) setGrantItem(db, g.id, 'grantee', item.id)
 })
@@ -691,7 +694,7 @@ function onHandoverOutcome(ctx, who, out) {
       break
     case 'sent':
       closed = tap('owner', `Approved — ${to} has been asked to accept.`)
-      audit(ctx, g.owner_user_id, { event: 'grant.handover_offered', summary: `You offered to hand ${to} ${subjectWords(g)}`, contact: oc, grant: g, by: g.requested_by })
+      audit(ctx, g.owner_user_id, { event: 'grant.handover_offered', summary: `You offered to hand ${to} ${subjectWords(g)}`, contact: oc, grant: g, by: g.pending_by ?? g.requested_by })
       handoverGranteeAsk(ctx, g)
       audit(ctx, g.grantee_user_id, { event: 'grant.handover_received', summary: `${from} offered to hand you ${subjectWordsFor(g)}`, contact: gc, grant: g })
       changed(ctx, g.grantee_user_id, { grant_id: g.id })
