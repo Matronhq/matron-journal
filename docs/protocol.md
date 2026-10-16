@@ -3729,7 +3729,8 @@ and nothing about it reaches their People log or their sockets. The journal
 records the send (`grants.sent_at`); a row sent once stays the grantee's to
 read whatever becomes of it, until the row is renewed by a new ask. Rows from before the
 column are backfilled as sent when they are pending or active, when the
-grantee had a card for them, answered or ended them, or has a
+grantee had a card for them, answered or ended them (a revoked row the
+grantee had accepted keeps that answer), or has a
 `grant.received` / `grant.handover_received` line for them in their People
 log that is newer than the row's current ask (an agent's ask is dated by
 its owner card; one with no card is not counted this way).

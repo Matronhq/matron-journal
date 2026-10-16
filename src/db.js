@@ -1569,6 +1569,10 @@ export function openDb(path) {
 export function backfillGrantSent(db) {
   return db.prepare(`UPDATE grants SET sent_at = COALESCE(answered_at, updated_at, created_at)
     WHERE sent_at IS NULL AND (state IN ('pending','active') OR grantee_item_id IS NOT NULL OR revoked_by = 'grantee'
+      -- Revoked after the grantee answered it: answered_at on a revoked row
+      -- is only ever the grantee's accept (a renewal resets it), and it
+      -- survives the raises that older code wrote over the card ids.
+      OR (state = 'revoked' AND answered_at IS NOT NULL)
       OR (state <> 'awaiting_owner' AND EXISTS (
         SELECT 1 FROM events e
         JOIN conversations pc ON pc.id = e.convo_id AND pc.system = 'people'

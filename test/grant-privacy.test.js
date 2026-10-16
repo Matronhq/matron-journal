@@ -183,13 +183,19 @@ test('the backfill counts as sent exactly the rows that reached the grantee', as
     VALUES('it_card2',?,98,'question','closed',1,'card','c',0,'agent',0,0,'share')`).run(alice.id)
   db.prepare("UPDATE grants SET requested_by='agent', owner_item_id='it_card2' WHERE id='gr_agentsent'").run()
   append(db, { userId: bob.id, convoId: people, sender: 'journal', type: 'people', payload: { event: 'grant.received', grant_id: 'gr_agentsent' } })
+  // A share bob accepted, then an agent raise that was never sent (the code
+  // before this column overwrote requested_by and the card ids for it), then
+  // revoked: bob had it, and his accept (answered_at, which only a renewal
+  // resets) still says so.
+  row('gr_raised', 'revoked', { by: 'owner', answered: 3 })
+  db.prepare("UPDATE grants SET requested_by='agent', owner_item_id='it_card' WHERE id='gr_raised'").run()
   // A line in someone else's log proves nothing about bob.
   const alicePeople = ensurePeopleConvo(db, alice.id).id
   append(db, { userId: alice.id, convoId: alicePeople, sender: 'journal', type: 'people', payload: { event: 'grant.received', grant_id: 'gr_exp' } })
   db.prepare('UPDATE grants SET sent_at=NULL').run()
   backfillGrantSent(db)
   const sent = db.prepare('SELECT id FROM grants WHERE sent_at IS NOT NULL ORDER BY id').all().map((r) => r.id)
-  assert.deepEqual(sent, ['gr_act', 'gr_agentsent', 'gr_bobno', 'gr_left', 'gr_nocard', 'gr_nocard2', 'gr_pend', 'gr_revsent'])
+  assert.deepEqual(sent, ['gr_act', 'gr_agentsent', 'gr_bobno', 'gr_left', 'gr_nocard', 'gr_nocard2', 'gr_pend', 'gr_raised', 'gr_revsent'])
 })
 
 test('revoking a share with a raise in flight leaves no trace of the raise', async (t) => {
