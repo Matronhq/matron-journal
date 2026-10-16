@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import http from 'node:http'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
@@ -34,7 +35,7 @@ async function world(t) {
   t.after(() => { for (const x of Object.values(sockets)) { try { x.close() } catch { /* already closed */ } } })
   const http = (token) => (p, opts = {}) => s.http(p, { token, ...opts })
   return {
-    s, alice, bob, ws: sockets,
+    s, alice, bob, ws: sockets, tokens,
     aliceBox: http(tokens.aliceBox), bobBox: http(tokens.bobBox), alicePhone: http(tokens.alicePhone), bobPhone: http(tokens.bobPhone),
   }
 }
@@ -296,4 +297,57 @@ test('a contributor who can also see the mission through the org rule still cont
   assert.equal((await w.bobPhone(`/items/${item.id}`)).json.item.shared_via, undefined, 'read under the org rule')
   assert.equal((await w.bobBox(`/items/${item.id}/comments`, post({ body: 'Still mine to say.', convo_id: 'bobwork' }))).status, 201)
   assert.equal((await w.bobBox(`/missions/${m.id}`, { method: 'PATCH', body: { status: 'Going.' } })).status, 200)
+})
+
+// A POST whose body arrives in two halves, with `between` run after the
+// route has seen the headers and before the body is complete.
+function slowRequest(base, token, path, method, body, between) {
+  return new Promise((resolve, reject) => {
+    const data = Buffer.from(JSON.stringify(body))
+    const req = http.request(`${base}${path}`, { method, headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'content-length': data.length } }, (res) => {
+      let text = ''
+      res.on('data', (c) => { text += c })
+      res.on('end', () => resolve({ status: res.statusCode, json: text ? JSON.parse(text) : null }))
+    })
+    req.on('error', reject)
+    req.write(data.subarray(0, 5))
+    setTimeout(async () => { try { await between() } catch (err) { reject(err) } req.end(data.subarray(5)) }, 150)
+  })
+}
+
+test('a share revoked while a contributor\'s write is still arriving stops that write', async (t) => {
+  const w = await world(t)
+  const { m, item, gid } = await contributing(w)
+  const revoke = async () => assert.equal((await w.alicePhone(`/grants/${gid}`, { method: 'DELETE' })).status, 200)
+  const r = await slowRequest(w.s.base, w.tokens.bobBox, `/items/${item.id}/comments`, 'POST', { body: 'late words', convo_id: 'bobwork' }, revoke)
+  assert.equal(r.status, 404)
+  assert.equal((await w.alicePhone(`/items/${item.id}`)).json.comments.length, 0, 'nothing was written')
+  // The same for the mission's status, after a fresh share.
+  const again = (await w.alicePhone(`/missions/${m.id}/shares`, post({ contact: 'bob', level: 'contribute' }))).json.grant
+  await w.bobPhone(`/grants/${again.id}/answer`, post({ decision: 'approve' }))
+  const r2 = await slowRequest(w.s.base, w.tokens.bobBox, `/missions/${m.id}`, 'PATCH', { status: 'late status' },
+    async () => assert.equal((await w.alicePhone(`/grants/${again.id}`, { method: 'DELETE' })).status, 200))
+  assert.equal(r2.status, 404)
+  assert.equal((await w.alicePhone(`/missions/${m.id}`)).json.mission.status, null)
+})
+
+test('a contributor\'s close withdraws a pending item hand-over, and a stray inline ref is refused', async (t) => {
+  const w = await world(t)
+  const { item } = await contributing(w)
+  const other = createAgent(w.s.db, w.alice.id, 'alice-box-2')
+  upsertConversation(w.s.db, { id: 'side', ownerUserId: w.alice.id, title: 'Side', agentDeviceId: other.deviceId })
+  const offer = await w.aliceBox(`/items/${item.id}/handover`, post({ to_convo_id: 'side', as_convo_id: 'work' }))
+  assert.equal(offer.status, 201)
+  assert.equal((await w.bobPhone(`/items/${item.id}/close`, post({ resolution: 'answered' }))).status, 200)
+  assert.equal((await w.alicePhone(`/items/${item.id}`)).json.item.handover, null, 'the offer went with the close')
+  const bad = await w.bobBox(`/items/${item.id}/comments`, post({ body: 'see ![x](attachment:abc123)', convo_id: 'bobwork' }))
+  assert.equal(bad.status, 400)
+  assert.equal(bad.json.error, 'invalid_attachment_ref')
+})
+
+test('a contributor\'s item takes attachments: [] as "none"', async (t) => {
+  const w = await world(t)
+  const { m } = await contributing(w)
+  assert.equal((await w.bobBox('/items', post({ mission: m.id, kind: 'task', title: 'x', convo_id: 'bobwork', attachments: [] }))).status, 201)
+  assert.equal((await w.bobBox('/items', post({ mission: m.id, kind: 'task', title: 'x', convo_id: 'bobwork', body: 'see ![x](attachment:abc123)' }))).status, 400)
 })

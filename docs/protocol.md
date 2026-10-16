@@ -3833,10 +3833,15 @@ conversation of the caller's own that it may write to (404 otherwise): on an
 item it is where the owner's replies go. Refused: anything else on the
 mission (rename, close, share: 403), any other item write (PATCH, rank,
 handover: 403), action buttons — offering (`actions`) or tapping (`action`,
-`reply_to`) — (403), attachments (400; files do not cross), a `notice` (400),
+`reply_to`) — (403), attachments (400; files do not cross; `attachments: []`
+is accepted as none), an inline attachment ref in a body or note (400
+`invalid_attachment_ref`, as on the owner's own routes), a `notice` (400),
 consent mirrors (invisible: 404), a closed mission (409 `closed`). A `read`
 grant gets 403; a mission not shared with the caller (or whose box has since
-turned private, or whose grant has ended) 404. All responses are the
+turned private, or whose grant has ended) 404. Access is checked again
+inside the write itself, so a share that ends while a request's body is
+still arriving stops it (404, nothing written). A contributor's close
+withdraws a pending item hand-over offer, as the owner's close does. All responses are the
 contributor's grantee view (`shared_via: 'grant'`, no origin).
 
 **Attribution**, as the owner reads it (and the grantee):

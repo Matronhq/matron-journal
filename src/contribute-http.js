@@ -25,6 +25,8 @@ import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE, missionMarkerPayload, milesto
 import { MILESTONE_KINDS, TITLE_MAX, validateMissionFields, getMission, getGrantedMission, milestoneRow } from './missions.js'
 import { missionAccess } from './visibility.js'
 import { wakeConvoAgent } from './wake.js'
+import { strayInlineRef } from './inline-refs.js'
+import { withdrawOnClose } from './item-handover-http.js'
 import { notifyGrantees } from './sharing-events.js'
 import { PEOPLE_TITLE, PEOPLE_SYSTEM } from './people-convo.js'
 import {
@@ -33,6 +35,22 @@ import {
 } from './contribute.js'
 
 const forbidden = (res) => { json(res, 403, { error: 'forbidden' }); return true }
+// The same rule the owner's own routes apply: an inline ref may only place
+// one of the write's own attachments, and a contributor's writes have none.
+function strayRef(res, text) {
+  const ref = strayInlineRef(text, [])
+  if (ref == null) return false
+  json(res, 400, { error: 'invalid_attachment_ref', ref })
+  return true
+}
+// A share that ended while the body arrived (contribute.js 'gone'): the
+// same 404 a fresh request would get.
+function gone(res, fn) {
+  try { return { out: fn() } } catch (err) {
+    if (err.message === 'gone') { notFound(res); return null }
+    throw err
+  }
+}
 const personSender = (name) => `person:${name}`
 const WAKES = new Set(['commented', 'closed', 'reopened'])
 
@@ -144,9 +162,12 @@ export function handleContributedMilestone(ctx, res, who, body, { writableConvo 
 export function handleContributedItem(ctx, res, who, body, { writableConvo }) {
   const { db, hub } = ctx
   if (!CONTRIBUTE_KINDS.includes(body.kind)) return badRequest(res)
-  if (body.attachments !== undefined || body.actions !== undefined || body.on_behalf_of !== undefined || body.supersedes !== undefined) return badRequest(res)
+  // `attachments: []` is "none", as on a comment; anything in it is refused.
+  if (body.attachments !== undefined && !(Array.isArray(body.attachments) && body.attachments.length === 0)) return badRequest(res)
+  if (body.actions !== undefined || body.on_behalf_of !== undefined || body.supersedes !== undefined) return badRequest(res)
   const v = validateItemFields({ title: body.title, body: body.body, labels: body.labels, links: body.links })
   if (!v.ok) return badRequest(res)
+  if (strayRef(res, v.value.body)) return true
   if (who.kind === 'agent' && (typeof body.convo_id !== 'string' || !body.convo_id)) return badRequest(res)
   const replyConvoId = ownConvo(db, who, body.convo_id, writableConvo)
   if (replyConvoId === null) return notFound(res)
@@ -185,19 +206,28 @@ export async function handleContributorItemSub(ctx, req, res, who, shared, sub, 
     if (body.actions != null && !(Array.isArray(body.actions) && body.actions.length === 0)) return forbidden(res)
     if (body.attachments !== undefined && !(Array.isArray(body.attachments) && body.attachments.length === 0)) return badRequest(res)
     if (typeof body.body !== 'string' || !body.body.trim() || body.body.length > BODY_MAX) return badRequest(res)
-    const comment = contributeComment(db, { item, contributor, body: body.body })
-    toOwner(ctx, { contributor, item, action: 'commented', comment })
-    return reply(comment)
+    if (strayRef(res, body.body)) return true
+    const r = gone(res, () => contributeComment(db, { item, contributor, body: body.body }))
+    if (!r) return true
+    toOwner(ctx, { contributor, item, action: 'commented', comment: r.out })
+    return reply(r.out)
   }
   if (body.comment !== undefined && (typeof body.comment !== 'string' || body.comment.length > BODY_MAX)) return badRequest(res)
+  if (strayRef(res, body.comment)) return true
   if (sub === 'close') {
     if (!RESOLUTIONS.includes(body.resolution)) return badRequest(res)
-    const out = contributeClose(db, { item, contributor, resolution: body.resolution, comment: body.comment ?? '' })
+    const r = gone(res, () => contributeClose(db, { item, contributor, resolution: body.resolution, comment: body.comment ?? '' }))
+    if (!r) return true
+    const out = r.out
     if (!out) return conflict(res)
+    // As the owner's close route does: a pending item hand-over goes with it.
+    withdrawOnClose(ctx, item.user_id, item.id)
     toOwner(ctx, { contributor, item, action: 'closed', comment: out.comment })
     return reply(out)
   }
-  const out = contributeReopen(db, { item, contributor, comment: body.comment ?? '' })
+  const r = gone(res, () => contributeReopen(db, { item, contributor, comment: body.comment ?? '' }))
+  if (!r) return true
+  const out = r.out
   if (!out) return conflict(res)
   toOwner(ctx, { contributor, item, action: 'reopened', comment: out.comment })
   return reply(out)
@@ -217,7 +247,9 @@ export async function handleContributorMissionPatch(ctx, req, res, who, granted)
   if (!v.ok) return badRequest(res)
   if (mission.state !== 'open') return conflict(res, { blocked_by: 'closed' })
   const contributor = contributorOf(db, who)
-  const updated = contributeStatus(db, { mission, contributor, status: v.value.status })
+  const r = gone(res, () => contributeStatus(db, { mission, contributor, status: v.value.status }))
+  if (!r) return true
+  const updated = r.out
   // The owner's origin conversation is told, as for any status change: a
   // flag, never the text, from the other person.
   try {

@@ -99,10 +99,16 @@ export function contributableItem(db, viewerUserId, itemId) {
   try { return contributableMission(db, viewerUserId, it.mission_id) ? it : null } catch { return null }
 }
 
+// The writes below re-check, inside their own transaction, that the writer
+// still contributes: the route checked before reading the body, and a share
+// may have ended while it arrived. Error('gone') if not.
+const stillContributes = (db, contributor, item) => { if (!contributableItem(db, contributor.userId, item.id)) fail('gone') }
+
 // A comment: words only — no buttons, no taps, no files. It does not move
 // the item's status (the owner's turn hears it either way).
 export function contributeComment(db, { item, contributor, body, now = Date.now() }) {
   return db.transaction(() => {
+    stillContributes(db, contributor, item)
     const comment = insertComment(db, { itemId: item.id, userId: item.user_id, author: 'agent', deviceId: 0, kind: 'comment', body, attachments: [], meta: metaOf(contributor), idemKey: null, now })
     db.prepare('UPDATE items SET updated_at=? WHERE id=?').run(now, item.id)
     return comment
@@ -110,18 +116,29 @@ export function contributeComment(db, { item, contributor, body, now = Date.now(
 }
 
 export function contributeClose(db, { item, contributor, resolution, comment = '', now = Date.now() }) {
-  return closeItem(db, { userId: item.user_id, itemId: item.id, resolution, author: 'agent', deviceId: 0, comment, meta: metaOf(contributor), now })
+  return db.transaction(() => {
+    stillContributes(db, contributor, item)
+    return closeItem(db, { userId: item.user_id, itemId: item.id, resolution, author: 'agent', deviceId: 0, comment, meta: metaOf(contributor), now })
+  })()
 }
 
 export function contributeReopen(db, { item, contributor, comment = '', now = Date.now() }) {
-  return reopenItem(db, { userId: item.user_id, itemId: item.id, author: 'agent', deviceId: 0, comment, meta: metaOf(contributor), now })
+  return db.transaction(() => {
+    stillContributes(db, contributor, item)
+    return reopenItem(db, { userId: item.user_id, itemId: item.id, author: 'agent', deviceId: 0, comment, meta: metaOf(contributor), now })
+  })()
 }
 
 // The mission's status, by the contributor: written like an agent's with no
 // conversation named, plus their name. null clears it.
 export function contributeStatus(db, { mission, contributor, status }) {
-  return updateMission(db, {
-    userId: mission.user_id, missionId: mission.id, fields: { status },
-    statusWriter: { by: 'agent', convoId: null, deviceId: null, contributor: contributor.name },
-  })
+  return db.transaction(() => {
+    let still = null
+    try { still = contributableMission(db, contributor.userId, mission.id) } catch { /* read only now */ }
+    if (!still) fail('gone')
+    return updateMission(db, {
+      userId: mission.user_id, missionId: mission.id, fields: { status },
+      statusWriter: { by: 'agent', convoId: null, deviceId: null, contributor: contributor.name },
+    })
+  })()
 }
