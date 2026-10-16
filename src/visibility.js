@@ -76,11 +76,11 @@ export function missionAccess(db, viewerUserId, missionId) {
 
 export const canReadMission = (db, viewerUserId, missionId) => missionAccess(db, viewerUserId, missionId) != null
 
-// Writes: today only the owner. `contribute` (phase 3) is the level that
-// will pass here; a `read` grant never does.
+// Writes: the owner, or a `contribute` grantee (src/contribute.js says
+// which writes); a `read` grant never passes.
 export function canWriteMission(db, viewerUserId, missionId) {
   const level = missionAccess(db, viewerUserId, missionId)
-  return level === 'owner'
+  return level === 'owner' || level === 'contribute'
 }
 
 export function canReadConvo(db, viewerUserId, convoId) {

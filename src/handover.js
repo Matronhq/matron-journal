@@ -215,17 +215,17 @@ function copyMission(db, { m, toUserId, ownerName, brief, peopleConvo, projectId
   const id = newId('ms')
   const num = nextNum(db, toUserId)
   const status = m.status_hidden ? null : m.status
-  db.prepare(`INSERT INTO missions(id,user_id,num,state,title,name,body,status,status_by,status_updated_at,origin_convo_id,origin_device_id,created_by,created_at,updated_at,project_id)
-    VALUES(?,?,?,'open',?,?,?,?,?,?,?,0,'user',?,?,?)`).run(
+  db.prepare(`INSERT INTO missions(id,user_id,num,state,title,name,body,status,status_by,status_updated_at,status_contributor,origin_convo_id,origin_device_id,created_by,created_at,updated_at,project_id)
+    VALUES(?,?,?,'open',?,?,?,?,?,?,?,?,0,'user',?,?,?)`).run(
     id, toUserId, num, m.title, m.name ?? null, m.body ?? '', status, status == null ? null : 'agent', status == null ? null : m.status_updated_at,
-    peopleConvo, now, now, projectId)
+    status == null ? null : m.status_contributor ?? null, peopleConvo, now, now, projectId)
   const { milestones, items } = missionContents(db, m.id)
-  const insMilestone = db.prepare(`INSERT INTO milestones(id,mission_id,user_id,num,kind,title,body,convo_id,seq,device_id,created_by,created_at)
-    VALUES(?,?,?,?,?,?,?,?,0,0,'agent',?)`)
+  const insMilestone = db.prepare(`INSERT INTO milestones(id,mission_id,user_id,num,kind,title,body,convo_id,seq,device_id,created_by,created_at,contributor_name,contributor_via)
+    VALUES(?,?,?,?,?,?,?,?,0,0,'agent',?,?,?)`)
   // The brief first, so it carries the copy's lowest milestone number; its
   // time is the hand-over's, so it is also the copy's latest milestone.
-  insMilestone.run(newId('ml'), id, toUserId, nextNum(db, toUserId), 'progress', `Handed over by ${ownerName}`, brief, peopleConvo, now)
-  for (const l of milestones) insMilestone.run(newId('ml'), id, toUserId, nextNum(db, toUserId), l.kind, l.title, l.body, peopleConvo, l.created_at)
+  insMilestone.run(newId('ml'), id, toUserId, nextNum(db, toUserId), 'progress', `Handed over by ${ownerName}`, brief, peopleConvo, now, null, null)
+  for (const l of milestones) insMilestone.run(newId('ml'), id, toUserId, nextNum(db, toUserId), l.kind, l.title, l.body, peopleConvo, l.created_at, l.contributor_name ?? null, l.contributor_via ?? null)
   db.prepare('UPDATE missions SET last_milestone_at=? WHERE id=?').run(now, id)
 
   // The same blob attached twice is copied once.
@@ -252,9 +252,11 @@ function copyMission(db, { m, toUserId, ownerName, brief, peopleConvo, projectId
     return out
   }
   const itemIds = new Map()
+  // A contributor's item keeps naming them, but not where their replies
+  // went: that was a conversation of theirs talking to the old owner.
   const insItem = db.prepare(`INSERT INTO items(id,user_id,num,kind,state,resolution,awaiting,rank,title,body,labels,links,supersedes,
-      origin_convo_id,origin_device_id,created_by,created_at,updated_at,closed_at,mission_id,actions,chosen_action)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,'agent',?,?,?,?,?,?)`)
+      origin_convo_id,origin_device_id,created_by,created_at,updated_at,closed_at,mission_id,actions,chosen_action,contributor_name,contributor_via)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,'agent',?,?,?,?,?,?,?,?)`)
   const insComment = db.prepare(`INSERT INTO item_comments(id,item_id,user_id,author,device_id,convo_id,kind,body,attachments,meta,created_at,actions,chosen_action)
     VALUES(?,?,?,'agent',0,NULL,?,?,?,?,?,?,?)`)
   const copied = []
@@ -266,12 +268,15 @@ function copyMission(db, { m, toUserId, ownerName, brief, peopleConvo, projectId
     const threads = it.comments.map((c) => ({ c, attachments: mapAttachments(parseJson(c.attachments, [])) }))
     insItem.run(itemId, toUserId, nextNum(db, toUserId), it.kind, it.state, it.resolution, it.awaiting,
       resolveRank(db, toUserId, { position: 'bottom' }), it.title, rewriteRefs(it.body, blobMap), it.labels, it.links,
-      it.supersedes ? itemIds.get(it.supersedes) ?? null : null, peopleConvo, it.created_at, now, it.closed_at, id, it.actions ?? '[]', it.chosen_action ?? null)
+      it.supersedes ? itemIds.get(it.supersedes) ?? null : null, peopleConvo, it.created_at, now, it.closed_at, id, it.actions ?? '[]', it.chosen_action ?? null,
+      it.contributor_name ?? null, it.contributor_via ?? null)
     const commentIds = new Map()
     for (const { c, attachments } of threads) {
       const cid = newId('ic')
       commentIds.set(c.id, cid)
-      const meta = { ...(parseJson(c.meta, null) ?? {}), attribution: c.author === 'user' ? ownerName : `${ownerName}'s agent` }
+      // A contributor's comment keeps naming them (src/contribute.js).
+      const prior = parseJson(c.meta, null) ?? {}
+      const meta = { ...prior, attribution: prior.attribution ?? (c.author === 'user' ? ownerName : `${ownerName}'s agent`) }
       if (meta.reply_to) meta.reply_to = commentIds.get(meta.reply_to) ?? null
       insComment.run(cid, itemId, toUserId, c.kind, rewriteRefs(c.body, blobMap), JSON.stringify(attachments), JSON.stringify(meta), c.created_at, c.actions ?? '[]', c.chosen_action ?? null)
     }

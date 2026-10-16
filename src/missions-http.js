@@ -22,6 +22,7 @@ import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE, missionMarkerPayload, milesto
 import { filteredAgent, privateOwnedConvo, markerTitleAllowed } from './privacy.js'
 import { getCoordinatorConvoId } from './coordinator.js'
 import { canReadConvo } from './visibility.js'
+import { handleContributedMilestone, handleContributorMissionPatch } from './contribute-http.js'
 
 const STATES = ['open', 'closed']
 
@@ -379,6 +380,12 @@ async function handleMilestoneCreate(ctx, req, res, who) {
   if (body.mission != null && typeof body.mission !== 'string' && typeof body.mission !== 'number') return badRequest(res)
   const idemKey = idemKeyOf(req, who)
   if (idemKey === undefined) return badRequest(res)
+  // An `ms_…` id that is not the caller's own: another person's mission
+  // the caller may contribute to (src/contribute-http.js).
+  if (typeof body.mission === 'string' && body.mission.startsWith('ms_') && !visibleMission(db, who, body.mission)
+      && !db.prepare('SELECT 1 FROM missions WHERE id=? AND user_id=?').get(body.mission, who.userId)) {
+    return handleContributedMilestone(ctx, res, who, body, { writableConvo })
+  }
   if (!writableConvo(db, who, body.convo_id)) return notFound(res)
   const sender = senderOf(db, who)
   const excludePrivateOwned = filteredAgent(db, who)
@@ -513,7 +520,14 @@ export async function handleMissionsRoute(ctx, req, res, url, who) {
         : grantedMissionDetail(db, granted))
       return true
     }
-    // Readable, not writable: a read grant never passes canWriteMission.
+    // A contributor sets the status, and nothing else (contribute-http.js);
+    // a read grant never writes.
+    // As for items: a mission also visible through the org rule still takes
+    // a contributor's status.
+    if (!sub && req.method === 'PATCH') {
+      const viaGrant = granted ?? getGrantedMission(db, who.userId, idOrNum)
+      if (viaGrant) return handleContributorMissionPatch(ctx, req, res, who, viaGrant)
+    }
     json(res, 403, { error: 'forbidden' })
     return true
   }

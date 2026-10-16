@@ -3,9 +3,9 @@
 // src/sharing-events.js owns the side effects; the read rule itself is in
 // src/visibility.js and the grantee's view of a mission in src/missions.js.
 //
-// A grant lets one contact into one subject at a level. `read` on a
-// mission (phase 1) and `owner` — a hand-over — on a mission or a project
-// (phase 3, src/handover.js). Every ask takes two yeses — the owner's (when
+// A grant lets one contact into one subject at a level. `read` and
+// `contribute` (src/contribute.js) on a mission, and `owner` — a hand-over —
+// on a mission or a project (src/handover.js). Every ask takes two yeses — the owner's (when
 // an agent asked: 'awaiting_owner') and the grantee's ('pending') — and
 // either side can end it until it is accepted.
 //
@@ -135,16 +135,15 @@ function upsertAsk(db, { ownerUserId, kind, subjectId, own, level, brief, exclud
 }
 
 // `by` as in requestContact. `contact` is the owner's contact row id, or a
-// same-journal peer's name. `level` 'read' or 'owner' (a hand-over, which
+// same-journal peer's name. `level` 'read', 'contribute' or 'owner' (a hand-over, which
 // needs `brief`; `excludeMedia` is the owner's own unticking, from a client).
-// Throws: bad_level, level_unavailable, no_mission, private_mission,
-// handed_over, mission_closed, not_contact, pending, too_many_asks.
+// Throws: bad_level, no_brief, no_mission, private_mission, handed_over,
+// mission_closed, not_contact, pending, too_many_asks.
 // Returns {grant, existing} — existing:true is an already-active grant at
 // that level or above, returned unchanged (sharing twice is not an error).
 export function shareMission(db, { ownerUserId, missionId, contact, level, brief = null, excludeMedia = null, by, convoId = null, deviceId = null, now = Date.now() }) {
   return db.transaction(() => {
     if (!GRANT_LEVELS.includes(level)) fail('bad_level')
-    if (level === 'contribute') fail('level_unavailable')
     if (level === 'owner' && !brief) fail('no_brief')
     const mission = db.prepare(`SELECT m.id, (${ORIGIN_SIEVE}) AS shareable FROM missions m WHERE m.id=? AND m.user_id=?`).get(missionId, ownerUserId)
     if (!mission) fail('no_mission')
