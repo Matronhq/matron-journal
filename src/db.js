@@ -1557,9 +1557,20 @@ export function openDb(path) {
 // revoke says so. Anything else (still awaiting the owner, declined or
 // revoked by the owner before approving, expired unanswered) was not.
 // Idempotent: only rows with no sent_at are touched.
+// The grantee's card is filed best-effort, so a sent row may have none: the
+// grantee's own "received" audit line, in their People conversation, counts
+// as evidence too (only the journal writes `people` events). A row still
+// awaiting its owner is never counted, whatever an older ask on it left.
 export function backfillGrantSent(db) {
   return db.prepare(`UPDATE grants SET sent_at = COALESCE(answered_at, updated_at, created_at)
-    WHERE sent_at IS NULL AND (state IN ('pending','active') OR grantee_item_id IS NOT NULL OR revoked_by = 'grantee')`).run().changes
+    WHERE sent_at IS NULL AND (state IN ('pending','active') OR grantee_item_id IS NOT NULL OR revoked_by = 'grantee'
+      OR (state <> 'awaiting_owner' AND EXISTS (
+        SELECT 1 FROM events e
+        JOIN conversations pc ON pc.id = e.convo_id AND pc.system = 'people'
+        JOIN contacts c ON c.id = grants.contact_id
+        WHERE e.user_id = c.peer_user_id AND pc.owner_user_id = c.peer_user_id AND e.type = 'people'
+          AND json_extract(e.payload, '$.grant_id') = grants.id
+          AND json_extract(e.payload, '$.event') IN ('grant.received', 'grant.handover_received'))))`).run().changes
 }
 
 export function insertBlob(db, { id, ownerUserId, contentType, size, sha256, diskPath, width = null, height = null }) {

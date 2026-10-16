@@ -3727,7 +3727,11 @@ the ask ends first (the owner declines or revokes it, or it expires). Such
 a row is in none of their `GET /grants` lists, whatever `state` is named,
 and nothing about it reaches their People log or their sockets. The journal
 records the send (`grants.sent_at`); a row sent once stays the grantee's to
-read whatever becomes of it, until the row is renewed by a new ask.
+read whatever becomes of it, until the row is renewed by a new ask. Rows from before the
+column are backfilled as sent when they are pending or active, when the
+grantee had a card for them, answered or ended them, or has a
+`grant.received` / `grant.handover_received` line for them in their People
+log.
 
 ### What a grantee reads
 

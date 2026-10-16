@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { openDb } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { upsertConversation } from '../src/journal.js'
+import { upsertConversation, append } from '../src/journal.js'
+import { ensurePeopleConvo } from '../src/people-convo.js'
 import { expireGrantAsks, backfillGrantSent } from '../src/grants.js'
 import { OWN_ASK_TTL_MS } from '../src/contacts.js'
 import { onGrantAskExpired } from '../src/sharing-events.js'
@@ -156,10 +157,20 @@ test('the backfill counts as sent exactly the rows that reached the grantee', as
   row('gr_revsent', 'revoked', { item: 'it_4', by: 'owner' })
   row('gr_revunsent', 'revoked', { by: 'owner' })
   row('gr_left', 'revoked', { by: 'grantee' })
+  // Sent and ended, but its card for bob was never filed (filing is
+  // best-effort): bob's own "received" audit line still says it reached him.
+  row('gr_nocard', 'revoked', { by: 'owner' })
+  row('gr_nocard2', 'declined', { answered: 4 })
+  const people = ensurePeopleConvo(db, bob.id).id
+  append(db, { userId: bob.id, convoId: people, sender: 'journal', type: 'people', payload: { event: 'grant.received', grant_id: 'gr_nocard' } })
+  append(db, { userId: bob.id, convoId: people, sender: 'journal', type: 'people', payload: { event: 'grant.handover_received', grant_id: 'gr_nocard2' } })
+  // A line in someone else's log proves nothing about bob.
+  const alicePeople = ensurePeopleConvo(db, alice.id).id
+  append(db, { userId: alice.id, convoId: alicePeople, sender: 'journal', type: 'people', payload: { event: 'grant.received', grant_id: 'gr_exp' } })
   db.prepare('UPDATE grants SET sent_at=NULL').run()
   backfillGrantSent(db)
   const sent = db.prepare('SELECT id FROM grants WHERE sent_at IS NOT NULL ORDER BY id').all().map((r) => r.id)
-  assert.deepEqual(sent, ['gr_act', 'gr_bobno', 'gr_left', 'gr_pend', 'gr_revsent'])
+  assert.deepEqual(sent, ['gr_act', 'gr_bobno', 'gr_left', 'gr_nocard', 'gr_nocard2', 'gr_pend', 'gr_revsent'])
 })
 
 test('revoking a share with a raise in flight leaves no trace of the raise', async (t) => {
