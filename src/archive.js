@@ -111,13 +111,24 @@ export function autoArchiveCandidates(db, userId, days, now = Date.now()) {
 }
 
 // One pass over every user. Returns {userId: changes} for users with any.
-export function runAutoArchive(db, now = Date.now()) {
+// Each user commits on its own, and `onUser(userId, changes)` runs right
+// after that commit, so one user's failure (logged, skipped) never costs
+// the users already archived their live frame.
+export function runAutoArchive(db, now = Date.now(), { onUser = () => {}, log = console } = {}) {
   const out = new Map()
   for (const { id: userId } of db.prepare('SELECT id FROM users').all()) {
-    const ids = autoArchiveCandidates(db, userId, getAutoArchiveDays(db, userId), now)
-    if (!ids.length) continue
-    const changes = setArchived(db, userId, ids, true, { now, auto: true })
-    if (changes.length) out.set(userId, changes)
+    let changes
+    try {
+      const ids = autoArchiveCandidates(db, userId, getAutoArchiveDays(db, userId), now)
+      if (!ids.length) continue
+      changes = setArchived(db, userId, ids, true, { now, auto: true })
+    } catch (err) {
+      try { log.error(`auto-archive: user ${userId} failed: ${err?.message || err}`) } catch { /* never throw from a timer */ }
+      continue
+    }
+    if (!changes.length) continue
+    out.set(userId, changes)
+    onUser(userId, changes)
   }
   return out
 }
@@ -132,13 +143,12 @@ export function sendArchiveFrame(hub, userId, changes, at) {
 // restart never races boot.
 export function startAutoArchiveSweep({ db, hub, intervalMs = AUTO_ARCHIVE_INTERVAL_MS, enabled = true, log = console } = {}) {
   function run(now = Date.now()) {
-    let changed
-    try { changed = runAutoArchive(db, now) } catch (err) {
+    try {
+      return runAutoArchive(db, now, { log, onUser: (userId, changes) => sendArchiveFrame(hub, userId, changes, now) })
+    } catch (err) {
       try { log.error(`auto-archive: sweep failed: ${err?.message || err}`) } catch { /* never throw from a timer */ }
       return new Map()
     }
-    for (const [userId, changes] of changed) sendArchiveFrame(hub, userId, changes, now)
-    return changed
   }
   if (!enabled) return { stop() {}, run }
   const t = setInterval(run, intervalMs)

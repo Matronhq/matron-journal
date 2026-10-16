@@ -2261,7 +2261,7 @@ no-op), and `at` is the value to send as `since` next time.
 | Route | Who | Body | Returns |
 |---|---|---|---|
 | `GET /archive[?since=ms]` | client only | | 200 `{changes, at, auto_archive_days}`. Without `since`: every conversation archived now |
-| `POST /archive` | client only | `{convo_ids: [id…] (1–500), archived: bool}` | 200 `{changes, at}` — only what changed; ids the user does not own, or already in that state, are skipped. **400** for a bad body |
+| `POST /archive` | client only | `{convo_ids: [id…] (1–500), archived: bool}` | 200 `{changes}` — only what changed (no `at`: advance `since` only from `GET`, `hello_ok` and frames); ids the user does not own, or already in that state, are skipped. **400** for a bad body |
 
 Agents get **403** `forbidden`. Every change, the sweep's included, sends
 `{kind:'archive', changes, at}` to the user's connected clients. A client

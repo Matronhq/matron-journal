@@ -3,7 +3,10 @@
 // change is sent live to the user's open apps ({kind:'archive'}).
 //
 //   GET  /archive?since=ms        → {changes, at, auto_archive_days}
-//   POST /archive                 {convo_ids: [...], archived: bool} → {changes, at}
+//   POST /archive                 {convo_ids: [...], archived: bool} → {changes}
+//
+// POST answers with no `at`: an app advances its `since` only from GET,
+// hello_ok and live frames, which never skip a change it has not seen.
 import { json, readBody } from './http-body.js'
 import { badRequest } from './http-who.js'
 import { CONVO_ID_MAX_CHARS } from './journal.js'
@@ -35,6 +38,6 @@ export async function handleArchiveRoute(ctx, req, res, url, who) {
   const now = Date.now()
   const changes = setArchived(db, who.userId, ids, archived, { now })
   sendArchiveFrame(hub, who.userId, changes, now)
-  json(res, 200, { changes, at: now })
+  json(res, 200, { changes })
   return true
 }

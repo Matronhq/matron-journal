@@ -95,6 +95,18 @@ test('auto-archive: idle conversations only, with every exemption', async () => 
   setAutoArchiveDays(db, alice.id, 30)
   const out = runAutoArchive(db, NOW)
   assert.deepEqual(out.get(alice.id).map((c) => [c.convo_id, c.auto]).sort(), [['item', true], ['mission', true]])
+  // Each user is reported as soon as it commits; a failing user is logged and skipped.
+  setArchived(db, alice.id, ['item', 'mission'], false, { now: NOW - 40 * DAY })
+  setAutoArchiveDays(db, bob.id, 30)
+  const seen = []
+  const errors = []
+  const failing = new Proxy(db, { get: (t, k) => k === 'prepare'
+    ? (sql) => { if (sql.includes('LEFT JOIN convo_archive a ON') && seen.length) throw new Error('disk'); return t.prepare(sql) }
+    : (typeof t[k] === 'function' ? t[k].bind(t) : t[k]) })
+  const out2 = runAutoArchive(failing, NOW, { onUser: (u, c) => seen.push([u, c.length]), log: { error: (m) => errors.push(m) } })
+  assert.deepEqual(seen, [[alice.id, 2]])
+  assert.equal(out2.size, 1)
+  assert.equal(errors.length, 1, "bob's failure is logged")
   assert.deepEqual(runAutoArchive(db, NOW).size, 0, 'a second pass changes nothing')
 })
 
