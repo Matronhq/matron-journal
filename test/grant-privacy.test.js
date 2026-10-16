@@ -161,3 +161,16 @@ test('the backfill counts as sent exactly the rows that reached the grantee', as
   const sent = db.prepare('SELECT id FROM grants WHERE sent_at IS NOT NULL ORDER BY id').all().map((r) => r.id)
   assert.deepEqual(sent, ['gr_act', 'gr_bobno', 'gr_left', 'gr_pend', 'gr_revsent'])
 })
+
+test('revoking a share with a raise in flight leaves no trace of the raise', async (t) => {
+  const w = await world(t)
+  const m = await mission(w)
+  const g = (await w.alicePhone(`/missions/${m.id}/shares`, post({ contact: 'bob' }))).json.grant
+  await w.bobPhone(`/grants/${g.id}/answer`, post({ decision: 'approve' }))
+  const ask = (await w.aliceBox(`/missions/${m.id}/shares`, post({ contact: 'bob', level: 'contribute', convo_id: 'work' }))).json.grant
+  assert.equal(ask.pending_requested_by, 'agent')
+  const rev = (await w.alicePhone(`/grants/${g.id}`, { method: 'DELETE' })).json.grant
+  assert.equal(rev.state, 'revoked')
+  assert.deepEqual([rev.pending_level, rev.pending_state, 'pending_requested_by' in rev], [null, null, false])
+  assert.deepEqual(w.s.db.prepare('SELECT pending_by, pending_at FROM grants WHERE id=?').get(g.id), { pending_by: null, pending_at: null })
+})

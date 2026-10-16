@@ -312,7 +312,7 @@ export function revokeGrant(db, { userId, grantId, now = Date.now() }) {
     if (!['awaiting_owner', 'pending', 'active'].includes(g.state)) fail('not_active')
     // A hand-over that happened is not undone by revoking its record.
     if (g.level === 'owner' && g.state === 'active') fail('handed_over')
-    setState(db, g.id, 'revoked', now, `, revoked_by='${isOwner ? 'owner' : 'grantee'}', revoked_at=${Number(now)}, pending_level=NULL, pending_state=NULL`)
+    setState(db, g.id, 'revoked', now, `, revoked_by='${isOwner ? 'owner' : 'grantee'}', revoked_at=${Number(now)}, pending_level=NULL, pending_state=NULL, pending_by=NULL, pending_at=NULL`)
     if (askOf(g).state === 'awaiting_owner') forgetBrief(db, g.id)
     return { grant: getGrantRaw(db, g.id), before: g, by: isOwner ? 'owner' : 'grantee' }
   })()
