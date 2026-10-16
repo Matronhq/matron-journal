@@ -721,3 +721,59 @@ test('openDb backfills events.blob_ref for image/file rows that only carry paylo
   db.close()
   assert.doesNotThrow(() => openDb(dbPath).close(), 'backfill must be idempotent on the next boot')
 })
+
+test('openDb rebuilds an old person_rooms table for talk requests, keeping its rows', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-talk-migration-'))
+  const dbPath = path.join(dir, 'pre-talk.db')
+  // Build a current database, then put person_rooms back to its shape from
+  // before talk requests (NOT NULL guest columns, no 'starting', no kind).
+  openDb(dbPath).close()
+  const raw = new Database(dbPath)
+  raw.exec(`
+    DROP TABLE person_rooms;
+    CREATE TABLE person_rooms(
+      id               TEXT PRIMARY KEY,
+      owner_user_id    INTEGER NOT NULL REFERENCES users(id),
+      owner_room_id    TEXT NOT NULL,
+      owner_device_id  INTEGER NOT NULL,
+      owner_convo_id   TEXT,
+      owner_contact_id TEXT NOT NULL REFERENCES contacts(id),
+      guest_user_id    INTEGER NOT NULL REFERENCES users(id),
+      guest_device_id  INTEGER NOT NULL,
+      guest_convo_id   TEXT NOT NULL,
+      guest_room_id    TEXT,
+      mission_id       TEXT,
+      state            TEXT NOT NULL CHECK(state IN
+                         ('awaiting_owner','awaiting_guest','invited','joined','declined','refused','withdrawn','left','expired')),
+      topic            TEXT NOT NULL DEFAULT '',
+      justification    TEXT NOT NULL DEFAULT '',
+      owner_item_id    TEXT,
+      guest_item_id    TEXT,
+      ended_by         TEXT,
+      created_at       INTEGER NOT NULL,
+      updated_at       INTEGER NOT NULL,
+      answered_at      INTEGER,
+      UNIQUE(owner_room_id, guest_device_id)
+    );
+    CREATE INDEX idx_person_rooms_owner_room ON person_rooms(owner_room_id, state);
+  `)
+  raw.pragma('foreign_keys = OFF')
+  raw.prepare(`INSERT INTO person_rooms(id,owner_user_id,owner_room_id,owner_device_id,owner_contact_id,guest_user_id,guest_device_id,guest_convo_id,state,created_at,updated_at)
+    VALUES('pr_1',1,'room',1,'ct_1',2,2,'s',  'joined',0,0)`).run()
+  raw.close()
+
+  const db = openDb(dbPath)
+  const cols = db.prepare('PRAGMA table_info(person_rooms)').all()
+  for (const c of ['kind', 'contact_by_talk', 'pick_options', 'spawn_id']) assert.ok(cols.some((x) => x.name === c), `missing ${c}`)
+  assert.equal(cols.find((c) => c.name === 'guest_device_id').notnull, 0)
+  assert.equal(cols.find((c) => c.name === 'guest_convo_id').notnull, 0)
+  assert.equal(cols.find((c) => c.name === 'owner_contact_id').notnull, 0)
+  const row = db.prepare("SELECT * FROM person_rooms WHERE id='pr_1'").get()
+  assert.equal(row.state, 'joined')
+  assert.equal(row.kind, 'session')
+  assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_person_rooms_owner_room'").get(), 'indexes survive')
+  db.pragma('foreign_keys = OFF')
+  db.prepare("UPDATE person_rooms SET state='starting' WHERE id='pr_1'").run()
+  db.close()
+  assert.doesNotThrow(() => openDb(dbPath).close())
+})
