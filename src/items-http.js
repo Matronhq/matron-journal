@@ -15,7 +15,8 @@ import {
   requestTurn,
 } from './items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE, ITEM_ACTIONS, itemFallbackText, FALLBACK_ACTIONS } from './items-marker.js'
-import { visibleMission } from './missions-http.js'
+import { visibleMission, writableConvo } from './missions-http.js'
+import { handleContributedItem, handleContributorItemSub, forwardToContributor } from './contribute-http.js'
 import { filteredAgent, privateOwnedConvo } from './privacy.js'
 import { handleConsentTap, isSharingMirror } from './sharing-http.js'
 import { handlePeopleRoomTap, isPeopleRoomMirror } from './person-rooms-http.js'
@@ -226,6 +227,9 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
   // view follows it live (spec 2026-10-02 matron-to-matron sharing). Never
   // for a consent mirror — the grantee's reads do not show one.
   if (item.mission_id && item.consent == null) notifyGrantees({ db, hub }, item.mission_id, 'item')
+  // An item a contributor filed: the owner's reply reaches the conversation
+  // that filed it, as another person's turn (src/contribute-http.js).
+  if (item.mission_id && item.consent == null) forwardToContributor({ db, hub, pushPipeline, waker }, who, item, { action, comment })
 }
 
 // The journal's transcription job settled every voice note on a comment
@@ -309,6 +313,10 @@ const noticeActionsOk = (list) => list === undefined || list.length === 0 || sam
 async function handleCreate(ctx, req, res, who) {
   const { db } = ctx
   const body = await readBody(req)
+  // `mission`: an item filed into another person's mission the caller
+  // contributes to (src/contribute-http.js). One's own items follow their
+  // conversation and never name a mission.
+  if (body.mission !== undefined) return handleContributedItem(ctx, res, who, body, { writableConvo })
   if (!ITEM_KINDS.includes(body.kind)) return badRequest(res)
   const v = validateItemFields(body)
   if (!v.ok) return badFields(res, v)
@@ -479,6 +487,9 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
       replyItems(who, res, 200, { item: shared, comments: shared.shared_via === 'grant' ? listGrantedComments(db, shared.id) : listSharedComments(db, shared.id) })
       return true
     }
+    // A contributor to the item's mission may comment, close and reopen
+    // (src/contribute-http.js answers everything else 403 too).
+    if (shared.shared_via === 'grant' && sub) return handleContributorItemSub(ctx, req, res, who, shared, sub, subId)
     json(res, 403, { error: 'forbidden' })
     return true
   }

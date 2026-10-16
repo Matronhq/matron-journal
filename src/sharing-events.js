@@ -301,10 +301,14 @@ const ownerContact = (db, g) => db.prepare('SELECT * FROM contacts WHERE id=?').
 
 const WHAT_CROSSES = "the mission's title, description and status, its milestones as text, and its items with their comments and attachments"
 const WHAT_NEVER = 'Conversation transcripts, tool output, memories, secrets and box names never cross, and anything from a private box stays hidden.'
+const WHAT_CONTRIBUTORS_DO = 'add milestones, file items, comment, close and reopen items, and set the mission\'s status'
+// How a share's level reads in a sentence: the level asked for (a raise
+// carries it in pending_level).
+const levelWords = (g) => (askOf(g).level === 'contribute' ? 'can contribute' : 'read-only')
 
 function shareCardPayload(db, g, direction) {
   return {
-    kind: SHARE_CARD_KIND, direction, grant_id: g.id, level: g.level,
+    kind: SHARE_CARD_KIND, direction, grant_id: g.id, level: askOf(g).level,
     owner: { user_id: g.owner_user_id, name: g.owner_name },
     grantee: { name: g.grantee_name, address: g.grantee_journal ? `${g.grantee_name}@${g.grantee_journal}` : g.grantee_name },
     mission: { id: g.subject_id, num: g.mission_num, title: sanitizePeerText(g.mission_title, MISSION_TITLE_CAP) },
@@ -322,14 +326,16 @@ const shareOwnerAsk = asking('share approval card', (ctx, who, g) => {
   })
   const item = fileMirror(ctx, {
     userId: g.owner_user_id, convoId: g.origin_convo_id, deviceId: who.deviceId, sender: `agent:${who.name}`, consent: 'share',
-    title: `Approve sharing mission #${g.mission_num} with ${to} (read-only) — ${titleOf(g.mission_title)}`,
+    title: `Approve sharing mission #${g.mission_num} with ${to} (${levelWords(g)}) — ${titleOf(g.mission_title)}`,
     body: [
-      `**${plain(sanitizePeerText(who.name, 80))}** asks to share mission **#${g.mission_num} ${titleOf(g.mission_title)}** with your contact **${to}**, read-only.`,
+      `**${plain(sanitizePeerText(who.name, 80))}** asks to share mission **#${g.mission_num} ${titleOf(g.mission_title)}** with your contact **${to}**, ${levelWords(g)}.`,
       '',
       `- **What ${to} will be able to read:** ${WHAT_CROSSES}.`,
       `- **Right now that is:** ${p.milestones} milestone(s), ${p.items} item(s), ${p.comments} comment(s), ${p.attachments} attachment(s).`,
       `- **Live:** new milestones, items and comments appear for ${to} as they happen, until you or ${to} end the share.`,
-      `- **Read-only:** ${to} cannot change anything.`,
+      askOf(g).level === 'contribute'
+        ? `- **Can contribute:** ${to} and ${to}'s agents can ${WHAT_CONTRIBUTORS_DO}, in your numbering and marked as theirs. Their replies reach your agents as another person's. They cannot rename, close or re-share the mission, or attach files.`
+        : `- **Read-only:** ${to} cannot change anything.`,
       '',
       WHAT_NEVER,
       '',
@@ -347,12 +353,14 @@ const shareGranteeAsk = asking('share offer card', (ctx, g) => {
   card(ctx, { userId: g.grantee_user_id, convoId, sender: JOURNAL, payload: shareCardPayload(db, g, 'in') })
   const item = fileMirror(ctx, {
     userId: g.grantee_user_id, convoId, deviceId: 0, sender: JOURNAL, consent: 'share',
-    title: `${from} wants to share a mission with you — ${titleOf(g.mission_title)}`,
+    title: `${from} wants to share a mission with you${askOf(g).level === 'contribute' ? ' (you can contribute)' : ''} — ${titleOf(g.mission_title)}`,
     body: [
-      `Your contact **${from}** offers you mission **${titleOf(g.mission_title)}** to read.`,
+      `Your contact **${from}** offers you mission **${titleOf(g.mission_title)}** to ${askOf(g).level === 'contribute' ? 'read and contribute to' : 'read'}.`,
       '',
       `- **You will see:** ${WHAT_CROSSES}, live, under "shared by ${from}".`,
-      '- **Read-only:** you cannot change it, and nothing of yours is shared back.',
+      askOf(g).level === 'contribute'
+        ? `- **You can contribute:** you and your agents can ${WHAT_CONTRIBUTORS_DO}, marked as yours. Nothing else of yours is shared.`
+        : '- **Read-only:** you cannot change it, and nothing of yours is shared back.',
       `- Either of you can end the share at any time.`,
       '',
       '**To answer:** tap **Accept** or **Decline**.',
@@ -363,6 +371,7 @@ const shareGranteeAsk = asking('share offer card', (ctx, g) => {
 })
 
 const missionWords = (g) => `mission #${g.mission_num} ${titleOf(g.mission_title)}`
+const verb = (g) => (askOf(g).level === 'contribute' ? 'contribute to' : 'read')
 // The grantee never uses the owner's number as if it were their own: the
 // title names the mission in their log.
 const missionWordsFor = (g) => `mission "${titleOf(g.mission_title)}"`
@@ -391,9 +400,9 @@ export function onGrantOutcome(ctx, who, out) {
       break
     case 'sent':
       closed = ownerTap(`Approved — ${to} has been asked to accept.`)
-      audit(ctx, g.owner_user_id, { event: 'grant.offered', summary: `You offered ${to} ${missionWords(g)} to read`, contact: oc, grant: g, by: g.requested_by })
+      audit(ctx, g.owner_user_id, { event: 'grant.offered', summary: `You offered ${to} ${missionWords(g)} to ${verb(g)}`, contact: oc, grant: g, by: g.requested_by })
       shareGranteeAsk(ctx, g)
-      audit(ctx, g.grantee_user_id, { event: 'grant.received', summary: `${from} offered you ${missionWordsFor(g)} to read`, contact: gc, grant: g })
+      audit(ctx, g.grantee_user_id, { event: 'grant.received', summary: `${from} offered you ${missionWordsFor(g)} to ${verb(g)}`, contact: gc, grant: g })
       changed(ctx, g.grantee_user_id, { grant_id: g.id })
       break
     case 'withdrawn':
@@ -408,7 +417,7 @@ export function onGrantOutcome(ctx, who, out) {
     case 'accepted':
       closed = granteeTap(`Accepted — the mission is now in your shared list, shared by ${from}.`)
       audit(ctx, g.grantee_user_id, { event: 'grant.accepted', summary: `You accepted ${missionWordsFor(g)} from ${from}`, contact: gc, grant: g })
-      audit(ctx, g.owner_user_id, { event: 'grant.accepted', summary: `${to} accepted ${missionWords(g)} — shared read-only`, contact: oc, grant: g })
+      audit(ctx, g.owner_user_id, { event: 'grant.accepted', summary: `${to} accepted ${missionWords(g)} — shared ${g.level === 'contribute' ? 'to contribute to' : 'read-only'}`, contact: oc, grant: g })
       safely('shared frame', () => hub.sendToClients(g.grantee_user_id, { kind: 'shared', event: 'mission_added', mission_id: g.subject_id, grant_id: g.id, owner: { user_id: g.owner_user_id, name: g.owner_name } }))
       changed(ctx, g.owner_user_id, { grant_id: g.id })
       break

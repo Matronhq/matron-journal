@@ -1513,6 +1513,21 @@ export function openDb(path) {
   for (const [name, type] of [['brief', 'TEXT'], ['exclude_media', 'TEXT'], ['copy_subject_id', 'TEXT'], ['pending_level', 'TEXT'], ['pending_state', 'TEXT'], ['approved', 'TEXT']]) {
     if (!grantCols.some((c) => c.name === name)) db.exec(`ALTER TABLE grants ADD COLUMN ${name} ${type}`)
   }
+  // Contributors (person-to-person sharing, phase 3): a write a contributor
+  // made in the owner's log names them. contributor_name/_via ('user' |
+  // 'agent') are what the owner reads ("by bob", "by bob's agent").
+  // items.contributor_user_id / contributor_convo_id say where the owner's
+  // replies go: the conversation, in the CONTRIBUTOR's log, that filed the
+  // item — never shown to the owner. missions.status_contributor names who
+  // set the status, until the owner next does.
+  const contribCols = (table) => db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name)
+  const addCols = (table, cols) => {
+    const have = contribCols(table)
+    for (const [name, type] of cols) if (!have.includes(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`)
+  }
+  addCols('items', [['contributor_user_id', 'INTEGER'], ['contributor_convo_id', 'TEXT'], ['contributor_name', 'TEXT'], ['contributor_via', 'TEXT']])
+  addCols('milestones', [['contributor_name', 'TEXT'], ['contributor_via', 'TEXT']])
+  addCols('missions', [['status_contributor', 'TEXT']])
   // Unified search's tracker mirror (spec 2026-10-12 unified search §1).
   // Must stay LAST: it reads columns added by every migration above (e.g.
   // missions.name), and its triggers must be reinstalled after any table

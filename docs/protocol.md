@@ -3622,7 +3622,8 @@ Malformed values refuse to start the journal, naming the variable.
 
 ## Contacts and grants (person-to-person sharing)
 
-Phase 1: same journal, read-only mission share. Phase 3: hand-over (below).
+Phase 1: same journal, read-only mission share. Phase 3: hand-over and
+contributors (below).
 
 The second way across the user boundary, beside the org rule above. Unlike
 the org rule it is explicit: two people become **contacts** by one asking
@@ -3713,8 +3714,8 @@ grantee's accept card is open) → `active`; `declined`, `revoked`
 
 `contact` is the owner's contact row id or a same-journal user name; the
 two must be mutual contacts (409 `not_contact`). `level` defaults to
-`read`; `owner` is a hand-over (below); `contribute` is a later phase and
-answers 409 `level_unavailable`. A mission born on a private device is 409
+`read`; `contribute` lets the grantee write (*Contributors*, below);
+`owner` is a hand-over (*Hand-over*, below). A mission born on a private device is 409
 `private_mission`. The mission is resolved through the caller's own sieve.
 A grantee is never told of a grant its owner has not approved: until then
 the id is a 404 for them.
@@ -3741,7 +3742,8 @@ widened, so no transcript route opens (`/convo/:id/messages`,
   granted mission with `shared_via: 'grant'`, no origin, no action buttons,
   and comments with `device_id: 0`. `GET /media/:id` serves their
   attachments. `GET /lookup` resolves the owner's number.
-- Every write by a grantee is 403.
+- Every write by a `read` grantee is 403. A `contribute` grantee writes
+  what *Contributors* lists, and nothing else (403).
 
 ### Cards, mirrors and who answers
 
@@ -3807,6 +3809,73 @@ Ephemeral frames, client sockets only:
 `mission_changed` fires on every milestone, item write and mission
 update/close on a granted mission. It is an invalidation: the grantee
 refetches through the sieved reads above.
+
+### Contributors
+
+A grant at `level: 'contribute'` (on a mission; asked, approved and accepted
+exactly like `read`, with the `mission_share` card at that level, or raised
+in place from an active read share) lets the grantee and their agents
+write into the owner's mission. Every write lands in the **owner's** log,
+under the owner's numbering, and is attributed to the contributor in words;
+nothing names a conversation or device of the contributor's.
+
+| Write | Route | Body |
+|---|---|---|
+| a milestone | `POST /milestones` | `{mission: <owner's ms_ id>, kind, title, body?, convo_id?}` → `201 {milestone, mission}` |
+| an item | `POST /items` | `{mission: <ms_ id>, kind: 'task'\|'question'\|'decision', title, body?, labels?, links?, convo_id}` (`convo_id` required for an agent, optional for a client) → `201 {item}` |
+| a comment | `POST /items/:id/comments` | `{body}` → `201 {item, comment}` |
+| close / reopen | `POST /items/:id/close` `{resolution, comment?}`, `POST /items/:id/reopen` `{comment?}` | → `200 {item, comment}` |
+| the mission's status | `PATCH /missions/:id` | `{status}` (string or null; `convo_id` ignored) → `200 {mission}` |
+
+`mission` is the owner's mission **id** (`ms_…`; `GET /lookup?user=&num=`
+resolves the owner's number). `convo_id`, when given, must be a
+conversation of the caller's own that it may write to (404 otherwise): on an
+item it is where the owner's replies go. Refused: anything else on the
+mission (rename, close, share: 403), any other item write (PATCH, rank,
+handover: 403), action buttons — offering (`actions`) or tapping (`action`,
+`reply_to`) — (403), attachments (400; files do not cross), a `notice` (400),
+consent mirrors (invisible: 404), a closed mission (409 `closed`). A `read`
+grant gets 403; a mission not shared with the caller (or whose box has since
+turned private, or whose grant has ended) 404. All responses are the
+contributor's grantee view (`shared_via: 'grant'`, no origin).
+
+**Attribution**, as the owner reads it (and the grantee):
+
+- an item: `contributor: {name, via: 'user'|'agent'}`; created_by `agent`,
+  origin = the owner's People conversation, `origin_device_id: 0`. It
+  awaits whoever its kind defaults to (a question: the owner).
+- a comment, close or reopen: `author: 'agent'`, `device_id: 0`, `convo_id:
+  null`, `contributor: {name, via}` and `attribution: "bob"` / `"bob's
+  agent"`. The comment does not change the item's status.
+- a milestone: `contributor: {name, via}`; `convo_id` is the owner's People
+  conversation, where its marker is.
+- the status: `status_contributor: <name>` on the mission row, until the
+  owner next sets the status.
+
+Each of those fields is **absent** (not null) on everything else, so the
+shapes clients already decode do not change. The conversation that filed a
+contributor's item is never shown to anyone.
+
+**Reply routing.** Both ways, a write reaches the other person's agent as
+the ordinary `item` marker that an item reply turn is built from, with
+sender `person:<name>` (a sender only the journal writes — a bridge runs
+the turn as a restricted, foreign one) and the extra fields
+`person: {name, via}` and `mission_id`:
+
+- a contributor's comment, close or reopen on one of the owner's items is
+  appended to that item's origin conversation in the owner's log (waking
+  its box, with a push); a contributor's new item, to the owner's People
+  conversation;
+- the owner's (or one of the owner's agents') comment, close or reopen on an
+  item a contributor filed is appended to the conversation that filed it,
+  in the **contributor's** log, as the contributor's view of the item (the
+  owner's number, `item_id` of the owner's row) with `shared_by: {user_id,
+  name}` naming the owner — while the contributor still holds `contribute`.
+
+A contributor's milestone and status change are `milestone` and `mission`
+markers with the same `person:` sender and `person` field, in the owner's
+People conversation and origin conversation. Every write also fires
+`shared` `mission_changed` to the mission's grantees.
 
 ### Hand-over
 

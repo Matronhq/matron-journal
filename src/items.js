@@ -154,6 +154,10 @@ export function rowToItem(row) {
     labels, links, attachments, actions, idem_key: _idemKey,
     turn_requested_at: turnRequestedAt, owner_session_state: sessionState,
     owner_turn_started_at: turnStartedAt, owner_turn_ended_at: turnEndedAt,
+    // Internal: where a contributor's replies go (src/contribute.js), never
+    // on the wire — least of all to the owner.
+    contributor_user_id: _contributorUserId, contributor_convo_id: _contributorConvoId,
+    contributor_name: contributorName, contributor_via: contributorVia,
     ...rest
   } = row
   const out = {
@@ -164,6 +168,9 @@ export function rowToItem(row) {
     actions: parseJson(actions ?? '[]', []),
     chosen_action: rest.chosen_action ?? null,
   }
+  // Filed by another person, a contributor to the item's mission: who, in
+  // words. Absent on every other item, so their shape is unchanged.
+  if (contributorName) out.contributor = { name: contributorName, via: contributorVia ?? 'agent' }
   if ('handover' in out) out.handover = out.handover == null ? null : parseJson(out.handover, null)
   if ('comment_count' in out) out.comment_count = Number(out.comment_count)
   if ('has_image' in out) out.has_image = !!out.has_image
@@ -246,6 +253,9 @@ export function rowToComment(row) {
   // agent". Absent on every comment written in this log, so the shape
   // every client already decodes is unchanged.
   const attribution = typeof m?.attribution === 'string' ? { attribution: m.attribution } : {}
+  // `contributor` {name, via}: written by a contributor to the item's
+  // mission (src/contribute.js). Absent otherwise, like attribution.
+  if (m?.contributor && typeof m.contributor.name === 'string') attribution.contributor = { name: m.contributor.name, via: m.contributor.via === 'user' ? 'user' : 'agent' }
   return {
     ...rest, attachments: parseJson(attachments, []), meta: m, action, reply_to: replyTo, ...attribution,
     actions: parseJson(actions ?? '[]', []), chosen_action: rest.chosen_action ?? null,
@@ -792,18 +802,20 @@ export function addComment(db, { userId, itemId, author, deviceId, convoId = nul
 
 const statusOf = (row) => ({ state: row.state, resolution: row.resolution, awaiting: row.awaiting })
 
-export function closeItem(db, { userId, itemId, resolution, author, deviceId, convoId = null, comment = '', now = Date.now() }) {
+// `meta` is merged into the status row's own: a contributor's close
+// (src/contribute.js) says who closed it.
+export function closeItem(db, { userId, itemId, resolution, author, deviceId, convoId = null, comment = '', meta = null, now = Date.now() }) {
   return db.transaction(() => {
     const row = ownedRow(db, userId, itemId)
     if (!row || row.state === 'closed') return null
     const to = { state: 'closed', resolution, awaiting: null }
     db.prepare("UPDATE items SET state='closed', resolution=?, awaiting=NULL, closed_at=?, updated_at=? WHERE id=?").run(resolution, now, now, itemId)
-    const c = insertComment(db, { itemId, userId, author, deviceId, convoId, kind: 'status', body: comment, attachments: [], meta: { from: statusOf(row), to }, idemKey: null, now })
+    const c = insertComment(db, { itemId, userId, author, deviceId, convoId, kind: 'status', body: comment, attachments: [], meta: { ...meta, from: statusOf(row), to }, idemKey: null, now })
     return { item: getItem(db, userId, itemId), comment: c }
   })()
 }
 
-export function reopenItem(db, { userId, itemId, author, deviceId, convoId = null, comment = '', now = Date.now() }) {
+export function reopenItem(db, { userId, itemId, author, deviceId, convoId = null, comment = '', meta = null, now = Date.now() }) {
   return db.transaction(() => {
     const row = ownedRow(db, userId, itemId)
     if (!row || row.state === 'open') return null
@@ -812,7 +824,7 @@ export function reopenItem(db, { userId, itemId, author, deviceId, convoId = nul
     db.prepare("UPDATE items SET state='open', resolution=NULL, awaiting=?, closed_at=NULL, updated_at=? WHERE id=?").run(awaiting, now, itemId)
     // A reopened notice is unread again: its Seen button goes back live.
     if (row.kind === 'notice') db.prepare('UPDATE items SET chosen_action=NULL WHERE id=?').run(itemId)
-    const c = insertComment(db, { itemId, userId, author, deviceId, convoId, kind: 'status', body: comment, attachments: [], meta: { from: statusOf(row), to }, idemKey: null, now })
+    const c = insertComment(db, { itemId, userId, author, deviceId, convoId, kind: 'status', body: comment, attachments: [], meta: { ...meta, from: statusOf(row), to }, idemKey: null, now })
     return { item: getItem(db, userId, itemId), comment: c }
   })()
 }
