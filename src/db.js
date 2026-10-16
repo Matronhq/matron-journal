@@ -1559,8 +1559,13 @@ export function openDb(path) {
 // Idempotent: only rows with no sent_at are touched.
 // The grantee's card is filed best-effort, so a sent row may have none: the
 // grantee's own "received" audit line, in their People conversation, counts
-// as evidence too (only the journal writes `people` events). A row still
-// awaiting its owner is never counted, whatever an older ask on it left.
+// as evidence too (only the journal writes `people` events) — but only for
+// the row's CURRENT ask. A row is reused for a later ask, which may have
+// ended unsent, and an old receipt says nothing about it: so the receipt
+// must be newer than the current ask. A client's ask is sent as it is made,
+// so any receipt is its own; an agent's ask is dated by its owner's card
+// (owner_item_id), and one with no card cannot be dated and is not counted.
+// A row still awaiting its owner is never counted.
 export function backfillGrantSent(db) {
   return db.prepare(`UPDATE grants SET sent_at = COALESCE(answered_at, updated_at, created_at)
     WHERE sent_at IS NULL AND (state IN ('pending','active') OR grantee_item_id IS NOT NULL OR revoked_by = 'grantee'
@@ -1570,7 +1575,9 @@ export function backfillGrantSent(db) {
         JOIN contacts c ON c.id = grants.contact_id
         WHERE e.user_id = c.peer_user_id AND pc.owner_user_id = c.peer_user_id AND e.type = 'people'
           AND json_extract(e.payload, '$.grant_id') = grants.id
-          AND json_extract(e.payload, '$.event') IN ('grant.received', 'grant.handover_received'))))`).run().changes
+          AND json_extract(e.payload, '$.event') IN ('grant.received', 'grant.handover_received')
+          AND (grants.requested_by IS NOT 'agent'
+               OR e.ts >= (SELECT oi.created_at FROM items oi WHERE oi.id = grants.owner_item_id)))))`).run().changes
 }
 
 export function insertBlob(db, { id, ownerUserId, contentType, size, sha256, diskPath, width = null, height = null }) {

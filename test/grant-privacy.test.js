@@ -164,13 +164,32 @@ test('the backfill counts as sent exactly the rows that reached the grantee', as
   const people = ensurePeopleConvo(db, bob.id).id
   append(db, { userId: bob.id, convoId: people, sender: 'journal', type: 'people', payload: { event: 'grant.received', grant_id: 'gr_nocard' } })
   append(db, { userId: bob.id, convoId: people, sender: 'journal', type: 'people', payload: { event: 'grant.handover_received', grant_id: 'gr_nocard2' } })
+  // A row reused for a later agent ask that ended unsent: bob's receipt is
+  // from the earlier ask (older than the new ask's card), so it proves
+  // nothing about this one. And an agent ask whose card is missing cannot be
+  // dated, so a receipt does not count for it either.
+  row('gr_renewed', 'declined', { answered: 9 })
+  append(db, { userId: bob.id, convoId: people, sender: 'journal', type: 'people', payload: { event: 'grant.received', grant_id: 'gr_renewed' } })
+  const later = Date.now() + 60000
+  db.prepare(`INSERT INTO items(id,user_id,num,kind,state,rank,title,origin_convo_id,origin_device_id,created_by,created_at,updated_at,consent)
+    VALUES('it_card',?,99,'question','closed',1,'card','c',0,'agent',?,?,'share')`).run(alice.id, later, later)
+  db.prepare("UPDATE grants SET requested_by='agent', owner_item_id='it_card' WHERE id='gr_renewed'").run()
+  row('gr_undated', 'declined', { answered: 9 })
+  append(db, { userId: bob.id, convoId: people, sender: 'journal', type: 'people', payload: { event: 'grant.received', grant_id: 'gr_undated' } })
+  db.prepare("UPDATE grants SET requested_by='agent' WHERE id='gr_undated'").run()
+  // An agent ask approved and sent: the receipt is newer than its card.
+  row('gr_agentsent', 'revoked', { by: 'owner' })
+  db.prepare(`INSERT INTO items(id,user_id,num,kind,state,rank,title,origin_convo_id,origin_device_id,created_by,created_at,updated_at,consent)
+    VALUES('it_card2',?,98,'question','closed',1,'card','c',0,'agent',0,0,'share')`).run(alice.id)
+  db.prepare("UPDATE grants SET requested_by='agent', owner_item_id='it_card2' WHERE id='gr_agentsent'").run()
+  append(db, { userId: bob.id, convoId: people, sender: 'journal', type: 'people', payload: { event: 'grant.received', grant_id: 'gr_agentsent' } })
   // A line in someone else's log proves nothing about bob.
   const alicePeople = ensurePeopleConvo(db, alice.id).id
   append(db, { userId: alice.id, convoId: alicePeople, sender: 'journal', type: 'people', payload: { event: 'grant.received', grant_id: 'gr_exp' } })
   db.prepare('UPDATE grants SET sent_at=NULL').run()
   backfillGrantSent(db)
   const sent = db.prepare('SELECT id FROM grants WHERE sent_at IS NOT NULL ORDER BY id').all().map((r) => r.id)
-  assert.deepEqual(sent, ['gr_act', 'gr_bobno', 'gr_left', 'gr_nocard', 'gr_nocard2', 'gr_pend', 'gr_revsent'])
+  assert.deepEqual(sent, ['gr_act', 'gr_agentsent', 'gr_bobno', 'gr_left', 'gr_nocard', 'gr_nocard2', 'gr_pend', 'gr_revsent'])
 })
 
 test('revoking a share with a raise in flight leaves no trace of the raise', async (t) => {

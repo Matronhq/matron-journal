@@ -3731,7 +3731,8 @@ read whatever becomes of it, until the row is renewed by a new ask. Rows from be
 column are backfilled as sent when they are pending or active, when the
 grantee had a card for them, answered or ended them, or has a
 `grant.received` / `grant.handover_received` line for them in their People
-log.
+log that is newer than the row's current ask (an agent's ask is dated by
+its owner card; one with no card is not counted this way).
 
 ### What a grantee reads
 
