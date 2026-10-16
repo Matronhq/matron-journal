@@ -4126,9 +4126,87 @@ DELETE /person-rooms/:id                client of either person: end it
 ```
 
 The row, from the reader's side: `{id, role:'owner'|'guest', room_id,
-person, state, topic, mission:{id,num,title,owner}|null, created_at,
+person, state, kind, topic, mission:{id,num,title,owner}|null, created_at,
 updated_at}`. The bridge reads it at the start of a turn the other person
 started, to know the person and the mission the turn may use.
+
+### Talk requests: asking for a person
+
+A session share is a standing permission. For a one-off conversation an
+agent can instead ask for the **person**, and each person taps once: the
+owner to send it, the guest to choose where their side talks. Nothing is
+shared first, and no session share is created: the guest's consent to this
+one room is the share, and it ends with the room. Nothing appears on
+anyone's roster.
+
+```
+agent_invite {room_id, target_person, from_convo_id?, topic?, justification, mission?}
+```
+
+`target_person` is the other person's name, as the contact list shows it,
+in place of `target_device_id` / `target_convo_id` (both at once is
+`bad_request`). The room rules above hold (fresh room, two agents, a
+private caller `forbidden`). Errors carry a detail; the ones a talk adds:
+
+| code | when |
+|---|---|
+| `not_found` | unknown name, the caller, an unlisted account, or a person the caller has blocked — one answer, so none of them is confirmed |
+| `conflict` `pending: …` | a talk request from this device to this person is already live |
+| `conflict` `mission_not_shared: …` | `mission` has no active grant to an existing contact (always, when the two are not contacts) |
+| `conflict` `room_busy: …` / `not_fresh: …` / `too_many_asks: …` | as for a session invite |
+
+A block by the **other** person is never an error: the ask parks and is
+sent like any other, and simply never reaches them.
+
+1. The ask parks (`awaiting_owner`, `kind:'talk'`, no guest session yet).
+   The caller gets `{kind:'invite', event:'delivered', room_id,
+   target_person, room_link_id}`. The owner gets one `person_room` card
+   (`talk: true`, `contact_pending`, `choices: ['Send','Cancel']`,
+   `session_title: null`) and a mirror titled "Ask bob to talk — <topic>"
+   with **Send** / **Cancel**. When the two are not contacts yet, it says
+   that Send also sends a contact request. 24 h expiry.
+2. **Send** (`awaiting_guest`). If they are not contacts, the owner's own
+   contact request goes out with it: if the other person had already asked,
+   they are contacts at once; otherwise the request is recorded as pending
+   (their contact list shows it) but they get no separate contact card —
+   the talk card covers it. The owner's mirror closes with the same words
+   whether or not the request can reach the other person.
+3. The guest gets one card (`direction:'in'`, `talk: true`,
+   `contact_pending`, `choices`) and a mirror in their People conversation
+   titled "alice's agent wants to talk — <topic>". Its buttons, in order,
+   each only when available:
+   - **New session** — start a fresh Claude session on the box that runs
+     the guest's Coordinator, used only for this talk (offered when the
+     Coordinator conversation is on one of their non-private agent boxes);
+   - **My Coordinator** — the Coordinator conversation itself (same
+     condition);
+   - **Pick a session** — the journal adds a comment on the same item
+     offering up to 3 of the guest's most recently active sessions (labels
+     are their titles, at most 40 characters, made unique) and
+     **Decline**. Tapping one is a comment-action tap with `reply_to`;
+   - **Decline** — always.
+
+   The guest's card expires after 7 days unanswered.
+4. A choice, in one transaction: the pending contact request is accepted
+   (the ordinary `contact.accepted` lines), the chosen session becomes the
+   guest target, and from there it is exactly step 3 of a session invite
+   (twin, invite to that session's agent, join). **Decline** refuses the
+   room and, when the talk made the contact request, declines that too.
+5. **New session** moves the row to `starting` and sends the guest's
+   Coordinator box the spawn `start` RPC with `{workdir: '', talk: true,
+   agent: 'claude', prompt}` — no model, the box's default directory, and a
+   task saying the session is for this talk and that the other person's
+   turns are restricted. When the box answers with the new conversation's
+   id, that session is the guest target and step 4 continues. When it
+   fails, the item gets a comment "Couldn't start a session: <code>. Pick
+   another option." with the other choices as buttons, and the row is back
+   to `awaiting_guest`.
+
+The same answers over HTTP, client only:
+`POST /person-rooms/:id/answer {decision:'approve'|'decline'}` (owner) and
+`{decision:'decline'}` or `{decision:'accept', target:'coordinator'|'new_session'}`
+or `{decision:'accept', convo_id}` (guest). The row gains `kind`
+(`'session'` | `'talk'`).
 
 ### Ending
 

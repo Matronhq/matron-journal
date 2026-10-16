@@ -572,7 +572,7 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       // answer to the card, applied by the journal itself — never a comment
       // for an agent to read.
       if (isSharingMirror(item)) return handleConsentTap(ctx, res, who, item, action)
-      if (isPeopleRoomMirror(item)) return handlePeopleRoomTap(ctx, res, who, item, action)
+      if (isPeopleRoomMirror(item)) return handlePeopleRoomTap(ctx, res, who, item, action, body.reply_to ?? null)
     }
     // `reply_to` (2026-10-04 comment-actions contract): the id of the comment
     // whose button was tapped — a follow-up question in this thread. It only

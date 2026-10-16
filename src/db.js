@@ -608,24 +608,33 @@ CREATE INDEX IF NOT EXISTS idx_session_shares_contact ON session_shares(contact_
 --   awaiting_guest  the owner approved; the guest person has not accepted
 --   invited         the guest accepted; the invite is with the guest agent
 --   joined          the guest agent joined
+--   starting        (talk only) the guest chose a new session; it is starting
 --   declined (owner said no) refused (guest person or agent said no)
 --   withdrawn left expired (ended)
 -- owner_contact_id is the owner's contact row for the guest. mission_id is
 -- the owner's mission the room is attached to, if any.
+--
+-- kind 'session' is an invite aimed at a session the guest shares; kind
+-- 'talk' is a talk request aimed at the PERSON: the guest picks where to
+-- talk when they accept, so guest_device_id / guest_convo_id stay NULL
+-- until then, and owner_contact_id stays NULL until the owner's Send when
+-- the two were not contacts yet. contact_by_talk: the owner's Send made the
+-- contact request. pick_options: the label -> session map of the guest's
+-- "Pick a session" follow-up. spawn_id: the new session in flight.
 CREATE TABLE IF NOT EXISTS person_rooms(
   id               TEXT PRIMARY KEY,
   owner_user_id    INTEGER NOT NULL REFERENCES users(id),
   owner_room_id    TEXT NOT NULL,
   owner_device_id  INTEGER NOT NULL,
   owner_convo_id   TEXT,
-  owner_contact_id TEXT NOT NULL REFERENCES contacts(id),
+  owner_contact_id TEXT REFERENCES contacts(id),
   guest_user_id    INTEGER NOT NULL REFERENCES users(id),
-  guest_device_id  INTEGER NOT NULL,
-  guest_convo_id   TEXT NOT NULL,
+  guest_device_id  INTEGER,
+  guest_convo_id   TEXT,
   guest_room_id    TEXT,
   mission_id       TEXT,
   state            TEXT NOT NULL CHECK(state IN
-                     ('awaiting_owner','awaiting_guest','invited','joined','declined','refused','withdrawn','left','expired')),
+                     ('awaiting_owner','awaiting_guest','starting','invited','joined','declined','refused','withdrawn','left','expired')),
   topic            TEXT NOT NULL DEFAULT '',
   justification    TEXT NOT NULL DEFAULT '',
   owner_item_id    TEXT,
@@ -634,6 +643,10 @@ CREATE TABLE IF NOT EXISTS person_rooms(
   created_at       INTEGER NOT NULL,
   updated_at       INTEGER NOT NULL,
   answered_at      INTEGER,
+  kind             TEXT NOT NULL DEFAULT 'session',
+  contact_by_talk  INTEGER NOT NULL DEFAULT 0,
+  pick_options     TEXT,
+  spawn_id         TEXT,
   UNIQUE(owner_room_id, guest_device_id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_person_rooms_guest_room ON person_rooms(guest_room_id) WHERE guest_room_id IS NOT NULL;
@@ -1155,6 +1168,8 @@ export function openDb(path) {
   // procedure, foreign keys off so item_comments' references survive the
   // drop. Placed after every items ALTER so the copy carries them all.
   rebuildItemsForNotice(db)
+  // Talk requests: person_rooms rows aimed at a person, not a session.
+  migratePersonRoomsForTalk(db)
   // Item handover (mission: hand a tracker item from one session to another).
   // An item's origin_convo_id / origin_device_id is its OWNER: every reply,
   // tap, wake and transcript follows it, and a handover moves it. The
@@ -1770,4 +1785,42 @@ export function rebuildItemsForNotice(db) {
     db.pragma('foreign_keys = ON')
   }
   return true
+}
+
+// Talk requests (docs/protocol.md "Rooms between people"): a person_rooms
+// row may name no guest session yet (and, before the owner's Send, no
+// contact row), and has the 'starting' state. SQLite cannot drop NOT NULL
+// or widen a CHECK, so a database from before is rebuilt once, the same
+// 12-step procedure as rebuildItemsForNotice. The new columns are added
+// after, by ALTER, so they land whichever path the table took. Idempotent.
+export function migratePersonRoomsForTalk(db) {
+  const def = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='person_rooms'").get()
+  if (def && !def.sql.includes("'starting'")) {
+    const createNew = def.sql
+      .replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?["`]?person_rooms["`]?\s*\(/i, 'CREATE TABLE person_rooms_talk_new(')
+      .replace(/(owner_contact_id\s+TEXT)\s+NOT NULL/, '$1')
+      .replace(/(guest_device_id\s+INTEGER)\s+NOT NULL/, '$1')
+      .replace(/(guest_convo_id\s+TEXT)\s+NOT NULL/, '$1')
+      .replace("'awaiting_guest','invited'", "'awaiting_guest','starting','invited'")
+    if (!createNew.includes("'starting'")) throw new Error('person_rooms: unexpected state CHECK, cannot add talk requests')
+    const indexes = db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='person_rooms' AND sql IS NOT NULL").all().map((r) => r.sql)
+    db.pragma('foreign_keys = OFF')
+    try {
+      db.transaction(() => {
+        db.exec(createNew)
+        db.exec('INSERT INTO person_rooms_talk_new SELECT * FROM person_rooms')
+        db.exec('DROP TABLE person_rooms')
+        db.exec('ALTER TABLE person_rooms_talk_new RENAME TO person_rooms')
+        for (const sql of indexes) db.exec(sql)
+      })()
+    } finally {
+      db.pragma('foreign_keys = ON')
+    }
+  }
+  const cols = db.prepare('PRAGMA table_info(person_rooms)').all()
+  const add = (name, ddl) => { if (!cols.some((c) => c.name === name)) db.exec(`ALTER TABLE person_rooms ADD COLUMN ${ddl}`) }
+  add('kind', "kind TEXT NOT NULL DEFAULT 'session'")
+  add('contact_by_talk', 'contact_by_talk INTEGER NOT NULL DEFAULT 0')
+  add('pick_options', 'pick_options TEXT')
+  add('spawn_id', 'spawn_id TEXT')
 }

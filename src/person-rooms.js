@@ -32,8 +32,8 @@ import { isPrivateDevice } from './db.js'
 import { recordJoined } from './participants.js'
 
 export const SHARE_STATES = ['awaiting_user', 'active', 'declined', 'revoked', 'expired']
-export const ROOM_STATES = ['awaiting_owner', 'awaiting_guest', 'invited', 'joined', 'declined', 'refused', 'withdrawn', 'left', 'expired']
-export const LIVE_ROOM_STATES = ['awaiting_owner', 'awaiting_guest', 'invited', 'joined']
+export const ROOM_STATES = ['awaiting_owner', 'awaiting_guest', 'starting', 'invited', 'joined', 'declined', 'refused', 'withdrawn', 'left', 'expired']
+export const LIVE_ROOM_STATES = ['awaiting_owner', 'awaiting_guest', 'starting', 'invited', 'joined']
 const LIVE_SQL = `('${LIVE_ROOM_STATES.join("','")}')`
 export const PERSON_SENDER_PREFIX = 'person:'
 
@@ -66,7 +66,7 @@ export function sessionShareRow(db, row) {
 // user, managed by one of the user's own agent devices that is not private
 // (a private box's sessions are invisible even to the user's own ordinary
 // agents, so they are certainly not offered to another person).
-function shareableSession(db, userId, convoId) {
+export function shareableSession(db, userId, convoId) {
   if (typeof convoId !== 'string' || !convoId) return null
   const c = db.prepare(`SELECT c.id, c.agent_device_id FROM conversations c JOIN devices d ON d.id = c.agent_device_id
     WHERE c.id=? AND c.owner_user_id=? AND c.parent_convo_id IS NULL AND c.system IS NULL AND d.user_id = c.owner_user_id AND d.kind='agent'`).get(convoId, userId)
@@ -75,6 +75,11 @@ function shareableSession(db, userId, convoId) {
   // A twin is the guest side of someone else's room, not a session.
   if (db.prepare('SELECT 1 FROM person_rooms WHERE guest_room_id=?').get(convoId)) return null
   return c
+}
+
+// The same, as a yes/no: a private session is simply not one.
+export function isShareableSession(db, userId, convoId) {
+  try { return !!shareableSession(db, userId, convoId) } catch { return false }
 }
 
 // Parked asks one agent device holds across contacts, grants, session
@@ -239,6 +244,7 @@ export function personRoomRow(link, side) {
     room_id: owner ? link.owner_room_id : link.guest_room_id,
     person: owner ? link.guest_name : link.owner_name,
     state: link.state,
+    kind: link.kind ?? 'session',
     topic: link.topic,
     mission: link.mission_id ? { id: link.mission_id, num: link.mission_num, title: link.mission_title, owner: link.owner_name } : null,
     created_at: link.created_at,
@@ -254,7 +260,7 @@ export function personRoomRow(link, side) {
 // room's own consent mirrors (an earlier ask on it that was declined or
 // expired) are not history: they are what a re-ask renews.
 export const FRESH_TEXT_MAX = 5
-function isFreshRoom(db, { userId, roomId, ownerSender }) {
+export function isFreshRoom(db, { userId, roomId, ownerSender }) {
   const r = db.prepare(`SELECT
       SUM(type='text') AS texts,
       SUM(type IN ('session_status','prompt_reply','file','image','milestone','summary')
@@ -308,7 +314,7 @@ export function parkPersonRoom(db, { ownerUserId, roomId, ownerDeviceId, ownerSe
     if (cur) {
       db.prepare(`UPDATE person_rooms SET owner_device_id=?, owner_convo_id=?, owner_contact_id=?, guest_user_id=?, guest_convo_id=?, guest_room_id=NULL,
           mission_id=?, state='awaiting_owner', topic=?, justification=?, owner_item_id=NULL, guest_item_id=NULL, ended_by=NULL,
-          created_at=?, updated_at=?, answered_at=NULL WHERE id=?`)
+          created_at=?, updated_at=?, answered_at=NULL, kind='session', contact_by_talk=0, pick_options=NULL, spawn_id=NULL WHERE id=?`)
         .run(ownerDeviceId, ownerConvoId, own.id, target.user_id, targetConvoId, missionId, topic, justification, now, now, id)
     } else {
       db.prepare(`INSERT INTO person_rooms(id,owner_user_id,owner_room_id,owner_device_id,owner_convo_id,owner_contact_id,guest_user_id,guest_device_id,guest_convo_id,
@@ -324,10 +330,17 @@ const setRoomState = (db, id, state, now, extra = '') =>
   db.prepare(`UPDATE person_rooms SET state=?, updated_at=? ${extra} WHERE id=?`).run(state, now, id)
 
 // Still allowed to go ahead: both contact rows active and the session
-// still shared with the owner.
-function stillAllowed(db, link) {
-  const own = db.prepare('SELECT * FROM contacts WHERE id=?').get(link.owner_contact_id)
+// still shared with the owner. A talk request has no share: the guest's
+// consent to this one room is the share, so its target need only still be
+// a session the guest could share (not private, not a twin).
+export function stillAllowed(db, link) {
+  const own = link.owner_contact_id ? db.prepare('SELECT * FROM contacts WHERE id=?').get(link.owner_contact_id) : null
   if (!isMutual(db, own)) return false
+  if (link.kind === 'talk') {
+    if (link.guest_convo_id == null) return true
+    const c = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(link.guest_convo_id)
+    return c?.agent_device_id === link.guest_device_id && isShareableSession(db, link.guest_user_id, link.guest_convo_id)
+  }
   return !!sharedSessionFor(db, { viewerUserId: link.owner_user_id, convoId: link.guest_convo_id, deviceId: link.guest_device_id })
 }
 
@@ -339,6 +352,18 @@ function createGuestRoom(db, link, now) {
   db.prepare(`INSERT INTO conversations(id, owner_user_id, title, session_state, created_at, agent_device_id)
     VALUES(?,?,?,'running',?,?)`).run(id, link.guest_user_id, title, now, link.owner_device_id)
   return id
+}
+
+// The guest person accepted: the twin, and the guest agent's invite into
+// it, exactly a same-user owner invite (the guest agent is the
+// non-initiator, so it is the one that acks and answers). Caller holds the
+// transaction and has fixed the guest device and session on `link`.
+export function inviteGuest(db, link, now) {
+  const guestRoomId = createGuestRoom(db, link, now)
+  db.prepare(`INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, justification, topic, target_convo_id, created_at)
+    VALUES(?,?,?,'invited',?,?,?,?)`).run(guestRoomId, link.guest_device_id, link.owner_device_id, link.justification, link.topic, link.guest_convo_id, now)
+  db.prepare(`UPDATE person_rooms SET state='invited', guest_room_id=?, updated_at=?, answered_at=? WHERE id=?`).run(guestRoomId, now, now, link.id)
+  return guestRoomId
 }
 
 // One person's answer to one of the two cards. null = neither side's.
@@ -353,7 +378,7 @@ export function answerPersonRoom(db, { userId, linkId, decision, now = Date.now(
     const isOwner = link.owner_user_id === userId
     if (!isOwner && link.guest_user_id !== userId) return null
     // The guest has never been told of an ask its owner has not approved.
-    if (!isOwner && link.state === 'awaiting_owner') return null
+    if (!isOwner && !guestSees(db, link)) return null
     const done = (outcome) => ({ outcome, link: getPersonRoom(db, link.id), before: link })
     if (isOwner && link.state === 'awaiting_owner') {
       if (now - link.updated_at > OWN_ASK_TTL_MS) { setRoomState(db, link.id, 'expired', now); return done('expired') }
@@ -365,12 +390,7 @@ export function answerPersonRoom(db, { userId, linkId, decision, now = Date.now(
     if (!isOwner && link.state === 'awaiting_guest') {
       if (decision === 'decline') { setRoomState(db, link.id, 'refused', now, `, answered_at=${Number(now)}, ended_by='guest'`); return done('refused') }
       if (!stillAllowed(db, link)) { setRoomState(db, link.id, 'withdrawn', now, ", ended_by='contact_removed'"); return done('unavailable') }
-      const guestRoomId = createGuestRoom(db, link, now)
-      // The guest agent's invite, exactly a same-user owner invite: it is
-      // the non-initiator, so it is the one that acks and answers.
-      db.prepare(`INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, justification, topic, target_convo_id, created_at)
-        VALUES(?,?,?,'invited',?,?,?,?)`).run(guestRoomId, link.guest_device_id, link.owner_device_id, link.justification, link.topic, link.guest_convo_id, now)
-      db.prepare(`UPDATE person_rooms SET state='invited', guest_room_id=?, updated_at=?, answered_at=? WHERE id=?`).run(guestRoomId, now, now, link.id)
+      inviteGuest(db, link, now)
       return done('accepted')
     }
     fail('not_pending')
@@ -404,6 +424,9 @@ export function endPersonRoom(db, { linkId, to = 'left', by, now = Date.now() })
     const link = getPersonRoom(db, linkId)
     if (!link || !LIVE_ROOM_STATES.includes(link.state)) return null
     db.prepare(`UPDATE person_rooms SET state=?, updated_at=?, ended_by=? WHERE id=?`).run(to, now, by, link.id)
+    // A talk that ends before its guest chose takes its own contact request
+    // with it: the guest only ever saw it on the talk's card.
+    if (['awaiting_guest', 'starting'].includes(link.state)) link.ended_contact = endTalkContact(db, link, 'removed', now)
     db.prepare("UPDATE convo_agents SET state='left', answered_at=? WHERE convo_id=? AND agent_device_id=? AND state IN ('invited','joined')")
       .run(now, link.owner_room_id, link.guest_device_id)
     if (link.guest_room_id) {
@@ -412,6 +435,26 @@ export function endPersonRoom(db, { linkId, to = 'left', by, now = Date.now() })
     }
     return link
   })()
+}
+
+// The contact request a talk's Send made (contact_by_talk), ended with the
+// talk when the guest never chose: the owner's pending_out row and the
+// guest's pending_in row both go to `to` ('expired' or 'removed'). A guest
+// row the guest blocked stays theirs. Anything else (already contacts, a
+// request that was not the talk's, one answered meanwhile) is left alone.
+// Caller holds the transaction. Returns {own, peer} (peer null when the
+// guest's row was not touched), or null.
+export function endTalkContact(db, link, to, now = Date.now()) {
+  if (link.kind !== 'talk' || !link.contact_by_talk) return null
+  const row = (u, p) => db.prepare('SELECT * FROM contacts WHERE user_id=? AND peer_user_id=? AND peer_journal IS NULL').get(u, p)
+  const own = row(link.owner_user_id, link.guest_user_id)
+  if (own?.state !== 'pending_out') return null
+  const theirs = row(link.guest_user_id, link.owner_user_id)
+  const end = (id) => db.prepare('UPDATE contacts SET state=?, updated_at=?, revoked_at=? WHERE id=?').run(to, now, now, id)
+  end(own.id)
+  const touchPeer = theirs?.state === 'pending_in'
+  if (touchPeer) end(theirs.id)
+  return { own: { ...own, state: to }, peer: touchPeer ? { ...theirs, state: to } : null }
 }
 
 // Every live link between two people, either way round.
@@ -455,7 +498,19 @@ export function setRoomItem(db, linkId, side, itemId) {
 export function listPersonRooms(db, userId) {
   return db.prepare(`${RAW} WHERE (pr.owner_user_id=@u OR (pr.guest_user_id=@u AND pr.state <> 'awaiting_owner')) AND pr.state IN ${LIVE_SQL}
     ORDER BY pr.updated_at DESC`).all({ u: userId })
+    .filter((l) => l.owner_user_id === userId || guestSees(db, l))
     .map((l) => personRoomRow(l, l.owner_user_id === userId ? 'owner' : 'guest'))
+}
+
+// May the guest person know of this link at all? Not before the owner
+// approved it, and never a talk request from someone the guest has blocked:
+// it was parked and "sent" like any other (a block is not an oracle) but
+// never delivered.
+export function guestSees(db, link) {
+  if (!link || link.state === 'awaiting_owner') return false
+  if (link.kind !== 'talk') return true
+  const theirs = db.prepare('SELECT state FROM contacts WHERE user_id=? AND peer_user_id=? AND peer_journal IS NULL').get(link.guest_user_id, link.owner_user_id)
+  return theirs?.state !== 'blocked'
 }
 
 export { userName, peerRowOf }
