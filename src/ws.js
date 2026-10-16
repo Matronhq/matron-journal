@@ -16,7 +16,9 @@ import { expireContactAsks } from './contacts.js'
 import { expireGrantAsks } from './grants.js'
 import { onContactAskExpired, onGrantAskExpired } from './sharing-events.js'
 import { sweepExpiredHandovers } from './item-handover-http.js'
-import { parkPersonRoom, linkOfRoom, isGuestRoom, onGuestAgentAnswer, onGuestInviteExpired, expirePersonRoomAsks, expireSessionShareAsks, LIVE_ROOM_STATES } from './person-rooms.js'
+import { parkPersonRoom, linkOfRoom, isGuestRoom, onGuestAgentAnswer, onGuestInviteExpired, expireSessionShareAsks, LIVE_ROOM_STATES } from './person-rooms.js'
+import { parkTalk } from './talk-requests.js'
+import { ownerTalkAsk, sweepTalkAsks } from './talk-requests-events.js'
 import { onPersonRoomOutcome, onGuestAck, onGuestAnswered, onGuestExpired, endAndNotify, copyRoomMessage, onShareAnswered } from './person-rooms-events.js'
 import { predictSpawnRun } from './spawn-model.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableDevice } from './wake.js'
@@ -366,7 +368,8 @@ export function attachWs({
       try {
         for (const row of expireContactAsks(db)) onContactAskExpired({ db, hub }, row)
         for (const row of expireGrantAsks(db)) onGrantAskExpired({ db, hub }, row)
-        for (const row of expirePersonRoomAsks(db)) onPersonRoomOutcome({ db, hub }, null, { outcome: 'expired', link: row, before: row })
+        // Room asks, session or talk (the owner's 24 h, a talk guest's week).
+        sweepTalkAsks({ db, hub, broker, spawnStartTimeoutMs, spawnWakeWaitMs, waker })
         for (const row of expireSessionShareAsks(db)) onShareAnswered({ db, hub }, null, { outcome: 'expired', share: { ...row, state: 'expired' }, before: row })
       } catch (err) {
         console.error('sharing: ask expiry sweep failed', err)
@@ -1368,6 +1371,44 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const { room, err } = loadRoom(msg.room_id)
         if (err) return fail(...err)
         if (room.agent_device_id !== conn.deviceId) return fail('forbidden', 'only the room owner may invite')
+        // A talk request: aimed at a PERSON, who chooses where their side
+        // talks when they accept (talk-requests.js). Exactly one of
+        // target_person and target_device_id. Every refusal that would say
+        // something about the person (unknown, self, a block) is not_found.
+        if (msg.target_person != null) {
+          if (msg.target_device_id != null || msg.target_convo_id != null) return fail('bad_request', 'target_person or target_device_id, not both')
+          if (typeof msg.target_person !== 'string' || !msg.target_person || msg.target_person.length > 64) return fail('bad_request', 'bad target_person')
+          if (msg.topic != null && (typeof msg.topic !== 'string' || msg.topic.length > INVITE_TOPIC_MAX_CHARS)) return fail('bad_request', 'bad topic')
+          if (typeof msg.justification !== 'string' || !msg.justification || msg.justification.length > INVITE_TEXT_MAX_CHARS) return fail('bad_request', 'bad justification')
+          if (msg.mission != null && !((Number.isInteger(msg.mission) && msg.mission > 0) || (typeof msg.mission === 'string' && msg.mission.length > 0 && msg.mission.length <= 64))) {
+            return fail('bad_request', 'bad mission')
+          }
+          const from = resolveFromConvo()
+          if (from.err) return fail(...from.err)
+          const pJustification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
+          if (!pJustification) return fail('bad_request', 'bad justification')
+          let link
+          try {
+            link = parkTalk(db, {
+              ownerUserId: conn.userId, roomId: msg.room_id, ownerDeviceId: conn.deviceId, ownerSender: `agent:${conn.name}`, ownerConvoId: msg.from_convo_id ?? null,
+              person: msg.target_person, missionRef: msg.mission ?? null,
+              topic: sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS), justification: pJustification,
+            })
+          } catch (err) {
+            if (err.message === 'not_found') return fail('not_found')
+            if (err.message === 'pending') return fail('conflict', 'pending: a talk request to this person is already waiting')
+            if (err.message === 'room_busy') return fail('conflict', 'room_busy: a room with another person holds just the two agents: start a new room')
+            if (err.message === 'too_many_asks') return fail('conflict', 'too_many_asks: too many requests awaiting user approval')
+            if (err.message === 'no_mission') return fail('not_found', 'no such mission')
+            if (err.message === 'mission_not_shared') return fail('conflict', 'mission_not_shared: that mission is not shared with this person: share it first')
+            if (err.message === 'private_box') return fail('forbidden', 'private_box: a private box cannot open a room with another person')
+            if (err.message === 'not_fresh') return fail('conflict', 'not_fresh: a room with another person must be a new room: everything said in it crosses to them (use agent_chat_start)')
+            throw err
+          }
+          ownerTalkAsk(personCtx, link)
+          conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_person: link.guest_name, room_link_id: link.id }))
+          break
+        }
         if (!Number.isInteger(msg.target_device_id)) return fail('bad_request', 'bad target_device_id')
         if (msg.target_device_id === conn.deviceId) return fail('bad_request', 'cannot invite self')
         if (msg.topic != null && (typeof msg.topic !== 'string' || msg.topic.length > INVITE_TOPIC_MAX_CHARS)) return fail('bad_request', 'bad topic')
@@ -1654,7 +1695,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (room.agent_device_id === conn.deviceId) {
           const hit = linkOfRoom(db, msg.room_id)
           if (hit?.side === 'owner' && LIVE_ROOM_STATES.includes(hit.link.state)) {
-            const pending = hit.link.state === 'awaiting_owner' || hit.link.state === 'awaiting_guest'
+            const pending = ['awaiting_owner', 'awaiting_guest', 'starting'].includes(hit.link.state)
             endAndNotify(personCtx, hit.link.id, 'owner_agent', pending ? 'withdrawn' : 'left')
             if (!hasParticipants(db, msg.room_id)) break
           }
