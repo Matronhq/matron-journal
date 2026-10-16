@@ -274,6 +274,11 @@ export function answerTalkGuest(db, { userId, linkId, choice, now = Date.now() }
     if (!link || link.kind !== 'talk' || link.guest_user_id !== userId || !guestSees(db, link)) return null
     if (link.state !== 'awaiting_guest') fail('not_pending')
     const done = (outcome, extra = {}) => ({ outcome, link: getPersonRoom(db, link.id), before: link, ...extra })
+    // Past its week: the same answer the sweep gives, committed here.
+    if (now - link.updated_at > TALK_GUEST_TTL_MS) {
+      setState(db, link.id, 'expired', now, ", ended_by='guest'")
+      return done('expired', { endedContact: endTalkContact(db, link, 'expired', now) })
+    }
     if (choice === 'decline') {
       setState(db, link.id, 'refused', now, `, answered_at=${Number(now)}, ended_by='guest'`)
       let contact = null

@@ -179,6 +179,10 @@ export function onTalkGuestOutcome(ctx, who, out) {
   const l = out.link
   if (out.contact) onContactOutcome(ctx, who, out.contact)
   switch (out.outcome) {
+    case 'expired': {
+      onTalkGuestExpired(ctx, out.before, out.endedContact)
+      return { closed: null, comment: null }
+    }
     case 'pick': {
       const q = guestQuestion(ctx, l, 'Which session should talk with them?', [...Object.keys(out.options), CHOICE.decline])
       return { comment: q?.comment ?? null }

@@ -592,3 +592,22 @@ test('ending a talk leaves a contact request it did not make, and a block, alone
   sweepTalkAsks({ db: w2.s.db, hub: w2.s.hub })
   assert.deepEqual(contactStates(w2), { bob: 'expired', alice: 'blocked' })
 })
+
+test('a guest tap after the week gets the sweep\'s answer', async (t) => {
+  const w = await world(t)
+  await askAndSend(w)
+  const theirs = await guestItem(w)
+  w.s.db.prepare("UPDATE person_rooms SET updated_at=? WHERE kind='talk'").run(Date.now() - TALK_GUEST_TTL_MS - 1000)
+  const late = await w.bobPhone(`/items/${theirs.id}/comments`, post({ action: 'My Coordinator' }))
+  assert.equal(late.status, 409)
+  assert.equal(late.json.blocked_by, 'expired')
+  assert.equal(talkRow(w).state, 'expired')
+  const no = await w.ws.aliceBox.waitFor((f) => f.kind === 'invite' && f.event === 'answer' && f.room_id === 'room')
+  assert.equal(no.accept, false)
+  assert.equal(no.reason, 'expired')
+  assert.equal((await w.bobPhone(`/items/${theirs.id}`)).json.item.state, 'closed')
+  assert.deepEqual(contactStates(w), { bob: 'expired', alice: 'expired' })
+  assert.equal(w.ws.bobCoord.frames.filter((f) => f.kind === 'invite').length, 0, 'no invite went out')
+  // Over HTTP too.
+  assert.equal((await w.bobPhone(`/person-rooms/${talkRow(w).id}/answer`, post({ decision: 'accept', target: 'coordinator' }))).status, 409)
+})
