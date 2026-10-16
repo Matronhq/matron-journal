@@ -325,7 +325,11 @@ function endOtherAsks(db, kind, id, selfId, now) {
     AND (state IN ('awaiting_owner','pending') OR pending_state IS NOT NULL)`).all(kind, id, selfId)
   for (const r of rows) {
     if (r.pending_state) db.prepare('UPDATE grants SET pending_level=NULL, pending_state=NULL, brief=NULL, exclude_media=NULL, approved=NULL, updated_at=? WHERE id=?').run(now, r.id)
-    else db.prepare("UPDATE grants SET state='expired', updated_at=? WHERE id=?").run(now, r.id)
+    else {
+      db.prepare("UPDATE grants SET state='expired', updated_at=? WHERE id=?").run(now, r.id)
+      // Never approved, never sent: the brief is not the recipient's to read.
+      if (r.state === 'awaiting_owner') db.prepare('UPDATE grants SET brief=NULL, exclude_media=NULL, approved=NULL WHERE id=?').run(r.id)
+    }
   }
   return rows
 }

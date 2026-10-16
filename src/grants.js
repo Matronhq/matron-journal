@@ -185,7 +185,11 @@ function setAsk(db, g, state, now, extra = '') {
 const dropRaise = (db, g, now) => db.prepare('UPDATE grants SET pending_level=NULL, pending_state=NULL, brief=NULL, exclude_media=NULL, approved=NULL, updated_at=? WHERE id=?').run(now, g.id)
 // An ask that ends before its owner said yes was never the grantee's to
 // read: its brief goes with it (an ended row stays readable to them).
-const forgetBrief = (db, id) => db.prepare('UPDATE grants SET brief=NULL, exclude_media=NULL WHERE id=?').run(id)
+// Every path that ends an ask still awaiting the owner forgets it this way
+// (an approval refused here, a withdrawal, an expiry, a revoke — and, in
+// contacts.js and handover.js, a removed contact and a hand-over that
+// overtook it).
+const forgetBrief = (db, id) => db.prepare('UPDATE grants SET brief=NULL, exclude_media=NULL, approved=NULL WHERE id=?').run(id)
 
 // null when the hand-over `g` asks for can still happen, else the reason it
 // cannot (one of HANDOVER_REFUSALS).
@@ -196,9 +200,15 @@ function stillPossible(db, g) {
   }
 }
 // A hand-over that can no longer happen: it expires (a raise just drops).
+// Refused at the owner's approval, it was never sent: its brief goes too,
+// since the ended row is readable to the recipient. Refused at the accept,
+// the recipient has already read it.
 function endAsk(db, g, ask, now) {
   if (ask.raise) dropRaise(db, g, now)
-  else setState(db, g.id, 'expired', now)
+  else {
+    setState(db, g.id, 'expired', now)
+    if (ask.state === 'awaiting_owner') forgetBrief(db, g.id)
+  }
 }
 
 // One party's answer to one of the two cards. null = not a grant of

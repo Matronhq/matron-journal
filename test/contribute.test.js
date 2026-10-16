@@ -351,3 +351,36 @@ test('a contributor\'s item takes attachments: [] as "none"', async (t) => {
   assert.equal((await w.bobBox('/items', post({ mission: m.id, kind: 'task', title: 'x', convo_id: 'bobwork', attachments: [] }))).status, 201)
   assert.equal((await w.bobBox('/items', post({ mission: m.id, kind: 'task', title: 'x', convo_id: 'bobwork', body: 'see ![x](attachment:abc123)' }))).status, 400)
 })
+
+test('a contributor\'s reply shows the owner\'s item as queued for its session', async (t) => {
+  const w = await world(t)
+  const { item } = await contributing(w)
+  w.s.db.prepare("UPDATE conversations SET session_state='done' WHERE id='work'").run()
+  assert.equal((await w.bobBox(`/items/${item.id}/comments`, post({ body: 'Second one.', convo_id: 'bobwork' }))).status, 201)
+  assert.equal((await w.alicePhone(`/items/${item.id}`)).json.item.working?.state, 'queued')
+})
+
+test('a mission closed while a contributor\'s status is arriving is a 409, not a 500', async (t) => {
+  const w = await world(t)
+  const { m } = await contributing(w)
+  const r = await slowRequest(w.s.base, w.tokens.bobBox, `/missions/${m.id}`, 'PATCH', { status: 'late' },
+    async () => assert.equal((await w.alicePhone(`/missions/${m.id}/close`, post({ summary: 'done' }))).status, 200))
+  assert.equal(r.status, 409)
+  assert.equal(r.json.blocked_by, 'closed')
+})
+
+test('accepting a raise to contribute says the mission changed, not that it was added', async (t) => {
+  const w = await world(t)
+  const m = (await w.aliceBox('/missions', post({ convo_id: 'work', title: 'Launch' }))).json.mission
+  await makeContacts(w)
+  const read = (await w.alicePhone(`/missions/${m.id}/shares`, post({ contact: 'bob' }))).json.grant
+  await w.bobPhone(`/grants/${read.id}/answer`, post({ decision: 'approve' }))
+  await w.alicePhone(`/missions/${m.id}/shares`, post({ contact: 'bob', level: 'contribute' }))
+  await settle()
+  w.ws.bobPhone.frames.length = 0
+  await w.bobPhone(`/grants/${read.id}/answer`, post({ decision: 'approve' }))
+  await settle()
+  const shared = w.ws.bobPhone.frames.filter((f) => f.kind === 'shared')
+  assert.deepEqual(shared.map((f) => [f.event, f.what]), [['mission_changed', 'grant']])
+  assert.equal(shared[0].mission_id, m.id)
+})
