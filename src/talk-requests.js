@@ -228,6 +228,11 @@ function targetOf(db, link, choice) {
 // session-room guest accept (twin, invite). Caller holds the transaction.
 function acceptOnto(db, link, target, now) {
   const contact = acceptContactForTalk(db, link, now)
+  // An earlier ask in this room that ended without a twin may hold the same
+  // guest device (UNIQUE(owner_room_id, guest_device_id)). A re-ask renews
+  // such a row (parkPersonRoom); here this talk replaces it.
+  db.prepare(`DELETE FROM person_rooms WHERE owner_room_id=? AND guest_device_id=? AND id<>? AND guest_room_id IS NULL AND state NOT IN ${LIVE_SQL}`)
+    .run(link.owner_room_id, target.deviceId, link.id)
   db.prepare('UPDATE person_rooms SET guest_device_id=?, guest_convo_id=?, spawn_id=NULL, updated_at=? WHERE id=?').run(target.deviceId, target.convoId, now, link.id)
   const fixed = getPersonRoom(db, link.id)
   if (!stillAllowed(db, fixed)) {

@@ -314,7 +314,7 @@ export function parkPersonRoom(db, { ownerUserId, roomId, ownerDeviceId, ownerSe
     if (cur) {
       db.prepare(`UPDATE person_rooms SET owner_device_id=?, owner_convo_id=?, owner_contact_id=?, guest_user_id=?, guest_convo_id=?, guest_room_id=NULL,
           mission_id=?, state='awaiting_owner', topic=?, justification=?, owner_item_id=NULL, guest_item_id=NULL, ended_by=NULL,
-          created_at=?, updated_at=?, answered_at=NULL WHERE id=?`)
+          created_at=?, updated_at=?, answered_at=NULL, kind='session', contact_by_talk=0, pick_options=NULL, spawn_id=NULL WHERE id=?`)
         .run(ownerDeviceId, ownerConvoId, own.id, target.user_id, targetConvoId, missionId, topic, justification, now, now, id)
     } else {
       db.prepare(`INSERT INTO person_rooms(id,owner_user_id,owner_room_id,owner_device_id,owner_convo_id,owner_contact_id,guest_user_id,guest_device_id,guest_convo_id,

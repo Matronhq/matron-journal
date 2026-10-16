@@ -443,6 +443,47 @@ test('the existing session invite path keeps working beside talk requests', asyn
   assert.equal(row.kind, 'session')
 })
 
+test('a talk in a room whose earlier session ask was declined lands on the same guest box', async (t) => {
+  const w = await world(t)
+  await makeContacts(w)
+  assert.equal((await w.bobPhone('/session-shares', post({ convo_id: 'bobwork', contact: 'alice' }))).status, 201)
+  w.ws.aliceBox.send({ op: 'agent_invite', room_id: 'room', target_device_id: w.bobBoxId, target_convo_id: 'bobwork', justification: 'old path', from_convo_id: 'room' })
+  await w.ws.aliceBox.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  await settle()
+  const [sessionAsk] = await openItems(w.alicePhone, 'room')
+  assert.equal((await w.alicePhone(`/items/${sessionAsk.id}/comments`, post({ action: 'Decline' }))).status, 200)
+  await settle()
+  w.ws.aliceBox.frames.length = 0
+  await askAndSend(w)
+  const link = talkRow(w)
+  const r = await w.bobPhone(`/person-rooms/${link.id}/answer`, post({ decision: 'accept', convo_id: 'bobwork' }))
+  assert.equal(r.status, 200)
+  assert.equal(r.json.person_room.state, 'invited')
+  const req = await guestJoins(w, 'bobBox')
+  assert.equal(req.target_convo_id, 'bobwork')
+})
+
+test('a session ask that renews an ended talk row is a session ask again', async (t) => {
+  const w = await world(t)
+  await makeContacts(w)
+  await askAndSend(w)
+  const theirs = await guestItem(w)
+  assert.equal((await w.bobPhone(`/items/${theirs.id}/comments`, post({ action: 'Decline' }))).status, 200)
+  // A talk that ended after its guest box was fixed, with no twin.
+  w.s.db.prepare("UPDATE person_rooms SET guest_device_id=?, guest_convo_id='bobwork', contact_by_talk=1, pick_options='{}' WHERE kind='talk'").run(w.bobBoxId)
+  assert.equal((await w.bobPhone('/session-shares', post({ convo_id: 'bobwork', contact: 'alice' }))).status, 201)
+  w.ws.aliceBox.frames.length = 0
+  w.ws.aliceBox.send({ op: 'agent_invite', room_id: 'room', target_device_id: w.bobBoxId, target_convo_id: 'bobwork', justification: 'old path', from_convo_id: 'room' })
+  await w.ws.aliceBox.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  const row = w.s.db.prepare("SELECT * FROM person_rooms WHERE owner_room_id='room'").get()
+  assert.equal(row.kind, 'session')
+  assert.equal(row.contact_by_talk, 0)
+  assert.equal(row.pick_options, null)
+  await settle()
+  const [own] = await openItems(w.alicePhone, 'room')
+  assert.deepEqual(own.actions, ['Approve', 'Decline'])
+})
+
 test('a talk held back by a block ends without a word to the person who blocked', async (t) => {
   const w = await world(t)
   const { bobContact } = await makeContacts(w)
