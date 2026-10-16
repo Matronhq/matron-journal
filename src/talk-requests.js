@@ -209,6 +209,21 @@ function acceptContactForTalk(db, link, now) {
   return answerContact(db, { userId: link.guest_user_id, contactId: theirs.id, decision: 'approve', now })
 }
 
+// May the guest's side talk from this conversation? One of their own
+// shareable sessions (not private, not a twin) on `deviceId`, and not a
+// room of any kind: an agent-chat room or a room with another person is
+// not a session to bring into a new room. The same set "Pick a session"
+// offers, so a choice made over HTTP cannot reach further than the buttons.
+export function isTalkTarget(db, userId, convoId, deviceId) {
+  if (typeof convoId !== 'string' || !convoId) return false
+  const c = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)
+  if (!c || c.agent_device_id !== deviceId) return false
+  if (!isShareableSession(db, userId, convoId)) return false
+  if (db.prepare('SELECT 1 FROM person_rooms WHERE owner_room_id=? OR guest_room_id=?').get(convoId, convoId)) return false
+  if (db.prepare('SELECT 1 FROM convo_agents WHERE convo_id=?').get(convoId)) return false
+  return true
+}
+
 // Resolve the guest's choice to a target {deviceId, convoId}, or throw
 // not_available. `choice` is 'coordinator' or {convoId}.
 function targetOf(db, link, choice) {
@@ -218,15 +233,18 @@ function targetOf(db, link, choice) {
     return t
   }
   const convoId = choice?.convoId
-  if (typeof convoId !== 'string' || !convoId || !isShareableSession(db, link.guest_user_id, convoId)) fail('not_available')
-  const c = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)
+  const c = typeof convoId === 'string' && convoId ? db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId) : null
+  if (!c || !isTalkTarget(db, link.guest_user_id, convoId, c.agent_device_id)) fail('not_available')
   return { deviceId: c.agent_device_id, convoId }
 }
 
 // Accept onto a target, in one transaction: the contact request (if one is
 // pending), the guest session fixed on the row, then exactly the
 // session-room guest accept (twin, invite). Caller holds the transaction.
+// The target is checked FIRST: a tap that cannot land changes nothing, the
+// contact request included.
 function acceptOnto(db, link, target, now) {
+  if (!isTalkTarget(db, link.guest_user_id, target.convoId, target.deviceId)) fail('not_available')
   const contact = acceptContactForTalk(db, link, now)
   // An earlier ask in this room that ended without a twin may hold the same
   // guest device (UNIQUE(owner_room_id, guest_device_id)). A re-ask renews
@@ -291,6 +309,12 @@ export function completeTalkStart(db, { linkId, spawnId, deviceId, convoId, now 
   return db.transaction(() => {
     const link = getPersonRoom(db, linkId)
     if (!link || link.state !== 'starting' || link.spawn_id !== spawnId) return null
+    // The reply named something that is not a fresh session of theirs on
+    // that box: a failed start, back to the guest's choice.
+    if (!isTalkTarget(db, link.guest_user_id, convoId, deviceId)) {
+      setState(db, link.id, 'awaiting_guest', now, ', spawn_id=NULL')
+      return { outcome: 'start_failed', link: getPersonRoom(db, link.id), before: link }
+    }
     const r = acceptOnto(db, { ...link }, { deviceId, convoId }, now)
     return { outcome: r.outcome, contact: r.contact, link: getPersonRoom(db, link.id), before: link }
   })()

@@ -484,6 +484,56 @@ test('a session ask that renews an ended talk row is a session ask again', async
   assert.deepEqual(own.actions, ['Approve', 'Decline'])
 })
 
+test('a guest choice over HTTP reaches no further than the buttons: never a room', async (t) => {
+  const w = await world(t)
+  await makeContacts(w)
+  // An agent-chat room of bob's and a room bob's agent opened with someone.
+  upsertConversation(w.s.db, { id: 'bobchat', ownerUserId: w.bob.id, title: 'Chat', agentDeviceId: w.bobBoxId })
+  w.s.db.prepare("INSERT INTO convo_agents(convo_id, agent_device_id, initiator_device_id, state, created_at) VALUES('bobchat', ?, ?, 'joined', ?)").run(w.bobCoordId, w.bobBoxId, Date.now())
+  await askAndSend(w)
+  const link = talkRow(w)
+  for (const convoId of ['bobchat', 'room', 'nope']) {
+    const r = await w.bobPhone(`/person-rooms/${link.id}/answer`, post({ decision: 'accept', convo_id: convoId }))
+    assert.equal(r.status, 409, convoId)
+    assert.equal(r.json.blocked_by, 'not_available')
+  }
+  assert.equal(talkRow(w).state, 'awaiting_guest')
+})
+
+test('New session whose start names a session that is not new on that box: nothing is accepted, bob chooses again', async (t) => {
+  const w = await world(t)
+  await askAndSend(w)
+  const theirs = await guestItem(w)
+  assert.equal((await w.bobPhone(`/items/${theirs.id}/comments`, post({ action: 'New session' }))).status, 200)
+  const rpc = await w.ws.bobCoord.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start')
+  // bobwork lives on bob's other box, not the Coordinator's.
+  w.ws.bobCoord.send({ op: 'agent_response', request_id: rpc.request.request_id, to_device_id: 0, ok: true, result: { convo_id: 'bobwork' } })
+  await settle(200)
+  const row = talkRow(w)
+  assert.equal(row.state, 'awaiting_guest')
+  assert.equal(row.guest_convo_id, null)
+  assert.equal((await w.bobPhone('/contacts')).json.contacts[0].state, 'pending_in', 'the contact request is not accepted by a start that failed')
+  const retry = (await w.bobPhone(`/items/${theirs.id}`)).json.comments.filter((c) => c.actions?.length).at(-1)
+  assert.equal(retry.body, 'Couldn\'t start a session: bad_start_reply. Pick another option.')
+})
+
+test('New session that times out: back to bob\'s choice', async (t) => {
+  const w = await world(t, { spawnStartTimeoutMs: 100 })
+  await makeContacts(w)
+  await askAndSend(w)
+  const theirs = await guestItem(w)
+  assert.equal((await w.bobPhone(`/items/${theirs.id}/comments`, post({ action: 'New session' }))).status, 200)
+  await w.ws.bobCoord.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start')
+  // The box never answers.
+  await settle(400)
+  assert.equal(talkRow(w).state, 'awaiting_guest')
+  assert.equal(talkRow(w).spawn_id, null)
+  const retry = (await w.bobPhone(`/items/${theirs.id}`)).json.comments.filter((c) => c.actions?.length).at(-1)
+  assert.match(retry.body, /^Couldn't start a session: .+\. Pick another option\.$/)
+  assert.deepEqual(retry.actions, ['My Coordinator', 'Pick a session', 'Decline'])
+  assert.equal(w.ws.aliceBox.frames.filter((f) => f.kind === 'invite' && f.event === 'answer').length, 0, 'alice\'s agent is still waiting')
+})
+
 test('a talk held back by a block ends without a word to the person who blocked', async (t) => {
   const w = await world(t)
   const { bobContact } = await makeContacts(w)

@@ -233,6 +233,10 @@ export async function startTalkSession(ctx, l, target, spawnId, who) {
       if (!cur) upsertConversation(db, { id: convoId, ownerUserId: l.guest_user_id, title: talkSessionTitle(l), agentDeviceId: target.deviceId })
     })
     const done = safely('talk start complete', () => completeTalkStart(db, { linkId: l.id, spawnId, deviceId: target.deviceId, convoId }))
+    if (done?.outcome === 'start_failed') {
+      offerAgain(ctx, done.link, "Couldn't start a session: bad_start_reply. Pick another option.")
+      return 'failed'
+    }
     if (done) { onTalkGuestOutcome(ctx, who, done); return 'started' }
     return 'stale'
   }
