@@ -88,6 +88,59 @@ export function checkHandoverSubject(db, { kind, id, ownerUserId }) {
   return missions
 }
 
+// The refusals an ask, an approval or an accept may meet.
+export const HANDOVER_REFUSALS = new Set(['private_mission', 'mission_closed', 'project_closed', 'empty_project', 'handed_over', 'pending', 'handover_changed'])
+
+// A hand-over of this subject other than `excludeId`: an ask in flight (to
+// anyone), or one already accepted.
+const handoverOf = (db, kind, id, excludeId = '') => db.prepare(`SELECT state, pending_state FROM grants WHERE subject_kind=? AND subject_id=? AND id<>?
+  AND (level='owner' OR pending_level='owner') AND (state IN ('awaiting_owner','pending') OR pending_state IS NOT NULL OR (level='owner' AND state='active'))
+  ORDER BY (level='owner' AND state='active') DESC LIMIT 1`).get(kind, id, excludeId)
+const isAccepted = (h) => h.state === 'active' && !h.pending_state
+
+// Is a hand-over of this mission or project in flight — of it, of the
+// project a mission is in, or of a mission in a project? What refiling a
+// mission must not change under an ask (missions-http.js).
+export function handoverInFlight(db, kind, id) {
+  const h = handoverOf(db, kind, id)
+  return !!h && !isAccepted(h)
+}
+
+// A hand-over's own refusals: the subject is already handed over, or no
+// longer can be (checkHandoverSubject), or another hand-over of it — of the
+// project a mission is in, or of a mission in the project, too: one accept
+// would strand the other — is in flight. `selfId` is the ask being checked
+// again (at its approval or its accept), which is not "another".
+export function checkHandoverAsk(db, { kind, id, ownerUserId, selfId = '' }) {
+  const live = handoverOf(db, kind, id, selfId)
+  if (live && isAccepted(live)) fail('handed_over')
+  const missions = checkHandoverSubject(db, { kind, id, ownerUserId })
+  if (live) fail('pending')
+  const asked = (k, sid) => { const h = handoverOf(db, k, sid, selfId); return h && !isAccepted(h) }
+  if (kind === 'mission' && missions[0].project_id && asked('project', missions[0].project_id)) fail('pending')
+  if (kind === 'project' && missions.some((m) => asked('mission', m.id))) fail('pending')
+  return missions
+}
+export const checkHandoverStill = (db, g) => checkHandoverAsk(db, { kind: g.subject_kind, id: g.subject_id, ownerUserId: g.owner_user_id, selfId: g.id })
+
+// What the owner says yes to: the missions that would cross and the files
+// that would be copied, by id. Fixed on the grant at the approval (or at a
+// client's own ask); the accept copies exactly this or nothing.
+export function approvedSet(db, { kind, id, ownerUserId, excludeMedia = [] }) {
+  const exclude = new Set(excludeMedia)
+  const p = handoverPreview(db, { kind, id, ownerUserId })
+  return {
+    missions: subjectMissions(db, { kind, id, ownerUserId }).map((m) => m.id).sort(),
+    attachments: p.attachments.map((a) => a.media_id).filter((x) => !exclude.has(x)).sort(),
+  }
+}
+export function sameApprovedSet(db, g) {
+  if (!g.approved) return false
+  const was = JSON.parse(g.approved)
+  const now = approvedSet(db, { kind: g.subject_kind, id: g.subject_id, ownerUserId: g.owner_user_id, excludeMedia: JSON.parse(g.exclude_media ?? '[]') })
+  return JSON.stringify(was) === JSON.stringify(now)
+}
+
 // What crosses for one mission, through the private sieve. Comments are
 // every row of each item's thread (the item body's attachment row included)
 // except the item-handover lines, which name the owner's conversations.
@@ -232,7 +285,7 @@ function copyMission(db, { m, toUserId, ownerName, brief, peopleConvo, projectId
 // work went, the mission closes with a summary naming the copy, and every
 // conversation still on it leaves. `copiedItems` tells which of its items
 // crossed. Returns what the events layer needs for markers.
-function closeOriginal(db, { m, copy, granteeName, copiedItems, now }) {
+function closeOriginal(db, { m, copy, granteeName, copiedItems, selfId, now }) {
   const crossed = new Set(copiedItems.map((x) => x.from))
   const open = db.prepare("SELECT id FROM items WHERE mission_id=? AND user_id=? AND state='open' AND consent IS NULL ORDER BY num").all(m.id, m.user_id)
   const closedItems = []
@@ -255,7 +308,21 @@ function closeOriginal(db, { m, copy, granteeName, copiedItems, now }) {
     const out = leaveMission(db, { userId: m.user_id, missionId: m.id, convoId })
     if (out.left) left.push({ convoId, currentMissionId: out.currentChanged ? out.currentMissionId : null, retitled: out.retitled })
   }
-  return { missionId: m.id, closedItems, left }
+  return { missionId: m.id, closedItems, left, endedAsks: endOtherAsks(db, 'mission', m.id, selfId, now) }
+}
+
+// Every other ask still open on a handed-over subject ends with it: a share
+// waiting for the owner or the other person, or the raise of an active
+// share. Returns the rows as they stood, for the events layer to close
+// their cards.
+function endOtherAsks(db, kind, id, selfId, now) {
+  const rows = db.prepare(`SELECT * FROM grants WHERE subject_kind=? AND subject_id=? AND id<>?
+    AND (state IN ('awaiting_owner','pending') OR pending_state IS NOT NULL)`).all(kind, id, selfId)
+  for (const r of rows) {
+    if (r.pending_state) db.prepare('UPDATE grants SET pending_level=NULL, pending_state=NULL, brief=NULL, exclude_media=NULL, approved=NULL, updated_at=? WHERE id=?').run(now, r.id)
+    else db.prepare("UPDATE grants SET state='expired', updated_at=? WHERE id=?").run(now, r.id)
+  }
+  return rows
 }
 
 // The accept. Runs INSIDE answerGrant's transaction: either all of it
@@ -266,7 +333,9 @@ export function applyHandover(db, { g, files, now = Date.now() }) {
   const kind = g.subject_kind
   const ownerUserId = g.owner_user_id
   const toUserId = g.grantee_user_id
-  const missions = checkHandoverSubject(db, { kind, id: g.subject_id, ownerUserId })
+  // Checked again here, whatever the caller did: nothing about the subject
+  // or the other asks on it may have changed under this transaction.
+  const missions = checkHandoverStill(db, g)
   // The recipient's own contact row for the owner: what their read grant on
   // the copy hangs on.
   const theirs = db.prepare("SELECT id FROM contacts WHERE user_id=? AND peer_user_id=? AND peer_journal IS NULL AND state='active'").get(toUserId, ownerUserId)
@@ -292,8 +361,9 @@ export function applyHandover(db, { g, files, now = Date.now() }) {
       : insertDefaultProject(db, { userId: toUserId, deviceId: 0, createdBy: 'user', convoId: people.id, title: m.title, body: m.body ?? '', ts: now })
     const copy = copyMission(db, { m, projectId, ...ctx })
     copies.push(copy)
-    originals.push(closeOriginal(db, { m, copy, granteeName: g.grantee_name, copiedItems: copy.items, now }))
+    originals.push(closeOriginal(db, { m, copy, granteeName: g.grantee_name, copiedItems: copy.items, selfId: g.id, now }))
   }
+  const projectAsks = project ? endOtherAsks(db, 'project', g.subject_id, g.id, now) : []
   if (project) {
     db.prepare(`UPDATE projects SET state='closed', close_summary=?, closed_by='user', closed_over_open_missions=0, closed_at=?, updated_at=? WHERE id=?`)
       .run(`Handed to ${g.grantee_name}: now ${g.grantee_name}'s project #${project.num}.`, now, now, g.subject_id)
@@ -310,5 +380,5 @@ export function applyHandover(db, { g, files, now = Date.now() }) {
   const copyId = project ? project.id : copies[0].id
   db.prepare(`UPDATE grants SET state='active', level='owner', pending_level=NULL, pending_state=NULL, copy_subject_id=?, answered_at=?, updated_at=? WHERE id=?`)
     .run(copyId, now, now, g.id)
-  return { copyId, project, copies, originals, reverse, peopleConvo: people }
+  return { copyId, project, copies, originals, reverse, peopleConvo: people, endedAsks: [...originals.flatMap((o) => o.endedAsks), ...projectAsks] }
 }

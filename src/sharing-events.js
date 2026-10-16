@@ -26,7 +26,7 @@ import { setGrantItem, sharePreview, activeGranteeIds, askOf, getGrantRaw } from
 import { handoverPreview } from './handover.js'
 import { getMission } from './missions.js'
 import { MISSION_EVENT_TYPE, missionMarkerPayload } from './missions-marker.js'
-import { getItem } from './items.js'
+import { getItem, insertComment } from './items.js'
 import { withdrawOnClose } from './item-handover-http.js'
 import { CONSENT_LABEL, consentLink } from './consent-items.js'
 
@@ -618,6 +618,47 @@ export function startSessionOnCopy(_ctx, _who, _g, _request) {
   return { status: 'unavailable' }
 }
 
+// Why a hand-over can no longer happen, in a sentence's words.
+const REFUSAL_WORDS = {
+  private_mission: 'it now comes from a private box',
+  mission_closed: 'the mission has been closed',
+  project_closed: 'the project has been closed',
+  empty_project: 'no open mission is left in the project',
+  handed_over: 'it has already been handed over',
+  pending: 'another hand-over of it is under way',
+  handover_changed: 'what would be handed over has changed since it was approved',
+}
+
+// A note on a card: closes its mirror when still open, else adds the line
+// to its thread (an answered card still says what became of it).
+function noteMirror(ctx, { userId, itemId, consent, comment }) {
+  if (!itemId) return
+  if (closeMirror(ctx, { userId, itemId, consent, resolution: 'cancelled', author: 'agent', comment })) return
+  safely('card note', () => {
+    const { db, hub } = ctx
+    const item = getItem(db, userId, itemId)
+    if (!item) return
+    // A status line with a meta: listComments drops a status row whose meta is null.
+    const c = insertComment(db, { itemId, userId, author: 'agent', deviceId: 0, kind: 'status', body: comment, attachments: [], meta: { note: 'ended' }, idemKey: null, now: Date.now() })
+    appendAndBroadcast(db, hub, { userId, convoId: item.origin_convo_id, sender: JOURNAL, type: ITEM_EVENT_TYPE, payload: itemMarkerPayload({ item, action: 'updated', by: 'agent', comment: c, extra: { consent } }) })
+  })
+}
+
+// Another ask on a subject that has just been handed over ended with it
+// (handover.js endOtherAsks): its open cards close and say so.
+function onAskEndedByHandover(ctx, row, to) {
+  const g = { ...row, ...namesOf(ctx.db, row.id) }
+  const ask = askOf(row)
+  const consent = ask.level === 'owner' ? 'handover' : 'share'
+  const comment = `Ended — the ${g.subject_kind} was handed over to ${plain(to)}.`
+  if (ask.state === 'awaiting_owner') noteMirror(ctx, { userId: g.owner_user_id, itemId: row.owner_item_id, consent, comment })
+  if (ask.state === 'pending') {
+    noteMirror(ctx, { userId: g.grantee_user_id, itemId: row.grantee_item_id, consent, comment })
+    changed(ctx, g.grantee_user_id, { grant_id: g.id })
+  }
+  changed(ctx, g.owner_user_id, { grant_id: g.id })
+}
+
 function onHandoverOutcome(ctx, who, out) {
   const { db } = ctx
   const g = out.grant
@@ -651,6 +692,20 @@ function onHandoverOutcome(ctx, who, out) {
     case 'expired':
       closeMirror(ctx, { userId: g.owner_user_id, itemId: before?.owner_item_id, consent: 'handover', resolution: 'cancelled', author: 'agent', deviceId: before?.origin_device_id, comment: 'Expired — no answer within 24 h. Nothing was sent.' })
       break
+    case 'refused': {
+      // At the owner's approval (nothing reached the recipient) or at the
+      // recipient's accept (both cards are told).
+      const why = REFUSAL_WORDS[out.reason] ?? 'it can no longer be handed over'
+      const atAccept = askOf(before).state === 'pending'
+      noteMirror(ctx, { userId: g.owner_user_id, itemId: before?.owner_item_id, consent: 'handover', comment: `Ended: ${why}. Nothing was handed over.` })
+      if (atAccept) {
+        noteMirror(ctx, { userId: g.grantee_user_id, itemId: before?.grantee_item_id, consent: 'handover', comment: `Ended: ${why}. Nothing was handed over.` })
+        audit(ctx, g.owner_user_id, { event: 'grant.handover_ended', summary: `The hand-over of ${subjectWords(before)} to ${to} ended: ${why}`, contact: oc, grant: g })
+        audit(ctx, g.grantee_user_id, { event: 'grant.handover_ended', summary: `The hand-over of ${subjectWordsFor(before)} from ${from} ended: ${why}`, contact: gc, grant: g })
+        changed(ctx, g.owner_user_id, { grant_id: g.id })
+      }
+      break
+    }
     case 'handed_over': {
       const h = out.handover
       const copy = h.project ? `project #${h.project.num}` : `mission #${h.copies[0].num}`
@@ -660,6 +715,7 @@ function onHandoverOutcome(ctx, who, out) {
       audit(ctx, g.grantee_user_id, { event: 'grant.handover_accepted', summary: `You took over ${subjectWordsFor(before ?? g)} from ${from}: now your ${copy}`, contact: gc, grant: g })
       audit(ctx, g.owner_user_id, { event: 'grant.handover_accepted', summary: `${to} took over ${subjectWords(before ?? g)}`, contact: oc, grant: g })
       announceHandover(ctx, before ?? g, h)
+      for (const row of h.endedAsks) onAskEndedByHandover(ctx, row, g.grantee_name)
       // A raised read share: the recipient's read of the original ends here
       // (it is closed, and theirs now as the copy).
       if (before?.state === 'active' && g.subject_kind === 'mission') {
@@ -676,7 +732,7 @@ function onHandoverOutcome(ctx, who, out) {
       break
     default: break
   }
-  changed(ctx, out.outcome === 'handed_over' || out.outcome === 'declined' ? g.grantee_user_id : g.owner_user_id, { grant_id: g.id })
+  changed(ctx, ['handed_over', 'declined'].includes(out.outcome) || (out.outcome === 'refused' && askOf(before).state === 'pending') ? g.grantee_user_id : g.owner_user_id, { grant_id: g.id })
   return closed
 }
 

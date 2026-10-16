@@ -16,6 +16,7 @@ import {
 } from './missions.js'
 import { notifyGrantees } from './sharing-events.js'
 import { getProject } from './projects.js'
+import { handoverInFlight } from './handover.js'
 import { hasActiveLink } from './mission-links.js'
 import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE, missionMarkerPayload, milestoneMarkerPayload } from './missions-marker.js'
 import { filteredAgent, privateOwnedConvo, markerTitleAllowed } from './privacy.js'
@@ -220,6 +221,11 @@ async function handlePatch(ctx, req, res, who, mission) {
     const ref = projectRefOf(db, who, body.project)
     if (refusedProjectRef(res, ref)) return true
     fields.projectId = ref.projectId
+    // A hand-over in flight was approved for a set of missions: the mission,
+    // the project it leaves and the project it joins all stay as they are
+    // until it ends (src/handover.js).
+    if (ref.projectId !== mission.project_id && [['mission', mission.id], ['project', mission.project_id], ['project', ref.projectId]]
+      .some(([kind, id]) => id && handoverInFlight(db, kind, id))) return conflict(res, { blocked_by: 'handover_pending' })
   }
   if (Object.keys(fields).length === 0) return badRequest(res)
   const statusWriter = typeof fields.status === 'string'

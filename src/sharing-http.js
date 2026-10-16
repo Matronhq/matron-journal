@@ -62,7 +62,7 @@ const forbidden = (res) => { json(res, 403, { error: 'forbidden' }); return true
 const blocked = (res, by, extra = {}) => conflict(res, { blocked_by: by, ...extra })
 const CONTACT_CONFLICTS = new Set(['already_contact', 'pending', 'pending_in', 'blocked', 'too_many_asks', 'not_pending', 'not_active', 'not_blocked'])
 const GRANT_CONFLICTS = new Set(['not_contact', 'level_unavailable', 'private_mission', 'pending', 'too_many_asks', 'not_pending', 'not_active',
-  'handed_over', 'mission_closed', 'project_closed', 'empty_project'])
+  'handed_over', 'mission_closed', 'project_closed', 'empty_project', 'handover_changed'])
 
 // The conversation an agent's ask is parked in — where its card goes. Same
 // gate as every other agent-authored append. A client names none.
@@ -250,6 +250,7 @@ export function applyGrantAnswer(ctx, who, grantId, decision, { excludeMedia, st
   const closed = onGrantOutcome(ctx, who, out)
   if (out.outcome === 'expired') return { status: 409, body: { error: 'conflict', blocked_by: 'expired' }, closed }
   if (out.outcome === 'unavailable') return { status: 409, body: { error: 'conflict', blocked_by: 'not_contact' }, closed }
+  if (out.outcome === 'refused') return { status: 409, body: { error: 'conflict', blocked_by: out.reason }, closed }
   const session = out.outcome === 'handed_over' && startSession ? { start_session: startSessionOnCopy(ctx, who, out.grant, startSession) } : {}
   return { status: 200, body: { grant: grantRow(out.grant, who.userId), ...session }, closed }
 }

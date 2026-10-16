@@ -1508,7 +1508,9 @@ export function openDb(path) {
   // row stays active at its old level until both yeses are in, then takes
   // the new one. pending_state is 'awaiting_owner' | 'pending', like state.
   const grantCols = db.prepare('PRAGMA table_info(grants)').all()
-  for (const [name, type] of [['brief', 'TEXT'], ['exclude_media', 'TEXT'], ['copy_subject_id', 'TEXT'], ['pending_level', 'TEXT'], ['pending_state', 'TEXT']]) {
+  // `approved` is what the owner said yes to for a hand-over: the mission ids
+  // and the attachment ids that would cross, fixed at the owner's approval.
+  for (const [name, type] of [['brief', 'TEXT'], ['exclude_media', 'TEXT'], ['copy_subject_id', 'TEXT'], ['pending_level', 'TEXT'], ['pending_state', 'TEXT'], ['approved', 'TEXT']]) {
     if (!grantCols.some((c) => c.name === name)) db.exec(`ALTER TABLE grants ADD COLUMN ${name} ${type}`)
   }
   // Unified search's tracker mirror (spec 2026-10-12 unified search §1).

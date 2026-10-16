@@ -533,3 +533,94 @@ test('withdrawing a project hand-over names the project, and a link to a vanishe
   assert.equal((await w.bobPhone(`/grants/${again.id}/answer`, post({ decision: 'approve' }))).status, 200)
   assert.equal(w.s.db.prepare("SELECT ended_at FROM mission_conversations WHERE convo_id='gone'").get().ended_at != null, true)
 })
+
+test('the owner approves a set; if what would cross changes before the accept, the hand-over ends', async (t) => {
+  const w = await world(t)
+  const proj = (await w.alicePhone('/projects', post({ title: 'Garden Club' }))).json.project
+  await w.aliceBox('/missions', post({ convo_id: 'work', title: 'Launch', project: proj.id }))
+  await makeContacts(w)
+  const ask = (await w.aliceBox(`/projects/${proj.id}/shares`, post({ contact: 'bob', level: 'owner', brief: BRIEF, convo_id: 'work' }))).json.grant
+  assert.equal((await w.alicePhone(`/grants/${ask.id}/answer`, post({ decision: 'approve' }))).status, 200)
+  // A mission joins the project after alice approved what crosses.
+  upsertConversation(w.s.db, { id: 'late', ownerUserId: w.alice.id, title: 'Late', agentDeviceId: null })
+  const late = await w.alicePhone('/missions', post({ convo_id: 'late', title: 'Late mission', project: proj.id }))
+  assert.equal(late.status, 201)
+  const r = await w.bobPhone(`/grants/${ask.id}/answer`, post({ decision: 'approve' }))
+  assert.equal(r.status, 409)
+  assert.equal(r.json.blocked_by, 'handover_changed')
+  assert.equal((await w.alicePhone(`/grants/${ask.id}`)).json.grant.state, 'expired')
+  const bobMirror = (await w.bobPhone('/items?label=consent&state=closed')).json.items.find((i) => i.consent === 'handover')
+  assert.equal(bobMirror.resolution, 'cancelled')
+  assert.match((await w.bobPhone(`/items/${bobMirror.id}`)).json.comments.at(-1).body, /changed/)
+  const aliceMirror = (await w.alicePhone('/items?label=consent&state=closed')).json.items.find((i) => i.consent === 'handover')
+  assert.match((await w.alicePhone(`/items/${aliceMirror.id}`)).json.comments.at(-1).body, /changed/)
+  assert.equal((await w.alicePhone(`/projects/${proj.id}`)).json.project.state, 'open', 'nothing moved')
+  assert.deepEqual((await w.bobPhone('/missions')).json.missions, [])
+})
+
+test('a new attachment after the approval ends the hand-over too', async (t) => {
+  const w = await world(t)
+  const m = (await w.aliceBox('/missions', post({ convo_id: 'work', title: 'Launch' }))).json.mission
+  const item = (await w.aliceBox('/items', post({ convo_id: 'work', kind: 'task', title: 'Plan' }))).json.item
+  await makeContacts(w)
+  const g = (await w.alicePhone(`/missions/${m.id}/shares`, post({ contact: 'bob', level: 'owner', brief: BRIEF }))).json.grant
+  const blob = await w.upload(w.tokens.aliceBox, 'late file', 'text/plain')
+  await w.aliceBox(`/items/${item.id}/comments`, post({ body: 'one more', attachments: [{ blob_ref: blob, mime: 'text/plain', name: 'late.txt', size: 9 }] }))
+  const r = await w.bobPhone(`/grants/${g.id}/answer`, post({ decision: 'approve' }))
+  assert.equal(r.json.blocked_by, 'handover_changed')
+  assert.equal((await w.alicePhone(`/missions/${m.id}`)).json.mission.state, 'open')
+})
+
+test('approving re-checks the subject: a mission closed meanwhile ends the ask and the card says why', async (t) => {
+  const w = await world(t)
+  const m = (await w.aliceBox('/missions', post({ convo_id: 'work', title: 'Launch' }))).json.mission
+  await makeContacts(w)
+  const ask = (await w.aliceBox(`/missions/${m.id}/shares`, post({ contact: 'bob', level: 'owner', brief: BRIEF, convo_id: 'work' }))).json.grant
+  assert.equal((await w.alicePhone(`/missions/${m.id}/close`, post({ summary: 'done another way' }))).status, 200)
+  const r = await w.alicePhone(`/grants/${ask.id}/answer`, post({ decision: 'approve' }))
+  assert.equal(r.status, 409)
+  assert.equal(r.json.blocked_by, 'mission_closed')
+  assert.equal((await w.alicePhone(`/grants/${ask.id}`)).json.grant.state, 'expired')
+  const mirror = (await w.alicePhone('/items?label=consent&state=closed')).json.items.find((i) => i.consent === 'handover')
+  assert.match((await w.alicePhone(`/items/${mirror.id}`)).json.comments.at(-1).body, /closed/)
+  await settle()
+  assert.equal(cards(w.ws.bobPhone, 'mission_handover').length, 0, 'nothing reached bob')
+})
+
+test('a mission or project with a hand-over in flight cannot be refiled', async (t) => {
+  const w = await world(t)
+  const projA = (await w.alicePhone('/projects', post({ title: 'A' }))).json.project
+  const projB = (await w.alicePhone('/projects', post({ title: 'B' }))).json.project
+  const m = (await w.aliceBox('/missions', post({ convo_id: 'work', title: 'Launch', project: projA.id }))).json.mission
+  upsertConversation(w.s.db, { id: 'loose', ownerUserId: w.alice.id, title: 'Loose', agentDeviceId: null })
+  const loose = (await w.alicePhone('/missions', post({ convo_id: 'loose', title: 'Loose' }))).json.mission
+  await makeContacts(w)
+  const g = (await w.alicePhone(`/missions/${m.id}/shares`, post({ contact: 'bob', level: 'owner', brief: BRIEF }))).json.grant
+  const out = await w.alicePhone(`/missions/${m.id}`, { method: 'PATCH', body: { project: projB.id } })
+  assert.equal(out.status, 409)
+  assert.equal(out.json.blocked_by, 'handover_pending')
+  await w.bobPhone(`/grants/${g.id}/answer`, post({ decision: 'decline' }))
+  assert.equal((await w.alicePhone(`/missions/${m.id}`, { method: 'PATCH', body: { project: projB.id } })).status, 200, 'once it ended')
+  // A project being handed over takes no missions in or out.
+  await w.alicePhone(`/projects/${projB.id}/shares`, post({ contact: 'bob', level: 'owner', brief: BRIEF }))
+  assert.equal((await w.alicePhone(`/missions/${loose.id}`, { method: 'PATCH', body: { project: projB.id } })).json.blocked_by, 'handover_pending')
+  assert.equal((await w.alicePhone(`/missions/${m.id}`, { method: 'PATCH', body: { project: projA.id } })).json.blocked_by, 'handover_pending')
+  assert.equal((await w.alicePhone(`/missions/${m.id}`, { method: 'PATCH', body: { title: 'Renamed' } })).status, 200, 'other edits are fine')
+})
+
+test('handing over ends the original\'s other open asks and closes their cards', async (t) => {
+  const w = await world(t)
+  const m = (await w.aliceBox('/missions', post({ convo_id: 'work', title: 'Launch' }))).json.mission
+  await makeContacts(w)
+  await makeContacts(w, 'alicePhone', 'carolPhone', 'carol')
+  // A read share offered to carol, still with her; and alice's agent's
+  // second ask, still with alice.
+  const toCarol = (await w.alicePhone(`/missions/${m.id}/shares`, post({ contact: 'carol' }))).json.grant
+  const g = (await w.alicePhone(`/missions/${m.id}/shares`, post({ contact: 'bob', level: 'owner', brief: BRIEF }))).json.grant
+  assert.equal((await w.bobPhone(`/grants/${g.id}/answer`, post({ decision: 'approve' }))).status, 200)
+  assert.equal((await w.alicePhone(`/grants/${toCarol.id}`)).json.grant.state, 'expired')
+  const carolMirror = (await w.carolPhone('/items?label=consent&state=closed')).json.items.find((i) => i.consent === 'share')
+  assert.equal(carolMirror.resolution, 'cancelled')
+  assert.match((await w.carolPhone(`/items/${carolMirror.id}`)).json.comments.at(-1).body, /handed over/)
+  assert.equal((await w.carolPhone('/items?label=consent&state=open')).json.items.length, 0)
+})

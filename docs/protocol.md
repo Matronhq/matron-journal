@@ -3792,7 +3792,7 @@ conversation: `{event, summary, contact_id, peer:{name,address}, grant_id?,
 level?, mission?:{id,num,title}, owner?, by?}` with `event` one of
 `contact.requested|received|accepted|declined|removed|blocked|unblocked`
 and `grant.offered|received|accepted|declined|revoked`, and for a
-hand-over `grant.handover_offered|handover_received|handover_accepted|handover_declined`
+hand-over `grant.handover_offered|handover_received|handover_accepted|handover_declined|handover_ended`
 (with `project?:{id,num,title}` for a project). Never a push.
 
 Ephemeral frames, client sockets only:
@@ -3860,8 +3860,11 @@ reason. The mirror's status does not change.
  preview:{missions, milestones, items, comments, attachments}}
 ```
 
-`attachments` here is the count that will arrive. No number, box or
-conversation of the owner's. The recipient answers `POST /grants/:id/answer
+`attachments` here is the count that will arrive. The card carries no
+number, box or conversation of the owner's. (As for a read share, the
+recipient's `GET /grants/:id` and their audit events do name the owner's
+mission or project number, in `mission`/`project`; a number names nothing
+the recipient can open.) The recipient answers `POST /grants/:id/answer
 {decision, start_session?}`; `start_session: {device_id, workdir?}` asks for
 a session on the copy and is answered `start_session: {status:
 'unavailable'}` until the journal can start one (the copy is made either way).
@@ -3899,9 +3902,28 @@ a session on the copy and is answered `start_session: {status:
   `contribute` only), `DELETE` on it is 409 `handed_over`, and removing the
   contact leaves it.
 
-If the subject can no longer be handed over at accept time (closed, made
-private, the contact gone) the answer is 409 with the reason and nothing
-changes.
+**What the owner approved is what crosses.** At the owner's approval (or a
+client's own ask, which is the owner's yes) the journal fixes the set: the
+mission ids and the attachment ids that would be copied. The subject is
+checked again at that approval: if it can no longer be handed over the ask
+ends (`expired`), the owner's card says why, and the answer is 409 with the
+reason (`mission_closed`, `project_closed`, `empty_project`,
+`private_mission`, `handed_over`, `pending`). The accept checks again, and
+also refuses when the set differs from the one approved — a mission joined
+or left the project, a file was added or is gone — with 409
+`handover_changed`. A refused accept ends the hand-over (`expired`; a raise
+just drops), notes the reason on both cards, writes `grant.handover_ended`
+to both People logs, and changes nothing else. A contact gone at the accept
+is 409 `not_pending`.
+
+While a hand-over is in flight, `PATCH /missions/:id {project}` that would
+move the mission, or move a mission into or out of the project being
+handed over, is 409 `handover_pending`.
+
+On accept, every other ask still open on the original mission or project
+— a share waiting for its owner or for the other person, or the raise of an
+active share — ends (`expired`, or the raise drops) and its open cards close
+saying the subject was handed over.
 
 ## Rooms between people (phase 2)
 
