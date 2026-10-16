@@ -523,6 +523,9 @@ function handoverCardPayload(db, g, direction) {
     owner: { user_id: g.owner_user_id, name: g.owner_name },
     grantee: { name: g.grantee_name, address: g.grantee_journal ? `${g.grantee_name}@${g.grantee_journal}` : g.grantee_name },
     subject: subjectOf(g, direction), brief: g.brief ?? '',
+    // What the owner keeps on the copy: 'read' or 'contribute'. The owner's
+    // card can change it (POST /grants/:id/answer {keep_level}).
+    keep_level: g.keep_level === 'contribute' ? 'contribute' : 'read',
   }
   if (direction === 'out') return { ...base, preview: p }
   const excluded = new Set(g.exclude_media ? JSON.parse(g.exclude_media) : [])
@@ -550,7 +553,7 @@ const handoverOwnerAsk = asking('hand-over approval card', (ctx, who, g) => {
       `**${plain(sanitizePeerText(who.name, 80))}** asks to hand **${subjectWords(g)}** over to your contact **${to}**.`,
       '',
       `- **What crosses:** ${counts(p, p.attachments.length)}${p.attachments.length ? ` — ${p.attachments.map((a) => plain(sanitizePeerText(a.name, 80)) || 'a file').join(', ')}` : ''}. Untick attachments on the card.`,
-      `- **Then:** ${to} gets their own copy, under their own numbering. Your ${g.subject_kind} closes as handed to ${to}, its open items are cancelled, and you keep read access to the copy until ${to} ends it.`,
+      `- **Then:** ${to} gets their own copy, under their own numbering. Your ${g.subject_kind} closes as handed to ${to}, its open items are cancelled, and you keep ${g.keep_level === 'contribute' ? 'contributing to' : 'read access to'} the copy until ${to} ends it.${g.keep_level === 'contribute' ? '' : ' To keep contributing instead, switch it on the card.'}`,
       '',
       WHAT_NEVER,
       '',
@@ -578,7 +581,9 @@ const handoverGranteeAsk = asking('hand-over offer card', (ctx, g) => {
       `Your contact **${from}** wants to hand ${subjectWordsFor(g)} over to you.`,
       '',
       `- **You would get:** ${counts(payload.preview, payload.preview.attachments)}, as your own ${g.subject_kind}, under your own numbering.`,
-      `- ${from} keeps read access to it, which you can end at any time.`,
+      g.keep_level === 'contribute'
+        ? `- ${from} stays on as a contributor: they can post milestones, file and comment on items and set its status. You can end that at any time.`
+        : `- ${from} keeps read access to it, which you can end at any time.`,
       '',
       `**${from}'s brief** (the first milestone of your copy):`,
       '',

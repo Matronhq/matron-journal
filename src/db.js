@@ -1544,7 +1544,9 @@ export function openDb(path) {
   const grantCols = db.prepare('PRAGMA table_info(grants)').all()
   // `approved` is what the owner said yes to for a hand-over: the mission ids
   // and the attachment ids that would cross, fixed at the owner's approval.
-  for (const [name, type] of [['brief', 'TEXT'], ['exclude_media', 'TEXT'], ['copy_subject_id', 'TEXT'], ['pending_level', 'TEXT'], ['pending_state', 'TEXT'], ['approved', 'TEXT']]) {
+  // `keep_level` is what the old owner keeps on the copy after a hand-over:
+  // 'contribute', or NULL for read.
+  for (const [name, type] of [['brief', 'TEXT'], ['exclude_media', 'TEXT'], ['copy_subject_id', 'TEXT'], ['pending_level', 'TEXT'], ['pending_state', 'TEXT'], ['approved', 'TEXT'], ['keep_level', 'TEXT']]) {
     if (!grantCols.some((c) => c.name === name)) db.exec(`ALTER TABLE grants ADD COLUMN ${name} ${type}`)
   }
   // `sent_at`: when the row was sent to its grantee (moved to pending). The

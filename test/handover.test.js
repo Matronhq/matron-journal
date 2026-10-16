@@ -403,6 +403,60 @@ test('hand-over of a mission already shared read-only: the share upgrades in pla
   assert.equal((await w.alicePhone(`/missions/${copyId}`)).status, 200)
 })
 
+test('hand over and keep contributing: the agent asks for it, the cards say so, and alice can still write to bob\'s copy', async (t) => {
+  const w = await world(t)
+  const m = (await w.aliceBox('/missions', post({ convo_id: 'work', title: 'Launch' }))).json.mission
+  await makeContacts(w)
+  // Only a hand-over keeps a level, and only read or contribute.
+  assert.equal((await w.aliceBox(`/missions/${m.id}/shares`, post({ contact: 'bob', keep_level: 'contribute', convo_id: 'work' }))).status, 400)
+  assert.equal((await w.aliceBox(`/missions/${m.id}/shares`, post({ contact: 'bob', level: 'owner', brief: BRIEF, keep_level: 'owner', convo_id: 'work' }))).status, 400)
+
+  const ask = await w.aliceBox(`/missions/${m.id}/shares`, post({ contact: 'bob', level: 'owner', brief: BRIEF, keep_level: 'contribute', convo_id: 'work' }))
+  assert.equal(ask.status, 202)
+  assert.equal(ask.json.grant.keep_level, 'contribute')
+  await settle()
+  const out = cards(w.ws.alicePhone, 'mission_handover').at(-1)
+  assert.equal(out.payload.keep_level, 'contribute')
+  const ownerMirror = (await w.alicePhone('/items?limit=500')).json.items.find((i) => i.consent === 'handover')
+  assert.match(ownerMirror.body, /keep contributing to the copy/)
+
+  // alice approves; the card's switch is hers, and her answer stands.
+  assert.equal((await w.alicePhone(`/grants/${ask.json.grant.id}/answer`, post({ decision: 'approve', keep_level: 'banana' }))).status, 400)
+  assert.equal((await w.alicePhone(`/grants/${ask.json.grant.id}/answer`, post({ decision: 'approve', keep_level: 'contribute' }))).status, 200)
+  await settle()
+  const inCard = cards(w.ws.bobPhone, 'mission_handover').at(-1)
+  assert.equal(inCard.payload.keep_level, 'contribute')
+  assert.equal((await w.bobPhone(`/grants/${ask.json.grant.id}`)).json.grant.keep_level, 'contribute')
+  const bobMirror = (await w.bobPhone('/items?limit=500')).json.items.find((i) => i.consent === 'handover')
+  assert.match(bobMirror.body, /stays on as a contributor/)
+
+  const accepted = await w.bobPhone(`/grants/${ask.json.grant.id}/answer`, post({ decision: 'approve' }))
+  assert.equal(accepted.status, 200)
+  const copyId = accepted.json.grant.copy_id
+  const back = (await w.alicePhone('/grants?direction=in')).json.grants
+  assert.deepEqual(back.map((g) => [g.level, g.state, g.subject_id]), [['contribute', 'active', copyId]])
+  // alice's agent writes into bob's copy, as a contributor.
+  upsertConversation(w.s.db, { id: 'later', ownerUserId: w.alice.id, title: 'Later', agentDeviceId: w.s.db.prepare("SELECT id FROM devices WHERE name='alice-box'").get().id })
+  const ms = await w.aliceBox('/milestones', post({ mission: copyId, kind: 'progress', title: 'Caterer confirmed', convo_id: 'later' }))
+  assert.equal(ms.status, 201)
+  assert.deepEqual(ms.json.milestone.contributor, { name: 'alice', via: 'agent' })
+  // bob can step alice down to reading, or end it, like any share of his.
+  assert.equal((await w.bobPhone(`/grants/${back[0].id}`, { method: 'DELETE' })).status, 200)
+})
+
+test('the owner\'s card overrides the agent: switching keep contributing off hands over read-only', async (t) => {
+  const w = await world(t)
+  const m = (await w.aliceBox('/missions', post({ convo_id: 'work', title: 'Launch' }))).json.mission
+  await makeContacts(w)
+  const ask = await w.aliceBox(`/missions/${m.id}/shares`, post({ contact: 'bob', level: 'owner', brief: BRIEF, keep_level: 'contribute', convo_id: 'work' }))
+  assert.equal((await w.alicePhone(`/grants/${ask.json.grant.id}/answer`, post({ decision: 'approve', keep_level: 'read' }))).status, 200)
+  assert.equal((await w.bobPhone(`/grants/${ask.json.grant.id}`)).json.grant.keep_level, 'read')
+  // The recipient cannot change what they are agreeing to.
+  assert.equal((await w.bobPhone(`/grants/${ask.json.grant.id}/answer`, post({ decision: 'approve', keep_level: 'contribute' }))).status, 200)
+  const back = (await w.alicePhone('/grants?direction=in')).json.grants
+  assert.deepEqual(back.map((g) => g.level), ['read'])
+})
+
 test('a declined upgrade leaves the read share as it was', async (t) => {
   const w = await world(t)
   const m = (await w.aliceBox('/missions', post({ convo_id: 'work', title: 'Launch' }))).json.mission
