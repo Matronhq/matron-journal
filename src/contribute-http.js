@@ -171,6 +171,8 @@ export async function handleContributorItemSub(ctx, req, res, who, shared, sub, 
   const item = contributableItem(db, who.userId, shared.id)
   if (!item) return forbidden(res)
   const body = await readBody(req)
+  // A closed mission takes no more writes, as for milestones and items.
+  if (db.prepare('SELECT state FROM missions WHERE id=?').get(item.mission_id)?.state !== 'open') return conflict(res, { blocked_by: 'closed' })
   const contributor = contributorOf(db, who)
   const reply = (out) => {
     json(res, sub === 'comments' ? 201 : 200, { item: getSharedItem(db, who.userId, item.id), comment: grantedComment(out.comment ?? out) })

@@ -215,10 +215,10 @@ function copyMission(db, { m, toUserId, ownerName, brief, peopleConvo, projectId
   const id = newId('ms')
   const num = nextNum(db, toUserId)
   const status = m.status_hidden ? null : m.status
-  db.prepare(`INSERT INTO missions(id,user_id,num,state,title,name,body,status,status_by,status_updated_at,origin_convo_id,origin_device_id,created_by,created_at,updated_at,project_id)
-    VALUES(?,?,?,'open',?,?,?,?,?,?,?,0,'user',?,?,?)`).run(
+  db.prepare(`INSERT INTO missions(id,user_id,num,state,title,name,body,status,status_by,status_updated_at,status_contributor,origin_convo_id,origin_device_id,created_by,created_at,updated_at,project_id)
+    VALUES(?,?,?,'open',?,?,?,?,?,?,?,?,0,'user',?,?,?)`).run(
     id, toUserId, num, m.title, m.name ?? null, m.body ?? '', status, status == null ? null : 'agent', status == null ? null : m.status_updated_at,
-    peopleConvo, now, now, projectId)
+    status == null ? null : m.status_contributor ?? null, peopleConvo, now, now, projectId)
   const { milestones, items } = missionContents(db, m.id)
   const insMilestone = db.prepare(`INSERT INTO milestones(id,mission_id,user_id,num,kind,title,body,convo_id,seq,device_id,created_by,created_at,contributor_name,contributor_via)
     VALUES(?,?,?,?,?,?,?,?,0,0,'agent',?,?,?)`)

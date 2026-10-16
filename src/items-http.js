@@ -17,6 +17,7 @@ import {
 import { itemMarkerPayload, ITEM_EVENT_TYPE, ITEM_ACTIONS, itemFallbackText, FALLBACK_ACTIONS } from './items-marker.js'
 import { visibleMission, writableConvo } from './missions-http.js'
 import { handleContributedItem, handleContributorItemSub, forwardToContributor } from './contribute-http.js'
+import { contributableItem } from './contribute.js'
 import { filteredAgent, privateOwnedConvo } from './privacy.js'
 import { handleConsentTap, isSharingMirror } from './sharing-http.js'
 import { handlePeopleRoomTap, isPeopleRoomMirror } from './person-rooms-http.js'
@@ -488,8 +489,10 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
       return true
     }
     // A contributor to the item's mission may comment, close and reopen
-    // (src/contribute-http.js answers everything else 403 too).
-    if (shared.shared_via === 'grant' && sub) return handleContributorItemSub(ctx, req, res, who, shared, sub, subId)
+    // (src/contribute-http.js answers everything else 403 too) — whichever
+    // rule the read came back under: an item also visible through the org
+    // rule is still on a mission they contribute to.
+    if (sub && contributableItem(db, who.userId, shared.id)) return handleContributorItemSub(ctx, req, res, who, shared, sub, subId)
     json(res, 403, { error: 'forbidden' })
     return true
   }

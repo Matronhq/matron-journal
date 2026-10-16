@@ -250,11 +250,13 @@ test('handing over a mission keeps naming its contributor', async (t) => {
   await w.bobBox(`/items/${item.id}/comments`, post({ body: 'The second one.', convo_id: 'bobwork' }))
   await w.bobBox('/items', post({ mission: m.id, kind: 'task', title: 'Print menus', convo_id: 'bobwork' }))
   await w.bobBox('/milestones', post({ mission: m.id, kind: 'progress', title: 'Menus drafted', convo_id: 'bobwork' }))
+  await w.bobBox(`/missions/${m.id}`, { method: 'PATCH', body: { status: 'Menus out.' } })
   // alice hands the mission to bob himself: the share is raised in place.
   const g = (await w.alicePhone(`/missions/${m.id}/shares`, post({ contact: 'bob', level: 'owner', brief: 'All yours.' }))).json.grant
   const copyId = (await w.bobPhone(`/grants/${g.id}/answer`, post({ decision: 'approve' }))).json.grant.copy_id
   const copy = (await w.bobPhone(`/missions/${copyId}`)).json
   assert.deepEqual(copy.milestones.find((x) => x.title === 'Menus drafted').contributor, { name: 'bob', via: 'agent' })
+  assert.equal(copy.mission.status_contributor, 'bob')
   const items = (await w.bobPhone('/items?limit=500')).json.items.filter((i) => i.mission_id === copyId)
   assert.deepEqual(items.find((i) => i.title === 'Print menus').contributor, { name: 'bob', via: 'agent' })
   const thread = (await w.bobPhone(`/items/${items.find((i) => i.title === 'Which caterer?').id}`)).json.comments
@@ -268,4 +270,30 @@ test('a mission whose box turns private is no longer written to', async (t) => {
   assert.equal((await w.bobBox('/milestones', post({ mission: m.id, kind: 'progress', title: 'x', convo_id: 'bobwork' }))).status, 404)
   assert.equal((await w.bobBox('/items', post({ mission: m.id, kind: 'task', title: 'x', convo_id: 'bobwork' }))).status, 404)
   assert.equal((await w.bobBox(`/missions/${m.id}`, { method: 'PATCH', body: { status: 'x' } })).status, 404)
+})
+
+test('a closed mission takes no more writes from a contributor', async (t) => {
+  const w = await world(t)
+  const { m, item } = await contributing(w)
+  assert.equal((await w.alicePhone(`/missions/${m.id}/close`, post({ summary: 'done' }))).status, 200)
+  for (const [p, body] of [[`/items/${item.id}/comments`, { body: 'x' }], [`/items/${item.id}/close`, { resolution: 'done' }], ['/milestones', { mission: m.id, kind: 'progress', title: 'x' }]]) {
+    const r = await w.bobPhone(p, post(body))
+    assert.equal(r.status, 409, p)
+    assert.equal(r.json.blocked_by, 'closed')
+  }
+})
+
+test('a contributor who can also see the mission through the org rule still contributes', async (t) => {
+  const w = await world(t)
+  const { m, item } = await contributing(w)
+  // Both are verified members of one org, and the conversation names a repo in it.
+  const db = w.s.db
+  for (const u of [w.alice, w.bob]) {
+    db.prepare("INSERT INTO github_accounts(user_id, github_id, login, token, state, linked_at) VALUES(?, ?, ?, 'x', 'ok', 0)").run(u.id, u.id, `gh-${u.name}`)
+    db.prepare("INSERT INTO github_orgs(user_id, scope) VALUES(?, 'github.com/example')").run(u.id)
+  }
+  db.prepare("UPDATE conversations SET repo='github.com/example/app', repo_scope='github.com/example' WHERE id='work'").run()
+  assert.equal((await w.bobPhone(`/items/${item.id}`)).json.item.shared_via, undefined, 'read under the org rule')
+  assert.equal((await w.bobBox(`/items/${item.id}/comments`, post({ body: 'Still mine to say.', convo_id: 'bobwork' }))).status, 201)
+  assert.equal((await w.bobBox(`/missions/${m.id}`, { method: 'PATCH', body: { status: 'Going.' } })).status, 200)
 })

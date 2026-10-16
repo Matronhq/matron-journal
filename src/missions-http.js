@@ -522,7 +522,12 @@ export async function handleMissionsRoute(ctx, req, res, url, who) {
     }
     // A contributor sets the status, and nothing else (contribute-http.js);
     // a read grant never writes.
-    if (granted && !sub && req.method === 'PATCH') return handleContributorMissionPatch(ctx, req, res, who, granted)
+    // As for items: a mission also visible through the org rule still takes
+    // a contributor's status.
+    if (!sub && req.method === 'PATCH') {
+      const viaGrant = granted ?? getGrantedMission(db, who.userId, idOrNum)
+      if (viaGrant) return handleContributorMissionPatch(ctx, req, res, who, viaGrant)
+    }
     json(res, 403, { error: 'forbidden' })
     return true
   }
