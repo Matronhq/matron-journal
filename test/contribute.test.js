@@ -383,4 +383,5 @@ test('accepting a raise to contribute says the mission changed, not that it was 
   const shared = w.ws.bobPhone.frames.filter((f) => f.kind === 'shared')
   assert.deepEqual(shared.map((f) => [f.event, f.what]), [['mission_changed', 'grant']])
   assert.equal(shared[0].mission_id, m.id)
+  assert.equal(shared[0].grant_id, read.id)
 })
