@@ -3728,22 +3728,22 @@ out of a block, and only a client device may call it.
 ### Grants
 
 ```
-POST   /missions/:id/shares {contact, level, brief?, exclude_media?, convo_id?}   201|202 {grant, pending} | 200 {grant, existing:true}
+POST   /missions/:id/shares {contact, level, brief?, exclude_media?, keep_level?, convo_id?}   201|202 {grant, pending} | 200 {grant, existing:true}
 GET    /missions/:id/shares                               {grants} — the owner's grants on one mission
-POST   /projects/:id/shares {contact, level:'owner', brief, exclude_media?, convo_id?}   hand-over only (below)
+POST   /projects/:id/shares {contact, level:'owner', brief, exclude_media?, keep_level?, convo_id?}   hand-over only (below)
 GET    /projects/:id/shares                               {grants} — the owner's grants on one project
 GET    /grants[?direction=in|out][&state=]                {grants} — live rows unless a state is named
 GET    /grants/:id
-POST   /grants/:id/answer {decision, exclude_media?, start_session?}   client devices only
+POST   /grants/:id/answer {decision, exclude_media?, keep_level?, start_session?}   client devices only
 DELETE /grants/:id                                        the owner revokes, the grantee leaves
 ```
 
 `grant`: `{id, direction:'out'|'in', subject_kind, subject_id, level, state,
 owner:{user_id,name}, grantee:{name,address}, contact_id?, mission?:{id,num,title},
-project?:{id,num,title}, pending_level, pending_state, pending_requested_by?, brief?, exclude_media?, copy_id?,
+project?:{id,num,title}, pending_level, pending_state, pending_requested_by?, brief?, exclude_media?, keep_level?, copy_id?,
 requested_by, revoked_by, created_at, updated_at, answered_at, revoked_at}`.
 `contact_id` and `exclude_media` are the owner's and are present only on the
-owner's side (`direction: 'out'`). `brief` is present on a hand-over;
+owner's side (`direction: 'out'`). `brief` and `keep_level` are present on a hand-over;
 `copy_id` once one is accepted (see *Hand-over*).
 
 **Raising an active grant.** Asking for a higher level (`read` <
@@ -3963,7 +3963,11 @@ else 400): the agent-written hand-over brief — where things stand, what is
 next, the gotchas. An agent's ask parks (`202`, `awaiting_owner`) with a card
 for its own user; a client's goes straight to the recipient (`201`,
 `pending`). `exclude_media` (an array of media ids, at most 1,000) may come
-only from a client and only on a hand-over (else 400). A project takes
+only from a client and only on a hand-over (else 400). `keep_level`
+(`'read'`, the default, or `'contribute'`) is what the owner keeps on the
+copy afterwards: "hand over and step away" or "hand over and keep
+contributing". Any asker may send it, on a hand-over only (else 400); the
+owner's card can change it. A project takes
 `owner` only (409 `level_unavailable` otherwise). Refusals, 409
 `blocked_by`: `not_contact`, `private_mission` (the mission, the project or
 any of its open missions was born on a private box), `mission_closed`,
@@ -3976,7 +3980,7 @@ mission in the project — is already asked, to anyone), `too_many_asks`.
 ```
 {kind:'mission_handover', direction:'out', grant_id, level:'owner',
  owner:{user_id,name}, grantee:{name,address},
- subject:{kind:'mission'|'project', id, num, title}, brief,
+ subject:{kind:'mission'|'project', id, num, title}, brief, keep_level,
  preview:{missions, milestones, items, comments,
           attachments:[{media_id, name, mime, size, item_num}]},
  from_device_id, from_name, from_convo_id}
@@ -3986,9 +3990,12 @@ mission in the project — is already asked, to anyone), `too_many_asks`.
 a read share (milestones and items from a private box, consent mirrors and
 item-handover lines are never counted or copied); for a project it is the
 sum over its open missions. `attachments` lists each copyable file once.
-The owner answers `POST /grants/:id/answer {decision, exclude_media?}` —
+The owner answers `POST /grants/:id/answer {decision, exclude_media?, keep_level?}` —
 the ids of the files to leave behind (a tap on the mirror's Approve sends
-everything). The mirror (`consent: 'handover'`) is the owner's alone, but a
+everything), and the owner's final say on `keep_level` (absent keeps the
+ask's). The card shows `keep_level` as a switch, "Keep contributing after
+the hand-over". `keep_level` is ignored on the recipient's answer: what they
+accept is what the owner approved. The mirror (`consent: 'handover'`) is the owner's alone, but a
 **reply** on it — before or after answering — reaches the agent that asked,
 as an ordinary item reply turn: that is how the owner declines with a
 reason. The mirror's status does not change.
@@ -3997,7 +4004,7 @@ reason. The mirror's status does not change.
 
 ```
 {kind:'mission_handover', direction:'in', grant_id, level:'owner',
- owner:{user_id,name}, grantee:{name,address}, subject:{kind, title}, brief,
+ owner:{user_id,name}, grantee:{name,address}, subject:{kind, title}, brief, keep_level,
  preview:{missions, milestones, items, comments, attachments},
  choices:['Accept', 'New session'?, 'Pick a box'?, 'Decline'],
  pick_options:{<box label>: <device id>}}
@@ -4088,8 +4095,9 @@ mission stays the recipient's to start a session on from their apps.
   <recipient>'s mission #N (/u/<recipient>/N)."; every conversation on it
   leaves it. Its `closed` marker and each `left` marker carry
   `handed_over: {to}`. A handed project closes too.
-- The owner gets a `read` grant on each copy, `active` at once (both already
-  said yes); the new owner may revoke it like any share of theirs. The
+- The owner gets a grant on each copy at `keep_level` (`read`, or
+  `contribute` when the owner chose to keep contributing), `active` at once
+  (both already said yes: the recipient's card said which); the new owner may revoke it like any share of theirs. The
   owner's apps get `shared` `mission_added` for each.
 - The hand-over grant stays as the record: `state: 'active'`, `level:
   'owner'`, `copy_id`. It gives no access (the read rule admits `read` and

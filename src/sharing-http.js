@@ -8,12 +8,12 @@
 //   POST   /contacts/:id/block             DELETE /contacts/:id    (remove / withdraw)
 //   POST   /contacts/:id/unblock                                   (client only)
 //   GET    /contacts/:id/activity          the audit events for one contact
-//   POST   /missions/:id/shares {contact, level, brief?, exclude_media?, convo_id?}
+//   POST   /missions/:id/shares {contact, level, brief?, exclude_media?, keep_level?, convo_id?}
 //   GET    /missions/:id/shares            the owner's grants on one mission
-//   POST   /projects/:id/shares {contact, level:'owner', brief, exclude_media?, convo_id?}
+//   POST   /projects/:id/shares {contact, level:'owner', brief, exclude_media?, keep_level?, convo_id?}
 //   GET    /projects/:id/shares            the owner's grants on one project
 //   GET    /grants[?direction=in|out][&state=]
-//   POST   /grants/:id/answer {decision, exclude_media?, start_session?}   (client only)
+//   POST   /grants/:id/answer {decision, exclude_media?, keep_level?, start_session?}   (client only)
 //   DELETE /grants/:id                     revoke (owner) / leave (grantee)
 //
 // Who may do what:
@@ -34,7 +34,7 @@ import {
   removeContact, blockContact, unblockContact,
 } from './contacts.js'
 import { grantRow, getGrantRaw, shareMission, shareProject, answerGrant, revokeGrant, listGrants, GRANT_LEVELS, GRANT_STATES } from './grants.js'
-import { validBrief, validExcludeMedia } from './handover.js'
+import { validBrief, validExcludeMedia, validKeepLevel } from './handover.js'
 import { onContactOutcome, onContactEnded, onContactUnblocked, onGrantOutcome, onGrantRevoked } from './sharing-events.js'
 import { HANDOVER_CHOICE, beginHandoverSession, pickableBoxes, cardLine } from './handover-session.js'
 import { talkQuestionActions, recordFollowUpTap } from './talk-requests-events.js'
@@ -212,10 +212,14 @@ async function handleShareCreate(ctx, req, res, who, subject) {
   }
   const excludeMedia = validExcludeMedia(body.exclude_media)
   if (excludeMedia === null || (excludeMedia !== undefined && (who.kind !== 'client' || level !== 'owner'))) return badRequest(res)
+  // What the owner keeps on the copy: a hand-over's alone. An agent may ask
+  // for it; the owner's card can still change it.
+  const keepLevel = validKeepLevel(body.keep_level)
+  if (keepLevel === null || (keepLevel !== undefined && level !== 'owner')) return badRequest(res)
   const convo = askConvo(db, who, body.convo_id)
   if (convo.status === 400) return badRequest(res)
   if (convo.status === 404) return notFound(res)
-  const args = { ownerUserId: who.userId, contact: body.contact, level, brief, excludeMedia: excludeMedia ?? null, by: by(who), convoId: convo.convoId, deviceId: who.deviceId }
+  const args = { ownerUserId: who.userId, contact: body.contact, level, brief, excludeMedia: excludeMedia ?? null, keepLevel: keepLevel ?? null, by: by(who), convoId: convo.convoId, deviceId: who.deviceId }
   let out
   try {
     out = subject.kind === 'project'
@@ -234,15 +238,15 @@ async function handleShareCreate(ctx, req, res, who, subject) {
   return true
 }
 
-// `excludeMedia` (the owner's approval of a hand-over) only comes from POST
+// `excludeMedia` and `keepLevel` (the owner's approval of a hand-over) only come from POST
 // /grants/:id/answer. `startSession` (the recipient's accept) is the
 // answer's {device_id, workdir?}, or 'coordinator' for the card's New
 // session button (src/handover-session.js).
-export function applyGrantAnswer(ctx, who, grantId, decision, { excludeMedia, startSession = null } = {}) {
+export function applyGrantAnswer(ctx, who, grantId, decision, { excludeMedia, keepLevel, startSession = null } = {}) {
   const { db } = ctx
   let out
   try {
-    out = answerGrant(db, { userId: who.userId, grantId, decision, excludeMedia })
+    out = answerGrant(db, { userId: who.userId, grantId, decision, excludeMedia, keepLevel })
   } catch (err) {
     if (GRANT_CONFLICTS.has(err.message)) return { status: 409, body: { error: 'conflict', blocked_by: err.message } }
     // The subject of a hand-over was deleted under the ask: nothing to take over.
@@ -312,8 +316,9 @@ async function handleGrantRoute(ctx, req, res, url, who) {
   if (!DECISIONS.includes(body.decision)) return badRequest(res)
   const excludeMedia = validExcludeMedia(body.exclude_media)
   const startSession = startSessionOf(body.start_session)
-  if (excludeMedia === null || startSession === null) return badRequest(res)
-  const r = applyGrantAnswer(ctx, who, g.id, body.decision, { excludeMedia, startSession })
+  const keepLevel = validKeepLevel(body.keep_level)
+  if (excludeMedia === null || keepLevel === null || startSession === null) return badRequest(res)
+  const r = applyGrantAnswer(ctx, who, g.id, body.decision, { excludeMedia, keepLevel, startSession })
   json(res, r.status, r.body)
   return true
 }

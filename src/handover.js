@@ -45,6 +45,13 @@ export function validBrief(v) {
   return s && s.length <= BRIEF_MAX ? s : null
 }
 
+// What the owner keeps on the copy after a hand-over: undefined = absent,
+// null = malformed.
+export function validKeepLevel(v) {
+  if (v === undefined) return undefined
+  return v === 'read' || v === 'contribute' ? v : null
+}
+
 // undefined = absent, null = malformed, else the de-duplicated ids.
 export function validExcludeMedia(v) {
   if (v === undefined) return undefined
@@ -325,12 +332,12 @@ function endOtherAsks(db, kind, id, selfId, now) {
     AND (state IN ('awaiting_owner','pending') OR pending_state IS NOT NULL)`).all(kind, id, selfId)
   for (const r of rows) {
     // A raise drops; one never sent leaves the share exactly as its grantee knows it.
-    if (r.pending_state) db.prepare(`UPDATE grants SET pending_level=NULL, pending_state=NULL, pending_by=NULL, pending_at=NULL, brief=NULL, exclude_media=NULL, approved=NULL,
+    if (r.pending_state) db.prepare(`UPDATE grants SET pending_level=NULL, pending_state=NULL, pending_by=NULL, pending_at=NULL, brief=NULL, exclude_media=NULL, keep_level=NULL, approved=NULL,
       updated_at=CASE WHEN ?='awaiting_owner' THEN updated_at ELSE ? END WHERE id=?`).run(r.pending_state, now, r.id)
     else {
       db.prepare("UPDATE grants SET state='expired', updated_at=? WHERE id=?").run(now, r.id)
       // Never approved, never sent: the brief is not the recipient's to read.
-      if (r.state === 'awaiting_owner') db.prepare('UPDATE grants SET brief=NULL, exclude_media=NULL, approved=NULL WHERE id=?').run(r.id)
+      if (r.state === 'awaiting_owner') db.prepare('UPDATE grants SET brief=NULL, exclude_media=NULL, keep_level=NULL, approved=NULL WHERE id=?').run(r.id)
     }
   }
   return rows
@@ -379,14 +386,17 @@ export function applyHandover(db, { g, files, now = Date.now() }) {
     db.prepare(`UPDATE projects SET state='closed', close_summary=?, closed_by='user', closed_over_open_missions=0, closed_at=?, updated_at=? WHERE id=?`)
       .run(`Handed to ${g.grantee_name}: now ${g.grantee_name}'s project #${project.num}.`, now, now, g.subject_id)
   }
-  // The old owner keeps reading what they handed over (spec decision 9):
-  // both people have already said yes, so it is active at once, and the
-  // new owner may revoke it like any share of theirs.
+  // The old owner keeps reading what they handed over (spec decision 9),
+  // or keeps contributing to it when the owner chose that at the approval
+  // and the recipient accepted the hand-over saying so: both people have
+  // already said yes, so it is active at once, and the new owner may
+  // revoke it like any share of theirs.
+  const keep = g.keep_level === 'contribute' ? 'contribute' : 'read'
   const reverse = copies.map((c) => {
     const id = newId('gr')
     db.prepare(`INSERT INTO grants(id,owner_user_id,subject_kind,subject_id,contact_id,level,state,requested_by,created_at,updated_at,answered_at,sent_at)
-      VALUES(?,?,'mission',?,?,'read','active','user',?,?,?,?)`).run(id, toUserId, c.id, theirs.id, now, now, now, now)
-    return { id, missionId: c.id }
+      VALUES(?,?,'mission',?,?,?,'active','user',?,?,?,?)`).run(id, toUserId, c.id, theirs.id, keep, now, now, now, now)
+    return { id, missionId: c.id, level: keep }
   })
   const copyId = project ? project.id : copies[0].id
   db.prepare(`UPDATE grants SET state='active', level='owner', pending_level=NULL, pending_state=NULL, pending_by=NULL, pending_at=NULL, copy_subject_id=?, answered_at=?, updated_at=? WHERE id=?`)

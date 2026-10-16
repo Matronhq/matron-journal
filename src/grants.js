@@ -80,6 +80,7 @@ export function grantRow(row, viewerUserId) {
     // Who asked for a raise still in flight: the owner's to know.
     ...(out && row.pending_by ? { pending_requested_by: row.pending_by } : {}),
     ...(out && row.exclude_media != null ? { exclude_media: JSON.parse(row.exclude_media) } : {}),
+    ...((row.level === 'owner' || row.pending_level === 'owner') && !hidden ? { keep_level: row.keep_level ?? 'read' } : {}),
     ...(row.copy_subject_id ? { copy_id: row.copy_subject_id } : {}),
     requested_by: row.requested_by ?? null,
     revoked_by: row.revoked_by ?? null,
@@ -107,14 +108,14 @@ export function sharePreview(db, missionId) {
 // The shared tail of shareMission and shareProject, inside their
 // transaction: find or renew the (subject, contact) row, or raise an
 // active one. Returns {grant, existing}.
-function upsertAsk(db, { ownerUserId, kind, subjectId, own, level, brief, excludeMedia, by, convoId, deviceId, now }) {
+function upsertAsk(db, { ownerUserId, kind, subjectId, own, level, brief, excludeMedia, keepLevel, by, convoId, deviceId, now }) {
   const cur = db.prepare('SELECT * FROM grants WHERE subject_kind=? AND subject_id=? AND contact_id=?').get(kind, subjectId, own.id)
   if (cur && (cur.state === 'awaiting_owner' || cur.state === 'pending' || cur.pending_state)) fail('pending')
   // Asking for what the contact already has, or less, changes nothing.
   if (cur?.state === 'active' && RANK[level] <= RANK[cur.level]) return { grant: getGrantRaw(db, cur.id), existing: true }
   if (by === 'agent' && parkedAsks(db, deviceId) >= MAX_PARKED_PER_DEVICE) fail('too_many_asks')
   const state = by === 'agent' ? 'awaiting_owner' : 'pending'
-  const extra = [brief ?? null, excludeMedia ? JSON.stringify(excludeMedia) : null]
+  const extra = [brief ?? null, excludeMedia ? JSON.stringify(excludeMedia) : null, level === 'owner' && keepLevel === 'contribute' ? 'contribute' : null]
   // A client's hand-over ask is the owner's own yes: what crosses is fixed now.
   const approved = level === 'owner' && state === 'pending'
     ? JSON.stringify(approvedSet(db, { kind, id: subjectId, ownerUserId, excludeMedia: excludeMedia ?? [] })) : null
@@ -122,7 +123,7 @@ function upsertAsk(db, { ownerUserId, kind, subjectId, own, level, brief, exclud
     // A raise keeps the share's own fields (requested_by, updated_at) as the
     // grantee knows them: its asker and time are pending_by / pending_at,
     // and updated_at moves only once the raise is sent to the grantee.
-    db.prepare(`UPDATE grants SET pending_level=?, pending_state=?, pending_by=?, pending_at=?, brief=?, exclude_media=?, approved=?, origin_convo_id=?, origin_device_id=?,
+    db.prepare(`UPDATE grants SET pending_level=?, pending_state=?, pending_by=?, pending_at=?, brief=?, exclude_media=?, keep_level=?, approved=?, origin_convo_id=?, origin_device_id=?,
       owner_item_id=NULL, grantee_item_id=NULL, updated_at=CASE WHEN ?='pending' THEN ? ELSE updated_at END WHERE id=?`)
       .run(level, state, by, now, ...extra, approved, convoId, deviceId, state, now, cur.id)
     return { grant: getGrantRaw(db, cur.id), existing: false }
@@ -131,25 +132,26 @@ function upsertAsk(db, { ownerUserId, kind, subjectId, own, level, brief, exclud
   if (cur) {
     // A renewed row is a new ask: whatever the grantee saw of the old one,
     // this one is theirs to see only once it is sent (sent_at).
-    db.prepare(`UPDATE grants SET level=?, state=?, brief=?, exclude_media=?, approved=?, copy_subject_id=NULL, pending_level=NULL, pending_state=NULL,
+    db.prepare(`UPDATE grants SET level=?, state=?, brief=?, exclude_media=?, keep_level=?, approved=?, copy_subject_id=NULL, pending_level=NULL, pending_state=NULL,
       pending_by=NULL, pending_at=NULL, sent_at=?, requested_by=?, origin_convo_id=?, origin_device_id=?, owner_item_id=NULL, grantee_item_id=NULL,
       revoked_by=NULL, updated_at=?, answered_at=NULL, revoked_at=NULL WHERE id=?`).run(level, state, ...extra, approved, state === 'pending' ? now : null, by, convoId, deviceId, now, cur.id)
   } else {
     id = newId('gr')
-    db.prepare(`INSERT INTO grants(id,owner_user_id,subject_kind,subject_id,contact_id,level,state,requested_by,origin_convo_id,origin_device_id,brief,exclude_media,approved,sent_at,created_at,updated_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, ownerUserId, kind, subjectId, own.id, level, state, by, convoId, deviceId, ...extra, approved, state === 'pending' ? now : null, now, now)
+    db.prepare(`INSERT INTO grants(id,owner_user_id,subject_kind,subject_id,contact_id,level,state,requested_by,origin_convo_id,origin_device_id,brief,exclude_media,keep_level,approved,sent_at,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, ownerUserId, kind, subjectId, own.id, level, state, by, convoId, deviceId, ...extra, approved, state === 'pending' ? now : null, now, now)
   }
   return { grant: getGrantRaw(db, id), existing: false }
 }
 
 // `by` as in requestContact. `contact` is the owner's contact row id, or a
 // same-journal peer's name. `level` 'read', 'contribute' or 'owner' (a hand-over, which
-// needs `brief`; `excludeMedia` is the owner's own unticking, from a client).
+// needs `brief`; `excludeMedia` is the owner's own unticking, from a client;
+// `keepLevel` 'contribute' keeps the owner contributing to the copy).
 // Throws: bad_level, no_brief, no_mission, private_mission, handed_over,
 // mission_closed, not_contact, pending, too_many_asks.
 // Returns {grant, existing} — existing:true is an already-active grant at
 // that level or above, returned unchanged (sharing twice is not an error).
-export function shareMission(db, { ownerUserId, missionId, contact, level, brief = null, excludeMedia = null, by, convoId = null, deviceId = null, now = Date.now() }) {
+export function shareMission(db, { ownerUserId, missionId, contact, level, brief = null, excludeMedia = null, keepLevel = null, by, convoId = null, deviceId = null, now = Date.now() }) {
   return db.transaction(() => {
     if (!GRANT_LEVELS.includes(level)) fail('bad_level')
     if (level === 'owner' && !brief) fail('no_brief')
@@ -161,14 +163,14 @@ export function shareMission(db, { ownerUserId, missionId, contact, level, brief
     if (level === 'owner') checkHandoverAsk(db, { kind: 'mission', id: mission.id, ownerUserId })
     const own = getContactRaw(db, ownerUserId, contact)
     if (!own || !isMutual(db, own)) fail('not_contact')
-    return upsertAsk(db, { ownerUserId, kind: 'mission', subjectId: mission.id, own, level, brief: level === 'owner' ? brief : null, excludeMedia, by, convoId, deviceId, now })
+    return upsertAsk(db, { ownerUserId, kind: 'mission', subjectId: mission.id, own, level, brief: level === 'owner' ? brief : null, excludeMedia, keepLevel, by, convoId, deviceId, now })
   })()
 }
 
 // A project is only ever handed over: `owner` level, with its open
 // missions. Throws as shareMission, plus no_project, project_closed and
 // empty_project.
-export function shareProject(db, { ownerUserId, projectId, contact, level, brief = null, excludeMedia = null, by, convoId = null, deviceId = null, now = Date.now() }) {
+export function shareProject(db, { ownerUserId, projectId, contact, level, brief = null, excludeMedia = null, keepLevel = null, by, convoId = null, deviceId = null, now = Date.now() }) {
   return db.transaction(() => {
     if (!GRANT_LEVELS.includes(level)) fail('bad_level')
     if (level !== 'owner') fail('level_unavailable')
@@ -177,7 +179,7 @@ export function shareProject(db, { ownerUserId, projectId, contact, level, brief
     checkHandoverAsk(db, { kind: 'project', id: projectId, ownerUserId })
     const own = getContactRaw(db, ownerUserId, contact)
     if (!own || !isMutual(db, own)) fail('not_contact')
-    return upsertAsk(db, { ownerUserId, kind: 'project', subjectId: projectId, own, level, brief, excludeMedia, by, convoId, deviceId, now })
+    return upsertAsk(db, { ownerUserId, kind: 'project', subjectId: projectId, own, level, brief, excludeMedia, keepLevel, by, convoId, deviceId, now })
   })()
 }
 
@@ -193,7 +195,7 @@ function setAsk(db, g, state, now, extra = '') {
 }
 // A raise that ends without happening leaves the row as it was — to the
 // grantee, exactly as it was when it was never sent (updated_at untouched).
-const dropRaise = (db, g, now) => db.prepare(`UPDATE grants SET pending_level=NULL, pending_state=NULL, pending_by=NULL, pending_at=NULL, brief=NULL, exclude_media=NULL, approved=NULL,
+const dropRaise = (db, g, now) => db.prepare(`UPDATE grants SET pending_level=NULL, pending_state=NULL, pending_by=NULL, pending_at=NULL, brief=NULL, exclude_media=NULL, keep_level=NULL, approved=NULL,
   updated_at=CASE WHEN ?='awaiting_owner' THEN updated_at ELSE ? END WHERE id=?`).run(g.pending_state, now, g.id)
 // The time an ask was made: a raise's own, else the row's.
 const askedAt = (g) => (g.pending_state ? g.pending_at ?? g.updated_at : g.updated_at)
@@ -203,7 +205,7 @@ const askedAt = (g) => (g.pending_state ? g.pending_at ?? g.updated_at : g.updat
 // (an approval refused here, a withdrawal, an expiry, a revoke — and, in
 // contacts.js and handover.js, a removed contact and a hand-over that
 // overtook it).
-const forgetBrief = (db, id) => db.prepare('UPDATE grants SET brief=NULL, exclude_media=NULL, approved=NULL WHERE id=?').run(id)
+const forgetBrief = (db, id) => db.prepare('UPDATE grants SET brief=NULL, exclude_media=NULL, keep_level=NULL, approved=NULL WHERE id=?').run(id)
 
 // null when the hand-over `g` asks for can still happen, else the reason it
 // cannot (one of HANDOVER_REFUSALS).
@@ -234,8 +236,9 @@ function endAsk(db, g, ask, now) {
 // happen, with `reason`: the ask has ended). An accepted hand-over is 'handed_over', with
 // `handover` (what applyHandover did); `files` collects the blob files it
 // wrote, and is cleaned up here if the transaction rolls back.
-// `excludeMedia` (the owner's approval of a hand-over) replaces the ask's.
-export function answerGrant(db, { userId, grantId, decision, excludeMedia, now = Date.now() }) {
+// `excludeMedia` and `keepLevel` (the owner's approval of a hand-over)
+// replace the ask's.
+export function answerGrant(db, { userId, grantId, decision, excludeMedia, keepLevel, now = Date.now() }) {
   const files = []
   try {
     return db.transaction(() => {
@@ -268,6 +271,7 @@ export function answerGrant(db, { userId, grantId, decision, excludeMedia, now =
           const refused = stillPossible(db, g)
           if (refused) { endAsk(db, g, ask, now); return done('refused', { reason: refused }) }
           if (excludeMedia !== undefined) db.prepare('UPDATE grants SET exclude_media=? WHERE id=?').run(JSON.stringify(excludeMedia), g.id)
+          if (keepLevel !== undefined) db.prepare('UPDATE grants SET keep_level=? WHERE id=?').run(keepLevel === 'contribute' ? 'contribute' : null, g.id)
           // What the owner approved is fixed now; the accept copies it or
           // nothing (sameApprovedSet).
           const set = approvedSet(db, { kind: g.subject_kind, id: g.subject_id, ownerUserId: g.owner_user_id, excludeMedia: excludeMedia ?? JSON.parse(g.exclude_media ?? '[]') })
