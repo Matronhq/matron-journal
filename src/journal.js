@@ -45,7 +45,7 @@ export const CONVO_ID_MAX_CHARS = 128
 // they come from, or send data to, ANOTHER PERSON, and only a tap on the
 // user's own device may answer them — no agent, the Coordinator included,
 // ever hears of one.
-const CLIENT_ONLY_CARD_KINDS = new Set(['agent_chat', 'agent_spawn', 'contact_request', 'mission_share', 'person_room', 'session_share'])
+const CLIENT_ONLY_CARD_KINDS = new Set(['agent_chat', 'agent_spawn', 'contact_request', 'mission_share', 'mission_handover', 'person_room', 'session_share'])
 export const PEOPLE_EVENT_TYPE = 'people'
 
 export function isClientOnlyEvent(type, payload) {
@@ -70,6 +70,7 @@ export function snippetOf(type, payload) {
   if (type === 'permission_request' && isClientOnlyEvent(type, payload)) {
     if (p.kind === 'contact_request') return '🤝 Contact request'
     if (p.kind === 'mission_share') return '🤝 Mission share request'
+    if (p.kind === 'mission_handover') return '🤝 Hand-over request'
     if (p.kind === 'person_room') return '🤝 Room with another person'
     if (p.kind === 'session_share') return '🤝 Session share request'
     return p.kind === 'agent_spawn' ? '🤝 Agent spawn request' : '🤝 Agent chat request'

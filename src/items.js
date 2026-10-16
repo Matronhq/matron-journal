@@ -241,8 +241,13 @@ export function rowToComment(row) {
   const m = meta == null ? null : parseJson(meta, null)
   const action = typeof m?.action === 'string' ? m.action : null
   const replyTo = typeof m?.reply_to === 'string' ? m.reply_to : null
+  // `attribution`: who wrote a comment that came from another person, in
+  // words — a hand-over copy (src/handover.js) carries "alice" or "alice's
+  // agent". Absent on every comment written in this log, so the shape
+  // every client already decodes is unchanged.
+  const attribution = typeof m?.attribution === 'string' ? { attribution: m.attribution } : {}
   return {
-    ...rest, attachments: parseJson(attachments, []), meta: m, action, reply_to: replyTo,
+    ...rest, attachments: parseJson(attachments, []), meta: m, action, reply_to: replyTo, ...attribution,
     actions: parseJson(actions ?? '[]', []), chosen_action: rest.chosen_action ?? null,
   }
 }

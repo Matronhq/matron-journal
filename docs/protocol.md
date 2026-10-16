@@ -3622,7 +3622,7 @@ Malformed values refuse to start the journal, naming the variable.
 
 ## Contacts and grants (person-to-person sharing)
 
-Phase 1: same journal, read-only mission share.
+Phase 1: same journal, read-only mission share. Phase 3: hand-over (below).
 
 The second way across the user boundary, beside the org rule above. Unlike
 the org rule it is explicit: two people become **contacts** by one asking
@@ -3680,27 +3680,41 @@ out of a block, and only a client device may call it.
 ### Grants
 
 ```
-POST   /missions/:id/shares {contact, level, convo_id?}   201|202 {grant, pending} | 200 {grant, existing:true}
+POST   /missions/:id/shares {contact, level, brief?, exclude_media?, convo_id?}   201|202 {grant, pending} | 200 {grant, existing:true}
 GET    /missions/:id/shares                               {grants} — the owner's grants on one mission
+POST   /projects/:id/shares {contact, level:'owner', brief, exclude_media?, convo_id?}   hand-over only (below)
+GET    /projects/:id/shares                               {grants} — the owner's grants on one project
 GET    /grants[?direction=in|out][&state=]                {grants} — live rows unless a state is named
 GET    /grants/:id
-POST   /grants/:id/answer {decision}                      client devices only
+POST   /grants/:id/answer {decision, exclude_media?, start_session?}   client devices only
 DELETE /grants/:id                                        the owner revokes, the grantee leaves
 ```
 
 `grant`: `{id, direction:'out'|'in', subject_kind, subject_id, level, state,
 owner:{user_id,name}, grantee:{name,address}, contact_id?, mission?:{id,num,title},
+project?:{id,num,title}, pending_level, pending_state, brief?, exclude_media?, copy_id?,
 requested_by, revoked_by, created_at, updated_at, answered_at, revoked_at}`.
-`contact_id` is the owner's contact row and is present only on the owner's
-side (`direction: 'out'`).
+`contact_id` and `exclude_media` are the owner's and are present only on the
+owner's side (`direction: 'out'`). `brief` is present on a hand-over;
+`copy_id` once one is accepted (see *Hand-over*).
+
+**Raising an active grant.** Asking for a higher level (`read` <
+`contribute` < `owner`) on a grant that is already `active` does not make a
+second row: the row stays `active` at its old level and carries the ask in
+`pending_level` / `pending_state` (`awaiting_owner` → `pending`), through
+the same two yeses and the same cards. Only the grantee's accept raises it;
+a decline, a withdrawal or the 24 h expiry clears the two fields and leaves
+the grant as it was. Until the owner has approved, the grantee reads both
+fields as null and no `brief`, and cannot answer (404). Asking for the
+level the contact already has, or a lower one, is `200 {existing:true}`.
 States: `awaiting_owner` (the owner's agent asked, 24 h) → `pending` (the
 grantee's accept card is open) → `active`; `declined`, `revoked`
 (`revoked_by`: `owner` | `grantee` | `contact_removed`), `expired`.
 
 `contact` is the owner's contact row id or a same-journal user name; the
 two must be mutual contacts (409 `not_contact`). `level` defaults to
-`read`; `contribute` and `owner` are the spec's later phases and answer
-409 `level_unavailable`. A mission born on a private device is 409
+`read`; `owner` is a hand-over (below); `contribute` is a later phase and
+answers 409 `level_unavailable`. A mission born on a private device is 409
 `private_mission`. The mission is resolved through the caller's own sieve.
 A grantee is never told of a grant its owner has not approved: until then
 the id is a 404 for them.
@@ -3742,17 +3756,19 @@ id>`), on each side that has something to decide:
 | `contact_request` | `in` | the recipient's People conversation | Accept / Decline |
 | `mission_share` | `out` | the asking agent's conversation; carries `preview` `{milestones, items, comments, attachments}` | Approve / Decline |
 | `mission_share` | `in` | the grantee's People conversation | Accept / Decline |
+| `mission_handover` | `out` / `in` | as `mission_share` (see *Hand-over*); mirrors carry `consent: 'handover'`, link `matron://consent/handover/<grant id>` | Approve / Decline, Accept / Decline |
 
 Card payloads: `contact_request` `{kind, direction, contact_id, peer:{name,
 address}}`; `mission_share` `{kind, direction, grant_id, level, owner,
 grantee, mission:{id,num,title}, preview}`; `out` cards add
-`from_device_id`, `from_name`, `from_convo_id`.
+`from_device_id`, `from_name`, `from_convo_id`. A raise (above) uses the
+card of the level asked for.
 
 A card is answered by `POST …/answer` **or** by tapping the mirror's button
 (`POST /items/:id/comments {action}`), which the journal applies itself and
 answers `200 {item, comment, contact|grant}`.
 
-**Only a client device answers.** Both cards and the `people` events are
+**Only a client device answers.** All these cards and the `people` events are
 client-only events, the mirrors' markers carry `consent`, both answer
 routes and the button tap refuse agents with 403, and these asks are never
 in `/consent/pending` nor accepted by `/consent/answer`. The Coordinator is
@@ -3775,7 +3791,9 @@ Every transition appends one `people` event to **each** side's People
 conversation: `{event, summary, contact_id, peer:{name,address}, grant_id?,
 level?, mission?:{id,num,title}, owner?, by?}` with `event` one of
 `contact.requested|received|accepted|declined|removed|blocked|unblocked`
-and `grant.offered|received|accepted|declined|revoked`. Never a push.
+and `grant.offered|received|accepted|declined|revoked`, and for a
+hand-over `grant.handover_offered|handover_received|handover_accepted|handover_declined`
+(with `project?:{id,num,title}` for a project). Never a push.
 
 Ephemeral frames, client sockets only:
 
@@ -3789,6 +3807,101 @@ Ephemeral frames, client sockets only:
 `mission_changed` fires on every milestone, item write and mission
 update/close on a granted mission. It is an invalidation: the grantee
 refetches through the sieved reads above.
+
+### Hand-over
+
+The owner gives a mission — or a project with its open missions — to a
+contact. It is a grant at level `owner` with the same two yeses as a read
+share; on the recipient's accept the journal **copies** the tracker record
+into the recipient's log, under the recipient's own numbering, and closes
+the original. Even on one journal nothing moves in place.
+
+**Asking.** `POST /missions/:id/shares` or `POST /projects/:id/shares` with
+`level: 'owner'` and `brief` (required, 1–16,000 characters after trimming;
+else 400): the agent-written hand-over brief — where things stand, what is
+next, the gotchas. An agent's ask parks (`202`, `awaiting_owner`) with a card
+for its own user; a client's goes straight to the recipient (`201`,
+`pending`). `exclude_media` (an array of media ids, at most 1,000) may come
+only from a client and only on a hand-over (else 400). A project takes
+`owner` only (409 `level_unavailable` otherwise). Refusals, 409
+`blocked_by`: `not_contact`, `private_mission` (the mission, the project or
+any of its open missions was born on a private box), `mission_closed`,
+`project_closed`, `empty_project` (no open mission), `handed_over` (already
+handed over), `pending` (a hand-over of it — or of its project, or of a
+mission in the project — is already asked, to anyone), `too_many_asks`.
+
+**The owner's card**, in the asking conversation:
+
+```
+{kind:'mission_handover', direction:'out', grant_id, level:'owner',
+ owner:{user_id,name}, grantee:{name,address},
+ subject:{kind:'mission'|'project', id, num, title}, brief,
+ preview:{missions, milestones, items, comments,
+          attachments:[{media_id, name, mime, size, item_num}]},
+ from_device_id, from_name, from_convo_id}
+```
+
+`preview` counts exactly what will cross, through the same private sieve as
+a read share (milestones and items from a private box, consent mirrors and
+item-handover lines are never counted or copied); for a project it is the
+sum over its open missions. `attachments` lists each copyable file once.
+The owner answers `POST /grants/:id/answer {decision, exclude_media?}` —
+the ids of the files to leave behind (a tap on the mirror's Approve sends
+everything). The mirror (`consent: 'handover'`) is the owner's alone, but a
+**reply** on it — before or after answering — reaches the agent that asked,
+as an ordinary item reply turn: that is how the owner declines with a
+reason. The mirror's status does not change.
+
+**The recipient's card**, in their People conversation:
+
+```
+{kind:'mission_handover', direction:'in', grant_id, level:'owner',
+ owner:{user_id,name}, grantee:{name,address}, subject:{kind, title}, brief,
+ preview:{missions, milestones, items, comments, attachments}}
+```
+
+`attachments` here is the count that will arrive. No number, box or
+conversation of the owner's. The recipient answers `POST /grants/:id/answer
+{decision, start_session?}`; `start_session: {device_id, workdir?}` asks for
+a session on the copy and is answered `start_session: {status:
+'unavailable'}` until the journal can start one (the copy is made either way).
+
+**On accept**, in one transaction (all of it or nothing):
+
+- The recipient gets one new mission per handed mission (title, name, body,
+  and the status unless it was written privately), in their own numbering,
+  filed in a new project of its own — or, for a project, all in one new
+  project with the project's title and body. `grant.copy_id` names the
+  mission (or the project).
+- Each copy's milestones: `Handed over by <owner>` (kind `progress`, body =
+  the brief, the lowest number on the copy, time = the accept), then the
+  original milestones as text with their kind, title, body and time.
+- Items (sieved, not consent mirrors) with their whole threads. Open items
+  stay open, awaiting whoever they awaited; closed stay closed. Every copied
+  comment is `author: 'agent'`, `device_id: 0`, `convo_id: null`, and carries
+  `attribution: "<owner>"` or `"<owner>'s agent"`; `attribution` is absent on
+  every comment written in the recipient's own log. Attachments are copied
+  to new files the recipient owns (new media ids, inline refs rewritten);
+  unticked ones are dropped, and a ref to one becomes its caption.
+- Copied rows hang off the recipient's People conversation (milestones with
+  `seq: 0`: there is no transcript to jump to); a `mission` `created` marker
+  for each copy goes there.
+- The original: its open items close `cancelled` with "Handed over to
+  <recipient>."; it closes with `close_summary` "Handed to <recipient>: now
+  <recipient>'s mission #N (/u/<recipient>/N)."; every conversation on it
+  leaves it. Its `closed` marker and each `left` marker carry
+  `handed_over: {to}`. A handed project closes too.
+- The owner gets a `read` grant on each copy, `active` at once (both already
+  said yes); the new owner may revoke it like any share of theirs. The
+  owner's apps get `shared` `mission_added` for each.
+- The hand-over grant stays as the record: `state: 'active'`, `level:
+  'owner'`, `copy_id`. It gives no access (the read rule admits `read` and
+  `contribute` only), `DELETE` on it is 409 `handed_over`, and removing the
+  contact leaves it.
+
+If the subject can no longer be handed over at accept time (closed, made
+private, the contact gone) the answer is 409 with the reason and nothing
+changes.
 
 ## Rooms between people (phase 2)
 

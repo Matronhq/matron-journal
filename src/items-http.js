@@ -117,11 +117,19 @@ function visibleItem(db, who, idOrNum) {
 //     joiner, who is not in it — parking exists to keep the ask from the
 //     room's owner until the user says yes, so the reply stays client-only;
 //   - contact and share mirrors are answered on the item and never reach an
-//     agent.
+//     agent;
+//   - a hand-over's OWNER mirror lives in the asking agent's conversation,
+//     and a reply there is how the user declines with a reason ("not yet:
+//     finish X first"), so it reaches that agent — answered or not. The
+//     recipient's mirror is in their People conversation and reaches no one.
 // A chat row renewed since (its item_id names a newer item) no longer vouches
 // for this one: client-only.
 function replyReachesAsker(db, item) {
   if (item.consent === 'spawn') return true
+  if (item.consent === 'handover') {
+    return !!db.prepare(`SELECT 1 FROM grants g JOIN conversations c ON c.id = g.origin_convo_id
+      WHERE g.owner_item_id = ? AND g.origin_convo_id = ? AND c.agent_device_id = g.origin_device_id`).get(item.id, item.origin_convo_id)
+  }
   if (item.consent !== 'chat') return false
   return !!db.prepare(`
     SELECT 1 FROM convo_agents ca JOIN conversations c ON c.id = ca.convo_id

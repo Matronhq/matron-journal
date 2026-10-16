@@ -218,7 +218,7 @@ test('grants: an agent\'s ask parks for the owner, expires, and removal of the c
   db.close()
 })
 
-test('grants: only read, only the owner\'s own shareable missions', async () => {
+test('grants: read or a hand-over, only the owner\'s own shareable missions', async () => {
   const w = await world()
   const { db, alice, bob, priv } = w
   const m = mission(db, w)
@@ -226,7 +226,7 @@ test('grants: only read, only the owner\'s own shareable missions', async () => 
   contacts(db, alice, bob)
   const share = (over) => shareMission(db, { ownerUserId: alice.id, missionId: m.id, contact: 'bob', level: 'read', by: 'user', ...over })
   assert.throws(() => share({ level: 'contribute' }), /level_unavailable/)
-  assert.throws(() => share({ level: 'owner' }), /level_unavailable/)
+  assert.throws(() => share({ level: 'owner' }), /no_brief/, 'a hand-over needs its brief (test/handover.test.js)')
   assert.throws(() => share({ level: 'admin' }), /bad_level/)
   assert.throws(() => share({ contact: 'sam' }), /not_contact/)
   assert.throws(() => share({ missionId: hidden.id }), /private_mission/)

@@ -8,10 +8,12 @@
 //   POST   /contacts/:id/block             DELETE /contacts/:id    (remove / withdraw)
 //   POST   /contacts/:id/unblock                                   (client only)
 //   GET    /contacts/:id/activity          the audit events for one contact
-//   POST   /missions/:id/shares {contact, level, convo_id?}
+//   POST   /missions/:id/shares {contact, level, brief?, exclude_media?, convo_id?}
 //   GET    /missions/:id/shares            the owner's grants on one mission
+//   POST   /projects/:id/shares {contact, level:'owner', brief, exclude_media?, convo_id?}
+//   GET    /projects/:id/shares            the owner's grants on one project
 //   GET    /grants[?direction=in|out][&state=]
-//   POST   /grants/:id/answer {decision}   approve | decline       (client only)
+//   POST   /grants/:id/answer {decision, exclude_media?, start_session?}   (client only)
 //   DELETE /grants/:id                     revoke (owner) / leave (grantee)
 //
 // Who may do what:
@@ -31,9 +33,12 @@ import {
   DECISIONS, CONTACT_STATES, contactRow, listJournalUsers, getContactRaw, listContacts, requestContact, answerContact,
   removeContact, blockContact, unblockContact,
 } from './contacts.js'
-import { grantRow, getGrantRaw, shareMission, answerGrant, revokeGrant, listGrants, GRANT_LEVELS, GRANT_STATES } from './grants.js'
-import { onContactOutcome, onContactEnded, onContactUnblocked, onGrantOutcome, onGrantRevoked } from './sharing-events.js'
+import { grantRow, getGrantRaw, shareMission, shareProject, answerGrant, revokeGrant, listGrants, GRANT_LEVELS, GRANT_STATES } from './grants.js'
+import { validBrief, validExcludeMedia } from './handover.js'
+import { onContactOutcome, onContactEnded, onContactUnblocked, onGrantOutcome, onGrantRevoked, startSessionOnCopy } from './sharing-events.js'
 import { visibleMission, writableConvo } from './missions-http.js'
+import { getProject } from './projects.js'
+import { filteredAgent } from './privacy.js'
 import { getItem } from './items.js'
 import { USERNAME_RE } from './users-http.js'
 import { revokeSharesBetween } from './person-rooms.js'
@@ -56,7 +61,8 @@ function endPeopleRooms(ctx, out) {
 const forbidden = (res) => { json(res, 403, { error: 'forbidden' }); return true }
 const blocked = (res, by, extra = {}) => conflict(res, { blocked_by: by, ...extra })
 const CONTACT_CONFLICTS = new Set(['already_contact', 'pending', 'pending_in', 'blocked', 'too_many_asks', 'not_pending', 'not_active', 'not_blocked'])
-const GRANT_CONFLICTS = new Set(['not_contact', 'level_unavailable', 'private_mission', 'pending', 'too_many_asks', 'not_pending', 'not_active'])
+const GRANT_CONFLICTS = new Set(['not_contact', 'level_unavailable', 'private_mission', 'pending', 'too_many_asks', 'not_pending', 'not_active',
+  'handed_over', 'mission_closed', 'project_closed', 'empty_project'])
 
 // The conversation an agent's ask is parked in — where its card goes. Same
 // gate as every other agent-authored append. A client names none.
@@ -188,44 +194,72 @@ function contactActivity(db, userId, contactId) {
 
 // --- Grants -----------------------------------------------------------------
 
-async function handleShareCreate(ctx, req, res, who, mission) {
+// `subject` is {kind:'mission'|'project', row}. A hand-over (level owner)
+// needs `brief`; `exclude_media` is the owner's own unticking, so only a
+// client may send it with the ask (an agent's ask is unticked on the card).
+async function handleShareCreate(ctx, req, res, who, subject) {
   const { db } = ctx
   const body = await readBody(req)
   if (typeof body.contact !== 'string' || !body.contact || body.contact.length > 128) return badRequest(res)
   const level = body.level ?? 'read'
   if (!GRANT_LEVELS.includes(level)) return badRequest(res)
+  let brief = null
+  if (level === 'owner') {
+    brief = validBrief(body.brief)
+    if (!brief) return badRequest(res)
+  }
+  const excludeMedia = validExcludeMedia(body.exclude_media)
+  if (excludeMedia === null || (excludeMedia !== undefined && (who.kind !== 'client' || level !== 'owner'))) return badRequest(res)
   const convo = askConvo(db, who, body.convo_id)
   if (convo.status === 400) return badRequest(res)
   if (convo.status === 404) return notFound(res)
+  const args = { ownerUserId: who.userId, contact: body.contact, level, brief, excludeMedia: excludeMedia ?? null, by: by(who), convoId: convo.convoId, deviceId: who.deviceId }
   let out
   try {
-    out = shareMission(db, { ownerUserId: who.userId, missionId: mission.id, contact: body.contact, level, by: by(who), convoId: convo.convoId, deviceId: who.deviceId })
+    out = subject.kind === 'project'
+      ? shareProject(db, { ...args, projectId: subject.row.id })
+      : shareMission(db, { ...args, missionId: subject.row.id })
   } catch (err) {
-    if (err.message === 'no_mission') return notFound(res)
+    if (err.message === 'no_mission' || err.message === 'no_project') return notFound(res)
+    if (err.message === 'no_brief') return badRequest(res)
     if (GRANT_CONFLICTS.has(err.message)) return blocked(res, err.message)
     throw err
   }
   if (out.existing) { json(res, 200, { grant: grantRow(out.grant, who.userId), existing: true }); return true }
-  const parked = out.grant.state === 'awaiting_owner'
+  const parked = (out.grant.pending_state ?? out.grant.state) === 'awaiting_owner'
   onGrantOutcome(ctx, who, { outcome: parked ? 'parked' : 'sent', grant: out.grant })
   json(res, parked ? 202 : 201, { grant: grantRow(out.grant, who.userId), pending: parked ? 'owner' : 'peer' })
   return true
 }
 
-export function applyGrantAnswer(ctx, who, grantId, decision) {
+// `excludeMedia` (the owner's approval of a hand-over) and `startSession`
+// (the recipient's accept) only come from POST /grants/:id/answer; a tap on
+// the mirror sends neither.
+export function applyGrantAnswer(ctx, who, grantId, decision, { excludeMedia, startSession = null } = {}) {
   const { db } = ctx
   let out
   try {
-    out = answerGrant(db, { userId: who.userId, grantId, decision })
+    out = answerGrant(db, { userId: who.userId, grantId, decision, excludeMedia })
   } catch (err) {
     if (GRANT_CONFLICTS.has(err.message)) return { status: 409, body: { error: 'conflict', blocked_by: err.message } }
+    // The subject of a hand-over was deleted under the ask: nothing to take over.
+    if (err.message === 'no_mission' || err.message === 'no_project') return { status: 409, body: { error: 'conflict', blocked_by: 'mission_closed' } }
     throw err
   }
   if (!out) return { status: 404, body: { error: 'not_found' } }
   const closed = onGrantOutcome(ctx, who, out)
   if (out.outcome === 'expired') return { status: 409, body: { error: 'conflict', blocked_by: 'expired' }, closed }
   if (out.outcome === 'unavailable') return { status: 409, body: { error: 'conflict', blocked_by: 'not_contact' }, closed }
-  return { status: 200, body: { grant: grantRow(out.grant, who.userId) }, closed }
+  const session = out.outcome === 'handed_over' && startSession ? { start_session: startSessionOnCopy(ctx, who, out.grant, startSession) } : {}
+  return { status: 200, body: { grant: grantRow(out.grant, who.userId), ...session }, closed }
+}
+
+// {device_id, workdir?}: null = malformed.
+function startSessionOf(v) {
+  if (v == null) return undefined
+  if (typeof v !== 'object' || Array.isArray(v) || !Number.isInteger(v.device_id) || v.device_id < 1) return null
+  if (v.workdir !== undefined && (typeof v.workdir !== 'string' || !v.workdir || v.workdir.length > 4096)) return null
+  return { device_id: v.device_id, ...(v.workdir !== undefined ? { workdir: v.workdir } : {}) }
 }
 
 async function handleGrantRoute(ctx, req, res, url, who) {
@@ -269,7 +303,10 @@ async function handleGrantRoute(ctx, req, res, url, who) {
   if (who.kind !== 'client') return forbidden(res)
   const body = await readBody(req)
   if (!DECISIONS.includes(body.decision)) return badRequest(res)
-  const r = applyGrantAnswer(ctx, who, g.id, body.decision)
+  const excludeMedia = validExcludeMedia(body.exclude_media)
+  const startSession = startSessionOf(body.start_session)
+  if (excludeMedia === null || startSession === null) return badRequest(res)
+  const r = applyGrantAnswer(ctx, who, g.id, body.decision, { excludeMedia, startSession })
   json(res, r.status, r.body)
   return true
 }
@@ -298,7 +335,7 @@ export function handleConsentTap(ctx, res, who, item, action) {
   return true
 }
 
-export const isSharingMirror = (item) => item?.consent === 'contact' || item?.consent === 'share'
+export const isSharingMirror = (item) => item?.consent === 'contact' || item?.consent === 'share' || item?.consent === 'handover'
 
 export async function handleSharingRoute(ctx, req, res, url, who) {
   const { db } = ctx
@@ -314,7 +351,20 @@ export async function handleSharingRoute(ctx, req, res, url, who) {
     const mission = visibleMission(db, who, idOrNum)
     if (!mission) return notFound(res)
     if (req.method === 'GET') { json(res, 200, { grants: listGrants(db, who.userId, { direction: 'out', missionId: mission.id }) }); return true }
-    if (req.method === 'POST') return handleShareCreate(ctx, req, res, who, mission)
+    if (req.method === 'POST') return handleShareCreate(ctx, req, res, who, { kind: 'mission', row: mission })
+    return false
+  }
+
+  const pm = path.match(/^\/projects\/([^/]+)\/shares$/)
+  if (pm) {
+    let idOrNum
+    try { idOrNum = decodeURIComponent(pm[1]) } catch { return badRequest(res) }
+    // Same stance as a mission: the caller's own sieve, so a project an
+    // ordinary agent cannot see cannot be handed over by it, or probed for.
+    const project = getProject(db, who.userId, idOrNum, { excludePrivateOwned: filteredAgent(db, who) })
+    if (!project) return notFound(res)
+    if (req.method === 'GET') { json(res, 200, { grants: listGrants(db, who.userId, { direction: 'out', projectId: project.id }) }); return true }
+    if (req.method === 'POST') return handleShareCreate(ctx, req, res, who, { kind: 'project', row: project })
     return false
   }
 

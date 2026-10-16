@@ -249,10 +249,10 @@ test('a read-only mission share: two yeses, a sieved view, live, and no writes',
   assert.equal(early.status, 409)
   assert.equal(early.json.blocked_by, 'not_contact')
   await makeContacts(w)
-  for (const level of ['contribute', 'owner']) {
-    const r = await w.aliceBox(`/missions/${mission.num}/shares`, post({ contact: 'bob', level, convo_id: 'work' }))
-    assert.equal(r.json.blocked_by, 'level_unavailable', `${level} is a later phase`)
-  }
+  const later = await w.aliceBox(`/missions/${mission.num}/shares`, post({ contact: 'bob', level: 'contribute', convo_id: 'work' }))
+  assert.equal(later.json.blocked_by, 'level_unavailable', 'contribute is a later phase')
+  // owner (a hand-over, test/handover.test.js) needs its brief.
+  assert.equal((await w.aliceBox(`/missions/${mission.num}/shares`, post({ contact: 'bob', level: 'owner', convo_id: 'work' }))).status, 400)
   for (const k of Object.keys(w.ws)) w.ws[k].frames.length = 0
 
   // alice's agent asks; alice gets the card with the preview of what crosses.

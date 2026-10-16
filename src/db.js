@@ -1500,6 +1500,17 @@ export function openDb(path) {
       db.pragma('user_version = 2')
     })()
   }
+  // Hand-over and level changes (person-to-person sharing, phase 3). `brief`
+  // is the owner's hand-over brief; `exclude_media` the JSON array of media
+  // ids the owner unticked; `copy_subject_id` the recipient's copy once a
+  // hand-over is accepted. `pending_level` / `pending_state` carry an ask to
+  // raise the level of a grant that is already active (read → owner): the
+  // row stays active at its old level until both yeses are in, then takes
+  // the new one. pending_state is 'awaiting_owner' | 'pending', like state.
+  const grantCols = db.prepare('PRAGMA table_info(grants)').all()
+  for (const [name, type] of [['brief', 'TEXT'], ['exclude_media', 'TEXT'], ['copy_subject_id', 'TEXT'], ['pending_level', 'TEXT'], ['pending_state', 'TEXT']]) {
+    if (!grantCols.some((c) => c.name === name)) db.exec(`ALTER TABLE grants ADD COLUMN ${name} ${type}`)
+  }
   // Unified search's tracker mirror (spec 2026-10-12 unified search §1).
   // Must stay LAST: it reads columns added by every migration above (e.g.
   // missions.name), and its triggers must be reinstalled after any table
