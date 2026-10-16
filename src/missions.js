@@ -833,7 +833,7 @@ function grantedCountsSql() {
     ,${activitySql(GRANT_CONVO_SIEVE)},
     NULL AS project_num,
     (SELECT json_object('id', g.id, 'level', g.level) FROM grants g JOIN contacts oc ON oc.id = g.contact_id
-       WHERE g.subject_kind = 'mission' AND g.subject_id = m.id AND g.state = 'active' AND oc.peer_user_id = @viewer LIMIT 1) AS grant_json
+       WHERE g.subject_kind = 'mission' AND g.subject_id = m.id AND g.state = 'active' AND g.level <> 'owner' AND oc.peer_user_id = @viewer LIMIT 1) AS grant_json
   `
 }
 

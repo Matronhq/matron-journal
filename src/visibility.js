@@ -43,6 +43,11 @@ export const sharedConvoSql = (c) => `(
 // sees of a granted mission is built in missions.js (grantedMissionDetail)
 // and items.js (getGrantedItem), which apply the private-device sieve.
 //
+// An `owner` grant is never a way in. Once accepted it is the record of a
+// hand-over (src/handover.js): the subject is the old owner's closed
+// original, and the new owner works on their own copy. So the rule — and
+// missionAccess below — admits `read` and `contribute` only.
+//
 // Same named @viewer parameter as sharedConvoSql. `m` is the missions alias.
 // Same-journal contacts only (peer_journal IS NULL) until federation.
 export const grantedMissionSql = (m) => `EXISTS (
@@ -52,7 +57,7 @@ export const grantedMissionSql = (m) => `EXISTS (
   JOIN contacts vc ON vc.user_id = oc.peer_user_id AND vc.peer_user_id = oc.user_id
     AND vc.state = 'active' AND vc.peer_journal IS NULL
   WHERE g.subject_kind = 'mission' AND g.subject_id = ${m}.id AND g.owner_user_id = ${m}.user_id
-    AND g.state = 'active' AND oc.peer_user_id = @viewer AND ${m}.user_id <> @viewer
+    AND g.state = 'active' AND g.level <> 'owner' AND oc.peer_user_id = @viewer AND ${m}.user_id <> @viewer
 )`
 
 // The level a viewer holds on a mission: 'owner' for its user, the grant's
@@ -63,7 +68,7 @@ export function missionAccess(db, viewerUserId, missionId) {
         JOIN contacts oc ON oc.id = g.contact_id AND oc.user_id = g.owner_user_id AND oc.state = 'active' AND oc.peer_journal IS NULL
         JOIN contacts vc ON vc.user_id = oc.peer_user_id AND vc.peer_user_id = oc.user_id AND vc.state = 'active' AND vc.peer_journal IS NULL
         WHERE g.subject_kind = 'mission' AND g.subject_id = m.id AND g.owner_user_id = m.user_id
-          AND g.state = 'active' AND oc.peer_user_id = @viewer) AS level
+          AND g.state = 'active' AND g.level <> 'owner' AND oc.peer_user_id = @viewer) AS level
     FROM missions m WHERE m.id = @id`).get({ viewer: viewerUserId, id: missionId })
   if (!row) return null
   return row.own ? 'owner' : (row.level ?? null)

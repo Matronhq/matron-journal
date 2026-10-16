@@ -82,7 +82,7 @@ function shareableSession(db, userId, convoId) {
 export function parkedPeopleAsks(db, deviceId) {
   return db.prepare(`SELECT
       (SELECT COUNT(*) FROM contacts WHERE origin_device_id=@d AND state='awaiting_user')
-    + (SELECT COUNT(*) FROM grants WHERE origin_device_id=@d AND state='awaiting_owner')
+    + (SELECT COUNT(*) FROM grants WHERE origin_device_id=@d AND (state='awaiting_owner' OR pending_state='awaiting_owner'))
     + (SELECT COUNT(*) FROM session_shares WHERE origin_device_id=@d AND state='awaiting_user')
     + (SELECT COUNT(*) FROM person_rooms WHERE owner_device_id=@d AND state='awaiting_owner') AS n`).get({ d: deviceId }).n
 }
@@ -299,7 +299,7 @@ export function parkPersonRoom(db, { ownerUserId, roomId, ownerDeviceId, ownerSe
     if (missionRef != null) {
       const m = getMission(db, ownerUserId, missionRef, { excludePrivateOwned: true })
       if (!m) fail('no_mission')
-      const g = db.prepare("SELECT 1 FROM grants WHERE subject_kind='mission' AND subject_id=? AND contact_id=? AND state='active'").get(m.id, own.id)
+      const g = db.prepare("SELECT 1 FROM grants WHERE subject_kind='mission' AND subject_id=? AND contact_id=? AND state='active' AND level <> 'owner'").get(m.id, own.id)
       if (!g) fail('mission_not_shared')
       missionId = m.id
     }
