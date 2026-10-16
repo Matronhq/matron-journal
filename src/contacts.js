@@ -131,6 +131,10 @@ function revokeGrantsBetween(db, contactIds, now) {
   const marks = ids.map(() => '?').join(',')
   const rows = db.prepare(`SELECT * FROM grants WHERE contact_id IN (${marks}) AND ${LIVE_NOT_HANDED}`).all(...ids)
   if (rows.length) {
+    // An ask the owner had not approved was never sent: its brief goes with
+    // it, as when any other path ends one (grants.js forgetBrief).
+    db.prepare(`UPDATE grants SET brief=NULL, exclude_media=NULL, approved=NULL
+      WHERE contact_id IN (${marks}) AND ${LIVE_NOT_HANDED} AND (state='awaiting_owner' OR pending_state='awaiting_owner')`).run(...ids)
     db.prepare(`UPDATE grants SET state='revoked', revoked_by='contact_removed', revoked_at=?, updated_at=?, pending_level=NULL, pending_state=NULL
       WHERE contact_id IN (${marks}) AND ${LIVE_NOT_HANDED}`).run(now, now, ...ids)
   }

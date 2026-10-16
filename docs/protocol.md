@@ -3802,13 +3802,16 @@ Ephemeral frames, client sockets only:
 ```
 {kind:'people', event:'changed', contact_id?|grant_id?}        refetch /contacts and /grants
 {kind:'shared', event:'mission_added',   mission_id, grant_id, owner}
-{kind:'shared', event:'mission_changed', mission_id, what:'milestone'|'item'|'mission', owner}
+{kind:'shared', event:'mission_changed', mission_id, what:'milestone'|'item'|'mission'|'grant', owner, grant_id?}
 {kind:'shared', event:'mission_removed', mission_id, grant_id}
 ```
 
 `mission_changed` fires on every milestone, item write and mission
 update/close on a granted mission. It is an invalidation: the grantee
-refetches through the sieved reads above.
+refetches through the sieved reads above. `what: 'grant'` (with `grant_id`)
+is the grantee's accept of a raise (read → contribute): the mission was
+already in their list and their level changed, so they refetch the grant
+too. `mission_added` is only for a share that is new to them.
 
 ### Contributors
 
@@ -3840,7 +3843,8 @@ consent mirrors (invisible: 404), a closed mission (409 `closed`). A `read`
 grant gets 403; a mission not shared with the caller (or whose box has since
 turned private, or whose grant has ended) 404. Access is checked again
 inside the write itself, so a share that ends while a request's body is
-still arriving stops it (404, nothing written). A contributor's close
+still arriving stops it (404, nothing written), and a mission closed
+meanwhile is 409 `closed`. A contributor's close
 withdraws a pending item hand-over offer, as the owner's close does. All responses are the
 contributor's grantee view (`shared_via: 'grant'`, no origin).
 
@@ -3869,7 +3873,8 @@ the turn as a restricted, foreign one) and the extra fields
 
 - a contributor's comment, close or reopen on one of the owner's items is
   appended to that item's origin conversation in the owner's log (waking
-  its box, with a push); a contributor's new item, to the owner's People
+  its box, with a push, and marking the item `working: queued` like a
+  user's reply); a contributor's new item, to the owner's People
   conversation;
 - the owner's (or one of the owner's agents') comment, close or reopen on an
   item a contributor filed is appended to the conversation that filed it,

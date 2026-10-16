@@ -19,7 +19,7 @@
 import { appendAndBroadcast, broadcastAppended, append, toEventShape } from './journal.js'
 import { json, readBody } from './http-body.js'
 import { badRequest, notFound, conflict } from './http-who.js'
-import { validateItemFields, getSharedItem, RESOLUTIONS, BODY_MAX } from './items.js'
+import { validateItemFields, getSharedItem, requestTurn, RESOLUTIONS, BODY_MAX } from './items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE } from './items-marker.js'
 import { MISSION_EVENT_TYPE, MILESTONE_EVENT_TYPE, missionMarkerPayload, milestoneMarkerPayload } from './missions-marker.js'
 import { MILESTONE_KINDS, TITLE_MAX, validateMissionFields, getMission, getGrantedMission, milestoneRow } from './missions.js'
@@ -45,9 +45,11 @@ function strayRef(res, text) {
 }
 // A share that ended while the body arrived (contribute.js 'gone'): the
 // same 404 a fresh request would get.
+// A mission closed meanwhile is the 409 a fresh request would get.
 function gone(res, fn) {
   try { return { out: fn() } } catch (err) {
     if (err.message === 'gone') { notFound(res); return null }
+    if (err.message === 'closed') { conflict(res, { blocked_by: 'closed' }); return null }
     throw err
   }
 }
@@ -94,7 +96,12 @@ function toOwner(ctx, { contributor, item, action, comment = null }) {
     r = appendAndBroadcast(db, hub, { userId: owner, convoId, sender, type: ITEM_EVENT_TYPE, payload })
   } catch (err) { console.error('contribute: owner marker failed (the write stands)', err); return }
   try { pushPipeline?.onAppend(owner, toEventShape({ seq: r.seq, convo_id: convoId, ts: r.ts, sender, type: ITEM_EVENT_TYPE, payload }), null) } catch (err) { console.error('contribute: push failed', err) }
-  if (WAKES.has(action)) wakeConvoAgent(ctx, owner, convoId)
+  // As the owner's own item-reply path does (items-http.js emitMarker): the
+  // item shows its session's turn as queued until it starts.
+  if (WAKES.has(action)) {
+    try { requestTurn(db, item.id) } catch (err) { console.error('contribute: turn request stamp failed', err) }
+    wakeConvoAgent(ctx, owner, convoId)
+  }
   notifyGrantees(ctx, full.mission_id, 'item')
 }
 

@@ -418,7 +418,11 @@ export function onGrantOutcome(ctx, who, out) {
       closed = granteeTap(`Accepted — the mission is now in your shared list, shared by ${from}.`)
       audit(ctx, g.grantee_user_id, { event: 'grant.accepted', summary: `You accepted ${missionWordsFor(g)} from ${from}`, contact: gc, grant: g })
       audit(ctx, g.owner_user_id, { event: 'grant.accepted', summary: `${to} accepted ${missionWords(g)} — shared ${g.level === 'contribute' ? 'to contribute to' : 'read-only'}`, contact: oc, grant: g })
-      safely('shared frame', () => hub.sendToClients(g.grantee_user_id, { kind: 'shared', event: 'mission_added', mission_id: g.subject_id, grant_id: g.id, owner: { user_id: g.owner_user_id, name: g.owner_name } }))
+      // A raise (the grantee already had the mission) changes what they may
+      // do with it; a new share adds it to their list.
+      safely('shared frame', () => hub.sendToClients(g.grantee_user_id, before?.state === 'active'
+        ? { kind: 'shared', event: 'mission_changed', mission_id: g.subject_id, what: 'grant', grant_id: g.id, owner: { user_id: g.owner_user_id, name: g.owner_name } }
+        : { kind: 'shared', event: 'mission_added', mission_id: g.subject_id, grant_id: g.id, owner: { user_id: g.owner_user_id, name: g.owner_name } }))
       changed(ctx, g.owner_user_id, { grant_id: g.id })
       break
     case 'declined':
