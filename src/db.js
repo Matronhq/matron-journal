@@ -1296,6 +1296,11 @@ export function openDb(path) {
   if (!settingsCols.some((c) => c.name === 'notices')) {
     db.exec('ALTER TABLE user_settings ADD COLUMN notices INTEGER NOT NULL DEFAULT 1')
   }
+  // Auto-archive idle conversations after this many days (src/archive.js).
+  // NULL = the default, 0 = off.
+  if (!settingsCols.some((c) => c.name === 'auto_archive_days')) {
+    db.exec('ALTER TABLE user_settings ADD COLUMN auto_archive_days INTEGER')
+  }
   if (!db.prepare('PRAGMA table_info(devices)').all().some((c) => c.name === 'push_level')) {
     db.exec('ALTER TABLE devices ADD COLUMN push_level TEXT')
   }
@@ -1335,6 +1340,20 @@ export function openDb(path) {
     updated_at INTEGER NOT NULL,
     PRIMARY KEY(user_id, convo_id)
   )`)
+  // Archived conversations (src/archive.js): the user's own "out of the
+  // way" flag, synced to every app. archived_at NULL = not archived; the
+  // row stays after an unarchive so unarchived_at can restart the
+  // auto-archive idle clock. updated_at versions changes for `since` reads.
+  db.exec(`CREATE TABLE IF NOT EXISTS convo_archive(
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    convo_id TEXT NOT NULL,
+    archived_at INTEGER,
+    auto INTEGER NOT NULL DEFAULT 0,
+    unarchived_at INTEGER,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(user_id, convo_id)
+  )`)
+  db.exec('CREATE INDEX IF NOT EXISTS idx_convo_archive_updated ON convo_archive(user_id, updated_at)')
   // The startup resume of held consent pushes (push.js resumeHeldConsent)
   // reads recent permission_request cards; partial, so ordinary appends
   // never touch it.

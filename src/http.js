@@ -33,6 +33,7 @@ import { handleDefaultsRoute } from './defaults-http.js'
 import { handleBoxDefaultsRoute } from './box-defaults-http.js'
 import { boxDefaultsByDevice } from './box-defaults.js'
 import { handlePinsRoute } from './pins-http.js'
+import { handleArchiveRoute } from './archive-http.js'
 import { listPins, pinLabels } from './pins.js'
 import { handleSettingsRoute } from './settings-http.js'
 import { handleMemoriesRoute } from './memories-http.js'
@@ -328,6 +329,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
       // open to agent tokens too, unlike the other /devices/:id routes.
       if (await handleBoxDefaultsRoute({ db, hub }, req, res, url, who)) return
       if (await handlePinsRoute({ db, hub }, req, res, url, who)) return
+      if (await handleArchiveRoute({ db, hub }, req, res, url, who)) return
       if (await handleSettingsRoute({ db, hub }, req, res, url, who)) return
       // Coordinator consent approval (src/consent-http.js): the same answer
       // path the two client routes below use, gated on the Coordinator.

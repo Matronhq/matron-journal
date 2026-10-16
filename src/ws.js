@@ -23,6 +23,7 @@ import { onPersonRoomOutcome, onGuestAck, onGuestAnswered, onGuestExpired, endAn
 import { predictSpawnRun } from './spawn-model.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableDevice } from './wake.js'
 import { listPins, isSuccessorOfAPin, pinHintBeforeAppend, sendPinsFrame } from './pins.js'
+import { archiveChanges, sendArchiveFrame } from './archive.js'
 import { coordinatorFor } from './coordinator.js'
 import { getMission } from './missions.js'
 import { sanitizeConvoStatus, upsertConvoStatus } from './convo-status.js'
@@ -519,10 +520,18 @@ export function attachWs({
           // box_defaults (src/box-defaults.js): an agent's own defaults for
           // new sessions, nulls when unset, so a bridge is right from its
           // first frame; the box_defaults frame keeps it current after.
+          // archive (src/archive.js): only for a client that asks with
+          // `archive_since` (ms; 0 = everything), so an app that predates
+          // archiving is not sent every archived id on each connect.
+          const archive = who.kind === 'client' && Number.isInteger(msg.archive_since) && msg.archive_since >= 0
+            ? archiveChanges(db, who.userId, msg.archive_since)
+            : null
+          conn.archiveAt = archive?.at ?? null
           ws.send(JSON.stringify({
             kind: 'control', op: 'hello_ok', seq: headSeq, device_id: who.deviceId, name: who.name, coordinator_convo_id: coordinator,
             settings: settingsView(db, who.userId),
             ...(who.kind === 'client' ? { pins: listPins(db, who.userId) } : {}),
+            ...(archive ? { archive } : {}),
             ...(who.kind === 'agent' ? { box_defaults: getBoxDefaults(db, who.userId, who.deviceId) } : {}),
           }))
           if (msg.cursor != null) {
@@ -611,6 +620,10 @@ export function attachWs({
           hub.register(conn)
           conn.registered = true
           if (yielded && who.kind === 'client') ws.send(JSON.stringify({ kind: 'pins', pins: listPins(db, who.userId) }))
+          if (yielded && conn.archiveAt != null) {
+            const missed = archiveChanges(db, who.userId, conn.archiveAt)
+            if (missed.changes.length) ws.send(JSON.stringify({ kind: 'archive', ...missed }))
+          }
           // Catch-up delivery for THIS device only (spec: single pump, three
           // callers) — an invite approved while this agent was offline sits
           // undelivered until it next connects; this is that moment. Scoped
@@ -775,6 +788,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         sender: args.sender, type: args.type, payload: args.payload,
       }), args.pushHint)
       if (hintBefore) sendPinsFrame(db, hub, args.userId)
+      if (r.unarchived) sendArchiveFrame(hub, args.userId, [r.unarchived], r.ts)
     }
     return r
   }

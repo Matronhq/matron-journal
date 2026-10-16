@@ -2227,6 +2227,51 @@ pin's `successor`. A client's `hello_ok` and `/snapshot` carry `pins`
 conversations, so an agent can find "the help desk" by the user's name
 for it.
 
+### Archived conversations (`/archive`)
+
+The user's own "out of the way" flag for a conversation, synced to every
+app (`src/archive.js`, `src/archive-http.js`). Archiving hides a
+conversation from the apps' main list and **deletes nothing**: its events,
+search entries, items and milestone anchors are untouched, and it stays
+readable from the apps' Archived view.
+
+- **A message brings it back.** Any message event (the `MESSAGE_TYPES`
+  that bump unread) appended to an archived top-level conversation
+  unarchives it in the same transaction, the way mail returns a thread to
+  the inbox. Sub-chats are left as they are. Apps apply the same rule to
+  the message they receive, so a missed `archive` frame loses nothing.
+- **Auto-archive.** Once an hour the journal archives each user's
+  conversations that have been idle for `auto_archive_days` (a user
+  setting, default **30**, `0` = off): no message, no creation and no
+  unarchive within that many days. Never archived automatically: sub-chats,
+  system conversations, sessions whose state is `running` or `waiting`, the
+  Coordinator, pinned conversations, a conversation that filed a still-open
+  tracker item, a conversation linked to an open mission (current or
+  earlier link), and a parent whose sub-chat is still running or has had a
+  message within the window. `MATRON_AUTO_ARCHIVE=0` stops the sweep on a journal.
+- An unarchive restarts the idle clock, so a conversation the user brought
+  back is not archived again by the next sweep.
+
+Change object: `{convo_id, archived_at, auto}` — `archived_at` ms, or `null`
+for an unarchive; `auto` true when the sweep archived it. Changes are
+versioned by time: `since` returns every change at or after it (a change in
+the boundary millisecond may come twice; applying a change twice is a
+no-op), and `at` is the value to send as `since` next time.
+
+| Route | Who | Body | Returns |
+|---|---|---|---|
+| `GET /archive[?since=ms]` | client only | | 200 `{changes, at, auto_archive_days}`. Without `since`: every conversation archived now |
+| `POST /archive` | client only | `{convo_ids: [id…] (1–500), archived: bool}` | 200 `{changes}` — only what changed (no `at`: advance `since` only from `GET`, `hello_ok` and frames); ids the user does not own, or already in that state, are skipped. **400** for a bad body |
+
+Agents get **403** `forbidden`. Every change, the sweep's included, sends
+`{kind:'archive', changes, at}` to the user's connected clients. A client
+that sends `archive_since` (ms, `0` for everything) in `hello` gets
+`archive: {changes, at}` in `hello_ok`, and an `archive` frame after
+registration if anything changed during a long replay; a client that does
+not send it gets neither, so older apps see no change on connect.
+`/snapshot` rows carry `archived_at` on archived conversations only (no key
+= not archived).
+
 ### Session control (`session_control`)
 
 The Coordinator asks the journal to have another session's
@@ -2804,9 +2849,11 @@ user, from an app, sends no `as_convo_id`.
 
 ## User settings
 
-`GET /settings` (either device kind) → `{notices: boolean}`.
-`PATCH /settings {notices}` (client only, else **403**; an unknown key or a
-non-boolean is **400**) → the new view. `notices` — "Send things I need to
+`GET /settings` (either device kind) → `{notices: boolean, auto_archive_days: integer}`.
+`PATCH /settings {notices?, auto_archive_days?}` (client only, else **403**;
+an unknown key, a non-boolean `notices` or an `auto_archive_days` outside
+0–3650 is **400**) → the new view. `auto_archive_days` is the auto-archive
+idle window (see *Archived conversations*), default 30, `0` = off. `notices` — "Send things I need to
 read to For you" — defaults to `true` (no row reads as `true`). While on,
 bridges add the notices block to new sessions' instructions, and the
 unseen lists (`GET /unseen`, the nudge) skip what an open item already

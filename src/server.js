@@ -35,6 +35,7 @@ import { startUnseenNudge } from './unseen-nudge.js'
 import { makeRoutineFirer, startRoutinesSweep } from './routines-sweep.js'
 import { seedRoutines } from './routines.js'
 import { startStallWakeSweep } from './stall-wake.js'
+import { startAutoArchiveSweep } from './archive.js'
 import { sealStoredTokens } from './github-accounts.js'
 import { CONSENT_DAILY_CAP_DEFAULT } from './consent.js'
 import { warnAlertWebhookConfig } from './alerts-http.js'
@@ -411,6 +412,8 @@ export function startServer({
   // coordinator consent); beyond it the ask stays for the user. 0 = no cap.
   consentDailyCap = resolveConsentDailyCap(process.env.MATRON_COORDINATOR_CONSENT_DAILY_CAP),
   stallWakeIntervalMs = null,
+  autoArchiveIntervalMs = null,
+  autoArchive = process.env.MATRON_AUTO_ARCHIVE !== '0',
   // The unseen nudge (src/unseen-nudge.js). MATRON_UNSEEN_NUDGE=0 turns it off.
   unseenNudgeIntervalMs = null,
   unseenNudge = process.env.MATRON_UNSEEN_NUDGE !== '0',
@@ -495,6 +498,9 @@ export function startServer({
   // usage-limit reset has passed is woken so its bridge can carry on. No-op
   // without a waker; stopped in close().
   const stallWakeSweep = startStallWakeSweep({ db, hub, waker: resolvedWaker, ...(stallWakeIntervalMs ? { intervalMs: stallWakeIntervalMs } : {}) })
+  // Auto-archive (src/archive.js): hourly, archives each user's idle
+  // conversations per their setting. MATRON_AUTO_ARCHIVE=0 stops it.
+  const autoArchiveSweep = startAutoArchiveSweep({ db, hub, enabled: autoArchive, ...(autoArchiveIntervalMs ? { intervalMs: autoArchiveIntervalMs } : {}) })
   const unseenNudgeSweep = startUnseenNudge({ db, hub, enabled: unseenNudge, ...(unseenNudgeIntervalMs ? { intervalMs: unseenNudgeIntervalMs } : {}) })
   // Coordinator routines (spec 2026-10-01): one firer per process (the
   // sweep and POST /routines/:key/run share its in-flight bound), the
@@ -706,6 +712,7 @@ export function startServer({
         imageDimsBackfill,
         unseenNudge: unseenNudgeSweep,
         routinesSweep: routinesSweeper,
+        autoArchive: autoArchiveSweep,
         routineFirer,
         github: resolvedGithub,
         close: () => new Promise((r) => {
@@ -720,6 +727,7 @@ export function startServer({
           // arming the timer this clears.
           if (semanticTimer) clearInterval(semanticTimer)
           stallWakeSweep.stop()
+          autoArchiveSweep.stop()
           unseenNudgeSweep.stop()
           routinesSweeper.stop()
           // Wake-before-spawn waiters (hub.waitForDevice) hold ref'd timers
