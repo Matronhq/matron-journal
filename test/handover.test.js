@@ -197,7 +197,7 @@ test('hand-over: an agent asks, alice approves with an attachment unticked, bob 
 
   // bob accepts from his mirror.
   const bobMirror = (await w.bobPhone('/items?label=consent&state=open')).json.items.find((i) => i.consent === 'handover')
-  assert.deepEqual(bobMirror.actions, ['Accept', 'Decline'])
+  assert.deepEqual(bobMirror.actions, ['Accept', 'Pick a box', 'Decline'], 'bob has a box but no Coordinator (test/handover-session.test.js)')
   const tap = await w.bobPhone(`/items/${bobMirror.id}/comments`, post({ action: 'Accept' }))
   assert.equal(tap.status, 200)
   assert.equal(tap.json.grant.state, 'active')
@@ -394,7 +394,7 @@ test('hand-over of a mission already shared read-only: the share upgrades in pla
   assert.equal(accepted.status, 200)
   assert.equal(accepted.json.grant.level, 'owner')
   assert.equal(accepted.json.grant.pending_level, null)
-  assert.deepEqual(accepted.json.start_session, { status: 'unavailable' }, 'the journal cannot start a session yet')
+  assert.deepEqual(accepted.json.start_session, { status: 'refused', reason: 'not_your_box' }, 'device 1 is not one of bob\'s; the copy is made all the same')
   const copyId = accepted.json.grant.copy_id
   assert.equal((await w.bobPhone(`/missions/${copyId}`)).json.mission.title, 'Launch')
   assert.equal((await w.bobPhone(`/missions/${m.id}`)).status, 404, 'the closed original is alice\'s')

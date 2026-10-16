@@ -571,7 +571,7 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       // A contact or share card's mirror (sharing-events.js): the tap is the
       // answer to the card, applied by the journal itself — never a comment
       // for an agent to read.
-      if (isSharingMirror(item)) return handleConsentTap(ctx, res, who, item, action)
+      if (isSharingMirror(item)) return handleConsentTap(ctx, res, who, item, action, body.reply_to ?? null)
       if (isPeopleRoomMirror(item)) return handlePeopleRoomTap(ctx, res, who, item, action, body.reply_to ?? null)
     }
     // `reply_to` (2026-10-04 comment-actions contract): the id of the comment
