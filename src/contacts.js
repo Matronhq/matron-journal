@@ -135,7 +135,7 @@ function revokeGrantsBetween(db, contactIds, now) {
     // it, as when any other path ends one (grants.js forgetBrief).
     db.prepare(`UPDATE grants SET brief=NULL, exclude_media=NULL, approved=NULL
       WHERE contact_id IN (${marks}) AND ${LIVE_NOT_HANDED} AND (state='awaiting_owner' OR pending_state='awaiting_owner')`).run(...ids)
-    db.prepare(`UPDATE grants SET state='revoked', revoked_by='contact_removed', revoked_at=?, updated_at=?, pending_level=NULL, pending_state=NULL
+    db.prepare(`UPDATE grants SET state='revoked', revoked_by='contact_removed', revoked_at=?, updated_at=?, pending_level=NULL, pending_state=NULL, pending_by=NULL, pending_at=NULL
       WHERE contact_id IN (${marks}) AND ${LIVE_NOT_HANDED}`).run(now, now, ...ids)
   }
   return rows

@@ -77,6 +77,8 @@ export function grantRow(row, viewerUserId) {
     pending_level: hidden ? null : row.pending_level ?? null,
     pending_state: hidden ? null : row.pending_state ?? null,
     ...(row.brief != null && !hidden ? { brief: row.brief } : {}),
+    // Who asked for a raise still in flight: the owner's to know.
+    ...(out && row.pending_by ? { pending_requested_by: row.pending_by } : {}),
     ...(out && row.exclude_media != null ? { exclude_media: JSON.parse(row.exclude_media) } : {}),
     ...(row.copy_subject_id ? { copy_id: row.copy_subject_id } : {}),
     requested_by: row.requested_by ?? null,
@@ -117,19 +119,25 @@ function upsertAsk(db, { ownerUserId, kind, subjectId, own, level, brief, exclud
   const approved = level === 'owner' && state === 'pending'
     ? JSON.stringify(approvedSet(db, { kind, id: subjectId, ownerUserId, excludeMedia: excludeMedia ?? [] })) : null
   if (cur?.state === 'active') {
-    db.prepare(`UPDATE grants SET pending_level=?, pending_state=?, brief=?, exclude_media=?, approved=?, requested_by=?, origin_convo_id=?, origin_device_id=?,
-      owner_item_id=NULL, grantee_item_id=NULL, updated_at=? WHERE id=?`).run(level, state, ...extra, approved, by, convoId, deviceId, now, cur.id)
+    // A raise keeps the share's own fields (requested_by, updated_at) as the
+    // grantee knows them: its asker and time are pending_by / pending_at,
+    // and updated_at moves only once the raise is sent to the grantee.
+    db.prepare(`UPDATE grants SET pending_level=?, pending_state=?, pending_by=?, pending_at=?, brief=?, exclude_media=?, approved=?, origin_convo_id=?, origin_device_id=?,
+      owner_item_id=NULL, grantee_item_id=NULL, updated_at=CASE WHEN ?='pending' THEN ? ELSE updated_at END WHERE id=?`)
+      .run(level, state, by, now, ...extra, approved, convoId, deviceId, state, now, cur.id)
     return { grant: getGrantRaw(db, cur.id), existing: false }
   }
   let id = cur?.id
   if (cur) {
+    // A renewed row is a new ask: whatever the grantee saw of the old one,
+    // this one is theirs to see only once it is sent (sent_at).
     db.prepare(`UPDATE grants SET level=?, state=?, brief=?, exclude_media=?, approved=?, copy_subject_id=NULL, pending_level=NULL, pending_state=NULL,
-      requested_by=?, origin_convo_id=?, origin_device_id=?, owner_item_id=NULL, grantee_item_id=NULL,
-      revoked_by=NULL, updated_at=?, answered_at=NULL, revoked_at=NULL WHERE id=?`).run(level, state, ...extra, approved, by, convoId, deviceId, now, cur.id)
+      pending_by=NULL, pending_at=NULL, sent_at=?, requested_by=?, origin_convo_id=?, origin_device_id=?, owner_item_id=NULL, grantee_item_id=NULL,
+      revoked_by=NULL, updated_at=?, answered_at=NULL, revoked_at=NULL WHERE id=?`).run(level, state, ...extra, approved, state === 'pending' ? now : null, by, convoId, deviceId, now, cur.id)
   } else {
     id = newId('gr')
-    db.prepare(`INSERT INTO grants(id,owner_user_id,subject_kind,subject_id,contact_id,level,state,requested_by,origin_convo_id,origin_device_id,brief,exclude_media,approved,created_at,updated_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, ownerUserId, kind, subjectId, own.id, level, state, by, convoId, deviceId, ...extra, approved, now, now)
+    db.prepare(`INSERT INTO grants(id,owner_user_id,subject_kind,subject_id,contact_id,level,state,requested_by,origin_convo_id,origin_device_id,brief,exclude_media,approved,sent_at,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, ownerUserId, kind, subjectId, own.id, level, state, by, convoId, deviceId, ...extra, approved, state === 'pending' ? now : null, now, now)
   }
   return { grant: getGrantRaw(db, id), existing: false }
 }
@@ -177,14 +185,20 @@ const setState = (db, id, state, now, extra = '') =>
   db.prepare(`UPDATE grants SET state=?, updated_at=? ${extra} WHERE id=?`).run(state, now, id)
 
 // Moves the ask a row carries: its own state, or its pending raise.
+// Sending an ask to the grantee (state or raise → pending) stamps the row
+// sent: from then on they may read it, whatever becomes of it.
 function setAsk(db, g, state, now, extra = '') {
-  if (g.pending_state) db.prepare(`UPDATE grants SET pending_state=?, updated_at=? WHERE id=?`).run(state, now, g.id)
-  else setState(db, g.id, state, now, extra)
+  if (g.pending_state) db.prepare(`UPDATE grants SET pending_state=?, pending_at=?, updated_at=? WHERE id=?`).run(state, now, now, g.id)
+  else setState(db, g.id, state, now, `${extra}${state === 'pending' ? `, sent_at=${Number(now)}` : ''}`)
 }
-// A raise that ends without happening leaves the row as it was.
-const dropRaise = (db, g, now) => db.prepare('UPDATE grants SET pending_level=NULL, pending_state=NULL, brief=NULL, exclude_media=NULL, approved=NULL, updated_at=? WHERE id=?').run(now, g.id)
-// An ask that ends before its owner said yes was never the grantee's to
-// read: its brief goes with it (an ended row stays readable to them).
+// A raise that ends without happening leaves the row as it was — to the
+// grantee, exactly as it was when it was never sent (updated_at untouched).
+const dropRaise = (db, g, now) => db.prepare(`UPDATE grants SET pending_level=NULL, pending_state=NULL, pending_by=NULL, pending_at=NULL, brief=NULL, exclude_media=NULL, approved=NULL,
+  updated_at=CASE WHEN ?='awaiting_owner' THEN updated_at ELSE ? END WHERE id=?`).run(g.pending_state, now, g.id)
+// The time an ask was made: a raise's own, else the row's.
+const askedAt = (g) => (g.pending_state ? g.pending_at ?? g.updated_at : g.updated_at)
+// An ask that ends before its owner said yes was never sent (sent_at is
+// null), so the grantee never sees the row at all; its brief goes too.
 // Every path that ends an ask still awaiting the owner forgets it this way
 // (an approval refused here, a withdrawal, an expiry, a revoke — and, in
 // contacts.js and handover.js, a removed contact and a hand-over that
@@ -200,9 +214,9 @@ function stillPossible(db, g) {
   }
 }
 // A hand-over that can no longer happen: it expires (a raise just drops).
-// Refused at the owner's approval, it was never sent: its brief goes too,
-// since the ended row is readable to the recipient. Refused at the accept,
-// the recipient has already read it.
+// Refused at the owner's approval, it was never sent: the row stays hidden
+// from the recipient (sent_at null) and its brief goes too. Refused at the
+// accept, the recipient has already read it.
 function endAsk(db, g, ask, now) {
   if (ask.raise) dropRaise(db, g, now)
   else {
@@ -229,12 +243,13 @@ export function answerGrant(db, { userId, grantId, decision, excludeMedia, now =
       if (!g || (g.owner_user_id !== userId && g.grantee_user_id !== userId)) return null
       const isOwner = g.owner_user_id === userId
       const ask = askOf(g)
-      // The grantee has never been told of an ask its owner has not approved.
-      if (!isOwner && ask.state === 'awaiting_owner') return null
+      // The grantee has never been told of an ask its owner has not approved
+      // (or of a row that was never sent to them at all).
+      if (!isOwner && (ask.state === 'awaiting_owner' || g.sent_at == null)) return null
       const done = (outcome, extra = {}) => ({ outcome, grant: getGrantRaw(db, g.id), before: g, ...extra })
       const contact = db.prepare('SELECT * FROM contacts WHERE id=?').get(g.contact_id)
       if (isOwner && ask.state === 'awaiting_owner') {
-        if (now - g.updated_at > OWN_ASK_TTL_MS) {
+        if (now - askedAt(g) > OWN_ASK_TTL_MS) {
           if (ask.raise) dropRaise(db, g, now); else { setState(db, g.id, 'expired', now); forgetBrief(db, g.id) }
           return done('expired')
         }
@@ -273,7 +288,7 @@ export function answerGrant(db, { userId, grantId, decision, excludeMedia, now =
           const handover = applyHandover(db, { g: getGrantRaw(db, g.id), files, now })
           return done('handed_over', { handover })
         }
-        if (ask.raise) db.prepare(`UPDATE grants SET level=pending_level, pending_level=NULL, pending_state=NULL, answered_at=?, updated_at=? WHERE id=?`).run(now, now, g.id)
+        if (ask.raise) db.prepare(`UPDATE grants SET level=pending_level, pending_level=NULL, pending_state=NULL, pending_by=NULL, pending_at=NULL, answered_at=?, updated_at=? WHERE id=?`).run(now, now, g.id)
         else setState(db, g.id, 'active', now, `, answered_at=${Number(now)}`)
         return done('accepted')
       }
@@ -293,24 +308,25 @@ export function revokeGrant(db, { userId, grantId, now = Date.now() }) {
     const g = getGrantRaw(db, grantId)
     if (!g || (g.owner_user_id !== userId && g.grantee_user_id !== userId)) return null
     const isOwner = g.owner_user_id === userId
-    if (!isOwner && g.state === 'awaiting_owner') return null
+    if (!isOwner && g.sent_at == null) return null
     if (!['awaiting_owner', 'pending', 'active'].includes(g.state)) fail('not_active')
     // A hand-over that happened is not undone by revoking its record.
     if (g.level === 'owner' && g.state === 'active') fail('handed_over')
-    setState(db, g.id, 'revoked', now, `, revoked_by='${isOwner ? 'owner' : 'grantee'}', revoked_at=${Number(now)}, pending_level=NULL, pending_state=NULL`)
+    setState(db, g.id, 'revoked', now, `, revoked_by='${isOwner ? 'owner' : 'grantee'}', revoked_at=${Number(now)}, pending_level=NULL, pending_state=NULL, pending_by=NULL, pending_at=NULL`)
     if (askOf(g).state === 'awaiting_owner') forgetBrief(db, g.id)
     return { grant: getGrantRaw(db, g.id), before: g, by: isOwner ? 'owner' : 'grantee' }
   })()
 }
 
-// direction 'out' = grants I gave, 'in' = grants given to me (never one
-// still waiting for its owner's approval). Ended rows are listed only when
-// a state is named.
+// direction 'out' = grants I gave, 'in' = grants given to me — only rows
+// ever sent to me (sent_at): never one still waiting for its owner's
+// approval, nor one that ended before the owner approved it. Ended rows
+// are listed only when a state is named.
 export function listGrants(db, userId, { direction = null, missionId = null, projectId = null, state = null } = {}) {
   const where = []; const args = { u: userId }
   if (direction === 'out') where.push('g.owner_user_id = @u')
-  else if (direction === 'in') where.push("oc.peer_user_id = @u AND oc.peer_journal IS NULL AND g.state <> 'awaiting_owner'")
-  else where.push("(g.owner_user_id = @u OR (oc.peer_user_id = @u AND oc.peer_journal IS NULL AND g.state <> 'awaiting_owner'))")
+  else if (direction === 'in') where.push('oc.peer_user_id = @u AND oc.peer_journal IS NULL AND g.sent_at IS NOT NULL')
+  else where.push('(g.owner_user_id = @u OR (oc.peer_user_id = @u AND oc.peer_journal IS NULL AND g.sent_at IS NOT NULL))')
   if (missionId) { where.push("g.subject_kind = 'mission' AND g.subject_id = @m"); args.m = missionId }
   if (projectId) { where.push("g.subject_kind = 'project' AND g.subject_id = @p"); args.p = projectId }
   if (state) { where.push('g.state = @s'); args.s = state } else where.push(`g.state IN ${LIVE_GRANT_STATES}`)
@@ -328,11 +344,15 @@ export function activeGranteeIds(db, missionId) {
 // A raise that expires just drops; the row stays as it was.
 export function expireGrantAsks(db, now = Date.now()) {
   return db.transaction(() => {
-    const rows = db.prepare(`${RAW} WHERE (g.state='awaiting_owner' OR g.pending_state='awaiting_owner') AND g.updated_at < ?`).all(now - OWN_ASK_TTL_MS)
+    const rows = db.prepare(`${RAW} WHERE ((g.state='awaiting_owner' AND g.updated_at < @t) OR (g.pending_state='awaiting_owner' AND COALESCE(g.pending_at, g.updated_at) < @t))`).all({ t: now - OWN_ASK_TTL_MS })
     for (const r of rows) { if (r.pending_state) dropRaise(db, r, now); else { setState(db, r.id, 'expired', now); forgetBrief(db, r.id) } }
     return rows
   })()
 }
+
+// The sent_at backfill lives in db.js (its migration runs it); re-exported
+// here beside the rule it serves.
+export { backfillGrantSent } from './db.js'
 
 export function setGrantItem(db, grantId, side, itemId) {
   db.prepare(`UPDATE grants SET ${side === 'owner' ? 'owner_item_id' : 'grantee_item_id'}=? WHERE id=?`).run(itemId, grantId)

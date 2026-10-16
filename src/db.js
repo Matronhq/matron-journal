@@ -1547,6 +1547,20 @@ export function openDb(path) {
   for (const [name, type] of [['brief', 'TEXT'], ['exclude_media', 'TEXT'], ['copy_subject_id', 'TEXT'], ['pending_level', 'TEXT'], ['pending_state', 'TEXT'], ['approved', 'TEXT']]) {
     if (!grantCols.some((c) => c.name === name)) db.exec(`ALTER TABLE grants ADD COLUMN ${name} ${type}`)
   }
+  // `sent_at`: when the row was sent to its grantee (moved to pending). The
+  // grantee reads a row only once it has been: an ask its owner never
+  // approved — still waiting, declined, expired or revoked — stays a 404 to
+  // them. `pending_by` / `pending_at` are a raise's own asker and time, so
+  // the share's requested_by and updated_at stay as its grantee knows them
+  // while a raise waits. Added together; the backfill runs once, with them.
+  if (!grantCols.some((c) => c.name === 'sent_at')) {
+    db.transaction(() => {
+      db.exec('ALTER TABLE grants ADD COLUMN sent_at INTEGER')
+      db.exec('ALTER TABLE grants ADD COLUMN pending_by TEXT')
+      db.exec('ALTER TABLE grants ADD COLUMN pending_at INTEGER')
+      backfillGrantSent(db)
+    })()
+  }
   // Contributors (person-to-person sharing, phase 3): a write a contributor
   // made in the owner's log names them. contributor_name/_via ('user' |
   // 'agent') are what the owner reads ("by bob", "by bob's agent").
@@ -1569,6 +1583,39 @@ export function openDb(path) {
   // items, which drops its triggers with it).
   installSearchDocs(db)
   return db
+}
+
+// Whether a row was ever sent to its grantee (sent_at), for rows written
+// before the column: one that is pending or active was, and so was one the
+// grantee answered or ended — their card (grantee_item_id) or their own
+// revoke says so. Anything else (still awaiting the owner, declined or
+// revoked by the owner before approving, expired unanswered) was not.
+// Idempotent: only rows with no sent_at are touched.
+// The grantee's card is filed best-effort, so a sent row may have none: the
+// grantee's own "received" audit line, in their People conversation, counts
+// as evidence too (only the journal writes `people` events) — but only for
+// the row's CURRENT ask. A row is reused for a later ask, which may have
+// ended unsent, and an old receipt says nothing about it: so the receipt
+// must be newer than the current ask. A client's ask is sent as it is made,
+// so any receipt is its own; an agent's ask is dated by its owner's card
+// (owner_item_id), and one with no card cannot be dated and is not counted.
+// A row still awaiting its owner is never counted.
+export function backfillGrantSent(db) {
+  return db.prepare(`UPDATE grants SET sent_at = COALESCE(answered_at, updated_at, created_at)
+    WHERE sent_at IS NULL AND (state IN ('pending','active') OR grantee_item_id IS NOT NULL OR revoked_by = 'grantee'
+      -- Revoked after the grantee answered it: answered_at on a revoked row
+      -- is only ever the grantee's accept (a renewal resets it), and it
+      -- survives the raises that older code wrote over the card ids.
+      OR (state = 'revoked' AND answered_at IS NOT NULL)
+      OR (state <> 'awaiting_owner' AND EXISTS (
+        SELECT 1 FROM events e
+        JOIN conversations pc ON pc.id = e.convo_id AND pc.system = 'people'
+        JOIN contacts c ON c.id = grants.contact_id
+        WHERE e.user_id = c.peer_user_id AND pc.owner_user_id = c.peer_user_id AND e.type = 'people'
+          AND json_extract(e.payload, '$.grant_id') = grants.id
+          AND json_extract(e.payload, '$.event') IN ('grant.received', 'grant.handover_received')
+          AND (grants.requested_by IS NOT 'agent'
+               OR e.ts >= (SELECT oi.created_at FROM items oi WHERE oi.id = grants.owner_item_id)))))`).run().changes
 }
 
 export function insertBlob(db, { id, ownerUserId, contentType, size, sha256, diskPath, width = null, height = null }) {

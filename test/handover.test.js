@@ -352,8 +352,7 @@ test('declining: alice declines with a note that reaches the asking agent; bob d
   assert.equal(heard.payload.comment.body, 'Not yet: finish the invitations first.')
   assert.equal(w.ws.aliceCoord.journal().filter((f) => f.payload?.item_id === mirror.id).length, 0, 'no other agent does')
   assert.equal(cards(w.ws.bobPhone, 'mission_handover').length, 0, 'nothing reached bob')
-  const ended = (await w.bobPhone(`/grants/${ask.json.grant.id}`)).json.grant
-  assert.equal('brief' in ended, false, 'a brief alice never approved is not bob\'s to read')
+  assert.equal((await w.bobPhone(`/grants/${ask.json.grant.id}`)).status, 404, 'an ask alice never approved is never bob\'s to see (test/grant-privacy.test.js)')
 
   // A client's own ask goes straight to bob; bob declines.
   const direct = await w.alicePhone(`/missions/${m.id}/shares`, post({ contact: 'bob', level: 'owner', brief: BRIEF }))
@@ -633,16 +632,12 @@ test('an ask that ends before the owner approves never leaves its brief for the 
   const ask = (await w.aliceBox(`/missions/${m.id}/shares`, post({ contact: 'bob', level: 'owner', brief: BRIEF, convo_id: 'work' }))).json.grant
   await w.alicePhone(`/missions/${m.id}/close`, post({ summary: 'done' }))
   assert.equal((await w.alicePhone(`/grants/${ask.id}/answer`, post({ decision: 'approve' }))).status, 409)
-  const seen = await w.bobPhone(`/grants/${ask.id}`)
-  assert.equal(seen.status, 200, 'an ended row is readable to bob')
-  assert.equal('brief' in seen.json.grant, false)
+  assert.equal((await w.bobPhone(`/grants/${ask.id}`)).status, 404, 'never sent, so never bob\'s to see')
   // Ended by removing the contact while it waited for alice.
   const m2 = (await w.aliceBox('/missions', post({ convo_id: 'side', title: 'Second' }))).json.mission
   const ask2 = (await w.aliceBox(`/missions/${m2.id}/shares`, post({ contact: 'bob', level: 'owner', brief: BRIEF, convo_id: 'side' }))).json.grant
   assert.equal((await w.alicePhone(`/contacts/${aliceContact}`, { method: 'DELETE' })).status, 200)
-  const seen2 = await w.bobPhone(`/grants/${ask2.id}`)
-  assert.equal(seen2.status, 200)
-  assert.equal('brief' in seen2.json.grant, false)
+  assert.equal((await w.bobPhone(`/grants/${ask2.id}`)).status, 404)
   const row = w.s.db.prepare('SELECT brief, exclude_media, approved FROM grants WHERE id=?').get(ask2.id)
   assert.deepEqual(row, { brief: null, exclude_media: null, approved: null })
 })
