@@ -246,6 +246,12 @@ function closeOriginal(db, { m, copy, granteeName, copiedItems, now }) {
     WHERE id=?`).run(summary, now, now, m.id)
   const left = []
   for (const { convo_id: convoId } of db.prepare('SELECT convo_id FROM mission_conversations WHERE mission_id=? AND ended_at IS NULL').all(m.id)) {
+    // A link whose conversation row is gone (links have no foreign key)
+    // just ends: leaveMission would refuse it and fail the whole accept.
+    if (!db.prepare('SELECT 1 FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, m.user_id)) {
+      db.prepare('UPDATE mission_conversations SET ended_at=? WHERE mission_id=? AND convo_id=?').run(now, m.id, convoId)
+      continue
+    }
     const out = leaveMission(db, { userId: m.user_id, missionId: m.id, convoId })
     if (out.left) left.push({ convoId, currentMissionId: out.currentChanged ? out.currentMissionId : null, retitled: out.retitled })
   }

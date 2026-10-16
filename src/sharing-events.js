@@ -454,14 +454,15 @@ export function onGrantRevoked(ctx, before, by, who = null) {
   if (state !== 'awaiting_owner') {
     audit(ctx, g.grantee_user_id, {
       event: 'grant.revoked', contact: gc, grant: g, by: by === 'grantee' ? 'you' : 'peer',
-      summary: by === 'grantee' ? `You ended the share of ${missionWordsFor(g)} from ${from}` : `${from} ended the share of ${missionWordsFor(g)}`,
+      summary: by === 'grantee' ? `You ended the share of ${subjectWordsFor(g)} from ${from}` : `${from} ended the share of ${subjectWordsFor(g)}`,
     })
-    safely('shared frame', () => hub.sendToClients(g.grantee_user_id, { kind: 'shared', event: 'mission_removed', mission_id: g.subject_id, grant_id: g.id }))
+    // A project is never readable through a grant: there is nothing to drop.
+    if (g.subject_kind === 'mission') safely('shared frame', () => hub.sendToClients(g.grantee_user_id, { kind: 'shared', event: 'mission_removed', mission_id: g.subject_id, grant_id: g.id }))
     changed(ctx, g.grantee_user_id, { grant_id: g.id })
   }
   audit(ctx, g.owner_user_id, {
     event: 'grant.revoked', contact: oc, grant: g, by: by === 'owner' ? 'you' : 'peer',
-    summary: by === 'grantee' ? `${to} ended the share of ${missionWords(g)}` : `You stopped sharing ${missionWords(g)} with ${to}`,
+    summary: by === 'grantee' ? `${to} ended the share of ${subjectWords(g)}` : `You stopped sharing ${subjectWords(g)} with ${to}`,
   })
   changed(ctx, g.owner_user_id, { grant_id: g.id })
 }
@@ -659,6 +660,11 @@ function onHandoverOutcome(ctx, who, out) {
       audit(ctx, g.grantee_user_id, { event: 'grant.handover_accepted', summary: `You took over ${subjectWordsFor(before ?? g)} from ${from}: now your ${copy}`, contact: gc, grant: g })
       audit(ctx, g.owner_user_id, { event: 'grant.handover_accepted', summary: `${to} took over ${subjectWords(before ?? g)}`, contact: oc, grant: g })
       announceHandover(ctx, before ?? g, h)
+      // A raised read share: the recipient's read of the original ends here
+      // (it is closed, and theirs now as the copy).
+      if (before?.state === 'active' && g.subject_kind === 'mission') {
+        safely('shared frame', () => ctx.hub.sendToClients(g.grantee_user_id, { kind: 'shared', event: 'mission_removed', mission_id: g.subject_id, grant_id: g.id }))
+      }
       changed(ctx, g.owner_user_id, { grant_id: g.id })
       break
     }

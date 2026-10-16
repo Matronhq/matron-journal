@@ -390,6 +390,7 @@ test('hand-over of a mission already shared read-only: the share upgrades in pla
   assert.equal((await w.alicePhone(`/grants/${read.json.grant.id}/answer`, post({ decision: 'approve' }))).json.grant.pending_level, 'owner')
   assert.equal((await w.bobPhone(`/grants/${read.json.grant.id}`)).json.grant.pending_level, 'owner')
   assert.equal((await w.bobPhone(`/missions/${m.id}`)).status, 200, 'still readable while bob decides')
+  w.ws.bobPhone.frames.length = 0
   const accepted = await w.bobPhone(`/grants/${read.json.grant.id}/answer`, post({ decision: 'approve', start_session: { device_id: 1 } }))
   assert.equal(accepted.status, 200)
   assert.equal(accepted.json.grant.level, 'owner')
@@ -398,6 +399,8 @@ test('hand-over of a mission already shared read-only: the share upgrades in pla
   const copyId = accepted.json.grant.copy_id
   assert.equal((await w.bobPhone(`/missions/${copyId}`)).json.mission.title, 'Launch')
   assert.equal((await w.bobPhone(`/missions/${m.id}`)).status, 404, 'the closed original is alice\'s')
+  await settle()
+  assert.ok(w.ws.bobPhone.frames.some((f) => f.kind === 'shared' && f.event === 'mission_removed' && f.mission_id === m.id), 'bob\'s apps drop the original')
   assert.equal((await w.alicePhone(`/missions/${copyId}`)).status, 200)
 })
 
@@ -507,4 +510,26 @@ test('an accept that fails part-way changes nothing and leaves no copied file be
   assert.deepEqual((await w.bobPhone('/missions')).json.missions, [])
   w.s.db.exec('DROP TRIGGER no_handover')
   assert.equal((await w.bobPhone(`/grants/${g.id}/answer`, post({ decision: 'approve' }))).status, 200, 'and it can be accepted after')
+})
+
+test('withdrawing a project hand-over names the project, and a link to a vanished conversation does not block an accept', async (t) => {
+  const w = await world(t)
+  const proj = (await w.alicePhone('/projects', post({ title: 'Garden Club' }))).json.project
+  const m = (await w.aliceBox('/missions', post({ convo_id: 'work', title: 'Launch', project: proj.id }))).json.mission
+  await makeContacts(w)
+  const g = (await w.alicePhone(`/projects/${proj.id}/shares`, post({ contact: 'bob', level: 'owner', brief: BRIEF }))).json.grant
+  w.ws.bobPhone.frames.length = 0
+  assert.equal((await w.alicePhone(`/grants/${g.id}`, { method: 'DELETE' })).status, 200)
+  await settle()
+  const lines = [...w.ws.alicePhone.journal(), ...w.ws.bobPhone.journal()].filter((f) => f.type === 'people' && f.payload.event === 'grant.revoked').map((f) => f.payload.summary)
+  assert.equal(lines.length, 2)
+  for (const line of lines) assert.match(line, /project/)
+  for (const line of lines) assert.doesNotMatch(line, /undefined|null/)
+  assert.equal(w.ws.bobPhone.frames.filter((f) => f.kind === 'shared' && f.event === 'mission_removed').length, 0)
+
+  // A link whose conversation row is gone.
+  w.s.db.prepare("INSERT INTO mission_conversations(mission_id, convo_id, user_id, how, joined_at) VALUES(?, 'gone', ?, 'joined', 1)").run(m.id, w.alice.id)
+  const again = (await w.alicePhone(`/missions/${m.id}/shares`, post({ contact: 'bob', level: 'owner', brief: BRIEF }))).json.grant
+  assert.equal((await w.bobPhone(`/grants/${again.id}/answer`, post({ decision: 'approve' }))).status, 200)
+  assert.equal(w.s.db.prepare("SELECT ended_at FROM mission_conversations WHERE convo_id='gone'").get().ended_at != null, true)
 })
