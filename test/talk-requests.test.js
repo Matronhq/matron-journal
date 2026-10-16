@@ -547,3 +547,48 @@ test('a talk held back by a block ends without a word to the person who blocked'
   assert.equal(w.ws.bobPhone.frames.filter((f) => f.kind === 'people').length, 0)
   assert.equal(w.ws.bobPhone.journal().filter((f) => JSON.stringify(f).includes(link.id)).length, 0)
 })
+
+const contactStates = (w) => Object.fromEntries(w.s.db.prepare('SELECT peer_user, state FROM contacts').all().map((r) => [r.peer_user, r.state]))
+
+test('a talk that expires unanswered takes the contact request it made with it', async (t) => {
+  const w = await world(t)
+  await askAndSend(w)
+  assert.deepEqual(contactStates(w), { bob: 'pending_out', alice: 'pending_in' })
+  w.ws.bobPhone.frames.length = 0
+  w.s.db.prepare("UPDATE person_rooms SET updated_at=? WHERE kind='talk'").run(Date.now() - TALK_GUEST_TTL_MS - 1000)
+  sweepTalkAsks({ db: w.s.db, hub: w.s.hub })
+  assert.equal(talkRow(w).state, 'expired')
+  assert.deepEqual(contactStates(w), { bob: 'expired', alice: 'expired' })
+  await settle()
+  assert.ok(w.ws.bobPhone.frames.some((f) => f.kind === 'people' && f.contact_id), 'bob\'s contact list refreshes')
+})
+
+test('a talk the owner ends before the guest chooses withdraws the contact request it made', async (t) => {
+  const w = await world(t)
+  await askAndSend(w)
+  const link = talkRow(w)
+  assert.equal((await w.alicePhone(`/person-rooms/${link.id}`, { method: 'DELETE' })).status, 200)
+  assert.deepEqual(contactStates(w), { bob: 'removed', alice: 'removed' })
+})
+
+test('ending a talk leaves a contact request it did not make, and a block, alone', async (t) => {
+  const w = await world(t)
+  // A request alice sent herself, before the talk.
+  assert.equal((await w.alicePhone('/contacts', post({ user: 'bob' }))).status, 201)
+  await askAndSend(w)
+  assert.equal(talkRow(w).contact_by_talk, 0)
+  w.s.db.prepare("UPDATE person_rooms SET updated_at=? WHERE kind='talk'").run(Date.now() - TALK_GUEST_TTL_MS - 1000)
+  sweepTalkAsks({ db: w.s.db, hub: w.s.hub })
+  assert.deepEqual(contactStates(w), { bob: 'pending_out', alice: 'pending_in' })
+
+  // bob blocked alice: her talk's request reads as sent; it ends with the
+  // talk, and bob's block stays.
+  const w2 = await world(t)
+  const { bobContact } = await makeContacts(w2)
+  assert.equal((await w2.bobPhone(`/contacts/${bobContact}/block`, post({}))).status, 200)
+  await askAndSend(w2)
+  assert.equal(talkRow(w2).contact_by_talk, 1)
+  w2.s.db.prepare("UPDATE person_rooms SET updated_at=? WHERE kind='talk'").run(Date.now() - TALK_GUEST_TTL_MS - 1000)
+  sweepTalkAsks({ db: w2.s.db, hub: w2.s.hub })
+  assert.deepEqual(contactStates(w2), { bob: 'expired', alice: 'blocked' })
+})

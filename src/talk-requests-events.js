@@ -252,18 +252,31 @@ function offerAgain(ctx, l, body) {
 
 // --- Sweep ------------------------------------------------------------------
 
+// The guest's week ran out (the sweep, or a tap that came too late): the
+// guest's card closes, the owner's agent hears 'expired', and a contact
+// request the talk made ended with it.
+export function onTalkGuestExpired(ctx, l, endedContact = null) {
+  closeMirror(ctx, { userId: l.guest_user_id, itemId: l.guest_item_id, consent: 'room', resolution: 'cancelled', author: 'agent', comment: `Expired — no answer within ${DAYS} days.` })
+  refuseToOwner(ctx, l, 'expired')
+  roomAudit(ctx, l.owner_user_id, l, 'owner', 'room.expired', `${t(l.guest_name)} did not answer the talk request`)
+  changed(ctx, l.owner_user_id, { room_link_id: l.id })
+  talkContactEnded(ctx, endedContact)
+}
+
+// The people frames for a contact request that ended with its talk.
+export function talkContactEnded(ctx, ended) {
+  if (!ended) return
+  changed(ctx, ended.own.user_id, { contact_id: ended.own.id })
+  if (ended.peer) changed(ctx, ended.peer.user_id, { contact_id: ended.peer.id })
+}
+
 // Talk asks nobody answered: the owner's after 24 h (as any room ask), the
 // guest's after TALK_GUEST_TTL_MS, and new sessions that never reported
 // back. Best-effort like every sweep tail.
 export function sweepTalkAsks(ctx, now = Date.now()) {
   for (const row of expirePersonRoomAsks(ctx.db, now)) onPersonRoomOutcome(ctx, null, { outcome: 'expired', link: row, before: row })
   const { expired, stuck } = expireTalkAsks(ctx.db, now)
-  for (const l of expired) {
-    closeMirror(ctx, { userId: l.guest_user_id, itemId: l.guest_item_id, consent: 'room', resolution: 'cancelled', author: 'agent', comment: `Expired — no answer within ${DAYS} days.` })
-    refuseToOwner(ctx, l, 'expired')
-    roomAudit(ctx, l.owner_user_id, l, 'owner', 'room.expired', `${t(l.guest_name)} did not answer the talk request`)
-    changed(ctx, l.owner_user_id, { room_link_id: l.id })
-  }
+  for (const l of expired) onTalkGuestExpired(ctx, l, l.ended_contact)
   for (const l of stuck) offerAgain(ctx, l, "Couldn't start a session: it did not report back. Pick another option.")
 }
 

@@ -296,6 +296,11 @@ export function onPersonRoomEnded(ctx, before, by) {
   if (guestWasTold) roomAudit(ctx, l.guest_user_id, l, 'guest', 'room.ended', words('guest'))
   changed(ctx, l.owner_user_id, { room_link_id: l.id })
   if (guestWasTold) changed(ctx, l.guest_user_id, { room_link_id: l.id })
+  // The contact request the talk made, ended with it (endPersonRoom).
+  if (l.ended_contact) {
+    changed(ctx, l.ended_contact.own.user_id, { contact_id: l.ended_contact.own.id })
+    if (l.ended_contact.peer) changed(ctx, l.ended_contact.peer.user_id, { contact_id: l.ended_contact.peer.id })
+  }
 }
 
 export function endAndNotify(ctx, linkId, by, to = 'left') {

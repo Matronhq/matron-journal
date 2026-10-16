@@ -424,6 +424,9 @@ export function endPersonRoom(db, { linkId, to = 'left', by, now = Date.now() })
     const link = getPersonRoom(db, linkId)
     if (!link || !LIVE_ROOM_STATES.includes(link.state)) return null
     db.prepare(`UPDATE person_rooms SET state=?, updated_at=?, ended_by=? WHERE id=?`).run(to, now, by, link.id)
+    // A talk that ends before its guest chose takes its own contact request
+    // with it: the guest only ever saw it on the talk's card.
+    if (['awaiting_guest', 'starting'].includes(link.state)) link.ended_contact = endTalkContact(db, link, 'removed', now)
     db.prepare("UPDATE convo_agents SET state='left', answered_at=? WHERE convo_id=? AND agent_device_id=? AND state IN ('invited','joined')")
       .run(now, link.owner_room_id, link.guest_device_id)
     if (link.guest_room_id) {
@@ -432,6 +435,26 @@ export function endPersonRoom(db, { linkId, to = 'left', by, now = Date.now() })
     }
     return link
   })()
+}
+
+// The contact request a talk's Send made (contact_by_talk), ended with the
+// talk when the guest never chose: the owner's pending_out row and the
+// guest's pending_in row both go to `to` ('expired' or 'removed'). A guest
+// row the guest blocked stays theirs. Anything else (already contacts, a
+// request that was not the talk's, one answered meanwhile) is left alone.
+// Caller holds the transaction. Returns {own, peer} (peer null when the
+// guest's row was not touched), or null.
+export function endTalkContact(db, link, to, now = Date.now()) {
+  if (link.kind !== 'talk' || !link.contact_by_talk) return null
+  const row = (u, p) => db.prepare('SELECT * FROM contacts WHERE user_id=? AND peer_user_id=? AND peer_journal IS NULL').get(u, p)
+  const own = row(link.owner_user_id, link.guest_user_id)
+  if (own?.state !== 'pending_out') return null
+  const theirs = row(link.guest_user_id, link.owner_user_id)
+  const end = (id) => db.prepare('UPDATE contacts SET state=?, updated_at=?, revoked_at=? WHERE id=?').run(to, now, now, id)
+  end(own.id)
+  const touchPeer = theirs?.state === 'pending_in'
+  if (touchPeer) end(theirs.id)
+  return { own: { ...own, state: to }, peer: touchPeer ? { ...theirs, state: to } : null }
 }
 
 // Every live link between two people, either way round.

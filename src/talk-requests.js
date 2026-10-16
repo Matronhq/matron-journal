@@ -18,7 +18,7 @@ import { getMission } from './missions.js'
 import { isPrivateDevice } from './db.js'
 import { getCoordinatorConvoId } from './coordinator.js'
 import {
-  getPersonRoom, isGuestRoom, isFreshRoom, parkedPeopleAsks, inviteGuest, stillAllowed, isShareableSession, guestSees, LIVE_ROOM_STATES,
+  getPersonRoom, isGuestRoom, isFreshRoom, parkedPeopleAsks, inviteGuest, stillAllowed, isShareableSession, guestSees, endTalkContact, LIVE_ROOM_STATES,
 } from './person-rooms.js'
 
 // The guest's card waits a week: people take days.
@@ -340,7 +340,10 @@ export function expireTalkAsks(db, now = Date.now()) {
   return db.transaction(() => {
     const expired = db.prepare("SELECT id FROM person_rooms WHERE kind='talk' AND state='awaiting_guest' AND updated_at < ?").all(now - TALK_GUEST_TTL_MS)
       .map((r) => getPersonRoom(db, r.id))
-    for (const r of expired) setState(db, r.id, 'expired', now, ", ended_by='guest'")
+    for (const r of expired) {
+      setState(db, r.id, 'expired', now, ", ended_by='guest'")
+      r.ended_contact = endTalkContact(db, r, 'expired', now)
+    }
     const stuck = db.prepare("SELECT id, spawn_id FROM person_rooms WHERE kind='talk' AND state='starting' AND updated_at < ?").all(now - TALK_START_STUCK_MS)
       .map((r) => failTalkStart(db, { linkId: r.id, spawnId: r.spawn_id, now })).filter(Boolean)
     return { expired, stuck }
