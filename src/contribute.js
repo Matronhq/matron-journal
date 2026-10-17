@@ -56,13 +56,25 @@ export function contributableMission(db, viewerUserId, missionId) {
 
 const openMission = (m) => { if (m.state !== 'open') fail('closed') }
 
+// The mission row as it is NOW, for a write inside its own transaction: the
+// route checked before reading the body, and the share may have ended (or
+// the mission closed) while it arrived. Error('gone') when the contributor
+// no longer may; the fresh row otherwise, so the write sees current state.
+function stillContributesTo(db, contributor, mission) {
+  let m
+  try { m = contributableMission(db, contributor.userId, mission.id) } catch { m = null }
+  if (!m) fail('gone')
+  openMission(m)
+  return m
+}
+
 // A milestone, anchored on a marker in the owner's People conversation:
 // `appendMarker(convoId, payload)` runs inside this transaction (as in
 // createMilestone) and its seq is the row's anchor. Returns {milestone,
 // convoId, seq, ts}.
 export function contributeMilestone(db, { mission, contributor, kind, title, body = '', appendMarker, now = Date.now() }) {
   return db.transaction(() => {
-    openMission(mission)
+    mission = stillContributesTo(db, contributor, mission)
     const people = ensurePeopleConvo(db, mission.user_id, now)
     const id = newId('ml')
     const num = nextNum(db, mission.user_id)
@@ -80,7 +92,7 @@ export function contributeMilestone(db, { mission, contributor, kind, title, bod
 // contributor's phone, which has none). Returns the owner-side item id.
 export function contributeItem(db, { mission, contributor, replyConvoId = null, kind, title, body = '', labels = [], links = [], now = Date.now() }) {
   return db.transaction(() => {
-    openMission(mission)
+    mission = stillContributesTo(db, contributor, mission)
     const people = ensurePeopleConvo(db, mission.user_id, now)
     const { item } = createItem(db, {
       userId: mission.user_id, kind, title, body, labels, links, originConvoId: people.id, originDeviceId: 0, createdBy: 'agent', now,

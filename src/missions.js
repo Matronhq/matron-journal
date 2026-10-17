@@ -429,7 +429,7 @@ export function missionDetail(db, userId, missionId, { excludePrivateOwned = fal
       (c.mission_id IS NOT NULL AND c.mission_id = l.mission_id) AS current, l.how, l.joined_at, l.ended_at,
       s.reported_at AS status_reported_at, s.status AS status_json
     FROM mission_conversations l JOIN conversations c ON c.id = l.convo_id AND c.owner_user_id = ?
-    LEFT JOIN devices d ON d.id = c.agent_device_id
+    LEFT JOIN devices d ON d.id = c.agent_device_id AND d.user_id = c.owner_user_id
     LEFT JOIN conversation_status s ON s.convo_id = c.id
     WHERE l.mission_id = ? ${history ? '' : 'AND l.ended_at IS NULL'} ${sieve}
     ORDER BY (l.ended_at IS NOT NULL), l.joined_at, c.created_at`).all(userId, mission.id)

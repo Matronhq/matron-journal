@@ -142,6 +142,10 @@ async function handleContactSub(ctx, req, res, url, who, id, sub) {
     return false
   }
   if (sub === 'activity' && req.method === 'GET') {
+    // Client-only, like the events it lists: a line about an ask the user
+    // has not yet answered must not reach an agent through this door
+    // either (sharing-events.js, rule 1).
+    if (who.kind !== 'client') return forbidden(res)
     json(res, 200, { events: contactActivity(db, who.userId, own.id) })
     return true
   }
@@ -183,8 +187,7 @@ async function handleContactSub(ctx, req, res, url, who, id, sub) {
 
 // The audit trail for one contact, newest first: the `people` events in the
 // caller's own People conversation that name this contact row. Clients
-// only see it through this route or their own timeline; an agent may read
-// it (it is its user's record of what was shared with whom).
+// only: the events are client-only in the timeline, and so is this door.
 const ACTIVITY_MAX = 200
 function contactActivity(db, userId, contactId) {
   return db.prepare(`SELECT e.seq, e.ts, e.payload FROM events e

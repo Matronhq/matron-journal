@@ -3700,7 +3700,7 @@ GET    /contacts/:id                      :id is the row id (ct_…) or a same-j
 POST   /contacts/:id/answer {decision}    'approve' | 'decline' — client devices only
 DELETE /contacts/:id                      remove, or withdraw a request
 POST   /contacts/:id/block                POST /contacts/:id/unblock (client only)
-GET    /contacts/:id/activity             {events:[…]} — the audit events naming this contact, newest first
+GET    /contacts/:id/activity             {events:[…]} — the audit events naming this contact, newest first (clients only; 403 to an agent)
 ```
 
 `contact`: `{id, address, peer_user, peer_journal, display_name, state,
