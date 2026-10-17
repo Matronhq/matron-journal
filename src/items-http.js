@@ -227,10 +227,12 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
   // A write on an item of a mission someone has been granted: their shared
   // view follows it live (spec 2026-10-02 matron-to-matron sharing). Never
   // for a consent mirror — the grantee's reads do not show one.
-  if (item.mission_id && item.consent == null) notifyGrantees({ db, hub }, item.mission_id, 'item')
+  // Nor for an owner-only item (`private`): no grantee can read it, so
+  // there is nothing to follow and nobody to forward to.
+  if (item.mission_id && item.consent == null && !item.private) notifyGrantees({ db, hub }, item.mission_id, 'item')
   // An item a contributor filed: the owner's reply reaches the conversation
   // that filed it, as another person's turn (src/contribute-http.js).
-  if (item.mission_id && item.consent == null) forwardToContributor({ db, hub, pushPipeline, waker }, who, item, { action, comment })
+  if (item.mission_id && item.consent == null && !item.private) forwardToContributor({ db, hub, pushPipeline, waker }, who, item, { action, comment })
 }
 
 // The journal's transcription job settled every voice note on a comment
@@ -339,6 +341,10 @@ async function handleCreate(ctx, req, res, who) {
   // marker's `by` read 'user', so the apps show who really filed it. The
   // marker's sender stays the agent device (no wake, no self-prompt).
   if (body.on_behalf_of !== undefined && (body.on_behalf_of !== 'user' || who.kind !== 'agent')) return badRequest(res)
+  // `private`: an owner-only item (db.js) — what a bridge files for the
+  // user alone (a secure-input request, a foreign "Allow once" ask). Set at
+  // create only.
+  if (body.private !== undefined && typeof body.private !== 'boolean') return badRequest(res)
   const idemKey = idemKeyOf(req, who)
   if (idemKey === undefined) return badRequest(res)
   // Every body-only rule is settled above, so a malformed field answers 400
@@ -371,7 +377,7 @@ async function handleCreate(ctx, req, res, who) {
       position: body.position, after: body.after, before: body.before,
       originConvoId: body.convo_id, originDeviceId: who.deviceId,
       createdBy,
-      supersedes: body.supersedes ?? null, idemKey,
+      supersedes: body.supersedes ?? null, idemKey, isPrivate: body.private === true,
     })
   } catch (err) {
     if (answerKnownError(res, err)) return true

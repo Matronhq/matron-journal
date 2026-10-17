@@ -819,7 +819,7 @@ export function listSharedMilestones(db, viewerUserId, convoId) {
 // you" is about the viewer, a read grantee is never the one an item waits
 // on, and missionRow derives `activity` from the same number — so the
 // owner's waiting items never read as the grantee's.
-const GRANT_ITEM_SIEVE = `AND i.consent IS NULL AND NOT EXISTS (SELECT 1 FROM conversations oc JOIN private_devices d ON d.id = oc.agent_device_id
+const GRANT_ITEM_SIEVE = `AND i.consent IS NULL AND i.private = 0 AND NOT EXISTS (SELECT 1 FROM conversations oc JOIN private_devices d ON d.id = oc.agent_device_id
   WHERE oc.id = i.origin_convo_id)`
 const GRANT_MILESTONE_SIEVE = `AND NOT EXISTS (SELECT 1 FROM conversations mc JOIN private_devices d ON d.id = mc.agent_device_id
   WHERE mc.id = l.convo_id)`

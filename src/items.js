@@ -167,6 +167,9 @@ export function rowToItem(row) {
     attachments: parseJson(attachments ?? '[]', []),
     actions: parseJson(actions ?? '[]', []),
     chosen_action: rest.chosen_action ?? null,
+    // Owner-only (see db.js): never on another person's wire, so a row
+    // that reaches one is always false there.
+    private: !!rest.private,
   }
   // Filed by another person, a contributor to the item's mission: who, in
   // words. Absent on every other item, so their shape is unchanged.
@@ -359,7 +362,7 @@ export function resolveRank(db, userId, { position, after, before, excludeId = n
 
 export function createItem(db, {
   userId, kind, title, body = '', labels = [], links = [], attachments = [], actions = [], awaiting, position, after, before,
-  originConvoId, originDeviceId, createdBy, supersedes = null, idemKey = null, consent = null, now = Date.now(),
+  originConvoId, originDeviceId, createdBy, supersedes = null, idemKey = null, consent = null, isPrivate = false, now = Date.now(),
 }) {
   return db.transaction(() => {
     if (idemKey) {
@@ -379,10 +382,10 @@ export function createItem(db, {
     const missionId = db.prepare('SELECT mission_id FROM conversations WHERE id=?').get(originConvoId)?.mission_id ?? null
     try {
       db.prepare(`INSERT INTO items(id,user_id,num,kind,state,resolution,awaiting,rank,title,body,labels,links,supersedes,
-        origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at,mission_id,consent,actions)
-        VALUES(?,?,?,?,'open',NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at,mission_id,consent,actions,private)
+        VALUES(?,?,?,?,'open',NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(id, userId, num, kind, aw, rank, title, body, JSON.stringify(labels), JSON.stringify(links), supersedes,
-          originConvoId, originDeviceId, createdBy, idemKey, now, now, missionId, consent, JSON.stringify(actions))
+          originConvoId, originDeviceId, createdBy, idemKey, now, now, missionId, consent, JSON.stringify(actions), isPrivate ? 1 : 0)
     } catch (err) {
       // A racing writer on another connection committed the same
       // (user_id, idem_key) between our lookup above and this INSERT. That
@@ -605,9 +608,10 @@ const OWNER_DECORATE = `
 
 // The grant rule for an item (spec 2026-10-02 matron-to-matron sharing): it
 // sits on a mission granted to @viewer, is not a consent mirror (callers add
-// i.consent IS NULL), and was not filed from a private box — the same sieve
-// the grantee's mission view applies (missions.js grantedMissionDetail).
-const GRANTED_ITEM = `(i.mission_id IS NOT NULL AND EXISTS (
+// i.consent IS NULL), is not owner-only (`private`, db.js), and was not
+// filed from a private box — the same sieve the grantee's mission view
+// applies (missions.js grantedMissionDetail).
+const GRANTED_ITEM = `(i.mission_id IS NOT NULL AND i.private = 0 AND EXISTS (
     SELECT 1 FROM missions m WHERE m.id = i.mission_id AND m.user_id = i.user_id
       AND NOT EXISTS (SELECT 1 FROM conversations mo JOIN private_devices md ON md.id = mo.agent_device_id
                       WHERE mo.id = m.origin_convo_id)
