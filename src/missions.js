@@ -727,9 +727,9 @@ const OWNER_FROM = `JOIN users u ON u.id = m.user_id LEFT JOIN github_accounts g
 function sharedCountsSql() {
   return `
     (SELECT COUNT(*) FROM items i JOIN conversations ic ON ic.id = i.origin_convo_id
-       WHERE i.mission_id = m.id AND i.state='open' AND i.consent IS NULL AND ${sharedConvoSql('ic')}) AS open_items,
+       WHERE i.mission_id = m.id AND i.state='open' AND i.consent IS NULL AND i.private = 0 AND ${sharedConvoSql('ic')}) AS open_items,
     (SELECT COUNT(*) FROM items i JOIN conversations ic ON ic.id = i.origin_convo_id
-       WHERE i.mission_id = m.id AND i.state='open' AND i.awaiting='user' AND i.consent IS NULL AND ${sharedConvoSql('ic')}) AS needs_you,
+       WHERE i.mission_id = m.id AND i.state='open' AND i.awaiting='user' AND i.consent IS NULL AND i.private = 0 AND ${sharedConvoSql('ic')}) AS needs_you,
     (SELECT COUNT(*) FROM mission_conversations sl JOIN conversations cc ON cc.id = sl.convo_id
        WHERE sl.mission_id = m.id AND sl.ended_at IS NULL AND cc.parent_convo_id IS NULL AND ${sharedConvoSql('cc')}) AS conversations,
     (SELECT COUNT(*) FROM milestones l JOIN conversations mc ON mc.id = l.convo_id
@@ -784,7 +784,7 @@ export function sharedMissionDetail(db, viewerUserId, mission, { subchats = fals
     WHERE l.mission_id = @mid AND ${sharedConvoSql('cv')} ORDER BY l.created_at DESC, l.seq DESC`).all(args).map(milestoneRow)
   const items = db.prepare(`SELECT i.id, i.num, i.kind, i.state, i.awaiting, i.title, i.origin_convo_id, i.updated_at
     FROM items i JOIN conversations cv ON cv.id = i.origin_convo_id
-    WHERE i.mission_id = @mid AND i.state='open' AND i.consent IS NULL AND ${sharedConvoSql('cv')}
+    WHERE i.mission_id = @mid AND i.state='open' AND i.consent IS NULL AND i.private = 0 AND ${sharedConvoSql('cv')}
     ORDER BY (i.awaiting = 'user') DESC, i.updated_at DESC`).all(args)
   // parent_convo_id is withheld when the colleague cannot read the parent.
   const conversations = foldSubchats(db.prepare(`SELECT cv.id, cv.title, cv.auto_title, cv.session_state AS state, cv.repo, d.name AS box,
@@ -819,7 +819,7 @@ export function listSharedMilestones(db, viewerUserId, convoId) {
 // you" is about the viewer, a read grantee is never the one an item waits
 // on, and missionRow derives `activity` from the same number — so the
 // owner's waiting items never read as the grantee's.
-const GRANT_ITEM_SIEVE = `AND i.consent IS NULL AND NOT EXISTS (SELECT 1 FROM conversations oc JOIN private_devices d ON d.id = oc.agent_device_id
+const GRANT_ITEM_SIEVE = `AND i.consent IS NULL AND i.private = 0 AND NOT EXISTS (SELECT 1 FROM conversations oc JOIN private_devices d ON d.id = oc.agent_device_id
   WHERE oc.id = i.origin_convo_id)`
 const GRANT_MILESTONE_SIEVE = `AND NOT EXISTS (SELECT 1 FROM conversations mc JOIN private_devices d ON d.id = mc.agent_device_id
   WHERE mc.id = l.convo_id)`

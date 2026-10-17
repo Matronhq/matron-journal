@@ -95,7 +95,9 @@ export function contributeItem(db, { mission, contributor, replyConvoId = null, 
 // contribute to, not a consent mirror. null otherwise.
 export function contributableItem(db, viewerUserId, itemId) {
   const it = db.prepare('SELECT * FROM items WHERE id=?').get(itemId)
-  if (!it || it.consent != null || !it.mission_id || it.user_id === viewerUserId) return null
+  // An owner-only item (`private`, db.js) is the owner's alone: a
+  // contributor neither reads nor writes it.
+  if (!it || it.consent != null || it.private || !it.mission_id || it.user_id === viewerUserId) return null
   try { return contributableMission(db, viewerUserId, it.mission_id) ? it : null } catch { return null }
 }
 

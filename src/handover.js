@@ -154,7 +154,8 @@ export function sameApprovedSet(db, g) {
 function missionContents(db, missionId) {
   const milestones = db.prepare(`SELECT * FROM milestones l WHERE l.mission_id=? AND NOT ${PRIVATE_CONVO('l.convo_id')}
     ORDER BY l.created_at, l.seq`).all(missionId)
-  const items = db.prepare(`SELECT * FROM items i WHERE i.mission_id=? AND i.consent IS NULL AND NOT ${PRIVATE_CONVO('i.origin_convo_id')}
+  // Owner-only items (`private`, db.js) stay with the owner: never copied.
+  const items = db.prepare(`SELECT * FROM items i WHERE i.mission_id=? AND i.consent IS NULL AND i.private = 0 AND NOT ${PRIVATE_CONVO('i.origin_convo_id')}
     ORDER BY i.num`).all(missionId)
   const comments = db.prepare('SELECT * FROM item_comments WHERE item_id=? ORDER BY created_at, rowid')
   for (const it of items) it.comments = comments.all(it.id).filter((c) => !parseJson(c.meta, null)?.handover)

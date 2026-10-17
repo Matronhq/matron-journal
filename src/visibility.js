@@ -112,18 +112,18 @@ export function canReadBlob(db, viewerUserId, blobId) {
       JOIN items i ON i.id = ic.item_id
       JOIN blobs b ON b.id = @id
       JOIN conversations c ON c.id = i.origin_convo_id
-      WHERE ic.attachments LIKE '%"blob_ref":"' || @id || '"%' AND i.consent IS NULL AND b.owner_user_id = i.user_id
+      WHERE ic.attachments LIKE '%"blob_ref":"' || @id || '"%' AND i.consent IS NULL AND i.private = 0 AND b.owner_user_id = i.user_id
         AND ${sharedConvoSql('c')})
     OR EXISTS (
       -- A grantee: an attachment on an item of a granted mission, under the
       -- same sieve as GRANTED_ITEM in items.js (never a consent mirror,
-      -- never an item filed from a private box, never a mission whose origin
-      -- box is private).
+      -- never an owner-only item, never an item filed from a private box,
+      -- never a mission whose origin box is private).
       SELECT 1 FROM item_comments ic
       JOIN items i ON i.id = ic.item_id
       JOIN missions m ON m.id = i.mission_id
       JOIN blobs b ON b.id = @id
-      WHERE ic.attachments LIKE '%"blob_ref":"' || @id || '"%' AND i.consent IS NULL AND b.owner_user_id = i.user_id
+      WHERE ic.attachments LIKE '%"blob_ref":"' || @id || '"%' AND i.consent IS NULL AND i.private = 0 AND b.owner_user_id = i.user_id
         AND m.user_id = i.user_id
         AND NOT EXISTS (SELECT 1 FROM conversations pc JOIN private_devices pd ON pd.id = pc.agent_device_id
                         WHERE pc.id = i.origin_convo_id)

@@ -227,10 +227,12 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
   // A write on an item of a mission someone has been granted: their shared
   // view follows it live (spec 2026-10-02 matron-to-matron sharing). Never
   // for a consent mirror — the grantee's reads do not show one.
-  if (item.mission_id && item.consent == null) notifyGrantees({ db, hub }, item.mission_id, 'item')
+  // Nor for an owner-only item (`private`): no grantee can read it, so
+  // there is nothing to follow and nobody to forward to.
+  if (item.mission_id && item.consent == null && !item.private) notifyGrantees({ db, hub }, item.mission_id, 'item')
   // An item a contributor filed: the owner's reply reaches the conversation
   // that filed it, as another person's turn (src/contribute-http.js).
-  if (item.mission_id && item.consent == null) forwardToContributor({ db, hub, pushPipeline, waker }, who, item, { action, comment })
+  if (item.mission_id && item.consent == null && !item.private) forwardToContributor({ db, hub, pushPipeline, waker }, who, item, { action, comment })
 }
 
 // The journal's transcription job settled every voice note on a comment
@@ -317,7 +319,14 @@ async function handleCreate(ctx, req, res, who) {
   // `mission`: an item filed into another person's mission the caller
   // contributes to (src/contribute-http.js). One's own items follow their
   // conversation and never name a mission.
-  if (body.mission !== undefined) return handleContributedItem(ctx, res, who, body, { writableConvo })
+  // `private`: an owner-only item (db.js) — what a bridge files for the
+  // user alone (a secure-input request, a foreign "Allow once" ask). Set at
+  // create only, and never on an item filed into someone else's mission.
+  if (body.private !== undefined && typeof body.private !== 'boolean') return badRequest(res)
+  if (body.mission !== undefined) {
+    if (body.private !== undefined) return badRequest(res)
+    return handleContributedItem(ctx, res, who, body, { writableConvo })
+  }
   if (!ITEM_KINDS.includes(body.kind)) return badRequest(res)
   const v = validateItemFields(body)
   if (!v.ok) return badFields(res, v)
@@ -371,7 +380,7 @@ async function handleCreate(ctx, req, res, who) {
       position: body.position, after: body.after, before: body.before,
       originConvoId: body.convo_id, originDeviceId: who.deviceId,
       createdBy,
-      supersedes: body.supersedes ?? null, idemKey,
+      supersedes: body.supersedes ?? null, idemKey, isPrivate: body.private === true,
     })
   } catch (err) {
     if (answerKnownError(res, err)) return true

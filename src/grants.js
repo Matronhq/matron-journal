@@ -98,11 +98,11 @@ export function sharePreview(db, missionId) {
   const NOT_PRIVATE = (col) => `NOT EXISTS (SELECT 1 FROM conversations pc JOIN private_devices pd ON pd.id = pc.agent_device_id WHERE pc.id = ${col})`
   return db.prepare(`SELECT
       (SELECT COUNT(*) FROM milestones l WHERE l.mission_id = @m AND ${NOT_PRIVATE('l.convo_id')}) AS milestones,
-      (SELECT COUNT(*) FROM items i WHERE i.mission_id = @m AND i.consent IS NULL AND ${NOT_PRIVATE('i.origin_convo_id')}) AS items,
+      (SELECT COUNT(*) FROM items i WHERE i.mission_id = @m AND i.consent IS NULL AND i.private = 0 AND ${NOT_PRIVATE('i.origin_convo_id')}) AS items,
       (SELECT COUNT(*) FROM item_comments ic JOIN items i ON i.id = ic.item_id
-         WHERE i.mission_id = @m AND i.consent IS NULL AND ic.kind = 'comment' AND ${NOT_PRIVATE('i.origin_convo_id')}) AS comments,
+         WHERE i.mission_id = @m AND i.consent IS NULL AND i.private = 0 AND ic.kind = 'comment' AND ${NOT_PRIVATE('i.origin_convo_id')}) AS comments,
       (SELECT COALESCE(SUM(json_array_length(ic.attachments)), 0) FROM item_comments ic JOIN items i ON i.id = ic.item_id
-         WHERE i.mission_id = @m AND i.consent IS NULL AND ${NOT_PRIVATE('i.origin_convo_id')}) AS attachments`).get({ m: missionId })
+         WHERE i.mission_id = @m AND i.consent IS NULL AND i.private = 0 AND ${NOT_PRIVATE('i.origin_convo_id')}) AS attachments`).get({ m: missionId })
 }
 
 // The shared tail of shareMission and shareProject, inside their

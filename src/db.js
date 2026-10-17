@@ -1141,6 +1141,16 @@ export function openDb(path) {
   if (!itemActionCols.some((c) => c.name === 'chosen_action')) {
     db.exec('ALTER TABLE items ADD COLUMN chosen_action TEXT')
   }
+  // Owner-only items (2026-10-17): `private` is 1 on an item that must never
+  // leave its owner however its mission is shared — a bridge's secure-input
+  // request (its body carries the live form link), a foreign "Allow once"
+  // ask (the exact call another person's turn asked for). Hidden from every
+  // grantee and contributor, never copied by a hand-over, never counted on
+  // a share card. To the owner's own agents and clients it is an item like
+  // any other. 0 on every pre-existing row.
+  if (!itemActionCols.some((c) => c.name === 'private')) {
+    db.exec('ALTER TABLE items ADD COLUMN private INTEGER NOT NULL DEFAULT 0')
+  }
   // Comment action buttons (2026-10-04 comment-actions contract): the same
   // pair as the item's, one level down. `actions` is the list an agent
   // offered on ONE comment (a follow-up question in the thread),
