@@ -319,7 +319,14 @@ async function handleCreate(ctx, req, res, who) {
   // `mission`: an item filed into another person's mission the caller
   // contributes to (src/contribute-http.js). One's own items follow their
   // conversation and never name a mission.
-  if (body.mission !== undefined) return handleContributedItem(ctx, res, who, body, { writableConvo })
+  // `private`: an owner-only item (db.js) — what a bridge files for the
+  // user alone (a secure-input request, a foreign "Allow once" ask). Set at
+  // create only, and never on an item filed into someone else's mission.
+  if (body.private !== undefined && typeof body.private !== 'boolean') return badRequest(res)
+  if (body.mission !== undefined) {
+    if (body.private !== undefined) return badRequest(res)
+    return handleContributedItem(ctx, res, who, body, { writableConvo })
+  }
   if (!ITEM_KINDS.includes(body.kind)) return badRequest(res)
   const v = validateItemFields(body)
   if (!v.ok) return badFields(res, v)
@@ -341,10 +348,6 @@ async function handleCreate(ctx, req, res, who) {
   // marker's `by` read 'user', so the apps show who really filed it. The
   // marker's sender stays the agent device (no wake, no self-prompt).
   if (body.on_behalf_of !== undefined && (body.on_behalf_of !== 'user' || who.kind !== 'agent')) return badRequest(res)
-  // `private`: an owner-only item (db.js) — what a bridge files for the
-  // user alone (a secure-input request, a foreign "Allow once" ask). Set at
-  // create only.
-  if (body.private !== undefined && typeof body.private !== 'boolean') return badRequest(res)
   const idemKey = idemKeyOf(req, who)
   if (idemKey === undefined) return badRequest(res)
   // Every body-only rule is settled above, so a malformed field answers 400

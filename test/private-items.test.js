@@ -92,6 +92,12 @@ test('a contributor neither reads nor writes an owner-only item', async (t) => {
   assert.equal((await w.bobBox(`/items/${secret.id}/close`, post({ resolution: 'done' }))).status, 404)
   assert.equal((await w.bobBox(`/items/${secret.id}/reopen`, post({}))).status, 404)
   assert.equal((await w.bobPhone(`/items/${secret.id}/comments`, post({ action: 'Done' }))).status, 404)
+  // A contributor cannot file one into the owner's mission (nor make a
+  // non-private one by naming the flag).
+  const m = (await w.aliceBox(`/items/${plain.id}`)).json.item.mission_id
+  assert.equal((await w.bobBox('/items', post({ mission: m, kind: 'task', title: 'mine', private: true, convo_id: 'bobwork' }))).status, 400)
+  assert.equal((await w.bobBox('/items', post({ mission: m, kind: 'task', title: 'mine', private: false, convo_id: 'bobwork' }))).status, 400)
+  assert.equal((await w.bobBox('/items', post({ mission: m, kind: 'task', title: 'mine', convo_id: 'bobwork' }))).status, 201)
   // The ordinary item is still theirs to comment on.
   assert.equal((await w.bobBox(`/items/${plain.id}/comments`, post({ body: 'The second one.', convo_id: 'bobwork' }))).status, 201)
   // Nothing the owner does on the owner-only item is announced to the grantee's side.

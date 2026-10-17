@@ -112,7 +112,7 @@ export function canReadBlob(db, viewerUserId, blobId) {
       JOIN items i ON i.id = ic.item_id
       JOIN blobs b ON b.id = @id
       JOIN conversations c ON c.id = i.origin_convo_id
-      WHERE ic.attachments LIKE '%"blob_ref":"' || @id || '"%' AND i.consent IS NULL AND b.owner_user_id = i.user_id
+      WHERE ic.attachments LIKE '%"blob_ref":"' || @id || '"%' AND i.consent IS NULL AND i.private = 0 AND b.owner_user_id = i.user_id
         AND ${sharedConvoSql('c')})
     OR EXISTS (
       -- A grantee: an attachment on an item of a granted mission, under the

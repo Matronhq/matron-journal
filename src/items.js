@@ -666,7 +666,9 @@ export function listSharedComments(db, itemId) {
 
 export function listSharedItems(db, viewerUserId, { kind = null, state = null, awaiting = null, limit = 100, cursor = null } = {}) {
   limit = Math.min(Math.max(Number(limit) || 100, 1), 500)
-  const where = [`(${ORG_SHARED} OR ${GRANTED_ITEM})`, 'i.consent IS NULL']
+  // Owner-only items (`private`) stay out of every other person's read,
+  // the org rule included.
+  const where = [`(${ORG_SHARED} OR ${GRANTED_ITEM})`, 'i.consent IS NULL', 'i.private = 0']
   const args = { viewer: viewerUserId }
   if (Array.isArray(kind)) { where.push(`i.kind IN (${kind.map((_, i) => `@kind${i}`).join(',')})`); kind.forEach((k, i) => { args[`kind${i}`] = k }) }
   else if (kind != null) { where.push('i.kind = @kind'); args.kind = kind }
@@ -686,7 +688,7 @@ export function listSharedItems(db, viewerUserId, { kind = null, state = null, a
 export function getSharedItem(db, viewerUserId, itemId) {
   if (typeof itemId !== 'string' || !itemId.startsWith('it_')) return null
   const row = db.prepare(`SELECT i.*, ${DECORATE}, ${OWNER_DECORATE}, ${ORG_SHARED} AS org_shared ${SHARED_OR_GRANTED_FROM}
-    WHERE i.id = @id AND i.consent IS NULL AND (${ORG_SHARED} OR ${GRANTED_ITEM})`).get({ viewer: viewerUserId, id: itemId })
+    WHERE i.id = @id AND i.consent IS NULL AND i.private = 0 AND (${ORG_SHARED} OR ${GRANTED_ITEM})`).get({ viewer: viewerUserId, id: itemId })
   return rowToSharedItem(row)
 }
 
