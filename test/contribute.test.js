@@ -227,6 +227,34 @@ test('replies cross both ways as another person\'s turn', async (t) => {
   assert.equal((await w.bobBox(`/items/${it.id}/comments`, post({ body: 'late' }))).status, 404)
 })
 
+test('a create refused inside its transaction answers 404 or 409, never 500', async (t) => {
+  const w = await world(t)
+  const { m } = await contributing(w)
+  // The share ends, or the mission closes, after the route's own check and
+  // before the write's transaction (contribute.js stillContributesTo): the
+  // transaction wrapper is the one place that runs between the two.
+  const db = w.s.db
+  const orig = db.transaction.bind(db)
+  const once = (before) => { db.transaction = (fn) => { db.transaction = orig; return orig(() => { before(); return fn() }) } }
+  const closeMission = () => db.prepare("UPDATE missions SET state='closed' WHERE id=?").run(m.id)
+  const reopen = () => db.prepare("UPDATE missions SET state='open' WHERE id=?").run(m.id)
+  once(closeMission)
+  assert.equal((await w.bobBox('/milestones', post({ mission: m.id, kind: 'progress', title: 'late', convo_id: 'bobwork' }))).json.blocked_by, 'closed')
+  reopen()
+  once(closeMission)
+  assert.equal((await w.bobBox('/items', post({ mission: m.id, kind: 'task', title: 'late', convo_id: 'bobwork' }))).status, 409)
+  reopen()
+  const g = (await w.alicePhone('/grants?direction=out')).json.grants[0]
+  const revoke = () => db.prepare("UPDATE grants SET state='revoked' WHERE id=?").run(g.id)
+  once(revoke)
+  assert.equal((await w.bobBox('/milestones', post({ mission: m.id, kind: 'progress', title: 'late', convo_id: 'bobwork' }))).status, 404)
+  db.prepare("UPDATE grants SET state='active' WHERE id=?").run(g.id)
+  once(revoke)
+  assert.equal((await w.bobBox('/items', post({ mission: m.id, kind: 'task', title: 'late', convo_id: 'bobwork' }))).status, 404)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM milestones WHERE mission_id=?').get(m.id).n, 0)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM items WHERE mission_id=? AND contributor_user_id IS NOT NULL').get(m.id).n, 0)
+})
+
 test('a read grantee still writes nothing', async (t) => {
   const w = await world(t)
   const m = (await w.aliceBox('/missions', post({ convo_id: 'work', title: 'Launch' }))).json.mission
