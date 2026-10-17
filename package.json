@@ -15,6 +15,9 @@
   "engines": {
     "node": ">=20"
   },
+  "overrides": {
+    "sharp": "^0.35.5"
+  },
   "dependencies": {
     "argon2": "^0.41.0",
     "better-sqlite3": "^11.0.0",
