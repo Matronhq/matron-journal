@@ -172,7 +172,7 @@ export function cardFields(db, userId, { excludePrivateOwned = false } = {}) {
     FROM missions m
     JOIN mission_conversations l ON l.mission_id = m.id AND l.ended_at IS NULL
     JOIN conversations c ON c.id = l.convo_id AND c.parent_convo_id IS NULL
-    JOIN devices bd ON bd.id = c.agent_device_id
+    JOIN devices bd ON bd.id = c.agent_device_id AND bd.user_id = c.owner_user_id
     WHERE m.user_id = ? AND m.project_id IS NOT NULL AND m.state = 'open'
       ${excludePrivateOwned ? `AND bd.private = 0 AND ${ORIGIN_SIEVE}` : ''}
     GROUP BY m.project_id`).all(userId)

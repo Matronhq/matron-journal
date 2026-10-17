@@ -149,10 +149,12 @@ export function handleContributedMilestone(ctx, res, who, body, { writableConvo 
   const sender = personSender(contributor.name)
   const ownerMission = getMission(db, mission.user_id, mission.id)
   const markerOf = (row) => ({ ...milestoneMarkerPayload({ milestone: row, mission: ownerMission, by: contributor.via }), person: { name: contributor.name, via: contributor.via } })
-  const out = contributeMilestone(db, {
+  const r = gone(res, () => contributeMilestone(db, {
     mission, contributor, kind: body.kind, title: body.title.trim(), body: body.body ?? '',
     appendMarker: (convoId, row) => append(db, { userId: mission.user_id, convoId, sender, type: MILESTONE_EVENT_TYPE, payload: markerOf(row) }),
-  })
+  }))
+  if (!r) return true
+  const { out } = r
   try {
     if (out.peopleCreated) appendAndBroadcast(db, hub, { userId: mission.user_id, convoId: out.convoId, sender: 'journal', type: 'convo_meta', payload: { title: PEOPLE_TITLE, parent_convo_id: null, system: PEOPLE_SYSTEM } })
     broadcastAppended(db, hub, { userId: mission.user_id, convoId: out.convoId, seq: out.seq, ts: out.ts, sender, type: MILESTONE_EVENT_TYPE, payload: markerOf(out.milestone) })
@@ -181,7 +183,9 @@ export function handleContributedItem(ctx, res, who, body, { writableConvo }) {
   const mission = missionFor(db, res, who, body.mission)
   if (!mission) return true
   const contributor = contributorOf(db, who)
-  const out = contributeItem(db, { mission, contributor, replyConvoId: replyConvoId ?? null, kind: body.kind, ...v.value, labels: v.value.labels ?? [], links: v.value.links ?? [] })
+  const r = gone(res, () => contributeItem(db, { mission, contributor, replyConvoId: replyConvoId ?? null, kind: body.kind, ...v.value, labels: v.value.labels ?? [], links: v.value.links ?? [] }))
+  if (!r) return true
+  const { out } = r
   if (out.peopleConvo.created) {
     try { appendAndBroadcast(db, hub, { userId: mission.user_id, convoId: out.peopleConvo.id, sender: 'journal', type: 'convo_meta', payload: { title: PEOPLE_TITLE, parent_convo_id: null, system: PEOPLE_SYSTEM } }) } catch (err) { console.error('contribute: people convo announce failed', err) }
   }

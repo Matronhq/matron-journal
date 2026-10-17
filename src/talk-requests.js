@@ -129,9 +129,11 @@ export function parkTalk(db, { ownerUserId, roomId, ownerDeviceId, ownerSender, 
     if (missionRef != null) {
       const m = getMission(db, ownerUserId, missionRef, { excludePrivateOwned: true })
       if (!m) fail('no_mission')
-      // A mission needs an active grant to an existing contact.
+      // A mission needs an active grant to an existing contact — one that
+      // lets them read it: a hand-over's owner-level row stays active but
+      // confers nothing (the same rule as parkPersonRoom).
       const g = own && isMutual(db, own)
-        ? db.prepare("SELECT 1 FROM grants WHERE subject_kind='mission' AND subject_id=? AND contact_id=? AND state='active'").get(m.id, own.id)
+        ? db.prepare("SELECT 1 FROM grants WHERE subject_kind='mission' AND subject_id=? AND contact_id=? AND state='active' AND level <> 'owner'").get(m.id, own.id)
         : null
       if (!g) fail('mission_not_shared')
       missionId = m.id

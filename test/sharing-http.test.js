@@ -178,6 +178,8 @@ test('an agent\'s contact ask parks for its own user; the tap sends it; the othe
   for (const k of ['aliceBox', 'aliceCoord', 'bobBox']) assert.deepEqual(audits(w.ws[k]), [], `${k} hears no audit event`)
   const activity = (await w.alicePhone(`/contacts/${id}/activity`)).json.events.map((e) => e.event)
   assert.deepEqual(activity, ['contact.accepted', 'contact.requested'])
+  // The trail is the user's, like the events it lists: an agent gets no door to it.
+  assert.equal((await w.aliceBox(`/contacts/${id}/activity`)).status, 403)
 })
 
 test('the Coordinator is never offered, and cannot answer, a contact or share ask', async (t) => {
