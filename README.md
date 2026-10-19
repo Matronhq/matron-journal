@@ -47,6 +47,9 @@ Node 20+. A systemd unit template is in
     MATRON_DB=./matron.db npx matron-admin offload [--days N]
     MATRON_DB=./matron.db npx matron-admin expire-logs [--hours N]
     MATRON_DB=./matron.db npx matron-admin status
+    MATRON_DB=./matron.db npx matron-admin two-factor status
+    MATRON_DB=./matron.db npx matron-admin two-factor require on|off
+    MATRON_DB=./matron.db npx matron-admin user 2fa-reset alice
 
 Passwords come from stdin (`--password-stdin`) or the `MATRON_PASSWORD` env
 var; the legacy `--password <pw>` flag still works but puts the plaintext on
@@ -56,6 +59,13 @@ Clients log in with `POST /login` and get their own device token; agents are
 provisioned with `matron-admin agent add`, which prints a token once.
 `link-code` prints a QR code and a short code for signing in a second device
 without retyping credentials.
+
+Two-factor sign-in: each user turns it on in the web app's settings with an
+authenticator app (TOTP) and gets ten recovery codes. `two-factor require on`
+makes it compulsory, so users without it enrol at their next password sign-in.
+`user 2fa-reset` is the way back in for someone who has lost both their app
+and their recovery codes. Details are in [docs/protocol.md](docs/protocol.md),
+"Two-factor sign-in".
 
 Next steps: install [matron-bridge](https://github.com/Matronhq/matron-bridge)
 on each dev box, then sign in from an app with your journal URL + username.
@@ -70,7 +80,7 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_GITHUB_CLIENT_ID` | Matron's published OAuth App id (`Ov23likaFmqoegaDMTtz`) | GitHub OAuth App client id for account linking (device flow works with the id alone). Set to the empty string to disable linking; set your own app's id, with its secret, for the web flow |
 | `MATRON_GITHUB_CLIENT_SECRET` | unset | Client secret of an OAuth App registered for this journal (callback `https://<journal>/github/callback`). Enables the one-click web flow |
 | `MATRON_GITHUB_HOST` | `github.com` | GitHub Enterprise host, if any |
-| `MATRON_TOKEN_KEY` | unset (tokens stored as-is) | 64 hex chars (`openssl rand -hex 32`). Seals stored GitHub tokens with AES-256-GCM; existing rows are sealed at the next start. Losing it means every user re-links |
+| `MATRON_TOKEN_KEY` | unset (tokens stored as-is) | 64 hex chars (`openssl rand -hex 32`). Seals stored GitHub tokens and two-factor secrets with AES-256-GCM; existing GitHub rows are sealed at the next start. Two-factor sign-in needs it. Losing it means every user re-links GitHub, and two-factor users need `matron-admin user 2fa-reset` |
 | `MATRON_WEB_DIR` | unset (nothing served) | Directory of the built tracker web app. Served read-only with `index.html` fallback for `/u/*` and `/app/*` |
 | `MATRON_APPLE_APP_IDS` | unset (404) | Comma-separated `TEAMID.bundle.id` list for `/.well-known/apple-app-site-association`, claiming `/u/*` |
 | `MATRON_ANDROID_PACKAGE` | unset (404) | Android package name for `/.well-known/assetlinks.json`; needs `MATRON_ANDROID_CERT_SHA256` too |

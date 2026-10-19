@@ -10,6 +10,9 @@ the machine-checkable version of this page.
   Brute-force protection: 5 attempts/min per IP (429 `rate_limited`), plus per-username
   lockout after 5 consecutive failures — 30s doubling per failure up to 1h, cleared by
   a successful login (429 `locked_out` with `retry_after` seconds + `Retry-After` header).
+  A user with two-factor on (or any user, when it is required) gets no token here: see
+  "Two-factor sign-in" below for the 401 `two_factor_required` /
+  `two_factor_enrolment_required` answer and the code step.
 - `GET /snapshot` (Bearer) -> `{conversations, agents, seq}`. Each conversation row
   carries `parent_convo_id` (`null` for a normal conversation; set for a
   subagent child — see "Child conversations") and `agent_device_id` (the
@@ -2847,6 +2850,87 @@ user, from an app, sends no `as_convo_id`.
   sender can't be forged. The approval question goes to the owner's
   conversation as a `commented` marker, `by: agent`, awaiting the user.
 
+## Two-factor sign-in
+
+Time-based one-time codes (RFC 6238: HMAC-SHA1, 6 digits, 30-second steps)
+from an authenticator app, plus ten single-use recovery codes. Every
+password sign-in for a user who has two-factor on needs a code. Tokens that
+already exist, agent tokens, box pairing and Link a Device do not: a link is
+approved on one of the user's own signed-in devices.
+
+The TOTP secret is sealed at rest with the token key (`MATRON_TOKEN_KEY`,
+the same AES-256-GCM key that protects stored GitHub tokens). Without the
+key nobody can enrol (503 `two_factor_unavailable`) and the journal-wide
+requirement is not enforced. Recovery codes (16 base32 characters, shown as
+`xxxx-xxxx-xxxx-xxxx`) are stored only as SHA-256 hashes.
+
+### Signing in
+
+1. `POST /login {username, password, device_name}`. With a right password
+   and two-factor on, the answer is **401**
+   `{error:'two_factor_required', two_factor_ticket, expires_in}` instead of
+   a token. (401 rather than 200 so a client that predates this step shows
+   a failed sign-in.) A wrong password is still 403 `bad_credentials`.
+2. `POST /login/2fa {ticket, code}` (unauthenticated). `code` is a 6-digit
+   code (spaces allowed) or a recovery code (case, spaces and dashes
+   ignored). → `{token, device_id, user_id, used_recovery_code,
+   recovery_codes_left}`; the device gets the `device_name` from step 1.
+
+Tickets live in memory for 5 minutes and allow 5 wrong codes (403
+`{error:'bad_code', ticket_valid}`; `ticket_valid:false` once spent). An
+unknown, expired or used ticket is 401 `two_factor_ticket_invalid`. Wrong
+codes count toward the same per-username lockout as wrong passwords (429
+`locked_out`), and a right password does not clear it — only a right code
+does. The code steps share a per-IP budget of 10 requests a minute (429
+`rate_limited`), separate from `/login`'s. Codes one step either side of now
+are accepted; a code for a step at or before the last accepted one is
+refused, so a code cannot be replayed.
+
+### Required for everyone
+
+`matron-admin two-factor require on`, or `PUT /2fa/policy {required:true}`
+from an admin. A user without two-factor who signs in with a password then
+gets 401 `{error:'two_factor_enrolment_required', two_factor_ticket,
+expires_in}` and enrols before getting a token:
+
+- `POST /login/2fa/setup {ticket}` → `{secret, otpauth_uri, issuer, account}`
+- `POST /login/2fa/enable {ticket, code}` → `{token, device_id, user_id,
+  recovery_codes}`
+
+A verify ticket cannot be used on these routes, nor an enrol ticket at
+`/login/2fa` (401 `two_factor_ticket_invalid`). An enrol ticket also goes
+dead once the user has two-factor on (enrolled elsewhere meanwhile), so it
+can never replace an active secret. Existing sessions stay
+signed in. While it is required, `/2fa/disable` is 409
+`two_factor_required`.
+
+### Settings (Bearer, client devices only; agents get 403)
+
+| Route | Body | Answer |
+|---|---|---|
+| `GET /2fa` | — | `{enabled, enabled_at, recovery_codes_left, required, available}` (`available`: the token key is set) |
+| `POST /2fa/setup` | `{password, code?}` — `code` (TOTP or recovery) only when two-factor is already on (moving to a new app) | `{secret, otpauth_uri, issuer, account}`. Starts a pending setup (15 minutes); an active secret stays in force until the new one is confirmed |
+| `POST /2fa/enable` | `{code, sign_out_others?}` | `{recovery_codes, signed_out}` — the codes are shown this once. `sign_out_others:true` revokes the user's other **client** devices (never agents). 409 `no_pending_setup`, 403 `bad_code` |
+| `POST /2fa/disable` | `{password, code}` | `{ok:true}`; 409 `not_enabled` / `two_factor_required` |
+| `POST /2fa/recovery-codes` | `{password, code}` | `{recovery_codes}` — a new set replaces the old |
+| `PUT /2fa/policy` | `{required}` (admins only) | `{required}`; 503 when the token key is not set |
+
+A wrong password is 401 `bad_password`, a wrong code 403 `bad_code`; both
+count toward the username's lockout. `GET /me` carries
+`two_factor: {enabled, required}`.
+
+`otpauth_uri` is `otpauth://totp/Matron:<name>@<host>?secret=…&issuer=Matron&algorithm=SHA1&digits=6&period=30`;
+the host is the request's `X-Forwarded-Host` or `Host`, without a port.
+
+### Operator commands
+
+- `matron-admin user 2fa-reset <name>` — the lockout escape hatch: turns
+  two-factor off for a user, who then signs in with their password (and
+  sets it up again at once when it is required).
+- `matron-admin two-factor status` — each user on or off, and whether it is
+  required.
+- `matron-admin two-factor require on|off`.
+
 ## User settings
 
 `GET /settings` (either device kind) → `{notices: boolean, auto_archive_days: integer}`.
@@ -3627,11 +3711,12 @@ page needs no shell.
 
 | Route | Body | Response |
 |---|---|---|
-| `GET /users` | — | `{users:[{id, name, is_admin, unlisted, created_at, github:{login, state, host} \| null}]}` (no token, no hash) |
+| `GET /users` | — | `{users:[{id, name, is_admin, unlisted, created_at, two_factor, github:{login, state, host} \| null}]}` (no token, no hash; `two_factor` is a boolean) |
 | `POST /users` | `{name, password, is_admin?}` — name `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, password ≥ 8 | `201 {user}`; `400 bad_request` \| `400 weak_password`; `409 conflict` if the name is taken |
 | `PATCH /users/:id` | `{is_admin: boolean}` | `{user}`; `409 conflict {reason:'last_admin'}` when it would demote the only admin |
 | `POST /users/:id/password` | `{password}` ≥ 8 | `{ok:true}`; device tokens stay valid (same as `matron-admin user passwd`) |
 | `DELETE /users/:id/github-link` | — | `{ok:true}`; `404` if nothing linked. Resolves a `409 conflict` at link time |
+| `DELETE /users/:id/two-factor` | — | `{ok:true}`; `404` if two-factor was off. Turns it off for a user who lost their authenticator app and recovery codes (same as `matron-admin user 2fa-reset`) |
 | `POST /users/:id/link-code` | `{ttl_seconds?}` (60–86400, default 600) | `{link_code, expires_in}` — the same pre-approved pairing code `matron-admin link-code` mints; the app builds `matron://link?v=1&server=<origin>&code=<link_code>` |
 
 Unknown `:id` is `404 not_found`. Self-service stays on the existing

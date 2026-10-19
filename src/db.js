@@ -652,6 +652,30 @@ CREATE TABLE IF NOT EXISTS person_rooms(
 CREATE UNIQUE INDEX IF NOT EXISTS idx_person_rooms_guest_room ON person_rooms(guest_room_id) WHERE guest_room_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_person_rooms_owner_room ON person_rooms(owner_room_id, state);
 CREATE INDEX IF NOT EXISTS idx_person_rooms_contact ON person_rooms(owner_contact_id, state);
+-- Two-factor sign-in (src/two-factor.js). secret is the active TOTP secret,
+-- sealed by the token box; NULL means two-factor is off. pending_secret is a
+-- setup the user has started but not yet confirmed with a code. last_step is
+-- the newest 30-second step a code was accepted for (replay guard).
+CREATE TABLE IF NOT EXISTS two_factor(
+  user_id        INTEGER PRIMARY KEY REFERENCES users(id),
+  secret         TEXT,
+  enabled_at     INTEGER,
+  last_step      INTEGER NOT NULL DEFAULT 0,
+  pending_secret TEXT,
+  pending_at     INTEGER
+);
+-- Single-use recovery codes, SHA-256 only.
+CREATE TABLE IF NOT EXISTS two_factor_recovery(
+  user_id   INTEGER NOT NULL REFERENCES users(id),
+  code_hash TEXT NOT NULL,
+  used_at   INTEGER,
+  PRIMARY KEY(user_id, code_hash)
+);
+-- Journal-wide switches set by the operator or an admin (key → value).
+CREATE TABLE IF NOT EXISTS journal_settings(
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 `
 
 export function openDb(path) {
