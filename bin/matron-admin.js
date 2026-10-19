@@ -11,12 +11,16 @@ import { resolvePreapproveKeyPath } from '../src/preapprove-key.js'
 import { runOffload, runExpireLogs } from '../src/retention.js'
 import { listAwaiting, answerParkedInvite } from '../src/participants.js'
 import { closeChatConsentItem } from '../src/consent-items.js'
+import { disableTwoFactor, twoFactorState, isTwoFactorRequired, setTwoFactorRequired } from '../src/two-factor.js'
 
 const USAGE = `usage:
   matron-admin user add <name> (--password <pw> | --password-stdin | env MATRON_PASSWORD)
   matron-admin user passwd <name> (--password <pw> | --password-stdin | env MATRON_PASSWORD)
   matron-admin user admin <name> on|off
   matron-admin user unlisted <name> on|off
+  matron-admin user 2fa-reset <name>
+  matron-admin two-factor status
+  matron-admin two-factor require on|off
   matron-admin agent add <username> <agent-name>
   matron-admin device list <username>
   matron-admin device revoke <device_id>
@@ -153,6 +157,34 @@ export async function runAdmin(db, argv, deps = {}) {
     return value === 'on'
       ? `${name} is now unlisted: left out of the add-contact user list, and cannot send or be sent a contact request`
       : `${name} is listed again in the add-contact user list`
+  }
+  // The lockout escape hatch: a user who has lost their authenticator app
+  // and their recovery codes signs in with the password alone again, and
+  // can set two-factor up afresh (or is made to, when it is required).
+  if (a === 'user' && b === '2fa-reset') {
+    const name = argv[2]
+    if (!name) throw new Error(USAGE)
+    const user = requireUser(db, name)
+    return disableTwoFactor(db, user.id)
+      ? `two-factor turned off for ${name}; they sign in with their password and can set it up again`
+      : `${name} did not have two-factor on`
+  }
+  if (a === 'two-factor' && b === 'status') {
+    const users = db.prepare('SELECT id, name FROM users ORDER BY name').all()
+    const lines = users.map((u) => {
+      const s = twoFactorState(db, u.id)
+      return `${u.name}\t${s.enabled ? `on (${s.recoveryCodesLeft} recovery codes left)` : 'off'}`
+    })
+    const keyNote = process.env.MATRON_TOKEN_KEY ? '' : ' (MATRON_TOKEN_KEY is not set in this shell; the server needs it for two-factor)'
+    return [`required for everyone: ${isTwoFactorRequired(db) ? 'yes' : 'no'}${keyNote}`, ...lines].join('\n')
+  }
+  if (a === 'two-factor' && b === 'require') {
+    const value = argv[2]
+    if (value !== 'on' && value !== 'off') throw new Error(USAGE)
+    setTwoFactorRequired(db, value === 'on')
+    return value === 'on'
+      ? 'two-factor is now required: users without it set it up at their next password sign-in (existing sessions stay signed in)'
+      : 'two-factor is optional again'
   }
   if (a === 'agent' && b === 'add') {
     const [, , username, agentName] = argv

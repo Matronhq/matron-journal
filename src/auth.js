@@ -62,7 +62,10 @@ const dummyHashPromise = argon2.hash(crypto.randomBytes(32).toString('hex'), { t
 // login would then surface the same error itself, failing closed).
 dummyHashPromise.catch(() => {})
 
-export async function login(db, { username, password, deviceName }) {
+// The password half of a sign-in: the user's id, or null. POST /login
+// calls this first so a two-factor user gets a sign-in ticket instead of a
+// device (src/two-factor-http.js).
+export async function checkPassword(db, { username, password }) {
   const user = db.prepare('SELECT id, password_hash FROM users WHERE name=?').get(username)
   if (!user) {
     // No user-enumeration timing oracle: verify against a fixed dummy hash
@@ -73,8 +76,22 @@ export async function login(db, { username, password, deviceName }) {
     return null
   }
   if (!(await argon2.verify(user.password_hash, password))) return null
-  const d = issueDevice(db, user.id, 'client', deviceName || 'unnamed')
-  return { ...d, userId: user.id }
+  return { userId: user.id }
+}
+
+// Re-check the signed-in user's own password before a security change
+// (turning two-factor on or off, new recovery codes).
+export async function verifyUserPassword(db, userId, password) {
+  const user = db.prepare('SELECT password_hash FROM users WHERE id=?').get(userId)
+  if (!user || typeof password !== 'string' || !password) return false
+  return argon2.verify(user.password_hash, password)
+}
+
+export async function login(db, { username, password, deviceName }) {
+  const u = await checkPassword(db, { username, password })
+  if (!u) return null
+  const d = issueDevice(db, u.userId, 'client', deviceName || 'unnamed')
+  return { ...d, userId: u.userId }
 }
 
 export function createAgent(db, userId, name, tagChar = null) {

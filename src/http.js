@@ -1,7 +1,7 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { pipeline } from 'node:stream/promises'
-import { login, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
+import { checkPassword, makeRateLimiter, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice, deviceStatuses } from './db.js'
 import { receiveBlob } from './media.js'
@@ -26,6 +26,9 @@ import { handleProjectsRoute } from './projects-http.js'
 import { handleGithubRoute, handleGithubCallback } from './github-http.js'
 import { handleLookupRoute } from './lookup-http.js'
 import { handleUsersRoute } from './users-http.js'
+import { handleTwoFactorLogin, handleTwoFactorRoute, twoFactorRequiredNow } from './two-factor-http.js'
+import { isTwoFactorEnabled, makeTwoFactorTickets } from './two-factor.js'
+import { PLAIN_BOX } from './token-box.js'
 import { githubAccountView } from './github-accounts.js'
 import { handleCoordinatorRoute } from './coordinator-http.js'
 import { handleNotifyRoute } from './notify-http.js'
@@ -108,7 +111,12 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, itemTranscription = null, blobTranscripts = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null } }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, itemTranscription = null, blobTranscripts = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null } }) {
+  // Two-factor sign-in (src/two-factor-http.js). The server passes its own;
+  // the defaults keep a bare handler (tests) working the same way.
+  const twoFactorBox = tokenBox || PLAIN_BOX
+  const signInTickets = tickets || makeTwoFactorTickets()
+  const codeLimiter = twoFactorLimiter || makeRateLimiter({ max: 10 })
   // Alertmanager webhook (src/alerts-http.js): built once so its in-flight
   // bound is per process. Off (declines every request) without config.
   const handleAlerts = makeAlertsHandler({
@@ -155,11 +163,29 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
           res.setHeader('Retry-After', retryAfter)
           return json(res, 429, { error: 'locked_out', retry_after: retryAfter })
         }
-        const s = await login(db, { username, password, deviceName: device_name })
-        if (!s) { loginGuard.fail(username); return json(res, 403, { error: 'bad_credentials' }) }
+        const u = await checkPassword(db, { username, password })
+        if (!u) { loginGuard.fail(username); return json(res, 403, { error: 'bad_credentials' }) }
+        const deviceName = device_name || 'unnamed'
+        // Two-factor (src/two-factor-http.js): a right password alone buys a
+        // short-lived ticket, not a token. The lockout is not reset yet —
+        // only a right code clears it, so wrong codes keep counting. 401,
+        // not 200, so an app that predates the code step shows a failed
+        // sign-in rather than looking for a token that is not there.
+        const enrolled = isTwoFactorEnabled(db, u.userId)
+        if (enrolled || twoFactorRequiredNow(db, twoFactorBox)) {
+          const purpose = enrolled ? 'verify' : 'enrol'
+          const t = signInTickets.issue({ userId: u.userId, username, deviceName, purpose })
+          if (!t) return json(res, 429, { error: 'rate_limited' })
+          return json(res, 401, {
+            error: enrolled ? 'two_factor_required' : 'two_factor_enrolment_required',
+            two_factor_ticket: t.ticket, expires_in: t.expiresIn,
+          })
+        }
         loginGuard.ok(username)
-        return json(res, 200, { token: s.token, device_id: s.deviceId, user_id: s.userId })
+        const d = createClientDevice(db, u.userId, deviceName)
+        return json(res, 200, { token: d.token, device_id: d.deviceId, user_id: u.userId })
       }
+      if (await handleTwoFactorLogin({ db, tokenBox: twoFactorBox, tickets: signInTickets, twoFactorLimiter: codeLimiter, loginGuard }, req, res, url, { rejectEarly })) return
       if (req.method === 'POST' && url.pathname === '/pair/start') {
         // Unauthenticated by design: this grants nothing — the pair becomes
         // an agent only if an authenticated client approves the code, and
@@ -314,10 +340,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, mediaDir, mediaMa
         return json(res, 200, out.body)
       }
       if (await handleUsersRoute({ db, links }, req, res, url, who)) return
+      if (await handleTwoFactorRoute({ db, tokenBox: twoFactorBox, loginGuard }, req, res, url, who)) return
       if (req.method === 'GET' && url.pathname === '/me') {
         const user = db.prepare('SELECT id, name, is_admin FROM users WHERE id=?').get(who.userId)
         return json(res, 200, {
           user: { id: user.id, name: user.name, is_admin: !!user.is_admin },
+          two_factor: { enabled: isTwoFactorEnabled(db, who.userId), required: twoFactorRequiredNow(db, twoFactorBox) },
           github: githubAccountView(db, who.userId),
           github_linking: { enabled: !!(github && github.enabled), web_flow: !!(github && github.webFlow) },
         })

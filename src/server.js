@@ -4,6 +4,7 @@ import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
 import { makeLoginGuard, makeRateLimiter } from './auth.js'
+import { makeTwoFactorTickets, isTwoFactorRequired } from './two-factor.js'
 import { makeHttpHandler } from './http.js'
 import { ensurePreapproveKey } from './preapprove-key.js'
 import { makePairStore } from './pairing.js'
@@ -465,6 +466,13 @@ export function startServer({
   db.pragma('wal_autocheckpoint = 0')
   const rateLimiter = makeRateLimiter()
   const loginGuard = makeLoginGuard()
+  // Two-factor code steps (/login/2fa*): their own per-IP budget, sized for
+  // a code request or two per sign-in (src/two-factor-http.js).
+  const twoFactorLimiter = makeRateLimiter({ max: 10 })
+  const tickets = makeTwoFactorTickets()
+  if (isTwoFactorRequired(db) && !tokenBox.enabled) {
+    console.warn('two-factor: required for everyone, but MATRON_TOKEN_KEY is not set — nobody can enrol, so the requirement is not enforced')
+  }
   const resolvedPairs = pairs || makePairStore()
   const resolvedLinks = links || makeLinkStore({ db })
   const resolvedMediaDir = resolveMediaDir(resolvedDbPath, mediaDir)
@@ -576,7 +584,7 @@ export function startServer({
   let indexingNow = false
   let semanticInFlight = Promise.resolve()
   const server = http.createServer(makeHttpHandler({
-    db, rateLimiter, loginGuard, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
+    db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap,
