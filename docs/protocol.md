@@ -2898,7 +2898,9 @@ expires_in}` and enrols before getting a token:
   recovery_codes}`
 
 A verify ticket cannot be used on these routes, nor an enrol ticket at
-`/login/2fa` (401 `two_factor_ticket_invalid`). Existing sessions stay
+`/login/2fa` (401 `two_factor_ticket_invalid`). An enrol ticket also goes
+dead once the user has two-factor on (enrolled elsewhere meanwhile), so it
+can never replace an active secret. Existing sessions stay
 signed in. While it is required, `/2fa/disable` is 409
 `two_factor_required`.
 

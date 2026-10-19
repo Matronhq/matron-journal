@@ -18,7 +18,7 @@ import { json, readBody } from './http-body.js'
 import { verifyUserPassword, createClientDevice } from './auth.js'
 import { isAdmin } from './users-http.js'
 import {
-  twoFactorState, beginSetup, finishSetup, verifySecondFactor, disableTwoFactor,
+  twoFactorState, isTwoFactorEnabled, beginSetup, finishSetup, verifySecondFactor, disableTwoFactor,
   regenerateRecoveryCodes, isTwoFactorRequired, setTwoFactorRequired, otpauthUri,
 } from './two-factor.js'
 
@@ -63,6 +63,14 @@ export async function handleTwoFactorLogin(ctx, req, res, url, { rejectEarly }) 
   const t = tickets.get(ticket)
   const wantPurpose = path === '/login/2fa' ? 'verify' : 'enrol'
   if (!t || t.purpose !== wantPurpose) { json(res, 401, { error: 'two_factor_ticket_invalid' }); return true }
+  // An enrol ticket is for a user who had no two-factor when it was issued.
+  // Once they have it (enrolled from another tab or device meanwhile), the
+  // password-only ticket must not be able to replace their secret.
+  if (wantPurpose === 'enrol' && isTwoFactorEnabled(db, t.userId)) {
+    tickets.consume(ticket)
+    json(res, 401, { error: 'two_factor_ticket_invalid' })
+    return true
+  }
 
   if (path === '/login/2fa/setup') {
     const s = beginSetup(db, tokenBox, t.userId)
@@ -92,13 +100,7 @@ export async function handleTwoFactorLogin(ctx, req, res, url, { rejectEarly }) 
   // POST /login/2fa: the username's lockout covers codes as well as
   // passwords, so rotating tickets (each needs the password) or IPs buys an
   // attacker nothing.
-  const gate = loginGuard.check(t.username)
-  if (!gate.allowed) {
-    const retryAfter = Math.ceil(gate.retryAfterMs / 1000)
-    res.setHeader('Retry-After', retryAfter)
-    json(res, 429, { error: 'locked_out', retry_after: retryAfter })
-    return true
-  }
+  if (!guardAllows(loginGuard, res, t.username)) return true
   const v = verifySecondFactor(db, tokenBox, t.userId, code)
   if (!v.ok) {
     if (v.reason === 'unavailable') { unavailable(res); return true }
@@ -116,19 +118,24 @@ export async function handleTwoFactorLogin(ctx, req, res, url, { rejectEarly }) 
   return true
 }
 
+// The username's lockout (auth.js makeLoginGuard): false, with a 429 sent,
+// while it is locked.
+function guardAllows(loginGuard, res, username) {
+  const gate = loginGuard.check(username)
+  if (gate.allowed) return true
+  const retryAfter = Math.ceil(gate.retryAfterMs / 1000)
+  res.setHeader('Retry-After', retryAfter)
+  json(res, 429, { error: 'locked_out', retry_after: retryAfter })
+  return false
+}
+
 // Password (and, when two-factor is on, a code) before a security change.
 // Wrong guesses count against the username's lockout like a sign-in, so a
 // stolen token cannot be used to grind the password here.
 async function confirmIdentity(ctx, res, who, { password, code, needCode }) {
   const { db, tokenBox, loginGuard } = ctx
   const user = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId)
-  const gate = loginGuard.check(user.name)
-  if (!gate.allowed) {
-    const retryAfter = Math.ceil(gate.retryAfterMs / 1000)
-    res.setHeader('Retry-After', retryAfter)
-    json(res, 429, { error: 'locked_out', retry_after: retryAfter })
-    return false
-  }
+  if (!guardAllows(loginGuard, res, user.name)) return false
   if (typeof password !== 'string' || !password) { json(res, 400, { error: 'bad_request' }); return false }
   if (!(await verifyUserPassword(db, who.userId, password))) {
     loginGuard.fail(user.name)
@@ -179,10 +186,15 @@ export async function handleTwoFactorRoute(ctx, req, res, url, who) {
   if (path === '/2fa/enable' && req.method === 'POST') {
     const { code, sign_out_others = false } = await readBody(req)
     if (typeof code !== 'string' || !code || typeof sign_out_others !== 'boolean') { json(res, 400, { error: 'bad_request' }); return true }
+    // Wrong codes here count against the username's lockout like any other
+    // code, so a session cannot grind a pending secret's six digits.
+    const user = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId)
+    if (!guardAllows(ctx.loginGuard, res, user.name)) return true
     const r = finishSetup(db, tokenBox, who.userId, code)
     if (!r.ok) {
       if (r.reason === 'unavailable') { unavailable(res); return true }
       if (r.reason === 'no_pending') { json(res, 409, { error: 'no_pending_setup' }); return true }
+      ctx.loginGuard.fail(user.name)
       json(res, 403, { error: 'bad_code' })
       return true
     }

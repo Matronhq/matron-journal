@@ -325,3 +325,29 @@ test('a stale setup expires and must be started again', async (t) => {
   assert.equal((await s.http('/2fa/enable', { method: 'POST', token, body: { code: codeFor(st.json.secret) } })).status, 409)
   assert.ok(STEP_MS === 30000)
 })
+
+test('an enrol ticket goes dead once the user has two-factor, so it cannot replace the secret', async (t) => {
+  const { s, token } = await setup(t)
+  s.db.prepare('UPDATE users SET is_admin=1').run()
+  await s.http('/2fa/policy', { method: 'PUT', token, body: { required: true } })
+  // A password-only enrol ticket is minted, then the user enrols elsewhere.
+  const stale = (await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'hunter22' } })).json.two_factor_ticket
+  const { secret } = await enrol(s, token)
+  assert.equal((await s.http('/login/2fa/setup', { method: 'POST', body: { ticket: stale } })).status, 401)
+  assert.equal((await s.http('/login/2fa/enable', { method: 'POST', body: { ticket: stale, code: '123456' } })).status, 401)
+  // The real secret still works.
+  const ticket = (await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'hunter22' } })).json.two_factor_ticket
+  assert.equal((await s.http('/login/2fa', { method: 'POST', body: { ticket, code: codeFor(secret, 1) } })).status, 200)
+})
+
+test('wrong codes at /2fa/enable count toward the lockout', async (t) => {
+  const { s, token } = await setup(t)
+  const st = await s.http('/2fa/setup', { method: 'POST', token, body: { password: 'hunter22' } })
+  const wrong = String((Number(codeFor(st.json.secret)) + 500000) % 1e6).padStart(6, '0')
+  for (let i = 0; i < 5; i++) {
+    assert.equal((await s.http('/2fa/enable', { method: 'POST', token, body: { code: wrong } })).status, 403)
+  }
+  const locked = await s.http('/2fa/enable', { method: 'POST', token, body: { code: codeFor(st.json.secret) } })
+  assert.equal(locked.status, 429)
+  assert.equal(locked.json.error, 'locked_out')
+})
