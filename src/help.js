@@ -232,11 +232,17 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   boxes: [names] | null}\` bounds what an ask born of a fire may do.
   Agents: the Coordinator only, naming its own conversation as
   \`convo_id\` (403 \`not_coordinator\` otherwise). Fires at least 15
-  minutes apart; 409 \`blocked_by: name|cap\`. \`DELETE\` is the user's
-  alone (403 for every agent): pause with \`enabled: false\` instead.
+  minutes apart; 409 \`blocked_by: name|cap\`. \`DELETE /routines/:name\`
+  \`{convo_id}\` takes the same gate.
 - \`POST /routines/:name/run\` \`{convo_id}\` → 202 — fire it now, whatever
   \`enabled\` says; the schedule is untouched. Every change and fire lands as
   a quiet \`routine\` event in the Coordinator conversation.
+- Creating, rewriting (\`prompt\`, \`schedule\`, \`trigger\`, \`envelope\`) and
+  running a routine needs the user's ask: your bridge sends the turn's
+  \`causes\`, and they must be the user's words in your conversation or the
+  user's comment on one of your items — a routine fire is not enough. 403
+  \`routine_write_unverified\` (with \`why\`) otherwise; ask the user, or
+  leave it for them. Pausing, retitling, \`tz\` and \`DELETE\` need no ask.
 - \`POST /briefings\` \`{convo_id, body (markdown, ≤32 KB)}\` → 201
   \`{briefing}\` — publish a briefing (Coordinator only, naming its own
   conversation). The journal writes it into that conversation as your

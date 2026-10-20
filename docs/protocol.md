@@ -2391,10 +2391,10 @@ whatever matches now, records untouched.
 |---|---|---|---|
 | `GET /routines` | any | | 200 `{routines}` by name |
 | `GET /routines/:key` | any | | 200 `{routine}`; `:key` is the id or the name |
-| `POST /routines` | client, or the Coordinator | `{name, title, schedule \| trigger, prompt, tz?, enabled?, envelope?, convo_id?}` | 201 `{routine}`; **409** `{error:'conflict', blocked_by:'name'|'cap'}` |
-| `PATCH /routines/:key` | client, or the Coordinator | `{title?, schedule?, trigger?, tz?, prompt?, enabled?, envelope? (null clears), convo_id?}` — at least one; `name` is not editable | 200 `{routine}` |
-| `DELETE /routines/:key` | client, or the Coordinator | `{convo_id?}` | 200 `{ok:true}` |
-| `POST /routines/:key/run` | client, or the Coordinator | `{convo_id?}` | 202 `{accepted:true}`, or `{delivered:false, reason:'no_coordinator'\|'busy'}` |
+| `POST /routines` | client, or the Coordinator | `{name, title, schedule \| trigger, prompt, tz?, enabled?, envelope?, convo_id?, causes?}` | 201 `{routine}`; **403** `routine_write_unverified`; **409** `{error:'conflict', blocked_by:'name'|'cap'}` |
+| `PATCH /routines/:key` | client, or the Coordinator | `{title?, schedule?, trigger?, tz?, prompt?, enabled?, envelope? (null clears), convo_id?, causes?}` — at least one; `name` is not editable | 200 `{routine}`; **403** `routine_write_unverified` |
+| `DELETE /routines/:key` | client, or the Coordinator | `{convo_id?, causes?}` | 200 `{ok:true}` |
+| `POST /routines/:key/run` | client, or the Coordinator | `{convo_id?, causes?}` | 202 `{accepted:true}`, or `{delivered:false, reason:'no_coordinator'\|'busy'}`; **403** `routine_write_unverified` |
 
 **The Coordinator gate** on agent writes is the one project close/merge
 use (`closingConvo`, required): the agent names its own conversation in
@@ -2404,6 +2404,25 @@ conversation this device does not own → **404**, a malformed `convo_id`
 → **400**. A client token passes with no `convo_id`. The Coordinator
 creates and deletes as well as edits (2026-10-02); the marker's `by` says
 which (`'agent'` or `'user'`).
+
+**The provenance gate** on the Coordinator's routine writes (a client
+token is the user and passes): an injected turn must not be able to write
+a routine with its own prompt and envelope, run it, and approve its own
+asks inside the fire. The bridge sends `causes` — the causes of the turn
+that made the request, the same `[{kind, ref?, at?}]` list as on a
+`spawn_request` (absent or `null` = none) — on create, update, run and
+delete; any other unusable value is **400** `{error:'bad_request',
+detail:'bad causes'}` on all four, whoever sends it. `POST /routines`, a
+`PATCH` that gives any of `prompt`, `schedule`, `trigger` or `envelope`
+(`null` included), and `POST /routines/:key/run` then need the causes to
+resolve (`src/ask-cause.js`, measured from now, in the conversation named
+in `convo_id`) to the user's verified words or the user's comment or tap
+on one of that conversation's items. Anything else — no causes, a cause
+that does not check out, or a root that is a routine fire (a routine
+cannot create, rewrite or run routines) — is **403** `{error:'forbidden',
+detail:'routine_write_unverified', why}`, checked after the body's own
+validation and before anything is written or fired. A `PATCH` of only `enabled`, `title` or `tz`, and
+`DELETE`, need no cause: none of them widens what a routine may do.
 
 `enabled: false` clears `next_at`; `true` again, or a `schedule`/`tz`
 change, recomputes it from now; `title`/`prompt` edits leave the schedule
