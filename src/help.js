@@ -182,7 +182,7 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
 - \`GET /settings\` → \`{notices}\` — whether the user wants things to read filed as \`notice\` items (default true; \`hello_ok\` carries it as \`settings\`, and a change arrives as \`{kind:'control', op:'settings', settings}\`). \`PATCH /settings {notices}\` is the user's alone.
 - \`GET /coordinator\` → \`{convo_id, consent}\` — the user's Coordinator, and whether it may approve chats and spawns
 - \`GET /consent/pending?convo_id=<coordinator convo>\` → \`{pending:[…]}\` — parked chat invites, join requests and spawn requests (Coordinator only)
-- \`POST /consent/answer\` \`{convo_id, kind: chat|spawn, id, decision: approve|decline, reason}\` — answer one on the user's behalf (Coordinator only; see /help's protocol for the guardrails)
+- \`POST /consent/answer\` \`{convo_id, kind: chat|spawn, id, decision: approve|decline, reason}\` — answer one on the user's behalf (Coordinator only; see /help's protocol for the guardrails). Approving the Coordinator's OWN ask needs its \`causes\` to resolve to the user's words or item reply/tap (else 403 own_ask_unverified), or to a routine fire inside the routine's envelope (403 envelope), passed by the verifier (403 verifier / 409 verifier_unavailable) and under the routine cap (409 routine_cap)
   conversation, or null. Only the user sets it; you hear a change as a
   \`coordinator\` event \`{role: 'assigned'|'released'}\` in the conversation.
 - \`GET /defaults\` → \`{default_model, default_effort}\` — the user's default
@@ -225,16 +225,24 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   → \`{routine}\` with \`enabled\`, \`next_at\`, \`last_fired_at\`,
   \`last_outcome\`.
 - \`POST /routines\` \`{name, title, schedule | trigger, prompt (≤2000),
-  tz? (default Europe/London), enabled?, convo_id}\` → 201 \`{routine}\`;
+  tz? (default Europe/London), enabled?, envelope?, convo_id}\` → 201 \`{routine}\`;
   \`PATCH /routines/:name\` \`{title?, schedule?, trigger?, tz?, prompt?,
-  enabled?, convo_id}\` → 200 (a routine stays scheduled or triggered).
+  enabled?, envelope? (null clears), convo_id}\` → 200 (a routine stays
+  scheduled or triggered). \`envelope\` \`{spawns_per_fire (0-50), chats,
+  boxes: [names] | null}\` bounds what an ask born of a fire may do.
   Agents: the Coordinator only, naming its own conversation as
   \`convo_id\` (403 \`not_coordinator\` otherwise). Fires at least 15
-  minutes apart; 409 \`blocked_by: name|cap\`. \`DELETE\` is the user's
-  alone (403 for every agent): pause with \`enabled: false\` instead.
+  minutes apart; 409 \`blocked_by: name|cap\`. \`DELETE /routines/:name\`
+  \`{convo_id}\` takes the same Coordinator gate and needs no \`causes\`.
 - \`POST /routines/:name/run\` \`{convo_id}\` → 202 — fire it now, whatever
   \`enabled\` says; the schedule is untouched. Every change and fire lands as
   a quiet \`routine\` event in the Coordinator conversation.
+- Creating, rewriting (\`prompt\`, \`schedule\`, \`trigger\`, \`envelope\`) and
+  running a routine needs the user's ask: your bridge sends the turn's
+  \`causes\`, and they must be the user's words in your conversation or the
+  user's comment on one of your items — a routine fire is not enough. 403
+  \`routine_write_unverified\` (with \`why\`) otherwise; ask the user, or
+  leave it for them. Pausing, retitling and \`tz\` need no ask.
 - \`POST /briefings\` \`{convo_id, body (markdown, ≤32 KB)}\` → 201
   \`{briefing}\` — publish a briefing (Coordinator only, naming its own
   conversation). The journal writes it into that conversation as your

@@ -68,6 +68,48 @@ export function validateTrigger(raw) {
 
 export const parseTrigger = (text) => { try { return text ? validateTrigger(JSON.parse(text)) : null } catch { return null } }
 
+// Envelope (spec "Envelopes"): the bounds on what an ask born of one of this
+// routine's fires may do when the Coordinator approves it itself —
+//   spawns_per_fire  0..50   approved spawns per fire (absent: 0)
+//   chats            boolean chat rooms at all (absent: false)
+//   boxes            1..32 device names a spawn may target or a chat may
+//                    reach (the invitee, or for a join the room's owner),
+//                    or null for any box (absent: null)
+// NULL on the row (no envelope) allows nothing. The value is always stored
+// and read back with all three keys.
+export const ENVELOPE_SPAWNS_MAX = 50
+export const ENVELOPE_BOXES_MAX = 32
+const ENVELOPE_BOX_MAX = 64
+const ENVELOPE_KEYS = ['spawns_per_fire', 'chats', 'boxes']
+
+export function validateEnvelope(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false }
+  if (Object.keys(raw).some((k) => raw[k] !== undefined && !ENVELOPE_KEYS.includes(k))) return { ok: false }
+  const spawns = raw.spawns_per_fire === undefined ? 0 : raw.spawns_per_fire
+  if (!Number.isInteger(spawns) || spawns < 0 || spawns > ENVELOPE_SPAWNS_MAX) return { ok: false }
+  const chats = raw.chats === undefined ? false : raw.chats
+  if (typeof chats !== 'boolean') return { ok: false }
+  let boxes = raw.boxes === undefined ? null : raw.boxes
+  if (boxes !== null) {
+    if (!Array.isArray(boxes) || boxes.length === 0 || boxes.length > ENVELOPE_BOXES_MAX) return { ok: false }
+    if (boxes.some((b) => typeof b !== 'string' || !b || b.length > ENVELOPE_BOX_MAX || LINE_BAD.test(b))) return { ok: false }
+    boxes = [...new Set(boxes)]
+  }
+  return { ok: true, value: { spawns_per_fire: spawns, chats, boxes } }
+}
+
+// The stored column back, re-validated (it is only ever written from
+// validateEnvelope, but a reader should not depend on that): object or null.
+export function parseEnvelope(text) {
+  if (typeof text !== 'string' || !text) return null
+  try {
+    const v = validateEnvelope(JSON.parse(text))
+    return v.ok ? v.value : null
+  } catch {
+    return null
+  }
+}
+
 export const newRoutineId = () => `rt_${randomBytes(8).toString('hex')}`
 
 export function validTz(tz) {
@@ -165,6 +207,15 @@ export function validateRoutineFields(body, { partial = false, now = Date.now() 
     if (typeof e !== 'boolean') return { ok: false }
     out.enabled = e
   }
+  // Optional on create too (absent = no envelope); null clears on a PATCH.
+  if (body.envelope !== undefined) {
+    if (body.envelope === null) out.envelope = null
+    else {
+      const env = validateEnvelope(body.envelope)
+      if (!env.ok) return { ok: false }
+      out.envelope = env.value
+    }
+  }
   return { ok: true, value: out }
 }
 
@@ -174,8 +225,11 @@ export function routineRow(row) {
   out.enabled = !!out.enabled
   out.schedule = out.schedule ?? null
   out.trigger = parseTrigger(out.trigger)
+  out.envelope = parseEnvelope(out.envelope)
   return out
 }
+
+const envelopeText = (env) => (env == null ? null : JSON.stringify(env))
 
 const byKey = (key) => (typeof key === 'string' && key.startsWith('rt_') ? 'id=?' : 'name=?')
 
@@ -195,8 +249,8 @@ export function createRoutine(db, { userId, origin, fields, now = Date.now() }) 
     if (db.prepare('SELECT 1 FROM routines WHERE user_id=? AND name=?').get(userId, fields.name)) throw new Error('conflict')
     const id = newRoutineId()
     const nextAt = fields.enabled && fields.schedule ? nextRunAt(fields.schedule, fields.tz, now) : null
-    db.prepare(`INSERT INTO routines(id, user_id, name, title, schedule, trigger, tz, prompt, enabled, origin, next_at, created_at, updated_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, userId, fields.name, fields.title, fields.schedule ?? null, fields.trigger ? JSON.stringify(fields.trigger) : null, fields.tz, fields.prompt, fields.enabled ? 1 : 0, origin, nextAt, now, now)
+    db.prepare(`INSERT INTO routines(id, user_id, name, title, schedule, trigger, tz, prompt, enabled, origin, next_at, envelope, created_at, updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, userId, fields.name, fields.title, fields.schedule ?? null, fields.trigger ? JSON.stringify(fields.trigger) : null, fields.tz, fields.prompt, fields.enabled ? 1 : 0, origin, nextAt, envelopeText(fields.envelope), now, now)
     return getRoutine(db, userId, id)
   })()
 }
@@ -221,8 +275,10 @@ export function updateRoutine(db, { userId, key, fields, now = Date.now() }) {
     let retryAt = row.retry_at
     if (!next.enabled) { nextAt = null; retryAt = null } else if (reschedule) { nextAt = nextRunAt(next.schedule, next.tz, now); retryAt = null }
     const triggerText = scheduled ? null : JSON.stringify(fields.trigger ?? parseTrigger(row.trigger))
-    db.prepare(`UPDATE routines SET title=?, schedule=?, trigger=?, tz=?, prompt=?, enabled=?, next_at=?, retry_at=?, updated_at=? WHERE id=?`)
-      .run(next.title, scheduled ? next.schedule : null, triggerText, next.tz, next.prompt, next.enabled ? 1 : 0, nextAt, retryAt, now, row.id)
+    // Absent leaves the stored text as it is; null clears it.
+    const envText = fields.envelope === undefined ? row.envelope : envelopeText(fields.envelope)
+    db.prepare(`UPDATE routines SET title=?, schedule=?, trigger=?, tz=?, prompt=?, enabled=?, next_at=?, retry_at=?, envelope=?, updated_at=? WHERE id=?`)
+      .run(next.title, scheduled ? next.schedule : null, triggerText, next.tz, next.prompt, next.enabled ? 1 : 0, nextAt, retryAt, envText, now, row.id)
     // A paused or re-thresholded trigger starts afresh: its subjects re-trip.
     if (!scheduled && (!next.enabled || fields.trigger !== undefined)) db.prepare('DELETE FROM routine_trigger_state WHERE routine_id=?').run(row.id)
     return getRoutine(db, userId, row.id)

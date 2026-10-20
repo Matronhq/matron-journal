@@ -10,10 +10,14 @@ import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { getCoordinatorConvoId } from './coordinator.js'
 import { isWakeableDevice } from './wake.js'
 import { predictSpawnRun } from './spawn-model.js'
+import { parseCauses } from './ask-causes.js'
 
 export const CONSENT_REASON_MAX = 200
 export const CONSENT_DAILY_CAP_DEFAULT = 20
 export const CONSENT_DAILY_WINDOW_MS = 24 * 60 * 60 * 1000
+// Routine-born approvals of the Coordinator's own asks per rolling 24 h
+// (MATRON_COORDINATOR_ROUTINE_CAP; 0 = no cap), on top of the daily cap.
+export const CONSENT_ROUTINE_CAP_DEFAULT = 10
 export const CONSENT_KINDS = new Set(['chat', 'spawn'])
 export const CONSENT_DECISIONS = new Set(['approve', 'decline'])
 export const CONSENT_DECISION_EVENT_TYPE = 'consent_decision'
@@ -86,6 +90,12 @@ export function isUserOnlyChat(db, userId, roomId, targetDeviceId) {
 }
 
 const name = (raw) => (raw == null ? '' : sanitizePeerText(raw, PEER_NAME_CAP))
+// The causes the asking bridge stamped on the ask (src/ask-causes.js), for
+// the Coordinator to weigh; omitted, never empty, when it stamped none.
+const causesField = (text) => {
+  const causes = parseCauses(text)
+  return causes ? { causes } : {}
+}
 
 // Every ask awaiting this user's decision, both tables, oldest first. The
 // shape is what the Coordinator's consent_list renders and what the nudge
@@ -94,7 +104,7 @@ const name = (raw) => (raw == null ? '' : sanitizePeerText(raw, PEER_NAME_CAP))
 // the pending endpoint does).
 export function listPendingAsks({ db, hub, waker }, userId) {
   const spawns = db.prepare(`
-    SELECT r.id, r.from_device_id, r.from_convo_id, r.target_device_id, r.workdir, r.task, r.topic, r.model, r.effort, r.agent, r.link, r.mission_num, r.created_at,
+    SELECT r.id, r.from_device_id, r.from_convo_id, r.target_device_id, r.workdir, r.task, r.topic, r.model, r.effort, r.agent, r.link, r.mission_num, r.causes, r.created_at,
            fd.name AS from_name, td.name AS target_name, fc.title AS from_convo_title, i.num AS item_num
     FROM agent_spawn_requests r
     LEFT JOIN devices fd ON fd.id = r.from_device_id
@@ -117,9 +127,10 @@ export function listPendingAsks({ db, hub, waker }, userId) {
     ...(r.mission_num ? { mission_num: r.mission_num } : {}),
     ...(r.item_num != null ? { item_num: r.item_num } : {}),
     ...(isUserOnlySpawn(db, userId, r) ? { user_only: true } : {}),
+    ...causesField(r.causes),
   }))
   const chats = db.prepare(`
-    SELECT ca.convo_id, ca.agent_device_id, ca.initiator_device_id, ca.initiator_convo_id, ca.target_convo_id, ca.justification, ca.topic, ca.created_at,
+    SELECT ca.convo_id, ca.agent_device_id, ca.initiator_device_id, ca.initiator_convo_id, ca.target_convo_id, ca.justification, ca.topic, ca.causes, ca.created_at,
            c.title AS room_title, c.agent_device_id AS room_owner_id,
            di.name AS initiator_name, dt.name AS agent_name, od.name AS owner_name,
            ic.title AS initiator_convo_title, tc.title AS target_convo_title, i.num AS item_num
@@ -146,20 +157,36 @@ export function listPendingAsks({ db, hub, waker }, userId) {
       topic: r.topic || '', justification: r.justification,
       ...(r.item_num != null ? { item_num: r.item_num } : {}),
       ...(isUserOnlyChat(db, userId, r.convo_id, r.agent_device_id) ? { user_only: true } : {}),
+      ...causesField(r.causes),
     }
   })
   return [...spawns, ...chats].sort((a, b) => a.created_at - b.created_at)
 }
 
 // One row per Coordinator decision: the audit record and the daily cap's
-// counter. Never written for a user's own tap.
-export function recordConsentDecision(db, { userId, kind, askId, decision, convoId, reason, now = Date.now() }) {
-  db.prepare('INSERT INTO consent_decisions(user_id, kind, ask_id, decision, convo_id, reason, created_at) VALUES(?,?,?,?,?,?,?)')
-    .run(userId, kind, askId, decision, convoId, reason, now)
+// counter. Never written for a user's own tap. causeKind / causeRef /
+// verifierNote are set only when the Coordinator approved an ask it made
+// itself: the root the journal resolved it to ('user' | 'item' |
+// 'routine', and its ref) and, for a routine root, the verifier's note.
+export function recordConsentDecision(db, { userId, kind, askId, decision, convoId, reason, causeKind = null, causeRef = null, verifierNote = null, now = Date.now() }) {
+  db.prepare('INSERT INTO consent_decisions(user_id, kind, ask_id, decision, convo_id, reason, cause_kind, cause_ref, verifier_note, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)')
+    .run(userId, kind, askId, decision, convoId, reason, causeKind, causeRef, verifierNote, now)
 }
 
 export function coordinatorApprovalsSince(db, userId, since) {
   return db.prepare("SELECT COUNT(*) c FROM consent_decisions WHERE user_id=? AND decision='approve' AND created_at>?").get(userId, since).c
+}
+
+// The routine cap's counter: approvals of the Coordinator's own asks that
+// rested on a routine fire.
+export function coordinatorRoutineApprovalsSince(db, userId, since) {
+  return db.prepare("SELECT COUNT(*) c FROM consent_decisions WHERE user_id=? AND decision='approve' AND cause_kind='routine' AND created_at>?").get(userId, since).c
+}
+
+// The envelope's spawns_per_fire counter: approved asks of `kind` born of
+// one routine fire, by its canonical root ref (routine:<name>@<fired_at>).
+export function approvalsForFire(db, userId, fireRef, kind = 'spawn') {
+  return db.prepare("SELECT COUNT(*) c FROM consent_decisions WHERE user_id=? AND decision='approve' AND cause_kind='routine' AND cause_ref=? AND kind=?").get(userId, fireRef, kind).c
 }
 
 // The Coordinator's own box, or null when none is set / its conversation

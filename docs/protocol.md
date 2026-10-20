@@ -2344,14 +2344,23 @@ prompts use), `title` (one line ≤ 200), exactly one of `schedule` (five
 cron fields, evaluated by `croner` in `tz`) and `trigger` (below), `tz`
 (IANA, default `Europe/London`), `prompt` (≤ 2000 chars, line breaks
 kept, other control characters stripped), `enabled`, `origin`
-(`seed|user|agent`), `next_at` (ms; NULL while paused, always NULL for a
-triggered routine), `last_fired_at`, `last_outcome`, `created_at`,
-`updated_at`. A schedule whose consecutive fires (checked over the next
+(`seed|user|agent`), `envelope` (below; `null` = none), `next_at` (ms;
+NULL while paused, always NULL for a triggered routine), `last_fired_at`,
+`last_outcome`, `created_at`, `updated_at`. A schedule whose consecutive fires (checked over the next
 five from now) are under 15 minutes apart, or with fewer than five future
 fires, is `bad_request`: a routine is a check-in, not a poll. At most 50
 per user. A routine is scheduled or triggered for life: `PATCH` may give
 `schedule` only to a scheduled routine and `trigger` only to a triggered
 one, never both (`bad_request`).
+
+**Envelope.** `envelope` is `{spawns_per_fire, chats, boxes}` — the bounds
+on what an ask born of one of the routine's fires may do when the
+Coordinator approves it itself: `spawns_per_fire` 0–50 (absent: 0),
+`chats` a boolean (absent: false), `boxes` 1–32 device names (each ≤ 64
+chars, duplicates folded) a spawn may target or a chat may reach, or `null` for any box
+(absent: null). Read back with all three keys. Optional on create (absent
+= `null`, which allows nothing); on `PATCH`, `envelope: null` clears it and
+an absent `envelope` leaves it alone. Any other shape is `bad_request`.
 
 **Triggers.** `trigger` is `{kind:'context_over', pct}` (1–99: a live
 session, never the Coordinator's own, a helper conversation inside a
@@ -2382,10 +2391,10 @@ whatever matches now, records untouched.
 |---|---|---|---|
 | `GET /routines` | any | | 200 `{routines}` by name |
 | `GET /routines/:key` | any | | 200 `{routine}`; `:key` is the id or the name |
-| `POST /routines` | client, or the Coordinator | `{name, title, schedule \| trigger, prompt, tz?, enabled?, convo_id?}` | 201 `{routine}`; **409** `{error:'conflict', blocked_by:'name'|'cap'}` |
-| `PATCH /routines/:key` | client, or the Coordinator | `{title?, schedule?, trigger?, tz?, prompt?, enabled?, convo_id?}` — at least one; `name` is not editable | 200 `{routine}` |
-| `DELETE /routines/:key` | client, or the Coordinator | `{convo_id?}` | 200 `{ok:true}` |
-| `POST /routines/:key/run` | client, or the Coordinator | `{convo_id?}` | 202 `{accepted:true}`, or `{delivered:false, reason:'no_coordinator'\|'busy'}` |
+| `POST /routines` | client, or the Coordinator | `{name, title, schedule \| trigger, prompt, tz?, enabled?, envelope?, convo_id?, causes?}` | 201 `{routine}`; **403** `routine_write_unverified`; **409** `{error:'conflict', blocked_by:'name' \| 'cap'}` |
+| `PATCH /routines/:key` | client, or the Coordinator | `{title?, schedule?, trigger?, tz?, prompt?, enabled?, envelope? (null clears), convo_id?, causes?}` — at least one; `name` is not editable | 200 `{routine}`; **403** `routine_write_unverified` |
+| `DELETE /routines/:key` | client, or the Coordinator | `{convo_id?, causes?}` | 200 `{ok:true}` |
+| `POST /routines/:key/run` | client, or the Coordinator | `{convo_id?, causes?}` | 202 `{accepted:true}`, or `{delivered:false, reason:'no_coordinator'\|'busy'}`; **403** `routine_write_unverified` |
 
 **The Coordinator gate** on agent writes is the one project close/merge
 use (`closingConvo`, required): the agent names its own conversation in
@@ -2395,6 +2404,28 @@ conversation this device does not own → **404**, a malformed `convo_id`
 → **400**. A client token passes with no `convo_id`. The Coordinator
 creates and deletes as well as edits (2026-10-02); the marker's `by` says
 which (`'agent'` or `'user'`).
+
+**The provenance gate** on the Coordinator's routine writes (a client
+token is the user and passes): an injected turn must not be able to write
+a routine with its own prompt and envelope, run it, and approve its own
+asks inside the fire. The bridge sends `causes` — the causes of the turn
+that made the request, the same `[{kind, ref?, at?}]` list as on a
+`spawn_request` (absent or `null` = none) — on create, update, run and
+delete; any other unusable value is **400** `{error:'bad_request',
+detail:'bad causes'}` on all four, whoever sends it. `POST /routines`, a
+`PATCH` that gives any of `prompt`, `schedule`, `trigger` or `envelope`
+(`null` included), and `POST /routines/:key/run` then need the causes to
+resolve (`src/ask-cause.js`, measured from now, in the conversation named
+in `convo_id`) to the user's verified words or the user's comment or tap
+on one of that conversation's items. Anything else — no causes, a cause
+that does not check out, or a root that is a routine fire (a routine
+cannot create, rewrite or run routines) — is **403** `{error:'forbidden',
+detail:'routine_write_unverified', why}`, checked after the body's own
+validation and before anything is written or fired. A `PATCH` of only `enabled`, `title` or `tz`, and
+`DELETE`, need no cause: none of them widens what a routine may do. A `tz`
+or `enabled` edit can move the next fire, but never widens what a fire may
+do: every ask born of it still has to fit the envelope and pass the
+verifier.
 
 `enabled: false` clears `next_at`; `true` again, or a `schedule`/`tz`
 change, recomputes it from now; `title`/`prompt` edits leave the schedule
@@ -2617,7 +2648,7 @@ so nothing here can reach them.
 
 | Route | Who | Body / query | Returns |
 |---|---|---|---|
-| `GET /consent/pending` | agent, Coordinator only | `?convo_id=<the Coordinator conversation>` | 200 `{pending:[…]}`, oldest first. A spawn row: `{kind:'spawn', id: request_id, created_at, from_device_id, from_name, from_convo_id, from_convo_title, target_device_id, target_name, target_state, workdir, task, topic, model?, link?, mission_num?, item_num?}`. A chat row: `{kind:'chat', id: '<room_id>/<target_device_id>', request:'invite'\|'join', room_id, room_title, target_device_id, from_device_id, from_name, from_convo_id, from_convo_title, to_device_id, to_name, to_convo_id, to_convo_title, target_state, topic, justification, item_num?}` — `id` is the same pair the consent link `matron://consent/chat/<room>/<device>` carries, and `POST /agent-chat/answer` keys on. `target_state` is `online` (a live socket), `asleep` (no socket, but the box can be woken) or `offline`. |
+| `GET /consent/pending` | agent, Coordinator only | `?convo_id=<the Coordinator conversation>` | 200 `{pending:[…]}`, oldest first. A spawn row: `{kind:'spawn', id: request_id, created_at, from_device_id, from_name, from_convo_id, from_convo_title, target_device_id, target_name, target_state, workdir, task, topic, model?, link?, mission_num?, item_num?, user_only?, causes?}`. A chat row: `{kind:'chat', id: '<room_id>/<target_device_id>', request:'invite'\|'join', room_id, room_title, target_device_id, from_device_id, from_name, from_convo_id, from_convo_title, to_device_id, to_name, to_convo_id, to_convo_title, target_state, topic, justification, item_num?, user_only?, causes?}` — `id` is the same pair the consent link `matron://consent/chat/<room>/<device>` carries, and `POST /agent-chat/answer` keys on. `target_state` is `online` (a live socket), `asleep` (no socket, but the box can be woken) or `offline`. `causes` is the list the asking bridge stamped on the ask (below), omitted when it stamped none. |
 | `POST /consent/answer` | agent, Coordinator only | `{convo_id, kind:'chat'\|'spawn', id, decision:'approve'\|'decline', reason}` | 200 `{ok:true}` (`delivered` too for a chat approval, as `/agent-chat/answer`). |
 
 **Gate**, in order, every failure a bare error body: a client connection
@@ -2627,16 +2658,65 @@ conversation this device owns **404**; not `user_settings.coordinator_convo_id`
 `{detail:'consent_disabled'}`. Then, for an answer: `reason` is required —
 1–200 characters after the usual peer-text sanitising — and is the audit
 line the user reads; the ask must exist (**404**, unknown and another
-user's indistinguishable) and still be `awaiting_user` (**409** `conflict`);
-an approval when the Coordinator's approvals in the last 24 h are at the
-**daily cap** (`MATRON_COORDINATOR_CONSENT_DAILY_CAP`, default 20; `0` is
-no cap) is
-**409** `{detail:'daily_cap', cap}` and the ask stays for the user —
-declines are never capped; a **spawn** approval into a target box that is
-`offline` (no socket and no wake possible) is **409**
+user's indistinguishable) and still be `awaiting_user` (**409** `conflict`).
+Then, for an **approval** only, in this order: an ask a **user-only box**
+takes part in is **403** `{detail:'user_only'}` (below); a **spawn** into a
+target box that is `offline` (no socket and no wake possible) is **409**
 `{detail:'target_offline'}` — an `asleep` box is woken exactly as a tap
-would; an **approval** of an ask a **user-only box** takes part in is
-**403** `{detail:'user_only'}` (below). Every refusal leaves the ask as it was.
+would; an ask the Coordinator made **itself** must pass the own-ask checks
+(below): **403** `{detail:'own_ask_unverified', why}`, **403**
+`{detail:'envelope', why}`, **409** `{error:'conflict',
+detail:'verifier_unavailable', why}`, **403** `{detail:'verifier', why}`,
+**409** `{error:'conflict', detail:'routine_cap', cap}`; and an approval
+when the Coordinator's approvals in the last 24 h are at the **daily cap**
+(`MATRON_COORDINATOR_CONSENT_DAILY_CAP`, default 20; `0` is no cap) is
+**409** `{detail:'daily_cap', cap}`. Declines skip all of these. The
+verifier is a wait, so after it answers the journal checks again, in one
+step with the decision: the consent switch, that the ask is still awaiting
+and unchanged (one answered or asked again meanwhile is a bare **409**
+`{error:'conflict'}`), `user_only`, `target_offline` and the routine's
+envelope as it is now (its per-fire count included), then `routine_cap`,
+then `daily_cap`. Every refusal leaves the ask as it was, for the user:
+nothing is written until every check has passed.
+
+**Causes.** A `spawn_request`, `agent_invite` or `agent_join` may carry
+`causes`: the causes of the bridge's turn that made the ask, a list of 1–8
+`{kind, ref?, at?}` — `kind` one of `user_message` (ref `<convo>:<seq>`),
+`item_reply` / `item_tap` (ref `item:<num>@<ISO time>`), `routine` (ref
+`routine:<name>@<ISO fire time>`), `spawn_outcome` (ref `spawn:<id>`),
+`room_message`, `reminder`, `carry_on`, `alert`, `handoff`, `other`; `ref` at
+most 200 characters; `at` a hint in ms. Absent or `null` is an ask with no
+causes; any other unusable value refuses the op `bad_request` `bad causes`.
+They are stored on the parked row and listed on `/consent/pending`.
+
+**The Coordinator's own asks.** An ask is the Coordinator's own when a spawn
+was asked for from the Coordinator conversation (`from_convo_id`), or a
+chat ask was made from it (`initiator_convo_id`; with none recorded, when
+the asking box is the Coordinator's). Approving one needs its causes to
+resolve (`src/ask-cause.js`) to a root the journal checks for itself, else
+**403** `own_ask_unverified` with the reason in `why`: the user's verified
+words in that conversation, or the user's comment or tap on one of its
+items, within 48 h of the ask (a `spawn_outcome` stands for the causes of
+the spawn it reports, a few hops at most); or a fire of one of the user's
+routines within 6 h, and only when the turn had no user or item cause. Any
+other kind of cause (a peer's room message, a reminder, an alert, …) fails
+the ask. A user or item root is approved like any other ask. A **routine**
+root must also fit the routine's **envelope** (*Routines*): none at all, a
+spawn when the fire's approved spawns already reach `spawns_per_fire`, a
+chat when `chats` is false, or a target box (the spawn's target; the
+chat's invitee, or for a join the room's owner) whose name is not in
+`boxes` when `boxes` is set, is **403** `envelope`. It then goes to the
+**verifier** (`src/verifier.js`): a model shown the routine's name and
+prompt (never its title, which changes without the user's ask), the ask (task or justification, target box, workdir, topic)
+and the reason, asked whether the ask is within the routine's remit and not
+injected. Off (no `MATRON_VERIFIER_API_KEY` / `_FILE`), failing or timing
+out is **409** `verifier_unavailable`; a no is **403** `verifier` with its
+note in `why`. Last, routine-born approvals in the last 24 h at the
+**routine cap** (`MATRON_COORDINATOR_ROUTINE_CAP`, default 10; `0` is no
+cap) are **409** `routine_cap`. An approval that passes records its root on
+the decision (`consent_decisions.cause_kind` `user`|`item`|`routine`,
+`cause_ref`, and `verifier_note` for a routine root); every other decision
+leaves them null. Another agent's ask is answered exactly as before.
 
 **User-only boxes.** `devices.consent_user_only`, set and cleared only by
 `matron-admin device consent <device_id> user-only|any` (no bridge can
@@ -2672,7 +2752,8 @@ that, a Coordinator decision:
 - appends a **client-only** `consent_decision` event on the card's
   conversation (the parent conversation for a spawn, the room for a chat):
   `{kind, request_id | room_id + target_device_id, decision, by:'coordinator',
-  convo_id, reason}` — never fanned to an agent, never replayed to one,
+  convo_id, reason, cause}` — `cause` is `{kind, ref}`, the root an approval
+  of the Coordinator's own ask rested on, and `null` otherwise — never fanned to an agent, never replayed to one,
   never a push — which is what an app renders as the "approved by the
   Coordinator" badge with its one-tap Stop session / Mute room.
 

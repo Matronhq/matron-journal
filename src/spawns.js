@@ -33,12 +33,14 @@ import { startReplyFallback } from './spawn-model.js'
 //
 // `agent` is 'claude' | 'codex' when the requester named one, else NULL:
 // the target bridge then starts its own box default.
-export function createSpawnRequest(db, { id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic = '', model = '', effort = '', agent = null, link = false, missionNum = null, missionInherited = false, now = Date.now() }) {
+// `causes`: the asking turn's causes, already normalised at the ws boundary
+// (src/ask-causes.js) — stored as JSON, NULL when the ask carried none.
+export function createSpawnRequest(db, { id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic = '', model = '', effort = '', agent = null, link = false, missionNum = null, missionInherited = false, causes = null, now = Date.now() }) {
   db.prepare(`
     INSERT INTO agent_spawn_requests(id, user_id, from_device_id, from_convo_id, target_device_id,
-      workdir, task, topic, model, effort, agent, link, mission_num, mission_inherited, state, created_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'awaiting_user',?)
-  `).run(id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic, model, effort, agent, link ? 1 : 0, missionNum, missionInherited && missionNum ? 1 : 0, now)
+      workdir, task, topic, model, effort, agent, link, mission_num, mission_inherited, causes, state, created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'awaiting_user',?)
+  `).run(id, userId, fromDeviceId, fromConvoId, targetDeviceId, workdir, task, topic, model, effort, agent, link ? 1 : 0, missionNum, missionInherited && missionNum ? 1 : 0, causes ? JSON.stringify(causes) : null, now)
   return { id }
 }
 

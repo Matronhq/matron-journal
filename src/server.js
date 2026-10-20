@@ -38,7 +38,8 @@ import { seedRoutines } from './routines.js'
 import { startStallWakeSweep } from './stall-wake.js'
 import { startAutoArchiveSweep } from './archive.js'
 import { sealStoredTokens } from './github-accounts.js'
-import { CONSENT_DAILY_CAP_DEFAULT } from './consent.js'
+import { CONSENT_DAILY_CAP_DEFAULT, CONSENT_ROUTINE_CAP_DEFAULT } from './consent.js'
+import { makeVerifier } from './verifier.js'
 import { warnAlertWebhookConfig } from './alerts-http.js'
 import { throttle, cancellableDelay } from './background.js'
 
@@ -412,6 +413,12 @@ export function startServer({
   // Coordinator consent approvals per rolling 24 h (spec: 2026-09-29
   // coordinator consent); beyond it the ask stays for the user. 0 = no cap.
   consentDailyCap = resolveConsentDailyCap(process.env.MATRON_COORDINATOR_CONSENT_DAILY_CAP),
+  // Approvals of the Coordinator's own routine-born asks per rolling 24 h
+  // (src/consent-own-ask.js), on top of the daily cap. 0 = no cap.
+  consentRoutineCap = resolveZeroableEnv('MATRON_COORDINATOR_ROUTINE_CAP', process.env.MATRON_COORDINATOR_ROUTINE_CAP, CONSENT_ROUTINE_CAP_DEFAULT),
+  // The second opinion on those asks (src/verifier.js): off without a key,
+  // and then every routine-born own ask stays for the user.
+  verifier = makeVerifier(),
   stallWakeIntervalMs = null,
   autoArchiveIntervalMs = null,
   autoArchive = process.env.MATRON_AUTO_ARCHIVE !== '0',
@@ -587,7 +594,7 @@ export function startServer({
     db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
-    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap,
+    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentRoutineCap, verifier,
     github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic,
   }))

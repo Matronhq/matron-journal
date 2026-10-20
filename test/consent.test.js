@@ -41,6 +41,45 @@ test('GET /consent/pending: client 403; an ordinary agent 403 not_coordinator; a
   assert.equal(ch.topic, 'review'); assert.equal(ch.justification, 'need eyes on the diff'); assert.equal(typeof ch.item_num, 'number')
 })
 
+test('GET /consent/pending carries the causes a spawn and a chat ask were parked with, and none on an ask parked without', async (t) => {
+  const f = await fleet(t)
+  const spawnCauses = [{ kind: 'user_message', ref: 'ask:7', at: 1700000000000 }]
+  const chatCauses = [{ kind: 'routine', ref: 'morning-sweep' }, { kind: 'item_reply', ref: 'it_1:c2', at: 1700000000001 }]
+  const spawnId = await parkSpawn(f, { causes: spawnCauses })
+  const bare = await parkSpawn(f, { rid: 'q2' })
+  await parkInviteAsk(f, { causes: chatCauses })
+  const rows = (await pending(f, f.coordDev.token)).json.pending
+  assert.deepEqual(rows.find((p) => p.id === spawnId).causes, spawnCauses)
+  assert.ok(!('causes' in rows.find((p) => p.id === bare)))
+  assert.deepEqual(rows.find((p) => p.kind === 'chat').causes, chatCauses)
+})
+
+test('agent_invite and agent_join refuse present-but-unusable causes; nothing parks', async (t) => {
+  const f = await fleet(t)
+  f.asker.send({ op: 'agent_invite', room_id: 'room', target_device_id: f.targetDev.deviceId, justification: 'need eyes', from_convo_id: 'ask', causes: [{ kind: 'telepathy' }] })
+  const e1 = await f.asker.waitFor((x) => x.kind === 'control' && x.op === 'error')
+  assert.equal(e1.code, 'bad_request'); assert.equal(e1.detail, 'bad causes')
+  f.target.send({ op: 'agent_join', room_id: 'room', justification: 'let me in', causes: [] })
+  const e2 = await f.target.waitFor((x) => x.kind === 'control' && x.op === 'error')
+  assert.equal(e2.code, 'bad_request'); assert.equal(e2.detail, 'bad causes')
+  assert.equal(f.s.db.prepare("SELECT COUNT(*) n FROM convo_agents WHERE state='awaiting_user'").get().n, 0)
+})
+
+test('agent_invite with causes: null parks the ask with NULL causes', async (t) => {
+  const f = await fleet(t)
+  await parkInviteAsk(f, { causes: null })
+  assert.equal(f.s.db.prepare("SELECT causes FROM convo_agents WHERE convo_id='room' AND agent_device_id=?").get(f.targetDev.deviceId).causes, null)
+  assert.ok(!('causes' in (await pending(f, f.coordDev.token)).json.pending[0]))
+})
+
+test('agent_join stores the causes it carries on the parked row', async (t) => {
+  const f = await fleet(t)
+  const causes = [{ kind: 'handoff', ref: 'h1' }]
+  f.target.send({ op: 'agent_join', room_id: 'room', justification: 'let me in', causes })
+  await f.target.waitFor((x) => x.kind === 'invite' && x.event === 'delivered')
+  assert.deepEqual(JSON.parse(f.s.db.prepare("SELECT causes FROM convo_agents WHERE convo_id='room' AND agent_device_id=?").get(f.targetDev.deviceId).causes), causes)
+})
+
 test('GET /consent/pending: a no-model spawn onto a box out of Fable carries the predicted Opus fallback, read at list time', async (t) => {
   const f = await fleet(t)
   await parkSpawn(f)
@@ -66,7 +105,7 @@ test('approve a spawn: the start RPC reaches the target, the outcome and its dur
   assert.equal(durable.payload.decided_by, 'coordinator'); assert.equal(durable.payload.reason, 'follows the box rules')
   const decision = await f.client.waitFor((x) => x.kind === 'journal' && x.type === 'consent_decision')
   assert.equal(decision.convo_id, 'ask')
-  assert.deepEqual(decision.payload, { kind: 'spawn', request_id: spawnId, decision: 'approve', by: 'coordinator', convo_id: 'coord', reason: 'follows the box rules' })
+  assert.deepEqual(decision.payload, { kind: 'spawn', request_id: spawnId, decision: 'approve', by: 'coordinator', convo_id: 'coord', reason: 'follows the box rules', cause: null })
   await settle()
   assert.equal(f.asker.frames.find((x) => x.kind === 'journal' && x.type === 'consent_decision'), undefined)
   const row = getSpawn(f.s.db, spawnId)

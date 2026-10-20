@@ -2,9 +2,10 @@
 // (POST /agent-chat/answer, POST /agent-spawn/answer) and the
 // Coordinator's answer (POST /consent/answer). `decidedBy` is
 // {kind:'user', deviceId} for a tap, or {kind:'coordinator', deviceId,
-// convoId, reason}; the Coordinator form additionally stamps the row
-// (answered_by / answer_reason), records the decision for the daily cap,
-// and appends a client-only `consent_decision` event on the card's
+// convoId, reason, causeKind?, causeRef?, verifierNote?} — the cause fields
+// only on the Coordinator's approval of an ask it made itself. The
+// Coordinator form additionally stamps the row (answered_by /
+// answer_reason), records the decision for the caps, and appends a client-only `consent_decision` event on the card's
 // conversation so the apps can show "approved by the Coordinator".
 // Returns {status, body} for the route to send.
 import { answerParkedInvite, getParticipant } from './participants.js'
@@ -21,14 +22,21 @@ const stamp = (decidedBy) => (byCoordinator(decidedBy) ? { answeredBy: 'coordina
 function recordAndAnnounce({ db, hub }, { userId, kind, askId, decision, decidedBy, convoId, payload }) {
   if (!byCoordinator(decidedBy)) return
   try {
-    recordConsentDecision(db, { userId, kind, askId, decision, convoId: decidedBy.convoId, reason: decidedBy.reason })
+    recordConsentDecision(db, {
+      userId, kind, askId, decision, convoId: decidedBy.convoId, reason: decidedBy.reason,
+      causeKind: decidedBy.causeKind ?? null, causeRef: decidedBy.causeRef ?? null, verifierNote: decidedBy.verifierNote ?? null,
+    })
   } catch (err) {
-    console.error('consent: decision record failed (the answer stands)', err)
+    // The answer stands; the counters reading this table do not.
+    console.error(`journal: consent decision not recorded (${err?.name}) for ${kind} ${askId} — fire and routine caps will under-count`)
   }
   try {
     appendAndBroadcast(db, hub, {
       userId, convoId, sender: 'journal', type: CONSENT_DECISION_EVENT_TYPE,
-      payload: { kind, ...payload, decision, by: 'coordinator', convo_id: decidedBy.convoId, reason: decidedBy.reason },
+      payload: {
+        kind, ...payload, decision, by: 'coordinator', convo_id: decidedBy.convoId, reason: decidedBy.reason,
+        cause: decidedBy.causeKind ? { kind: decidedBy.causeKind, ref: decidedBy.causeRef } : null,
+      },
     })
   } catch (err) {
     console.error('consent: consent_decision append failed (the answer stands)', err)
