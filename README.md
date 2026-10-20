@@ -108,6 +108,11 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_BACKGROUND_DELAY_MS` | 30000 | How long after listening the startup backfills (message search index, `is_diff`, image sizes) and the first vector index pass wait before starting. They then run one at a time, and each saves its place per batch, so a restart resumes rather than starting over |
 | `MATRON_BACKGROUND_PACE` | 1 | Rest between background batches, as a whole multiple of the batch's own time: 1 keeps that work to at most half of one core, 0 only yields one event-loop turn |
 | `MATRON_SEMANTIC_MODEL_DIR` | unset (`<db dir>/models`, downloaded on first boot) | Directory holding a pre-seeded model, laid out as `<dir>/Xenova/bge-small-en-v1.5/{config.json,tokenizer.json,tokenizer_config.json,onnx/model_quantized.onnx}`. When set, the model is never downloaded, so boot needs no network. When unset, the first boot downloads the model (about 35 MB) into `<db dir>/models`, which must be writable |
+| `MATRON_COORDINATOR_CONSENT_DAILY_CAP` | `20` | The Coordinator's consent approvals per user per rolling 24 h. `0` is no cap. See docs/protocol.md *Consent approval* |
+| `MATRON_COORDINATOR_ROUTINE_CAP` | `10` | Routine-born self-approvals (a spawn or chat ask the Coordinator makes and approves itself during a scheduled routine) per user per rolling 24 h, on top of the daily cap. `0` is no cap |
+| `MATRON_VERIFIER_API_KEY` / `MATRON_VERIFIER_API_KEY_FILE` | unset (verifier off) | Anthropic API key, inline or read from a file, for the verifier that judges the Coordinator's routine-born self-approvals. With no key those approvals are refused `409 verifier_unavailable` and the card waits for the user. See docs/protocol.md *Consent approval* for the causes, envelopes and verifier rules |
+| `MATRON_VERIFIER_MODEL` | `claude-opus-5-5` | Model the verifier calls |
+| `MATRON_VERIFIER_TIMEOUT_MS` | `60000` | Bound on the whole verifier call; a timeout fails closed (the approval is refused and the card waits for the user) |
 | `MATRON_APNS_KEY_FILE` / `_KEY_ID` / `_TEAM_ID` / `_TOPIC` | unset | All four set = push enabled; otherwise push is an inert no-op |
 | `MATRON_PUSH_GATEWAY_URL` | unset | Push relay URL when you have no APNs key — see Push relay section |
 | `MATRON_RELAY_PORT` / `MATRON_RELAY_BIND` | `9821` / `127.0.0.1` | matron-push-relay only |
