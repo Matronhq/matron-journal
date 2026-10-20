@@ -25,7 +25,7 @@ import {
   isUserOnlySpawn, isUserOnlyChat,
 } from './consent.js'
 import { answerChatAsk, answerSpawnAsk } from './consent-answer.js'
-import { checkOwnAsk, spawnAsk, chatAsk } from './consent-own-ask.js'
+import { verifyOwnAsk, confirmOwnAsk, spawnAsk, chatAsk } from './consent-own-ask.js'
 import { getSpawn } from './spawns.js'
 
 const forbidden = (res, detail) => { json(res, 403, { error: 'forbidden', ...(detail ? { detail } : {}) }); return true }
@@ -78,7 +78,9 @@ export async function handleConsentRoute(ctx, req, res, url, who) {
       if (deviceState({ db, hub, waker }, who.userId, row.target_device_id) === 'offline') {
         json(res, 409, { error: 'conflict', detail: 'target_offline' }); return true
       }
-      if (!(await approvalAllowed(ctx, res, who, body, reason, spawnAsk(db, who, body, row), decidedBy))) return true
+      const ask = spawnAsk(db, who, body, row)
+      const verdict = ask.own ? await verifyOwnAsk(ctx, { who, convoId: body.convo_id, reason, ask }) : null
+      if (!approvalAllowed(ctx, res, who, ask, verdict, decidedBy)) return true
     }
     const r = answerSpawnAsk(ctx, { userId: who.userId, requestId: body.id, decision: body.decision, decidedBy })
     json(res, r.status, r.body); return true
@@ -87,24 +89,27 @@ export async function handleConsentRoute(ctx, req, res, url, who) {
   if (!key) { json(res, 400, { error: 'bad_request' }); return true }
   if (body.decision === 'approve') {
     if (isUserOnlyChat(db, who.userId, key.roomId, key.targetDeviceId)) return forbidden(res, 'user_only')
-    if (!(await approvalAllowed(ctx, res, who, body, reason, chatAsk(db, who, body, key), decidedBy))) return true
+    const ask = chatAsk(db, who, body, key)
+    const verdict = ask?.own ? await verifyOwnAsk(ctx, { who, convoId: body.convo_id, reason, ask }) : null
+    if (!approvalAllowed(ctx, res, who, ask, verdict, decidedBy)) return true
   }
   const r = answerChatAsk(ctx, { userId: who.userId, roomId: key.roomId, targetDeviceId: key.targetDeviceId, decision: body.decision, decidedBy })
   json(res, r.status, r.body)
   return true
 }
 
-// The last checks on an approval, after the per-ask ones: the
-// Coordinator's own ask needs a verified cause (src/consent-own-ask.js),
-// whose root lands on decidedBy for the decision row; then the daily cap
+// The last checks on an approval, run synchronously right before the
+// answer writes anything: for the Coordinator's own ask the verdict of
+// verifyOwnAsk (src/consent-own-ask.js) and its re-checks after the wait,
+// its root landing on decidedBy for the decision row; then the daily cap
 // (0 = unlimited, MATRON_COORDINATOR_CONSENT_DAILY_CAP=0). `ask` is null
 // for a chat ask that is not awaiting — the answer path gives its own
 // 404 / 409 then. → false once a refusal is sent.
-async function approvalAllowed(ctx, res, who, body, reason, ask, decidedBy) {
-  if (ask?.own) {
-    const own = await checkOwnAsk(ctx, { who, convoId: body.convo_id, reason, ask })
-    if (!own.ok) { json(res, own.status, own.body); return false }
-    Object.assign(decidedBy, own.cause)
+function approvalAllowed(ctx, res, who, ask, verdict, decidedBy) {
+  if (verdict) {
+    const refused = verdict.ok ? confirmOwnAsk(ctx, { who, ask, verdict }) : verdict
+    if (refused) { json(res, refused.status, refused.body); return false }
+    Object.assign(decidedBy, verdict.cause)
   }
   const cap = Number.isInteger(ctx.consentDailyCap) && ctx.consentDailyCap >= 0 ? ctx.consentDailyCap : CONSENT_DAILY_CAP_DEFAULT
   if (cap > 0 && coordinatorApprovalsSince(ctx.db, who.userId, Date.now() - CONSENT_DAILY_WINDOW_MS) >= cap) {

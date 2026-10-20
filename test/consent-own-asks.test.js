@@ -280,3 +280,99 @@ test('declines are never gated: an unverified, envelope-less or verifier-refused
   assert.equal(rows.length, 4)
   for (const d of rows) { assert.equal(d.decision, 'decline'); assert.equal(d.cause_kind, null); assert.equal(d.cause_ref, null) }
 })
+
+// A verifier whose answers wait until the test releases them: release()
+// lets every call made so far through.
+function gatedVerifier(result = { ok: true, approve: true, note: 'within the routine' }) {
+  const calls = []
+  let waiting = []
+  return {
+    calls,
+    enabled: true,
+    release: () => { for (const go of waiting) go(); waiting = [] },
+    verify: async (args) => { calls.push(args); await new Promise((resolve) => waiting.push(resolve)); return result },
+  }
+}
+const until = async (pred, ms = 2000) => {
+  const t0 = Date.now()
+  while (!pred()) {
+    if (Date.now() - t0 > ms) throw new Error('until timeout')
+    await settle(10)
+  }
+}
+
+test('own chat ask without a recorded asking conversation: the Coordinator\'s box asking makes it own, so no causes is 403 own_ask_unverified', async (t) => {
+  const f = await fleet(t, { verifier: stubVerifier() })
+  const room = coordRoom(f)
+  await parkInviteAsk(f, { ws: f.coord, room, from: null })
+  assert.equal(getParticipant(f.s.db, room, f.targetDev.deviceId).initiator_convo_id, null)
+  const r = await approve(f, 'chat', `${room}/${f.targetDev.deviceId}`)
+  assert.equal(r.status, 403); assert.equal(r.json.detail, 'own_ask_unverified')
+  assert.deepEqual(decisions(f), [])
+})
+
+test('a chat ask declined by the user and asked again while the verifier answers is not approved under the first ask\'s cause: 409, nothing recorded', async (t) => {
+  const verifier = gatedVerifier()
+  const f = await fleet(t, { verifier })
+  const room = coordRoom(f)
+  const id = `${room}/${f.targetDev.deviceId}`
+  const rt = routine(f, { envelope: { spawns_per_fire: 0, chats: true, boxes: null } })
+  await parkInviteAsk(f, { ws: f.coord, room, from: 'coord', causes: rt.causes })
+  const pendingAnswer = approve(f, 'chat', id, 'the sweep wants a word')
+  await until(() => verifier.calls.length === 1)
+  // The user says no to it; the Coordinator asks again for the same pair.
+  const tap = await f.s.http('/agent-chat/answer', { method: 'POST', token: f.clientToken, body: { room_id: room, target_device_id: f.targetDev.deviceId, decision: 'deny' } })
+  assert.equal(tap.status, 200)
+  assert.equal(getParticipant(f.s.db, room, f.targetDev.deviceId).state, 'denied')
+  await settle(5)
+  await parkInviteAsk(f, { ws: f.coord, room, from: 'coord', causes: [{ kind: 'other' }] })
+  verifier.release()
+  const r = await pendingAnswer
+  assert.equal(r.status, 409); assert.deepEqual(r.json, { error: 'conflict' })
+  const row = getParticipant(f.s.db, room, f.targetDev.deviceId)
+  assert.equal(row.state, 'awaiting_user'); assert.equal(row.answered_by, null)
+  assert.deepEqual(decisions(f), [])
+})
+
+test('two approvals of one fire with spawns_per_fire 1, both past the verifier together: exactly one is approved, the other is 403 envelope', async (t) => {
+  const verifier = gatedVerifier()
+  const f = await fleet(t, { verifier })
+  autoStart(f)
+  const rt = routine(f, { envelope: { spawns_per_fire: 1, chats: false, boxes: null } })
+  const a = await ownSpawn(f, 'q1', rt.causes)
+  const b = await ownSpawn(f, 'q2', rt.causes)
+  const both = Promise.all([approve(f, 'spawn', a), approve(f, 'spawn', b)])
+  await until(() => verifier.calls.length === 2)
+  verifier.release()
+  const results = await both
+  assert.deepEqual(results.map((r) => r.status).sort(), [200, 403])
+  const lost = results.find((r) => r.status === 403)
+  assert.equal(lost.json.detail, 'envelope')
+  const won = results[0].status === 200 ? a : b
+  await started(f, won)
+  assert.equal(getSpawn(f.s.db, won === a ? b : a).state, 'awaiting_user')
+  assert.equal(decisions(f).length, 1)
+})
+
+test('the switch turned off, or the target box going offline, while the verifier answers refuses with the usual codes', async (t) => {
+  const verifier = gatedVerifier()
+  const f = await fleet(t, { verifier })
+  const rt = routine(f, { envelope: { spawns_per_fire: 2, chats: false, boxes: null } })
+  const id = await ownSpawn(f, 'q1', rt.causes)
+  const first = approve(f, 'spawn', id)
+  await until(() => verifier.calls.length === 1)
+  assert.equal((await f.s.http('/coordinator', { method: 'PUT', token: f.clientToken, body: { consent: false } })).status, 200)
+  verifier.release()
+  const off = await first
+  assert.equal(off.status, 403); assert.equal(off.json.detail, 'consent_disabled')
+  assert.equal((await f.s.http('/coordinator', { method: 'PUT', token: f.clientToken, body: { consent: true } })).status, 200)
+  const second = approve(f, 'spawn', id)
+  await until(() => verifier.calls.length === 2)
+  f.target.close()
+  await settle()
+  verifier.release()
+  const offline = await second
+  assert.equal(offline.status, 409); assert.equal(offline.json.detail, 'target_offline')
+  assert.equal(getSpawn(f.s.db, id).state, 'awaiting_user')
+  assert.deepEqual(decisions(f), [])
+})

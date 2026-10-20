@@ -72,8 +72,9 @@ export const parseTrigger = (text) => { try { return text ? validateTrigger(JSON
 // routine's fires may do when the Coordinator approves it itself —
 //   spawns_per_fire  0..50   approved spawns per fire (absent: 0)
 //   chats            boolean chat rooms at all (absent: false)
-//   boxes            1..32 device names a spawn may target, or null for
-//                    any box (absent: null)
+//   boxes            1..32 device names a spawn may target or a chat may
+//                    reach (the invitee, or for a join the room's owner),
+//                    or null for any box (absent: null)
 // NULL on the row (no envelope) allows nothing. The value is always stored
 // and read back with all three keys.
 export const ENVELOPE_SPAWNS_MAX = 50

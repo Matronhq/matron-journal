@@ -39,9 +39,10 @@ export const parkSpawn = async (f, { rid = 'q1', from = 'ask', ws = null, causes
   return ack.spawn_id
 }
 // `ws`, `room` and `from` default to the asker's own room and session; an
-// own ask of the Coordinator passes its socket, a room it owns and 'coord'.
+// own ask of the Coordinator passes its socket, a room it owns and 'coord'
+// (`from: null` sends no from_convo_id, as an older bridge would).
 export const parkInviteAsk = async (f, { causes, ws = null, room = 'room', from = 'ask' } = {}) => {
-  (ws || f.asker).send({ op: 'agent_invite', room_id: room, target_device_id: f.targetDev.deviceId, justification: 'need eyes on the diff', topic: 'review', from_convo_id: from, ...(causes !== undefined ? { causes } : {}) })
+  (ws || f.asker).send({ op: 'agent_invite', room_id: room, target_device_id: f.targetDev.deviceId, justification: 'need eyes on the diff', topic: 'review', ...(from != null ? { from_convo_id: from } : {}), ...(causes !== undefined ? { causes } : {}) })
   await (ws || f.asker).waitFor((x) => x.kind === 'invite' && x.event === 'delivered' && x.room_id === room)
 }
 export const pending = (f, token, convoId = 'coord') => f.s.http(`/consent/pending?convo_id=${encodeURIComponent(convoId)}`, { token })

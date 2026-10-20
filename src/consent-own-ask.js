@@ -15,8 +15,10 @@
 import { resolveAskCause } from './ask-cause.js'
 import { parseCauses } from './ask-causes.js'
 import { getParticipant } from './participants.js'
+import { getSpawn } from './spawns.js'
 import {
   approvalsForFire, coordinatorRoutineApprovalsSince, CONSENT_ROUTINE_CAP_DEFAULT, CONSENT_DAILY_WINDOW_MS,
+  getConsentEnabled, isUserOnlySpawn, isUserOnlyChat, deviceState,
 } from './consent.js'
 
 // The asking conversation is the Coordinator's: a spawn asked for from it,
@@ -35,14 +37,17 @@ const deviceName = (db, userId, deviceId) =>
 export function spawnAsk(db, who, body, row) {
   const targetBox = deviceName(db, who.userId, row.target_device_id)
   return {
-    kind: 'spawn', own: isOwnAsk(who, body, row), causes: row.causes, createdAt: row.created_at, targetBox,
+    kind: 'spawn', id: row.id, own: isOwnAsk(who, body, row), causes: row.causes, createdAt: row.created_at, targetBox,
     verifier: { kind: 'spawn', task: row.task, target_box: targetBox, workdir: row.workdir, topic: row.topic || '' },
   }
 }
 
 // A chat ask still awaiting the user in one of the user's rooms, or null —
 // the answer path then gives its own 404 / 409. The box it reaches is the
-// invitee, or for a join the room's owner.
+// invitee, or for a join the room's owner. `causes` and `createdAt` are the
+// row's own (raw causes text): a chat ask is keyed only by (room, target),
+// and a declined row is renewed in place, so they are what tells a later
+// read whether it is still the same ask.
 export function chatAsk(db, who, body, { roomId, targetDeviceId }) {
   const room = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(roomId)
   if (!room || room.owner_user_id !== who.userId) return null
@@ -51,7 +56,7 @@ export function chatAsk(db, who, body, { roomId, targetDeviceId }) {
   const isJoin = row.initiator_device_id === targetDeviceId
   const targetBox = deviceName(db, who.userId, isJoin ? room.agent_device_id : targetDeviceId)
   return {
-    kind: 'chat', own: isOwnAsk(who, body, row), causes: row.causes, createdAt: row.created_at, targetBox,
+    kind: 'chat', roomId, targetDeviceId, own: isOwnAsk(who, body, row), causes: row.causes, createdAt: row.created_at, targetBox,
     verifier: { kind: 'chat', justification: row.justification, target_box: targetBox, topic: row.topic || '' },
   }
 }
@@ -72,6 +77,27 @@ function outsideEnvelope(db, userId, root, ask) {
   return null
 }
 
+// After the wait: the cheap preconditions the route checked before it,
+// again and in the same order (the switch, the ask still awaiting and
+// still the same ask, user_only, target_offline), with their own refusals.
+// A changed or answered ask is the bare 409 a lost claim answers.
+function changedWhileVerifying(ctx, who, ask) {
+  const { db } = ctx
+  if (!getConsentEnabled(db, who.userId)) return refusal(403, 'consent_disabled')
+  if (ask.kind === 'spawn') {
+    const row = getSpawn(db, ask.id)
+    if (!row || row.state !== 'awaiting_user') return conflict()
+    if (isUserOnlySpawn(db, who.userId, row)) return refusal(403, 'user_only')
+    if (deviceState(ctx, who.userId, row.target_device_id) === 'offline') return refusal(409, 'target_offline')
+    return null
+  }
+  if (isUserOnlyChat(db, who.userId, ask.roomId, ask.targetDeviceId)) return refusal(403, 'user_only')
+  const row = getParticipant(db, ask.roomId, ask.targetDeviceId)
+  if (!row || row.state !== 'awaiting_user' || row.created_at !== ask.createdAt || row.causes !== ask.causes) return conflict()
+  return null
+}
+const conflict = () => ({ ok: false, status: 409, body: { error: 'conflict' } })
+
 async function askVerifier(verifier, args) {
   if (!verifier?.verify) return { ok: false, reason: 'disabled' }
   try {
@@ -81,16 +107,25 @@ async function askVerifier(verifier, args) {
   }
 }
 
-// → { ok: true, cause: {causeKind, causeRef, verifierNote?} } to go ahead,
-//   or { ok: false, status, body } to refuse, in the documented order:
-//   own_ask_unverified, envelope, verifier_unavailable / verifier,
-//   routine_cap. `who` is the route's authenticated caller.
-export async function checkOwnAsk(ctx, { who, convoId, reason, ask }) {
+// Two halves, because the verifier is a wait. verifyOwnAsk resolves the
+// cause, checks the envelope and (for a routine root) asks the verifier;
+// the route awaits it and then calls confirmOwnAsk SYNCHRONOUSLY, with
+// nothing awaited between it, the daily cap and the decision row — so
+// whatever changed during the wait (the ask answered or renewed, the
+// switch, user_only, the target going offline, another approval of the
+// same fire) is seen, and two approvals cannot both pass a count.
+// Refusals, in order: own_ask_unverified, envelope, verifier_unavailable /
+// verifier, then the re-checks, envelope again, routine_cap. `who` is the
+// route's authenticated caller.
+//
+// → { ok: true, root, cause: {causeKind, causeRef, verifierNote?} }
+//   or { ok: false, status, body }.
+export async function verifyOwnAsk(ctx, { who, convoId, reason, ask }) {
   const { db } = ctx
   const res = resolveAskCause(db, { who, userId: who.userId, causes: parseCauses(ask.causes), createdAt: ask.createdAt, fromConvoId: convoId })
   if (!res.ok) return refusal(403, 'own_ask_unverified', { why: res.why })
   const { root } = res
-  if (root.kind !== 'routine') return { ok: true, cause: { causeKind: root.kind, causeRef: root.ref } }
+  if (root.kind !== 'routine') return { ok: true, root, cause: { causeKind: root.kind, causeRef: root.ref } }
   const outside = outsideEnvelope(db, who.userId, root, ask)
   if (outside) return refusal(403, 'envelope', { why: outside })
   const { name, title, prompt } = root.routine
@@ -100,13 +135,20 @@ export async function checkOwnAsk(ctx, { who, convoId, reason, ask }) {
     return refusal(409, 'verifier_unavailable', { why })
   }
   if (!verdict.approve) return refusal(403, 'verifier', { why: verdict.note || 'the verifier refused the ask' })
-  // Again: another approval of the same fire may have landed while the
-  // verifier was answering. From here to the decision row nothing awaits.
-  const late = outsideEnvelope(db, who.userId, root, ask)
+  return { ok: true, root, cause: { causeKind: 'routine', causeRef: root.ref, verifierNote: verdict.note ?? '' } }
+}
+
+// → a refusal, or null to go ahead. Synchronous by design (above).
+export function confirmOwnAsk(ctx, { who, ask, verdict }) {
+  const { db } = ctx
+  const changed = changedWhileVerifying(ctx, who, ask)
+  if (changed) return changed
+  if (verdict.root.kind !== 'routine') return null
+  const late = outsideEnvelope(db, who.userId, verdict.root, ask)
   if (late) return refusal(403, 'envelope', { why: late })
   const cap = Number.isInteger(ctx.consentRoutineCap) && ctx.consentRoutineCap >= 0 ? ctx.consentRoutineCap : CONSENT_ROUTINE_CAP_DEFAULT
   if (cap > 0 && coordinatorRoutineApprovalsSince(db, who.userId, Date.now() - CONSENT_DAILY_WINDOW_MS) >= cap) {
     return refusal(409, 'routine_cap', { cap })
   }
-  return { ok: true, cause: { causeKind: 'routine', causeRef: root.ref, verifierNote: verdict.note ?? '' } }
+  return null
 }
