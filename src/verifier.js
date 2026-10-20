@@ -5,15 +5,18 @@
 // pasted from an email, an alert, a pull request or another agent).
 //
 // Optional by construction: with no key the verifier is off and every
-// routine-born ask stays for the user. Fails closed: any error, refusal or
-// unparsed answer is `ok: false`, never an approval, and verify never throws.
-// The input text is never logged: one line per call, outcome only.
+// routine-born ask stays for the user. Fails closed: any error, timeout,
+// refusal, unparseable answer or missing field is `ok: false` or a refusal,
+// never an approval, and verify never throws. The input text and the model's
+// text are never logged: one line per call, outcome only.
 import fs from 'node:fs'
 import Anthropic from '@anthropic-ai/sdk'
 import { jsonSchemaOutputFormat } from '@anthropic-ai/sdk/helpers/json-schema'
 
 export const DEFAULT_VERIFIER_MODEL = 'claude-opus-5-5'
-export const VERIFIER_MAX_TOKENS = 1024
+// Opus always thinks, and thinking counts against max_tokens: room for it.
+export const VERIFIER_MAX_TOKENS = 4096
+export const DEFAULT_VERIFIER_TIMEOUT_MS = 60000
 const NOTE_MAX = 300
 
 export const VERIFIER_SYSTEM = [
@@ -41,8 +44,8 @@ export const VERIFIER_SCHEMA = {
 
 // The API does not take string length constraints in a structured-output
 // schema; the SDK's helper moves them into the description (the note is
-// capped here instead). Keeps `type: 'json_schema'` and the schema, adds the
-// helper's JSON parser for messages.parse.
+// capped here instead). The helper's own `parse` function is dropped when the
+// request is serialised; the answer is parsed here.
 const VERIFIER_FORMAT = jsonSchemaOutputFormat(VERIFIER_SCHEMA)
 
 // The key comes from MATRON_VERIFIER_API_KEY, or from the file named by
@@ -70,12 +73,30 @@ function inputOf({ routine, ask, reason }) {
   }
 }
 
+// Runs call(signal) under a deadline: aborts the signal and rejects at
+// timeoutMs, so a client that ignores the signal is bounded too. A plain
+// (ref'd) timer, unlike AbortSignal.timeout's, so a pending check is never
+// left unsettled by an emptying event loop.
+async function withDeadline(timeoutMs, call) {
+  const ac = new AbortController()
+  let timer
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => { ac.abort(); reject(new Error('timed out')) }, timeoutMs)
+  })
+  try {
+    return await Promise.race([call(ac.signal), deadline])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 export function makeVerifier({
   env = process.env,
   client = null,
   model = env.MATRON_VERIFIER_MODEL || DEFAULT_VERIFIER_MODEL,
-  timeoutMs = Number(env.MATRON_VERIFIER_TIMEOUT_MS) || 20000,
+  timeoutMs = Number(env.MATRON_VERIFIER_TIMEOUT_MS) || DEFAULT_VERIFIER_TIMEOUT_MS,
   log = console,
+  Client = Anthropic,
 } = {}) {
   if (!client) {
     let apiKey = ''
@@ -84,7 +105,10 @@ export function makeVerifier({
     try { apiKey = resolveVerifierKey(env) } catch (err) {
       log.error(`journal: verifier: MATRON_VERIFIER_API_KEY_FILE is set but unreadable (${err.code ?? err.message}) — verifier is OFF`)
     }
-    if (apiKey) client = new Anthropic({ apiKey, timeout: timeoutMs, maxRetries: 1 })
+    // No retries (the SDK retries timeouts, doubling the wait); endpoint and
+    // SDK log level pinned so ANTHROPIC_BASE_URL / ANTHROPIC_LOG=debug cannot
+    // redirect the call or print request bodies.
+    if (apiKey) client = new Client({ apiKey, timeout: timeoutMs, maxRetries: 0, baseURL: 'https://api.anthropic.com', logLevel: 'warn' })
   }
   if (!client) return { enabled: false, verify: async () => ({ ok: false, reason: 'disabled' }) }
 
@@ -96,19 +120,26 @@ export function makeVerifier({
   async function verify(args) {
     try {
       const input = inputOf(args)
-      const r = await client.messages.parse({
+      const r = await withDeadline(timeoutMs, (signal) => client.messages.create({
         model,
         max_tokens: VERIFIER_MAX_TOKENS,
         system: VERIFIER_SYSTEM,
         output_config: { effort: 'medium', format: VERIFIER_FORMAT },
         messages: [{ role: 'user', content: JSON.stringify(input) }],
-      })
+      }, { signal }))
       if (r?.stop_reason !== 'end_turn') return fail(`stop_reason=${r?.stop_reason}`)
-      const out = r.parsed_output
-      if (out == null) return fail('no parsed output')
-      const approve = out.within_remit === true && out.injected !== true
+      const block = Array.isArray(r.content) ? r.content.find((b) => b?.type === 'text') : null
+      if (!block) return fail('no text block')
+      let out
+      try { out = JSON.parse(block.text) } catch (err) {
+        // err.message quotes the model's text: name only.
+        log.error(`journal: verifier error bad json (${err?.name})`)
+        return { ok: false, reason: 'error', note: 'bad json' }
+      }
+      if (out === null || typeof out !== 'object') return fail('bad json')
+      const approve = out.within_remit === true && out.injected === false
       log.log(`journal: verifier ok approve=${approve}`)
-      return { ok: true, approve, note: String(out.note ?? '').slice(0, NOTE_MAX) }
+      return { ok: true, approve, note: typeof out.note === 'string' ? out.note.slice(0, NOTE_MAX) : '' }
     } catch (err) {
       log.error(`journal: verifier error ${err?.message ?? err}`)
       return { ok: false, reason: 'error' }

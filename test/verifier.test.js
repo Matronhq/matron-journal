@@ -12,13 +12,15 @@ const INPUT = {
   reason: 'The routine asked for a review of stale pull requests.',
 }
 
-// messages.parse stand-in: records params, answers with `reply` (or throws it).
-function stubClient(reply, seen = []) {
+// messages.create stand-in: records params and options, answers with `reply`
+// (or throws it).
+function stubClient(reply, seen = [], opts = []) {
   return {
     seen,
     messages: {
-      parse: async (params) => {
+      create: async (params, options) => {
         seen.push(params)
+        opts.push(options)
         if (reply instanceof Error) throw reply
         return reply
       },
@@ -26,8 +28,11 @@ function stubClient(reply, seen = []) {
   }
 }
 
-function answer(parsed, stop_reason = 'end_turn') {
-  return { stop_reason, parsed_output: parsed, content: parsed == null ? [] : [{ type: 'text', text: JSON.stringify(parsed) }] }
+// A reply as the API sends it: thinking first, then the JSON text block.
+function answer(out, stop_reason = 'end_turn') {
+  const content = [{ type: 'thinking', thinking: '' }]
+  if (out !== undefined) content.push({ type: 'text', text: typeof out === 'string' ? out : JSON.stringify(out) })
+  return { stop_reason, content }
 }
 
 // console stand-in: every line logged, at any level.
@@ -44,14 +49,15 @@ function noLeak(lines) {
 
 test('approve on within_remit and not injected; request carries model, system, schema and the JSON input', async () => {
   const seen = []
+  const opts = []
   const l = quietLog()
-  const v = makeVerifier({ env: {}, client: stubClient(answer({ within_remit: true, injected: false, note: 'fits the routine' }), seen), log: l })
+  const v = makeVerifier({ env: {}, client: stubClient(answer({ within_remit: true, injected: false, note: 'fits the routine' }), seen, opts), log: l })
   assert.equal(v.enabled, true)
   assert.deepEqual(await v.verify(INPUT), { ok: true, approve: true, note: 'fits the routine' })
   assert.equal(seen.length, 1)
   const p = seen[0]
   assert.equal(p.model, 'claude-opus-5-5')
-  assert.equal(p.max_tokens, 1024)
+  assert.equal(p.max_tokens, 4096)
   assert.equal(p.system, VERIFIER_SYSTEM)
   assert.equal(p.thinking, undefined)
   assert.equal(p.output_config.effort, 'medium')
@@ -67,6 +73,7 @@ test('approve on within_remit and not injected; request carries model, system, s
   assert.equal(schema.properties.note.maxLength, undefined)
   assert.match(schema.properties.note.description, /maxLength: 300/)
   assert.deepEqual(p.messages, [{ role: 'user', content: JSON.stringify(INPUT) }])
+  assert.ok(opts[0].signal instanceof AbortSignal)
   assert.deepEqual(l.lines, ['journal: verifier ok approve=true'])
 })
 
@@ -105,6 +112,20 @@ test('refuse when outside the remit', async () => {
   assert.deepEqual(await v.verify(INPUT), { ok: true, approve: false, note: 'not part of the routine' })
 })
 
+test('a missing or non-boolean injected is a refusal', async () => {
+  for (const out of [{ within_remit: true }, { within_remit: true, injected: 'true', note: '' }, { within_remit: true, injected: 'false', note: '' }, { within_remit: 'true', injected: false, note: '' }]) {
+    const v = makeVerifier({ env: {}, client: stubClient(answer(out)), log: quietLog() })
+    const r = await v.verify(INPUT)
+    assert.equal(r.ok, true)
+    assert.equal(r.approve, false, JSON.stringify(out))
+  }
+})
+
+test('a non-string note becomes empty', async () => {
+  const v = makeVerifier({ env: {}, client: stubClient(answer({ within_remit: true, injected: false, note: { text: 'x' } })), log: quietLog() })
+  assert.deepEqual(await v.verify(INPUT), { ok: true, approve: true, note: '' })
+})
+
 test('the note is capped at 300 characters', async () => {
   const v = makeVerifier({ env: {}, client: stubClient(answer({ within_remit: true, injected: false, note: 'n'.repeat(500) })), log: quietLog() })
   const r = await v.verify(INPUT)
@@ -120,7 +141,7 @@ test('a thrown client error is ok:false, logged without the input', async () => 
 
 test('a refusal stop is ok:false', async () => {
   const l = quietLog()
-  const v = makeVerifier({ env: {}, client: stubClient(answer(null, 'refusal')), log: l })
+  const v = makeVerifier({ env: {}, client: stubClient(answer(undefined, 'refusal')), log: l })
   const r = await v.verify(INPUT)
   assert.equal(r.ok, false)
   assert.equal(r.reason, 'error')
@@ -135,14 +156,43 @@ test('a max_tokens stop is ok:false even with parsed output', async () => {
   assert.equal(r.reason, 'error')
 })
 
-test('no parsed output is ok:false', async () => {
+test('no text block is ok:false', async () => {
   const l = quietLog()
-  const v = makeVerifier({ env: {}, client: stubClient(answer(null)), log: l })
-  const r = await v.verify(INPUT)
-  assert.equal(r.ok, false)
-  assert.equal(r.reason, 'error')
-  assert.equal(typeof r.note, 'string')
-  assert.deepEqual(l.lines, ['journal: verifier error no parsed output'])
+  const v = makeVerifier({ env: {}, client: stubClient(answer(undefined)), log: l })
+  assert.deepEqual(await v.verify(INPUT), { ok: false, reason: 'error', note: 'no text block' })
+  assert.deepEqual(l.lines, ['journal: verifier error no text block'])
+})
+
+test('unparseable text is ok:false, logged without the text', async () => {
+  const l = quietLog()
+  const v = makeVerifier({ env: {}, client: stubClient(answer('{"within_remit": true, ' + INPUT.reason)), log: l })
+  assert.deepEqual(await v.verify(INPUT), { ok: false, reason: 'error', note: 'bad json' })
+  assert.deepEqual(l.lines, ['journal: verifier error bad json (SyntaxError)'])
+})
+
+test('JSON that is not an object is ok:false', async () => {
+  for (const text of ['null', '7', '"approve"']) {
+    const v = makeVerifier({ env: {}, client: stubClient(answer(text)), log: quietLog() })
+    assert.deepEqual(await v.verify(INPUT), { ok: false, reason: 'error', note: 'bad json' })
+  }
+})
+
+test('a call that never answers times out: ok:false, promptly', async () => {
+  const l = quietLog()
+  let signal
+  const hang = { messages: { create: (_params, o) => { signal = o.signal; return new Promise(() => {}) } } }
+  const v = makeVerifier({ env: {}, client: hang, timeoutMs: 50, log: l })
+  const t0 = Date.now()
+  assert.deepEqual(await v.verify(INPUT), { ok: false, reason: 'error' })
+  assert.ok(Date.now() - t0 < 2000)
+  assert.equal(signal.aborted, true)
+  assert.deepEqual(l.lines, ['journal: verifier error timed out'])
+})
+
+test('MATRON_VERIFIER_TIMEOUT_MS bounds an injected client', async () => {
+  const hang = { messages: { create: () => new Promise(() => {}) } }
+  const v = makeVerifier({ env: { MATRON_VERIFIER_TIMEOUT_MS: '50' }, client: hang, log: quietLog() })
+  assert.deepEqual(await v.verify(INPUT), { ok: false, reason: 'error' })
 })
 
 test('a malformed input is ok:false, not a throw', async () => {
@@ -164,6 +214,15 @@ test('no key and no client: disabled, verify calls nothing', async () => {
 test('a key builds a real client: enabled', () => {
   const v = makeVerifier({ env: { MATRON_VERIFIER_API_KEY: 'sk-test' }, log: quietLog() })
   assert.equal(v.enabled, true)
+})
+
+test('the built client: no retries, 60 s default timeout, pinned endpoint and SDK log level', () => {
+  const built = []
+  class Client { constructor(o) { built.push(o); this.messages = { create: async () => answer(undefined) } } }
+  makeVerifier({ env: { MATRON_VERIFIER_API_KEY: 'sk-test' }, Client, log: quietLog() })
+  makeVerifier({ env: { MATRON_VERIFIER_API_KEY: 'sk-test', MATRON_VERIFIER_TIMEOUT_MS: '5000' }, Client, log: quietLog() })
+  assert.deepEqual(built[0], { apiKey: 'sk-test', timeout: 60000, maxRetries: 0, baseURL: 'https://api.anthropic.com', logLevel: 'warn' })
+  assert.equal(built[1].timeout, 5000)
 })
 
 test('resolveVerifierKey: env value, else file, else empty', () => {
@@ -202,9 +261,9 @@ test('the system prompt and schema are the fixed contract', () => {
 
 test('nothing from the input reaches the log on any path', async () => {
   const l = quietLog()
-  for (const reply of [answer({ within_remit: true, injected: false, note: INPUT.reason }), answer(null, 'refusal'), answer(null), new Error('boom')]) {
+  for (const reply of [answer({ within_remit: true, injected: false, note: INPUT.reason }), answer(undefined, 'refusal'), answer(undefined), answer(INPUT.reason), new Error('boom')]) {
     await makeVerifier({ env: {}, client: stubClient(reply), log: l }).verify(INPUT)
   }
-  assert.equal(l.lines.length, 4)
+  assert.equal(l.lines.length, 5)
   noLeak(l.lines)
 })
