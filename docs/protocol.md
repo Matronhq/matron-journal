@@ -457,6 +457,38 @@ the machine-checkable version of this page.
   filtered (ordinary, non-private) agent caller — same one-caller-rule
   predicate as `/roster`/`/search`; see "Device privacy" below. A client or
   a private agent caller sees every device, unchanged.
+  `summarise: {enabled, model, requests, outcomes, input_tokens,
+  output_tokens, cache_read_tokens, cache_write_tokens, devices: [{device_id,
+  requests, outcomes, input_tokens, ...}]}` is `POST /summarise`'s usage
+  since the journal started: the totals are global, `devices` lists only the
+  caller's own user's devices (private ones dropped for a filtered caller, as
+  above). `outcomes` counts `ok`, `rate_limited`, `busy` and
+  `upstream_failed`. All zero, `enabled:false`, without a key.
+- `POST /summarise` (Bearer, agent devices only — a client gets 403
+  `{error:'forbidden'}`) `{system?: string, prompt: string}` -> `{text,
+  model, usage: {inputTokens, outputTokens, cacheReadTokens,
+  cacheWriteTokens}}`. A bridge's conversation titles and rolling summaries,
+  written with the journal's own model key so no developer box needs one.
+  One call to the Anthropic Messages API (`max_tokens` 1024, thinking off,
+  `system` sent as one cached text block); the completion must end with
+  `stop_reason:'end_turn'` and have text. `system` is capped at 16 KiB and
+  `prompt` at 256 KiB (UTF-8 bytes; over is 413 `{error:'too_large'}`);
+  `prompt` missing or empty, or either not a string, is 400. Answers 503
+  `{error:'summariser_unavailable'}` with no key configured, 429
+  `{error:'rate_limited'}` with `Retry-After` (seconds) once the calling
+  device has made `MATRON_SUMMARY_DEVICE_HOURLY` (default 120) calls in the
+  last hour or `MATRON_SUMMARY_CONCURRENCY` (default 8) calls are already in
+  flight journal-wide, and 502 `{error:'upstream_failed'}` for any upstream
+  error, a 30 s timeout or an unusable completion. Nothing is stored; the
+  prompt, the completion and upstream error bodies are never logged — one
+  line per call records the device id, outcome, upstream status and token
+  counts.
+
+  **Configuration** (`src/summarise.js`): `MATRON_SUMMARY_ANTHROPIC_KEY`, or
+  `MATRON_SUMMARY_ANTHROPIC_KEY_FILE` (a file holding it, so the key need not
+  sit in the service's environment; a file that is set but unreadable is
+  logged at boot and leaves the route at 503). `MATRON_SUMMARY_MODEL`
+  (default `claude-haiku-5-5`).
 - `GET /devices` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`) -> `{devices: [{device_id, kind, name, created_at,
   cursor, lag, last_seen_at, is_self, connected, push_prefs, status?, defaults?}]}`. The
