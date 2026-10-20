@@ -105,7 +105,7 @@ test('approve a spawn: the start RPC reaches the target, the outcome and its dur
   assert.equal(durable.payload.decided_by, 'coordinator'); assert.equal(durable.payload.reason, 'follows the box rules')
   const decision = await f.client.waitFor((x) => x.kind === 'journal' && x.type === 'consent_decision')
   assert.equal(decision.convo_id, 'ask')
-  assert.deepEqual(decision.payload, { kind: 'spawn', request_id: spawnId, decision: 'approve', by: 'coordinator', convo_id: 'coord', reason: 'follows the box rules' })
+  assert.deepEqual(decision.payload, { kind: 'spawn', request_id: spawnId, decision: 'approve', by: 'coordinator', convo_id: 'coord', reason: 'follows the box rules', cause: null })
   await settle()
   assert.equal(f.asker.frames.find((x) => x.kind === 'journal' && x.type === 'consent_decision'), undefined)
   const row = getSpawn(f.s.db, spawnId)

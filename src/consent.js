@@ -15,6 +15,9 @@ import { parseCauses } from './ask-causes.js'
 export const CONSENT_REASON_MAX = 200
 export const CONSENT_DAILY_CAP_DEFAULT = 20
 export const CONSENT_DAILY_WINDOW_MS = 24 * 60 * 60 * 1000
+// Routine-born approvals of the Coordinator's own asks per rolling 24 h
+// (MATRON_COORDINATOR_ROUTINE_CAP; 0 = no cap), on top of the daily cap.
+export const CONSENT_ROUTINE_CAP_DEFAULT = 10
 export const CONSENT_KINDS = new Set(['chat', 'spawn'])
 export const CONSENT_DECISIONS = new Set(['approve', 'decline'])
 export const CONSENT_DECISION_EVENT_TYPE = 'consent_decision'
@@ -161,14 +164,29 @@ export function listPendingAsks({ db, hub, waker }, userId) {
 }
 
 // One row per Coordinator decision: the audit record and the daily cap's
-// counter. Never written for a user's own tap.
-export function recordConsentDecision(db, { userId, kind, askId, decision, convoId, reason, now = Date.now() }) {
-  db.prepare('INSERT INTO consent_decisions(user_id, kind, ask_id, decision, convo_id, reason, created_at) VALUES(?,?,?,?,?,?,?)')
-    .run(userId, kind, askId, decision, convoId, reason, now)
+// counter. Never written for a user's own tap. causeKind / causeRef /
+// verifierNote are set only when the Coordinator approved an ask it made
+// itself: the root the journal resolved it to ('user' | 'item' |
+// 'routine', and its ref) and, for a routine root, the verifier's note.
+export function recordConsentDecision(db, { userId, kind, askId, decision, convoId, reason, causeKind = null, causeRef = null, verifierNote = null, now = Date.now() }) {
+  db.prepare('INSERT INTO consent_decisions(user_id, kind, ask_id, decision, convo_id, reason, cause_kind, cause_ref, verifier_note, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)')
+    .run(userId, kind, askId, decision, convoId, reason, causeKind, causeRef, verifierNote, now)
 }
 
 export function coordinatorApprovalsSince(db, userId, since) {
   return db.prepare("SELECT COUNT(*) c FROM consent_decisions WHERE user_id=? AND decision='approve' AND created_at>?").get(userId, since).c
+}
+
+// The routine cap's counter: approvals of the Coordinator's own asks that
+// rested on a routine fire.
+export function coordinatorRoutineApprovalsSince(db, userId, since) {
+  return db.prepare("SELECT COUNT(*) c FROM consent_decisions WHERE user_id=? AND decision='approve' AND cause_kind='routine' AND created_at>?").get(userId, since).c
+}
+
+// The envelope's spawns_per_fire counter: approved asks of `kind` born of
+// one routine fire, by its canonical root ref (routine:<name>@<fired_at>).
+export function approvalsForFire(db, userId, fireRef, kind = 'spawn') {
+  return db.prepare("SELECT COUNT(*) c FROM consent_decisions WHERE user_id=? AND decision='approve' AND cause_kind='routine' AND cause_ref=? AND kind=?").get(userId, fireRef, kind).c
 }
 
 // The Coordinator's own box, or null when none is set / its conversation
