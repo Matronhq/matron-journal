@@ -237,32 +237,31 @@ test('spawn_request rejects a non-string or oversized effort', async (t) => {
   }
 })
 
-test('spawn_request stores the causes it carries on the row; the client card never carries them', async (t) => {
+test('spawn_request stores the causes it carries on the row, NULL for none or null; the client card never carries them', async (t) => {
   const { s, targetDev, parent, client } = await spawnFleet(t)
   const causes = [{ kind: 'user_message', ref: 'parent-convo:12', at: 1700000000000 }, { kind: 'item_tap', ref: 'it_1\nforged' }]
   parent.send({
     op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo',
     target_device_id: targetDev.deviceId, workdir: '/w', task: 'do work', causes,
   })
-  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
+  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending' && f.request_id === 'q1')
   assert.deepEqual(JSON.parse(getSpawn(s.db, ack.spawn_id).causes), [
     { kind: 'user_message', ref: 'parent-convo:12', at: 1700000000000 },
     { kind: 'item_tap', ref: 'it_1 forged' },
   ])
   const card = await client.waitFor(isSpawnCard)
   assert.ok(!('causes' in card.payload), 'causes are for the Coordinator, not the client card')
-})
-
-test('spawn_request without causes stores NULL', async (t) => {
-  const { s, targetDev, parent } = await spawnFleet(t)
-  parent.send({ op: 'spawn_request', request_id: 'q1', from_convo_id: 'parent-convo', target_device_id: targetDev.deviceId, workdir: '/w', task: 'do work' })
-  const ack = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending')
-  assert.equal(getSpawn(s.db, ack.spawn_id).causes, null)
+  // Absent and an explicit null both mean "no causes": the ask parks, NULL.
+  for (const [rid, extra] of [['q2', {}], ['q3', { causes: null }]]) {
+    parent.send({ op: 'spawn_request', request_id: rid, from_convo_id: 'parent-convo', target_device_id: targetDev.deviceId, workdir: '/w', task: 'do work', ...extra })
+    const a = await parent.waitFor((f) => f.kind === 'spawn' && f.event === 'pending' && f.request_id === rid)
+    assert.equal(getSpawn(s.db, a.spawn_id).causes, null, rid)
+  }
 })
 
 test('spawn_request rejects causes that are present but unusable, before any row exists', async (t) => {
   const { s, targetDev, parent } = await spawnFleet(t)
-  const bad = [[], 'user_message', [{ kind: 'telepathy' }], [{ kind: 'alert', ref: 'r'.repeat(201) }], Array.from({ length: 9 }, () => ({ kind: 'alert' })), null]
+  const bad = [[], 'user_message', [{ kind: 'telepathy' }], [{ kind: 'alert', ref: 'r'.repeat(201) }], Array.from({ length: 9 }, () => ({ kind: 'alert' }))]
   for (const [i, causes] of bad.entries()) {
     parent.frames.length = 0
     parent.send({ op: 'spawn_request', request_id: `q${i}`, from_convo_id: 'parent-convo', target_device_id: targetDev.deviceId, workdir: '/w', task: 'x', causes })

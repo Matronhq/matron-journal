@@ -65,6 +65,13 @@ test('agent_invite and agent_join refuse present-but-unusable causes; nothing pa
   assert.equal(f.s.db.prepare("SELECT COUNT(*) n FROM convo_agents WHERE state='awaiting_user'").get().n, 0)
 })
 
+test('agent_invite with causes: null parks the ask with NULL causes', async (t) => {
+  const f = await fleet(t)
+  await parkInviteAsk(f, { causes: null })
+  assert.equal(f.s.db.prepare("SELECT causes FROM convo_agents WHERE convo_id='room' AND agent_device_id=?").get(f.targetDev.deviceId).causes, null)
+  assert.ok(!('causes' in (await pending(f, f.coordDev.token)).json.pending[0]))
+})
+
 test('agent_join stores the causes it carries on the parked row', async (t) => {
   const f = await fleet(t)
   const causes = [{ kind: 'handoff', ref: 'h1' }]

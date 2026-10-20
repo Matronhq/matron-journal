@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { normalizeCauses, parseCauses, CAUSE_KINDS, CAUSES_MAX, CAUSE_REF_MAX } from '../src/ask-causes.js'
+import { normalizeCauses, parseCauses, causesFromFrame, CAUSE_KINDS, CAUSES_MAX, CAUSE_REF_MAX } from '../src/ask-causes.js'
 
 test('normalizeCauses keeps a well-formed list as given', () => {
   assert.deepEqual(normalizeCauses([{ kind: 'user_message', ref: 'c1:12', at: 1 }]), [{ kind: 'user_message', ref: 'c1:12', at: 1 }])
@@ -44,6 +44,17 @@ test('normalizeCauses: a non-integer at is dropped, the entry kept', () => {
   assert.deepEqual(normalizeCauses([{ kind: 'reminder', ref: 'r1', at: 1.5 }]), [{ kind: 'reminder', ref: 'r1' }])
   assert.deepEqual(normalizeCauses([{ kind: 'reminder', at: '123' }]), [{ kind: 'reminder' }])
   assert.deepEqual(normalizeCauses([{ kind: 'reminder', at: 0 }]), [{ kind: 'reminder', at: 0 }])
+  assert.deepEqual(normalizeCauses([{ kind: 'reminder', at: -1 }]), [{ kind: 'reminder' }])
+  assert.deepEqual(normalizeCauses([{ kind: 'reminder', at: 2 ** 60 }]), [{ kind: 'reminder' }])
+})
+
+test('causesFromFrame: absent or null is no causes; anything else must normalise', () => {
+  assert.deepEqual(causesFromFrame({}), { ok: true, causes: null })
+  assert.deepEqual(causesFromFrame({ causes: null }), { ok: true, causes: null })
+  assert.deepEqual(causesFromFrame({ causes: [{ kind: 'alert', ref: 'a' }] }), { ok: true, causes: [{ kind: 'alert', ref: 'a' }] })
+  for (const causes of [[], 'alert', 0, false, [{ kind: 'telepathy' }]]) {
+    assert.deepEqual(causesFromFrame({ causes }), { ok: false }, JSON.stringify(causes))
+  }
 })
 
 test('parseCauses reads the stored JSON back, null for NULL or junk', () => {

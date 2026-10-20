@@ -21,7 +21,7 @@ import { parkTalk } from './talk-requests.js'
 import { ownerTalkAsk, sweepTalkAsks } from './talk-requests-events.js'
 import { onPersonRoomOutcome, onGuestAck, onGuestAnswered, onGuestExpired, endAndNotify, copyRoomMessage, onShareAnswered } from './person-rooms-events.js'
 import { predictSpawnRun } from './spawn-model.js'
-import { normalizeCauses } from './ask-causes.js'
+import { causesFromFrame } from './ask-causes.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableDevice } from './wake.js'
 import { listPins, isSuccessorOfAPin, pinHintBeforeAppend, sendPinsFrame } from './pins.js'
 import { archiveChanges, sendArchiveFrame } from './archive.js'
@@ -1090,11 +1090,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const link = msg.link === true
         // Optional causes of the asking turn (src/ask-causes.js), stored on
         // the row for GET /consent/pending and never put on the client card.
-        // Absent is a bridge that predates the field and stores NULL; present
-        // but unusable (null included) is a bad ask, refused before the wake
-        // below so it never starts a box.
-        const causes = msg.causes === undefined ? null : normalizeCauses(msg.causes)
-        if (msg.causes !== undefined && !causes) return fail('bad_request', 'bad causes')
+        // Absent or null stores NULL; any other value that does not
+        // normalise is a bad ask, refused before the wake below so it never
+        // starts a box.
+        const frameCauses = causesFromFrame(msg)
+        if (!frameCauses.ok) return fail('bad_request', 'bad causes')
+        const causes = frameCauses.causes
         if (!Number.isInteger(msg.target_device_id)) return fail('bad_request', 'bad target_device_id')
         // Spawning on the caller's own box is allowed: the start rpc lands on
         // the same bridge, which already runs several sessions side by side
@@ -1396,8 +1397,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // The asking turn's causes, same rules as spawn_request's. Checked
         // ahead of both paths so the op has one shape; only the same-user
         // park below stores them.
-        const causes = msg.causes === undefined ? null : normalizeCauses(msg.causes)
-        if (msg.causes !== undefined && !causes) return fail('bad_request', 'bad causes')
+        const frameCauses = causesFromFrame(msg)
+        if (!frameCauses.ok) return fail('bad_request', 'bad causes')
+        const causes = frameCauses.causes
         // A talk request: aimed at a PERSON, who chooses where their side
         // talks when they accept (talk-requests.js). Exactly one of
         // target_person and target_device_id. Every refusal that would say
@@ -1587,8 +1589,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (err) return fail(...err)
         if (typeof msg.justification !== 'string' || !msg.justification || msg.justification.length > INVITE_TEXT_MAX_CHARS) return fail('bad_request', 'bad justification')
         // The asking turn's causes, same rules as spawn_request's.
-        const causes = msg.causes === undefined ? null : normalizeCauses(msg.causes)
-        if (msg.causes !== undefined && !causes) return fail('bad_request', 'bad causes')
+        const frameCauses = causesFromFrame(msg)
+        if (!frameCauses.ok) return fail('bad_request', 'bad causes')
+        const causes = frameCauses.causes
         if (room.agent_device_id == null) return fail('conflict', 'room has no recorded owner to ask')
         if (room.agent_device_id === conn.deviceId) return fail('bad_request', 'cannot join own room')
         if (personLinked(msg.room_id)) return fail('conflict', 'a room with another person holds just the two agents')

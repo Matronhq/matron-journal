@@ -522,14 +522,19 @@ test('openDb adds agent_spawn_requests.link defaulting to 1 for pre-existing row
 
 // Bridge-stamped causes (src/ask-causes.js) and the consent-decision and
 // routine columns that resolve them later: additive, NULL on every older row.
-test('schema: causes columns on both ask tables, cause columns on consent_decisions, envelope on routines', () => {
-  const db = openDb(':memory:')
+test('schema: causes columns on both ask tables, cause columns on consent_decisions, envelope on routines', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-ask-causes-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const dbPath = path.join(dir, 'causes.db')
+  const db = openDb(dbPath)
   const cols = (t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name)
   assert.ok(cols('agent_spawn_requests').includes('causes'))
   assert.ok(cols('convo_agents').includes('causes'))
   for (const c of ['cause_kind', 'cause_ref', 'verifier_note']) assert.ok(cols('consent_decisions').includes(c), c)
   assert.ok(cols('routines').includes('envelope'))
   db.close()
+  // The migration runs again on every open; it must find the columns and stop.
+  assert.doesNotThrow(() => openDb(dbPath).close())
 })
 
 // device_status rides the device row: a revoked box takes its last report

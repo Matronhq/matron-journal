@@ -25,8 +25,8 @@ const KINDS = new Set(CAUSE_KINDS)
 // array, an empty one, more than CAUSES_MAX entries, an entry that is not
 // an object of a known kind, a ref that is not a string or is over
 // CAUSE_REF_MAX. Never an empty array — "no causes" is null everywhere, so
-// a caller tests one value. A caller that must tell an absent field from a
-// bad one (the ws boundary) checks for undefined before calling.
+// a caller tests one value. It cannot tell an absent field from a bad one;
+// the ws boundary uses causesFromFrame below for that.
 export function normalizeCauses(raw) {
   if (!Array.isArray(raw) || raw.length === 0 || raw.length > CAUSES_MAX) return null
   const out = []
@@ -39,10 +39,20 @@ export function normalizeCauses(raw) {
       const ref = sanitizePeerText(entry.ref, CAUSE_REF_MAX)
       if (ref) cause.ref = ref
     }
-    if (Number.isInteger(entry.at)) cause.at = entry.at
+    if (Number.isSafeInteger(entry.at) && entry.at >= 0) cause.at = entry.at
     out.push(cause)
   }
   return out
+}
+
+// The causes on a spawn_request / agent_invite / agent_join frame. Absent
+// or null is a frame with no causes — a bridge that predates the field, or
+// one with nothing to say — and stores NULL. Any other value is a claim
+// about the turn, so it must normalise or the ask is refused: { ok: false }.
+export function causesFromFrame(msg) {
+  if (msg.causes == null) return { ok: true, causes: null }
+  const causes = normalizeCauses(msg.causes)
+  return causes ? { ok: true, causes } : { ok: false }
 }
 
 // The stored column back as a list, or null for NULL. Re-normalised rather
