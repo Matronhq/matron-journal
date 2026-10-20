@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { setCoordinatorConvoId } from '../src/coordinator.js'
-import { upsertConversation } from '../src/journal.js'
+import { upsertConversation, append } from '../src/journal.js'
 import { listRoutines, getRoutine, STARTER_ROUTINES, ROUTINES_MAX } from '../src/routines.js'
 import { ROUTINE_FROM_NAME, ROUTINE_MAX_INFLIGHT } from '../src/routines-sweep.js'
 
@@ -34,6 +34,12 @@ async function fleet(t, { coordinator = true, connect = true, waker = null, seed
   }
   void seedAtBoot
   return { s, alice, coordDev, jade, client: login.json.token, coord }
+}
+// The user's own words in a conversation, cited as a turn cause the way the
+// bridge stamps one: [{kind:'user_message', ref:'<convo>:<seq>'}].
+const userSaid = (s, userId, convoId = 'coord', sender = 'user:alice') => {
+  const { seq } = append(s.db, { userId, convoId, sender, type: 'text', payload: { body: 'yes, set that routine up' } })
+  return [{ kind: 'user_message', ref: `${convoId}:${seq}` }]
 }
 const markers = (s) => s.db.prepare("SELECT convo_id, sender, payload FROM events WHERE type='routine' ORDER BY seq").all().map((r) => ({ ...r, payload: JSON.parse(r.payload) }))
 const settle = async (s) => { const t0 = Date.now(); while (s.broker.pendingCount() > 0 && Date.now() - t0 < 2000) await new Promise((r) => setTimeout(r, 10)) }
@@ -66,14 +72,14 @@ test('GET /routines: any device kind reads the user\'s list; agents of another u
 })
 
 test('POST / PATCH / DELETE: the client may; an agent only as the Coordinator naming its own conversation', async (t) => {
-  const { s, client, jade, coordDev } = await fleet(t, { connect: false })
+  const { s, alice, client, jade, coordDev } = await fleet(t, { connect: false })
   // Agent without convo_id, or naming a conversation it does not own, or the wrong one.
   assert.deepEqual(await s.http('/routines', { method: 'POST', token: coordDev.token, body: body() }), { status: 403, json: { error: 'forbidden', detail: 'not_coordinator' } })
   assert.equal((await s.http('/routines', { method: 'POST', token: jade.token, body: body({ convo_id: 'coord' }) })).status, 404)
   assert.deepEqual(await s.http('/routines', { method: 'POST', token: jade.token, body: body({ convo_id: 'g1' }) }), { status: 403, json: { error: 'forbidden', detail: 'not_coordinator' } })
   assert.equal((await s.http('/routines', { method: 'POST', token: coordDev.token, body: body({ convo_id: '' }) })).status, 400)
   // The Coordinator creates; origin 'agent'.
-  const c = await s.http('/routines', { method: 'POST', token: coordDev.token, body: body({ convo_id: 'coord' }) })
+  const c = await s.http('/routines', { method: 'POST', token: coordDev.token, body: body({ convo_id: 'coord', causes: userSaid(s, alice.id) }) })
   assert.equal(c.status, 201); assert.equal(c.json.routine.origin, 'agent'); assert.equal(c.json.routine.tz, 'Europe/London')
   // Name taken → 409; bad fields → 400.
   assert.deepEqual(await s.http('/routines', { method: 'POST', token: client, body: body() }), { status: 409, json: { error: 'conflict', blocked_by: 'name' } })
@@ -112,6 +118,31 @@ test('POST / PATCH / DELETE: the client may; an agent only as the Coordinator na
   assert.deepEqual(await s.http('/routines', { method: 'POST', token: client, body: body({ name: 'one-more' }) }), { status: 409, json: { error: 'conflict', blocked_by: 'cap' } })
 })
 
+test('envelope: stored and returned on create, changed and cleared by PATCH, bad shapes refused, absent reads null', async (t) => {
+  const { s, alice, client, coordDev } = await fleet(t, { connect: false })
+  const env = { spawns_per_fire: 2, chats: true, boxes: ['box-a'] }
+  const c = await s.http('/routines', { method: 'POST', token: client, body: body({ envelope: env }) })
+  assert.equal(c.status, 201); assert.deepEqual(c.json.routine.envelope, env)
+  assert.deepEqual((await s.http('/routines/daily-sweep', { token: client })).json.routine.envelope, env)
+  const plain = await s.http('/routines', { method: 'POST', token: client, body: body({ name: 'plain' }) })
+  assert.equal(plain.json.routine.envelope, null)
+  assert.equal((await s.http('/routines', { token: client })).json.routines.find((r) => r.name === 'plain').envelope, null)
+  // PATCH changes it (the Coordinator too, on the user's ask), then null clears it.
+  const p = await s.http('/routines/daily-sweep', { method: 'PATCH', token: coordDev.token, body: { envelope: { spawns_per_fire: 1, chats: false, boxes: null }, convo_id: 'coord', causes: userSaid(s, alice.id) } })
+  assert.equal(p.status, 200); assert.deepEqual(p.json.routine.envelope, { spawns_per_fire: 1, chats: false, boxes: null })
+  const cleared = await s.http('/routines/daily-sweep', { method: 'PATCH', token: client, body: { envelope: null } })
+  assert.equal(cleared.status, 200); assert.equal(cleared.json.routine.envelope, null)
+  assert.equal(getRoutine(s.db, alice.id, 'daily-sweep').envelope, null)
+  // Bad shapes: 400 on create (no row) and on PATCH (envelope unchanged).
+  await s.http('/routines/daily-sweep', { method: 'PATCH', token: client, body: { envelope: env } })
+  for (const envelope of [{ spawns_per_fire: 51 }, { spawns_per_fire: 1, boxes: [] }, { spawns_per_fire: 1, boxes: 'x' }, { spawns_per_fire: 1, chats: 'yes' }]) {
+    assert.equal((await s.http('/routines', { method: 'POST', token: client, body: body({ name: 'bad-one', envelope }) })).status, 400, JSON.stringify(envelope))
+    assert.equal((await s.http('/routines/daily-sweep', { method: 'PATCH', token: client, body: { envelope } })).status, 400, JSON.stringify(envelope))
+  }
+  assert.equal(getRoutine(s.db, alice.id, 'bad-one'), null)
+  assert.deepEqual(getRoutine(s.db, alice.id, 'daily-sweep').envelope, env)
+})
+
 test('no Coordinator set: writes still work for the client, no marker is appended', async (t) => {
   const { s, client } = await fleet(t, { connect: false, coordinator: false })
   assert.equal((await s.http('/routines', { method: 'POST', token: client, body: body() })).status, 201)
@@ -124,7 +155,7 @@ test('POST /routines/:key/run: fires now as session_control {action: routine}; o
   const id = c.json.routine.id
   assert.equal((await s.http('/routines/daily-sweep/run', { method: 'POST', token: jade.token, body: { convo_id: 'g1' } })).status, 403)
   assert.equal((await s.http('/routines/nope/run', { method: 'POST', token: client })).status, 404)
-  const r = await s.http('/routines/daily-sweep/run', { method: 'POST', token: coordDev.token, body: { convo_id: 'coord' } })
+  const r = await s.http('/routines/daily-sweep/run', { method: 'POST', token: coordDev.token, body: { convo_id: 'coord', causes: userSaid(s, alice.id) } })
   assert.deepEqual(r, { status: 202, json: { accepted: true } })
   const req = await answerRpc(coord)
   assert.equal(req.from_device_id, 0)

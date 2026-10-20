@@ -225,9 +225,11 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   → \`{routine}\` with \`enabled\`, \`next_at\`, \`last_fired_at\`,
   \`last_outcome\`.
 - \`POST /routines\` \`{name, title, schedule | trigger, prompt (≤2000),
-  tz? (default Europe/London), enabled?, convo_id}\` → 201 \`{routine}\`;
+  tz? (default Europe/London), enabled?, envelope?, convo_id}\` → 201 \`{routine}\`;
   \`PATCH /routines/:name\` \`{title?, schedule?, trigger?, tz?, prompt?,
-  enabled?, convo_id}\` → 200 (a routine stays scheduled or triggered).
+  enabled?, envelope? (null clears), convo_id}\` → 200 (a routine stays
+  scheduled or triggered). \`envelope\` \`{spawns_per_fire (0-50), chats,
+  boxes: [names] | null}\` bounds what an ask born of a fire may do.
   Agents: the Coordinator only, naming its own conversation as
   \`convo_id\` (403 \`not_coordinator\` otherwise). Fires at least 15
   minutes apart; 409 \`blocked_by: name|cap\`. \`DELETE\` is the user's

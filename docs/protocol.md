@@ -2344,14 +2344,23 @@ prompts use), `title` (one line ≤ 200), exactly one of `schedule` (five
 cron fields, evaluated by `croner` in `tz`) and `trigger` (below), `tz`
 (IANA, default `Europe/London`), `prompt` (≤ 2000 chars, line breaks
 kept, other control characters stripped), `enabled`, `origin`
-(`seed|user|agent`), `next_at` (ms; NULL while paused, always NULL for a
-triggered routine), `last_fired_at`, `last_outcome`, `created_at`,
-`updated_at`. A schedule whose consecutive fires (checked over the next
+(`seed|user|agent`), `envelope` (below; `null` = none), `next_at` (ms;
+NULL while paused, always NULL for a triggered routine), `last_fired_at`,
+`last_outcome`, `created_at`, `updated_at`. A schedule whose consecutive fires (checked over the next
 five from now) are under 15 minutes apart, or with fewer than five future
 fires, is `bad_request`: a routine is a check-in, not a poll. At most 50
 per user. A routine is scheduled or triggered for life: `PATCH` may give
 `schedule` only to a scheduled routine and `trigger` only to a triggered
 one, never both (`bad_request`).
+
+**Envelope.** `envelope` is `{spawns_per_fire, chats, boxes}` — the bounds
+on what an ask born of one of the routine's fires may do when the
+Coordinator approves it itself: `spawns_per_fire` 0–50 (absent: 0),
+`chats` a boolean (absent: false), `boxes` 1–32 device names (each ≤ 64
+chars, duplicates folded) a spawn may target, or `null` for any box
+(absent: null). Read back with all three keys. Optional on create (absent
+= `null`, which allows nothing); on `PATCH`, `envelope: null` clears it and
+an absent `envelope` leaves it alone. Any other shape is `bad_request`.
 
 **Triggers.** `trigger` is `{kind:'context_over', pct}` (1–99: a live
 session, never the Coordinator's own, a helper conversation inside a
@@ -2382,8 +2391,8 @@ whatever matches now, records untouched.
 |---|---|---|---|
 | `GET /routines` | any | | 200 `{routines}` by name |
 | `GET /routines/:key` | any | | 200 `{routine}`; `:key` is the id or the name |
-| `POST /routines` | client, or the Coordinator | `{name, title, schedule \| trigger, prompt, tz?, enabled?, convo_id?}` | 201 `{routine}`; **409** `{error:'conflict', blocked_by:'name'|'cap'}` |
-| `PATCH /routines/:key` | client, or the Coordinator | `{title?, schedule?, trigger?, tz?, prompt?, enabled?, convo_id?}` — at least one; `name` is not editable | 200 `{routine}` |
+| `POST /routines` | client, or the Coordinator | `{name, title, schedule \| trigger, prompt, tz?, enabled?, envelope?, convo_id?}` | 201 `{routine}`; **409** `{error:'conflict', blocked_by:'name'|'cap'}` |
+| `PATCH /routines/:key` | client, or the Coordinator | `{title?, schedule?, trigger?, tz?, prompt?, enabled?, envelope? (null clears), convo_id?}` — at least one; `name` is not editable | 200 `{routine}` |
 | `DELETE /routines/:key` | client, or the Coordinator | `{convo_id?}` | 200 `{ok:true}` |
 | `POST /routines/:key/run` | client, or the Coordinator | `{convo_id?}` | 202 `{accepted:true}`, or `{delivered:false, reason:'no_coordinator'\|'busy'}` |
 
