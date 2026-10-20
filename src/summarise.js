@@ -54,18 +54,28 @@ const positiveInt = (raw, fallback) => {
 // makeRateLimiter it says when the oldest hit ages out, for Retry-After.
 export function makeWindowLimiter({ max, windowMs = HOUR_MS, now = Date.now }) {
   const hits = new Map()
+  const live = (key, t) => {
+    if (hits.size > 10000) {
+      for (const [k, list] of hits) if (!list.length || t - list[list.length - 1] >= windowMs) hits.delete(k)
+    }
+    const list = (hits.get(key) || []).filter((h) => t - h < windowMs)
+    hits.set(key, list)
+    return list
+  }
+  const verdict = (list, t) => (list.length >= max ? { ok: false, retryAfterMs: list[0] + windowMs - t } : { ok: true })
   return {
-    // {ok:true}, or {ok:false, retryAfterMs} without recording a hit.
+    // {ok:true}, or {ok:false, retryAfterMs}; never records a hit.
+    check(key) {
+      const t = now()
+      return verdict(live(key, t), t)
+    },
+    // As check, and records a hit when ok.
     take(key) {
       const t = now()
-      if (hits.size > 10000) {
-        for (const [k, list] of hits) if (!list.length || t - list[list.length - 1] >= windowMs) hits.delete(k)
-      }
-      const list = (hits.get(key) || []).filter((h) => t - h < windowMs)
-      hits.set(key, list)
-      if (list.length >= max) return { ok: false, retryAfterMs: list[0] + windowMs - t }
-      list.push(t)
-      return { ok: true }
+      const list = live(key, t)
+      const v = verdict(list, t)
+      if (v.ok) list.push(t)
+      return v
     },
   }
 }
@@ -100,7 +110,9 @@ export function makeSummariser({
   let inFlight = 0
   // Usage for GET /metrics: totals, and per device with its user so the
   // route can show a user only their own devices. In memory: a restart
-  // starts from zero, the per-request log line is the durable record.
+  // starts from zero. The durable record is the log: one line for each call
+  // that goes upstream and each MATRON_SUMMARY_USERS refusal; `rate_limited`
+  // and `busy` refusals are counted here only.
   const totals = blankStats()
   const byDevice = new Map()
 
@@ -176,17 +188,26 @@ export function makeSummariser({
     // | {status:'busy', retryAfter} | {status:'upstream_failed'}.
     // `who` is the authenticated device; only its id and user are used.
     async summarise(who, { system, prompt }) {
-      const gate = limiter.take(who.deviceId)
-      if (!gate.ok) {
+      const rateLimited = (gate) => {
         record(who, 'rate_limited')
         return { status: 'rate_limited', retryAfter: Math.max(1, Math.ceil(gate.retryAfterMs / 1000)) }
       }
+      // Budget first without spending it, so an over-budget device is told
+      // the real wait rather than the busy one.
+      const gate = limiter.check(who.deviceId)
+      if (!gate.ok) return rateLimited(gate)
       // A burst from many devices at once is refused rather than queued,
-      // so upstream calls never pile up behind the cap.
+      // so upstream calls never pile up behind the cap. A call refused here
+      // does not spend the device's hourly budget.
       if (inFlight >= concurrency) {
         record(who, 'busy')
         return { status: 'busy', retryAfter: 2 }
       }
+      // Holding a slot, the call is charged — whatever upstream then does,
+      // failures included, so a broken upstream cannot be hammered. Nothing
+      // awaits between check and take, so this cannot disagree with it.
+      const taken = limiter.take(who.deviceId)
+      if (!taken.ok) return rateLimited(taken)
       inFlight += 1
       const t0 = now()
       try {

@@ -219,6 +219,39 @@ test('global concurrency cap: a call past it is 429 with Retry-After, not queued
   assert.equal(f.seen.length, 1)
 })
 
+test('a busy refusal does not spend the hourly budget; a call that gets a slot does, upstream failure included', async (t) => {
+  let release
+  let gate = new Promise((r) => { release = r })
+  let fail = false
+  const f = await fleet(t, {
+    make: { concurrency: 1, deviceHourly: 2 },
+    reply: async () => { await gate; return fail ? { status: 500, body: { error: UPSTREAM_SECRET } } : { body: completion() } },
+  })
+  // box-b holds the only slot; box-a is refused busy many times over.
+  const holder = f.post(f.boxB.token, { prompt: 'p' })
+  while (f.seen.length < 1) await new Promise((r) => setTimeout(r, 5))
+  for (let i = 0; i < 5; i++) {
+    const r = await rawPost(f.s, f.boxA.token, { prompt: 'p' })
+    assert.equal(r.status, 429)
+    assert.equal(r.headers.get('retry-after'), '2', 'busy, not out of budget')
+  }
+  release()
+  assert.equal((await holder).status, 200)
+  gate = Promise.resolve()
+  // box-a still has both of its calls: one fails upstream, one succeeds…
+  fail = true
+  assert.equal((await f.post(f.boxA.token, { prompt: 'p' })).status, 502)
+  fail = false
+  assert.equal((await f.post(f.boxA.token, { prompt: 'p' })).status, 200)
+  // …and both were charged, the failure too.
+  const res = await rawPost(f.s, f.boxA.token, { prompt: 'p' })
+  assert.equal(res.status, 429)
+  assert.ok(Number(res.headers.get('retry-after')) > 2, 'out of budget: the hour-long wait')
+  const m = (await f.s.http('/metrics', { token: f.client })).json.summarise
+  const a = m.devices.find((d) => d.device_id === f.boxA.deviceId)
+  assert.deepEqual(a.outcomes, { busy: 5, upstream_failed: 1, ok: 1, rate_limited: 1 })
+})
+
 test('GET /metrics: per-device spend for the caller\'s own devices only; totals for everyone', async (t) => {
   const f = await fleet(t)
   await f.post(f.boxA.token, { prompt: 'p' })
@@ -250,6 +283,11 @@ test('makeWindowLimiter: rolling window, retryAfterMs until the oldest hit ages 
   assert.deepEqual(l.take(2), { ok: true })
   now = 1000
   assert.deepEqual(l.take(1), { ok: true })
+  // check never records.
+  const c = makeWindowLimiter({ max: 1, windowMs: 1000, now: () => now })
+  for (let i = 0; i < 3; i++) assert.deepEqual(c.check(7), { ok: true })
+  assert.deepEqual(c.take(7), { ok: true })
+  assert.deepEqual(c.check(7), { ok: false, retryAfterMs: 1000 })
 })
 
 test('key: env first, else the _FILE, trimmed; none is no summariser', (t) => {

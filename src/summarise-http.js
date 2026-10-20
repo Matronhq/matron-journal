@@ -21,9 +21,9 @@
 // Privacy: the prompt is the calling device's own conversation text, and
 // the completion goes back to that device and nowhere else. Nothing is
 // stored, journaled or broadcast, and neither the prompt nor any upstream
-// body is logged — so a private device's content is never shown to another
-// device by this route, and the private-device rules (src/privacy.js) have
-// nothing here to filter.
+// body is logged (src/summarise.js says which calls get a log line) — so a
+// private device's content is never shown to another device by this route,
+// and the private-device rules (src/privacy.js) have nothing here to filter.
 import { json, readBody } from './http-body.js'
 import { badRequest } from './http-who.js'
 

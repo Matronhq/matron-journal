@@ -480,10 +480,14 @@ the machine-checkable version of this page.
   device has made `MATRON_SUMMARY_DEVICE_HOURLY` (default 120) calls in the
   last hour or `MATRON_SUMMARY_CONCURRENCY` (default 8) calls are already in
   flight journal-wide, and 502 `{error:'upstream_failed'}` for any upstream
-  error, a 30 s timeout or an unusable completion. Nothing is stored; the
-  prompt, the completion and upstream error bodies are never logged — one
-  line per call records the device id, outcome, upstream status and token
-  counts.
+  error, a 30 s timeout or an unusable completion. Only a call that goes
+  upstream is charged to the device's hourly budget (failures included); a
+  `busy` refusal at the concurrency cap is not. Nothing is stored; the
+  prompt, the completion and upstream error bodies are never logged. One
+  line is logged for each call that goes upstream (device id, outcome,
+  upstream status on failure, token counts) and for each
+  `MATRON_SUMMARY_USERS` refusal; `rate_limited` and `busy` refusals are
+  counted in `GET /metrics` only.
 
   **Configuration** (`src/summarise.js`): `MATRON_SUMMARY_ANTHROPIC_KEY`, or
   `MATRON_SUMMARY_ANTHROPIC_KEY_FILE` (a file holding it, so the key need not
