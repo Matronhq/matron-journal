@@ -1397,6 +1397,30 @@ export function openDb(path) {
     if (!cols.some((c) => c.name === 'answered_by')) db.exec(`ALTER TABLE ${table} ADD COLUMN answered_by TEXT`)
     if (!cols.some((c) => c.name === 'answer_reason')) db.exec(`ALTER TABLE ${table} ADD COLUMN answer_reason TEXT`)
   }
+  // The causes the asking bridge stamped on a spawn or chat ask
+  // (src/ask-causes.js): a JSON array of {kind, ref?, at?}, NULL when the
+  // ask carried none — a bridge that predates the field, and every row
+  // predating the column. On convo_agents it describes the CURRENT ask:
+  // upsertRow rewrites it on every renewal like justification and topic.
+  for (const table of ['convo_agents', 'agent_spawn_requests']) {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all()
+    if (!cols.some((c) => c.name === 'causes')) db.exec(`ALTER TABLE ${table} ADD COLUMN causes TEXT`)
+  }
+  // When the Coordinator approves an ask it made itself, the root cause the
+  // journal resolved it to ('user' | 'item' | 'routine', and its ref) and
+  // what the verifier said about it. NULL on every other decision and on
+  // every decision made before the columns.
+  const decisionCols = db.prepare('PRAGMA table_info(consent_decisions)').all()
+  for (const c of ['cause_kind', 'cause_ref', 'verifier_note']) {
+    if (!decisionCols.some((d) => d.name === c)) db.exec(`ALTER TABLE consent_decisions ADD COLUMN ${c} TEXT`)
+  }
+  // A routine's envelope (JSON): the bounds on what an ask born of one of
+  // its fires may do — how many spawns per fire, whether chats, which boxes.
+  // NULL = no envelope, the value for every routine predating the column.
+  const routineCols = db.prepare('PRAGMA table_info(routines)').all()
+  if (!routineCols.some((c) => c.name === 'envelope')) {
+    db.exec('ALTER TABLE routines ADD COLUMN envelope TEXT')
+  }
   // Standing agent-chat consent ("always allow A -> B") is gone: every ask
   // parks for the user now. Dropped rather than left in place, because a
   // table of grants that nothing consults still reads like a live security

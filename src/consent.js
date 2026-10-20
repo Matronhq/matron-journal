@@ -10,6 +10,7 @@ import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { getCoordinatorConvoId } from './coordinator.js'
 import { isWakeableDevice } from './wake.js'
 import { predictSpawnRun } from './spawn-model.js'
+import { parseCauses } from './ask-causes.js'
 
 export const CONSENT_REASON_MAX = 200
 export const CONSENT_DAILY_CAP_DEFAULT = 20
@@ -86,6 +87,12 @@ export function isUserOnlyChat(db, userId, roomId, targetDeviceId) {
 }
 
 const name = (raw) => (raw == null ? '' : sanitizePeerText(raw, PEER_NAME_CAP))
+// The causes the asking bridge stamped on the ask (src/ask-causes.js), for
+// the Coordinator to weigh; omitted, never empty, when it stamped none.
+const causesField = (text) => {
+  const causes = parseCauses(text)
+  return causes ? { causes } : {}
+}
 
 // Every ask awaiting this user's decision, both tables, oldest first. The
 // shape is what the Coordinator's consent_list renders and what the nudge
@@ -94,7 +101,7 @@ const name = (raw) => (raw == null ? '' : sanitizePeerText(raw, PEER_NAME_CAP))
 // the pending endpoint does).
 export function listPendingAsks({ db, hub, waker }, userId) {
   const spawns = db.prepare(`
-    SELECT r.id, r.from_device_id, r.from_convo_id, r.target_device_id, r.workdir, r.task, r.topic, r.model, r.effort, r.agent, r.link, r.mission_num, r.created_at,
+    SELECT r.id, r.from_device_id, r.from_convo_id, r.target_device_id, r.workdir, r.task, r.topic, r.model, r.effort, r.agent, r.link, r.mission_num, r.causes, r.created_at,
            fd.name AS from_name, td.name AS target_name, fc.title AS from_convo_title, i.num AS item_num
     FROM agent_spawn_requests r
     LEFT JOIN devices fd ON fd.id = r.from_device_id
@@ -117,9 +124,10 @@ export function listPendingAsks({ db, hub, waker }, userId) {
     ...(r.mission_num ? { mission_num: r.mission_num } : {}),
     ...(r.item_num != null ? { item_num: r.item_num } : {}),
     ...(isUserOnlySpawn(db, userId, r) ? { user_only: true } : {}),
+    ...causesField(r.causes),
   }))
   const chats = db.prepare(`
-    SELECT ca.convo_id, ca.agent_device_id, ca.initiator_device_id, ca.initiator_convo_id, ca.target_convo_id, ca.justification, ca.topic, ca.created_at,
+    SELECT ca.convo_id, ca.agent_device_id, ca.initiator_device_id, ca.initiator_convo_id, ca.target_convo_id, ca.justification, ca.topic, ca.causes, ca.created_at,
            c.title AS room_title, c.agent_device_id AS room_owner_id,
            di.name AS initiator_name, dt.name AS agent_name, od.name AS owner_name,
            ic.title AS initiator_convo_title, tc.title AS target_convo_title, i.num AS item_num
@@ -146,6 +154,7 @@ export function listPendingAsks({ db, hub, waker }, userId) {
       topic: r.topic || '', justification: r.justification,
       ...(r.item_num != null ? { item_num: r.item_num } : {}),
       ...(isUserOnlyChat(db, userId, r.convo_id, r.agent_device_id) ? { user_only: true } : {}),
+      ...causesField(r.causes),
     }
   })
   return [...spawns, ...chats].sort((a, b) => a.created_at - b.created_at)

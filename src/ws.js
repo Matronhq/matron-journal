@@ -21,6 +21,7 @@ import { parkTalk } from './talk-requests.js'
 import { ownerTalkAsk, sweepTalkAsks } from './talk-requests-events.js'
 import { onPersonRoomOutcome, onGuestAck, onGuestAnswered, onGuestExpired, endAndNotify, copyRoomMessage, onShareAnswered } from './person-rooms-events.js'
 import { predictSpawnRun } from './spawn-model.js'
+import { normalizeCauses } from './ask-causes.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableDevice } from './wake.js'
 import { listPins, isSuccessorOfAPin, pinHintBeforeAppend, sendPinsFrame } from './pins.js'
 import { archiveChanges, sendArchiveFrame } from './archive.js'
@@ -1087,6 +1088,13 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // default); anything but a boolean is a bad ask, not a coerced one.
         if (msg.link != null && typeof msg.link !== 'boolean') return fail('bad_request', 'bad link')
         const link = msg.link === true
+        // Optional causes of the asking turn (src/ask-causes.js), stored on
+        // the row for GET /consent/pending and never put on the client card.
+        // Absent is a bridge that predates the field and stores NULL; present
+        // but unusable (null included) is a bad ask, refused before the wake
+        // below so it never starts a box.
+        const causes = msg.causes === undefined ? null : normalizeCauses(msg.causes)
+        if (msg.causes !== undefined && !causes) return fail('bad_request', 'bad causes')
         if (!Number.isInteger(msg.target_device_id)) return fail('bad_request', 'bad target_device_id')
         // Spawning on the caller's own box is allowed: the start rpc lands on
         // the same bridge, which already runs several sessions side by side
@@ -1167,7 +1175,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         createSpawnRequest(db, {
           id: spawnId, userId: conn.userId, fromDeviceId: conn.deviceId,
           fromConvoId: msg.from_convo_id, targetDeviceId: msg.target_device_id,
-          workdir, task, topic, model, effort, agent, link, missionNum, missionInherited,
+          workdir, task, topic, model, effort, agent, link, missionNum, missionInherited, causes,
         })
         // Client-only card (isClientOnlyEvent covers kind:'agent_spawn'),
         // published into the PARENT's own conversation — where the user is
@@ -1385,6 +1393,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const { room, err } = loadRoom(msg.room_id)
         if (err) return fail(...err)
         if (room.agent_device_id !== conn.deviceId) return fail('forbidden', 'only the room owner may invite')
+        // The asking turn's causes, same rules as spawn_request's. Checked
+        // ahead of both paths so the op has one shape; only the same-user
+        // park below stores them.
+        const causes = msg.causes === undefined ? null : normalizeCauses(msg.causes)
+        if (msg.causes !== undefined && !causes) return fail('bad_request', 'bad causes')
         // A talk request: aimed at a PERSON, who chooses where their side
         // talks when they accept (talk-requests.js). Exactly one of
         // target_person and target_device_id. Every refusal that would say
@@ -1521,7 +1534,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (countPendingAsks(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
           return fail('conflict', 'too many requests awaiting user approval')
         }
-        const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id, initiatorDeviceId: conn.deviceId, justification, topic, targetConvoId, initiatorConvoId: msg.from_convo_id ?? null })
+        const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: msg.target_device_id, initiatorDeviceId: conn.deviceId, justification, topic, targetConvoId, initiatorConvoId: msg.from_convo_id ?? null, causes })
         if (!r.ok) return fail('conflict', `already ${r.state}`)
         // An asleep target is started now, while the ask waits for the user:
         // by the time they approve, the box is usually up to receive it, and
@@ -1573,6 +1586,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const { room, err } = loadRoom(msg.room_id)
         if (err) return fail(...err)
         if (typeof msg.justification !== 'string' || !msg.justification || msg.justification.length > INVITE_TEXT_MAX_CHARS) return fail('bad_request', 'bad justification')
+        // The asking turn's causes, same rules as spawn_request's.
+        const causes = msg.causes === undefined ? null : normalizeCauses(msg.causes)
+        if (msg.causes !== undefined && !causes) return fail('bad_request', 'bad causes')
         if (room.agent_device_id == null) return fail('conflict', 'room has no recorded owner to ask')
         if (room.agent_device_id === conn.deviceId) return fail('bad_request', 'cannot join own room')
         if (personLinked(msg.room_id)) return fail('conflict', 'a room with another person holds just the two agents')
@@ -1597,7 +1613,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (countPendingAsks(db, conn.deviceId) >= MAX_AWAITING_PER_REQUESTER) {
           return fail('conflict', 'too many requests awaiting user approval')
         }
-        const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId, initiatorDeviceId: conn.deviceId, justification, topic: '', initiatorConvoId: msg.from_convo_id ?? null })
+        const r = parkInvite(db, { convoId: msg.room_id, agentDeviceId: conn.deviceId, initiatorDeviceId: conn.deviceId, justification, topic: '', initiatorConvoId: msg.from_convo_id ?? null, causes })
         if (!r.ok) return fail('conflict', `already ${r.state}`)
         // The recipient of a join is the room's owner box; start it if asleep
         // (same stance as agent_invite above).

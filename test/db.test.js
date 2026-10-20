@@ -520,6 +520,18 @@ test('openDb adds agent_spawn_requests.link defaulting to 1 for pre-existing row
   assert.doesNotThrow(() => openDb(dbPath).close())
 })
 
+// Bridge-stamped causes (src/ask-causes.js) and the consent-decision and
+// routine columns that resolve them later: additive, NULL on every older row.
+test('schema: causes columns on both ask tables, cause columns on consent_decisions, envelope on routines', () => {
+  const db = openDb(':memory:')
+  const cols = (t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name)
+  assert.ok(cols('agent_spawn_requests').includes('causes'))
+  assert.ok(cols('convo_agents').includes('causes'))
+  for (const c of ['cause_kind', 'cause_ref', 'verifier_note']) assert.ok(cols('consent_decisions').includes(c), c)
+  assert.ok(cols('routines').includes('envelope'))
+  db.close()
+})
+
 // device_status rides the device row: a revoked box takes its last report
 // with it, so a replacement that happens to reuse the integer id (devices.id
 // is a plain rowid, not AUTOINCREMENT) cannot inherit the old usage, paths
