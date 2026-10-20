@@ -25,7 +25,16 @@
 //  - a routine fire is the root only when the turn had no user or item
 //    cause;
 //  - a spawn outcome stands for the causes of the ask that spawn answered,
-//    followed at most CAUSE_CHAIN_MAX_DEPTH hops.
+//    followed at most CAUSE_CHAIN_MAX_DEPTH hops. A chain that ends in a
+//    user or item cause that does not resolve counts as a user failure
+//    here too, so it blocks a routine root beside it just the same. An
+//    untrusted kind among a cited spawn's OWN causes fails only that
+//    cause, not the whole ask: that spawn was itself approved on some
+//    root, and the outcome is all this turn saw of it.
+//
+// A routine root is canonical: its ref and time are the routine's recorded
+// last fire, never the cited time, so every ask born of one fire names the
+// same root (the per-fire approval count is keyed on it).
 import { normalizeCauses, parseCauses } from './ask-causes.js'
 import { verifySaid, parseCitation } from './said.js'
 import { getSpawn } from './spawns.js'
@@ -74,6 +83,14 @@ function parseIsoMs(s) {
   return ms
 }
 
+// The routine row's envelope as an object, or null. routines.js reads it
+// back already parsed and validated; a raw TEXT column (a row from before
+// that) is parsed here defensively.
+function routineEnvelope(row) {
+  if (typeof row.envelope === 'string') return parseEnvelope(row.envelope)
+  return row.envelope && typeof row.envelope === 'object' && !Array.isArray(row.envelope) ? row.envelope : null
+}
+
 function parseEnvelope(text) {
   if (typeof text !== 'string' || !text) return null
   try {
@@ -108,7 +125,8 @@ function resolveUserMessage(db, ctx, cause) {
   return { ok: true, root: { kind: 'user', ref: `${r.body.convo_id}:${r.body.seq}`, at: r.body.ts } }
 }
 
-const ITEM_REF_RE = /^item:([1-9][0-9]{0,15})@(.+)$/
+// At most 15 digits, so Number() is exact.
+const ITEM_REF_RE = /^item:([1-9][0-9]{0,14})@(.+)$/
 function resolveItem(db, ctx, cause) {
   const m = typeof cause.ref === 'string' ? ITEM_REF_RE.exec(cause.ref) : null
   const at = m ? parseIsoMs(m[2]) : null
@@ -143,9 +161,11 @@ function resolveRoutine(db, ctx, cause) {
     return fail('the routine cause is not that routine\'s last fire')
   }
   if (firedAt < ctx.createdAt - SELF_APPROVAL_ROUTINE_WINDOW_MS) return fail('the routine cause fired more than 6 h before the ask')
+  if (firedAt > ctx.createdAt + FUTURE_SLACK_MS) return fail('the routine cause fired after the ask')
+  const firedIso = new Date(row.last_fired_at).toISOString()
   return {
     ok: true,
-    root: { kind: 'routine', ref: `routine:${name}@${m[2]}`, at: firedAt, routine: { ...row, envelope: parseEnvelope(row.envelope) } },
+    root: { kind: 'routine', ref: `routine:${name}@${firedIso}`, at: row.last_fired_at, routine: { ...row, envelope: routineEnvelope(row) } },
   }
 }
 
@@ -193,9 +213,11 @@ function resolveLevel(db, ctx, causes, depth) {
       continue
     }
     firstFail ??= r
-    if (USER_KINDS.has(cause.kind)) firstUserFail ??= r
+    // r.userFail: a spawn whose chain ended in an unresolved user/item cause.
+    if (USER_KINDS.has(cause.kind) || r.userFail) firstUserFail ??= r
   }
-  return firstUserFail ?? routineRoot ?? firstFail
+  if (firstUserFail) return { ...firstUserFail, userFail: true }
+  return routineRoot ?? firstFail
 }
 
 // → { ok: true, root: { kind: 'user' | 'item' | 'routine', ref, at, routine? } }
@@ -205,6 +227,9 @@ function resolveLevel(db, ctx, causes, depth) {
 // time (every window is measured against it, down the whole chain),
 // `fromConvoId` the conversation that made the ask.
 export function resolveAskCause(db, { who, userId, causes, createdAt, fromConvoId, depth = 0 }) {
+  // `who` must be the real caller identity (kind, deviceId), as the request
+  // was authenticated: verifySaid's private-box rule reads it, and a
+  // hand-built { userId } would skip that rule.
   if (!who || who.userId !== userId) return fail(WHY_NOT_ASKING_USER)
   if (!Number.isSafeInteger(createdAt)) return fail('the ask has no creation time')
   const ctx = { who, userId, createdAt, fromConvoId, hops: 0 }
