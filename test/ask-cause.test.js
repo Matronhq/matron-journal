@@ -7,6 +7,7 @@ import { createSpawnRequest } from '../src/spawns.js'
 import { createRoutine } from '../src/routines.js'
 import {
   resolveAskCause, SELF_APPROVAL_USER_WINDOW_MS, SELF_APPROVAL_ROUTINE_WINDOW_MS, FIRE_SLACK_MS, CAUSE_CHAIN_MAX_DEPTH,
+  WHY_NO_CAUSE, WHY_OTHER_CONVO_MESSAGE, WHY_OTHER_CONVO_ITEM, WHY_CHAIN_TOO_DEEP, WHY_NOT_ASKING_USER, whyStartedBy,
 } from '../src/ask-cause.js'
 
 const MIN = 60 * 1000
@@ -40,12 +41,12 @@ const say = (convoId, sender, body, userId = alice.id) => {
   const { ts } = s.db.prepare('SELECT ts FROM events WHERE user_id=? AND seq=?').get(userId, seq)
   return { seq, ts, ref: `${convoId}:${seq}` }
 }
-const item = (userId = alice.id) => {
+const item = (userId = alice.id, ownerConvoId = 'c0') => {
   const num = ++n
   const id = `it_${num}`
   const now = Date.now()
   s.db.prepare(`INSERT INTO items(id,user_id,num,kind,state,rank,title,origin_convo_id,origin_device_id,created_by,created_at,updated_at)
-    VALUES(?,?,?,'question','open',?,?,'c0',?,'agent',?,?)`).run(id, userId, num, num, 'A question', boxA.deviceId, now, now)
+    VALUES(?,?,?,'question','open',?,?,?,?,'agent',?,?)`).run(id, userId, num, num, 'A question', ownerConvoId, boxA.deviceId, now, now)
   return { id, num }
 }
 const comment = (it, { author = 'user', kind = 'comment', meta = null, at = Date.now(), userId = alice.id } = {}) => {
@@ -68,16 +69,21 @@ const spawn = ({ fromConvoId, causes, state = 'started', userId = alice.id, id =
 const resolve = (causes, { fromConvoId = 'c0', createdAt = Date.now(), as = who, userId = alice.id, depth } = {}) =>
   resolveAskCause(s.db, { who: as, userId, causes, createdAt, fromConvoId, ...(depth != null ? { depth } : {}) })
 
-test('the windows and the depth limit are exported', () => {
+test('the windows, the depth limit and the whys are exported', () => {
   assert.equal(SELF_APPROVAL_USER_WINDOW_MS, 48 * HOUR)
   assert.equal(SELF_APPROVAL_ROUTINE_WINDOW_MS, 6 * HOUR)
   assert.equal(FIRE_SLACK_MS, 60 * 1000)
   assert.equal(CAUSE_CHAIN_MAX_DEPTH, 4)
+  assert.equal(WHY_NO_CAUSE, 'the ask carries no turn cause (bridge too old, or the turn had none)')
+  assert.equal(WHY_OTHER_CONVO_MESSAGE, 'the cited message is in another conversation')
+  assert.equal(WHY_OTHER_CONVO_ITEM, 'the cited item belongs to another conversation')
+  assert.equal(WHY_CHAIN_TOO_DEEP, 'the cause chain is deeper than 4 spawns')
+  assert.equal(whyStartedBy('room_message'), 'started by room_message')
 })
 
 test('no causes: null and an empty list both fail with the same why', () => {
   for (const causes of [null, undefined, []]) {
-    assert.deepEqual(resolve(causes), { ok: false, why: 'the ask carries no turn cause (bridge too old, or the turn had none)' })
+    assert.deepEqual(resolve(causes), { ok: false, why: WHY_NO_CAUSE })
   }
 })
 
@@ -98,10 +104,18 @@ test('user_message: the user\'s own words within the window resolve to the user'
   const r = resolve([{ kind: 'user_message', ref: m.ref }], { fromConvoId: c, createdAt: m.ts + 10 * MIN })
   assert.deepEqual(r, { ok: true, root: { kind: 'user', ref: m.ref, at: m.ts } })
   // A little clock skew the other way is tolerated; more is not.
-  assert.equal(resolve([{ kind: 'user_message', ref: m.ref }], { createdAt: m.ts - 4 * MIN }).ok, true)
-  assert.equal(resolve([{ kind: 'user_message', ref: m.ref }], { createdAt: m.ts - 6 * MIN }).ok, false)
+  assert.equal(resolve([{ kind: 'user_message', ref: m.ref }], { fromConvoId: c, createdAt: m.ts - 4 * MIN }).ok, true)
+  assert.equal(resolve([{ kind: 'user_message', ref: m.ref }], { fromConvoId: c, createdAt: m.ts - 6 * MIN }).ok, false)
   // Exactly 48 h is still inside.
-  assert.equal(resolve([{ kind: 'user_message', ref: m.ref }], { createdAt: m.ts + 48 * HOUR }).ok, true)
+  assert.equal(resolve([{ kind: 'user_message', ref: m.ref }], { fromConvoId: c, createdAt: m.ts + 48 * HOUR }).ok, true)
+})
+
+test('user_message: the user\'s verified words in another conversation fail', () => {
+  const c = convo()
+  const elsewhere = convo()
+  const m = say(elsewhere, 'user:alice', 'yes, go ahead')
+  assert.deepEqual(resolve([{ kind: 'user_message', ref: m.ref }], { fromConvoId: c, createdAt: m.ts }), { ok: false, why: WHY_OTHER_CONVO_MESSAGE })
+  assert.equal(resolve([{ kind: 'user_message', ref: m.ref }], { fromConvoId: elsewhere, createdAt: m.ts }).ok, true)
 })
 
 test('user_message: an agent message fails', () => {
@@ -128,9 +142,10 @@ test('user_message: unknown, malformed and another user\'s citations fail', () =
     assert.equal(r.ok, false, String(ref))
     assert.equal(typeof r.why, 'string')
   }
+  assert.equal(resolve([{ kind: 'user_message', ref: bm.ref }], { fromConvoId: bc }).ok, false)
   // The caller's identity must be the asking user's.
-  assert.equal(resolve([{ kind: 'user_message', ref: bm.ref }], { as: bobWho }).ok, false)
-  assert.equal(resolve([{ kind: 'user_message', ref: bm.ref }], { as: bobWho, userId: bob.id }).ok, true)
+  assert.deepEqual(resolve([{ kind: 'user_message', ref: bm.ref }], { as: bobWho, fromConvoId: bc }), { ok: false, why: WHY_NOT_ASKING_USER })
+  assert.equal(resolve([{ kind: 'user_message', ref: bm.ref }], { as: bobWho, userId: bob.id, fromConvoId: bc }).ok, true)
 })
 
 test('item_reply / item_tap: the user\'s comment resolves to the item; a tap needs an action', () => {
@@ -144,6 +159,15 @@ test('item_reply / item_tap: the user\'s comment resolves to the item; a tap nee
   assert.equal(resolve([{ kind: 'item_tap', ref: reply }]).ok, false)
   const bad = comment(it, { at: at + 2, meta: { action: 5 } })
   assert.equal(resolve([{ kind: 'item_tap', ref: bad }]).ok, false)
+})
+
+test('item_reply / item_tap: an item owned by another conversation fails', () => {
+  const it = item(alice.id, 'c-other')
+  const reply = comment(it, { at: Date.now() - MIN })
+  const tap = comment(it, { at: Date.now() - 2 * MIN, meta: { action: 'Go' } })
+  assert.deepEqual(resolve([{ kind: 'item_reply', ref: reply }]), { ok: false, why: WHY_OTHER_CONVO_ITEM })
+  assert.deepEqual(resolve([{ kind: 'item_tap', ref: tap }]), { ok: false, why: WHY_OTHER_CONVO_ITEM })
+  assert.equal(resolve([{ kind: 'item_reply', ref: reply }], { fromConvoId: 'c-other' }).ok, true)
 })
 
 test('item_reply: an agent comment, a status row, a wrong time, an old one and another user\'s item fail', () => {
@@ -216,7 +240,7 @@ test('a user cause wins over a routine, whichever comes first', () => {
   const r = resolve([{ kind: 'routine', ref: rref }, { kind: 'user_message', ref: a.ref }], { fromConvoId: c })
   assert.equal(r.ok, false)
   // The first user/item cause that resolves wins.
-  const it = item()
+  const it = item(alice.id, c)
   const reply = comment(it, { at: Date.now() - MIN })
   assert.equal(resolve([{ kind: 'user_message', ref: a.ref }, { kind: 'item_reply', ref: reply }], { fromConvoId: c }).root.kind, 'item')
 })
@@ -240,7 +264,7 @@ test('spawn_outcome: a self-referencing chain fails on depth', () => {
   spawn({ id, fromConvoId: c, causes: [{ kind: 'spawn_outcome', ref: `spawn:${id}` }] })
   const r = resolve([{ kind: 'spawn_outcome', ref: `spawn:${id}` }], { fromConvoId: c })
   assert.equal(r.ok, false)
-  assert.match(r.why, /deeper than 4/)
+  assert.equal(r.why, WHY_CHAIN_TOO_DEEP)
   // A wide loop is cut off just the same, without exploding.
   const wide = 'sp_wide'
   spawn({ id: wide, fromConvoId: c, causes: Array.from({ length: 8 }, () => ({ kind: 'spawn_outcome', ref: `spawn:${wide}` })) })
