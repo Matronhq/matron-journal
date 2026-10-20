@@ -38,7 +38,7 @@
 import { normalizeCauses, parseCauses } from './ask-causes.js'
 import { verifySaid, parseCitation } from './said.js'
 import { getSpawn } from './spawns.js'
-import { getRoutine, NAME_RE } from './routines.js'
+import { getRoutine, parseEnvelope, NAME_RE } from './routines.js'
 
 // How old the user's words (or item comment) may be when the ask is made.
 export const SELF_APPROVAL_USER_WINDOW_MS = 48 * 60 * 60 * 1000
@@ -83,22 +83,12 @@ function parseIsoMs(s) {
   return ms
 }
 
-// The routine row's envelope as an object, or null. routines.js reads it
-// back already parsed and validated; a raw TEXT column (a row from before
-// that) is parsed here defensively.
+// The routine row's envelope as an object, or null. getRoutine reads it
+// back already parsed and validated; raw column text is put through the
+// same validating parse, and anything else allows nothing.
 function routineEnvelope(row) {
   if (typeof row.envelope === 'string') return parseEnvelope(row.envelope)
   return row.envelope && typeof row.envelope === 'object' && !Array.isArray(row.envelope) ? row.envelope : null
-}
-
-function parseEnvelope(text) {
-  if (typeof text !== 'string' || !text) return null
-  try {
-    const v = JSON.parse(text)
-    return v && typeof v === 'object' && !Array.isArray(v) ? v : null
-  } catch {
-    return null
-  }
 }
 
 // The user/item window: not older than 48 h before the ask, not more than a
@@ -160,8 +150,10 @@ function resolveRoutine(db, ctx, cause) {
   if (!Number.isSafeInteger(row.last_fired_at) || Math.abs(firedAt - row.last_fired_at) > FIRE_SLACK_MS) {
     return fail('the routine cause is not that routine\'s last fire')
   }
-  if (firedAt < ctx.createdAt - SELF_APPROVAL_ROUTINE_WINDOW_MS) return fail('the routine cause fired more than 6 h before the ask')
-  if (firedAt > ctx.createdAt + FUTURE_SLACK_MS) return fail('the routine cause fired after the ask')
+  // The windows are measured on the recorded fire (canonical), not the
+  // cited time: the slack above is only for matching the citation to it.
+  if (row.last_fired_at < ctx.createdAt - SELF_APPROVAL_ROUTINE_WINDOW_MS) return fail('the routine cause fired more than 6 h before the ask')
+  if (row.last_fired_at > ctx.createdAt + FUTURE_SLACK_MS) return fail('the routine cause fired after the ask')
   const firedIso = new Date(row.last_fired_at).toISOString()
   return {
     ok: true,

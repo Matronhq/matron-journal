@@ -28,7 +28,7 @@ function recordAndAnnounce({ db, hub }, { userId, kind, askId, decision, decided
     })
   } catch (err) {
     // The answer stands; the counters reading this table do not.
-    console.error(`journal: consent decision not recorded (${err?.name}) — fire and routine caps will under-count`)
+    console.error(`journal: consent decision not recorded (${err?.name}) for ${kind} ${askId} — fire and routine caps will under-count`)
   }
   try {
     appendAndBroadcast(db, hub, {

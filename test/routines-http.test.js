@@ -5,6 +5,7 @@ import { createUser, createAgent } from '../src/auth.js'
 import { setCoordinatorConvoId } from '../src/coordinator.js'
 import { upsertConversation, append } from '../src/journal.js'
 import { WHY_NO_CAUSE, WHY_OTHER_CONVO_MESSAGE } from '../src/ask-cause.js'
+import { WHY_ROUTINE_ROOT } from '../src/routines-http.js'
 import { listRoutines, getRoutine, STARTER_ROUTINES, ROUTINES_MAX } from '../src/routines.js'
 import { ROUTINE_FROM_NAME, ROUTINE_MAX_INFLIGHT } from '../src/routines-sweep.js'
 
@@ -206,6 +207,59 @@ test('provenance: run with the user\'s ask fires; with none, last_fired_at stays
   assert.equal(req.params.name, 'daily-sweep')
   await settle(s)
   assert.ok(getRoutine(s.db, alice.id, c.json.routine.id).last_fired_at > 0)
+})
+
+// A user comment (or tap) on an item the Coordinator conversation owns,
+// cited the way the bridge stamps an item turn: item:<num>@<created_at>.
+let itemNum = 0
+const userOnItem = (s, userId, deviceId, { tap = false, ownerConvoId = 'coord' } = {}) => {
+  const num = ++itemNum
+  const id = `it_${num}`
+  const now = Date.now()
+  s.db.prepare(`INSERT INTO items(id,user_id,num,kind,state,rank,title,origin_convo_id,origin_device_id,created_by,created_at,updated_at)
+    VALUES(?,?,?,'question','open',?,?,?,?,'agent',?,?)`).run(id, userId, num, num, 'Set up the sweep?', ownerConvoId, deviceId, now, now)
+  s.db.prepare(`INSERT INTO item_comments(id,item_id,user_id,author,device_id,kind,body,meta,created_at)
+    VALUES(?,?,?,'user',?,'comment',?,?,?)`).run(`ic_${num}`, id, userId, deviceId, 'yes', tap ? JSON.stringify({ action: 'Yes' }) : null, now)
+  return [{ kind: tap ? 'item_tap' : 'item_reply', ref: `item:${num}@${new Date(now).toISOString()}` }]
+}
+
+test('provenance: an item reply or tap on one of the Coordinator\'s items is the user\'s ask for create and run', async (t) => {
+  const { s, alice, coord, coordDev } = await fleet(t)
+  const c = await s.http('/routines', { method: 'POST', token: coordDev.token, body: body({ convo_id: 'coord', causes: userOnItem(s, alice.id, coordDev.deviceId) }) })
+  assert.equal(c.status, 201)
+  assert.equal(getRoutine(s.db, alice.id, 'daily-sweep').prompt, 'Routine daily-sweep: sweep.')
+  // An item another conversation owns is not this conversation's ask.
+  assert.equal((await s.http('/routines', { method: 'POST', token: coordDev.token, body: body({ name: 'x1', convo_id: 'coord', causes: userOnItem(s, alice.id, coordDev.deviceId, { ownerConvoId: 'g1' }) }) })).json.detail, 'routine_write_unverified')
+  assert.equal(getRoutine(s.db, alice.id, 'x1'), null)
+  const run = await s.http('/routines/daily-sweep/run', { method: 'POST', token: coordDev.token, body: { convo_id: 'coord', causes: userOnItem(s, alice.id, coordDev.deviceId, { tap: true }) } })
+  assert.deepEqual(run, { status: 202, json: { accepted: true } })
+  assert.equal((await answerRpc(coord)).params.name, 'daily-sweep')
+  await settle(s)
+  assert.ok(getRoutine(s.db, alice.id, 'daily-sweep').last_fired_at > 0)
+})
+
+test('provenance: the Coordinator\'s PATCH of trigger, or envelope to null, with no causes is 403 and leaves the row as it was', async (t) => {
+  const { s, alice, client, coordDev } = await fleet(t, { connect: false })
+  const env = { spawns_per_fire: 1, chats: false, boxes: null }
+  assert.equal((await s.http('/routines', { method: 'POST', token: client, body: body({ envelope: env }) })).status, 201)
+  assert.equal((await s.http('/routines', { method: 'POST', token: client, body: { name: 'on-trip', title: 'On trip', trigger: { kind: 'context_over', pct: 80 }, prompt: 'Routine on-trip: compact.' } })).status, 201)
+  const before = { sweep: getRoutine(s.db, alice.id, 'daily-sweep'), trip: getRoutine(s.db, alice.id, 'on-trip') }
+  assert.deepEqual(await s.http('/routines/on-trip', { method: 'PATCH', token: coordDev.token, body: { trigger: { kind: 'context_over', pct: 10 }, convo_id: 'coord' } }), unverified(WHY_NO_CAUSE))
+  assert.deepEqual(await s.http('/routines/daily-sweep', { method: 'PATCH', token: coordDev.token, body: { envelope: null, convo_id: 'coord' } }), unverified(WHY_NO_CAUSE))
+  assert.deepEqual({ sweep: getRoutine(s.db, alice.id, 'daily-sweep'), trip: getRoutine(s.db, alice.id, 'on-trip') }, before)
+  assert.deepEqual(markers(s).filter((m) => m.payload.by !== 'user'), [], 'no marker for a refused write')
+})
+
+test('provenance: run with a routine-root cause is 403 WHY_ROUTINE_ROOT; last_fired_at stays and nothing is delivered', async (t) => {
+  const { s, alice, client, coordDev } = await fleet(t)
+  const c = await s.http('/routines', { method: 'POST', token: client, body: body() })
+  const firedAt = Date.now() - 60000
+  s.db.prepare('UPDATE routines SET last_fired_at=? WHERE id=?').run(firedAt, c.json.routine.id)
+  const fromFire = [{ kind: 'routine', ref: `routine:daily-sweep@${new Date(firedAt).toISOString()}` }]
+  assert.deepEqual(await s.http('/routines/daily-sweep/run', { method: 'POST', token: coordDev.token, body: { convo_id: 'coord', causes: fromFire } }), unverified(WHY_ROUTINE_ROOT))
+  assert.equal(getRoutine(s.db, alice.id, 'daily-sweep').last_fired_at, firedAt)
+  assert.equal(getRoutine(s.db, alice.id, 'daily-sweep').last_outcome, null)
+  assert.equal(s.broker.pendingCount(), 0, 'nothing was sent to the Coordinator')
 })
 
 test('no Coordinator set: writes still work for the client, no marker is appended', async (t) => {

@@ -16,6 +16,7 @@ import { resolveAskCause } from './ask-cause.js'
 import { parseCauses } from './ask-causes.js'
 import { getParticipant } from './participants.js'
 import { getSpawn } from './spawns.js'
+import { getRoutine } from './routines.js'
 import {
   approvalsForFire, coordinatorRoutineApprovalsSince, CONSENT_ROUTINE_CAP_DEFAULT, CONSENT_DAILY_WINDOW_MS,
   getConsentEnabled, isUserOnlySpawn, isUserOnlyChat, deviceState,
@@ -65,22 +66,24 @@ const refusal = (status, detail, extra) => ({
   ok: false, status, body: { error: status === 403 ? 'forbidden' : 'conflict', detail, ...extra },
 })
 
-// → why the ask falls outside the fire's envelope, or null.
-function outsideEnvelope(db, userId, root, ask) {
-  const env = root.routine.envelope
-  if (!env) return `the routine "${root.routine.name}" has no envelope`
-  if (ask.kind === 'chat' && !env.chats) return `the routine "${root.routine.name}" may not open chats`
+// → why the ask falls outside the fire's envelope, or null. `routine` is
+// the routine row as read (its envelope parsed), `root` the fire.
+function outsideEnvelope(db, userId, root, routine, ask) {
+  const env = routine.envelope
+  if (!env) return `the routine "${routine.name}" has no envelope`
+  if (ask.kind === 'chat' && !env.chats) return `the routine "${routine.name}" may not open chats`
   if (ask.kind === 'spawn' && approvalsForFire(db, userId, root.ref, 'spawn') >= env.spawns_per_fire) {
-    return `the routine "${root.routine.name}" may start ${env.spawns_per_fire} spawn(s) per fire, and this fire has used them`
+    return `the routine "${routine.name}" may start ${env.spawns_per_fire} spawn(s) per fire, and this fire has used them`
   }
-  if (env.boxes && !env.boxes.includes(ask.targetBox)) return `the routine "${root.routine.name}" may not reach the box "${ask.targetBox}"`
+  if (env.boxes && !env.boxes.includes(ask.targetBox)) return `the routine "${routine.name}" may not reach the box "${ask.targetBox}"`
   return null
 }
 
 // After the wait: the cheap preconditions the route checked before it,
 // again and in the same order (the switch, the ask still awaiting and
-// still the same ask, user_only, target_offline), with their own refusals.
-// A changed or answered ask is the bare 409 a lost claim answers.
+// still the same ask — its time, causes, justification and topic —
+// user_only, target_offline), with their own refusals. A changed or
+// answered ask is the bare 409 a lost claim answers.
 function changedWhileVerifying(ctx, who, ask) {
   const { db } = ctx
   if (!getConsentEnabled(db, who.userId)) return refusal(403, 'consent_disabled')
@@ -94,6 +97,8 @@ function changedWhileVerifying(ctx, who, ask) {
   if (isUserOnlyChat(db, who.userId, ask.roomId, ask.targetDeviceId)) return refusal(403, 'user_only')
   const row = getParticipant(db, ask.roomId, ask.targetDeviceId)
   if (!row || row.state !== 'awaiting_user' || row.created_at !== ask.createdAt || row.causes !== ask.causes) return conflict()
+  // What the verifier judged must be what is approved.
+  if (row.justification !== ask.verifier.justification || (row.topic || '') !== ask.verifier.topic) return conflict()
   return null
 }
 const conflict = () => ({ ok: false, status: 409, body: { error: 'conflict' } })
@@ -126,10 +131,12 @@ export async function verifyOwnAsk(ctx, { who, convoId, reason, ask }) {
   if (!res.ok) return refusal(403, 'own_ask_unverified', { why: res.why })
   const { root } = res
   if (root.kind !== 'routine') return { ok: true, root, cause: { causeKind: root.kind, causeRef: root.ref } }
-  const outside = outsideEnvelope(db, who.userId, root, ask)
+  const outside = outsideEnvelope(db, who.userId, root, root.routine, ask)
   if (outside) return refusal(403, 'envelope', { why: outside })
-  const { name, title, prompt } = root.routine
-  const verdict = await askVerifier(ctx.verifier, { routine: { name, title, prompt }, ask: ask.verifier, reason })
+  // The routine's name and prompt only: the title is editable without the
+  // user's ask, the prompt is the remit.
+  const { name, prompt } = root.routine
+  const verdict = await askVerifier(ctx.verifier, { routine: { name, prompt }, ask: ask.verifier, reason })
   if (!verdict.ok) {
     const why = verdict.reason === 'disabled' ? 'no verifier is configured' : `the verifier could not answer${verdict.note ? ` (${verdict.note})` : ''}`
     return refusal(409, 'verifier_unavailable', { why })
@@ -144,7 +151,12 @@ export function confirmOwnAsk(ctx, { who, ask, verdict }) {
   const changed = changedWhileVerifying(ctx, who, ask)
   if (changed) return changed
   if (verdict.root.kind !== 'routine') return null
-  const late = outsideEnvelope(db, who.userId, verdict.root, ask)
+  // The routine as it is now, not as it was before the wait: the user may
+  // have narrowed or cleared its envelope, or deleted it, meanwhile. By id,
+  // so a routine deleted and made again under the same name is gone too.
+  const routine = getRoutine(db, who.userId, verdict.root.routine.id)
+  if (!routine) return refusal(403, 'envelope', { why: `the routine "${verdict.root.routine.name}" no longer exists` })
+  const late = outsideEnvelope(db, who.userId, verdict.root, routine, ask)
   if (late) return refusal(403, 'envelope', { why: late })
   const cap = Number.isInteger(ctx.consentRoutineCap) && ctx.consentRoutineCap >= 0 ? ctx.consentRoutineCap : CONSENT_ROUTINE_CAP_DEFAULT
   if (cap > 0 && coordinatorRoutineApprovalsSince(db, who.userId, Date.now() - CONSENT_DAILY_WINDOW_MS) >= cap) {

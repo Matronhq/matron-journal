@@ -159,7 +159,7 @@ test('routine-born own spawn inside the envelope: the verifier is asked, 200 rec
   await started(f, first)
   assert.equal(verifier.calls.length, 1)
   assert.deepEqual(verifier.calls[0], {
-    routine: { name: rt.name, title: 'A sweep', prompt: 'Do the sweep.' },
+    routine: { name: rt.name, prompt: 'Do the sweep.' },
     ask: { kind: 'spawn', task: 'fix the flaky test', target_box: 'opal', workdir: '/home/alice/proj', topic: 'flaky test' },
     reason: 'the sweep needs a helper',
   })
@@ -375,4 +375,81 @@ test('the switch turned off, or the target box going offline, while the verifier
   assert.equal(offline.status, 409); assert.equal(offline.json.detail, 'target_offline')
   assert.equal(getSpawn(f.s.db, id).state, 'awaiting_user')
   assert.deepEqual(decisions(f), [])
+})
+
+test('the envelope narrowed to spawns_per_fire 0 while the verifier answers: 403 envelope, nothing recorded', async (t) => {
+  const verifier = gatedVerifier()
+  const f = await fleet(t, { verifier })
+  autoStart(f) // a wrong approval must not leave a start RPC hanging
+  const rt = routine(f, { envelope: { spawns_per_fire: 1, chats: false, boxes: null } })
+  const id = await ownSpawn(f, 'q1', rt.causes)
+  const pendingAnswer = approve(f, 'spawn', id, 'the sweep needs a helper')
+  await until(() => verifier.calls.length === 1)
+  // The user narrows the routine meanwhile (their client needs no cause).
+  const p = await f.s.http(`/routines/${rt.name}`, { method: 'PATCH', token: f.clientToken, body: { envelope: { spawns_per_fire: 0, chats: false, boxes: null } } })
+  assert.equal(p.status, 200)
+  verifier.release()
+  const r = await pendingAnswer
+  assert.equal(r.status, 403); assert.equal(r.json.detail, 'envelope')
+  assert.equal(getSpawn(f.s.db, id).state, 'awaiting_user'); assert.equal(getSpawn(f.s.db, id).answered_by, null)
+  assert.deepEqual(decisions(f), [])
+})
+
+test('the routine deleted, or its envelope cleared, while the verifier answers: 403 envelope, nothing recorded', async (t) => {
+  const verifier = gatedVerifier()
+  const f = await fleet(t, { verifier })
+  autoStart(f) // a wrong approval must not leave a start RPC hanging
+  for (const change of ['clear', 'delete']) {
+    const rt = routine(f, { envelope: { spawns_per_fire: 2, chats: false, boxes: null } })
+    const id = await ownSpawn(f, `q-${change}`, rt.causes)
+    const pendingAnswer = approve(f, 'spawn', id)
+    await until(() => verifier.calls.length === (change === 'clear' ? 1 : 2))
+    const r0 = change === 'clear'
+      ? await f.s.http(`/routines/${rt.name}`, { method: 'PATCH', token: f.clientToken, body: { envelope: null } })
+      : await f.s.http(`/routines/${rt.name}`, { method: 'DELETE', token: f.clientToken, body: {} })
+    assert.equal(r0.status, 200, change)
+    verifier.release()
+    const r = await pendingAnswer
+    assert.equal(r.status, 403, change); assert.equal(r.json.detail, 'envelope', change)
+    assert.equal(getSpawn(f.s.db, id).state, 'awaiting_user')
+  }
+  assert.deepEqual(decisions(f), [])
+})
+
+test('a chat ask whose justification or topic changed while the verifier answers is a bare 409, nothing recorded', async (t) => {
+  const verifier = gatedVerifier()
+  const f = await fleet(t, { verifier })
+  const room = coordRoom(f)
+  const id = `${room}/${f.targetDev.deviceId}`
+  const rt = routine(f, { envelope: { spawns_per_fire: 0, chats: true, boxes: null } })
+  await parkInviteAsk(f, { ws: f.coord, room, from: 'coord', causes: rt.causes })
+  let calls = 0
+  for (const col of ['justification', 'topic']) {
+    const before = getParticipant(f.s.db, room, f.targetDev.deviceId)[col]
+    const pendingAnswer = approve(f, 'chat', id, 'the sweep wants a word')
+    calls += 1
+    await until(() => verifier.calls.length === calls)
+    f.s.db.prepare(`UPDATE convo_agents SET ${col}=? WHERE convo_id=? AND agent_device_id=?`).run('something else entirely', room, f.targetDev.deviceId)
+    verifier.release()
+    const r = await pendingAnswer
+    assert.equal(r.status, 409, col); assert.deepEqual(r.json, { error: 'conflict' }, col)
+    assert.equal(getParticipant(f.s.db, room, f.targetDev.deviceId).state, 'awaiting_user')
+    f.s.db.prepare(`UPDATE convo_agents SET ${col}=? WHERE convo_id=? AND agent_device_id=?`).run(before, room, f.targetDev.deviceId)
+  }
+  assert.deepEqual(decisions(f), [])
+})
+
+test('a decision row that cannot be written: the answer stands, and the log names the ask kind and id, never its text', async (t) => {
+  const f = await fleet(t, { verifier: stubVerifier() })
+  autoStart(f)
+  f.s.db.exec("CREATE TRIGGER no_decisions BEFORE INSERT ON consent_decisions BEGIN SELECT RAISE(ABORT, 'nope'); END")
+  const lines = []
+  t.mock.method(console, 'error', (...a) => { lines.push(a.map(String).join(' ')) })
+  const id = await parkSpawn(f)
+  assert.equal((await approve(f, 'spawn', id, 'follows the box rules')).status, 200)
+  await f.asker.waitFor((x) => x.kind === 'spawn' && x.event === 'outcome' && x.request_id === id)
+  const line = lines.find((l) => l.includes('consent decision not recorded'))
+  assert.ok(line, lines.join('\n'))
+  assert.ok(line.includes(`spawn ${id}`), line)
+  for (const text of ['fix the flaky test', 'flaky test', 'follows the box rules']) assert.ok(!line.includes(text), line)
 })

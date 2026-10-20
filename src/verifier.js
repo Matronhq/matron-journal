@@ -57,10 +57,12 @@ export function resolveVerifierKey(env = process.env) {
   return ''
 }
 
-// Only the fields the verifier is meant to judge are sent.
+// Only the fields the verifier is meant to judge are sent. The routine is its
+// name and prompt — the remit; its title is editable without the user's ask,
+// so it is never shown to the model.
 function inputOf({ routine, ask, reason }) {
   return {
-    routine: { name: routine.name, title: routine.title, prompt: routine.prompt },
+    routine: { name: routine.name, prompt: routine.prompt },
     ask: {
       kind: ask.kind,
       task: ask.task,
@@ -81,7 +83,12 @@ async function withDeadline(timeoutMs, call) {
   const ac = new AbortController()
   let timer
   const deadline = new Promise((_, reject) => {
-    timer = setTimeout(() => { ac.abort(); reject(new Error('timed out')) }, timeoutMs)
+    timer = setTimeout(() => {
+      ac.abort()
+      const err = new Error('timed out')
+      err.name = 'TimeoutError'
+      reject(err)
+    }, timeoutMs)
   })
   try {
     return await Promise.race([call(ac.signal), deadline])
@@ -89,6 +96,9 @@ async function withDeadline(timeoutMs, call) {
     clearTimeout(timer)
   }
 }
+
+const ERROR_NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/
+const errorName = (err) => (typeof err?.name === 'string' && ERROR_NAME_RE.test(err.name) ? err.name : 'unknown')
 
 export function makeVerifier({
   env = process.env,
@@ -141,7 +151,9 @@ export function makeVerifier({
       log.log(`journal: verifier ok approve=${approve}`)
       return { ok: true, approve, note: typeof out.note === 'string' ? out.note.slice(0, NOTE_MAX) : '' }
     } catch (err) {
-      log.error(`journal: verifier error ${err?.message ?? err}`)
+      // An SDK error's message can quote the request: its name and HTTP
+      // status only, never the message.
+      log.error(`journal: verifier error ${errorName(err)}${Number.isInteger(err?.status) ? ` status=${err.status}` : ''}`)
       return { ok: false, reason: 'error' }
     }
   }

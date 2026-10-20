@@ -233,7 +233,7 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   Agents: the Coordinator only, naming its own conversation as
   \`convo_id\` (403 \`not_coordinator\` otherwise). Fires at least 15
   minutes apart; 409 \`blocked_by: name|cap\`. \`DELETE /routines/:name\`
-  \`{convo_id}\` takes the same gate.
+  \`{convo_id}\` takes the same Coordinator gate and needs no \`causes\`.
 - \`POST /routines/:name/run\` \`{convo_id}\` → 202 — fire it now, whatever
   \`enabled\` says; the schedule is untouched. Every change and fire lands as
   a quiet \`routine\` event in the Coordinator conversation.
@@ -242,7 +242,7 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   \`causes\`, and they must be the user's words in your conversation or the
   user's comment on one of your items — a routine fire is not enough. 403
   \`routine_write_unverified\` (with \`why\`) otherwise; ask the user, or
-  leave it for them. Pausing, retitling, \`tz\` and \`DELETE\` need no ask.
+  leave it for them. Pausing, retitling and \`tz\` need no ask.
 - \`POST /briefings\` \`{convo_id, body (markdown, ≤32 KB)}\` → 201
   \`{briefing}\` — publish a briefing (Coordinator only, naming its own
   conversation). The journal writes it into that conversation as your

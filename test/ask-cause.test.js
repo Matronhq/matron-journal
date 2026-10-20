@@ -242,6 +242,18 @@ test('routine: a fired_at 5 min off last_fired_at fails', () => {
   assert.match(r.why, /last fire/)
 })
 
+test('routine: the 6 h and after-the-ask bounds are measured on the recorded fire, not the cited time', () => {
+  const createdAt = Date.now()
+  // Recorded just past 6 h before the ask; the citation, inside the slack, just inside it.
+  const old = routine({ firedAt: createdAt - SELF_APPROVAL_ROUTINE_WINDOW_MS - 30 * 1000 })
+  assert.deepEqual(resolve([{ kind: 'routine', ref: `routine:${old.name}@${iso(old.firedAt + 59 * 1000)}` }], { createdAt }),
+    { ok: false, why: 'the routine cause fired more than 6 h before the ask' })
+  // Recorded just past the future slack; the citation just inside it.
+  const late = routine({ firedAt: createdAt + 5 * MIN + 30 * 1000 })
+  assert.deepEqual(resolve([{ kind: 'routine', ref: `routine:${late.name}@${iso(late.firedAt - 59 * 1000)}` }], { createdAt }),
+    { ok: false, why: 'the routine cause fired after the ask' })
+})
+
 test('routine: a fire 7 h old fails', () => {
   const r0 = routine({ firedAt: Date.now() - 7 * HOUR })
   const r = resolve([{ kind: 'routine', ref: `routine:${r0.name}@${iso(r0.firedAt)}` }])

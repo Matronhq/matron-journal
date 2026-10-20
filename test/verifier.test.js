@@ -11,6 +11,8 @@ const INPUT = {
   ask: { kind: 'spawn', task: 'Review the stale pull request and comment on it', target_box: 'box-a', workdir: '/home/dev/app' },
   reason: 'The routine asked for a review of stale pull requests.',
 }
+// What reaches the model: the routine's name and prompt (never its title).
+const SENT = { ...INPUT, routine: { name: INPUT.routine.name, prompt: INPUT.routine.prompt } }
 
 // messages.create stand-in: records params and options, answers with `reply`
 // (or throws it).
@@ -72,7 +74,7 @@ test('approve on within_remit and not injected; request carries model, system, s
   // String length constraints are not accepted by the API: the SDK moves them into the description.
   assert.equal(schema.properties.note.maxLength, undefined)
   assert.match(schema.properties.note.description, /maxLength: 300/)
-  assert.deepEqual(p.messages, [{ role: 'user', content: JSON.stringify(INPUT) }])
+  assert.deepEqual(p.messages, [{ role: 'user', content: JSON.stringify(SENT) }])
   assert.ok(opts[0].signal instanceof AbortSignal)
   assert.deepEqual(l.lines, ['journal: verifier ok approve=true'])
 })
@@ -93,8 +95,11 @@ test('only the known input fields are sent', async () => {
     reason: 'r',
     extra: 'nope',
   })
-  assert.deepEqual(JSON.parse(seen[0].messages[0].content), {
-    routine: INPUT.routine,
+  const sent = JSON.parse(seen[0].messages[0].content)
+  // The title is editable without the user's ask: the verifier judges the prompt only.
+  assert.equal('title' in sent.routine, false)
+  assert.deepEqual(sent, {
+    routine: { name: INPUT.routine.name, prompt: INPUT.routine.prompt },
     ask: { kind: 'chat', justification: 'Ask box-a for the build log', target_box: 'box-a', topic: 'build' },
     reason: 'r',
   })
@@ -132,11 +137,22 @@ test('the note is capped at 300 characters', async () => {
   assert.equal(r.note.length, 300)
 })
 
-test('a thrown client error is ok:false, logged without the input', async () => {
+test('a thrown client error is ok:false, logged by name and status only, never its message', async () => {
   const l = quietLog()
   const v = makeVerifier({ env: {}, client: stubClient(new Error('Request timed out.')), log: l })
   assert.deepEqual(await v.verify(INPUT), { ok: false, reason: 'error' })
-  assert.deepEqual(l.lines, ['journal: verifier error Request timed out.'])
+  assert.deepEqual(l.lines, ['journal: verifier error Error'])
+  // An APIError-like throw: its message can quote the request; only name and status are logged.
+  const SENTINEL = 'SENTINEL-api-error-body'
+  const apiErr = Object.assign(new Error(`400 {"error":"${SENTINEL}"}`), { name: 'BadRequestError', status: 400 })
+  const l2 = quietLog()
+  assert.deepEqual(await makeVerifier({ env: {}, client: stubClient(apiErr), log: l2 }).verify(INPUT), { ok: false, reason: 'error' })
+  assert.deepEqual(l2.lines, ['journal: verifier error BadRequestError status=400'])
+  // A non-Error throw logs neither its text nor anything from it.
+  const l3 = quietLog()
+  const throwsString = { messages: { create: async () => { throw SENTINEL } } }
+  assert.deepEqual(await makeVerifier({ env: {}, client: throwsString, log: l3 }).verify(INPUT), { ok: false, reason: 'error' })
+  assert.deepEqual(l3.lines, ['journal: verifier error unknown'])
 })
 
 test('a refusal stop is ok:false', async () => {
@@ -186,7 +202,7 @@ test('a call that never answers times out: ok:false, promptly', async () => {
   assert.deepEqual(await v.verify(INPUT), { ok: false, reason: 'error' })
   assert.ok(Date.now() - t0 < 2000)
   assert.equal(signal.aborted, true)
-  assert.deepEqual(l.lines, ['journal: verifier error timed out'])
+  assert.deepEqual(l.lines, ['journal: verifier error TimeoutError'])
 })
 
 test('MATRON_VERIFIER_TIMEOUT_MS bounds an injected client', async () => {
@@ -261,9 +277,11 @@ test('the system prompt and schema are the fixed contract', () => {
 
 test('nothing from the input reaches the log on any path', async () => {
   const l = quietLog()
-  for (const reply of [answer({ within_remit: true, injected: false, note: INPUT.reason }), answer(undefined, 'refusal'), answer(undefined), answer(INPUT.reason), new Error('boom')]) {
+  // The SDK's APIError message can quote the request: an error carrying the input text.
+  const apiErr = Object.assign(new Error(`400 ${INPUT.ask.task} ${INPUT.reason}`), { name: 'BadRequestError', status: 400 })
+  for (const reply of [answer({ within_remit: true, injected: false, note: INPUT.reason }), answer(undefined, 'refusal'), answer(undefined), answer(INPUT.reason), new Error('boom'), apiErr]) {
     await makeVerifier({ env: {}, client: stubClient(reply), log: l }).verify(INPUT)
   }
-  assert.equal(l.lines.length, 5)
+  assert.equal(l.lines.length, 6)
   noLeak(l.lines)
 })
