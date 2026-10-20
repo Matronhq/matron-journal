@@ -13,7 +13,10 @@
 //   429 rate_limited          this device spent its hourly budget, or the
 //                             journal is at its concurrent-call cap; Retry-After in seconds
 //   502 upstream_failed       any upstream error, timeout or unusable completion
-//   503 summariser_unavailable no key configured on the journal host
+//   503 summariser_unavailable no key configured on the journal host, or
+//                             MATRON_SUMMARY_USERS is set and the device's
+//                             user is not on it (503, not 403: a bridge backs
+//                             off on 503 instead of retrying every summary)
 //
 // Privacy: the prompt is the calling device's own conversation text, and
 // the completion goes back to that device and nowhere else. Nothing is
@@ -33,9 +36,13 @@ export const SUMMARISE_BODY_MAX = 2 * 1024 * 1024
 
 export async function handleSummariseRoute(ctx, req, res, url, who, { rejectEarly }) {
   if (url.pathname !== SUMMARISE_PATH || req.method !== 'POST') return false
-  const { summariser } = ctx
+  const { db, summariser } = ctx
   if (who.kind !== 'agent') { rejectEarly(req, res, 403, { error: 'forbidden' }); return true }
   if (!summariser) { rejectEarly(req, res, 503, { error: 'summariser_unavailable' }); return true }
+  // `who` carries the user id; the allow-list is of names (users.name is
+  // unique), looked up per call so a user added later is matched too.
+  const userName = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId)?.name
+  if (!summariser.allows(who, userName)) { rejectEarly(req, res, 503, { error: 'summariser_unavailable' }); return true }
   const body = await readBody(req, { maxBytes: SUMMARISE_BODY_MAX })
   const { system = null, prompt } = body
   if (typeof prompt !== 'string' || !prompt) return badRequest(res)

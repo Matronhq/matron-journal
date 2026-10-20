@@ -6,7 +6,7 @@ import path from 'node:path'
 import { createUser, createAgent } from '../src/auth.js'
 import { pinDevicePrivate } from '../src/db.js'
 import {
-  makeSummariser, makeConfiguredSummariser, resolveSummaryKey, makeWindowLimiter,
+  makeSummariser, makeConfiguredSummariser, resolveSummaryKey, makeWindowLimiter, parseSummaryUsers,
   ANTHROPIC_MESSAGES_URL, ANTHROPIC_VERSION, DEFAULT_SUMMARY_MODEL,
 } from '../src/summarise.js'
 import { SYSTEM_MAX_BYTES, PROMPT_MAX_BYTES } from '../src/summarise-http.js'
@@ -286,4 +286,52 @@ test('makeConfiguredSummariser: key from _FILE reaches upstream; model and limit
   const bad = quiet()
   assert.equal(makeConfiguredSummariser({ env: { MATRON_SUMMARY_ANTHROPIC_KEY_FILE: path.join(dir, 'missing') }, log: bad }), null)
   assert.ok(bad.lines.some((l) => l.includes('unreadable')))
+})
+
+test('parseSummaryUsers: trimmed names, empty entries dropped; unset or nothing left is null (everyone)', () => {
+  assert.deepEqual(parseSummaryUsers(' alice , ,bob,, '), new Set(['alice', 'bob']))
+  assert.deepEqual(parseSummaryUsers('alice'), new Set(['alice']))
+  for (const raw of [undefined, null, '', '   ', ',', ' , ,, ']) assert.equal(parseSummaryUsers(raw), null, JSON.stringify(raw))
+})
+
+test('MATRON_SUMMARY_USERS set: a listed user\'s box gets 200, an unlisted user\'s box 503 without an upstream call', async (t) => {
+  const f = await fleet(t, { make: { users: parseSummaryUsers(' alice, ,carol ,') } })
+  assert.equal((await f.post(f.boxA.token, { prompt: 'p' })).status, 200)
+  const res = await rawPost(f.s, f.bobBox.token, { prompt: SECRET_PROMPT })
+  assert.equal(res.status, 503)
+  assert.deepEqual(await res.json(), { error: 'summariser_unavailable' })
+  assert.equal(f.seen.length, 1, 'the unlisted call never went upstream')
+  // Still attributed to the device, in the log and in /metrics.
+  assert.ok(f.out.lines.some((l) => l.includes(`device=${f.bobBox.deviceId} user=`) && l.includes('not allowed')))
+  assert.ok(!f.out.lines.join('\n').includes(SECRET_PROMPT))
+  const m = (await f.s.http('/metrics', { token: f.client })).json.summarise
+  assert.deepEqual(m.outcomes, { ok: 1, not_allowed: 1 })
+  // A client of an unlisted user is still a client: 403, not 503.
+  const bobLogin = await f.s.http('/login', { method: 'POST', body: { username: 'bob', password: 'pw', device_name: 'phone' } })
+  assert.equal((await f.post(bobLogin.json.token, { prompt: 'p' })).status, 403)
+})
+
+test('MATRON_SUMMARY_USERS matches the user name exactly', async (t) => {
+  const f = await fleet(t, { make: { users: parseSummaryUsers('Alice') } })
+  assert.deepEqual(await f.post(f.boxA.token, { prompt: 'p' }), { status: 503, json: { error: 'summariser_unavailable' } })
+})
+
+test('MATRON_SUMMARY_USERS unset or empty: every user allowed', async (t) => {
+  for (const users of [null, parseSummaryUsers(''), parseSummaryUsers(' , ')]) {
+    const f = await fleet(t, { make: { users } })
+    assert.equal((await f.post(f.boxA.token, { prompt: 'p' })).status, 200)
+    assert.equal((await f.post(f.bobBox.token, { prompt: 'p' })).status, 200)
+  }
+})
+
+test('makeConfiguredSummariser reads MATRON_SUMMARY_USERS', () => {
+  const out = quiet()
+  const s = makeConfiguredSummariser({ env: { MATRON_SUMMARY_ANTHROPIC_KEY: 'k', MATRON_SUMMARY_USERS: 'alice, bob' }, log: out })
+  const who = { deviceId: 3, userId: 1 }
+  assert.equal(s.allows(who, 'alice'), true)
+  assert.equal(s.allows(who, 'bob'), true)
+  assert.equal(s.allows(who, 'carol'), false)
+  assert.equal(s.allows(who, undefined), false)
+  const open = makeConfiguredSummariser({ env: { MATRON_SUMMARY_ANTHROPIC_KEY: 'k' }, log: out })
+  assert.equal(open.allows(who, 'carol'), true)
 })

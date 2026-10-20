@@ -325,7 +325,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       if (handleLookupRoute({ db }, req, res, url, who)) return
       // Titles and rolling summaries for the bridges (src/summarise-http.js):
       // agent tokens only, null summariser = 503.
-      if (await handleSummariseRoute({ summariser }, req, res, url, who, { rejectEarly })) return
+      if (await handleSummariseRoute({ db, summariser }, req, res, url, who, { rejectEarly })) return
       const said = url.pathname.match(/^\/said\/([^/]+)$/)
       if (req.method === 'GET' && said) {
         // Did the account's own user write this? (src/said.js) A guarded

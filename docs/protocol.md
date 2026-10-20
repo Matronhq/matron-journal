@@ -462,8 +462,8 @@ the machine-checkable version of this page.
   requests, outcomes, input_tokens, ...}]}` is `POST /summarise`'s usage
   since the journal started: the totals are global, `devices` lists only the
   caller's own user's devices (private ones dropped for a filtered caller, as
-  above). `outcomes` counts `ok`, `rate_limited`, `busy` and
-  `upstream_failed`. All zero, `enabled:false`, without a key.
+  above). `outcomes` counts `ok`, `rate_limited`, `busy`, `not_allowed`
+  and `upstream_failed`. All zero, `enabled:false`, without a key.
 - `POST /summarise` (Bearer, agent devices only — a client gets 403
   `{error:'forbidden'}`) `{system?: string, prompt: string}` -> `{text,
   model, usage: {inputTokens, outputTokens, cacheReadTokens,
@@ -474,7 +474,8 @@ the machine-checkable version of this page.
   `stop_reason:'end_turn'` and have text. `system` is capped at 16 KiB and
   `prompt` at 256 KiB (UTF-8 bytes; over is 413 `{error:'too_large'}`);
   `prompt` missing or empty, or either not a string, is 400. Answers 503
-  `{error:'summariser_unavailable'}` with no key configured, 429
+  `{error:'summariser_unavailable'}` with no key configured or when the
+  calling device's user is not allowed (`MATRON_SUMMARY_USERS`, below), 429
   `{error:'rate_limited'}` with `Retry-After` (seconds) once the calling
   device has made `MATRON_SUMMARY_DEVICE_HOURLY` (default 120) calls in the
   last hour or `MATRON_SUMMARY_CONCURRENCY` (default 8) calls are already in
@@ -488,7 +489,14 @@ the machine-checkable version of this page.
   `MATRON_SUMMARY_ANTHROPIC_KEY_FILE` (a file holding it, so the key need not
   sit in the service's environment; a file that is set but unreadable is
   logged at boot and leaves the route at 503). `MATRON_SUMMARY_MODEL`
-  (default `claude-haiku-5-5`).
+  (default `claude-haiku-5-5`). `MATRON_SUMMARY_USERS`: a comma-separated
+  list of journal user names (`users.name`, the name signed in with —
+  matched exactly) whose agent devices may use the key; whitespace around
+  a name and empty entries are ignored. Unset, or empty after that, allows
+  every user, so a single-operator install needs nothing. An agent device of
+  an unlisted user gets 503 `{error:'summariser_unavailable'}` (not 403, so
+  a bridge backs off as it does when there is no key); the call is counted
+  as `not_allowed` against the device and logged, and never goes upstream.
 - `GET /devices` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`) -> `{devices: [{device_id, kind, name, created_at,
   cursor, lag, last_seen_at, is_self, connected, push_prefs, status?, defaults?}]}`. The

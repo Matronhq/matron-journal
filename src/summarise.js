@@ -34,6 +34,16 @@ export function resolveSummaryKey(env = process.env) {
   return ''
 }
 
+// MATRON_SUMMARY_USERS: the journal user names allowed to use the key, as a
+// comma-separated list. Whitespace around a name and empty entries are
+// dropped. Unset, or nothing left after that, is null: every user allowed,
+// so a single-operator install needs no setting.
+export function parseSummaryUsers(raw) {
+  if (typeof raw !== 'string') return null
+  const names = raw.split(',').map((n) => n.trim()).filter(Boolean)
+  return names.length ? new Set(names) : null
+}
+
 // A positive integer from the environment, or the default.
 const positiveInt = (raw, fallback) => {
   const n = Number(raw)
@@ -82,6 +92,8 @@ export function makeSummariser({
   fetchImpl = globalThis.fetch,
   now = Date.now,
   log = console,
+  // A Set of user names, or null for everyone (parseSummaryUsers).
+  users = null,
 } = {}) {
   if (!key) return null
   const limiter = makeWindowLimiter({ max: deviceHourly, now })
@@ -149,6 +161,17 @@ export function makeSummariser({
 
   return {
     model,
+    // Is this user (by name, users.name — unique, and exact as at /login)
+    // allowed to spend the key? An unlisted user's call is recorded against
+    // its device and logged, and the route answers 503 as if there were no
+    // key: a bridge backs off on 503, where a 403 would be retried on every
+    // summary.
+    allows(who, userName) {
+      if (!users || (typeof userName === 'string' && users.has(userName))) return true
+      record(who, 'not_allowed')
+      log.log(`summarise: device=${who.deviceId} user=${who.userId} not allowed (not in MATRON_SUMMARY_USERS)`)
+      return false
+    },
     // {status:'ok', text, model, usage} | {status:'rate_limited', retryAfter}
     // | {status:'busy', retryAfter} | {status:'upstream_failed'}.
     // `who` is the authenticated device; only its id and user are used.
@@ -209,9 +232,11 @@ export function makeConfiguredSummariser({ env = process.env, log = console, fet
     model: env.MATRON_SUMMARY_MODEL || DEFAULT_SUMMARY_MODEL,
     deviceHourly: positiveInt(env.MATRON_SUMMARY_DEVICE_HOURLY, DEFAULT_DEVICE_HOURLY),
     concurrency: positiveInt(env.MATRON_SUMMARY_CONCURRENCY, DEFAULT_CONCURRENCY),
+    users: parseSummaryUsers(env.MATRON_SUMMARY_USERS),
     log,
     ...(fetchImpl ? { fetchImpl } : {}),
   })
-  log.log(`summarise: POST /summarise is on, model ${s.model}`)
+  const users = parseSummaryUsers(env.MATRON_SUMMARY_USERS)
+  log.log(`summarise: POST /summarise is on, model ${s.model}, ${users ? `for ${users.size} listed user(s)` : 'for every user'}`)
   return s
 }
