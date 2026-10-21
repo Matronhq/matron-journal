@@ -2140,16 +2140,16 @@ is unique per `(user_id, idem_key)` in the schema, not per item.
     "action": "created|commented|closed|reopened|reordered|updated", "by": "user|agent",
     "awaiting": "user|agent|null", "resolution": "…|null",
     "actions": ["Go"], "chosen_action": "Go|null",
-    "comment": { "id": "ic_…", "body": "…", "action": "Go|null", "created_at": 1760000000000,
+    "comment": { "id": "ic_…", "body": "…", "action": "Go|null", "created_at": 1760000000000|null,
                  "attachments": [ … ] } } }
 ```
 
 `actions` and `chosen_action` are the item's action buttons at the moment of
 the marker (see *Action buttons*), on every marker; `comment.action` is the
 tapped label when the comment is an action tap, else `null`; `comment.created_at`
-is when the comment was left, in ms — the time a bridge quotes back in an
-`item_reply` / `item_tap` cause (see *Causes*), so it must be read from the
-marker, never recomputed.
+is when the comment was left, in ms (`null` when the comment carries no
+usable time) — the time a bridge quotes back in an `item_reply` / `item_tap`
+cause (see *Causes*), so it must be read from the marker, never recomputed.
 
 Same envelope (`seq, convo_id, ts, sender, type, payload`) as every other
 journal event. `comment` is present only when the action carried comment
