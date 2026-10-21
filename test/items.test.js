@@ -189,6 +189,48 @@ test('item read shape exposes origin_convo_title for provenance labelling', asyn
   assert.equal(getItem(db, alice.id, a.id).origin_convo_title, null)
 })
 
+test('device_name names the box whose session filed an agent\'s item', async () => {
+  const { db, alice, agent } = await seed() // box-2 hosts c1 and c2
+  const filed = createItem(db, base({ userId: alice.id, originDeviceId: agent.deviceId })).item
+  assert.equal(filed.device_name, 'box-2')
+  assert.equal(getItem(db, alice.id, filed.id).device_name, 'box-2')
+  assert.equal(listItems(db, alice.id, {}).items.find((it) => it.id === filed.id).device_name, 'box-2')
+  // The user's own item: the app names it "You", there is no box.
+  const mine = createItem(db, base({ userId: alice.id, originDeviceId: agent.deviceId, createdBy: 'user' })).item
+  assert.equal(mine.device_name, null)
+  // A contributor's item names them, not a box of the user's.
+  db.prepare("UPDATE items SET contributor_name='bob', contributor_via='agent' WHERE id=?").run(filed.id)
+  assert.equal(getItem(db, alice.id, filed.id).device_name, null)
+  db.prepare('UPDATE items SET contributor_name=NULL, contributor_via=NULL WHERE id=?').run(filed.id)
+  // A device that is gone degrades to null.
+  const gone = createItem(db, base({ userId: alice.id, originDeviceId: 9999 })).item
+  assert.equal(gone.device_name, null)
+})
+
+test('device_name: a handed-over item keeps naming the box that filed it', async () => {
+  const { db, alice, agent } = await seed()
+  const other = createAgent(db, alice.id, 'box-3')
+  upsertConversation(db, { id: 'c3', ownerUserId: alice.id, title: 'C3', agentDeviceId: other.deviceId })
+  const it = createItem(db, base({ userId: alice.id, originDeviceId: agent.deviceId })).item
+  // What acceptHandover writes: the new owner, and the filing conversation kept.
+  db.prepare("UPDATE items SET origin_convo_id='c3', origin_device_id=?, filed_convo_id='c1' WHERE id=?").run(other.deviceId, it.id)
+  assert.equal(getItem(db, alice.id, it.id).device_name, 'box-2')
+})
+
+test('device_name: a private box\'s name stays off an item an ordinary agent can read', async () => {
+  const { db, alice } = await seed()
+  const priv = createAgent(db, alice.id, 'secret-box')
+  db.prepare('UPDATE devices SET private=1 WHERE id=?').run(priv.deviceId)
+  upsertConversation(db, { id: 'p1', ownerUserId: alice.id, title: 'P1', agentDeviceId: priv.deviceId })
+  // Filed in the private box's own conversation: only the user and private
+  // agents can read the item, so the name shows.
+  const own = createItem(db, base({ userId: alice.id, originConvoId: 'p1', originDeviceId: priv.deviceId })).item
+  assert.equal(own.device_name, 'secret-box')
+  // Filed into a public box's conversation: ordinary agents read it too.
+  const crossed = createItem(db, base({ userId: alice.id, originConvoId: 'c1', originDeviceId: priv.deviceId })).item
+  assert.equal(crossed.device_name, null)
+})
+
 test('origin_convo_title never discloses the title of another user\'s conversation', async () => {
   const { db, alice, pat, agent } = await seed()
   // Conversation ids are a global PK: if alice's item points at an id that pat
