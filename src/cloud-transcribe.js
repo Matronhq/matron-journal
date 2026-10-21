@@ -84,44 +84,61 @@ export function makeAzureTranscriber({
 } = {}) {
   if (!key) return null
   const url = `${String(endpoint).replace(/\/+$/, '')}/speechtotext/transcriptions:transcribe?api-version=${AZURE_API_VERSION}`
+  // diskPath -> Azure's parsed reply. Throws on an ffmpeg failure (a video
+  // with no audio stream among them) or an HTTP error.
+  async function callAzure(diskPath, { signal, userId = null } = {}) {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-'))
+    const flacPath = path.join(tmpDir, 'audio.flac')
+    try {
+      await toFlac(exec, diskPath, flacPath, { timeout: ffmpegTimeoutMs, signal })
+      const definition = {
+        locales: [locale],
+        phraseList: { phrases: phrasesFor(phrases, deviceNames, userId) },
+        ...(model ? { enhancedMode: { enabled: true, model, modelOptions: { transcribeStyle: style } } } : {}),
+      }
+      const form = new FormData()
+      form.append('audio', new Blob([fs.readFileSync(flacPath)], { type: 'audio/flac' }), 'audio.flac')
+      form.append('definition', JSON.stringify(definition))
+      const timeout = AbortSignal.timeout(requestTimeoutMs)
+      const res = await fetchImpl(url, {
+        method: 'POST',
+        headers: { 'Ocp-Apim-Subscription-Key': key },
+        body: form,
+        signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+      })
+      if (!res.ok) {
+        // The body is Azure's {code, message}; it never echoes the key.
+        const detail = (await res.text().catch(() => '')).slice(0, 200)
+        throw new Error(`azure transcription HTTP ${res.status}: ${detail}`)
+      }
+      return await res.json()
+    } finally {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }) } catch { /* best effort */ }
+    }
+  }
+  const combinedText = (body) => (body?.combinedPhrases ?? []).map((p) => p.text ?? '').join(' ').replace(/\s+/g, ' ').trim()
   return {
     kind: 'cloud',
     label: `Azure ${model || 'standard'} at ${new URL(url).host}`,
     concurrency,
     // diskPath -> transcript string. Throws on any failure, including audio
     // with no words in it; the caller records that as 'failed'.
-    async transcribeFile(diskPath, { signal, userId = null } = {}) {
-      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-'))
-      const flacPath = path.join(tmpDir, 'audio.flac')
-      try {
-        await toFlac(exec, diskPath, flacPath, { timeout: ffmpegTimeoutMs, signal })
-        const definition = {
-          locales: [locale],
-          phraseList: { phrases: phrasesFor(phrases, deviceNames, userId) },
-          ...(model ? { enhancedMode: { enabled: true, model, modelOptions: { transcribeStyle: style } } } : {}),
-        }
-        const form = new FormData()
-        form.append('audio', new Blob([fs.readFileSync(flacPath)], { type: 'audio/flac' }), 'audio.flac')
-        form.append('definition', JSON.stringify(definition))
-        const timeout = AbortSignal.timeout(requestTimeoutMs)
-        const res = await fetchImpl(url, {
-          method: 'POST',
-          headers: { 'Ocp-Apim-Subscription-Key': key },
-          body: form,
-          signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
-        })
-        if (!res.ok) {
-          // The body is Azure's {code, message}; it never echoes the key.
-          const detail = (await res.text().catch(() => '')).slice(0, 200)
-          throw new Error(`azure transcription HTTP ${res.status}: ${detail}`)
-        }
-        const body = await res.json()
-        const text = (body.combinedPhrases ?? []).map((p) => p.text ?? '').join(' ').replace(/\s+/g, ' ').trim()
-        if (!text) throw new Error('empty transcription result')
-        return text
-      } finally {
-        try { fs.rmSync(tmpDir, { recursive: true, force: true }) } catch { /* best effort */ }
-      }
+    async transcribeFile(diskPath, opts = {}) {
+      const text = combinedText(await callAzure(diskPath, opts))
+      if (!text) throw new Error('empty transcription result')
+      return text
+    },
+    // diskPath -> {text, segments: [{start_ms, text}]}, one segment per
+    // phrase Azure recognised, from where it starts. For a video upload's
+    // audio track; the same failures throw, an empty one included.
+    async transcribeFileSegments(diskPath, opts = {}) {
+      const body = await callAzure(diskPath, opts)
+      const text = combinedText(body)
+      if (!text) throw new Error('empty transcription result')
+      const segments = (body.phrases ?? [])
+        .map((p) => ({ start_ms: Math.max(0, Math.round(Number(p.offsetMilliseconds) || 0)), text: String(p.text ?? '').replace(/\s+/g, ' ').trim() }))
+        .filter((seg) => seg.text)
+      return { text, segments }
     },
   }
 }

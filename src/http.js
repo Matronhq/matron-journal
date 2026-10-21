@@ -992,16 +992,17 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           await fs.promises.unlink(received.diskPath).catch(() => {})
           throw e
         }
-        // A user's voice note goes straight off to the cloud transcriber, so
-        // its words are usually ready before the message naming it is sent.
-        // An agent's upload is never a voice note to transcribe.
+        // A user's voice note (or a video's audio track) goes straight off
+        // to the cloud transcriber, so its words are usually ready before the
+        // message naming it is sent. An agent's upload is never transcribed.
         const transcribing = who.kind !== 'agent' && !!blobTranscripts?.start(received.id, who.userId, contentType)
         return json(res, 200, { media_id: received.id, size: received.size, content_type: contentType, sha256: received.sha256, ...(dims ?? {}), ...(transcribing ? { transcript_status: 'pending' } : {}) })
       }
       const mt = url.pathname.match(/^\/media\/([^/]+)\/transcript$/)
       if (req.method === 'GET' && mt) {
         // The words of a voice note transcribed at upload (blob-transcripts.js):
-        // {status: 'none'|'pending'|'done'|'failed', transcript?}. ?wait=N
+        // {status: 'none'|'pending'|'done'|'failed', transcript?, segments?}
+        // — segments ([{start_ms, text}]) only for a video's. ?wait=N
         // (seconds, at most 30) holds a pending answer until the job settles,
         // so a bridge asks once instead of polling. Same read rule and same
         // 404 for missing-or-not-yours as GET /media/:id.

@@ -880,6 +880,10 @@ export function openDb(path) {
   // When the words landed: the clock runExpireVoiceNotes (retention.js)
   // measures a chat voice note's audio life from.
   if (!blobCols.some((c) => c.name === 'transcribed_at')) db.exec('ALTER TABLE blobs ADD COLUMN transcribed_at INTEGER')
+  // A video upload's words with their timing: JSON [{start_ms, text}], set
+  // with transcript when a video job is 'done'; NULL for audio and for every
+  // row before this column.
+  if (!blobCols.some((c) => c.name === 'transcript_segments')) db.exec('ALTER TABLE blobs ADD COLUMN transcript_segments TEXT')
   // Keeps the per-user quota SUM (see userBlobBytes) a cheap index scan rather
   // than a full-table read as the blob store grows.
   db.exec('CREATE INDEX IF NOT EXISTS idx_blobs_owner ON blobs(owner_user_id)')

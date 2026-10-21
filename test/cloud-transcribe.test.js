@@ -295,3 +295,90 @@ test('makeConfiguredTranscriber: key + a configured but missing whisper model �
   assert.match(log.lines[1], /transcribed on upload by Azure .* \(no whisper fallback\)$/)
   assert.ok(log.lines.every((l) => !/NOT be transcribed/.test(l)))
 })
+
+test('segments: phrases become start_ms/text, text is combinedPhrases', async () => {
+  const seen = []
+  const t = makeAzureTranscriber({
+    key: 'k',
+    fetchImpl: fakeFetch({ body: { combinedPhrases: [{ text: 'a b' }], phrases: [{ offsetMilliseconds: 0, text: 'a' }, { offsetMilliseconds: 1200, text: 'b' }] } }, seen),
+    exec: fakeExec(),
+    deviceNames: () => ['alice-mac'],
+  })
+  assert.deepEqual(await t.transcribeFileSegments('/media/ab/vid', { userId: 7 }), {
+    text: 'a b',
+    segments: [{ start_ms: 0, text: 'a' }, { start_ms: 1200, text: 'b' }],
+  })
+  // Same request as transcribeFile: the user's box names ride in the phrase list.
+  assert.ok(seen[0].definition.phraseList.phrases.includes('alice-mac'))
+  // transcribeFile still answers with the words alone.
+  assert.equal(await t.transcribeFile('/x'), 'a b')
+})
+
+test('segments: empty → throws \'empty transcription result\'', async () => {
+  const calls = []
+  const empty = makeAzureTranscriber({ key: 'k', fetchImpl: fakeFetch({ body: { combinedPhrases: [], phrases: [] } }), exec: fakeExec(calls) })
+  await assert.rejects(empty.transcribeFileSegments('/x'), { message: 'empty transcription result' })
+  const none = makeAzureTranscriber({ key: 'k', fetchImpl: fakeFetch({ body: {} }), exec: fakeExec(calls) })
+  await assert.rejects(none.transcribeFileSegments('/x'), { message: 'empty transcription result' })
+  for (const [, args] of calls) assert.equal(fs.existsSync(path.dirname(args[args.length - 1])), false)
+})
+
+test('segments: a video with no audio stream (ffmpeg fails) throws, and the temp dir is removed', async () => {
+  let flacDir = null
+  const exec = async (cmd, args) => { flacDir = path.dirname(args[args.length - 1]); throw new Error('Output file does not contain any stream') }
+  let fetched = 0
+  const t = makeAzureTranscriber({ key: 'k', fetchImpl: async () => { fetched++ }, exec })
+  await assert.rejects(t.transcribeFileSegments('/media/ab/mute'), /does not contain any stream/)
+  assert.equal(fetched, 0)
+  assert.equal(fs.existsSync(flacDir), false)
+})
+
+const withSegments = (t, impl) => Object.assign(t, { segCalls: 0, async transcribeFileSegments(diskPath, opts) { t.segCalls++; return impl(diskPath, opts) } })
+
+test('segments: primary failure → fallback segments', async () => {
+  const log = logSpy()
+  const primary = withSegments(azureLike(async () => 'unused'), async () => { throw new Error('azure transcription HTTP 503: busy') })
+  const seen = []
+  const fallback = withSegments(fakeTranscriber(async () => 'unused'), async (diskPath, opts) => { seen.push([diskPath, opts.userId]); return { text: 'w', segments: [{ start_ms: 1200, text: 'w' }] } })
+  const t = makeChainedTranscriber(primary, fallback, { log })
+  assert.deepEqual(await t.transcribeFileSegments('/media/ab/vid', { userId: 7 }), { text: 'w', segments: [{ start_ms: 1200, text: 'w' }] })
+  assert.deepEqual(seen, [['/media/ab/vid', 7]])
+  assert.equal(primary.calls + fallback.calls, 0) // transcribeFile never ran
+  assert.equal(log.lines.length, 1)
+  assert.match(log.lines[0], /HTTP 503.*trying whisper/)
+})
+
+test('segments: the chain offers transcribeFileSegments only when both sides have it', () => {
+  const both = makeChainedTranscriber(withSegments(azureLike(async () => ''), async () => ({})), withSegments(fakeTranscriber(async () => ''), async () => ({})), { log: logSpy() })
+  assert.equal(typeof both.transcribeFileSegments, 'function')
+  const primaryOnly = makeChainedTranscriber(withSegments(azureLike(async () => ''), async () => ({})), fakeTranscriber(async () => ''), { log: logSpy() })
+  assert.equal(primaryOnly.transcribeFileSegments, undefined)
+})
+
+test('segments: whisper runs one at a time across transcribeFile and transcribeFileSegments', async () => {
+  let inflight = 0
+  let maxInflight = 0
+  const releases = []
+  const hold = async (out) => { inflight++; maxInflight = Math.max(maxInflight, inflight); await new Promise((r) => releases.push(r)); inflight--; return out }
+  const primary = withSegments(azureLike(async () => { throw new Error('down') }), async () => { throw new Error('down') })
+  const fallback = withSegments(fakeTranscriber(async () => hold('note')), async () => hold({ text: 'vid', segments: [] }))
+  const t = makeChainedTranscriber(primary, fallback, { log: logSpy() })
+  const runs = [t.transcribeFile('/a'), t.transcribeFileSegments('/v'), t.transcribeFile('/b')]
+  for (let released = 0; released < 3; released++) {
+    while (releases.length === 0) await new Promise((r) => setImmediate(r))
+    assert.equal(inflight, 1)
+    releases.shift()()
+  }
+  assert.deepEqual(await Promise.all(runs), ['note', { text: 'vid', segments: [] }, 'note'])
+  assert.equal(maxInflight, 1)
+})
+
+test('makeConfiguredTranscriber: key + the real whisper → the chain offers transcribeFileSegments', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jt-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const modelPath = path.join(dir, 'ggml-small.bin'); fs.writeFileSync(modelPath, '')
+  const cliPath = path.join(dir, 'whisper-cli'); fs.writeFileSync(cliPath, '')
+  const tr = makeConfiguredTranscriber({ env: { MATRON_STT_AZURE_KEY: 'k' }, log: logSpy(), whisper: (opts) => makeTranscriber({ ...opts, modelPath, cliPath }) })
+  assert.equal(typeof tr.transcribeFileSegments, 'function')
+  assert.equal(tr.kind, 'cloud')
+})

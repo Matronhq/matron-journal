@@ -75,6 +75,27 @@ export function whisperCliPath(modelPath) {
 // whisper-cli prints non-speech markers ([BLANK_AUDIO], [MUSIC]) inline.
 export const cleanWhisperText = (stdout) => String(stdout).replace(/\[.*?\]/g, '').replace(/\s+/g, ' ').trim()
 
+// whisper-cli's default (timestamped) stdout, one line per segment:
+//   [00:00:04.320 --> 00:00:07.100]   And when I tap Pay, it freezes.
+// -> [{start_ms: 4320, text: 'And when I tap Pay, it freezes.'}]. Only the
+// start is kept; non-speech markers ([BLANK_AUDIO], (typing)) and empty
+// segments are dropped. Same rule as the bridge's parseWhisperSegments, in
+// milliseconds rather than seconds.
+export function parseSegments(stdout) {
+  const segments = []
+  for (const line of String(stdout).split('\n')) {
+    const m = line.match(/^\s*\[(\d{2}):(\d{2}):(\d{2})\.(\d{3}) --> [^\]]+\]\s*(.*)$/)
+    if (!m) continue
+    const text = m[5].replace(/\s+/g, ' ').trim()
+    if (!text || /^\[.*\]$/.test(text) || /^\(.*\)$/.test(text)) continue
+    const start_ms = ((Number(m[1]) * 60 + Number(m[2])) * 60 + Number(m[3])) * 1000 + Number(m[4])
+    segments.push({ start_ms, text })
+  }
+  return segments
+}
+
+const segmentsText = (segments) => segments.map((seg) => seg.text).join(' ').replace(/\s+/g, ' ').trim()
+
 // Returns null when transcription is not configured on this host, or is
 // configured but the binary/model is missing (said once, loudly, at boot —
 // a journal that silently never transcribes looks identical to a slow one).
@@ -92,6 +113,8 @@ export function makeTranscriber({
   exec = execFileAsync,
   ffmpegTimeoutMs = 30000,
   whisperTimeoutMs = 120000,
+  // transcribeFileSegments' whisper timeout: videos run longer than notes.
+  segmentsTimeoutMs = 600000,
   log = console,
   // What a configured but missing model or binary means, for the boot line:
   // the cloud path words it as a missing fallback instead.
@@ -105,36 +128,62 @@ export function makeTranscriber({
       return null
     }
   }
+  const words = (t) => t.split(/\s+/).filter(Boolean).length
+  // ffmpeg sniffs the container itself, so the blob's extensionless path is
+  // fine as input; -vn keeps a video upload's audio track only, and a video
+  // with no audio stream fails here. fn(wavPath) runs with the WAV in a temp
+  // dir that is removed afterwards, whatever happens.
+  async function withWav(diskPath, signal, fn) {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-'))
+    const wavPath = path.join(tmpDir, 'audio.wav')
+    try {
+      await exec('ffmpeg', ['-nostdin', '-i', diskPath, '-vn', '-ar', '16000', '-ac', '1', '-f', 'wav', '-y', wavPath], { timeout: ffmpegTimeoutMs, signal })
+      return await fn(wavPath)
+    } finally {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }) } catch { /* best effort */ }
+    }
+  }
+  // whisper-cli over the WAV -> the stdout of the run kept. `timestamps`
+  // keeps whisper's segment lines (no --no-timestamps); `textOf` reads the
+  // words out of a run's stdout for the prompt guard.
+  async function runWhisper(wavPath, { timestamps, timeoutMs, textOf, signal, userId }) {
+    const promptArgs = prompt ? ['--prompt', withDeviceNames(prompt, deviceNames, userId)] : []
+    const run = async (extra) => (await exec(cli, ['-m', modelPath, '-f', wavPath, ...(timestamps ? [] : ['--no-timestamps']), '-l', language, ...extra], { timeout: timeoutMs, signal })).stdout
+    let stdout = await run(promptArgs)
+    if (promptArgs.length && promptLooksTruncated(textOf(stdout), wavSeconds(wavPath))) {
+      // A rerun that fails (timeout, crash) costs nothing: the prompted
+      // transcript stands. Cancellation still propagates.
+      try {
+        const bare = await run([])
+        if (words(textOf(bare)) > words(textOf(stdout))) stdout = bare
+      } catch (err) {
+        if (signal?.aborted || err?.name === 'AbortError') throw err
+      }
+    }
+    return stdout
+  }
   return {
     // diskPath -> transcript string. Throws on any failure, including speech
     // whisper found no words in — the caller records that as 'failed'.
     // `signal` aborts the running child (journal shutdown).
     async transcribeFile(diskPath, { signal, userId = null } = {}) {
-      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-'))
-      const wavPath = path.join(tmpDir, 'audio.wav')
-      try {
-        // ffmpeg sniffs the container itself, so the blob's extensionless
-        // path is fine as input.
-        await exec('ffmpeg', ['-nostdin', '-i', diskPath, '-vn', '-ar', '16000', '-ac', '1', '-f', 'wav', '-y', wavPath], { timeout: ffmpegTimeoutMs, signal })
-        const promptArgs = prompt ? ['--prompt', withDeviceNames(prompt, deviceNames, userId)] : []
-        const run = async (extra) => cleanWhisperText((await exec(cli, ['-m', modelPath, '-f', wavPath, '--no-timestamps', '-l', language, ...extra], { timeout: whisperTimeoutMs, signal })).stdout)
-        let text = await run(promptArgs)
-        if (promptArgs.length && promptLooksTruncated(text, wavSeconds(wavPath))) {
-          // A rerun that fails (timeout, crash) costs nothing: the prompted
-          // transcript stands. Cancellation still propagates.
-          try {
-            const bare = await run([])
-            const words = (t) => t.split(/\s+/).filter(Boolean).length
-            if (words(bare) > words(text)) text = bare
-          } catch (err) {
-            if (signal?.aborted || err?.name === 'AbortError') throw err
-          }
-        }
+      return withWav(diskPath, signal, async (wavPath) => {
+        const text = cleanWhisperText(await runWhisper(wavPath, { timestamps: false, timeoutMs: whisperTimeoutMs, textOf: cleanWhisperText, signal, userId }))
         if (!text) throw new Error('empty transcription result')
         return text
-      } finally {
-        try { fs.rmSync(tmpDir, { recursive: true, force: true }) } catch { /* best effort */ }
-      }
+      })
+    },
+    // diskPath -> {text, segments: [{start_ms, text}]}, from whisper's own
+    // segment timestamps: a video upload's audio track. Same failures as
+    // transcribeFile (no words, no audio stream), on a longer timeout.
+    async transcribeFileSegments(diskPath, { signal, userId = null } = {}) {
+      return withWav(diskPath, signal, async (wavPath) => {
+        const textOf = (stdout) => segmentsText(parseSegments(stdout))
+        const segments = parseSegments(await runWhisper(wavPath, { timestamps: true, timeoutMs: segmentsTimeoutMs, textOf, signal, userId }))
+        const text = segmentsText(segments)
+        if (!text) throw new Error('empty transcription result')
+        return { text, segments }
+      })
     },
   }
 }

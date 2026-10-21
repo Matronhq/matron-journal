@@ -7,24 +7,30 @@ import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import { openDb } from '../src/db.js'
-import { makeBlobTranscripts, readBlobTranscript } from '../src/blob-transcripts.js'
+import { makeBlobTranscripts, readBlobTranscript, isTranscribableType } from '../src/blob-transcripts.js'
+import { makeAzureTranscriber, makeChainedTranscriber } from '../src/cloud-transcribe.js'
+import { makeTranscriber } from '../src/transcribe.js'
 
 // A cloud transcriber whose jobs the test releases by hand, so 'pending' is a
 // state the assertions can observe rather than a race.
-function gatedCloud({ concurrency = 4 } = {}) {
+// With `segments`, it also has transcribeFileSegments (what a video job
+// calls); each call records which method ran.
+function gatedCloud({ concurrency = 4, segments = false } = {}) {
   const calls = []
   const waiters = []
+  const gate = (method) => (diskPath, { signal, userId } = {}) => {
+    calls.push({ diskPath, userId, method })
+    return new Promise((resolve, reject) => {
+      waiters.push({ resolve, reject })
+      signal?.addEventListener('abort', () => reject(new Error('aborted')))
+    })
+  }
   return {
     kind: 'cloud',
     concurrency,
     calls,
-    transcribeFile(diskPath, { signal, userId } = {}) {
-      calls.push({ diskPath, userId })
-      return new Promise((resolve, reject) => {
-        waiters.push({ resolve, reject })
-        signal?.addEventListener('abort', () => reject(new Error('aborted')))
-      })
-    },
+    transcribeFile: gate('transcribeFile'),
+    ...(segments ? { transcribeFileSegments: gate('transcribeFileSegments') } : {}),
     pending: () => waiters.length,
     release(text) { waiters.shift().resolve(text) },
     fail(msg = 'boom') { waiters.shift().reject(new Error(msg)) },
@@ -200,4 +206,145 @@ test('an item voice note reuses the upload-time transcript: the audio is sent to
   assert.equal(updated.payload.comment.attachments[0].transcript, 'option A please')
   assert.equal(tr.calls.length, 1)
   ws.close()
+})
+
+const SEGMENTS = [{ start_ms: 0, text: 'a' }, { start_ms: 1200, text: 'b' }]
+
+test('isTranscribableType: audio and video, any case; nothing else', () => {
+  for (const ct of ['audio/mp4', 'audio/ogg', 'video/mp4', 'video/quicktime', 'Video/WebM']) assert.equal(isTranscribableType(ct), true, ct)
+  for (const ct of ['image/png', 'application/octet-stream', 'text/plain', '', null, undefined]) assert.equal(isTranscribableType(ct), false, String(ct))
+})
+
+test('video upload by a user is queued and stores segments', async (t) => {
+  const tr = gatedCloud({ segments: true })
+  const { s, aliceToken, upload } = await setup(t, { transcriber: tr })
+  const up = await upload(aliceToken, 'video/mp4', Buffer.from('fake-video'))
+  assert.equal(up.transcript_status, 'pending')
+  await until(() => tr.pending() === 1)
+  assert.equal(tr.calls[0].method, 'transcribeFileSegments')
+  const waiting = s.http(`/media/${up.media_id}/transcript?wait=10`, { token: aliceToken })
+  await new Promise((r) => setTimeout(r, 30))
+  tr.release({ text: ' a b ', segments: SEGMENTS })
+  const done = await waiting
+  assert.equal(done.status, 200)
+  assert.deepEqual(done.json, { status: 'done', transcript: 'a b', segments: SEGMENTS })
+  const row = s.db.prepare('SELECT transcript_segments, transcribed_at FROM blobs WHERE id=?').get(up.media_id)
+  assert.equal(typeof row.transcript_segments, 'string')
+  assert.deepEqual(JSON.parse(row.transcript_segments), SEGMENTS)
+  assert.ok(Number.isInteger(row.transcribed_at))
+})
+
+test('audio upload response has no segments key', async (t) => {
+  const tr = gatedCloud({ segments: true })
+  const { s, aliceToken, upload } = await setup(t, { transcriber: tr })
+  const up = await upload(aliceToken, 'audio/mp4')
+  await until(() => tr.pending() === 1)
+  assert.equal(tr.calls[0].method, 'transcribeFile') // audio jobs stay as they are
+  tr.release('just words')
+  const done = await s.http(`/media/${up.media_id}/transcript?wait=5`, { token: aliceToken })
+  assert.deepEqual(done.json, { status: 'done', transcript: 'just words' })
+  assert.equal('segments' in done.json, false)
+  assert.equal(s.db.prepare('SELECT transcript_segments FROM blobs WHERE id=?').get(up.media_id).transcript_segments, null)
+})
+
+test('video job whose transcriber throws settles failed', async (t) => {
+  const tr = gatedCloud({ concurrency: 1, segments: true })
+  const { s, aliceToken, upload } = await setup(t, { transcriber: tr })
+  const up = await upload(aliceToken, 'video/mp4')
+  await until(() => tr.pending() === 1)
+  tr.fail('Output file does not contain any stream')
+  const r = await s.http(`/media/${up.media_id}/transcript?wait=5`, { token: aliceToken })
+  assert.deepEqual(r.json, { status: 'failed' })
+  assert.equal(s.db.prepare('SELECT transcript_segments FROM blobs WHERE id=?').get(up.media_id).transcript_segments, null)
+  // The one slot is free again: the next upload runs.
+  const next = await upload(aliceToken, 'audio/mp4')
+  await until(() => tr.pending() === 1)
+  tr.release('next')
+  assert.deepEqual((await s.http(`/media/${next.media_id}/transcript?wait=5`, { token: aliceToken })).json, { status: 'done', transcript: 'next' })
+})
+
+test('a video with no audio stream, through the real Azure-then-whisper chain, settles failed and does not wedge the queue', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-bt-w-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const modelPath = path.join(dir, 'ggml-small.bin'); fs.writeFileSync(modelPath, '')
+  const cliPath = path.join(dir, 'whisper-cli'); fs.writeFileSync(cliPath, '')
+  // ffmpeg as it behaves on a video with no audio track: it refuses (here,
+  // any blob whose bytes say "mute"). Anything else decodes.
+  const ffmpegRuns = []
+  const ffmpeg = async (args) => {
+    const input = args[args.indexOf('-i') + 1]
+    const mute = fs.readFileSync(input, 'utf8').startsWith('mute')
+    ffmpegRuns.push(mute ? 'mute' : 'ok')
+    if (mute) throw new Error('Output file #0 does not contain any stream')
+    fs.writeFileSync(args[args.length - 1], 'decoded')
+    return { stdout: '' }
+  }
+  const quiet = { log() {}, error() {} }
+  let fetched = 0
+  const azure = makeAzureTranscriber({
+    key: 'k',
+    exec: (cmd, args) => ffmpeg(args),
+    fetchImpl: async () => { fetched++; return { ok: true, status: 200, json: async () => ({ combinedPhrases: [{ text: 'a b' }], phrases: SEGMENTS.map((x) => ({ offsetMilliseconds: x.start_ms, text: x.text })) }) } },
+  })
+  let whisperRuns = 0
+  const whisper = makeTranscriber({ modelPath, cliPath, prompt: '', log: quiet, exec: async (cmd, args) => { if (cmd === 'ffmpeg') return ffmpeg(args); whisperRuns++; return { stdout: '' } } })
+  const tr = makeChainedTranscriber(azure, whisper, { log: quiet })
+  assert.equal(typeof tr.transcribeFileSegments, 'function')
+  const { s, aliceToken, upload } = await setup(t, { transcriber: tr })
+
+  const up = await upload(aliceToken, 'video/mp4', Buffer.from('mute screen recording'))
+  assert.equal(up.transcript_status, 'pending')
+  const r = await s.http(`/media/${up.media_id}/transcript?wait=10`, { token: aliceToken })
+  assert.deepEqual(r.json, { status: 'failed' })
+  // Azure's ffmpeg refused, whisper's ffmpeg refused; neither sent nor ran anything.
+  assert.deepEqual(ffmpegRuns, ['mute', 'mute'])
+  assert.equal(fetched, 0)
+  assert.equal(whisperRuns, 0)
+
+  // The queue (and whisper's one-at-a-time slot) is free: a video with sound runs.
+  const next = await upload(aliceToken, 'video/mp4', Buffer.from('a video with sound'))
+  const ok = await s.http(`/media/${next.media_id}/transcript?wait=10`, { token: aliceToken })
+  assert.deepEqual(ok.json, { status: 'done', transcript: 'a b', segments: SEGMENTS })
+})
+
+test('a video is left to the bridge when the transcriber cannot give segments', async (t) => {
+  const tr = gatedCloud() // transcribeFile only
+  const { aliceToken, upload } = await setup(t, { transcriber: tr })
+  const up = await upload(aliceToken, 'video/mp4')
+  assert.equal(up.transcript_status, undefined)
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(tr.calls.length, 0)
+})
+
+test('readBlobTranscript: segments only on a done row that has them', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-bt-'))
+  const db = openDb(path.join(dir, 'x.db'))
+  t.after(() => db.close())
+  await users(db)
+  const ins = db.prepare('INSERT INTO blobs(id,owner_user_id,content_type,size,sha256,disk_path,created_at,transcript_status,transcript,transcript_segments) VALUES(?,?,?,?,?,?,?,?,?,?)')
+  ins.run('v', 1, 'video/mp4', 1, 'x', '/m/v', Date.now(), 'done', 'a b', JSON.stringify(SEGMENTS))
+  ins.run('a', 1, 'audio/ogg', 1, 'x', '/m/a', Date.now(), 'done', 'words', null)
+  ins.run('p', 1, 'video/mp4', 1, 'x', '/m/p', Date.now(), 'pending', null, null)
+  assert.deepEqual(readBlobTranscript(db, 'v'), { status: 'done', transcript: 'a b', segments: SEGMENTS })
+  assert.deepEqual(readBlobTranscript(db, 'a'), { status: 'done', transcript: 'words' })
+  assert.deepEqual(readBlobTranscript(db, 'p'), { status: 'pending' })
+})
+
+test('migration: an existing blobs table gains transcript_segments, NULL on old rows', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-bt-'))
+  const file = path.join(dir, 'x.db')
+  const db = openDb(file)
+  await users(db)
+  db.prepare("INSERT INTO blobs(id,owner_user_id,content_type,size,sha256,disk_path,created_at,transcript_status,transcript) VALUES('old',1,'audio/ogg',1,'x','/m/old',1,'done','w')").run()
+  db.exec('ALTER TABLE blobs DROP COLUMN transcript_segments')
+  db.close()
+  const again = openDb(file)
+  t.after(() => again.close())
+  const cols = again.prepare('PRAGMA table_info(blobs)').all()
+  const col = cols.find((c) => c.name === 'transcript_segments')
+  assert.ok(col, 'column added')
+  assert.equal(col.type, 'TEXT')
+  assert.equal(col.notnull, 0)
+  assert.equal(again.prepare("SELECT transcript_segments FROM blobs WHERE id='old'").get().transcript_segments, null)
+  assert.deepEqual(readBlobTranscript(again, 'old'), { status: 'done', transcript: 'w' })
 })
