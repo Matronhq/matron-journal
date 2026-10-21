@@ -194,8 +194,10 @@ export function handoverPreview(db, { kind, id, ownerUserId }) {
 // copy, not a second row on the same file: retention deletes a blob's file
 // with its row, and either side's retention must never take the other's.
 // The path goes on `files` so a rolled-back hand-over can remove it. null
-// when the original's file cannot be read.
-function copyBlob(db, b, toUserId, files) {
+// when the original's file cannot be read. The transcript crosses as it
+// stands, except a 'pending' one: no job runs for the copy's new id, so it
+// crosses as never asked (NULL), which a bridge can ask for again.
+export function copyBlob(db, b, toUserId, files) {
   const id = randomBytes(16).toString('hex')
   const dest = shardedPath(path.dirname(path.dirname(b.disk_path)), id)
   try {
@@ -206,8 +208,9 @@ function copyBlob(db, b, toUserId, files) {
     return null
   }
   files.push(dest)
-  db.prepare(`INSERT INTO blobs(id, owner_user_id, content_type, size, sha256, disk_path, created_at, width, height, transcript, transcript_status, transcribed_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, toUserId, b.content_type, b.size, b.sha256, dest, Date.now(), b.width, b.height, b.transcript, b.transcript_status, b.transcribed_at)
+  db.prepare(`INSERT INTO blobs(id, owner_user_id, content_type, size, sha256, disk_path, created_at, width, height, transcript, transcript_status, transcribed_at, transcript_segments)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, toUserId, b.content_type, b.size, b.sha256, dest, Date.now(), b.width, b.height,
+    ...(b.transcript_status === 'pending' ? [null, null, null, null] : [b.transcript, b.transcript_status, b.transcribed_at, b.transcript_segments ?? null]))
   return id
 }
 

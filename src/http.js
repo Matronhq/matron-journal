@@ -5,7 +5,7 @@ import { checkPassword, makeRateLimiter, authToken, changePassword, revokeOwnedD
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice, deviceStatuses } from './db.js'
 import { receiveBlob } from './media.js'
-import { readBlobTranscript } from './blob-transcripts.js'
+import { readBlobTranscript, isTranscribableType, transcriptWaitS } from './blob-transcripts.js'
 import { imageSizeFromFile } from './image-size.js'
 import { buildMetrics } from './metrics.js'
 import { listAwaiting } from './participants.js'
@@ -992,23 +992,53 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           await fs.promises.unlink(received.diskPath).catch(() => {})
           throw e
         }
-        // A user's voice note goes straight off to the cloud transcriber, so
-        // its words are usually ready before the message naming it is sent.
-        // An agent's upload is never a voice note to transcribe.
+        // A user's voice note (or a video's audio track) goes straight off
+        // to the cloud transcriber, so its words are usually ready before the
+        // message naming it is sent. An agent's upload is never transcribed
+        // at upload (it can still be asked for: POST /media/:id/transcript).
         const transcribing = who.kind !== 'agent' && !!blobTranscripts?.start(received.id, who.userId, contentType)
         return json(res, 200, { media_id: received.id, size: received.size, content_type: contentType, sha256: received.sha256, ...(dims ?? {}), ...(transcribing ? { transcript_status: 'pending' } : {}) })
       }
       const mt = url.pathname.match(/^\/media\/([^/]+)\/transcript$/)
       if (req.method === 'GET' && mt) {
         // The words of a voice note transcribed at upload (blob-transcripts.js):
-        // {status: 'none'|'pending'|'done'|'failed', transcript?}. ?wait=N
+        // {status: 'none'|'pending'|'done'|'failed', transcript?, segments?}
+        // — segments ([{start_ms, text}]) only for a video's. ?wait=N
         // (seconds, at most 30) holds a pending answer until the job settles,
         // so a bridge asks once instead of polling. Same read rule and same
         // 404 for missing-or-not-yours as GET /media/:id.
         const blob = getBlob(db, mt[1])
         if (!blob) return json(res, 404, { error: 'not_found' })
         if (blob.owner_user_id !== who.userId && !canReadBlob(db, who.userId, blob.id)) return json(res, 404, { error: 'not_found' })
-        const waitS = Math.min(30, Math.max(0, Number(url.searchParams.get('wait')) || 0))
+        const waitS = transcriptWaitS(url.searchParams.get('wait'))
+        const gone = new AbortController()
+        res.on('close', () => gone.abort())
+        const out = blobTranscripts
+          ? await blobTranscripts.wait(blob.id, waitS * 1000, gone.signal)
+          : readBlobTranscript(db, blob.id)
+        if (gone.signal.aborted && !res.writable) return
+        return json(res, 200, out)
+      }
+      if (req.method === 'POST' && mt) {
+        // Ask the journal to (re)transcribe a note: one never transcribed
+        // here (the backlog was full at upload) or whose job failed is queued
+        // again ({status:'pending'}); one already 'done' or 'pending' answers
+        // as it stands and nothing re-runs. A full backlog answers 200
+        // {status:'none', reason:'busy'}, which an older bridge reads as none.
+        // A journal that cannot take it (no cloud transcriber, or a video
+        // without timed segments) answers the row as it stands, as the GET
+        // would. ?wait=N as on the GET. The owner's own blobs only — a
+        // colleague who may read the words may not spend the owner's
+        // transcription backlog — with the GET's 404 for everyone else.
+        const blob = getBlob(db, mt[1])
+        if (!blob || blob.owner_user_id !== who.userId) return json(res, 404, { error: 'not_found' })
+        // Checked here too, so the 400 never depends on how the handler was wired.
+        if (!isTranscribableType(blob.content_type)) return json(res, 400, { error: 'not_transcribable' })
+        const asked = blobTranscripts ? blobTranscripts.retry(blob.id, who.userId) : 'unsupported'
+        if (asked === 'not_found') return json(res, 404, { error: 'not_found' })
+        if (asked === 'not_transcribable') return json(res, 400, { error: 'not_transcribable' })
+        if (asked === 'busy') return json(res, 200, { status: 'none', reason: 'busy' })
+        const waitS = asked === 'queued' || asked === 'pending' ? transcriptWaitS(url.searchParams.get('wait')) : 0
         const gone = new AbortController()
         res.on('close', () => gone.abort())
         const out = blobTranscripts

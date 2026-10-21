@@ -13,6 +13,9 @@ import { peopleConvoId } from '../src/people-convo.js'
 import { expireGrantAsks } from '../src/grants.js'
 import { OWN_ASK_TTL_MS } from '../src/contacts.js'
 import { onGrantAskExpired } from '../src/sharing-events.js'
+import { readBlobTranscript } from '../src/blob-transcripts.js'
+import { copyBlob } from '../src/handover.js'
+import { openDb, insertBlob } from '../src/db.js'
 
 // Hand-over (spec 2026-10-02 matron-to-matron sharing, "Hand-over"): alice
 // hands a mission, or a whole project, to her contact bob. Two yeses as for
@@ -117,6 +120,11 @@ test('hand-over: an agent asks, alice approves with an attachment unticked, bob 
   const r = await richMission(w)
   const m = r.mission
   await makeContacts(w)
+  // The kept attachment carries upload-time words with their timing (as a
+  // video transcribed at upload does); the copy must keep both.
+  const SEGMENTS = [{ start_ms: 0, text: 'the hall' }, { start_ms: 1500, text: 'is booked' }]
+  w.s.db.prepare("UPDATE blobs SET transcript_status='done', transcript='the hall is booked', transcript_segments=?, transcribed_at=? WHERE id=?")
+    .run(JSON.stringify(SEGMENTS), Date.now(), r.keep)
 
   // The brief is required for a hand-over, and bounded.
   assert.equal((await w.aliceBox(`/missions/${m.id}/shares`, post({ contact: 'bob', level: 'owner', convo_id: 'work' }))).status, 400)
@@ -238,6 +246,7 @@ test('hand-over: an agent asks, alice approves with an attachment unticked, bob 
   assert.notEqual(att.blob_ref, r.keep)
   assert.equal(words[0].body, `See the plan ![floor plan](attachment:${att.blob_ref})`)
   assert.deepEqual(await w.fetchMedia(w.tokens.bobPhone, att.blob_ref), { status: 200, text: 'floor plan bytes' })
+  assert.deepEqual(readBlobTranscript(w.s.db, att.blob_ref), { status: 'done', transcript: 'the hall is booked', segments: SEGMENTS })
   assert.deepEqual(words[1].attachments, [], 'the unticked receipt did not cross')
   assert.equal(words[1].body, 'And the receipt.')
   assert.equal((await w.fetchMedia(w.tokens.bobPhone, r.drop)).status, 404)
@@ -694,4 +703,40 @@ test('an ask that ends before the owner approves never leaves its brief for the 
   assert.equal((await w.bobPhone(`/grants/${ask2.id}`)).status, 404)
   const row = w.s.db.prepare('SELECT brief, exclude_media, approved FROM grants WHERE id=?').get(ask2.id)
   assert.deepEqual(row, { brief: null, exclude_media: null, approved: null })
+})
+
+test('copyBlob: a pending transcript does not cross (no job runs for the copy); every other status does', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-ho-blob-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const db = openDb(':memory:')
+  t.after(() => db.close())
+  const alice = await createUser(db, 'alice', 'pw')
+  const bob = await createUser(db, 'bob', 'pw')
+  const SEG = JSON.stringify([{ start_ms: 0, text: 'hi' }])
+  const rows = {
+    pending: { transcript_status: 'pending', transcript: null, transcript_segments: null, transcribed_at: null },
+    done: { transcript_status: 'done', transcript: 'hi', transcript_segments: SEG, transcribed_at: 5 },
+    failed: { transcript_status: 'failed', transcript: null, transcript_segments: null, transcribed_at: null },
+    none: { transcript_status: null, transcript: null, transcript_segments: null, transcribed_at: null },
+  }
+  const files = []
+  const copies = {}
+  for (const [k, cols] of Object.entries(rows)) {
+    const src = path.join(dir, 'ab', `src-${k}`)
+    fs.mkdirSync(path.dirname(src), { recursive: true })
+    fs.writeFileSync(src, `bytes ${k}`)
+    insertBlob(db, { id: `src-${k}`, ownerUserId: alice.id, contentType: 'video/mp4', size: 7, sha256: 'x', diskPath: src })
+    db.prepare('UPDATE blobs SET transcript_status=?, transcript=?, transcript_segments=?, transcribed_at=?, transcript_asked_at=? WHERE id=?')
+      .run(cols.transcript_status, cols.transcript, cols.transcript_segments, cols.transcribed_at, cols.transcript_status ? 1 : null, `src-${k}`)
+    copies[k] = copyBlob(db, db.prepare('SELECT * FROM blobs WHERE id=?').get(`src-${k}`), bob.id, files)
+    assert.ok(copies[k], k)
+  }
+  assert.deepEqual(readBlobTranscript(db, copies.pending), { status: 'none' }, 'a bridge can ask for it again')
+  const pendingCopy = db.prepare('SELECT transcript, transcript_status, transcript_segments, transcribed_at, transcript_asked_at FROM blobs WHERE id=?').get(copies.pending)
+  assert.deepEqual({ ...pendingCopy }, { transcript: null, transcript_status: null, transcript_segments: null, transcribed_at: null, transcript_asked_at: null })
+  assert.deepEqual(readBlobTranscript(db, copies.done), { status: 'done', transcript: 'hi', segments: [{ start_ms: 0, text: 'hi' }] })
+  assert.equal(db.prepare('SELECT transcribed_at FROM blobs WHERE id=?').get(copies.done).transcribed_at, 5)
+  assert.deepEqual(readBlobTranscript(db, copies.failed), { status: 'failed' })
+  assert.deepEqual(readBlobTranscript(db, copies.none), { status: 'none' })
+  assert.equal(files.length, 4)
 })

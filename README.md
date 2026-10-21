@@ -87,7 +87,12 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_ANDROID_CERT_SHA256` | unset | Comma-separated signing-cert SHA-256 fingerprints (`AA:BB:…`) for assetlinks |
 | `MATRON_MEDIA_DIR` | `<db dir>/media` | Blob storage root |
 | `MATRON_MEDIA_MAX_BYTES` | 50 MiB (`52428800`) | Upload size limit |
-| `MATRON_WHISPER_MODEL` | unset (off) | Path to a whisper.cpp model (`…/whisper.cpp/models/ggml-base.bin`). Set it and voice notes on tracker items are transcribed here on upload instead of waiting for the origin box; needs `ffmpeg` on `PATH`. Under the shipped systemd unit install whisper.cpp outside `/home` (e.g. `/opt/whisper.cpp`) — `ProtectHome=yes` hides it otherwise |
+| `MATRON_STT_AZURE_KEY` | unset (off) | Azure Speech resource key. Set it and every user's voice note, and the audio track of every user's video, is transcribed here on upload (Azure fast transcription), along with voice notes on tracker items; a bridge reads the words instead of running its own whisper, and can ask for a retry (`POST /media/:id/transcript`). Needs `ffmpeg` on `PATH`. With `MATRON_WHISPER_MODEL` set too, whisper is the fallback when the cloud call fails |
+| `MATRON_STT_AZURE_KEY_FILE` | unset | File holding the key, used when `MATRON_STT_AZURE_KEY` is unset; read at boot. Set but unreadable = cloud transcription off, said at boot |
+| `MATRON_STT_AZURE_MODEL` | `MAI-Transcribe-2` | Azure transcription model; the empty string = Azure's standard model |
+| `MATRON_STT_AZURE_ENDPOINT` | `https://northeurope.api.cognitive.microsoft.com` | Azure Speech endpoint of the resource the key belongs to |
+| `MATRON_STT_LOCALE` | `en` (`en-GB` for the standard model) | Locale sent to Azure |
+| `MATRON_WHISPER_MODEL` | unset (off) | Path to a whisper.cpp model (`…/whisper.cpp/models/ggml-base.bin`). With `MATRON_STT_AZURE_KEY` set, whisper is the fallback behind Azure: a note whose cloud call fails (an error, not an answer with no words in it) is transcribed here instead, one at a time. Without a key it is the transcriber, for voice notes on tracker items only (chat notes stay the origin box's job). Needs `ffmpeg` on `PATH`. Under the shipped systemd unit install whisper.cpp outside `/home` (e.g. `/opt/whisper.cpp`) — `ProtectHome=yes` hides it otherwise |
 | `MATRON_WHISPER_CLI` | `<model dir>/../build/bin/whisper-cli` | whisper-cli binary, if not in whisper.cpp's own layout |
 | `MATRON_WHISPER_LANGUAGE` | `en` | Language passed to whisper |
 | `MATRON_WHISPER_PROMPT` | built-in Matron vocabulary | Vocabulary hint passed to whisper-cli as `--prompt`: names and terms it should spell right (box names, `sudo`, `PR`). Set your own list, or the empty string to send no prompt |
