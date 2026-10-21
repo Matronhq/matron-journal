@@ -518,8 +518,10 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
       }
       db.transaction(() => {
         // A voice note the journal transcribed keeps its words (stamped, so
-        // said.js can still vouch for them); everything else is the bare
-        // tombstone, with any payload-supplied transcript_by dropped.
+        // said.js can still vouch for them; it takes audio only); everything
+        // else is the bare tombstone, with any payload-supplied
+        // transcript_by dropped. A reaped video's words go along too; its
+        // segments do not.
         const words = journalWordsOf(blob)
         for (const ref of refs.all(cand.blobRef, user.userId)) {
           let payload

@@ -29,8 +29,10 @@
 // (retry), and transcribes it locally only if it can.
 const DEFAULT_MAX_QUEUED = 100
 const DEFAULT_MAX_QUEUED_PER_USER = 20
-// A row left 'pending' by a process that died: re-run it at boot if it is
-// recent, give up on it otherwise (its bridge has long since fallen back).
+// A row left 'pending' by a process that died: re-run it at boot if it was
+// asked for recently (transcript_asked_at, else created_at: a retried old
+// note counts from the retry), give up on it otherwise (its bridge has long
+// since fallen back; a failed row can be asked again).
 const DEFAULT_RECOVER_MAX_AGE_MS = 60 * 60 * 1000
 
 export function isAudioType(contentType) {
@@ -89,7 +91,7 @@ function retryPrecheck(db, blobId, userId) {
   const row = db.prepare('SELECT content_type, transcript_status FROM blobs WHERE id=? AND owner_user_id=?').get(blobId, userId)
   if (!row) return { answer: 'not_found' }
   if (!isTranscribableType(row.content_type)) return { answer: 'not_transcribable' }
-  if (row.transcript_status === 'done' || row.transcript_status === 'pending') return { answer: row.transcript_status }
+  if (row.transcript_status === 'done' || row.transcript_status === 'pending') return { answer: row.transcript_status, row }
   return { answer: null, row }
 }
 
@@ -124,8 +126,9 @@ export function makeBlobTranscripts({
   const perUser = new Map()
 
   // start() takes only a row never asked; retry() a 'failed' one too.
-  const setPendingFresh = db.prepare("UPDATE blobs SET transcript_status='pending', transcript=NULL WHERE id=? AND owner_user_id=? AND transcript_status IS NULL")
-  const setPending = db.prepare("UPDATE blobs SET transcript_status='pending', transcript=NULL WHERE id=? AND owner_user_id=? AND (transcript_status IS NULL OR transcript_status='failed')")
+  // Both stamp transcript_asked_at, which recover() judges a leftover by.
+  const setPendingFresh = db.prepare("UPDATE blobs SET transcript_status='pending', transcript=NULL, transcript_asked_at=? WHERE id=? AND owner_user_id=? AND transcript_status IS NULL")
+  const setPending = db.prepare("UPDATE blobs SET transcript_status='pending', transcript=NULL, transcript_asked_at=? WHERE id=? AND owner_user_id=? AND (transcript_status IS NULL OR transcript_status='failed' OR (transcript_status='pending' AND ?))")
   const setDone = db.prepare("UPDATE blobs SET transcript_status='done', transcript=?, transcript_segments=?, transcribed_at=? WHERE id=? AND transcript_status='pending'")
   const setFailed = db.prepare("UPDATE blobs SET transcript_status='failed', transcript=NULL, transcript_segments=NULL WHERE id=? AND transcript_status='pending'")
   // A video needs the timed variant; a transcriber without one leaves
@@ -200,7 +203,7 @@ export function makeBlobTranscripts({
       if (closed || !isTranscribableType(contentType)) return false
       if (isVideoType(contentType) && !canSegments) return false
       if (full(userId)) return false
-      if (setPendingFresh.run(blobId, userId).changes !== 1) return false
+      if (setPendingFresh.run(now(), blobId, userId).changes !== 1) return false
       enqueue(blobId, userId)
       return true
     },
@@ -214,11 +217,16 @@ export function makeBlobTranscripts({
     // such blob of this owner's. Same type checks and caps as start().
     retry(blobId, userId) {
       const { answer, row } = retryPrecheck(db, blobId, userId)
-      if (answer) return answer
+      // A 'pending' row with no job behind it (a hand-over copies a row as
+      // it stands, pending included, under a new id) would otherwise wait
+      // for the next boot: it is taken like a failed one. recover() runs
+      // before the first request, so every other pending row has a job.
+      const orphan = answer === 'pending' && !jobs.has(blobId)
+      if (answer && !orphan) return answer
       if (isVideoType(row.content_type) && !canSegments) return 'unsupported'
       if (closed || full(userId)) return 'busy'
       // Same tick as the precheck, so only a row reaped under us misses.
-      if (setPending.run(blobId, userId).changes !== 1) return 'not_found'
+      if (setPending.run(now(), blobId, userId, orphan ? 1 : 0).changes !== 1) return 'not_found'
       enqueue(blobId, userId)
       return 'queued'
     },
@@ -245,15 +253,19 @@ export function makeBlobTranscripts({
     // The running job's promise for this blob, for items-transcribe.js to
     // await instead of paying for the same audio twice.
     inFlight: (blobId) => jobs.get(blobId) ?? null,
+    // Called once at boot, before the first request. A row is judged by when
+    // it was last asked for, so a retried old note survives a restart; the
+    // caps hold as for any new job (over them, or asked too long ago:
+    // 'failed', which can be asked again).
     recover() {
-      const rows = db.prepare("SELECT id, owner_user_id, created_at FROM blobs WHERE transcript_status='pending'").all()
+      const rows = db.prepare("SELECT id, owner_user_id, COALESCE(transcript_asked_at, created_at) AS asked_at FROM blobs WHERE transcript_status='pending' ORDER BY asked_at").all()
       let requeued = 0
       for (const r of rows) {
-        if (now() - r.created_at > recoverMaxAgeMs) { setFailed.run(r.id); continue }
+        if (now() - r.asked_at > recoverMaxAgeMs || full(r.owner_user_id)) { setFailed.run(r.id); continue }
         enqueue(r.id, r.owner_user_id)
         requeued += 1
       }
-      if (rows.length) log.log(`blob-transcripts: ${requeued} pending transcript(s) re-queued, ${rows.length - requeued} too old and failed`)
+      if (rows.length) log.log(`blob-transcripts: ${requeued} pending transcript(s) re-queued, ${rows.length - requeued} failed (asked for too long ago, or over the backlog)`)
       return requeued
     },
     // Abort the in-flight requests and wait (bounded) for the jobs to return,

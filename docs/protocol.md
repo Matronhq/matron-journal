@@ -304,8 +304,8 @@ the machine-checkable version of this page.
   segments?}`, the upload-time transcript of a voice note or a video's
   audio track. `status` is `'none'` (never transcribed here: no cloud
   transcriber, neither audio nor video, a video this transcriber cannot
-  time, an agent's upload, or the backlog was full at upload), `'pending'`, `'done'`
-  (with `transcript`) or `'failed'`. A `done` video also carries `segments`,
+  time, an agent's upload, or the backlog was full at upload),
+  `'pending'`, `'done'` (with `transcript`) or `'failed'`. A `done` video also carries `segments`,
   `[{start_ms, text}]` in the order spoken (`start_ms` a non-negative
   integer, `text` non-empty), so a caller can line the words up with the
   video's frames; a voice note never has the key, and a video's may be `[]`
@@ -319,8 +319,8 @@ the machine-checkable version of this page.
 - `POST /media/:id/transcript[?wait=N]` (Bearer, client or agent) -> the
   GET's answer, after asking the journal to (re)transcribe the blob. A blob
   whose status is `none` or `failed` is queued again and answers
-  `{status:'pending'}` (with `wait`, as on the GET, the answer is held
-  until the job settles; the bridge sends `wait=0` by default). One already
+  `{status:'pending'}` (with `wait`, as on the GET, the answer is held until
+  the job settles; the bridge sends `wait=0` by default). One already
   `pending` answers `pending` and starts no second job; one already `done`
   answers its words (and `segments`) and nothing re-runs. When the backlog
   is full, or the journal is shutting down, the answer is 200
@@ -329,14 +329,19 @@ the machine-checkable version of this page.
   transcribe the blob at all (no cloud transcriber, or a video and a
   transcriber without timed segments), which answers the row as it stands
   (`none`, or `failed`) with no `reason`; a bridge that does not know
-  `reason` reads the busy answer as a plain `none`. 400 `{error:'not_transcribable'}` for a blob that is neither
-  `audio/*` nor `video/*`. The **owner's** blobs only, through any of their
-  devices (the bridge asks with its agent token): a colleague who may read
-  the words under *Shared visibility* may not spend the owner's backlog,
-  and gets the same 404 as for a missing blob. The same per-user and
-  overall caps apply as at upload. Item voice notes need no route of their
-  own: an attachment is a blob, so a bridge retries the blob and PATCHes
-  the words onto the comment as it does today.
+  `reason` reads the busy answer as a plain `none`. 400
+  `{error:'not_transcribable'}` for a blob that is neither `audio/*` nor
+  `video/*`. The **owner's** blobs only, through any of their devices (the
+  bridge asks with its agent token): a colleague who may read the words
+  under *Shared visibility* may not spend the owner's backlog, and gets the
+  same 404 as for a missing blob. The same per-user and overall caps apply
+  as at upload; nothing limits how often a `failed` blob is asked again, and
+  each ask is another cloud call (and, when that fails, a whisper run), so a
+  client asks once or twice, not in a loop. An agent's own audio upload,
+  never transcribed at upload, can be asked for this way, and once `done`
+  its audio is expired like a voice note's. Item voice notes need no route
+  of their own: an attachment is a blob, so a bridge retries the blob and
+  PATCHes the words onto the comment as it does today.
 
   **Cloud transcription** (`src/cloud-transcribe.js`): set
   `MATRON_STT_AZURE_KEY` (or `MATRON_STT_AZURE_KEY_FILE`, a file holding it)
@@ -353,21 +358,24 @@ the machine-checkable version of this page.
   100 overall may be queued. When whisper is configured too
   (`MATRON_WHISPER_MODEL`, see *Journal-side transcription*), a note whose
   cloud call fails is tried again with whisper on the journal host, **one
-  whisper run at a time** however many cloud calls fail together. A job
-  cut short by shutdown never reaches whisper (it is re-queued at the next
-  boot), and nor does a file ffmpeg cannot decode (a video with no audio
-  stream), which settles `failed` at once. Video jobs ask for timed
-  segments: from Azure's `phrases[]`, or from whisper's timestamps
-  (whisper's limit for a video is 10 minutes, against 2 for a note). A
-  near-silent clip can come back `done` with one short invented segment;
-  the journal stores what it is given, so a consumer that narrates a video should ignore a transcript too short to be
-  speech. A cloud transcriber also does item voice notes (below), reusing an
-  upload-time transcript rather than sending the same audio twice. A chat
-  voice note transcribed here has its audio expired like an item's
+  whisper run at a time** however many cloud calls fail together. A job cut
+  short by shutdown never reaches whisper (it is re-queued at the next boot,
+  judged by when it was last asked for, so a note retried just before a
+  restart survives it; one asked for over an hour before, or over the
+  backlog, settles `failed`), and nor does a file ffmpeg cannot decode (a
+  video with no audio stream), which settles `failed` at once. Video jobs
+  ask for timed segments: from Azure's `phrases[]`, or from whisper's
+  timestamps (whisper's limit for a video is 10 minutes, against 2 for a
+  note). A near-silent clip can come back `done` with one short invented
+  segment; the journal stores what it is given, so a consumer that narrates
+  a video should ignore a transcript too short to be speech. A cloud
+  transcriber also does item voice notes (below), reusing an upload-time
+  transcript rather than sending the same audio twice. A chat voice note
+  transcribed here has its audio expired like an item's
   (`MATRON_VOICE_NOTE_TTL_DAYS` after `blobs.transcribed_at`): its file
   events become tombstones carrying the `transcript`; a video's file is
-  never expired that way. Without a key nothing changes: chat notes stay
-  the bridge's job.
+  never expired that way. Without a key nothing changes: chat notes stay the
+  bridge's job.
 - `GET /media/:id` (Bearer) -> streams the blob with its Content-Type,
   Content-Length and a long-lived `Cache-Control` (ids are immutable random
   handles), plus `X-Content-Type-Options: nosniff` and

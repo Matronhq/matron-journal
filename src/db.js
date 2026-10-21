@@ -884,6 +884,10 @@ export function openDb(path) {
   // with transcript when a video job is 'done'; NULL for audio and for every
   // row before this column.
   if (!blobCols.some((c) => c.name === 'transcript_segments')) db.exec('ALTER TABLE blobs ADD COLUMN transcript_segments TEXT')
+  // When the journal was last asked to transcribe the row (at upload, or by
+  // a retry): the clock blob-transcripts.js recover() judges a leftover
+  // 'pending' row by. NULL on rows before it (created_at stands in).
+  if (!blobCols.some((c) => c.name === 'transcript_asked_at')) db.exec('ALTER TABLE blobs ADD COLUMN transcript_asked_at INTEGER')
   // Keeps the per-user quota SUM (see userBlobBytes) a cheap index scan rather
   // than a full-table read as the blob store grows.
   db.exec('CREATE INDEX IF NOT EXISTS idx_blobs_owner ON blobs(owner_user_id)')

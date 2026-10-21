@@ -362,6 +362,25 @@ test('migration: an existing blobs table gains transcript_segments, NULL on old 
   assert.deepEqual(readBlobTranscript(again, 'old'), { status: 'done', transcript: 'w' })
 })
 
+test('migration: an existing blobs table gains transcript_asked_at, NULL on old rows', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-bt-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const file = path.join(dir, 'x.db')
+  const db = openDb(file)
+  await users(db)
+  db.prepare("INSERT INTO blobs(id,owner_user_id,content_type,size,sha256,disk_path,created_at,transcript_status) VALUES('old',1,'audio/ogg',1,'x','/m/old',1,'pending')").run()
+  db.exec('ALTER TABLE blobs DROP COLUMN transcript_asked_at')
+  db.close()
+  const again = openDb(file)
+  t.after(() => again.close())
+  const col = again.prepare('PRAGMA table_info(blobs)').all().find((c) => c.name === 'transcript_asked_at')
+  assert.ok(col, 'column added')
+  assert.equal(col.type, 'INTEGER')
+  assert.equal(col.notnull, 0)
+  assert.equal(again.prepare("SELECT transcript_asked_at FROM blobs WHERE id='old'").get().transcript_asked_at, null)
+  openDb(file).close() // a second open is a no-op
+})
+
 test('a video job stores segments as [{start_ms: integer, text: string}], whatever shape the transcriber returned', async (t) => {
   const tr = gatedCloud({ segments: true })
   const { s, aliceToken, upload } = await setup(t, { transcriber: tr })
@@ -632,7 +651,9 @@ test('retry on an image is 400 even on a handler built without blob transcripts'
   const { s, aliceToken, upload } = await setup(t, { transcriber: null })
   const img = await upload(aliceToken, 'image/png')
   const note = await upload(aliceToken)
-  const handler = makeHttpHandler({ db: s.db, mediaDir: fs.mkdtempSync(path.join(os.tmpdir(), 'matron-bt-')), mediaMaxBytes: 1e6 })
+  const mediaDir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-bt-'))
+  t.after(() => fs.rmSync(mediaDir, { recursive: true, force: true }))
+  const handler = makeHttpHandler({ db: s.db, mediaDir, mediaMaxBytes: 1e6 })
   const http = await import('node:http')
   const server = http.createServer(handler)
   await new Promise((r) => server.listen(0, '127.0.0.1', r))
@@ -645,4 +666,73 @@ test('retry on an image is 400 even on a handler built without blob transcripts'
   const n = await go(note.media_id)
   assert.equal(n.status, 200)
   assert.deepEqual(await n.json(), { status: 'none' })
+})
+
+test('a retried old note still pending at a restart is re-queued at the next boot, and runs', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-bt-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const db = openDb(path.join(dir, 'x.db'))
+  t.after(() => db.close())
+  await users(db)
+  // A note from two days ago whose upload-time job failed.
+  db.prepare("INSERT INTO blobs(id,owner_user_id,content_type,size,sha256,disk_path,created_at,transcript_status) VALUES('old',1,'audio/ogg',1,'x','/m/old',?,'failed')").run(Date.now() - 2 * 24 * 60 * 60 * 1000)
+  const quiet = { log() {}, error() {} }
+  const first = gatedCloud()
+  const before = makeBlobTranscripts({ db, transcriber: first, log: quiet })
+  assert.equal(before.retry('old', 1), 'queued')
+  await until(() => first.pending() === 1)
+  await before.close() // the journal restarts mid-job
+  assert.deepEqual(readBlobTranscript(db, 'old'), { status: 'pending' })
+  const asked = db.prepare("SELECT transcript_asked_at FROM blobs WHERE id='old'").get().transcript_asked_at
+  assert.ok(Number.isInteger(asked) && Date.now() - asked < 5000, 'the ask is stamped')
+
+  const second = gatedCloud()
+  const after = makeBlobTranscripts({ db, transcriber: second, log: quiet })
+  assert.equal(after.recover(), 1, 'judged by when it was asked for, not when it was uploaded')
+  await until(() => second.pending() === 1)
+  second.release('back again')
+  assert.deepEqual(await after.wait('old', 1000), { status: 'done', transcript: 'back again' })
+  await after.close()
+})
+
+test('recover: re-queues within the caps, and a row asked for long ago is still failed', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-bt-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const db = openDb(path.join(dir, 'x.db'))
+  t.after(() => db.close())
+  await users(db)
+  const ins = db.prepare("INSERT INTO blobs(id,owner_user_id,content_type,size,sha256,disk_path,created_at,transcript_status,transcript_asked_at) VALUES(?,?,?,?,?,?,?,'pending',?)")
+  const hour = 60 * 60 * 1000
+  ins.run('p1', 1, 'audio/ogg', 1, 'x', '/m/p1', Date.now(), Date.now())
+  ins.run('p2', 1, 'audio/ogg', 1, 'x', '/m/p2', Date.now(), Date.now())
+  ins.run('p3', 2, 'audio/ogg', 1, 'x', '/m/p3', Date.now(), Date.now())
+  ins.run('asked-long-ago', 2, 'audio/ogg', 1, 'x', '/m/a', Date.now(), Date.now() - 2 * hour)
+  const tr = gatedCloud({ concurrency: 1 })
+  const lines = []
+  const bt = makeBlobTranscripts({ db, transcriber: tr, maxQueuedPerUser: 1, log: { log: (l) => lines.push(l), error() {} } })
+  assert.equal(bt.recover(), 2)
+  assert.deepEqual(readBlobTranscript(db, 'p2'), { status: 'failed' }, "over user 1's cap: failed, and can be asked again")
+  assert.deepEqual(readBlobTranscript(db, 'asked-long-ago'), { status: 'failed' })
+  assert.match(lines[0], /2 pending transcript\(s\) re-queued, 2 failed/)
+  assert.equal(bt.retry('p2', 1), 'busy', 'the cap still holds after boot')
+  await bt.close()
+})
+
+test('retry re-queues a pending row that has no job behind it (a hand-over copy)', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-bt-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const db = openDb(path.join(dir, 'x.db'))
+  t.after(() => db.close())
+  await users(db)
+  const tr = gatedCloud({ concurrency: 1 })
+  const bt = makeBlobTranscripts({ db, transcriber: tr })
+  // Written after boot by handover.js, copying a row that was pending.
+  db.prepare("INSERT INTO blobs(id,owner_user_id,content_type,size,sha256,disk_path,created_at,transcript_status) VALUES('copy',1,'audio/ogg',1,'x','/m/copy',?,'pending')").run(Date.now())
+  assert.equal(bt.retry('copy', 1), 'queued')
+  await until(() => tr.pending() === 1)
+  assert.equal(bt.retry('copy', 1), 'pending', 'now it has one: no second job')
+  tr.release('unstuck')
+  assert.deepEqual(await bt.wait('copy', 1000), { status: 'done', transcript: 'unstuck' })
+  assert.equal(tr.calls.length, 1)
+  await bt.close()
 })

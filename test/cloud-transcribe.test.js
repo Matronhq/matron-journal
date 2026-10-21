@@ -118,7 +118,12 @@ test('makeConfiguredTranscriber: cloud when keyed (key never logged), whisper ot
   assert.equal(cloud.kind, 'cloud')
   assert.match(cloud.label, /standard at northeurope/)
   assert.ok(logs.every((l) => !l.includes('sekrit')))
+  logs.length = 0
   assert.equal(makeConfiguredTranscriber({ env: {}, log, whisper }).kind, 'whisper')
+  assert.deepEqual(logs, ["transcribe: item voice notes are transcribed here by whisper.cpp (chat notes stay the bridge's job)"])
+  logs.length = 0
+  assert.equal(makeConfiguredTranscriber({ env: {}, log, whisper: () => null }), null)
+  assert.deepEqual(logs, [], 'no whisper, no key: nothing to say')
   logs.length = 0
   assert.equal(makeConfiguredTranscriber({ env: { MATRON_STT_AZURE_KEY_FILE: '/nonexistent/key' }, log, whisper }).kind, 'whisper')
   assert.match(logs[0], /unreadable.*OFF/)

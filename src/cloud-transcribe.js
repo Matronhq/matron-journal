@@ -103,7 +103,9 @@ export function makeAzureTranscriber({
         ...(model ? { enhancedMode: { enabled: true, model, modelOptions: { transcribeStyle: style } } } : {}),
       }
       const form = new FormData()
-      form.append('audio', new Blob([fs.readFileSync(flacPath)], { type: 'audio/flac' }), 'audio.flac')
+      // Streamed from disk as the request is sent, not read whole into
+      // memory: a long video's FLAC can run past 100 MB.
+      form.append('audio', await fs.openAsBlob(flacPath, { type: 'audio/flac' }), 'audio.flac')
       form.append('definition', JSON.stringify(definition))
       const timeout = AbortSignal.timeout(requestTimeoutMs)
       const res = await fetchImpl(url, {
@@ -238,5 +240,7 @@ export function makeConfiguredTranscriber({ env = process.env, deviceNames = nul
     log.log(`transcribe: voice notes are transcribed on upload by ${t.label}${w ? '' : ' (no whisper fallback)'}`)
     return t
   }
-  return whisper({ deviceNames, log })
+  const w = whisper({ deviceNames, log })
+  if (w) log.log("transcribe: item voice notes are transcribed here by whisper.cpp (chat notes stay the bridge's job)")
+  return w
 }
