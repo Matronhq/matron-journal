@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
-  makeAzureTranscriber, makeConfiguredTranscriber, phrasesFor, resolveAzureKey,
+  makeAzureTranscriber, makeConfiguredTranscriber, makeChainedTranscriber, phrasesFor, resolveAzureKey,
   DEFAULT_PHRASES, DEFAULT_AZURE_ENDPOINT, AZURE_API_VERSION,
 } from '../src/cloud-transcribe.js'
 
@@ -121,4 +121,136 @@ test('makeConfiguredTranscriber: cloud when keyed (key never logged), whisper ot
   logs.length = 0
   assert.equal(makeConfiguredTranscriber({ env: { MATRON_STT_AZURE_KEY_FILE: '/nonexistent/key' }, log, whisper }).kind, 'whisper')
   assert.match(logs[0], /unreadable.*OFF/)
+})
+
+// A transcriber stand-in: answers with `impl(diskPath, opts)` and counts calls.
+function fakeTranscriber(impl, extra = {}) {
+  const t = { calls: 0, ...extra, async transcribeFile(diskPath, opts) { t.calls++; return impl(diskPath, opts) } }
+  return t
+}
+
+function logSpy() {
+  const lines = []
+  return { lines, log: (m) => lines.push(m), error: (m) => lines.push(m) }
+}
+
+const azureLike = (impl) => fakeTranscriber(impl, { kind: 'cloud', label: 'Azure X at host.example', concurrency: 4 })
+
+test('chained: primary success never calls fallback', async () => {
+  const primary = azureLike(async () => 'from azure')
+  const fallback = fakeTranscriber(async () => 'from whisper')
+  const t = makeChainedTranscriber(primary, fallback, { log: logSpy() })
+  assert.equal(await t.transcribeFile('/x'), 'from azure')
+  assert.equal(fallback.calls, 0)
+})
+
+test('chained: primary throws → fallback text, one log line naming the primary label', async () => {
+  const log = logSpy()
+  const seen = []
+  const primary = azureLike(async () => { throw new Error('azure transcription HTTP 503: busy') })
+  const fallback = fakeTranscriber(async (diskPath, opts) => { seen.push([diskPath, opts.userId]); return 'from whisper' })
+  const t = makeChainedTranscriber(primary, fallback, { log })
+  assert.equal(await t.transcribeFile('/media/ab/abc', { userId: 7 }), 'from whisper')
+  assert.deepEqual(seen, [['/media/ab/abc', 7]])
+  assert.equal(log.lines.length, 1)
+  assert.ok(log.lines[0].includes('Azure X at host.example'))
+  assert.match(log.lines[0], /failed .*trying whisper/)
+  assert.match(log.lines[0], /HTTP 503/)
+})
+
+test('chained: four concurrent primary failures run the fallback one at a time', async () => {
+  let inflight = 0
+  let maxInflight = 0
+  const releases = []
+  const primary = azureLike(async () => { throw new Error('down') })
+  const fallback = fakeTranscriber(async (diskPath) => {
+    inflight++
+    maxInflight = Math.max(maxInflight, inflight)
+    await new Promise((resolve) => releases.push(resolve))
+    inflight--
+    return `whisper ${diskPath}`
+  })
+  const t = makeChainedTranscriber(primary, fallback, { log: logSpy() })
+  const runs = ['/a', '/b', '/c', '/d'].map((p) => t.transcribeFile(p))
+  // Release whichever run is waiting, one at a time, until all four are done.
+  for (let released = 0; released < 4; released++) {
+    while (releases.length === 0) await new Promise((r) => setImmediate(r))
+    assert.equal(inflight, 1)
+    releases.shift()()
+  }
+  assert.deepEqual(await Promise.all(runs), ['whisper /a', 'whisper /b', 'whisper /c', 'whisper /d'])
+  assert.equal(maxInflight, 1)
+  assert.equal(fallback.calls, 4)
+})
+
+test('chained: a fallback failure does not stall the runs queued behind it', async () => {
+  const primary = azureLike(async () => { throw new Error('down') })
+  const fallback = fakeTranscriber(async (diskPath) => { if (diskPath === '/bad') throw new Error('whisper crashed'); return 'ok' })
+  const t = makeChainedTranscriber(primary, fallback, { log: logSpy() })
+  const [bad, good] = await Promise.allSettled([t.transcribeFile('/bad'), t.transcribeFile('/good')])
+  assert.equal(bad.reason.message, 'whisper crashed')
+  assert.equal(good.value, 'ok')
+})
+
+test('chained: aborted signal skips the fallback and rethrows', async () => {
+  const ac = new AbortController()
+  const primary = azureLike(async () => { ac.abort(); throw new Error('This operation was aborted') })
+  const fallback = fakeTranscriber(async () => 'from whisper')
+  const t = makeChainedTranscriber(primary, fallback, { log: logSpy() })
+  await assert.rejects(t.transcribeFile('/x', { signal: ac.signal }), /aborted/)
+  assert.equal(ac.signal.aborted, true)
+  assert.equal(fallback.calls, 0)
+})
+
+test('chained: a request aborted while queued for the fallback never starts it', async () => {
+  let release
+  const primary = azureLike(async () => { throw new Error('down') })
+  const fallback = fakeTranscriber(async () => { await new Promise((r) => { release = r }); return 'from whisper' })
+  const t = makeChainedTranscriber(primary, fallback, { log: logSpy() })
+  const first = t.transcribeFile('/first')
+  const ac = new AbortController()
+  const second = t.transcribeFile('/second', { signal: ac.signal })
+  while (!release) await new Promise((r) => setImmediate(r))
+  ac.abort()
+  release()
+  assert.equal(await first, 'from whisper')
+  await assert.rejects(second, /down/)
+  assert.equal(fallback.calls, 1)
+})
+
+test('chained: fallback throw propagates', async () => {
+  const primary = azureLike(async () => { throw new Error('azure down') })
+  const fallback = fakeTranscriber(async () => { throw new Error('empty transcription result') })
+  const t = makeChainedTranscriber(primary, fallback, { log: logSpy() })
+  await assert.rejects(t.transcribeFile('/x'), { message: 'empty transcription result' })
+})
+
+test('chained: kind, label and concurrency come from the primary', () => {
+  const t = makeChainedTranscriber(azureLike(async () => ''), fakeTranscriber(async () => ''), { log: logSpy() })
+  assert.equal(t.kind, 'cloud')
+  assert.equal(t.label, 'Azure X at host.example, then whisper.cpp')
+  assert.equal(t.concurrency, 4)
+})
+
+test('makeConfiguredTranscriber: key + whisper → chain', async () => {
+  const log = logSpy()
+  const whisperT = fakeTranscriber(async () => 'from whisper')
+  const t = makeConfiguredTranscriber({
+    env: { MATRON_STT_AZURE_KEY: 'sekrit' },
+    log,
+    whisper: () => whisperT,
+  })
+  assert.equal(t.kind, 'cloud')
+  assert.match(t.label, /^Azure MAI-Transcribe-2 at northeurope\..*, then whisper\.cpp$/)
+  assert.equal(t.concurrency, 4)
+  assert.ok(log.lines.some((l) => l.includes(t.label)))
+  assert.ok(log.lines.every((l) => !l.includes('sekrit')))
+})
+
+test('makeConfiguredTranscriber: key + no whisper → plain azure', () => {
+  const log = logSpy()
+  const t = makeConfiguredTranscriber({ env: { MATRON_STT_AZURE_KEY: 'sekrit' }, log, whisper: () => null })
+  assert.equal(t.kind, 'cloud')
+  assert.doesNotMatch(t.label, /whisper/)
+  assert.ok(log.lines.some((l) => l.includes(t.label)))
 })

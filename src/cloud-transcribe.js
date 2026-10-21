@@ -123,8 +123,54 @@ export function makeAzureTranscriber({
   }
 }
 
-// The transcriber this journal runs: the cloud one when a key is configured,
-// else whisper when MATRON_WHISPER_MODEL is, else none. A key that is set but
+// Runs the functions it is handed one at a time, in arrival order: each
+// starts when the one before it settles, whether that resolved or threw.
+function serialize() {
+  let tail = Promise.resolve()
+  return (fn) => {
+    const run = tail.then(fn)
+    tail = run.catch(() => {})
+    return run
+  }
+}
+
+// The primary transcriber, falling back to `fallback` when it throws. The
+// chain is the primary as far as callers can tell (kind, label, concurrency),
+// so a cloud primary still turns on transcription at upload and still runs
+// `concurrency` jobs at once — while the fallback, whisper on this host's
+// CPU, runs one note at a time however many cloud calls fail together. A
+// request whose signal has aborted (the client went away, the journal is
+// shutting down) never starts the fallback, not even after waiting its turn.
+export function makeChainedTranscriber(primary, fallback, { log = console } = {}) {
+  const fallbackQueue = serialize()
+  const chained = (method) => async (diskPath, opts = {}) => {
+    try {
+      return await primary[method](diskPath, opts)
+    } catch (err) {
+      if (opts.signal?.aborted) throw err
+      log.error(`transcribe: ${primary.label} failed (${err.message}) — trying whisper.cpp`)
+      return fallbackQueue(() => {
+        if (opts.signal?.aborted) throw err
+        return fallback[method](diskPath, opts)
+      })
+    }
+  }
+  return {
+    kind: primary.kind,
+    label: `${primary.label}, then whisper.cpp`,
+    concurrency: primary.concurrency,
+    transcribeFile: chained('transcribeFile'),
+    // Timed segments only when both sides can give them; the shared queue
+    // keeps it to one whisper run at a time across both methods.
+    ...(primary.transcribeFileSegments && fallback.transcribeFileSegments
+      ? { transcribeFileSegments: chained('transcribeFileSegments') }
+      : {}),
+  }
+}
+
+// The transcriber this journal runs: the cloud one when a key is configured
+// (falling back to whisper when MATRON_WHISPER_MODEL is set too), else
+// whisper when MATRON_WHISPER_MODEL is, else none. A key that is set but
 // unreadable is said loudly at boot and falls back, rather than failing every
 // note quietly.
 export function makeConfiguredTranscriber({ env = process.env, deviceNames = null, log = console, whisper = makeTranscriber } = {}) {
@@ -134,13 +180,15 @@ export function makeConfiguredTranscriber({ env = process.env, deviceNames = nul
   }
   if (key) {
     const model = env.MATRON_STT_AZURE_MODEL ?? DEFAULT_AZURE_MODEL
-    const t = makeAzureTranscriber({
+    const azure = makeAzureTranscriber({
       key,
       endpoint: env.MATRON_STT_AZURE_ENDPOINT || DEFAULT_AZURE_ENDPOINT,
       model,
       ...(env.MATRON_STT_LOCALE ? { locale: env.MATRON_STT_LOCALE } : {}),
       deviceNames,
     })
+    const w = whisper({ deviceNames })
+    const t = w ? makeChainedTranscriber(azure, w, { log }) : azure
     log.log(`transcribe: voice notes are transcribed on upload by ${t.label}`)
     return t
   }
