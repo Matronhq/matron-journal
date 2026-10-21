@@ -444,7 +444,25 @@ const DONE_VIEW = `(i.state = 'closed' OR (i.created_by = 'agent' AND i.awaiting
 // closed tops the list, however long its agent takes to close it.
 const ACTED_AT = `COALESCE(${LAST_USER_INPUT}, i.closed_at, i.updated_at)`
 
+// The device that filed item `i`: the writer of its first post. A handover
+// (src/item-handover.js) moves origin_device_id to the new owner and keeps
+// the filing conversation in filed_convo_id, so a handed-over item is named
+// by the box that hosts that conversation.
+const FILER_DEVICE = `CASE WHEN i.filed_convo_id IS NULL THEN i.origin_device_id
+    ELSE (SELECT fc.agent_device_id FROM conversations fc WHERE fc.id = i.filed_convo_id AND fc.owner_user_id = i.user_id) END`
+
 const DECORATE = `${WORKING_DECORATE},
+  -- device_name: the box whose session filed an agent's item, as a comment's
+  -- device_name names the box that wrote it, so the item's own post is headed
+  -- the same way. NULL on the user's items, a contributor's (they name
+  -- themselves), when the device is gone, and when a private box filed into a
+  -- conversation that is not private-owned: an ordinary agent can read that
+  -- item, and a private box's name never crosses to one (privacy.js).
+  (SELECT d.name FROM devices d WHERE i.created_by = 'agent' AND i.contributor_name IS NULL
+     AND d.id = ${FILER_DEVICE} AND d.user_id = i.user_id AND d.kind = 'agent'
+     AND (NOT EXISTS (SELECT 1 FROM private_devices pd WHERE pd.id = d.id)
+          OR EXISTS (SELECT 1 FROM conversations oc JOIN private_devices od ON od.id = oc.agent_device_id
+                     WHERE oc.id = i.origin_convo_id))) AS device_name,
   (SELECT COUNT(*) FROM item_comments c WHERE c.item_id = i.id AND c.kind='comment') AS comment_count,
   (SELECT MAX(created_at) FROM item_comments c WHERE c.item_id = i.id AND c.kind='comment') AS last_comment_at,
   -- When the user last acted on the item: their latest comment, action tap,
@@ -636,8 +654,9 @@ function rowToSharedItem(row) {
   const item = rowToItem(rest)
   item.owner = parseJson(ownerJson, null)
   // Item handover (src/item-handover.js) names conversations that need not
-  // pass the sharing rule themselves: never shown to another person.
-  Object.assign(item, { filed_convo_id: null, handover: null })
+  // pass the sharing rule themselves, and the filing box is the user's own:
+  // never shown to another person (listSharedComments drops a comment's).
+  Object.assign(item, { filed_convo_id: null, handover: null, device_name: null })
   // Whether the owner's session is busy is the owner's to see.
   delete item.working
   if (orgShared === 0) {

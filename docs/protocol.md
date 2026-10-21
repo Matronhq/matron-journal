@@ -1944,7 +1944,16 @@ title, body, labels[], links[{url,title?}], supersedes, origin_convo_id,
 origin_device_id, created_by, created_at, updated_at, closed_at,
 comment_count, last_comment_at, last_user_input_at, attachments[], has_image,
 mission_id,
-mission_num, consent, actions[], chosen_action, origin_convo_title, working}`.
+mission_num, consent, actions[], chosen_action, origin_convo_title, device_name, working}`.
+`device_name` is the name of the box whose session filed an agent's item —
+the writer of the item's own first post, named the way a comment's
+`device_name` names its writer — so a thread can head the body with it. A
+handed-over item keeps naming the box of the conversation that filed it.
+`null` on an item the user filed, on a contributor's item (`contributor`
+names them), when the device is gone, on every item from another person's
+log, and when a private box filed into a conversation that is not
+private-owned (an ordinary agent can read that item; the name stays off it
+for every reader).
 `last_user_input_at` is when the user last acted on the item: their latest
 comment, action tap, close or reopen, else the filing time of an item they
 filed themselves; `null` when only agents have touched it. Clients order
