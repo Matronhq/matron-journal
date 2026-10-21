@@ -8,8 +8,9 @@
 // GET /media/:id/transcript for them instead of fetching the audio and
 // running its own whisper. A 30-second note is
 // usually done before the app has even sent the message that names it.
-// When the cloud call fails and whisper is configured too, the note falls
-// back to whisper on this host, one note at a time across the whole backlog.
+// When the cloud call fails (an error, not an answer with no words in it)
+// and whisper is configured too, the note falls back to whisper on this
+// host, one note at a time across the whole backlog.
 //
 // Off without a cloud transcriber: a whisper-only journal keeps transcribing
 // item voice notes alone (items-transcribe.js), since doing every chat note
@@ -126,8 +127,8 @@ export function makeBlobTranscripts({
   const perUser = new Map()
 
   // start() takes only a row never asked; retry() a 'failed' one too, and a
-  // 'pending' one with no job behind it (a hand-over copy of a row that was
-  // mid-transcription). Both stamp transcript_asked_at, which recover()
+  // 'pending' one with no job behind it (defensive: hand-over copies cross
+  // a pending row as never asked). Both stamp transcript_asked_at, which recover()
   // judges a leftover by.
   const setPendingFresh = db.prepare("UPDATE blobs SET transcript_status='pending', transcript=NULL, transcript_asked_at=? WHERE id=? AND owner_user_id=? AND transcript_status IS NULL")
   const setPending = db.prepare("UPDATE blobs SET transcript_status='pending', transcript=NULL, transcript_asked_at=? WHERE id=? AND owner_user_id=? AND (transcript_status IS NULL OR transcript_status='failed' OR (transcript_status='pending' AND ?))")
@@ -219,10 +220,11 @@ export function makeBlobTranscripts({
     // such blob of this owner's. Same type checks and caps as start().
     retry(blobId, userId) {
       const { answer, row } = retryPrecheck(db, blobId, userId)
-      // A 'pending' row with no job behind it (a hand-over copies a row as
-      // it stands, pending included, under a new id) would otherwise wait
-      // for the next boot: it is taken like a failed one. recover() runs
-      // before the first request, so every other pending row has a job.
+      // A 'pending' row with no job behind it would otherwise wait for the
+      // next boot: it is taken like a failed one. Nothing writes such a row
+      // today (recover() runs before the first request, and a hand-over
+      // copy crosses a pending row as never asked), so this is a guard for
+      // the next writer that does.
       const orphan = answer === 'pending' && !jobs.has(blobId)
       if (answer && !orphan) return answer
       if (isVideoType(row.content_type) && !canSegments) return 'unsupported'

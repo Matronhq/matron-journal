@@ -357,25 +357,26 @@ the machine-checkable version of this page.
   user's device names. Up to 4 jobs run at once, and at most 20 per user /
   100 overall may be queued. When whisper is configured too
   (`MATRON_WHISPER_MODEL`, see *Journal-side transcription*), a note whose
-  cloud call fails is tried again with whisper on the journal host, **one
-  whisper run at a time** however many cloud calls fail together. A job cut
-  short by shutdown never reaches whisper (it is re-queued at the next boot,
-  judged by when it was last asked for, so a note retried just before a
-  restart survives it; one asked for over an hour before, or over the
-  backlog, settles `failed`), and nor does a file ffmpeg cannot decode (a
-  video with no audio stream), which settles `failed` at once. Video jobs
-  ask for timed segments: from Azure's `phrases[]`, or from whisper's
-  timestamps (whisper's limit for a video is 10 minutes, against 2 for a
-  note). A near-silent clip can come back `done` with one short invented
-  segment; the journal stores what it is given, so a consumer that narrates
-  a video should ignore a transcript too short to be speech. A cloud
-  transcriber also does item voice notes (below), reusing an upload-time
-  transcript rather than sending the same audio twice. A chat voice note
-  transcribed here has its audio expired like an item's
-  (`MATRON_VOICE_NOTE_TTL_DAYS` after `blobs.transcribed_at`): its file
-  events become tombstones carrying the `transcript`; a video's file is
-  never expired that way. Without a key nothing changes: chat notes stay the
-  bridge's job.
+  cloud call fails (an HTTP error, the network, a timeout) is tried again
+  with whisper on the journal host, **one whisper run at a time** however
+  many cloud calls fail together. A job cut short by shutdown never reaches
+  whisper (it is re-queued at the next boot, judged by when it was last
+  asked for, so a note retried just before a restart survives it; one asked
+  for over an hour before, or over the backlog, settles `failed`), nor does
+  a file ffmpeg cannot decode (a video with no audio stream), and nor does
+  an answer in which the cloud heard no words (whisper on near-silent audio
+  tends to invent a phrase); both settle `failed` at once. Video jobs ask
+  for timed segments: from Azure's `phrases[]`, or from whisper's timestamps
+  (whisper's limit for a video is 10 minutes, against 2 for a note). A
+  near-silent clip can come back `done` with one short invented segment; the
+  journal stores what it is given, so a consumer that narrates a video
+  should ignore a transcript too short to be speech. A cloud transcriber
+  also does item voice notes (below), reusing an upload-time transcript
+  rather than sending the same audio twice. A chat voice note transcribed
+  here has its audio expired like an item's (`MATRON_VOICE_NOTE_TTL_DAYS`
+  after `blobs.transcribed_at`): its file events become tombstones carrying
+  the `transcript`; a video's file is never expired that way. Without a key
+  nothing changes: chat notes stay the bridge's job.
 - `GET /media/:id` (Bearer) -> streams the blob with its Content-Type,
   Content-Length and a long-lived `Cache-Control` (ids are immutable random
   handles), plus `X-Content-Type-Options: nosniff` and

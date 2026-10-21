@@ -718,7 +718,7 @@ test('recover: re-queues within the caps, and a row asked for long ago is still 
   await bt.close()
 })
 
-test('retry re-queues a pending row that has no job behind it (a hand-over copy)', async (t) => {
+test('retry re-queues a pending row that has no job behind it', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-bt-'))
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const db = openDb(path.join(dir, 'x.db'))
@@ -726,7 +726,7 @@ test('retry re-queues a pending row that has no job behind it (a hand-over copy)
   await users(db)
   const tr = gatedCloud({ concurrency: 1 })
   const bt = makeBlobTranscripts({ db, transcriber: tr })
-  // Written after boot by handover.js, copying a row that was pending.
+  // Written after boot by something other than this module (no job behind it).
   db.prepare("INSERT INTO blobs(id,owner_user_id,content_type,size,sha256,disk_path,created_at,transcript_status) VALUES('copy',1,'audio/ogg',1,'x','/m/copy',?,'pending')").run(Date.now())
   assert.equal(bt.retry('copy', 1), 'queued')
   await until(() => tr.pending() === 1)

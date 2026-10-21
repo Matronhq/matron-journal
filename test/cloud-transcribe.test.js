@@ -411,3 +411,21 @@ test('chained: audio Azure\'s ffmpeg cannot decode is not retried on whisper (it
   const down = makeAzureTranscriber({ key: 'k', exec: fakeExec(), fetchImpl: fakeFetch({ status: 503, body: { code: 'busy' } }) })
   assert.equal(await makeChainedTranscriber(down, fallback, { log: logSpy() }).transcribeFile('/x'), 'from whisper')
 })
+
+test('chained: an empty Azure result is not handed to whisper (the cloud heard nothing); a 5xx still is', async () => {
+  const fallback = withSegments(fakeTranscriber(async () => 'invented words'), async () => ({ text: 'invented', segments: [{ start_ms: 0, text: 'invented' }] }))
+  for (const body of [{ combinedPhrases: [{ text: '  ' }] }, { combinedPhrases: [], phrases: [] }, {}]) {
+    const log = logSpy()
+    const silent = makeAzureTranscriber({ key: 'k', exec: fakeExec(), fetchImpl: fakeFetch({ body }) })
+    const t = makeChainedTranscriber(silent, fallback, { log })
+    await assert.rejects(t.transcribeFile('/quiet'), (err) => err.message === 'empty transcription result' && err.emptyResult === true)
+    await assert.rejects(t.transcribeFileSegments('/quiet'), (err) => err.message === 'empty transcription result' && err.emptyResult === true)
+    assert.equal(log.lines.length, 2)
+    assert.match(log.lines[0], /heard no words .* not trying whisper\.cpp/)
+  }
+  assert.equal(fallback.calls + fallback.segCalls, 0, 'whisper never ran')
+  const down = makeAzureTranscriber({ key: 'k', exec: fakeExec(), fetchImpl: fakeFetch({ status: 503, body: { code: 'busy' } }) })
+  const chain = makeChainedTranscriber(down, fallback, { log: logSpy() })
+  assert.equal(await chain.transcribeFile('/x'), 'invented words')
+  assert.deepEqual(await chain.transcribeFileSegments('/x'), { text: 'invented', segments: [{ start_ms: 0, text: 'invented' }] })
+})

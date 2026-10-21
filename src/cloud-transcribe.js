@@ -15,8 +15,9 @@
 // 'cloud'` is what turns on transcription of chat voice notes at upload
 // (blob-transcripts.js): a remote call costs this host nothing, whisper
 // would cost it minutes of CPU per note. With whisper configured as well, a
-// note the cloud call fails on falls back to whisper here, one note at a
-// time (makeChainedTranscriber), so a cloud outage does put whisper CPU on
+// note the cloud call fails on (an error, not an answer with no words in
+// it) falls back to whisper here, one note at a time
+// (makeChainedTranscriber), so a cloud outage does put whisper CPU on
 // this host, serialised, for as long as the upload backlog lasts.
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
@@ -130,10 +131,11 @@ export function makeAzureTranscriber({
     label: `Azure ${model || 'standard'} at ${new URL(url).host}`,
     concurrency,
     // diskPath -> transcript string. Throws on any failure, including audio
-    // with no words in it; the caller records that as 'failed'.
+    // with no words in it (err.emptyResult); the caller records that as
+    // 'failed'.
     async transcribeFile(diskPath, opts = {}) {
       const text = combinedText(await callAzure(diskPath, opts))
-      if (!text) throw new Error('empty transcription result')
+      if (!text) throw emptyResult()
       return text
     },
     // diskPath -> {text, segments: [{start_ms, text}]}, one segment per
@@ -142,7 +144,7 @@ export function makeAzureTranscriber({
     async transcribeFileSegments(diskPath, opts = {}) {
       const body = await callAzure(diskPath, opts)
       const text = combinedText(body)
-      if (!text) throw new Error('empty transcription result')
+      if (!text) throw emptyResult()
       const segments = (body.phrases ?? [])
         .map((p) => ({ start_ms: Math.max(0, Math.round(Number(p.offsetMilliseconds) || 0)), text: String(p.text ?? '').replace(/\s+/g, ' ').trim() }))
         .filter((seg) => seg.text)
@@ -150,6 +152,12 @@ export function makeAzureTranscriber({
       return { text, segments }
     },
   }
+}
+
+// Azure answered and heard no words: marked, so the chain does not hand
+// the audio to whisper, which on near-silence invents a phrase.
+function emptyResult() {
+  return Object.assign(new Error('empty transcription result'), { emptyResult: true })
 }
 
 // An unreachable endpoint rejects fetch with a bare "fetch failed"; why
@@ -181,7 +189,10 @@ function serialize() {
 // Nor does a file the primary could not decode (err.decodeFailed: ffmpeg
 // refused it, e.g. a video with no audio stream): whisper decodes it with
 // the same ffmpeg, so queueing it behind other whisper runs would only fail
-// it later.
+// it later. Nor does an answer with no words in it (err.emptyResult): the
+// cloud heard nothing, and whisper on near-silent audio tends to invent a
+// short phrase, at a run's worth of this host's CPU. Every other failure
+// (an HTTP error, the network, a timeout) falls back.
 export function makeChainedTranscriber(primary, fallback, { log = console } = {}) {
   const fallbackName = fallback.label ?? 'whisper.cpp'
   const fallbackQueue = serialize()
@@ -192,6 +203,10 @@ export function makeChainedTranscriber(primary, fallback, { log = console } = {}
       if (opts.signal?.aborted) throw err
       if (err?.decodeFailed) {
         log.error(`transcribe: ${primary.label} could not decode the audio (${failureReason(err)}) — not trying ${fallbackName}, which decodes it the same way`)
+        throw err
+      }
+      if (err?.emptyResult) {
+        log.error(`transcribe: ${primary.label} heard no words — not trying ${fallbackName}, which would only invent some`)
         throw err
       }
       log.error(`transcribe: ${primary.label} failed (${failureReason(err)}) — trying ${fallbackName}`)
