@@ -359,9 +359,15 @@ close or merge.
 
 - \`POST /media\` (raw body, Content-Type captured) →
   \`{media_id, size, content_type, sha256}\`; fetch with \`GET /media/:id\`.
-- \`GET /media/:id/transcript?wait=N\` → \`{status, transcript?}\` — a
-  voice note's words when the journal transcribed it at upload (\`status\`
-  none|pending|done|failed; \`wait\` ≤ 30 s holds a pending answer).
+- \`GET /media/:id/transcript?wait=N\` → \`{status, transcript?, segments?}\`
+  — a voice note's words (or a video's, with \`segments\`
+  \`[{start_ms, text}]\`) when the journal transcribed it at upload
+  (\`status\` none|pending|done|failed; \`wait\` ≤ 30 s holds a pending
+  answer).
+- \`POST /media/:id/transcript?wait=N\` — your user's own note: asks the
+  journal to try a none/failed one again (→ pending); done/pending answer as
+  they stand, nothing re-runs; \`{status:'none', reason:'busy'}\` = backlog
+  full, try later; 400 \`not_transcribable\` for non audio/video.
 `
 
 /**

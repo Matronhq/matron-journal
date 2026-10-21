@@ -1018,6 +1018,32 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         if (gone.signal.aborted && !res.writable) return
         return json(res, 200, out)
       }
+      if (req.method === 'POST' && mt) {
+        // Ask the journal to (re)transcribe a note: one never transcribed
+        // here (the backlog was full at upload) or whose job failed is queued
+        // again ({status:'pending'}); one already 'done' or 'pending' answers
+        // as it stands and nothing re-runs. A full backlog answers 200
+        // {status:'none', reason:'busy'}, which an older bridge reads as none.
+        // A journal that cannot take it (no cloud transcriber, or a video
+        // without timed segments) answers the row as it stands, as the GET
+        // would. ?wait=N as on the GET. The owner's own blobs only — a
+        // colleague who may read the words may not spend the owner's
+        // transcription backlog — with the GET's 404 for everyone else.
+        const blob = getBlob(db, mt[1])
+        if (!blob || blob.owner_user_id !== who.userId) return json(res, 404, { error: 'not_found' })
+        const asked = blobTranscripts ? blobTranscripts.retry(blob.id, who.userId) : 'unsupported'
+        if (asked === 'not_found') return json(res, 404, { error: 'not_found' })
+        if (asked === 'not_transcribable') return json(res, 400, { error: 'not_transcribable' })
+        if (asked === 'busy') return json(res, 200, { status: 'none', reason: 'busy' })
+        const waitS = asked === 'queued' || asked === 'pending' ? Math.min(30, Math.max(0, Number(url.searchParams.get('wait')) || 0)) : 0
+        const gone = new AbortController()
+        res.on('close', () => gone.abort())
+        const out = blobTranscripts
+          ? await blobTranscripts.wait(blob.id, waitS * 1000, gone.signal)
+          : readBlobTranscript(db, blob.id)
+        if (gone.signal.aborted && !res.writable) return
+        return json(res, 200, out)
+      }
       const mm = url.pathname.match(/^\/media\/([^/]+)$/)
       if (req.method === 'GET' && mm) {
         // Missing and not-owned are made indistinguishable (404, never 403): a

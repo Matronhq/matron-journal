@@ -296,18 +296,47 @@ the machine-checkable version of this page.
   Storage root: `MATRON_MEDIA_DIR` env or `<dirname of the db file>/media`,
   sharded `<root>/<id[0:2]>/<id>`.
   When the journal has a cloud transcriber (below), a **user's** `audio/*`
-  upload is also sent for transcription at once and the response carries
-  `transcript_status:'pending'`; read the words with
+  upload is also sent for transcription at once, and so is a user's
+  `video/*` upload, for its audio track; the response then carries
+  `transcript_status:'pending'`. Read the words with
   `GET /media/:id/transcript`.
-- `GET /media/:id/transcript[?wait=N]` (Bearer) -> `{status, transcript?}`,
-  the upload-time transcript of a voice note. `status` is `'none'` (never
-  transcribed here: no cloud transcriber, not audio, an agent's upload, or
-  the backlog was full), `'pending'`, `'done'` (with `transcript`) or
-  `'failed'`. `wait` (seconds, capped at 30) holds a `pending` answer until
-  the job settles, so a caller asks once instead of polling. Same read rule
-  and same 404 for missing/not-yours as `GET /media/:id`. A bridge that gets
-  a chat voice note asks this first and falls back to its own whisper on
-  anything but `done` (or a 404 from an older journal).
+- `GET /media/:id/transcript[?wait=N]` (Bearer) -> `{status, transcript?,
+  segments?}`, the upload-time transcript of a voice note or a video's
+  audio track. `status` is `'none'` (never transcribed here: no cloud
+  transcriber, neither audio nor video, a video this transcriber cannot
+  time, an agent's upload, or the backlog was full at upload), `'pending'`, `'done'`
+  (with `transcript`) or `'failed'`. A `done` video also carries `segments`,
+  `[{start_ms, text}]` in the order spoken (`start_ms` a non-negative
+  integer, `text` non-empty), so a caller can line the words up with the
+  video's frames; a voice note never has the key, and a video's may be `[]`
+  (treat it as no narration). `wait` (seconds, capped at 30) holds a
+  `pending` answer until the job settles, so a caller asks once instead of
+  polling. Same read rule and same 404 for missing/not-yours as
+  `GET /media/:id`. A GET never starts a job. A bridge that gets a chat
+  voice note asks this first; on `none` or `failed` it may ask the journal
+  to try again (`POST`, below) before falling back to its own whisper, and
+  a 404 means an older journal without the route.
+- `POST /media/:id/transcript[?wait=N]` (Bearer, client or agent) -> the
+  GET's answer, after asking the journal to (re)transcribe the blob. A blob
+  whose status is `none` or `failed` is queued again and answers
+  `{status:'pending'}` (with `wait`, as on the GET, the answer is held
+  until the job settles; the bridge sends `wait=0` by default). One already
+  `pending` answers `pending` and starts no second job; one already `done`
+  answers its words (and `segments`) and nothing re-runs. When the backlog
+  is full, or the journal is shutting down, the answer is 200
+  `{status:'none', reason:'busy'}` and the row is untouched: try again
+  later. `reason:'busy'` tells a busy journal apart from one that cannot
+  transcribe the blob at all (no cloud transcriber, or a video and a
+  transcriber without timed segments), which answers the row as it stands
+  (`none`, or `failed`) with no `reason`; an older bridge reads both as
+  `none`. 400 `{error:'not_transcribable'}` for a blob that is neither
+  `audio/*` nor `video/*`. The **owner's** blobs only, through any of their
+  devices (the bridge asks with its agent token): a colleague who may read
+  the words under *Shared visibility* may not spend the owner's backlog,
+  and gets the same 404 as for a missing blob. The same per-user and
+  overall caps apply as at upload. Item voice notes need no route of their
+  own: an attachment is a blob, so a bridge retries the blob and PATCHes
+  the words onto the comment as it does today.
 
   **Cloud transcription** (`src/cloud-transcribe.js`): set
   `MATRON_STT_AZURE_KEY` (or `MATRON_STT_AZURE_KEY_FILE`, a file holding it)
@@ -318,14 +347,29 @@ the machine-checkable version of this page.
   `MATRON_STT_AZURE_MODEL` (default `MAI-Transcribe-2`; empty = Azure's
   standard model) and locale `MATRON_STT_LOCALE` (default `en`, or `en-GB`
   for the standard model). The audio is converted to 16 kHz mono FLAC with
-  `ffmpeg` (must be on `PATH`), and the phrase list is the whisper prompt's
-  vocabulary plus the user's device names. Up to 4 jobs run at once, and at
-  most 20 per user / 100 overall may be queued. A cloud transcriber also
-  does item voice notes (below), reusing an upload-time transcript rather
-  than sending the same audio twice. A chat voice note transcribed here has
-  its audio expired like an item's (`MATRON_VOICE_NOTE_TTL_DAYS` after
-  `blobs.transcribed_at`): its file events become tombstones carrying the
-  `transcript`. Without a key nothing changes.
+  `ffmpeg` (must be on `PATH`; `-vn`, so a video decodes to its audio
+  track), and the phrase list is the whisper prompt's vocabulary plus the
+  user's device names. Up to 4 jobs run at once, and at most 20 per user /
+  100 overall may be queued. When whisper is configured too
+  (`MATRON_WHISPER_MODEL`, see *Journal-side transcription*), a note whose
+  cloud call fails is tried again with whisper on the journal host, **one
+  whisper run at a time** however many cloud calls fail together. A job
+  cut short by shutdown never reaches whisper (it is re-queued at the next
+  boot), and nor does a file ffmpeg cannot decode (a video with no audio
+  stream), which settles `failed` at once. Video jobs ask
+  for timed segments: from Azure's `phrases[]`, or from whisper's
+  timestamps (whisper's limit for a video is 10 minutes, against 2 for a
+  note). A video with no audio stream fails like a silent note. A
+  near-silent clip can come back `done` with one short invented segment;
+  the journal stores what it is given, so a
+  consumer that narrates a video should ignore a transcript too short to be
+  speech. A cloud transcriber also does item voice notes (below), reusing an
+  upload-time transcript rather than sending the same audio twice. A chat
+  voice note transcribed here has its audio expired like an item's
+  (`MATRON_VOICE_NOTE_TTL_DAYS` after `blobs.transcribed_at`): its file
+  events become tombstones carrying the `transcript`; a video's file is
+  never expired that way. Without a key nothing changes: chat notes stay
+  the bridge's job.
 - `GET /media/:id` (Bearer) -> streams the blob with its Content-Type,
   Content-Length and a long-lived `Cache-Control` (ids are immutable random
   handles), plus `X-Content-Type-Options: nosniff` and
@@ -2051,7 +2095,8 @@ by age.
 `MATRON_WHISPER_CLI`, default `<model dir>/../build/bin/whisper-cli`;
 `MATRON_WHISPER_LANGUAGE`, default `en`; `ffmpeg` on `PATH`), a **user's**
 comment with `audio/*` attachments is transcribed on upload, one job at a
-time:
+time. With both, whisper is the fallback behind the cloud call (see the
+cloud transcription note); with whisper alone it is the transcriber:
 
 1. The comment is stored, and the `commented` marker announced, with
    `transcript_status:'pending'` on each audio attachment (`transcript:null`).
@@ -2066,8 +2111,10 @@ time:
    Quiet = no wake, no push, no fallback text.
 
 A bridge that knows the fields **holds the agent's turn** on a marker with a
-pending attachment and delivers it from the follow-up marker (falling back to
-its own whisper on `failed`, or if no follow-up arrives in time). A bridge
+pending attachment and delivers it from the follow-up marker. On `failed`, or
+if no follow-up arrives in time, it can ask the journal to try the
+attachment's blob again (`POST /media/:id/transcript`) and PATCH the words
+in, falling back to its own whisper only where it has one. A bridge
 that predates them sees `transcript:null`, transcribes as it always did and
 PATCHes the words in — which settles the status, so the journal's job skips
 the whisper run — and ignores the `updated` marker like any other. Pending

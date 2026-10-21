@@ -16,15 +16,16 @@
 // too would put minutes of CPU per note on the journal host.
 //
 // Status on the row: NULL = never asked (the bridge does it, as before),
-// 'pending', 'done', 'failed'. 'done' stamps transcribed_at, from which
+// 'pending', 'done', 'failed'. A NULL or 'failed' row can be asked again
+// (retry(), from POST /media/:id/transcript); a 'done' one never re-runs. 'done' stamps transcribed_at, from which
 // retention.js expires the audio (7 days by default), keeping the words; a
 // video's file is never expired that way (retention.js takes audio/* only).
 // Owner-scoped throughout: a job only ever reads the audio of the user who
 // uploaded it.
 
 // Bounded backlog, per user and overall, so a burst of uploads cannot queue
-// an unbounded bill. A blob refused here stays NULL, and its bridge
-// transcribes it locally.
+// an unbounded bill. A blob refused here stays NULL: its bridge asks again
+// (retry), and transcribes it locally only if it can.
 const DEFAULT_MAX_QUEUED = 100
 const DEFAULT_MAX_QUEUED_PER_USER = 20
 // A row left 'pending' by a process that died: re-run it at boot if it is
@@ -72,6 +73,18 @@ export function readBlobTranscript(db, blobId) {
   return out
 }
 
+// What retry() can answer before any queue is consulted: 'not_found' (no
+// such blob of this owner's), 'not_transcribable' (neither audio nor
+// video), 'done' / 'pending' (already so: nothing re-runs, no second job),
+// or null with the row, which is NULL or 'failed' and may be asked again.
+function retryPrecheck(db, blobId, userId) {
+  const row = db.prepare('SELECT content_type, transcript_status FROM blobs WHERE id=? AND owner_user_id=?').get(blobId, userId)
+  if (!row) return { answer: 'not_found' }
+  if (!isTranscribableType(row.content_type)) return { answer: 'not_transcribable' }
+  if (row.transcript_status === 'done' || row.transcript_status === 'pending') return { answer: row.transcript_status }
+  return { answer: null, row }
+}
+
 export function makeBlobTranscripts({
   db, transcriber, log = console, now = Date.now,
   maxQueued = DEFAULT_MAX_QUEUED, maxQueuedPerUser = DEFAULT_MAX_QUEUED_PER_USER,
@@ -82,6 +95,8 @@ export function makeBlobTranscripts({
     return {
       enabled: false,
       start: () => false,
+      // Nothing here can transcribe: 'unsupported' = answer the row as it stands.
+      retry: (blobId, userId) => retryPrecheck(db, blobId, userId).answer ?? 'unsupported',
       lookup: (blobId) => readBlobTranscript(db, blobId),
       wait: async (blobId) => readBlobTranscript(db, blobId),
       inFlight: () => null,
@@ -100,7 +115,9 @@ export function makeBlobTranscripts({
   const jobs = new Map()
   const perUser = new Map()
 
-  const setPending = db.prepare("UPDATE blobs SET transcript_status='pending', transcript=NULL WHERE id=? AND owner_user_id=? AND transcript_status IS NULL")
+  // start() takes only a row never asked; retry() a 'failed' one too.
+  const setPendingFresh = db.prepare("UPDATE blobs SET transcript_status='pending', transcript=NULL WHERE id=? AND owner_user_id=? AND transcript_status IS NULL")
+  const setPending = db.prepare("UPDATE blobs SET transcript_status='pending', transcript=NULL WHERE id=? AND owner_user_id=? AND (transcript_status IS NULL OR transcript_status='failed')")
   const setDone = db.prepare("UPDATE blobs SET transcript_status='done', transcript=?, transcript_segments=?, transcribed_at=? WHERE id=? AND transcript_status='pending'")
   const setFailed = db.prepare("UPDATE blobs SET transcript_status='failed', transcript=NULL, transcript_segments=NULL WHERE id=? AND transcript_status='pending'")
   // A video needs the timed variant; a transcriber without one leaves
@@ -163,6 +180,7 @@ export function makeBlobTranscripts({
   }
 
   function queuedCount() { return queue.length + running }
+  const full = (userId) => queuedCount() >= maxQueued || (perUser.get(userId) || 0) >= maxQueuedPerUser
 
   return {
     enabled: true,
@@ -173,10 +191,28 @@ export function makeBlobTranscripts({
     start(blobId, userId, contentType) {
       if (closed || !isTranscribableType(contentType)) return false
       if (isVideoType(contentType) && !canSegments) return false
-      if (queuedCount() >= maxQueued || (perUser.get(userId) || 0) >= maxQueuedPerUser) return false
-      if (setPending.run(blobId, userId).changes !== 1) return false
+      if (full(userId)) return false
+      if (setPendingFresh.run(blobId, userId).changes !== 1) return false
       enqueue(blobId, userId)
       return true
+    },
+    // POST /media/:id/transcript: ask again for a note that was never
+    // transcribed here (the backlog was full at upload) or whose job failed.
+    // 'queued' = now pending; 'busy' = the backlog (or a closing journal)
+    // refused it and the row is untouched; 'done' / 'pending' = already so,
+    // nothing re-run and no second job; 'unsupported' = this journal cannot
+    // take it (a video without timed segments), the row as it stands is the
+    // answer; 'not_transcribable' = not audio or video; 'not_found' = no
+    // such blob of this owner's. Same type checks and caps as start().
+    retry(blobId, userId) {
+      const { answer, row } = retryPrecheck(db, blobId, userId)
+      if (answer) return answer
+      if (isVideoType(row.content_type) && !canSegments) return 'unsupported'
+      if (closed || full(userId)) return 'busy'
+      // Same tick as the precheck, so only a row reaped under us misses.
+      if (setPending.run(blobId, userId).changes !== 1) return 'not_found'
+      enqueue(blobId, userId)
+      return 'queued'
     },
     lookup: (blobId) => readBlobTranscript(db, blobId),
     // The row's state once its job settles, or as it stands after `ms`.

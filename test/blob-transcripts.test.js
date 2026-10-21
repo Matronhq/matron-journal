@@ -5,7 +5,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { upsertConversation } from '../src/journal.js'
+import { upsertConversation, append } from '../src/journal.js'
+import { saveGithubIdentity } from '../src/github-accounts.js'
 import { openDb } from '../src/db.js'
 import { makeBlobTranscripts, readBlobTranscript, isTranscribableType } from '../src/blob-transcripts.js'
 import { makeAzureTranscriber, makeChainedTranscriber } from '../src/cloud-transcribe.js'
@@ -368,4 +369,239 @@ test('a video job stores segments as [{start_ms: integer, text: string}], whatev
   tr.release({ text: 'a b c', segments: [{ start_ms: '1200.7', text: '  b ', extra: 'x' }, null, { start_ms: -5, text: 'a' }, { start_ms: 3000, text: '   ' }, { start_ms: 'nope', text: 42 }] })
   const done = await s.http(`/media/${up.media_id}/transcript?wait=5`, { token: aliceToken })
   assert.deepEqual(done.json.segments, [{ start_ms: 1201, text: 'b' }, { start_ms: 0, text: 'a' }, { start_ms: 0, text: '42' }])
+})
+
+// --- POST /media/:id/transcript: the journal (re)transcribes on request ---
+
+const post = (s, id, token, qs = '') => s.http(`/media/${id}/transcript${qs}`, { method: 'POST', token })
+
+test('retry on a failed blob queues it and it ends done', async (t) => {
+  const tr = gatedCloud()
+  const { s, agent, aliceToken, upload } = await setup(t, { transcriber: tr })
+  const up = await upload(aliceToken)
+  await until(() => tr.pending() === 1)
+  tr.fail('HTTP 500')
+  assert.deepEqual((await s.http(`/media/${up.media_id}/transcript?wait=5`, { token: aliceToken })).json, { status: 'failed' })
+
+  // The bridge asks with its agent token, on its user's note, with ?wait=0.
+  const r = await post(s, up.media_id, agent.token, '?wait=0')
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.json, { status: 'pending' })
+  assert.deepEqual(readBlobTranscript(s.db, up.media_id), { status: 'pending' })
+  await until(() => tr.pending() === 1)
+  assert.equal(tr.calls.length, 2)
+  assert.equal(tr.calls[1].userId, s.db.prepare('SELECT owner_user_id FROM blobs WHERE id=?').get(up.media_id).owner_user_id)
+  tr.release('second time lucky')
+  assert.deepEqual((await s.http(`/media/${up.media_id}/transcript?wait=5`, { token: agent.token })).json, { status: 'done', transcript: 'second time lucky' })
+})
+
+test('retry with ?wait holds the answer until the job settles, like the GET', async (t) => {
+  const tr = gatedCloud()
+  const { s, aliceToken, upload } = await setup(t, { transcriber: tr })
+  const up = await upload(aliceToken)
+  await until(() => tr.pending() === 1)
+  tr.fail()
+  await s.http(`/media/${up.media_id}/transcript?wait=5`, { token: aliceToken })
+  const waiting = post(s, up.media_id, aliceToken, '?wait=10')
+  await until(() => tr.pending() === 1)
+  tr.release('held')
+  const r = await waiting
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.json, { status: 'done', transcript: 'held' })
+})
+
+test('retry on a done blob answers done and calls the transcriber 0 more times', async (t) => {
+  const tr = gatedCloud({ segments: true })
+  const { s, aliceToken, upload } = await setup(t, { transcriber: tr })
+  const note = await upload(aliceToken)
+  await until(() => tr.pending() === 1)
+  tr.release('already here')
+  await s.http(`/media/${note.media_id}/transcript?wait=5`, { token: aliceToken })
+  const video = await upload(aliceToken, 'video/mp4', Buffer.from('fake-video'))
+  await until(() => tr.pending() === 1)
+  tr.release({ text: 'a b', segments: SEGMENTS })
+  await s.http(`/media/${video.media_id}/transcript?wait=5`, { token: aliceToken })
+  const stampedBefore = s.db.prepare('SELECT transcribed_at FROM blobs WHERE id=?').get(note.media_id).transcribed_at
+  assert.equal(tr.calls.length, 2)
+
+  for (const qs of ['', '?wait=0', '?wait=5']) {
+    const r = await post(s, note.media_id, aliceToken, qs)
+    assert.equal(r.status, 200)
+    assert.deepEqual(r.json, { status: 'done', transcript: 'already here' })
+  }
+  const rv = await post(s, video.media_id, aliceToken)
+  assert.deepEqual(rv.json, { status: 'done', transcript: 'a b', segments: SEGMENTS })
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(tr.calls.length, 2, 'nothing re-run')
+  assert.equal(tr.pending(), 0)
+  assert.equal(s.db.prepare('SELECT transcribed_at FROM blobs WHERE id=?').get(note.media_id).transcribed_at, stampedBefore, 'the audio clock is not reset')
+})
+
+test('retry on a pending blob answers pending and starts no second job', async (t) => {
+  const tr = gatedCloud()
+  const { s, aliceToken, upload } = await setup(t, { transcriber: tr })
+  const up = await upload(aliceToken)
+  await until(() => tr.pending() === 1)
+  assert.deepEqual((await post(s, up.media_id, aliceToken)).json, { status: 'pending' })
+  assert.deepEqual((await post(s, up.media_id, aliceToken, '?wait=0')).json, { status: 'pending' })
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(tr.calls.length, 1)
+  tr.release('once')
+  assert.deepEqual((await s.http(`/media/${up.media_id}/transcript?wait=5`, { token: aliceToken })).json, { status: 'done', transcript: 'once' })
+  assert.equal(tr.calls.length, 1)
+})
+
+test('retry on a none (never queued, caps full) blob queues it', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-bt-'))
+  const db = openDb(path.join(dir, 'x.db'))
+  t.after(() => db.close())
+  await users(db)
+  const tr = gatedCloud({ concurrency: 1 })
+  const bt = makeBlobTranscripts({ db, transcriber: tr, maxQueuedPerUser: 1 })
+  const ins = db.prepare('INSERT INTO blobs(id,owner_user_id,content_type,size,sha256,disk_path,created_at) VALUES(?,?,?,?,?,?,?)')
+  for (const id of ['a', 'b']) ins.run(id, 1, 'audio/ogg', 1, 'x', `/m/${id}`, Date.now())
+  assert.equal(bt.start('a', 1, 'audio/ogg'), true)
+  assert.equal(bt.start('b', 1, 'audio/ogg'), false) // over the cap: left as none
+  assert.deepEqual(readBlobTranscript(db, 'b'), { status: 'none' })
+  await until(() => tr.pending() === 1)
+  tr.release('first')
+  assert.deepEqual(await bt.wait('a', 1000), { status: 'done', transcript: 'first' })
+  assert.equal(bt.retry('b', 1), 'queued')
+  assert.deepEqual(readBlobTranscript(db, 'b'), { status: 'pending' })
+  await until(() => tr.pending() === 1)
+  assert.equal(tr.calls[1].diskPath, '/m/b')
+  tr.release('second')
+  assert.deepEqual(await bt.wait('b', 1000), { status: 'done', transcript: 'second' })
+  assert.equal(bt.retry('b', 1), 'done')
+  assert.equal(bt.retry('a', 2), 'not_found', 'only the owner')
+  assert.equal(bt.retry('nope', 1), 'not_found')
+  await bt.close()
+})
+
+test('retry when caps are full answers busy', async (t) => {
+  // Unit: the per-user and the overall cap both refuse, and the row is untouched.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-bt-'))
+  const db = openDb(path.join(dir, 'x.db'))
+  t.after(() => db.close())
+  await users(db)
+  const tr = gatedCloud({ concurrency: 1 })
+  await createUser(db, 'u3', 'pw')
+  const bt = makeBlobTranscripts({ db, transcriber: tr, maxQueuedPerUser: 1, maxQueued: 2, log: { log() {}, error() {} } })
+  const ins = db.prepare('INSERT INTO blobs(id,owner_user_id,content_type,size,sha256,disk_path,created_at,transcript_status) VALUES(?,?,?,?,?,?,?,?)')
+  ins.run('a', 1, 'audio/ogg', 1, 'x', '/m/a', Date.now(), null)
+  ins.run('f1', 1, 'audio/ogg', 1, 'x', '/m/f1', Date.now(), 'failed')
+  ins.run('b', 2, 'audio/ogg', 1, 'x', '/m/b', Date.now(), null)
+  ins.run('f3', 3, 'audio/ogg', 1, 'x', '/m/f3', Date.now(), 'failed')
+  assert.equal(bt.start('a', 1, 'audio/ogg'), true)
+  assert.equal(bt.retry('f1', 1), 'busy', 'per-user cap')
+  assert.deepEqual(readBlobTranscript(db, 'f1'), { status: 'failed' })
+  assert.equal(bt.start('b', 2, 'audio/ogg'), true)
+  assert.equal(bt.retry('f3', 3), 'busy', 'overall cap')
+  assert.deepEqual(readBlobTranscript(db, 'f3'), { status: 'failed' })
+  await bt.close()
+  assert.equal(bt.retry('f3', 3), 'busy', 'a closing journal takes nothing new')
+
+  // HTTP: twenty notes fill alice's queue; the twenty-first is refused at
+  // upload and its retry is refused the same way, as a 200 an older bridge
+  // reads as none.
+  const gate = gatedCloud({ concurrency: 1 })
+  const { s, aliceToken, upload } = await setup(t, { transcriber: gate })
+  for (let i = 0; i < 20; i++) assert.equal((await upload(aliceToken)).transcript_status, 'pending')
+  const over = await upload(aliceToken)
+  assert.equal(over.transcript_status, undefined)
+  const r = await post(s, over.media_id, aliceToken, '?wait=5')
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.json, { status: 'none', reason: 'busy' })
+  assert.deepEqual(readBlobTranscript(s.db, over.media_id), { status: 'none' })
+  assert.equal(gate.calls.length, 1)
+})
+
+test('retry on an image is 400 not_transcribable', async (t) => {
+  const tr = gatedCloud()
+  const { s, aliceToken, upload } = await setup(t, { transcriber: tr })
+  const img = await upload(aliceToken, 'image/png')
+  const r = await post(s, img.media_id, aliceToken)
+  assert.equal(r.status, 400)
+  assert.deepEqual(r.json, { error: 'not_transcribable' })
+  const blob = await upload(aliceToken, 'application/octet-stream')
+  assert.equal((await post(s, blob.media_id, aliceToken)).status, 400)
+  assert.deepEqual(readBlobTranscript(s.db, img.media_id), { status: 'none' })
+  assert.equal(tr.calls.length, 0)
+})
+
+test("another user's blob is 404 on retry, a colleague's shared one too; unknown ids too", async (t) => {
+  const tr = gatedCloud()
+  const { s, alice, agent, aliceToken, patToken, upload } = await setup(t, { transcriber: tr })
+  const up = await upload(aliceToken)
+  await until(() => tr.pending() === 1)
+  tr.fail()
+  await s.http(`/media/${up.media_id}/transcript?wait=5`, { token: aliceToken })
+  const r = await post(s, up.media_id, patToken)
+  assert.equal(r.status, 404)
+  assert.deepEqual(r.json, { error: 'not_found' })
+  assert.equal((await post(s, 'nope', aliceToken)).status, 404)
+  assert.equal((await post(s, up.media_id, null)).status, 401)
+
+  // A colleague who may READ the note (shared conversation) still cannot
+  // spend its owner's transcription budget: the retry is the owner's.
+  const pat = s.db.prepare("SELECT id FROM users WHERE name='pat'").get()
+  for (const [u, gid] of [[alice, 1], [pat, 2]]) saveGithubIdentity(s.db, { userId: u.id, host: 'github.com', identity: { github_id: gid, login: `u${gid}`, scopes: ['github.com/acme'] }, token: `t${gid}`, now: 1 })
+  upsertConversation(s.db, { id: 'team', ownerUserId: alice.id, title: 'Team', agentDeviceId: agent.deviceId, repo: 'github.com/acme/x' })
+  append(s.db, { userId: alice.id, convoId: 'team', sender: 'user:alice', type: 'text', payload: { body: 'listen' }, blobRef: up.media_id })
+  assert.deepEqual((await s.http(`/media/${up.media_id}/transcript`, { token: patToken })).json, { status: 'failed' }, 'the colleague reads it')
+  assert.equal((await post(s, up.media_id, patToken)).status, 404, 'but cannot retry it')
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(tr.calls.length, 1)
+  assert.deepEqual(readBlobTranscript(s.db, up.media_id), { status: 'failed' })
+})
+
+test('older-client GET semantics unchanged: a GET never retries', async (t) => {
+  const tr = gatedCloud()
+  const { s, aliceToken, upload } = await setup(t, { transcriber: tr })
+  const up = await upload(aliceToken)
+  await until(() => tr.pending() === 1)
+  tr.fail()
+  for (const qs of ['', '?wait=0', '?wait=1']) {
+    const r = await s.http(`/media/${up.media_id}/transcript${qs}`, { token: aliceToken })
+    assert.equal(r.status, 200)
+    assert.deepEqual(r.json, { status: 'failed' })
+  }
+  const img = await upload(aliceToken, 'image/png')
+  assert.deepEqual((await s.http(`/media/${img.media_id}/transcript`, { token: aliceToken })).json, { status: 'none' }, 'an image is none on the GET, not a 400')
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(tr.calls.length, 1)
+})
+
+test('retry on a journal that cannot transcribe it answers the current state, with no busy reason', async (t) => {
+  // No cloud transcriber at all: none, exactly as the GET says.
+  for (const transcriber of [null, { kind: 'whisper', transcribeFile: async () => 'x' }]) {
+    const w = await setup(t, { transcriber })
+    const up = await w.upload(w.aliceToken)
+    const r = await post(w.s, up.media_id, w.aliceToken, '?wait=1')
+    assert.equal(r.status, 200)
+    assert.deepEqual(r.json, { status: 'none' })
+    assert.equal((await post(w.s, (await w.upload(w.aliceToken, 'image/png')).media_id, w.aliceToken)).status, 400)
+  }
+  // A cloud transcriber without timed segments leaves videos to the bridge.
+  const tr = gatedCloud({ segments: false })
+  const { s, aliceToken, upload } = await setup(t, { transcriber: tr })
+  const video = await upload(aliceToken, 'video/mp4')
+  assert.equal(video.transcript_status, undefined)
+  assert.deepEqual((await post(s, video.media_id, aliceToken)).json, { status: 'none' })
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(tr.calls.length, 0)
+})
+
+test('retry on a failed video re-runs the timed variant and stores segments', async (t) => {
+  const tr = gatedCloud({ segments: true })
+  const { s, aliceToken, upload } = await setup(t, { transcriber: tr })
+  const up = await upload(aliceToken, 'video/mp4', Buffer.from('fake-video'))
+  await until(() => tr.pending() === 1)
+  tr.fail('Output file does not contain any stream')
+  await s.http(`/media/${up.media_id}/transcript?wait=5`, { token: aliceToken })
+  assert.deepEqual((await post(s, up.media_id, aliceToken)).json, { status: 'pending' })
+  await until(() => tr.pending() === 1)
+  assert.equal(tr.calls[1].method, 'transcribeFileSegments')
+  tr.release({ text: 'a b', segments: SEGMENTS })
+  assert.deepEqual((await s.http(`/media/${up.media_id}/transcript?wait=5`, { token: aliceToken })).json, { status: 'done', transcript: 'a b', segments: SEGMENTS })
 })
