@@ -14,7 +14,10 @@
 // {signal, userId}) -> text — so items-transcribe.js runs either. `kind:
 // 'cloud'` is what turns on transcription of chat voice notes at upload
 // (blob-transcripts.js): a remote call costs this host nothing, whisper
-// would cost it minutes of CPU per note.
+// would cost it minutes of CPU per note. With whisper configured as well, a
+// note the cloud call fails on falls back to whisper here, one note at a
+// time (makeChainedTranscriber), so a cloud outage does put whisper CPU on
+// this host, serialised, for as long as the upload backlog lasts.
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import fs from 'node:fs'
@@ -123,6 +126,14 @@ export function makeAzureTranscriber({
   }
 }
 
+// An unreachable endpoint rejects fetch with a bare "fetch failed"; why
+// (ECONNREFUSED, ENOTFOUND, a certificate error) is on err.cause. The cause
+// names a host or an address at most, never the key, which is a header.
+function failureReason(err) {
+  const cause = err?.cause
+  return cause ? `${err.message}: ${cause.code ?? cause.message}` : err?.message
+}
+
 // Runs the functions it is handed one at a time, in arrival order: each
 // starts when the one before it settles, whether that resolved or threw.
 function serialize() {
@@ -142,13 +153,14 @@ function serialize() {
 // request whose signal has aborted (the client went away, the journal is
 // shutting down) never starts the fallback, not even after waiting its turn.
 export function makeChainedTranscriber(primary, fallback, { log = console } = {}) {
+  const fallbackName = fallback.label ?? 'whisper.cpp'
   const fallbackQueue = serialize()
   const chained = (method) => async (diskPath, opts = {}) => {
     try {
       return await primary[method](diskPath, opts)
     } catch (err) {
       if (opts.signal?.aborted) throw err
-      log.error(`transcribe: ${primary.label} failed (${err.message}) — trying whisper.cpp`)
+      log.error(`transcribe: ${primary.label} failed (${failureReason(err)}) — trying ${fallbackName}`)
       return fallbackQueue(() => {
         if (opts.signal?.aborted) throw err
         return fallback[method](diskPath, opts)
@@ -157,7 +169,7 @@ export function makeChainedTranscriber(primary, fallback, { log = console } = {}
   }
   return {
     kind: primary.kind,
-    label: `${primary.label}, then whisper.cpp`,
+    label: `${primary.label}, then ${fallbackName}`,
     concurrency: primary.concurrency,
     transcribeFile: chained('transcribeFile'),
     // Timed segments only when both sides can give them; the shared queue
@@ -187,10 +199,12 @@ export function makeConfiguredTranscriber({ env = process.env, deviceNames = nul
       ...(env.MATRON_STT_LOCALE ? { locale: env.MATRON_STT_LOCALE } : {}),
       deviceNames,
     })
-    const w = whisper({ deviceNames })
+    // Whisper here is only the fallback: a missing model must not be
+    // reported as notes going untranscribed.
+    const w = whisper({ deviceNames, log, missingMeans: 'no whisper fallback for cloud transcription' })
     const t = w ? makeChainedTranscriber(azure, w, { log }) : azure
-    log.log(`transcribe: voice notes are transcribed on upload by ${t.label}`)
+    log.log(`transcribe: voice notes are transcribed on upload by ${t.label}${w ? '' : ' (no whisper fallback)'}`)
     return t
   }
-  return whisper({ deviceNames })
+  return whisper({ deviceNames, log })
 }

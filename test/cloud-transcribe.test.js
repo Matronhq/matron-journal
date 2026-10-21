@@ -7,6 +7,7 @@ import {
   makeAzureTranscriber, makeConfiguredTranscriber, makeChainedTranscriber, phrasesFor, resolveAzureKey,
   DEFAULT_PHRASES, DEFAULT_AZURE_ENDPOINT, AZURE_API_VERSION,
 } from '../src/cloud-transcribe.js'
+import { makeTranscriber } from '../src/transcribe.js'
 
 // ffmpeg stand-in: writes a few bytes where the FLAC would go.
 function fakeExec(calls = []) {
@@ -194,12 +195,36 @@ test('chained: a fallback failure does not stall the runs queued behind it', asy
 
 test('chained: aborted signal skips the fallback and rethrows', async () => {
   const ac = new AbortController()
+  const log = logSpy()
   const primary = azureLike(async () => { ac.abort(); throw new Error('This operation was aborted') })
   const fallback = fakeTranscriber(async () => 'from whisper')
-  const t = makeChainedTranscriber(primary, fallback, { log: logSpy() })
+  const t = makeChainedTranscriber(primary, fallback, { log })
   await assert.rejects(t.transcribeFile('/x', { signal: ac.signal }), /aborted/)
   assert.equal(ac.signal.aborted, true)
   assert.equal(fallback.calls, 0)
+  assert.equal(log.lines.length, 0) // a shutdown says nothing about trying whisper
+})
+
+test('chained: an unreachable primary logs the network cause, not just "fetch failed"', async () => {
+  const log = logSpy()
+  const refused = Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('connect ECONNREFUSED 192.0.2.1:443'), { code: 'ECONNREFUSED' }) })
+  const t = makeChainedTranscriber(azureLike(async () => { throw refused }), fakeTranscriber(async () => 'from whisper'), { log })
+  assert.equal(await t.transcribeFile('/x'), 'from whisper')
+  assert.match(log.lines[0], /failed \(fetch failed: ECONNREFUSED\)/)
+  // A cause with no code gives its message instead.
+  log.lines.length = 0
+  const tls = Object.assign(new TypeError('fetch failed'), { cause: new Error('certificate has expired') })
+  const t2 = makeChainedTranscriber(azureLike(async () => { throw tls }), fakeTranscriber(async () => 'w'), { log })
+  await t2.transcribeFile('/x')
+  assert.match(log.lines[0], /fetch failed: certificate has expired/)
+})
+
+test('chained: the fallback is named by its label when it has one', async () => {
+  const log = logSpy()
+  const t = makeChainedTranscriber(azureLike(async () => { throw new Error('down') }), fakeTranscriber(async () => 'w', { label: 'other STT' }), { log })
+  assert.equal(t.label, 'Azure X at host.example, then other STT')
+  await t.transcribeFile('/x')
+  assert.match(log.lines[0], /trying other STT$/)
 })
 
 test('chained: a request aborted while queued for the fallback never starts it', async () => {
@@ -253,4 +278,20 @@ test('makeConfiguredTranscriber: key + no whisper → plain azure', () => {
   assert.equal(t.kind, 'cloud')
   assert.doesNotMatch(t.label, /whisper/)
   assert.ok(log.lines.some((l) => l.includes(t.label)))
+})
+
+test('makeConfiguredTranscriber: key + a configured but missing whisper model → boot says Azure with no fallback, never "not transcribed"', () => {
+  const log = logSpy()
+  const t = makeConfiguredTranscriber({
+    env: { MATRON_STT_AZURE_KEY: 'sekrit' },
+    log,
+    // The real whisper factory, pointed at a model that is not there.
+    whisper: (opts) => makeTranscriber({ ...opts, modelPath: '/nonexistent/models/ggml-small.bin' }),
+  })
+  assert.equal(t.kind, 'cloud')
+  assert.doesNotMatch(t.label, /whisper/)
+  assert.equal(log.lines.length, 2)
+  assert.match(log.lines[0], /whisper model is missing at .* no whisper fallback/)
+  assert.match(log.lines[1], /transcribed on upload by Azure .* \(no whisper fallback\)$/)
+  assert.ok(log.lines.every((l) => !/NOT be transcribed/.test(l)))
 })

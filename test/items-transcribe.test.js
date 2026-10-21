@@ -164,6 +164,7 @@ test('makeTranscriber: off without a model, off (loudly) when the model path is 
   const errs = []
   assert.equal(makeTranscriber({ modelPath: '/nope/models/ggml-base.bin', log: { error: (m) => errs.push(m) } }), null)
   assert.equal(errs.length, 1)
+  assert.match(errs[0], /whisper model is missing at .* voice notes will NOT be transcribed here/)
   assert.equal(cleanWhisperText(' [BLANK_AUDIO]\n Use option A.\n'), 'Use option A.')
 })
 

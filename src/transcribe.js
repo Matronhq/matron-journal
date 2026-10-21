@@ -93,12 +93,15 @@ export function makeTranscriber({
   ffmpegTimeoutMs = 30000,
   whisperTimeoutMs = 120000,
   log = console,
+  // What a configured but missing model or binary means, for the boot line:
+  // the cloud path words it as a missing fallback instead.
+  missingMeans = 'voice notes will NOT be transcribed here',
 } = {}) {
   if (!modelPath) return null
   const cli = cliPath || whisperCliPath(modelPath)
   for (const [what, p] of [['whisper model', modelPath], ['whisper-cli', cli]]) {
     if (!fs.existsSync(p)) {
-      log.error(`transcribe: MATRON_WHISPER_MODEL is set but the ${what} is missing at ${p} — voice notes will NOT be transcribed here`)
+      log.error(`transcribe: MATRON_WHISPER_MODEL is set but the ${what} is missing at ${p} — ${missingMeans}`)
       return null
     }
   }

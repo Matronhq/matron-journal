@@ -5,6 +5,8 @@
 // gets the chat message asks GET /media/:id/transcript for them instead of
 // fetching the audio and running its own whisper. A 30-second note is
 // usually done before the app has even sent the message that names it.
+// When the cloud call fails and whisper is configured too, the note falls
+// back to whisper on this host, one note at a time across the whole backlog.
 //
 // Off without a cloud transcriber: a whisper-only journal keeps transcribing
 // item voice notes alone (items-transcribe.js), since doing every chat note
