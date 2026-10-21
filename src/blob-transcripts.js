@@ -125,8 +125,10 @@ export function makeBlobTranscripts({
   const jobs = new Map()
   const perUser = new Map()
 
-  // start() takes only a row never asked; retry() a 'failed' one too.
-  // Both stamp transcript_asked_at, which recover() judges a leftover by.
+  // start() takes only a row never asked; retry() a 'failed' one too, and a
+  // 'pending' one with no job behind it (a hand-over copy of a row that was
+  // mid-transcription). Both stamp transcript_asked_at, which recover()
+  // judges a leftover by.
   const setPendingFresh = db.prepare("UPDATE blobs SET transcript_status='pending', transcript=NULL, transcript_asked_at=? WHERE id=? AND owner_user_id=? AND transcript_status IS NULL")
   const setPending = db.prepare("UPDATE blobs SET transcript_status='pending', transcript=NULL, transcript_asked_at=? WHERE id=? AND owner_user_id=? AND (transcript_status IS NULL OR transcript_status='failed' OR (transcript_status='pending' AND ?))")
   const setDone = db.prepare("UPDATE blobs SET transcript_status='done', transcript=?, transcript_segments=?, transcribed_at=? WHERE id=? AND transcript_status='pending'")

@@ -305,8 +305,8 @@ the machine-checkable version of this page.
   audio track. `status` is `'none'` (never transcribed here: no cloud
   transcriber, neither audio nor video, a video this transcriber cannot
   time, an agent's upload, or the backlog was full at upload),
-  `'pending'`, `'done'` (with `transcript`) or `'failed'`. A `done` video also carries `segments`,
-  `[{start_ms, text}]` in the order spoken (`start_ms` a non-negative
+  `'pending'`, `'done'` (with `transcript`) or `'failed'`. A `done` video also
+  carries `segments`, `[{start_ms, text}]` in the order spoken (`start_ms` a non-negative
   integer, `text` non-empty), so a caller can line the words up with the
   video's frames; a voice note never has the key, and a video's may be `[]`
   (treat it as no narration). `wait` (seconds, capped at 30) holds a
