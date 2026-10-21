@@ -44,6 +44,21 @@ export function isTranscribableType(contentType) {
   return isAudioType(contentType) || isVideoType(contentType)
 }
 
+// The column's contract, enforced where it is written: [{start_ms: a
+// non-negative integer, text: a non-empty trimmed string}], in the order the
+// transcriber gave. Anything else a transcriber returns is coerced or dropped.
+export function normalizeSegments(segments) {
+  if (!Array.isArray(segments)) return []
+  const out = []
+  for (const seg of segments) {
+    if (!seg || typeof seg !== 'object') continue
+    const text = String(seg.text ?? '').replace(/\s+/g, ' ').trim()
+    if (!text) continue
+    out.push({ start_ms: Math.max(0, Math.round(Number(seg.start_ms) || 0)), text })
+  }
+  return out
+}
+
 // {status: 'none'|'pending'|'failed'} or {status: 'done', transcript,
 // segments?} — segments only for a row that has them (a video).
 export function readBlobTranscript(db, blobId) {
@@ -120,7 +135,7 @@ export function makeBlobTranscripts({
         // recorded 'failed' like a silent note.
         const out = await transcriber.transcribeFileSegments(blob.disk_path, opts)
         text = out?.text
-        segments = Array.isArray(out?.segments) ? out.segments : []
+        segments = normalizeSegments(out?.segments)
       } else {
         text = await transcriber.transcribeFile(blob.disk_path, opts)
       }

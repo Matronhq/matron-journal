@@ -343,6 +343,59 @@ test('segments: the prompt guard reruns a truncated prompted run without the pro
   assert.equal(out.text.split(' ').length, 300)
 })
 
+// A whisper whose prompted run comes back implausibly short for a 124-second
+// WAV (so the prompt guard wants a rerun), on a clock the test moves: each
+// whisper run takes `runMs` of it.
+function guardedWhisper(t, { runMs, segmentsTimeoutMs, timed = true }) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jt-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const modelPath = path.join(dir, 'ggml-small.bin'); fs.writeFileSync(modelPath, '')
+  const cliPath = path.join(dir, 'whisper-cli'); fs.writeFileSync(cliPath, '')
+  let clock = 1_000_000
+  const runs = []
+  const out = (n) => Array.from({ length: n }, (_, i) => (timed ? `[00:00:${String(i % 60).padStart(2, '0')}.000 --> 00:00:59.999]  w${i}` : `w${i}`)).join('\n')
+  const exec = async (cmd, args, opts) => {
+    if (cmd === 'ffmpeg') { fs.writeFileSync(args[args.length - 1], Buffer.alloc(44 + 32000 * 124)); return { stdout: '' } }
+    runs.push({ prompted: args.includes('--prompt'), timeout: opts.timeout })
+    clock += runMs
+    return { stdout: args.includes('--prompt') ? out(16) : out(300) }
+  }
+  const tr = makeTranscriber({ modelPath, cliPath, prompt: 'Matron.', exec, now: () => clock, ...(segmentsTimeoutMs ? { segmentsTimeoutMs } : {}) })
+  return { tr, runs }
+}
+
+test('segments: the prompt-guard rerun gets what is left of the one 600 s budget, not a fresh one', async (t) => {
+  const { tr, runs } = guardedWhisper(t, { runMs: 200_000 })
+  const got = await tr.transcribeFileSegments('/blob')
+  assert.deepEqual(runs.map((r) => [r.prompted, r.timeout]), [[true, 600000], [false, 400000]])
+  assert.equal(got.segments.length, 300)
+  assert.ok(200_000 + runs[1].timeout <= 600000, 'the first run\'s time plus the rerun\'s limit fit the single budget')
+})
+
+test('segments: no rerun when under 60 s of the budget is left; the prompted run stands', async (t) => {
+  const { tr, runs } = guardedWhisper(t, { runMs: 545_000 })
+  const got = await tr.transcribeFileSegments('/blob')
+  assert.equal(runs.length, 1)
+  assert.equal(got.segments.length, 16)
+  // A custom budget is honoured the same way.
+  const custom = guardedWhisper(t, { runMs: 1_000, segmentsTimeoutMs: 10_000 })
+  await custom.tr.transcribeFileSegments('/blob')
+  assert.equal(custom.runs.length, 1)
+})
+
+test('transcribeFile: the prompt-guard rerun still gets its own 120 s timeout (voice notes unchanged)', async (t) => {
+  const { tr, runs } = guardedWhisper(t, { runMs: 100_000, timed: false })
+  await tr.transcribeFile('/blob')
+  assert.deepEqual(runs.map((r) => [r.prompted, r.timeout]), [[true, 120000], [false, 120000]])
+})
+
+test('parseSegments: inline markers are stripped like a note\'s, and segments come back in time order', () => {
+  assert.deepEqual(parseSegments('[00:00:03.000 --> 00:00:04.000]  later\n[00:00:01.000 --> 00:00:02.000]  [MUSIC] hello [BLANK_AUDIO]\n[00:00:02.000 --> 00:00:03.000]  [MUSIC] \n'), [
+    { start_ms: 1000, text: 'hello' },
+    { start_ms: 3000, text: 'later' },
+  ])
+})
+
 test('the same blob attached twice is one whisper run and settles both attachments', async (t) => {
   const tr = gatedTranscriber()
   const { s, client, itemId } = await fleet(t, { transcriber: tr })

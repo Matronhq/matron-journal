@@ -382,3 +382,27 @@ test('makeConfiguredTranscriber: key + the real whisper → the chain offers tra
   assert.equal(typeof tr.transcribeFileSegments, 'function')
   assert.equal(tr.kind, 'cloud')
 })
+
+test('segments: Azure phrases come back in time order', async () => {
+  const t = makeAzureTranscriber({ key: 'k', exec: fakeExec(), fetchImpl: fakeFetch({ body: { combinedPhrases: [{ text: 'a b' }], phrases: [{ offsetMilliseconds: 1200, text: 'b' }, { offsetMilliseconds: 0, text: 'a' }] } }) })
+  assert.deepEqual((await t.transcribeFileSegments('/x')).segments, [{ start_ms: 0, text: 'a' }, { start_ms: 1200, text: 'b' }])
+})
+
+test('chained: audio Azure\'s ffmpeg cannot decode is not retried on whisper (it decodes the same way)', async () => {
+  const log = logSpy()
+  const exec = async () => { throw new Error('Output file #0 does not contain any stream') }
+  let fetched = 0
+  const azure = makeAzureTranscriber({ key: 'k', exec, fetchImpl: async () => { fetched++ } })
+  const fallback = withSegments(fakeTranscriber(async () => 'from whisper'), async () => ({ text: 'w', segments: [] }))
+  const t = makeChainedTranscriber(azure, fallback, { log })
+  await assert.rejects(t.transcribeFileSegments('/mute'), /does not contain any stream/)
+  await assert.rejects(t.transcribeFile('/mute'), /does not contain any stream/)
+  assert.equal(fetched, 0)
+  assert.equal(fallback.calls + fallback.segCalls, 0)
+  assert.equal(log.lines.length, 2)
+  assert.match(log.lines[0], /could not decode .*does not contain any stream.* not trying whisper/)
+  assert.doesNotMatch(log.lines[0], /trying whisper\.cpp$/)
+  // An HTTP failure after a good decode still falls back.
+  const down = makeAzureTranscriber({ key: 'k', exec: fakeExec(), fetchImpl: fakeFetch({ status: 503, body: { code: 'busy' } }) })
+  assert.equal(await makeChainedTranscriber(down, fallback, { log: logSpy() }).transcribeFile('/x'), 'from whisper')
+})

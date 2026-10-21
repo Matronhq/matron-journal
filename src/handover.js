@@ -206,8 +206,8 @@ function copyBlob(db, b, toUserId, files) {
     return null
   }
   files.push(dest)
-  db.prepare(`INSERT INTO blobs(id, owner_user_id, content_type, size, sha256, disk_path, created_at, width, height, transcript, transcript_status, transcribed_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, toUserId, b.content_type, b.size, b.sha256, dest, Date.now(), b.width, b.height, b.transcript, b.transcript_status, b.transcribed_at)
+  db.prepare(`INSERT INTO blobs(id, owner_user_id, content_type, size, sha256, disk_path, created_at, width, height, transcript, transcript_status, transcribed_at, transcript_segments)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, toUserId, b.content_type, b.size, b.sha256, dest, Date.now(), b.width, b.height, b.transcript, b.transcript_status, b.transcribed_at, b.transcript_segments ?? null)
   return id
 }
 

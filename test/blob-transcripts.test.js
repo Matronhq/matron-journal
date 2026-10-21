@@ -280,14 +280,20 @@ test('a video with no audio stream, through the real Azure-then-whisper chain, s
     return { stdout: '' }
   }
   const quiet = { log() {}, error() {} }
+  // Azure is down for the whole test, so a video with sound has to go
+  // through whisper's one-at-a-time slot.
   let fetched = 0
   const azure = makeAzureTranscriber({
     key: 'k',
     exec: (cmd, args) => ffmpeg(args),
-    fetchImpl: async () => { fetched++; return { ok: true, status: 200, json: async () => ({ combinedPhrases: [{ text: 'a b' }], phrases: SEGMENTS.map((x) => ({ offsetMilliseconds: x.start_ms, text: x.text })) }) } },
+    fetchImpl: async () => { fetched++; return { ok: false, status: 503, text: async () => 'busy' } },
   })
   let whisperRuns = 0
-  const whisper = makeTranscriber({ modelPath, cliPath, prompt: '', log: quiet, exec: async (cmd, args) => { if (cmd === 'ffmpeg') return ffmpeg(args); whisperRuns++; return { stdout: '' } } })
+  const whisper = makeTranscriber({ modelPath, cliPath, prompt: '', log: quiet, exec: async (cmd, args) => {
+    if (cmd === 'ffmpeg') return ffmpeg(args)
+    whisperRuns++
+    return { stdout: '[00:00:00.000 --> 00:00:01.200]   a\n[00:00:01.200 --> 00:00:02.000]  b\n' }
+  } })
   const tr = makeChainedTranscriber(azure, whisper, { log: quiet })
   assert.equal(typeof tr.transcribeFileSegments, 'function')
   const { s, aliceToken, upload } = await setup(t, { transcriber: tr })
@@ -296,15 +302,20 @@ test('a video with no audio stream, through the real Azure-then-whisper chain, s
   assert.equal(up.transcript_status, 'pending')
   const r = await s.http(`/media/${up.media_id}/transcript?wait=10`, { token: aliceToken })
   assert.deepEqual(r.json, { status: 'failed' })
-  // Azure's ffmpeg refused, whisper's ffmpeg refused; neither sent nor ran anything.
-  assert.deepEqual(ffmpegRuns, ['mute', 'mute'])
+  // Azure's ffmpeg refused, and the chain did not queue the same decode on
+  // whisper: nothing was sent, whisper never ran.
+  assert.deepEqual(ffmpegRuns, ['mute'])
   assert.equal(fetched, 0)
   assert.equal(whisperRuns, 0)
 
-  // The queue (and whisper's one-at-a-time slot) is free: a video with sound runs.
+  // Both queues are free: a video with sound fails on Azure, goes through
+  // whisper's one-at-a-time slot, and lands with its segments.
   const next = await upload(aliceToken, 'video/mp4', Buffer.from('a video with sound'))
   const ok = await s.http(`/media/${next.media_id}/transcript?wait=10`, { token: aliceToken })
   assert.deepEqual(ok.json, { status: 'done', transcript: 'a b', segments: SEGMENTS })
+  assert.deepEqual(ffmpegRuns, ['mute', 'ok', 'ok'])
+  assert.equal(fetched, 1)
+  assert.equal(whisperRuns, 1)
 })
 
 test('a video is left to the bridge when the transcriber cannot give segments', async (t) => {
@@ -347,4 +358,14 @@ test('migration: an existing blobs table gains transcript_segments, NULL on old 
   assert.equal(col.notnull, 0)
   assert.equal(again.prepare("SELECT transcript_segments FROM blobs WHERE id='old'").get().transcript_segments, null)
   assert.deepEqual(readBlobTranscript(again, 'old'), { status: 'done', transcript: 'w' })
+})
+
+test('a video job stores segments as [{start_ms: integer, text: string}], whatever shape the transcriber returned', async (t) => {
+  const tr = gatedCloud({ segments: true })
+  const { s, aliceToken, upload } = await setup(t, { transcriber: tr })
+  const up = await upload(aliceToken, 'video/mp4')
+  await until(() => tr.pending() === 1)
+  tr.release({ text: 'a b c', segments: [{ start_ms: '1200.7', text: '  b ', extra: 'x' }, null, { start_ms: -5, text: 'a' }, { start_ms: 3000, text: '   ' }, { start_ms: 'nope', text: 42 }] })
+  const done = await s.http(`/media/${up.media_id}/transcript?wait=5`, { token: aliceToken })
+  assert.deepEqual(done.json.segments, [{ start_ms: 1201, text: 'b' }, { start_ms: 0, text: 'a' }, { start_ms: 0, text: '42' }])
 })

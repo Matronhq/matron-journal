@@ -85,12 +85,18 @@ export function makeAzureTranscriber({
   if (!key) return null
   const url = `${String(endpoint).replace(/\/+$/, '')}/speechtotext/transcriptions:transcribe?api-version=${AZURE_API_VERSION}`
   // diskPath -> Azure's parsed reply. Throws on an ffmpeg failure (a video
-  // with no audio stream among them) or an HTTP error.
+  // with no audio stream among them), marked `decodeFailed` so the chain
+  // does not hand the same undecodable file to whisper, or on an HTTP error.
   async function callAzure(diskPath, { signal, userId = null } = {}) {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-'))
     const flacPath = path.join(tmpDir, 'audio.flac')
     try {
-      await toFlac(exec, diskPath, flacPath, { timeout: ffmpegTimeoutMs, signal })
+      try {
+        await toFlac(exec, diskPath, flacPath, { timeout: ffmpegTimeoutMs, signal })
+      } catch (err) {
+        if (err && typeof err === 'object' && !signal?.aborted) err.decodeFailed = true
+        throw err
+      }
       const definition = {
         locales: [locale],
         phraseList: { phrases: phrasesFor(phrases, deviceNames, userId) },
@@ -138,6 +144,7 @@ export function makeAzureTranscriber({
       const segments = (body.phrases ?? [])
         .map((p) => ({ start_ms: Math.max(0, Math.round(Number(p.offsetMilliseconds) || 0)), text: String(p.text ?? '').replace(/\s+/g, ' ').trim() }))
         .filter((seg) => seg.text)
+        .sort((a, b) => a.start_ms - b.start_ms)
       return { text, segments }
     },
   }
@@ -169,6 +176,10 @@ function serialize() {
 // CPU, runs one note at a time however many cloud calls fail together. A
 // request whose signal has aborted (the client went away, the journal is
 // shutting down) never starts the fallback, not even after waiting its turn.
+// Nor does a file the primary could not decode (err.decodeFailed: ffmpeg
+// refused it, e.g. a video with no audio stream): whisper decodes it with
+// the same ffmpeg, so queueing it behind other whisper runs would only fail
+// it later.
 export function makeChainedTranscriber(primary, fallback, { log = console } = {}) {
   const fallbackName = fallback.label ?? 'whisper.cpp'
   const fallbackQueue = serialize()
@@ -177,6 +188,10 @@ export function makeChainedTranscriber(primary, fallback, { log = console } = {}
       return await primary[method](diskPath, opts)
     } catch (err) {
       if (opts.signal?.aborted) throw err
+      if (err?.decodeFailed) {
+        log.error(`transcribe: ${primary.label} could not decode the audio (${failureReason(err)}) — not trying ${fallbackName}, which decodes it the same way`)
+        throw err
+      }
       log.error(`transcribe: ${primary.label} failed (${failureReason(err)}) — trying ${fallbackName}`)
       return fallbackQueue(() => {
         if (opts.signal?.aborted) throw err

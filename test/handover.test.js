@@ -13,6 +13,7 @@ import { peopleConvoId } from '../src/people-convo.js'
 import { expireGrantAsks } from '../src/grants.js'
 import { OWN_ASK_TTL_MS } from '../src/contacts.js'
 import { onGrantAskExpired } from '../src/sharing-events.js'
+import { readBlobTranscript } from '../src/blob-transcripts.js'
 
 // Hand-over (spec 2026-10-02 matron-to-matron sharing, "Hand-over"): alice
 // hands a mission, or a whole project, to her contact bob. Two yeses as for
@@ -117,6 +118,11 @@ test('hand-over: an agent asks, alice approves with an attachment unticked, bob 
   const r = await richMission(w)
   const m = r.mission
   await makeContacts(w)
+  // The kept attachment carries upload-time words with their timing (as a
+  // video transcribed at upload does); the copy must keep both.
+  const SEGMENTS = [{ start_ms: 0, text: 'the hall' }, { start_ms: 1500, text: 'is booked' }]
+  w.s.db.prepare("UPDATE blobs SET transcript_status='done', transcript='the hall is booked', transcript_segments=?, transcribed_at=? WHERE id=?")
+    .run(JSON.stringify(SEGMENTS), Date.now(), r.keep)
 
   // The brief is required for a hand-over, and bounded.
   assert.equal((await w.aliceBox(`/missions/${m.id}/shares`, post({ contact: 'bob', level: 'owner', convo_id: 'work' }))).status, 400)
@@ -238,6 +244,7 @@ test('hand-over: an agent asks, alice approves with an attachment unticked, bob 
   assert.notEqual(att.blob_ref, r.keep)
   assert.equal(words[0].body, `See the plan ![floor plan](attachment:${att.blob_ref})`)
   assert.deepEqual(await w.fetchMedia(w.tokens.bobPhone, att.blob_ref), { status: 200, text: 'floor plan bytes' })
+  assert.deepEqual(readBlobTranscript(w.s.db, att.blob_ref), { status: 'done', transcript: 'the hall is booked', segments: SEGMENTS })
   assert.deepEqual(words[1].attachments, [], 'the unticked receipt did not cross')
   assert.equal(words[1].body, 'And the receipt.')
   assert.equal((await w.fetchMedia(w.tokens.bobPhone, r.drop)).status, 404)
