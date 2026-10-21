@@ -5,7 +5,7 @@ import { checkPassword, makeRateLimiter, authToken, changePassword, revokeOwnedD
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice, deviceStatuses } from './db.js'
 import { receiveBlob } from './media.js'
-import { readBlobTranscript } from './blob-transcripts.js'
+import { readBlobTranscript, isTranscribableType, transcriptWaitS } from './blob-transcripts.js'
 import { imageSizeFromFile } from './image-size.js'
 import { buildMetrics } from './metrics.js'
 import { listAwaiting } from './participants.js'
@@ -994,7 +994,8 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         }
         // A user's voice note (or a video's audio track) goes straight off
         // to the cloud transcriber, so its words are usually ready before the
-        // message naming it is sent. An agent's upload is never transcribed.
+        // message naming it is sent. An agent's upload is never transcribed
+        // at upload (it can still be asked for: POST /media/:id/transcript).
         const transcribing = who.kind !== 'agent' && !!blobTranscripts?.start(received.id, who.userId, contentType)
         return json(res, 200, { media_id: received.id, size: received.size, content_type: contentType, sha256: received.sha256, ...(dims ?? {}), ...(transcribing ? { transcript_status: 'pending' } : {}) })
       }
@@ -1009,7 +1010,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         const blob = getBlob(db, mt[1])
         if (!blob) return json(res, 404, { error: 'not_found' })
         if (blob.owner_user_id !== who.userId && !canReadBlob(db, who.userId, blob.id)) return json(res, 404, { error: 'not_found' })
-        const waitS = Math.min(30, Math.max(0, Number(url.searchParams.get('wait')) || 0))
+        const waitS = transcriptWaitS(url.searchParams.get('wait'))
         const gone = new AbortController()
         res.on('close', () => gone.abort())
         const out = blobTranscripts
@@ -1031,11 +1032,13 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // transcription backlog — with the GET's 404 for everyone else.
         const blob = getBlob(db, mt[1])
         if (!blob || blob.owner_user_id !== who.userId) return json(res, 404, { error: 'not_found' })
+        // Checked here too, so the 400 never depends on how the handler was wired.
+        if (!isTranscribableType(blob.content_type)) return json(res, 400, { error: 'not_transcribable' })
         const asked = blobTranscripts ? blobTranscripts.retry(blob.id, who.userId) : 'unsupported'
         if (asked === 'not_found') return json(res, 404, { error: 'not_found' })
         if (asked === 'not_transcribable') return json(res, 400, { error: 'not_transcribable' })
         if (asked === 'busy') return json(res, 200, { status: 'none', reason: 'busy' })
-        const waitS = asked === 'queued' || asked === 'pending' ? Math.min(30, Math.max(0, Number(url.searchParams.get('wait')) || 0)) : 0
+        const waitS = asked === 'queued' || asked === 'pending' ? transcriptWaitS(url.searchParams.get('wait')) : 0
         const gone = new AbortController()
         res.on('close', () => gone.abort())
         const out = blobTranscripts

@@ -365,8 +365,9 @@ close or merge.
   (\`status\` none|pending|done|failed; \`wait\` ≤ 30 s holds a pending
   answer).
 - \`POST /media/:id/transcript?wait=N\` — your user's own note: asks the
-  journal to try a none/failed one again (→ pending); done/pending answer as
-  they stand, nothing re-runs; \`{status:'none', reason:'busy'}\` = backlog
+  journal to try a none/failed one again (→ pending) when it has a cloud
+  transcriber, otherwise the row as it stands; done/pending answer as they
+  stand, nothing re-runs; \`{status:'none', reason:'busy'}\` = backlog
   full, try later; 400 \`not_transcribable\` for non audio/video.
 `
 

@@ -8,7 +8,8 @@ import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
 import { saveGithubIdentity } from '../src/github-accounts.js'
 import { openDb } from '../src/db.js'
-import { makeBlobTranscripts, readBlobTranscript, isTranscribableType } from '../src/blob-transcripts.js'
+import { makeBlobTranscripts, readBlobTranscript, isTranscribableType, transcriptWaitS } from '../src/blob-transcripts.js'
+import { makeHttpHandler } from '../src/http.js'
 import { makeAzureTranscriber, makeChainedTranscriber } from '../src/cloud-transcribe.js'
 import { makeTranscriber } from '../src/transcribe.js'
 
@@ -604,4 +605,44 @@ test('retry on a failed video re-runs the timed variant and stores segments', as
   assert.equal(tr.calls[1].method, 'transcribeFileSegments')
   tr.release({ text: 'a b', segments: SEGMENTS })
   assert.deepEqual((await s.http(`/media/${up.media_id}/transcript?wait=5`, { token: aliceToken })).json, { status: 'done', transcript: 'a b', segments: SEGMENTS })
+})
+
+test('two retries at once on a failed blob start one job', async (t) => {
+  const tr = gatedCloud()
+  const { s, aliceToken, upload } = await setup(t, { transcriber: tr })
+  const up = await upload(aliceToken)
+  await until(() => tr.pending() === 1)
+  tr.fail()
+  await s.http(`/media/${up.media_id}/transcript?wait=5`, { token: aliceToken })
+  const both = await Promise.all([post(s, up.media_id, aliceToken), post(s, up.media_id, aliceToken)])
+  assert.deepEqual(both.map((r) => r.json), [{ status: 'pending' }, { status: 'pending' }])
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(tr.calls.length, 2, 'the upload and one retry')
+  tr.release('just once')
+  assert.deepEqual((await s.http(`/media/${up.media_id}/transcript?wait=5`, { token: aliceToken })).json, { status: 'done', transcript: 'just once' })
+})
+
+test('transcriptWaitS: the ?wait both routes share is 0..30 seconds, anything else 0', () => {
+  for (const [v, want] of [[null, 0], ['', 0], ['abc', 0], ['-5', 0], ['0', 0], ['7', 7], ['30', 30], ['31', 30], ['999', 30], ['Infinity', 30]]) {
+    assert.equal(transcriptWaitS(v), want, String(v))
+  }
+})
+
+test('retry on an image is 400 even on a handler built without blob transcripts', async (t) => {
+  const { s, aliceToken, upload } = await setup(t, { transcriber: null })
+  const img = await upload(aliceToken, 'image/png')
+  const note = await upload(aliceToken)
+  const handler = makeHttpHandler({ db: s.db, mediaDir: fs.mkdtempSync(path.join(os.tmpdir(), 'matron-bt-')), mediaMaxBytes: 1e6 })
+  const http = await import('node:http')
+  const server = http.createServer(handler)
+  await new Promise((r) => server.listen(0, '127.0.0.1', r))
+  t.after(() => new Promise((r) => server.close(r)))
+  const base = `http://127.0.0.1:${server.address().port}`
+  const go = (id) => fetch(`${base}/media/${id}/transcript`, { method: 'POST', headers: { authorization: `Bearer ${aliceToken}` } })
+  const r = await go(img.media_id)
+  assert.equal(r.status, 400)
+  assert.deepEqual(await r.json(), { error: 'not_transcribable' })
+  const n = await go(note.media_id)
+  assert.equal(n.status, 200)
+  assert.deepEqual(await n.json(), { status: 'none' })
 })

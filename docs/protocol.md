@@ -328,8 +328,8 @@ the machine-checkable version of this page.
   later. `reason:'busy'` tells a busy journal apart from one that cannot
   transcribe the blob at all (no cloud transcriber, or a video and a
   transcriber without timed segments), which answers the row as it stands
-  (`none`, or `failed`) with no `reason`; an older bridge reads both as
-  `none`. 400 `{error:'not_transcribable'}` for a blob that is neither
+  (`none`, or `failed`) with no `reason`; a bridge that does not know
+  `reason` reads the busy answer as a plain `none`. 400 `{error:'not_transcribable'}` for a blob that is neither
   `audio/*` nor `video/*`. The **owner's** blobs only, through any of their
   devices (the bridge asks with its agent token): a colleague who may read
   the words under *Shared visibility* may not spend the owner's backlog,
@@ -356,13 +356,11 @@ the machine-checkable version of this page.
   whisper run at a time** however many cloud calls fail together. A job
   cut short by shutdown never reaches whisper (it is re-queued at the next
   boot), and nor does a file ffmpeg cannot decode (a video with no audio
-  stream), which settles `failed` at once. Video jobs ask
-  for timed segments: from Azure's `phrases[]`, or from whisper's
-  timestamps (whisper's limit for a video is 10 minutes, against 2 for a
-  note). A video with no audio stream fails like a silent note. A
+  stream), which settles `failed` at once. Video jobs ask for timed
+  segments: from Azure's `phrases[]`, or from whisper's timestamps
+  (whisper's limit for a video is 10 minutes, against 2 for a note). A
   near-silent clip can come back `done` with one short invented segment;
-  the journal stores what it is given, so a
-  consumer that narrates a video should ignore a transcript too short to be
+  the journal stores what it is given, so a consumer that narrates a video should ignore a transcript too short to be
   speech. A cloud transcriber also does item voice notes (below), reusing an
   upload-time transcript rather than sending the same audio twice. A chat
   voice note transcribed here has its audio expired like an item's
@@ -708,7 +706,7 @@ malformed citation is a 400. Every answer is logged
 |---|---|---|
 | `text` with sender `user:<account>` (only a client `send` writes one) | `payload.body` | `typed` |
 | the same, flagged `fallback_for` (an item-reply copy for old clients) | refused: `item_reply_copy` | |
-| `file` with sender `user:<account>` and audio `content_type` | the blob's transcript, if the journal's own transcriber wrote it (`blobs.transcript_status = 'done'`; the job never runs for an agent's upload). Once the audio has expired, the transcript retention moved onto the event, but only when it carries `transcript_by: 'journal'`. Retention stamps it only when the words were the blob's own; an item attachment's transcript, which an agent may have written, stays unstamped | `voice` |
+| `file` with sender `user:<account>` and audio `content_type` | the blob's transcript, if the journal's own transcriber wrote it (`blobs.transcript_status = 'done'`; the upload-time job never runs for an agent's upload). Once the audio has expired, the transcript retention moved onto the event, but only when it carries `transcript_by: 'journal'`. Retention stamps it only when the words were the blob's own; an item attachment's transcript, which an agent may have written, stays unstamped | `voice` |
 | the same, never transcribed by the journal (a bridge did it) | refused: `voice_not_transcribed_by_journal`, unless it has a typed caption | |
 | `file`/`image` with a caption | the caption | `typed` |
 | an agent's `text` starting `[Voice note transcription]:` (the bridge's copy) | the user's own voice note before it, in the same conversation and within a day, whose journal transcript is exactly those words. The answer's `seq` is the note, and `cited_seq` is the copy | `voice` |
@@ -2113,8 +2111,9 @@ cloud transcription note); with whisper alone it is the transcriber:
 A bridge that knows the fields **holds the agent's turn** on a marker with a
 pending attachment and delivers it from the follow-up marker. On `failed`, or
 if no follow-up arrives in time, it can ask the journal to try the
-attachment's blob again (`POST /media/:id/transcript`) and PATCH the words
-in, falling back to its own whisper only where it has one. A bridge
+attachment's blob again (`POST /media/:id/transcript`; only a journal with a
+cloud transcriber takes it, otherwise the row is answered as it stands) and
+PATCH the words in, falling back to its own whisper only where it has one. A bridge
 that predates them sees `transcript:null`, transcribes as it always did and
 PATCHes the words in — which settles the status, so the journal's job skips
 the whisper run — and ignores the `updated` marker like any other. Pending

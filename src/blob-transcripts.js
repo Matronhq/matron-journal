@@ -17,9 +17,10 @@
 //
 // Status on the row: NULL = never asked (the bridge does it, as before),
 // 'pending', 'done', 'failed'. A NULL or 'failed' row can be asked again
-// (retry(), from POST /media/:id/transcript); a 'done' one never re-runs. 'done' stamps transcribed_at, from which
-// retention.js expires the audio (7 days by default), keeping the words; a
-// video's file is never expired that way (retention.js takes audio/* only).
+// (retry(), from POST /media/:id/transcript); a 'done' one never re-runs.
+// 'done' stamps transcribed_at, from which retention.js expires the audio
+// (7 days by default), keeping the words; a video's file is never expired
+// that way (retention.js takes audio/* only).
 // Owner-scoped throughout: a job only ever reads the audio of the user who
 // uploaded it.
 
@@ -58,6 +59,13 @@ export function normalizeSegments(segments) {
     out.push({ start_ms: Math.max(0, Math.round(Number(seg.start_ms) || 0)), text })
   }
   return out
+}
+
+// The `?wait=N` of GET and POST /media/:id/transcript, in seconds: a
+// number from 0 to 30, anything else 0.
+export const MAX_TRANSCRIPT_WAIT_S = 30
+export function transcriptWaitS(value) {
+  return Math.min(MAX_TRANSCRIPT_WAIT_S, Math.max(0, Number(value) || 0))
 }
 
 // {status: 'none'|'pending'|'failed'} or {status: 'done', transcript,
