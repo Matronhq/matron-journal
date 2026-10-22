@@ -13,6 +13,7 @@ import { predictSpawnRun } from './spawn-model.js'
 import { parseCauses } from './ask-causes.js'
 import { isPrivateDevice } from './db.js'
 import { privateOwnedConvo } from './privacy.js'
+import { recipientDevices, parseFindings } from './transfers.js'
 
 export const CONSENT_REASON_MAX = 200
 export const CONSENT_DAILY_CAP_DEFAULT = 20
@@ -20,7 +21,7 @@ export const CONSENT_DAILY_WINDOW_MS = 24 * 60 * 60 * 1000
 // Routine-born approvals of the Coordinator's own asks per rolling 24 h
 // (MATRON_COORDINATOR_ROUTINE_CAP; 0 = no cap), on top of the daily cap.
 export const CONSENT_ROUTINE_CAP_DEFAULT = 10
-export const CONSENT_KINDS = new Set(['chat', 'spawn'])
+export const CONSENT_KINDS = new Set(['chat', 'spawn', 'transfer'])
 export const CONSENT_DECISIONS = new Set(['approve', 'decline'])
 export const CONSENT_DECISION_EVENT_TYPE = 'consent_decision'
 
@@ -91,6 +92,11 @@ export function isUserOnlyChat(db, userId, roomId, targetDeviceId) {
   return devices.some((d) => userOnlyDevice(db, userId, d))
 }
 
+// A transfer: the sending box or any box it goes to.
+export function isUserOnlyTransfer(db, userId, row) {
+  return [row.sender_device_id, ...recipientDevices(db, row.room_id, row.sender_device_id)].some((d) => userOnlyDevice(db, userId, d))
+}
+
 const name = (raw) => (raw == null ? '' : sanitizePeerText(raw, PEER_NAME_CAP))
 // The causes the asking bridge stamped on the ask (src/ask-causes.js), for
 // the Coordinator to weigh; omitted, never empty, when it stamped none.
@@ -122,7 +128,7 @@ export function chatAskInvolvesPrivate(db, userId, roomId, targetDeviceId) {
     (row.initiator != null && isPrivateDevice(db, row.initiator))
 }
 
-// Every ask awaiting this user's decision, both tables, oldest first. The
+// Every ask awaiting this user's decision, all three tables, oldest first. The
 // shape is what the Coordinator's consent_list renders and what the nudge
 // frame carries: enough to decide without opening the card, all of it
 // peer text already sanitised at the ws boundary (names re-sieved here as
@@ -186,7 +192,25 @@ export function listPendingAsks({ db, hub, waker }, userId, { excludePrivate = f
       ...causesField(r.causes),
     }
   })
-  return [...spawns, ...chats].sort((a, b) => a.created_at - b.created_at)
+  const deviceName = db.prepare('SELECT name FROM devices WHERE id=? AND user_id=?')
+  const transfers = db.prepare(`
+    SELECT t.*, fd.name AS from_name, fc.title AS from_convo_title, rc.title AS room_title, i.num AS item_num
+    FROM transfers t
+    LEFT JOIN devices fd ON fd.id = t.sender_device_id AND fd.user_id = t.user_id
+    LEFT JOIN conversations fc ON fc.id = t.from_convo_id
+    LEFT JOIN conversations rc ON rc.id = t.room_id
+    LEFT JOIN items i ON i.id = t.item_id
+    WHERE t.user_id=? AND t.consent='awaiting_user' AND t.phase='open'
+  `).all(userId).map((r) => ({
+    kind: 'transfer', id: r.id, created_at: r.created_at,
+    from_device_id: r.sender_device_id, from_name: name(r.from_name), from_convo_id: r.from_convo_id, from_convo_title: name(r.from_convo_title),
+    room_id: r.room_id, room_title: name(r.room_title),
+    to_names: recipientDevices(db, r.room_id, r.sender_device_id).map((d) => name(deviceName.get(d, userId)?.name)),
+    name: r.name, size: r.size, sha256: r.sha256, scan_verdict: r.scan_verdict, scan_findings: parseFindings(r.scan_findings),
+    reason: r.reason, item_num: r.item_num ?? null,
+    ...(isUserOnlyTransfer(db, userId, r) ? { user_only: true } : {}),
+  }))
+  return [...spawns, ...chats, ...transfers].sort((a, b) => a.created_at - b.created_at)
 }
 
 // One row per Coordinator decision: the audit record and the daily cap's

@@ -18,6 +18,8 @@ import {
   isPersonRoom,
 } from './transfers.js'
 import { joinedAgentIds } from './participants.js'
+import { fileTransferConsentItem, closeTransferConsentItem } from './transfer-consent.js'
+import { nudgeCoordinator } from './consent.js'
 
 export const TRANSFER_NAME_MAX = 255
 export const TRANSFER_REASON_MAX = 1000
@@ -27,10 +29,6 @@ const FINDING_LINE_MAX = 300
 const CONTENT_TYPE_MAX = 255
 const ID_MAX = 128
 const SHA_RE = /^[0-9a-f]{64}$/
-
-// Closes the transfer's consent item on the tracker. The consent card
-// arrives with the next change; until then there is no item to close.
-export function closeTransferConsentItem(_ctx, _transfer, _resolution) {}
 
 const bad = (res) => { json(res, 400, { error: 'bad_request' }); return true }
 const notFound = (res) => { json(res, 404, { error: 'not_found' }); return true }
@@ -120,6 +118,10 @@ async function create(ctx, req, res, who) {
     name: t.name, size: t.size, sha256: t.sha256, contentType: t.contentType, reason: t.reason, scan: t.scan,
   })
   console.log(`journal: transfer created id=${row.id} room=${row.room_id} device=${who.deviceId} size=${row.size} scan=${row.scan_verdict}`)
+  // The user's card, then a nudge to the Coordinator (skipped when it is
+  // the sender). Both best-effort: the transfer stands without them.
+  fileTransferConsentItem(ctx, row)
+  nudgeCoordinator(ctx, who.userId, { kind: 'transfer', id: row.id }, { askerConvoId: row.from_convo_id })
   json(res, 201, { transfer_id: row.id, chunk_bytes: chunkBytes, chunks: chunkCount(row.size, chunkBytes) })
   return true
 }
@@ -178,7 +180,7 @@ function cancel(ctx, res, who, id) {
   if (!setTransferState(db, id, { phase: 'cancelled', deleted_at: Date.now() })) { json(res, 409, { error: 'closed' }); return true }
   deleteTransferFiles(mediaDir, id)
   forgetChunks(db, id)
-  closeTransferConsentItem(ctx, getTransfer(db, id), 'cancelled')
+  closeTransferConsentItem(ctx, id, { outcome: 'cancelled' })
   console.log(`journal: transfer cancelled id=${id} device=${who.deviceId}`)
   json(res, 200, { id, phase: 'cancelled' })
   return true

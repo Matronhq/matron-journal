@@ -40,8 +40,8 @@ const cut = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
 // itself is never altered (it is what the user approves and the child
 // runs): a task carrying backtick runs simply gets a longer fence than
 // its longest run, which is the CommonMark rule for keeping it inside.
-const codeSpan = (s) => `\`${String(s).replace(/`/g, '')}\``
-const fenced = (s) => {
+export const codeSpan = (s) => `\`${String(s).replace(/`/g, '')}\``
+export const fenced = (s) => {
   const text = String(s)
   const longest = Math.max(0, ...(text.match(/`+/g) || []).map((run) => run.length))
   const fence = '`'.repeat(Math.max(3, longest + 1))

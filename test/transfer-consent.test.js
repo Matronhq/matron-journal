@@ -1,0 +1,363 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
+import os from 'node:os'
+import crypto from 'node:crypto'
+import { startTestServer } from './helpers.js'
+import { createUser, createAgent } from '../src/auth.js'
+import { recordJoined } from '../src/participants.js'
+import { getTransfer, transferDir, recordChunk } from '../src/transfers.js'
+import { recordConsentDecision } from '../src/consent.js'
+import { transferConsentItemFields, humanSize } from '../src/transfer-consent.js'
+import { widenConsentDecisionKinds } from '../src/db.js'
+import Database from 'better-sqlite3'
+
+// The `transfer` consent kind (Task 2): the card filed as a tracker item
+// when a transfer is created, the user's Approve / Decline tap on it, and
+// the Coordinator's answer through /consent/pending and /consent/answer.
+
+const CHUNK = 10
+const sha = (buf) => crypto.createHash('sha256').update(buf).digest('hex')
+
+function tmpDbPath() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-transfer-consent-'))
+  return path.join(dir, 'test.db')
+}
+
+function addConvo(db, id, userId, deviceId, title = id) {
+  db.prepare("INSERT INTO conversations(id, owner_user_id, title, session_state, created_at, agent_device_id) VALUES(?,?,?,'running',?,?)")
+    .run(id, userId, title, Date.now(), deviceId)
+}
+
+// alice: box-a owns the room and sends from its session "Notes writer";
+// box-b is joined with its session "Reviewer"; coord-box runs the
+// Coordinator. A client token for the user's taps. Every frame sent to a
+// device is recorded.
+async function fleet(t, opts = {}) {
+  const dbPath = tmpDbPath()
+  const s = await startTestServer({ dbPath, transferMaxBytes: 100, transferUserQuotaBytes: 1000, transferChunkBytes: CHUNK, ...opts })
+  t.after(() => s.close())
+  const mediaDir = path.join(path.dirname(dbPath), 'media')
+  const alice = await createUser(s.db, 'alice', 'pw')
+  const a = createAgent(s.db, alice.id, 'box-a')
+  const b = createAgent(s.db, alice.id, 'box-b')
+  const coord = createAgent(s.db, alice.id, 'coord-box')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'phone' } })
+  addConvo(s.db, 'room', alice.id, a.deviceId, 'Design review')
+  addConvo(s.db, 'sess-a', alice.id, a.deviceId, 'Notes writer')
+  addConvo(s.db, 'sess-b', alice.id, b.deviceId, 'Reviewer')
+  addConvo(s.db, 'coord', alice.id, coord.deviceId, 'Coordinator')
+  recordJoined(s.db, { convoId: 'room', agentDeviceId: b.deviceId, initiatorDeviceId: a.deviceId })
+  s.db.prepare("UPDATE convo_agents SET target_convo_id='sess-b' WHERE convo_id='room' AND agent_device_id=?").run(b.deviceId)
+  const client = login.json.token
+  assert.equal((await s.http('/coordinator', { method: 'PUT', token: client, body: { convo_id: 'coord' } })).status, 200)
+  const sent = []
+  const orig = s.hub.sendToDevice.bind(s.hub)
+  s.hub.sendToDevice = (userId, deviceId, frame) => { sent.push({ deviceId, frame }); return orig(userId, deviceId, frame) }
+  return { s, mediaDir, alice, a, b, coord, client, sent }
+}
+
+const createBody = (over = {}) => ({
+  room_id: 'room', from_convo_id: 'sess-a', name: 'notes.txt', size: 25, sha256: 'a'.repeat(64),
+  content_type: 'text/plain', reason: 'the notes you asked for', scan: { verdict: 'clean', findings: [] }, ...over,
+})
+
+async function createTransfer(f, over) {
+  const r = await f.s.http('/transfers', { method: 'POST', token: f.a.token, body: createBody(over) })
+  assert.equal(r.status, 201)
+  return r.json.transfer_id
+}
+
+// One stored chunk on disk, so a decline has something to delete.
+function fakeChunk(f, id) {
+  const p = path.join(transferDir(f.mediaDir, id), '0')
+  fs.mkdirSync(path.dirname(p), { recursive: true })
+  fs.writeFileSync(p, 'x'.repeat(CHUNK))
+  recordChunk(f.s.db, id, 0, CHUNK)
+}
+
+const itemOf = (f, id) => f.s.db.prepare('SELECT * FROM items WHERE id=?').get(getTransfer(f.s.db, id).item_id)
+const tap = (f, itemId, action) => f.s.http(`/items/${itemId}/comments`, { method: 'POST', token: f.client, body: { action } })
+const pending = (f) => f.s.http('/consent/pending?convo_id=coord', { token: f.coord.token })
+const answer = (f, body) => f.s.http('/consent/answer', { method: 'POST', token: f.coord.token, body: { convo_id: 'coord', kind: 'transfer', ...body } })
+const roomTexts = (f) => f.s.db.prepare("SELECT sender, payload FROM events WHERE convo_id='room' AND type='text'").all().map((e) => ({ sender: e.sender, body: JSON.parse(e.payload).body }))
+const lastStatusNote = (f, itemId) => f.s.db.prepare("SELECT body, author FROM item_comments WHERE item_id=? AND kind='status' ORDER BY created_at DESC, rowid DESC").get(itemId)
+
+test('humanSize', () => {
+  assert.equal(humanSize(25), '25 B')
+  assert.equal(humanSize(2048), '2.0 KB')
+  assert.equal(humanSize(33554432), '32.0 MB')
+  assert.equal(humanSize(10737418240), '10.0 GB')
+})
+
+test('item fields: title, every body line, the three scan lines; peer text is kept out of markdown', () => {
+  const row = {
+    id: 'tr_' + '0'.repeat(32), name: 'notes.txt', size: 2048, sha256: 'b'.repeat(64), content_type: 'text/plain',
+    reason: 'the notes `you` asked for', scan_verdict: 'clean', scan_findings: '[]',
+  }
+  const names = {
+    senderBox: 'box-a', senderSession: 'Notes writer', roomTitle: 'Design review',
+    recipients: [{ box: 'box-b', sessions: ['Reviewer'] }],
+  }
+  const f = transferConsentItemFields(row, names)
+  assert.equal(f.title, 'Approve file transfer: notes.txt (2.0 KB) from box-a to Design review')
+  assert.match(f.body, /box-a.*Notes writer/)
+  assert.match(f.body, /box-b.*Reviewer/)
+  assert.match(f.body, /Design review/)
+  assert.match(f.body, /2\.0 KB \(2048 bytes\)/)
+  assert.match(f.body, /text\/plain/)
+  assert.ok(f.body.includes('`' + 'b'.repeat(64) + '`'))
+  assert.ok(f.body.includes('```\nthe notes `you` asked for\n```'), 'the note is fenced like a spawn task')
+  assert.match(f.body, /✅ clean/)
+  assert.match(f.body, /Unanswered, it expires 7 days after it was sent\./)
+  assert.deepEqual(f.labels, ['consent'])
+
+  const flagged = transferConsentItemFields({ ...row, scan_verdict: 'flagged', scan_findings: JSON.stringify([{ kind: 'aws_key', line: 3 }, { kind: 'password', line: 'src.zip/a.env:2' }]) }, names)
+  assert.ok(flagged.body.includes('⚠️ 2 possible secrets: `aws_key` (3), `password` (`src.zip/a.env:2`)'), flagged.body)
+  const unscanned = transferConsentItemFields({ ...row, scan_verdict: 'not_scanned' }, names)
+  assert.match(unscanned.body, /not scanned \(binary or unsupported format\)/)
+  const marked = transferConsentItemFields({ ...row, name: '**my_notes**.txt' }, { ...names, senderBox: '[box](http://example.com)' })
+  assert.ok(!marked.body.includes('[box](http://example.com)'))
+  assert.ok(marked.body.includes('- **File:** `**my_notes**.txt`'), 'the file name sits in a code span')
+  assert.ok(marked.title.startsWith('Approve file transfer: my_notes.txt (2.0 KB) from box'), marked.title)
+})
+
+test('create files the consent card: a top question for the user with Approve / Decline, invisible to agents', async (t) => {
+  const f = await fleet(t)
+  const id = await createTransfer(f)
+  const row = getTransfer(f.s.db, id)
+  assert.ok(row.item_id, 'the row points at its card')
+  const item = itemOf(f, id)
+  assert.equal(item.kind, 'question')
+  assert.equal(item.awaiting, 'user')
+  assert.equal(item.consent, 'transfer')
+  assert.equal(item.origin_convo_id, 'sess-a')
+  assert.equal(item.idem_key, `consent:transfer:${id}`)
+  assert.deepEqual(JSON.parse(item.actions), ['Approve', 'Decline'])
+  assert.deepEqual(JSON.parse(item.labels), ['consent'])
+  assert.equal(item.title, 'Approve file transfer: notes.txt (25 B) from box-a to Design review')
+  const mine = await f.s.http('/items', { token: f.client })
+  assert.ok(mine.json.items.some((i) => i.id === item.id), 'the user sees it')
+  for (const token of [f.a.token, f.b.token, f.coord.token]) {
+    const list = await f.s.http('/items', { token })
+    assert.equal(list.status, 200)
+    assert.ok(!list.json.items.some((i) => i.id === item.id), 'no agent lists it')
+    assert.equal((await f.s.http(`/items/${item.id}`, { token })).status, 404, 'no agent reads it')
+  }
+})
+
+test('tap Approve: consent approved, the item closes, the bytes stay; a second tap is 409', async (t) => {
+  const f = await fleet(t)
+  const id = await createTransfer(f)
+  fakeChunk(f, id)
+  const item = itemOf(f, id)
+  const r = await tap(f, item.id, 'Approve')
+  assert.equal(r.status, 200)
+  const row = getTransfer(f.s.db, id)
+  assert.equal(row.consent, 'approved')
+  assert.equal(row.phase, 'open')
+  assert.equal(row.decided_by, 'user')
+  assert.ok(row.approved_at)
+  const closed = itemOf(f, id)
+  assert.equal(closed.state, 'closed')
+  assert.equal(closed.resolution, 'decided')
+  assert.equal(lastStatusNote(f, item.id).author, 'user')
+  assert.ok(fs.existsSync(path.join(transferDir(f.mediaDir, id), '0')))
+  for (const action of ['Approve', 'Decline']) {
+    const again = await tap(f, item.id, action)
+    assert.equal(again.status, 409)
+  }
+  assert.equal(getTransfer(f.s.db, id).consent, 'approved')
+  assert.equal(getTransfer(f.s.db, id).phase, 'open')
+})
+
+test('tap Decline: bytes deleted, phase declined, sender told, room told; a second tap is 409', async (t) => {
+  const f = await fleet(t)
+  const id = await createTransfer(f)
+  fakeChunk(f, id)
+  const item = itemOf(f, id)
+  const r = await tap(f, item.id, 'Decline')
+  assert.equal(r.status, 200)
+  const row = getTransfer(f.s.db, id)
+  assert.equal(row.consent, 'declined')
+  assert.equal(row.phase, 'declined')
+  assert.equal(row.decided_by, 'user')
+  assert.ok(row.deleted_at)
+  assert.equal(fs.existsSync(transferDir(f.mediaDir, id)), false)
+  assert.equal(f.s.db.prepare('SELECT COUNT(*) c FROM transfer_chunks WHERE transfer_id=?').get(id).c, 0)
+  const frame = f.sent.find((x) => x.frame.kind === 'transfer' && x.frame.event === 'declined')
+  assert.ok(frame)
+  assert.equal(frame.deviceId, f.a.deviceId)
+  assert.equal(frame.frame.transfer_id, id)
+  assert.equal(typeof frame.frame.reason, 'string')
+  assert.deepEqual(roomTexts(f), [{ sender: 'journal', body: 'File "notes.txt" was declined; nothing was delivered.' }])
+  const closed = itemOf(f, id)
+  assert.equal(closed.state, 'closed')
+  assert.equal(closed.resolution, 'decided')
+  assert.match(lastStatusNote(f, item.id).body, /Declined by you/)
+  const again = await tap(f, item.id, 'Decline')
+  assert.equal(again.status, 409)
+  assert.equal(roomTexts(f).length, 1, 'no second room event')
+  // Freed quota: declined is terminal.
+  assert.equal(f.s.db.prepare("SELECT COUNT(*) c FROM transfers WHERE phase IN ('open','released')").get().c, 0)
+})
+
+test('tap: an unknown label is 400 and changes nothing', async (t) => {
+  const f = await fleet(t)
+  const id = await createTransfer(f)
+  const r = await tap(f, itemOf(f, id).id, 'Maybe')
+  assert.equal(r.status, 400)
+  assert.equal(getTransfer(f.s.db, id).consent, 'awaiting_user')
+})
+
+test('cancel by the sender closes the card as cancelled; a tap after is 409', async (t) => {
+  const f = await fleet(t)
+  const id = await createTransfer(f)
+  const item = itemOf(f, id)
+  assert.equal((await f.s.http(`/transfers/${id}`, { method: 'DELETE', token: f.a.token })).status, 200)
+  const closed = itemOf(f, id)
+  assert.equal(closed.state, 'closed')
+  assert.equal(closed.resolution, 'cancelled')
+  assert.match(lastStatusNote(f, item.id).body, /[Cc]ancelled/)
+  assert.equal((await tap(f, item.id, 'Approve')).status, 409)
+  assert.equal(getTransfer(f.s.db, id).consent, 'awaiting_user')
+})
+
+test('Coordinator: /consent/pending lists the transfer with the decision fields', async (t) => {
+  const f = await fleet(t)
+  const id = await createTransfer(f, { scan: { verdict: 'flagged', findings: [{ kind: 'aws_key', line: 3 }] } })
+  const r = await pending(f)
+  assert.equal(r.status, 200)
+  const ask = r.json.pending.find((p) => p.kind === 'transfer')
+  assert.ok(ask)
+  const row = getTransfer(f.s.db, id)
+  assert.deepEqual(ask, {
+    kind: 'transfer', id, created_at: row.created_at,
+    from_device_id: f.a.deviceId, from_name: 'box-a', from_convo_id: 'sess-a', from_convo_title: 'Notes writer',
+    room_id: 'room', room_title: 'Design review', to_names: ['box-b'],
+    name: 'notes.txt', size: 25, sha256: 'a'.repeat(64), scan_verdict: 'flagged', scan_findings: [{ kind: 'aws_key', line: 3 }],
+    reason: 'the notes you asked for', item_num: itemOf(f, id).num,
+  })
+  // Answered: no longer pending.
+  assert.equal((await tap(f, itemOf(f, id).id, 'Decline')).status, 200)
+  assert.ok(!(await pending(f)).json.pending.some((p) => p.kind === 'transfer'))
+})
+
+test('Coordinator: approving a flagged transfer is 403 secret_scan_flagged and changes nothing; declining it works', async (t) => {
+  const f = await fleet(t)
+  const id = await createTransfer(f, { scan: { verdict: 'flagged', findings: [{ kind: 'aws_key', line: 3 }] } })
+  const r = await answer(f, { id, decision: 'approve', reason: 'looks fine' })
+  assert.equal(r.status, 403)
+  assert.deepEqual(r.json, { error: 'forbidden', detail: 'secret_scan_flagged' })
+  const row = getTransfer(f.s.db, id)
+  assert.equal(row.consent, 'awaiting_user')
+  assert.equal(row.phase, 'open')
+  assert.equal(itemOf(f, id).state, 'open')
+  assert.equal(f.s.db.prepare('SELECT COUNT(*) c FROM consent_decisions').get().c, 0)
+  const d = await answer(f, { id, decision: 'decline', reason: 'it carries a key' })
+  assert.equal(d.status, 200)
+  assert.equal(getTransfer(f.s.db, id).phase, 'declined')
+  assert.equal(getTransfer(f.s.db, id).decided_by, 'coordinator')
+  assert.equal(getTransfer(f.s.db, id).decided_reason, 'it carries a key')
+  assert.equal(lastStatusNote(f, itemOf(f, id).id).body, 'Declined by the Coordinator — it carries a key. The file was deleted; nothing was delivered.')
+  assert.deepEqual(roomTexts(f), [{ sender: 'journal', body: 'File "notes.txt" was declined; nothing was delivered.' }])
+  assert.ok(f.sent.some((x) => x.deviceId === f.a.deviceId && x.frame.kind === 'transfer' && x.frame.event === 'declined'))
+  const dec = f.s.db.prepare('SELECT kind, ask_id, decision FROM consent_decisions').all()
+  assert.deepEqual(dec.map((x) => ({ ...x })), [{ kind: 'transfer', ask_id: id, decision: 'decline' }])
+})
+
+test('Coordinator: approving a clean transfer works, is recorded for the daily cap and announced; the card says who', async (t) => {
+  const f = await fleet(t)
+  const id = await createTransfer(f)
+  const r = await answer(f, { id, decision: 'approve', reason: 'notes between my own sessions' })
+  assert.equal(r.status, 200)
+  const row = getTransfer(f.s.db, id)
+  assert.equal(row.consent, 'approved')
+  assert.equal(row.decided_by, 'coordinator')
+  assert.equal(row.decided_reason, 'notes between my own sessions')
+  const item = itemOf(f, id)
+  assert.equal(item.state, 'closed')
+  assert.equal(lastStatusNote(f, item.id).body, 'Approved by the Coordinator — notes between my own sessions.')
+  const dec = f.s.db.prepare('SELECT kind, ask_id, decision, convo_id FROM consent_decisions').all()
+  assert.deepEqual(dec.map((x) => ({ ...x })), [{ kind: 'transfer', ask_id: id, decision: 'approve', convo_id: 'coord' }])
+  const ev = f.s.db.prepare("SELECT convo_id, payload FROM events WHERE type='consent_decision'").get()
+  assert.equal(ev.convo_id, 'sess-a')
+  assert.equal(JSON.parse(ev.payload).transfer_id, id)
+  // Already answered.
+  const again = await answer(f, { id, decision: 'approve', reason: 'again' })
+  assert.equal(again.status, 409)
+  assert.equal((await tap(f, item.id, 'Decline')).status, 409)
+})
+
+test('Coordinator: an approval at the daily cap is 409 daily_cap and leaves the ask for the user', async (t) => {
+  const f = await fleet(t, { consentDailyCap: 1 })
+  recordConsentDecision(f.s.db, { userId: f.alice.id, kind: 'chat', askId: 'room/1', decision: 'approve', convoId: 'coord', reason: 'earlier' })
+  const id = await createTransfer(f)
+  const r = await answer(f, { id, decision: 'approve', reason: 'ok' })
+  assert.equal(r.status, 409)
+  assert.equal(r.json.detail, 'daily_cap')
+  assert.equal(getTransfer(f.s.db, id).consent, 'awaiting_user')
+  assert.equal(itemOf(f, id).state, 'open')
+})
+
+test('Coordinator: bad id is 400, an unknown or another user\'s transfer is 404, its own transfer cannot be approved', async (t) => {
+  const f = await fleet(t)
+  assert.equal((await answer(f, { id: 'nope', decision: 'approve', reason: 'x' })).status, 400)
+  assert.equal((await answer(f, { id: 'tr_' + 'f'.repeat(32), decision: 'approve', reason: 'x' })).status, 404)
+  // A transfer sent from the Coordinator's own conversation.
+  recordJoined(f.s.db, { convoId: 'room', agentDeviceId: f.coord.deviceId, initiatorDeviceId: f.a.deviceId })
+  const own = await f.s.http('/transfers', { method: 'POST', token: f.coord.token, body: createBody({ from_convo_id: 'coord' }) })
+  assert.equal(own.status, 201)
+  const r = await answer(f, { id: own.json.transfer_id, decision: 'approve', reason: 'mine' })
+  assert.equal(r.status, 403)
+  assert.equal(r.json.detail, 'own_ask_unverified')
+  assert.equal(getTransfer(f.s.db, own.json.transfer_id).consent, 'awaiting_user')
+})
+
+test('upload finished and the sha matches: unaffected by the card (a real chunk upload still works after approval)', async (t) => {
+  const f = await fleet(t)
+  const id = await createTransfer(f, { size: 5, sha256: sha(Buffer.from('hello')) })
+  assert.equal((await tap(f, itemOf(f, id).id, 'Approve')).status, 200)
+  const r = await fetch(`${f.s.base}/transfers/${id}/chunks/0`, {
+    method: 'PUT',
+    headers: { authorization: `Bearer ${f.a.token}`, 'content-type': 'application/octet-stream', 'x-chunk-sha256': sha(Buffer.from('hello')) },
+    body: Buffer.from('hello'),
+  })
+  assert.equal(r.status, 200)
+})
+
+test('Coordinator: a transfer a user-only box takes part in is the user\'s to approve (403 user_only); pending says so', async (t) => {
+  const f = await fleet(t)
+  f.s.db.prepare('UPDATE devices SET consent_user_only=1 WHERE id=?').run(f.b.deviceId)
+  const id = await createTransfer(f)
+  assert.equal((await pending(f)).json.pending.find((p) => p.id === id).user_only, true)
+  const r = await answer(f, { id, decision: 'approve', reason: 'ok' })
+  assert.equal(r.status, 403)
+  assert.equal(r.json.detail, 'user_only')
+  assert.equal(getTransfer(f.s.db, id).consent, 'awaiting_user')
+  assert.equal((await answer(f, { id, decision: 'decline', reason: 'not mine to allow' })).status, 200)
+})
+
+test('migration: an existing consent_decisions table is widened to take kind transfer, rows kept', () => {
+  const db = new Database(':memory:')
+  db.exec(`CREATE TABLE consent_decisions(
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id    INTEGER NOT NULL,
+  kind       TEXT NOT NULL CHECK(kind IN ('chat','spawn')),
+  ask_id     TEXT NOT NULL,
+  decision   TEXT NOT NULL CHECK(decision IN ('approve','decline')),
+  convo_id   TEXT NOT NULL,
+  reason     TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX idx_consent_decisions_user ON consent_decisions(user_id, created_at);
+ALTER TABLE consent_decisions ADD COLUMN cause_kind TEXT;`)
+  db.prepare("INSERT INTO consent_decisions(user_id, kind, ask_id, decision, convo_id, reason, created_at, cause_kind) VALUES(1,'chat','r/1','approve','c','why',5,'user')").run()
+  assert.throws(() => db.prepare("INSERT INTO consent_decisions(user_id, kind, ask_id, decision, convo_id, reason, created_at) VALUES(1,'transfer','x','approve','c','why',6)").run())
+  assert.equal(widenConsentDecisionKinds(db), true)
+  assert.equal(widenConsentDecisionKinds(db), false, 'idempotent')
+  db.prepare("INSERT INTO consent_decisions(user_id, kind, ask_id, decision, convo_id, reason, created_at) VALUES(1,'transfer','x','approve','c','why',6)").run()
+  assert.deepEqual(db.prepare('SELECT kind, cause_kind FROM consent_decisions ORDER BY id').all().map((r) => ({ ...r })), [{ kind: 'chat', cause_kind: 'user' }, { kind: 'transfer', cause_kind: null }])
+  assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_consent_decisions_user'").get())
+})

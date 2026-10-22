@@ -19,7 +19,9 @@ import { recordConsentDecision, CONSENT_DECISION_EVENT_TYPE } from './consent.js
 const byCoordinator = (decidedBy) => decidedBy?.kind === 'coordinator'
 const stamp = (decidedBy) => (byCoordinator(decidedBy) ? { answeredBy: 'coordinator', answerReason: decidedBy.reason } : {})
 
-function recordAndAnnounce({ db, hub }, { userId, kind, askId, decision, decidedBy, convoId, payload }) {
+// Exported for the transfer kind (src/transfer-consent.js), which answers
+// through its own module but records and announces exactly like these two.
+export function recordAndAnnounce({ db, hub }, { userId, kind, askId, decision, decidedBy, convoId, payload }) {
   if (!byCoordinator(decidedBy)) return
   try {
     recordConsentDecision(db, {

@@ -20,6 +20,7 @@ import { handleContributedItem, handleContributorItemSub, forwardToContributor }
 import { contributableItem } from './contribute.js'
 import { filteredAgent, privateOwnedConvo } from './privacy.js'
 import { handleConsentTap, isSharingMirror } from './sharing-http.js'
+import { transferTapAnswer } from './transfer-consent.js'
 import { handlePeopleRoomTap, isPeopleRoomMirror } from './person-rooms-http.js'
 import { notifyGrantees } from './sharing-events.js'
 import { inlineRefsToText, knowsInlineRefs, strayInlineRef } from './inline-refs.js'
@@ -589,6 +590,14 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       // answer to the card, applied by the journal itself — never a comment
       // for an agent to read.
       if (isSharingMirror(item)) return handleConsentTap(ctx, res, who, item, action, body.reply_to ?? null)
+      // A file transfer's card: the tap is the answer (transfer-consent.js).
+      if (item.consent === 'transfer') {
+        if (body.reply_to != null) { json(res, 400, { error: 'unknown_action' }); return true }
+        const r = transferTapAnswer(ctx, who, item, action)
+        if (r.status !== 200) { json(res, r.status, r.body); return true }
+        json(res, 200, { item: getItem(db, who.userId, item.id) ?? item, ...r.body })
+        return true
+      }
       if (isPeopleRoomMirror(item)) return handlePeopleRoomTap(ctx, res, who, item, action, body.reply_to ?? null)
     }
     // `reply_to` (2026-10-04 comment-actions contract): the id of the comment

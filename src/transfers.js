@@ -164,3 +164,13 @@ export function isPersonRoom(db, roomId) {
     return dev != null && dev.user_id !== room.owner_user_id
   })
 }
+
+// The stored findings, {kind, line} each; a damaged column reads as none.
+export function parseFindings(raw) {
+  try {
+    const list = JSON.parse(raw ?? '[]')
+    return Array.isArray(list) ? list.filter((f) => f && typeof f === 'object').map((f) => ({ kind: f.kind, line: f.line })) : []
+  } catch {
+    return []
+  }
+}

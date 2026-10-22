@@ -325,7 +325,7 @@ CREATE TABLE IF NOT EXISTS user_settings(
 CREATE TABLE IF NOT EXISTS consent_decisions(
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id    INTEGER NOT NULL REFERENCES users(id),
-  kind       TEXT NOT NULL CHECK(kind IN ('chat','spawn')),
+  kind       TEXT NOT NULL CHECK(kind IN ('chat','spawn','transfer')),
   ask_id     TEXT NOT NULL,
   decision   TEXT NOT NULL CHECK(decision IN ('approve','decline')),
   convo_id   TEXT NOT NULL,
@@ -1508,6 +1508,7 @@ export function openDb(path) {
   for (const c of ['cause_kind', 'cause_ref', 'verifier_note']) {
     if (!decisionCols.some((d) => d.name === c)) db.exec(`ALTER TABLE consent_decisions ADD COLUMN ${c} TEXT`)
   }
+  widenConsentDecisionKinds(db)
   // A routine's envelope (JSON): the bounds on what an ask born of one of
   // its fires may do — how many spawns per fire, whether chats, which boxes.
   // NULL = no envelope, the value for every routine predating the column.
@@ -2079,4 +2080,34 @@ export function migratePersonRoomsForTalk(db) {
   add('contact_by_talk', 'contact_by_talk INTEGER NOT NULL DEFAULT 0')
   add('pick_options', 'pick_options TEXT')
   add('spawn_id', 'spawn_id TEXT')
+}
+
+// The Coordinator answers file transfers too: consent_decisions.kind gains
+// 'transfer'. SQLite cannot widen a CHECK, so a table from before is
+// rebuilt once, the same procedure as rebuildItemsForNotice (its own
+// definition with the one CHECK replaced, so every column added by ALTER
+// since is kept). Idempotent.
+const DECISION_KIND_CHECK_OLD = "CHECK(kind IN ('chat','spawn'))"
+const DECISION_KIND_CHECK_NEW = "CHECK(kind IN ('chat','spawn','transfer'))"
+export function widenConsentDecisionKinds(db) {
+  const def = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='consent_decisions'").get()
+  if (!def || def.sql.includes("'transfer'")) return false
+  if (!def.sql.includes(DECISION_KIND_CHECK_OLD)) throw new Error('consent_decisions: unexpected kind CHECK, cannot add transfer')
+  const createNew = def.sql
+    .replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?["`]?consent_decisions["`]?\s*\(/i, 'CREATE TABLE consent_decisions_transfer_new(')
+    .replace(DECISION_KIND_CHECK_OLD, DECISION_KIND_CHECK_NEW)
+  const indexes = db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='consent_decisions' AND sql IS NOT NULL").all().map((r) => r.sql)
+  db.pragma('foreign_keys = OFF')
+  try {
+    db.transaction(() => {
+      db.exec(createNew)
+      db.exec('INSERT INTO consent_decisions_transfer_new SELECT * FROM consent_decisions')
+      db.exec('DROP TABLE consent_decisions')
+      db.exec('ALTER TABLE consent_decisions_transfer_new RENAME TO consent_decisions')
+      for (const sql of indexes) db.exec(sql)
+    })()
+  } finally {
+    db.pragma('foreign_keys = ON')
+  }
+  return true
 }
