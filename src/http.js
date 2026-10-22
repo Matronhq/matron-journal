@@ -26,6 +26,7 @@ import { handleProjectsRoute } from './projects-http.js'
 import { handleGithubRoute, handleGithubCallback } from './github-http.js'
 import { handleLookupRoute } from './lookup-http.js'
 import { handleUsersRoute } from './users-http.js'
+import { handlePasswordResetRoute, handleAccountEmailRoute } from './password-reset-http.js'
 import { handleTwoFactorLogin, handleTwoFactorRoute, twoFactorRequiredNow } from './two-factor-http.js'
 import { isTwoFactorEnabled, makeTwoFactorTickets } from './two-factor.js'
 import { PLAIN_BOX } from './token-box.js'
@@ -112,13 +113,15 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, blobTranscripts = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, blobTranscripts = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null }) {
   // Two-factor sign-in (src/two-factor-http.js). The server passes its own;
   // the defaults keep a bare handler (tests) working the same way.
   const twoFactorBox = tokenBox || PLAIN_BOX
   const signInTickets = tickets || makeTwoFactorTickets()
   const codeLimiter = twoFactorLimiter || makeRateLimiter({ max: 10 })
   const passwordChecks = makeKeyedQueue()
+  // Forgot/reset password: their own per-IP budget, a few asks per quarter hour.
+  const passwordResetLimiter = resetLimiter || makeRateLimiter({ max: 5, windowMs: 15 * 60000 })
   // Alertmanager webhook (src/alerts-http.js): built once so its in-flight
   // bound is per process. Off (declines every request) without config.
   const handleAlerts = makeAlertsHandler({
@@ -188,6 +191,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         return json(res, 200, { token: d.token, device_id: d.deviceId, user_id: u.userId })
       }
       if (await handleTwoFactorLogin({ db, tokenBox: twoFactorBox, tickets: signInTickets, twoFactorLimiter: codeLimiter, loginGuard }, req, res, url, { rejectEarly })) return
+      if (await handlePasswordResetRoute({ db, mailer, resetLimiter: passwordResetLimiter, loginGuard, signInTickets }, req, res, url, { rejectEarly })) return
       if (req.method === 'POST' && url.pathname === '/pair/start') {
         // Unauthenticated by design: this grants nothing — the pair becomes
         // an agent only if an authenticated client approves the code, and
@@ -345,6 +349,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         return json(res, 200, out.body)
       }
       if (await handleUsersRoute({ db, links }, req, res, url, who)) return
+      if (await handleAccountEmailRoute({ db, mailer, loginGuard }, req, res, url, who)) return
       if (await handleTwoFactorRoute({ db, tokenBox: twoFactorBox, loginGuard }, req, res, url, who)) return
       if (req.method === 'GET' && url.pathname === '/me') {
         const user = db.prepare('SELECT id, name, is_admin FROM users WHERE id=?').get(who.userId)

@@ -722,3 +722,19 @@ test('device consent: user-only sets the flag and device list shows it; any clea
   await assert.rejects(() => runAdmin(db, ['device', 'consent', String(a.deviceId), 'coordinator']), /usage/i)
   db.close()
 })
+
+test('admin CLI: user email sets, normalises and clears the address; refuses a bad or taken one', async () => {
+  const db = openDb(':memory:')
+  await runAdmin(db, ['user', 'add', 'alice', '--password', 'pw123456'])
+  await runAdmin(db, ['user', 'add', 'bob', '--password', 'pw123456'])
+  const emailOf = (n) => db.prepare('SELECT email FROM users WHERE name=?').get(n).email
+  assert.match(await runAdmin(db, ['user', 'email', 'alice', ' alice@example.com ']), /alice's email is now alice@example\.com/)
+  assert.equal(emailOf('alice'), 'alice@example.com')
+  await assert.rejects(runAdmin(db, ['user', 'email', 'bob', 'ALICE@example.com']), /already has/)
+  await assert.rejects(runAdmin(db, ['user', 'email', 'bob', 'nope']), /not an email address/)
+  await assert.rejects(runAdmin(db, ['user', 'email', 'nobody', 'x@example.com']), /no such user/)
+  await assert.rejects(runAdmin(db, ['user', 'email', 'bob']), /usage/i)
+  assert.match(await runAdmin(db, ['user', 'email', 'alice', '--clear']), /no email address/)
+  assert.equal(emailOf('alice'), null)
+  db.close()
+})

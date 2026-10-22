@@ -11,6 +11,7 @@ import { resolvePreapproveKeyPath } from '../src/preapprove-key.js'
 import { runOffload, runExpireLogs } from '../src/retention.js'
 import { listAwaiting, answerParkedInvite } from '../src/participants.js'
 import { closeChatConsentItem } from '../src/consent-items.js'
+import { normaliseEmail, setUserEmail } from '../src/password-reset.js'
 import { disableTwoFactor, twoFactorState, isTwoFactorRequired, setTwoFactorRequired } from '../src/two-factor.js'
 
 const USAGE = `usage:
@@ -18,6 +19,7 @@ const USAGE = `usage:
   matron-admin user passwd <name> (--password <pw> | --password-stdin | env MATRON_PASSWORD)
   matron-admin user admin <name> on|off
   matron-admin user unlisted <name> on|off
+  matron-admin user email <name> <address>|--clear
   matron-admin user 2fa-reset <name>
   matron-admin two-factor status
   matron-admin two-factor require on|off
@@ -157,6 +159,18 @@ export async function runAdmin(db, argv, deps = {}) {
     return value === 'on'
       ? `${name} is now unlisted: left out of the add-contact user list, and cannot send or be sent a contact request`
       : `${name} is listed again in the add-contact user list`
+  }
+  // The address a forgot-password link goes to (src/password-reset.js).
+  if (a === 'user' && b === 'email') {
+    const name = argv[2]
+    const value = argv[3]
+    if (!name || !value) throw new Error(USAGE)
+    const email = value === '--clear' ? null : normaliseEmail(value)
+    if (value !== '--clear' && !email) throw new Error(`not an email address: ${value}`)
+    const u = db.prepare('SELECT id FROM users WHERE name=?').get(name)
+    if (!u) throw new Error(`no such user: ${name}`)
+    if (setUserEmail(db, u.id, email).conflict) throw new Error(`another account already has ${email}`)
+    return email ? `${name}'s email is now ${email}` : `${name} has no email address now`
   }
   // The lockout escape hatch: a user who has lost their authenticator app
   // and their recovery codes signs in with the password alone again, and

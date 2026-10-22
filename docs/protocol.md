@@ -3918,10 +3918,11 @@ page needs no shell.
 
 | Route | Body | Response |
 |---|---|---|
-| `GET /users` | — | `{users:[{id, name, is_admin, unlisted, created_at, two_factor, github:{login, state, host} \| null}]}` (no token, no hash; `two_factor` is a boolean) |
+| `GET /users` | — | `{users:[{id, name, email, is_admin, unlisted, created_at, two_factor, github:{login, state, host} \| null}]}` (no token, no hash; `two_factor` is a boolean) |
 | `POST /users` | `{name, password, is_admin?}` — name `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, password ≥ 8 | `201 {user}`; `400 bad_request` \| `400 weak_password`; `409 conflict` if the name is taken |
 | `PATCH /users/:id` | `{is_admin: boolean}` | `{user}`; `409 conflict {reason:'last_admin'}` when it would demote the only admin |
 | `POST /users/:id/password` | `{password}` ≥ 8 | `{ok:true}`; device tokens stay valid (same as `matron-admin user passwd`) |
+| `PUT /users/:id/email` | `{email: string \| null}` | `{user}`; `400 bad_email`; `409 email_taken` when another account has it (case-insensitive). `null` clears it. Where a forgot-password link goes (same as `matron-admin user email`) |
 | `DELETE /users/:id/github-link` | — | `{ok:true}`; `404` if nothing linked. Resolves a `409 conflict` at link time |
 | `DELETE /users/:id/two-factor` | — | `{ok:true}`; `404` if two-factor was off. Turns it off for a user who lost their authenticator app and recovery codes (same as `matron-admin user 2fa-reset`) |
 | `POST /users/:id/link-code` | `{ttl_seconds?}` (60–86400, default 600) | `{link_code, expires_in}` — the same pre-approved pairing code `matron-admin link-code` mints; the app builds `matron://link?v=1&server=<origin>&code=<link_code>` |
@@ -3929,6 +3930,43 @@ page needs no shell.
 Unknown `:id` is `404 not_found`. Self-service stays on the existing
 routes: `GET /devices`, `POST /devices/:id/revoke`, `POST /devices/:id/rename`,
 `POST /password`.
+
+## Password reset by email
+
+"Forgot password?" on a sign-in screen. Off unless the journal can send
+mail (README: `MATRON_RESEND_API_KEY`, `MATRON_MAIL_FROM`,
+`MATRON_PUBLIC_URL`), and only for accounts with an email address on file.
+
+- `GET /password/forgot` (no auth) -> `{enabled}`. Apps show "Forgot
+  password?" only when it is `true`.
+- `POST /password/forgot` (no auth) `{identifier}`: a username (exact) or
+  an email address (any case). Always `200 {ok:true}`, whether or not the
+  account exists or has an address, so the answer reveals nothing; the
+  mail is sent in the background. `400 bad_request` for an empty or
+  over-long identifier, `503 unavailable` when mail is off. If the account
+  has an address it gets a link
+  `<MATRON_PUBLIC_URL>/app/reset-password#token=<token>`, valid for 30
+  minutes and once. The token is 32 random bytes (base64url) and only its
+  SHA-256 is stored. A newer link replaces any older unused one. At most 3
+  links per account per hour, whoever asks; past that the request is
+  quietly not sent.
+- `POST /password/reset` (no auth) `{token, new_password}` (≥ 8) ->
+  `{ok:true, signed_out}`. Sets the password, spends every link for the
+  account, revokes every **client** device (`signed_out` is how many) and
+  clears the account's sign-in lockout. Agent devices stay connected; the
+  user can revoke any of them from their devices list. Two-factor still
+  applies at the next sign-in. `400 invalid_token` for an unknown, used or
+  expired token (one answer for all three), `400 weak_password`.
+- Both POSTs share a per-IP budget of 5 per 15 minutes -> `429
+  rate_limited`.
+
+The user's own address (Bearer, client devices only; agents get 403):
+
+- `GET /account/email` -> `{email: string | null, reset_by_email}`.
+- `PUT /account/email` `{password, email: string | null}` -> `{email}`.
+  Needs the current password, because the address is where a reset link
+  goes. Wrong passwords count against the sign-in lockout (`401
+  bad_password`, then `429 locked_out`). `400 bad_email`, `409 email_taken`.
 
 ## Static hosting and app links
 

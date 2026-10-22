@@ -27,6 +27,7 @@ import { resolveWebDir, makeStaticHandler } from './static-http.js'
 import { makeWellKnown, parseList } from './well-known.js'
 import { makeWaker, markWakeRefused, clearWakeRefused } from './wake.js'
 import { makeConfiguredTranscriber } from './cloud-transcribe.js'
+import { makeConfiguredMailer } from './mailer.js'
 import { makeConfiguredSummariser } from './summarise.js'
 import { makeBlobTranscripts } from './blob-transcripts.js'
 import { makeItemTranscription } from './items-transcribe.js'
@@ -439,6 +440,10 @@ export function startServer({
   // POST /summarise (src/summarise.js): the test seam; `null` forces it
   // off. Undefined resolves from MATRON_SUMMARY_ANTHROPIC_KEY(_FILE).
   summariser,
+  // Password reset by email (src/mailer.js): the test seam; `null` forces
+  // it off. Undefined resolves from MATRON_RESEND_API_KEY(_FILE),
+  // MATRON_MAIL_FROM and MATRON_PUBLIC_URL.
+  mailer,
   // Unified search's similar tier (spec 2026-10-12 §5): the test seam — an
   // injected embedder (incl. `null` to force the tier off) bypasses
   // loadEmbedder entirely, so the suite never loads or downloads a real
@@ -583,6 +588,7 @@ export function startServer({
   }
   if (resolvedAlertWebhook) warnAlertWebhookConfig(db, resolvedAlertWebhook)
   const resolvedSummariser = summariser !== undefined ? summariser : makeConfiguredSummariser()
+  const resolvedMailer = mailer !== undefined ? mailer : makeConfiguredMailer()
   // Unified search's similar tier (spec 2026-10-12 §5). `semantic.store`/
   // `.embedder` start null — /search/all answers `semantic: 'off'` until
   // (if ever) the embedder loads and the first index pass finishes, below.
@@ -601,7 +607,7 @@ export function startServer({
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentRoutineCap, verifier,
     github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
-    sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser,
+    sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
