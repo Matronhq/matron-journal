@@ -2982,7 +2982,7 @@ itself; a peer agent joined to the conversation cannot.
   when, but not what.
 - A withdrawn tap is undone: the item's `chosen_action` (or, for a tap on a
   comment's buttons, that comment's) goes back to the latest tap still
-  standing, or `null`. Another person's view of the
+  standing that the buttons still offer, or `null`. Another person's view of the
   thread (an org-shared or granted item) shows it the same way, and a
   hand-over copy leaves it out. The user's own apps still get the full
   comment, so they can show the reply as cancelled and offer to resend it.

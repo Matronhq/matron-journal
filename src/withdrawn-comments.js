@@ -88,7 +88,12 @@ function undoTap(db, { itemId, meta }) {
       AND json_extract(meta, '$.action') IS NOT NULL
       AND ${replyTo ? "json_extract(meta, '$.reply_to')=?" : "json_extract(meta, '$.reply_to') IS NULL"}
     ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(...(replyTo ? [itemId, replyTo] : [itemId]))
-  const restored = latest?.action ?? null
+  // Only a label the buttons still offer: an agent that replaced the
+  // buttons since that tap has already cleared the choice it answered.
+  const offered = replyTo
+    ? db.prepare('SELECT actions FROM item_comments WHERE id=? AND item_id=?').get(replyTo, itemId)?.actions
+    : db.prepare('SELECT actions FROM items WHERE id=?').get(itemId)?.actions
+  const restored = latest?.action != null && (parse(offered) ?? []).includes(latest.action) ? latest.action : null
   if (replyTo) {
     db.prepare('UPDATE item_comments SET chosen_action=? WHERE id=? AND item_id=? AND chosen_action IS ?').run(restored, replyTo, itemId, action)
     return { action, itemChosen: undefined }

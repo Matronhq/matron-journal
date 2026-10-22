@@ -168,3 +168,22 @@ test('the reply\'s copy in another person\'s log is scrubbed too', async (t) => 
   const rows = s.db.prepare("SELECT payload FROM events WHERE user_id=? AND convo_id='b1'").all(bob.id)
   assert.equal(rows.length, 1); assert.ok(!rows[0].payload.includes('zebra'))
 })
+
+test('a cancelled tap never restores a choice the buttons no longer offer', async (t) => {
+  const { s, agent, client } = await fleet(t)
+  const item = (await s.http('/items', { method: 'POST', token: agent.token, body: { kind: 'question', title: 'Pick one', convo_id: 'c1', actions: ['Plan A', 'Plan B'] } })).json.item
+  await s.http(`/items/${item.id}/comments`, { method: 'POST', token: client, body: { action: 'Plan A' } })
+  await s.http(`/items/${item.id}`, { method: 'PATCH', token: agent.token, body: { actions: ['Yes', 'No'] } })
+  const tap = (await s.http(`/items/${item.id}/comments`, { method: 'POST', token: client, body: { action: 'No' } })).json.comment
+  await queueAndRelease(s, agent, { item, reply: tap, action: 'cancel' })
+  assert.equal((await s.http(`/items/${item.id}`, { token: agent.token })).json.item.chosen_action, null)
+})
+
+test('a cancelled tap gives the choice back to the earlier tap still standing', async (t) => {
+  const { s, agent, client } = await fleet(t)
+  const item = (await s.http('/items', { method: 'POST', token: agent.token, body: { kind: 'question', title: 'Pick one', convo_id: 'c1', actions: ['Plan A', 'Plan B'] } })).json.item
+  await s.http(`/items/${item.id}/comments`, { method: 'POST', token: client, body: { action: 'Plan A' } })
+  const tap = (await s.http(`/items/${item.id}/comments`, { method: 'POST', token: client, body: { action: 'Plan B' } })).json.comment
+  await queueAndRelease(s, agent, { item, reply: tap, action: 'cancel' })
+  assert.equal((await s.http(`/items/${item.id}`, { token: agent.token })).json.item.chosen_action, 'Plan A')
+})
