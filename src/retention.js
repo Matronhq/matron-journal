@@ -1,10 +1,11 @@
 import fs from 'node:fs'
+import path from 'node:path'
 import { writeBlobSync } from './media.js'
 import { insertBlob, getBlob } from './db.js'
 import { isAudioAttachment } from './items.js'
 import { snippetOf, MESSAGE_TYPES, appendAndBroadcast } from './journal.js'
 import {
-  LIVE_PHASES, getTransfer, setTransferState, deleteTransferFiles, forgetChunks, transferDir,
+  LIVE_PHASES, getTransfer, setTransferState, deleteTransferFiles, forgetChunks, isTransferId,
   TRANSFER_DELIVERED_GRACE_MS, TRANSFER_EXPIRE_MS,
 } from './transfers.js'
 import { closeTransferConsentItem } from './transfer-consent.js'
@@ -769,12 +770,13 @@ export function runExpireDeviceContent(db, { rules, now = Date.now(), batchSize 
 // complete uses — so a sweep that runs twice, or lands moments after an
 // API call already settled the row, changes nothing on its second look.
 //
-// Also sweeps any leftover transfer directory of a declined, cancelled or
-// failed row: those routes delete their own bytes at once (`deleted_at` is
-// already stamped at the state change, so it cannot tell "cleaned" from
-// "not" — this checks the filesystem directly), so in steady state this is
-// only a crash-safety net for a process that died between the state change
-// and the unlink.
+// Also sweeps any leftover transfer directory the state-changing passes
+// above (or a chunk PUT racing one of them) left behind — see the
+// filesystem scan at the end of this function for why it is driven from
+// disk, not a table scan: a crash can land between a state change and its
+// delete in more places than a `declined | cancelled | failed` table scan
+// could ever find, and `transfers` rows are never deleted, so a scan over
+// every row this feature has ever written would grow forever.
 export function runExpireTransfers(db, { mediaDir, hub, now = Date.now() }) {
   let deleted = 0
   let expired = 0
@@ -811,9 +813,37 @@ export function runExpireTransfers(db, { mediaDir, hub, now = Date.now() }) {
     expired += 1
   }
 
-  const leftover = db.prepare("SELECT id FROM transfers WHERE phase IN ('declined','cancelled','failed')").all()
-  for (const { id } of leftover) {
-    if (!fs.existsSync(transferDir(mediaDir, id))) continue
+  // Crash-safety sweep, driven from the filesystem so its cost is bounded
+  // by what is actually still on disk (rows are never deleted, so a table
+  // scan would grow forever) and so it catches every way a delete can be
+  // missing, not just the three terminal phases a table scan could name:
+  //   - a crash between the delivered-copy claim above (`deleted_at` set)
+  //     and its `deleteTransferFiles` a few lines later;
+  //   - a crash between the expiry's `setTransferState` (phase ->
+  //     `expired`) and ITS `deleteTransferFiles` — `expired` isn't in
+  //     LIVE_PHASES, but it also isn't `declined`/`cancelled`/`failed`, so
+  //     the old phase-list scan could never find it;
+  //   - a chunk PUT that raced either pass and wrote a chunk file after
+  //     the row had already been read as due.
+  // A directory is kept only when its row still legitimately needs it: an
+  // open or released (LIVE_PHASES) row, or a delivered one still within
+  // its grace (`deleted_at IS NULL` — the pass above hasn't claimed it
+  // yet). Everything else — no row at all, or a row whose own state says
+  // the bytes should be gone — is deleted. Entries that don't look like a
+  // transfer id are left alone, so nothing a different feature or an
+  // operator ever drops under `<mediaDir>/transfers` is touched.
+  let entries
+  try {
+    entries = fs.readdirSync(path.join(mediaDir, 'transfers'))
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err
+    entries = []
+  }
+  for (const id of entries) {
+    if (!isTransferId(id)) continue
+    const row = getTransfer(db, id)
+    const keep = row && (LIVE_PHASES.includes(row.phase) || (row.phase === 'delivered' && row.deleted_at == null))
+    if (keep) continue
     deleteTransferFiles(mediaDir, id)
     forgetChunks(db, id)
     deleted += 1

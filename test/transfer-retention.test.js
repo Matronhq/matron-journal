@@ -107,6 +107,24 @@ function fakeChunk(f, id) {
   recordChunk(f.s.db, id, 0, CHUNK)
 }
 
+// Directly set columns on a transfer row, bypassing the guarded state
+// machine — only for simulating a specific on-disk-vs-row state a crash
+// could have left behind, not for driving the ordinary flows above.
+function rawSet(f, id, patch) {
+  const cols = Object.keys(patch)
+  f.s.db.prepare(`UPDATE transfers SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c]), id)
+}
+
+// A directory under <mediaDir>/transfers/<id> with no DB row behind it
+// (or behind a row the test will separately adjust) — the shape the
+// crash-safety sweep's disk scan walks.
+function diskOnlyLeftover(f, id) {
+  const dir = path.join(f.mediaDir, 'transfers', id)
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(path.join(dir, '0'), 'x'.repeat(CHUNK))
+  return dir
+}
+
 test('delivered copy: kept at +59 min, deleted (files and chunk rows gone, deleted_at stamped) at +61 min; a repeat run is a no-op', async (t) => {
   const f = await fleet(t)
   const id = await released(f)
@@ -119,7 +137,8 @@ test('delivered copy: kept at +59 min, deleted (files and chunk rows gone, delet
   assert.ok(fs.existsSync(transferDir(f.mediaDir, id)), 'bytes still there within the hour')
   assert.equal(getTransfer(f.s.db, id).deleted_at, null)
 
-  const after = runExpireTransfers(f.s.db, { mediaDir: f.mediaDir, hub: f.s.hub, now: deliveredAt + TRANSFER_DELIVERED_GRACE_MS + 60000 })
+  // Exactly 1h: the query is `<=`, so this is already due.
+  const after = runExpireTransfers(f.s.db, { mediaDir: f.mediaDir, hub: f.s.hub, now: deliveredAt + TRANSFER_DELIVERED_GRACE_MS })
   assert.deepEqual(after, { deleted: 1, expired: 0 })
   const row = getTransfer(f.s.db, id)
   assert.equal(row.phase, 'delivered', 'phase is untouched — the file was collected')
@@ -142,7 +161,8 @@ test('released but never collected: kept just under 7 days, expires just over; f
   assert.deepEqual(notYet, { deleted: 0, expired: 0 })
   assert.equal(getTransfer(f.s.db, id).phase, 'released')
 
-  const due = runExpireTransfers(f.s.db, { mediaDir: f.mediaDir, hub: f.s.hub, now: createdAt + TRANSFER_EXPIRE_MS + 1 })
+  // Exactly 7d: the query is `<=`, so this is already due.
+  const due = runExpireTransfers(f.s.db, { mediaDir: f.mediaDir, hub: f.s.hub, now: createdAt + TRANSFER_EXPIRE_MS })
   assert.deepEqual(due, { deleted: 0, expired: 1 })
   const row = getTransfer(f.s.db, id)
   assert.equal(row.phase, 'expired')
@@ -171,7 +191,12 @@ test('awaiting the user\'s answer, never answered: expires at 7 days, the card c
   fakeChunk(f, id)
   const createdAt = getTransfer(f.s.db, id).created_at
 
-  const r = runExpireTransfers(f.s.db, { mediaDir: f.mediaDir, hub: f.s.hub, now: createdAt + TRANSFER_EXPIRE_MS + 1 })
+  const notYet = runExpireTransfers(f.s.db, { mediaDir: f.mediaDir, hub: f.s.hub, now: createdAt + TRANSFER_EXPIRE_MS - 1 })
+  assert.deepEqual(notYet, { deleted: 0, expired: 0 })
+  assert.equal(getTransfer(f.s.db, id).phase, 'open')
+
+  // Exactly 7d: the query is `<=`, so this is already due.
+  const r = runExpireTransfers(f.s.db, { mediaDir: f.mediaDir, hub: f.s.hub, now: createdAt + TRANSFER_EXPIRE_MS })
   assert.deepEqual(r, { deleted: 0, expired: 1 })
   const row = getTransfer(f.s.db, id)
   assert.equal(row.phase, 'expired')
@@ -240,4 +265,91 @@ test('leftover chunk dir of a declined transfer is swept up (crash safety): not 
   assert.equal(fs.existsSync(transferDir(f.mediaDir, id)), false)
   assert.equal(chunkRows(f, id), 0)
   assert.equal(getTransfer(f.s.db, id).phase, 'declined', 'the phase is untouched')
+})
+
+// The crash-safety sweep is driven from the filesystem (what is actually
+// still on disk under <mediaDir>/transfers), not a table scan over every
+// transfer row ever written — a table scan can never find these cases,
+// since none of them touches a `deleted_at IS NULL` filter the earlier
+// passes rely on, and a `phase IN LIVE_PHASES` scan would miss `expired`
+// entirely (it isn't a LIVE_PHASES value, but it also isn't being looked
+// for by the old declined/cancelled/failed-only table scan).
+
+test('crash safety: a leftover dir on an EXPIRED row (crash between the phase flip and the delete) is swept', async (t) => {
+  const f = await fleet(t)
+  const id = await createTransfer(f)
+  fakeChunk(f, id)
+  rawSet(f, id, { phase: 'expired', deleted_at: Date.now() })
+
+  const r = runExpireTransfers(f.s.db, { mediaDir: f.mediaDir, hub: f.s.hub, now: Date.now() })
+  assert.deepEqual(r, { deleted: 1, expired: 0 })
+  assert.equal(fs.existsSync(transferDir(f.mediaDir, id)), false)
+  assert.equal(chunkRows(f, id), 0)
+  assert.equal(getTransfer(f.s.db, id).phase, 'expired', 'the phase is untouched')
+})
+
+test('crash safety: a leftover dir on a DELIVERED row whose deleted_at is already stamped (crash between the claim and the delete) is swept', async (t) => {
+  const f = await fleet(t)
+  const id = await createTransfer(f)
+  fakeChunk(f, id)
+  rawSet(f, id, { phase: 'delivered', delivered_at: Date.now() - 10000, deleted_at: Date.now() })
+
+  const r = runExpireTransfers(f.s.db, { mediaDir: f.mediaDir, hub: f.s.hub, now: Date.now() })
+  assert.deepEqual(r, { deleted: 1, expired: 0 })
+  assert.equal(fs.existsSync(transferDir(f.mediaDir, id)), false)
+  assert.equal(chunkRows(f, id), 0)
+})
+
+test('crash safety: a leftover dir on a CANCELLED row is swept', async (t) => {
+  const f = await fleet(t)
+  const id = await createTransfer(f)
+  fakeChunk(f, id)
+  rawSet(f, id, { phase: 'cancelled', deleted_at: Date.now() })
+
+  const r = runExpireTransfers(f.s.db, { mediaDir: f.mediaDir, hub: f.s.hub, now: Date.now() })
+  assert.deepEqual(r, { deleted: 1, expired: 0 })
+  assert.equal(fs.existsSync(transferDir(f.mediaDir, id)), false)
+  assert.equal(chunkRows(f, id), 0)
+})
+
+test('crash safety: a leftover dir on a FAILED row is swept', async (t) => {
+  const f = await fleet(t)
+  const id = await createTransfer(f)
+  fakeChunk(f, id)
+  rawSet(f, id, { phase: 'failed', deleted_at: Date.now() })
+
+  const r = runExpireTransfers(f.s.db, { mediaDir: f.mediaDir, hub: f.s.hub, now: Date.now() })
+  assert.deepEqual(r, { deleted: 1, expired: 0 })
+  assert.equal(fs.existsSync(transferDir(f.mediaDir, id)), false)
+  assert.equal(chunkRows(f, id), 0)
+})
+
+test('crash safety: a leftover dir with no transfer row at all is swept; a non-id entry under transfers/ is left alone', async (t) => {
+  const f = await fleet(t)
+  const orphanId = `tr_${'a'.repeat(32)}`
+  const orphanDir = diskOnlyLeftover(f, orphanId)
+  const junkDir = path.join(f.mediaDir, 'transfers', 'scratch')
+  fs.mkdirSync(junkDir, { recursive: true })
+  fs.writeFileSync(path.join(junkDir, 'note.txt'), 'not a transfer')
+
+  const r = runExpireTransfers(f.s.db, { mediaDir: f.mediaDir, hub: f.s.hub, now: Date.now() })
+  assert.deepEqual(r, { deleted: 1, expired: 0 })
+  assert.equal(fs.existsSync(orphanDir), false)
+  assert.ok(fs.existsSync(junkDir), 'a non-transfer-id entry is never touched')
+})
+
+test('crash safety: a live (open/released) row\'s directory, and an undelivered DELIVERED row\'s (deleted_at null), are kept', async (t) => {
+  const f = await fleet(t)
+  const open = await createTransfer(f)
+  fakeChunk(f, open)
+  const releasedId = await released(f, { name: 'other.txt' })
+  const deliveredId = await released(f, { name: 'third.txt' })
+  assert.equal((await received(f, deliveredId)).status, 200)
+  assert.equal(getTransfer(f.s.db, deliveredId).deleted_at, null, 'still within the 1h grace')
+
+  const r = runExpireTransfers(f.s.db, { mediaDir: f.mediaDir, hub: f.s.hub, now: Date.now() })
+  assert.deepEqual(r, { deleted: 0, expired: 0 })
+  assert.ok(fs.existsSync(transferDir(f.mediaDir, open)), 'open: kept')
+  assert.ok(fs.existsSync(transferDir(f.mediaDir, releasedId)), 'released: kept')
+  assert.ok(fs.existsSync(transferDir(f.mediaDir, deliveredId)), 'delivered, not yet past grace: kept')
 })
