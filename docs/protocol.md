@@ -1938,6 +1938,108 @@ Both paths use the same state-scoped `UPDATE ... WHERE state='approved'` (`markF
 
 Outstanding `awaiting_user` rows per *requesting* device are capped at `MAX_AWAITING_PER_REQUESTER` (3), shared with agent-chat invites and joins — the cap is what stops a re-ask loop, not TTL ambiguity or answer masking. Over the cap, `spawn_request` fails `{code:'conflict', detail:'too many requests awaiting user approval'}`. The user's Coordinator may answer its own or any other agent's parked asks through *Coordinator → Consent approval*, which is how a Coordinator that hit this cap on its own spawns clears it.
 
+## Agent-to-agent file transfers
+
+An agent may send a file to the other agents in a room it belongs to —
+the same consent-gated pattern as a spawn or an agent-chat invite, applied
+to bytes instead of a session. The sender's bridge uploads the file to the
+journal in fixed-size chunks; the user (or the Coordinator, within the
+usual rules) approves or declines it from a card; once approved *and*
+fully uploaded, the journal tells every recipient device and the room
+gets a line in the journal's voice; each recipient then downloads the
+bytes and tells the journal once its own copy is verified. The journal
+never assembles the file on disk — it streams the stored chunks back in
+order — and deletes its copy once it has been collected (or, failing
+that, after a week).
+
+A transfer's row (`transfers`) moves along three independent axes:
+
+```
+consent  awaiting_user -> approved | declined        (the user's card)
+upload   uploading     -> uploaded | failed           (the sender's chunks)
+phase    open -> released -> delivered, or a terminal end
+                              (expired | cancelled | failed | declined)
+```
+
+The file is only released into the room once consent is `approved` **and**
+upload is `uploaded` — whichever happens second does the releasing, so the
+order the sender and the user act in never matters.
+
+### Routes (Bearer, agent devices only — a client gets `403`)
+
+| Route | Who | What |
+|---|---|---|
+| `POST /transfers` | sender | create a transfer and reserve its declared size against the sender's quota |
+| `PUT /transfers/:id/chunks/:n` | sender | upload one chunk, verified by its own sha256 |
+| `GET /transfers/:id` | sender or a recipient | status: phase, consent, upload, and which chunks have landed |
+| `DELETE /transfers/:id` | sender | cancel before it is collected |
+| `POST /transfers/:id/complete` | sender | every chunk is in; the whole-file sha256 is checked and, if it matches and consent is already `approved`, the file is released |
+| `GET /transfers/:id/content` | a recipient | the bytes, once released — supports `Range` |
+| `POST /transfers/:id/received {sha256}` | a recipient | the receiver's own copy verified; tells the sender and the room |
+| `GET /transfers?for=me` | a recipient | every released, undelivered transfer waiting for this device — a bridge's catch-up list on reconnect |
+
+A transfer the caller is not entitled to see answers `404` on every route,
+never `403` — the same anti-enumeration stance as every other id-scoped
+route in this protocol, so a transfer id confirms nothing about who else
+can see it. Transfers never cross between unrelated people: a room shared
+with another person's agent (a *person room*, see "Rooms between people")
+refuses `POST /transfers` with `403 person_room` before anything is
+reserved or written.
+
+**`POST /transfers`** `{room_id, from_convo_id, name, size, sha256, content_type?, reason?, scan?}` — `room_id` must be a room the caller's device owns or has joined; `from_convo_id` must be a conversation the caller's device owns (the session the file is "from", shown on the card). `name` is a bare file name (no `/`, `\`, `.` or `..` — it is written into a recipient's inbox verbatim) capped at 255 characters; `size` is the file's declared length in bytes, checked against the uploaded chunks and the final sha256 at `/complete` but never trusted before that. A declared size over the per-file cap (`MATRON_TRANSFER_MAX_BYTES`, default 10 GiB) is `413 too_large`; one that would push the sender's **user**, not the room's, outstanding declared bytes — summed over every transfer still `open` or `released`, regardless of room — over the per-user quota (`MATRON_TRANSFER_USER_QUOTA_BYTES`, default 20 GiB, separate from the media/attachment quota) is `413 quota_exceeded`. The reservation is released the moment a transfer leaves those two phases, whichever way: delivered, expired, cancelled, declined or failed.
+
+`scan` is optional, pre-computed by the sender's bridge against the bytes before it ever asks the journal to hold them: `{verdict: 'clean' | 'flagged' | 'not_scanned', findings: [{kind, line}]}`. `line` is a 1-based line number, or `member:line` for a match inside an archive; the matched text itself is never sent or stored, only what kind of secret it looks like and where. A `flagged` transfer still files its card for the user — only the *Coordinator's* automatic approval refuses it (below) — the user can always see and approve their own agents' traffic.
+
+**`PUT /transfers/:id/chunks/:n`** — `x-chunk-sha256` identifies the chunk; its `Content-Length` must equal the exact size that chunk number is expected to hold (every chunk is `TRANSFER_CHUNK_BYTES` (32 MiB) except the last, which holds the remainder) or the call is `400 chunk_mismatch` before the body is even read. 32 MiB keeps every chunk body well under the 100 MB a proxy in front of the server may cap request bodies at. A chunk may be re-sent (a retried upload after a dropped connection); the write is to a private temp file first, so a failed or retried PUT never leaves a half-written chunk in place. Chunks may arrive out of order and the upload may be resumed after a restart from whichever chunk numbers the status route (`GET /transfers/:id`) says are still missing. Once the transfer leaves phase `open` (cancelled, declined, or already fully uploaded), every chunk PUT answers `409 closed`.
+
+**`POST /transfers/:id/complete`** hashes the chunks on disk, in order, and compares the result to the declared sha256. A mismatch moves the transfer to `failed`, deletes the bytes, tells the sender `{kind:'transfer', event:'failed', transfer_id, reason:'sha256_mismatch'}` and answers `422 sha256_mismatch` — nothing is ever released on a mismatch, however it was approved. A match that is also already `approved` releases the file; one that is not yet approved waits for the card. Calling it again once uploaded is a no-op `200`.
+
+**`GET /transfers/:id/content`** serves a `released` transfer, or a `delivered` one within an hour of its receipt (so a receiver that crashed right after verifying, before writing its own copy, can fetch it again). Anything else is `404`. It supports `Range: bytes=a-` and `bytes=a-b` (`206`, `content-range`); any other Range form (a suffix range, a start past the end) is `416` rather than silently served whole — a bridge resuming a partial download must treat a `200` body as "start over", never append it to a `.part` file. Response headers always include `content-disposition: attachment`, `x-content-type-options: nosniff` and `cache-control: private, no-store`: the content type is whatever the sender declared, served as-is but never sniffed or rendered inline.
+
+**`POST /transfers/:id/received`** takes the receiver's own sha256 of what it actually wrote to disk — a last confirmation that nothing was corrupted in transit or on the receiving side, separate from the journal's own check at `/complete`. A mismatch is `400`; a match moves the transfer to `delivered`, tells the sender `{kind:'transfer', event:'delivered', transfer_id}` and writes a line into the room. Calling it again with the same sha256 is a no-op `200`.
+
+### The consent card
+
+The moment a transfer is created, the journal files a tracker item — a `question` on the sender's own conversation, `Approve` / `Decline`, the same mechanics as a spawn or chat consent card (see "Agent-spawned sessions" → "Tracker item" for the shared rules: invisible to every agent, answered on the item itself or through `GET /consent/pending` / `POST /consent/answer` by the Coordinator, closed exactly once). Its title is `Approve file transfer: <name> (<human size>) from <sender box> to <room title>`; its body names the sender and its session, every recipient box and session in the room, the file name and size, the content type, the sha256, and one of three lines for the scan:
+
+- `✅ clean`
+- `⚠️ N possible secrets: <kind> (<line>), …`
+- `not scanned (binary or unsupported format)`
+
+plus the sender's note (`reason`), if any, in a fenced block. Unanswered, the card expires after 7 days (below).
+
+**The Coordinator may not approve a `flagged` transfer.** Every other consent rule applies as usual (the daily cap, the reason, the user being able to answer first) but a transfer whose scan verdict is `flagged` can only be approved by the user in person — the Coordinator's attempt answers `403 secret_scan_flagged` and changes nothing. Declining a flagged transfer is unaffected.
+
+### Frames
+
+Every transfer event sent to a live device takes the shape `{kind:'transfer', event:'<name>', transfer_id, ...}`:
+
+| event | to | when |
+|---|---|---|
+| `ready` | every recipient device | released — carries the whole `transfer` object (`id, room_id, name, size, sha256, content_type, from_name, from_convo_id`) so a bridge can file its own card without a follow-up request; an offline recipient box is woken |
+| `declined` | the sender | the user or Coordinator declined |
+| `failed` | the sender | the uploaded bytes didn't match the declared sha256 |
+| `delivered` | the sender | a recipient verified its own copy |
+| `expired` | the sender | 7 days passed with the transfer still uncollected |
+
+A recipient bridge that was offline when `ready` fired catches up with `GET /transfers?for=me` on reconnect — the same information, as a list.
+
+The room itself only ever sees two kinds of durable event for a transfer: a `file` event (sender `journal`, no `blob_ref` — the bytes live behind the transfer id, not a media blob) when it is released, and a plain `text` line in the journal's voice for a decline, a successful delivery, or an expiry, e.g. `` Delivered `notes.txt` (2.0 KB), sha256 verified. ``
+
+### Retention
+
+The journal keeps a transfer's bytes for as long as they are useful and no longer:
+
+- a **delivered** copy is deleted one hour after the receiver's verified receipt — long enough for a receiver that crashed between verifying and writing its own copy to fetch it again, short enough that a successful transfer doesn't sit on disk forever;
+- an **open or released** transfer nobody has collected — whether or not the user has even answered the card yet — is marked `expired` 7 days after it was created: its bytes are deleted, its card (if still open) closes with "Expired after 7 days.", the sender is told (`event:'expired'`) and the room gets `` File `<name>` expired after 7 days without being collected. ``;
+- a **declined, cancelled or failed** transfer's bytes are deleted at once, by the route that ends it; a periodic sweep also clears any leftover chunk directory for one of those, as a backstop for a server that crashed between the state change and the delete.
+
+This sweep has no on/off switch and no configurable window — unlike the
+TTL passes elsewhere in *Retention* below, it only ever deletes bytes the
+state machine has already decided are done for, never "everything older
+than N" against a setting that could be left misconfigured — so it always
+runs on the same schedule as the rest of *Retention*.
+
 ## Items (task & decision tracker)
 
 Items are journal-owned rows (`items`, `item_comments`), scoped to the
@@ -5495,3 +5597,10 @@ covers the journal's own store and search only: a client that already
 synced an event keeps its local copy until it re-syncs, and a bridge's
 echo of a room message into another session's conversation (and that
 session's own transcript) carries no room id, so it is not reached.
+
+### Transfer retention
+
+Agent-to-agent file transfers have their own always-on sweep, with no env
+knob — see "Agent-to-agent file transfers" → "Retention" above. In short:
+a collected copy is deleted an hour after receipt, and an uncollected one
+is marked `expired` and deleted a week after it was created.

@@ -113,6 +113,8 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_TOOL_LOG_TTL_HOURS` | `24` | Delete offloaded tool-log blobs older than this |
 | `MATRON_VOICE_NOTE_TTL_DAYS` | `7` | Delete an item voice note's audio this many days after its transcript landed; the transcript stays (`0` disables) |
 | `MATRON_DEVICE_RETENTION` | unset (off) | Comma-separated `<deviceId>:<days>` (e.g. `4:30,9:7`): expire the content of each device's sessions and rooms once older than that many days — payloads become tombstones, search rows and unshared blobs are deleted. Any invalid entry disables the whole setting. See docs/protocol.md *Per-device content expiry* |
+| `MATRON_TRANSFER_MAX_BYTES` | 10 GiB (`10737418240`) | Per-file size cap for agent-to-agent file transfers |
+| `MATRON_TRANSFER_USER_QUOTA_BYTES` | 20 GiB (`21474836480`) | Per-user cap on the declared size of transfers still in flight (not yet collected or ended), separate from the media/attachment quota |
 | `MATRON_WS_PING_MS` | `55000` | WebSocket heartbeat interval (kept under common 60s proxy idle timeouts) |
 | `MATRON_RPC_MAX_BYTES` | `16384` | Max inbound WebSocket RPC frame size |
 | `MATRON_TOOL_STREAM_MAX_BYTES` | `1048576` | Max bytes per live tool-output stream buffer |
@@ -177,6 +179,12 @@ on each dev box, then sign in from an app with your journal URL + username.
   (`src/search.js`).
 - **Agent chat rooms** — agent-to-agent conversations; every invite and
   join asks the user for consent, every time (`src/participants.js`).
+- **Agent-to-agent file transfers** — one agent sends a file to the other
+  agents in a room it belongs to; chunked, resumable uploads, a secret-scan
+  verdict on the consent card, Range-able downloads, and automatic cleanup
+  once a file is collected or a week passes uncollected
+  (`src/transfers.js`, `src/transfer-consent.js`; see docs/protocol.md
+  *Agent-to-agent file transfers*).
 - **Device privacy** — private agent devices hidden from ordinary agents
   (`matron-admin device private`).
 - **Media** — blob upload/download with per-user authorization and sharded

@@ -16,7 +16,7 @@ import { makeApnsClient } from './apns.js'
 import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
-import { runOffload, runExpireLogs, runReapMedia, runExpireVoiceNotes, runExpireDeviceContent } from './retention.js'
+import { runOffload, runExpireLogs, runReapMedia, runExpireVoiceNotes, runExpireDeviceContent, runExpireTransfers } from './retention.js'
 import { backfillSearchIndex, backfillIsDiff } from './search.js'
 import { loadEmbedder } from './embedder.js'
 import { ensureVectorSchema, runVectorIndexer, createVectorStore } from './vector-index.js'
@@ -255,9 +255,10 @@ export function resolveReapPcts({ mediaReapHighPct, mediaReapLowPct } = {}) {
 // expiry runs FIRST: what it tombstones the later passes skip, so an old
 // tool log of such a device is never offloaded to a blob only to be
 // deleted, and the reaper sees the bytes it freed. Its rules are logged
-// once, here, at boot. Returns the interval handle (for close()) or null
-// only when ALL passes are disabled.
-function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, deviceRetention }) {
+// once, here, at boot. The transfer-expiry pass (runExpireTransfers) runs
+// LAST and unconditionally — see the comment at its call site below.
+// Returns the interval handle (for close()).
+function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, deviceRetention }) {
   const days = resolveRetentionDays(retentionDays)
   const ttlHours = resolveToolLogTtlHours(toolLogTtlHours)
   const voiceDays = resolveVoiceNoteTtlDays(voiceNoteTtlDays)
@@ -266,7 +267,12 @@ function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, t
   if (deviceRules) {
     console.log(`retention: device content expiry on — ${deviceRules.map((r) => `device ${r.deviceId} after ${r.days}d`).join(', ')}`)
   }
-  if (days === null && ttlHours === null && voiceDays === null && reapPcts === null && deviceRules === null) return null
+  // Transfer expiry (runExpireTransfers) has no knob and no disable path —
+  // unlike every pass above it deletes only bytes the state machine has
+  // already decided are done for (a collected copy past its grace, an
+  // uncollected one past 7 days), never "everything older than N" against
+  // a setting that could be misconfigured — so the schedule always runs,
+  // even when every other pass below is off.
   const run = () => {
     if (deviceRules !== null) {
       try {
@@ -312,6 +318,15 @@ function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, t
       } catch (err) {
         console.error('retention: media reap run failed', err)
       }
+    }
+    // Agent-to-agent file transfers: a collected copy past its 1h grace,
+    // and an open or released transfer nobody collected within 7 days —
+    // always on, see the comment above.
+    try {
+      const r = runExpireTransfers(db, { mediaDir, hub })
+      if (r.deleted > 0 || r.expired > 0) console.log(`retention: transfers — ${r.deleted} copy/copies deleted, ${r.expired} expired after 7 days uncollected`)
+    } catch (err) {
+      console.error('retention: transfer expiry run failed', err)
     }
   }
   run()
@@ -637,7 +652,7 @@ export function startServer({
     server.listen(port, bind, () => {
       const startDelay = cancellableDelay(backgroundDelayMs)
       retentionInterval = scheduleRetention(db, {
-        mediaDir: resolvedMediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays,
+        mediaDir: resolvedMediaDir, hub, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays,
         mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes, deviceRetention,
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)

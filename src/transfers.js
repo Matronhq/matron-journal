@@ -36,6 +36,10 @@ export const isTerminalPhase = (phase) => !LIVE_PHASES.includes(phase)
 // deletes the journal's copy.
 export const TRANSFER_DELIVERED_GRACE_MS = 3600000
 
+// How long an open or released transfer waits, uncollected, before
+// retention gives up on it (runExpireTransfers).
+export const TRANSFER_EXPIRE_MS = 7 * 86400000
+
 export const SCAN_VERDICTS = Object.freeze(['clean', 'flagged', 'not_scanned'])
 
 // The allowed prior states for each target value. A move to the value the

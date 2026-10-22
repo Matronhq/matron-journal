@@ -141,7 +141,7 @@ export function transferConsentClosing(outcome, decidedBy = null) {
       : { resolution: 'decided', author: 'user', comment: `Declined by you. ${DELETED}` }
     case 'cancelled': return { resolution: 'cancelled', author: 'agent', comment: 'Cancelled by the sender before it was answered.' }
     case 'failed': return { resolution: 'cancelled', author: 'agent', comment: 'The upload failed; there is nothing to approve.' }
-    case 'expired': return { resolution: 'cancelled', author: 'agent', comment: 'Expired — no answer within 7 days.' }
+    case 'expired': return { resolution: 'cancelled', author: 'agent', comment: 'Expired after 7 days.' }
     default: return { resolution: 'cancelled', author: 'agent', comment: `Closed — ${outcome}.` }
   }
 }
