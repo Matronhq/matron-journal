@@ -676,6 +676,48 @@ CREATE TABLE IF NOT EXISTS journal_settings(
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+-- Agent-to-agent file transfers (src/transfers.js): one row per file a
+-- session sends into a room. Three axes: consent (the user's card), upload
+-- (the sender's chunks) and phase (where the file is in its life; every
+-- phase but open and released is terminal). size is the declared size,
+-- reserved against the user's transfer quota while the phase is live.
+-- scan_findings is a JSON array of {kind, line}, never the matched value.
+-- Chunk bytes live under <mediaDir>/transfers/<id>/<n>; transfer_chunks
+-- records which of them arrived whole and verified.
+CREATE TABLE IF NOT EXISTS transfers(
+  id               TEXT PRIMARY KEY,
+  user_id          INTEGER NOT NULL REFERENCES users(id),
+  room_id          TEXT NOT NULL,
+  sender_device_id INTEGER NOT NULL,
+  from_convo_id    TEXT NOT NULL,
+  name             TEXT NOT NULL,
+  size             INTEGER NOT NULL,
+  sha256           TEXT NOT NULL,
+  content_type     TEXT NOT NULL,
+  reason           TEXT NOT NULL DEFAULT '',
+  scan_verdict     TEXT NOT NULL CHECK(scan_verdict IN ('clean','flagged','not_scanned')),
+  scan_findings    TEXT NOT NULL DEFAULT '[]',
+  consent          TEXT NOT NULL DEFAULT 'awaiting_user' CHECK(consent IN ('awaiting_user','approved','declined')),
+  upload           TEXT NOT NULL DEFAULT 'uploading' CHECK(upload IN ('uploading','uploaded','failed')),
+  phase            TEXT NOT NULL DEFAULT 'open' CHECK(phase IN ('open','released','delivered','expired','cancelled','failed','declined')),
+  item_id          TEXT,
+  decided_by       TEXT,
+  decided_reason   TEXT,
+  created_at       INTEGER NOT NULL,
+  approved_at      INTEGER,
+  uploaded_at      INTEGER,
+  released_at      INTEGER,
+  delivered_at     INTEGER,
+  deleted_at       INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_transfers_user_phase ON transfers(user_id, phase);
+CREATE INDEX IF NOT EXISTS idx_transfers_room ON transfers(room_id);
+CREATE TABLE IF NOT EXISTS transfer_chunks(
+  transfer_id TEXT NOT NULL,
+  n           INTEGER NOT NULL,
+  size        INTEGER NOT NULL,
+  PRIMARY KEY(transfer_id, n)
+);
 `
 
 export function openDb(path) {
