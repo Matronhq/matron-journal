@@ -229,3 +229,11 @@ test('a link stops working once the account\'s password or address changes, by a
   const fresh = issueResetToken(db, alice.id)
   assert.equal((await resetPassword(db, fresh, 'brand-new-pw')).ok, true)
 })
+
+test('account email: parallel wrong passwords are all counted before the next is checked', async (t) => {
+  const { s, signIn } = await journal(t)
+  const bob = (await signIn('bob')).json.token
+  const r = await Promise.all(Array.from({ length: 8 }, (_, i) =>
+    s.http('/account/email', { method: 'PUT', token: bob, body: { password: `wrong-${i}`, email: 'bob@example.com' } })))
+  assert.deepEqual(r.map((x) => x.status).sort(), [401, 401, 401, 401, 401, 429, 429, 429])
+})

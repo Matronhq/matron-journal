@@ -60,7 +60,7 @@ export async function handlePasswordResetRoute(ctx, req, res, url, { rejectEarly
 // The signed-in user's own address: client devices only, and a change
 // needs the current password (an address is where a reset link goes).
 export async function handleAccountEmailRoute(ctx, req, res, url, who) {
-  const { db, mailer, loginGuard } = ctx
+  const { db, mailer, loginGuard, passwordChecks } = ctx
   if (url.pathname !== '/account/email') return false
   if (who.kind !== 'client') { json(res, 403, { error: 'forbidden' }); return true }
   if (req.method === 'GET') {
@@ -72,15 +72,17 @@ export async function handleAccountEmailRoute(ctx, req, res, url, who) {
   if (typeof password !== 'string' || !password) { json(res, 400, { error: 'bad_request' }); return true }
   const clean = email === null ? null : normaliseEmail(email)
   if (email !== null && !clean) { json(res, 400, { error: 'bad_email' }); return true }
-  const user = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId)
-  const gate = loginGuard.check(user.name)
-  if (!gate.allowed) return lockedOut(res, gate)
-  if (!(await verifyUserPassword(db, who.userId, password))) {
-    loginGuard.fail(user.name)
-    json(res, 401, { error: 'bad_password' })
-    return true
-  }
-  const r = setUserEmail(db, who.userId, clean)
+  // One check per user at a time, shared with POST /password, so parallel
+  // guesses can't all pass the lockout gate before the first is counted.
+  const r = await passwordChecks.run(who.userId, async () => {
+    const user = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId)
+    const gate = loginGuard.check(user.name)
+    if (!gate.allowed) return { gate }
+    if (!(await verifyUserPassword(db, who.userId, password))) { loginGuard.fail(user.name); return { badPassword: true } }
+    return setUserEmail(db, who.userId, clean)
+  })
+  if (r.gate) return lockedOut(res, r.gate)
+  if (r.badPassword) { json(res, 401, { error: 'bad_password' }); return true }
   if (r.conflict) { json(res, 409, { error: 'email_taken' }); return true }
   json(res, 200, { email: clean })
   return true

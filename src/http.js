@@ -349,7 +349,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         return json(res, 200, out.body)
       }
       if (await handleUsersRoute({ db, links }, req, res, url, who)) return
-      if (await handleAccountEmailRoute({ db, mailer, loginGuard }, req, res, url, who)) return
+      if (await handleAccountEmailRoute({ db, mailer, loginGuard, passwordChecks }, req, res, url, who)) return
       if (await handleTwoFactorRoute({ db, tokenBox: twoFactorBox, loginGuard }, req, res, url, who)) return
       if (req.method === 'GET' && url.pathname === '/me') {
         const user = db.prepare('SELECT id, name, is_admin FROM users WHERE id=?').get(who.userId)
