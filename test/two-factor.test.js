@@ -371,3 +371,18 @@ test('makeTwoFactorTickets.dropUser drops only that user\'s tickets', () => {
   assert.equal(tickets.get(a.ticket), null)
   assert.equal(tickets.get(b.ticket).username, 'bob')
 })
+
+test('a password reset by email drops sign-in tickets earned with the old password', async (t) => {
+  const sent = []
+  const mailer = { publicUrl: 'https://journal.example.com', async send(m) { sent.push(m) } }
+  const { s, alice, token } = await setup(t, { mailer })
+  const { secret } = await enrol(s, token)
+  s.db.prepare('UPDATE users SET email=? WHERE id=?').run('alice@example.com', alice.id)
+  const ticket = (await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'hunter22', device_name: 'phone' } })).json.two_factor_ticket
+  await s.http('/password/forgot', { method: 'POST', body: { identifier: 'alice' } })
+  await new Promise((r) => setImmediate(r))
+  const resetToken = sent[0].text.match(/#token=([A-Za-z0-9_-]+)/)[1]
+  assert.equal((await s.http('/password/reset', { method: 'POST', body: { token: resetToken, new_password: 'brand-new-pw' } })).status, 200)
+  const late = await s.http('/login/2fa', { method: 'POST', body: { ticket, code: codeFor(secret, 1) } })
+  assert.equal(late.status, 401)
+})

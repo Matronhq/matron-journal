@@ -3947,13 +3947,16 @@ mail (README: `MATRON_RESEND_API_KEY`, `MATRON_MAIL_FROM`,
   has an address it gets a link
   `<MATRON_PUBLIC_URL>/app/reset-password#token=<token>`, valid for 30
   minutes and once. The token is 32 random bytes (base64url) and only its
-  SHA-256 is stored. A newer link replaces any older unused one. At most 3
+  SHA-256 is stored. A newer link replaces any older unused one, and a link
+  stops working once the account's password or address changes by any
+  route. At most 3
   links per account per hour, whoever asks; past that the request is
   quietly not sent.
 - `POST /password/reset` (no auth) `{token, new_password}` (≥ 8) ->
   `{ok:true, signed_out}`. Sets the password, spends every link for the
   account, revokes every **client** device (`signed_out` is how many) and
-  clears the account's sign-in lockout. Agent devices stay connected; the
+  clears the account's sign-in lockout and any pending two-factor sign-in
+  ticket. Agent devices stay connected; the
   user can revoke any of them from their devices list. Two-factor still
   applies at the next sign-in. `400 invalid_token` for an unknown, used or
   expired token (one answer for all three), `400 weak_password`.

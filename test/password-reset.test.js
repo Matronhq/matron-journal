@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import { startTestServer } from './helpers.js'
-import { createUser, createAgent } from '../src/auth.js'
+import { createUser, createAgent, setPassword, login, changePassword } from '../src/auth.js'
 import { openDb } from '../src/db.js'
 import { normaliseEmail, issueResetToken, resetPassword, findResetTarget, setUserEmail, RESETS_PER_USER_HOUR, RESET_TTL_MS } from '../src/password-reset.js'
 import { makeConfiguredMailer, makeResendMailer, parsePublicUrl } from '../src/mailer.js'
@@ -209,4 +209,23 @@ test('admin: set and clear a user\'s address over HTTP; the list shows it', asyn
   const list = await s.http('/users', { token: tok })
   assert.equal(list.json.users.find((u) => u.name === 'bob').email, 'bob@example.com')
   assert.equal((await s.http(`/users/${bob.id}/email`, { method: 'PUT', token: tok, body: { email: null } })).json.user.email, null)
+})
+
+test('a link stops working once the account\'s password or address changes, by any route', async () => {
+  const db = openDb(':memory:')
+  const alice = await createUser(db, 'alice', 'hunter22')
+  setUserEmail(db, alice.id, 'alice@example.com')
+  const viaEmail = issueResetToken(db, alice.id)
+  setUserEmail(db, alice.id, 'alice@example.org')
+  assert.deepEqual(await resetPassword(db, viaEmail, 'brand-new-pw'), { ok: false }, 'new address')
+  const viaAdmin = issueResetToken(db, alice.id)
+  await setPassword(db, 'alice', 'admin-set-pw')
+  assert.deepEqual(await resetPassword(db, viaAdmin, 'brand-new-pw'), { ok: false }, 'admin reset')
+  const viaChange = issueResetToken(db, alice.id)
+  const mac = await login(db, { username: 'alice', password: 'admin-set-pw', deviceName: 'mac' })
+  assert.ok((await changePassword(db, alice.id, { oldPassword: 'admin-set-pw', newPassword: 'changed-pw-1', deviceId: mac.deviceId })).ok)
+  assert.deepEqual(await resetPassword(db, viaChange, 'brand-new-pw'), { ok: false }, 'self-service change')
+  db.prepare('DELETE FROM password_reset_sends').run() // past the hourly cap of three
+  const fresh = issueResetToken(db, alice.id)
+  assert.equal((await resetPassword(db, fresh, 'brand-new-pw')).ok, true)
 })
