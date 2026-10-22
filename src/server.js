@@ -1,4 +1,5 @@
 import http from 'node:http'
+import { makeAgentCommentLimiter } from './agent-comment-limiter.js'
 import path from 'node:path'
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -414,6 +415,7 @@ export function startServer({
   // Coordinator consent approvals per rolling 24 h (spec: 2026-09-29
   // coordinator consent); beyond it the ask stays for the user. 0 = no cap.
   consentDailyCap = resolveConsentDailyCap(process.env.MATRON_COORDINATOR_CONSENT_DAILY_CAP),
+  agentCommentClock = Date.now,
   // Approvals of the Coordinator's own routine-born asks per rolling 24 h
   // (src/consent-own-ask.js), on top of the daily cap. 0 = no cap.
   consentRoutineCap = resolveZeroableEnv('MATRON_COORDINATOR_ROUTINE_CAP', process.env.MATRON_COORDINATOR_ROUTINE_CAP, CONSENT_ROUTINE_CAP_DEFAULT),
@@ -600,6 +602,7 @@ export function startServer({
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentRoutineCap, verifier,
+    agentCommentLimiter: makeAgentCommentLimiter({ now: agentCommentClock }),
     github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser,
   }))
