@@ -26,22 +26,30 @@ const parse = (s) => { try { return JSON.parse(s) } catch { return null } }
 
 // A comment as an agent, or another person, may see it once withdrawn: who
 // wrote it and when, never what it said.
+// A tapped reply's label is what it said, too.
 export function presentWithdrawn(c) {
   if (!c || c.withdrawn_at == null) return c
-  return { ...c, body: '', attachments: [], withdrawn: true }
+  const meta = c.meta && typeof c.meta === 'object' ? { ...c.meta } : c.meta
+  if (meta) delete meta.action
+  return { ...c, body: '', attachments: [], meta, action: null, withdrawn: true }
 }
 
 // The bridge's cancel release for one of its queue cards (a `prompt_reply`
 // it published): withdraw the item reply the card held, if it held one.
+// Only the conversation's own bridge (the device that manages it, which is
+// the one that queues its turns) may do this, and only for a card it posted
+// itself: a peer agent joined to the room can publish prompts too.
 // Returns the withdrawn comment's id, or null when there was nothing to do.
-export function withdrawForQueuedCancel(db, { userId, convoId, payload, now = Date.now() }) {
+export function withdrawForQueuedCancel(db, { userId, deviceId, convoId, sender, payload, now = Date.now() }) {
   if (!payload || payload.kind !== 'queued_release' || payload.action !== 'cancel') return null
   const promptId = payload.prompt_id
   if (typeof promptId !== 'string' || !promptId) return null
+  const convo = db.prepare('SELECT agent_device_id FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)
+  if (!convo || convo.agent_device_id == null || convo.agent_device_id !== deviceId) return null
   const card = db.prepare(`SELECT seq, payload FROM events
-    WHERE user_id=? AND convo_id=? AND type='prompt' AND sender LIKE 'agent:%'
+    WHERE user_id=? AND convo_id=? AND type='prompt' AND sender=?
       AND json_extract(payload, '$.kind')='queued_release' AND json_extract(payload, '$.prompt_id')=?
-    ORDER BY seq DESC LIMIT 1`).get(userId, convoId, promptId)
+    ORDER BY seq DESC LIMIT 1`).get(userId, convoId, sender, promptId)
   if (!card) return null
   const p = parse(card.payload)
   const itemId = p?.item?.item_id
@@ -55,23 +63,47 @@ export function withdrawForQueuedCancel(db, { userId, convoId, payload, now = Da
 // the user's own replies qualify; anything else returns null untouched.
 export function withdrawComment(db, { userId, itemId, commentId, cardSeq = null, now = Date.now() }) {
   return db.transaction(() => {
-    const c = db.prepare(`SELECT c.id, c.withdrawn_at, i.origin_convo_id FROM item_comments c JOIN items i ON i.id = c.item_id
-      WHERE c.id=? AND c.item_id=? AND c.user_id=? AND c.author='user' AND c.kind='comment'`).get(commentId, itemId, userId)
+    const c = db.prepare(`SELECT id, withdrawn_at, meta FROM item_comments
+      WHERE id=? AND item_id=? AND user_id=? AND author='user' AND kind='comment'`).get(commentId, itemId, userId)
     if (!c || c.withdrawn_at != null) return null
     db.prepare('UPDATE item_comments SET withdrawn_at=? WHERE id=?').run(now, commentId)
     // The search triggers drop it too (search-docs.js); this covers a
     // database whose triggers predate the rule until they are recreated.
     db.prepare("DELETE FROM search_docs WHERE kind='comment' AND ref_id=?").run(commentId)
-    scrubEvents(db, { userId, itemId, commentId, cardSeq })
+    const chosen = undoTap(db, { itemId, meta: parse(c.meta) })
+    scrubEvents(db, { userId, itemId, commentId, cardSeq, chosen })
     return commentId
   })()
 }
 
-function scrubEvents(db, { userId, itemId, commentId, cardSeq }) {
+// A withdrawn tap was never the user's answer: the buttons it pressed go
+// back to the latest tap still standing on them, or to none. Returns
+// {action, itemChosen} for the log scrub, or null when it was not a tap.
+function undoTap(db, { itemId, meta }) {
+  const action = typeof meta?.action === 'string' ? meta.action : null
+  if (!action) return null
+  const replyTo = typeof meta.reply_to === 'string' ? meta.reply_to : null
+  const latest = db.prepare(`SELECT json_extract(meta, '$.action') AS action FROM item_comments
+    WHERE item_id=? AND author='user' AND kind='comment' AND withdrawn_at IS NULL
+      AND json_extract(meta, '$.action') IS NOT NULL
+      AND ${replyTo ? "json_extract(meta, '$.reply_to')=?" : "json_extract(meta, '$.reply_to') IS NULL"}
+    ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(...(replyTo ? [itemId, replyTo] : [itemId]))
+  const restored = latest?.action ?? null
+  if (replyTo) {
+    db.prepare('UPDATE item_comments SET chosen_action=? WHERE id=? AND item_id=? AND chosen_action IS ?').run(restored, replyTo, itemId, action)
+    return { action, itemChosen: undefined }
+  }
+  db.prepare('UPDATE items SET chosen_action=? WHERE id=? AND chosen_action IS ?').run(restored, itemId, action)
+  return { action, itemChosen: restored }
+}
+
+// Every user's log: a reply on an item a contributor filed was also copied
+// into the contributor's conversation (src/contribute-http.js).
+function scrubEvents(db, { userId, itemId, commentId, cardSeq, chosen }) {
   const update = db.prepare('UPDATE events SET payload=? WHERE user_id=? AND seq=?')
-  const markers = db.prepare(`SELECT seq, convo_id, sender, payload FROM events
-    WHERE user_id=? AND type=? AND json_extract(payload, '$.item_id')=? AND json_extract(payload, '$.comment.id')=?`)
-    .all(userId, ITEM_EVENT_TYPE, itemId, commentId)
+  const markers = db.prepare(`SELECT user_id, seq, convo_id, sender, payload FROM events
+    WHERE type=? AND json_extract(payload, '$.item_id')=? AND json_extract(payload, '$.comment.id')=?`)
+    .all(ITEM_EVENT_TYPE, itemId, commentId)
   const fallbackAfter = db.prepare(`SELECT seq, payload FROM events
     WHERE user_id=? AND convo_id=? AND sender=? AND type='text' AND seq>? AND seq<=?
       AND json_extract(payload, '$.fallback_for')='item' AND json_extract(payload, '$.item_id')=?
@@ -80,15 +112,29 @@ function scrubEvents(db, { userId, itemId, commentId, cardSeq }) {
   for (const m of markers) {
     const p = parse(m.payload)
     if (!p?.comment) continue
-    p.comment = { ...p.comment, body: '', attachments: [], withdrawn: true }
-    update.run(JSON.stringify(p), userId, m.seq)
+    p.comment = { ...p.comment, body: '', attachments: [], action: null, withdrawn: true }
+    update.run(JSON.stringify(p), m.user_id, m.seq)
     if (p.action !== 'commented') continue
-    const fb = fallbackAfter.get(userId, m.convo_id, m.sender, m.seq, m.seq + FALLBACK_WINDOW, itemId)
+    const fb = fallbackAfter.get(m.user_id, m.convo_id, m.sender, m.seq, m.seq + FALLBACK_WINDOW, itemId)
     const fp = fb && parse(fb.payload)
     if (!fp || typeof fp.body !== 'string') continue
     // Keep the heading line ("📌 Task #12 "…" — alice commented:"), drop the words.
     fp.body = `${fp.body.split('\n')[0]}\n${WITHDRAWN_NOTE}`
-    update.run(JSON.stringify(fp), userId, fb.seq)
+    update.run(JSON.stringify(fp), m.user_id, fb.seq)
+  }
+  // A withdrawn tap on the item's own buttons: the markers since it carry
+  // the item's chosen_action, which named the tap.
+  if (chosen && chosen.itemChosen !== undefined && markers.length) {
+    const since = Math.min(...markers.filter((m) => m.user_id === userId).map((m) => m.seq))
+    const later = db.prepare(`SELECT seq, payload FROM events
+      WHERE user_id=? AND type=? AND seq>=? AND json_extract(payload, '$.item_id')=? AND json_extract(payload, '$.chosen_action')=?`)
+      .all(userId, ITEM_EVENT_TYPE, since, itemId, chosen.action)
+    for (const r of later) {
+      const p = parse(r.payload)
+      if (!p) continue
+      p.chosen_action = chosen.itemChosen
+      update.run(JSON.stringify(p), userId, r.seq)
+    }
   }
   if (cardSeq != null) {
     const card = db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(userId, cardSeq)

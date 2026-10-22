@@ -2082,7 +2082,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // republished release runs it again, a no-op once it is done.
         if (msg.type === 'prompt_reply') {
           try {
-            withdrawForQueuedCancel(db, { userId: conn.userId, convoId: msg.convo_id, payload: msg.payload })
+            withdrawForQueuedCancel(db, { userId: conn.userId, deviceId: conn.deviceId, convoId: msg.convo_id, sender: publishArgs.sender, payload: msg.payload })
           } catch (err) {
             console.error('ws: withdrawing a cancelled item reply failed', err)
           }

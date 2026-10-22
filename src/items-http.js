@@ -171,7 +171,10 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
   const mirror = item.consent != null && !(userReply && replyReachesAsker(db, item))
   if (mirror) { extra = { ...extra, consent: item.consent }; fallback = false }
   const author = by == null ? (who.kind === 'agent' ? 'agent' : 'user') : by
-  const payload = itemMarkerPayload({ item, action, by: author, comment, extra })
+  // A later marker about a withdrawn reply (a transcript landing after the
+  // cancel) must not carry its words back into the log: without them the
+  // marker carries no comment at all (src/withdrawn-comments.js).
+  const payload = itemMarkerPayload({ item, action, by: author, comment: presentWithdrawn(comment), extra })
   const sender = senderOf(db, who)
   let r
   try {
@@ -685,7 +688,7 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     // announces with (emitTranscriptionMarker) — including `for_action`: the
     // item body's synthetic comment belongs to the `created` turn.
     emitMarker(ctx, who, { item: getItem(db, who.userId, item.id) ?? item, action: 'updated', comment: c, extra: { transcription: 'done', for_action: c.meta?.role === 'body' ? 'created' : 'commented' } })
-    json(res, 200, { comment: seenBy(c) })
+    json(res, 200, { comment: presentWithdrawn(seenBy(c)) })
     return true
   }
 
