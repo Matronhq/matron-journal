@@ -1,3 +1,4 @@
+import { makeAgentCommentLimiter } from './agent-comment-limiter.js'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { pipeline } from 'node:stream/promises'
@@ -112,7 +113,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, blobTranscripts = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, agentCommentLimiter = makeAgentCommentLimiter(), blobTranscripts = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null }) {
   // Two-factor sign-in (src/two-factor-http.js). The server passes its own;
   // the defaults keep a bare handler (tests) working the same way.
   const twoFactorBox = tokenBox || PLAIN_BOX
@@ -311,7 +312,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       // The tracker's own surface (src/items-http.js) — mounted first so
       // its /items* paths never collide with the chain below, and inside the
       // outer try/catch so readBody's 400/413 map like every other route's.
-      if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription, broker, spawnStartTimeoutMs, spawnWakeWaitMs }, req, res, url, who)) return
+      if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription, agentCommentLimiter, broker, spawnStartTimeoutMs, spawnWakeWaitMs }, req, res, url, who)) return
       // Ahead of the missions routes: /missions/:id/shares is its own surface.
       if (await handleSharingRoute({ db, hub, pushPipeline, waker, broker, spawnStartTimeoutMs, spawnWakeWaitMs }, req, res, url, who)) return
       if (await handlePersonRoomRoute({ db, hub, pushPipeline, waker, broker, spawnStartTimeoutMs, spawnWakeWaitMs }, req, res, url, who)) return
