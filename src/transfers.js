@@ -31,6 +31,11 @@ export const TRANSFER_STATES = Object.freeze({
 export const LIVE_PHASES = Object.freeze(['open', 'released'])
 export const isTerminalPhase = (phase) => !LIVE_PHASES.includes(phase)
 
+// How long a delivered transfer can still be downloaded again (a receiver
+// that crashed between its verify and its own write), and when retention
+// deletes the journal's copy.
+export const TRANSFER_DELIVERED_GRACE_MS = 3600000
+
 export const SCAN_VERDICTS = Object.freeze(['clean', 'flagged', 'not_scanned'])
 
 // The allowed prior states for each target value. A move to the value the

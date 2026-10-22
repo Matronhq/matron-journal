@@ -3,11 +3,17 @@
 //   PUT    /transfers/:id/chunks/:n    one chunk, header x-chunk-sha256 (the sender)
 //   GET    /transfers/:id              status and received chunks (sender or recipients)
 //   DELETE /transfers/:id              cancel (the sender)
+//   POST   /transfers/:id/complete     every chunk in, whole-file sha256 checked (the sender)
+//   GET    /transfers/:id/content      the bytes, Range-able, once released (recipients)
+//   POST   /transfers/:id/received     {sha256}: the receiver verified its copy (recipients)
+//   GET    /transfers?for=me           released, undelivered transfers for the caller (recipients)
 // Agent devices only: a client gets 403. A transfer the caller may not see
 // is 404, never 403, so its id confirms nothing. A refusal before a chunk
 // body is read closes the connection (rejectEarly), so unread bytes never
 // desync a keep-alive socket.
 import crypto from 'node:crypto'
+import fs from 'node:fs'
+import { pipeline } from 'node:stream/promises'
 import { json, readBody } from './http-body.js'
 import { sanitizePeerText } from './peer-text.js'
 import { receiveToPath } from './media.js'
@@ -15,11 +21,13 @@ import {
   TRANSFER_CHUNK_BYTES, TRANSFER_MAX_BYTES_DEFAULT, TRANSFER_USER_QUOTA_BYTES_DEFAULT, SCAN_VERDICTS,
   isTransferId, chunkCount, expectedChunkSize, transferChunkPath, createTransfer, getTransfer, recordChunk,
   receivedChunks, forgetChunks, reservedTransferBytes, recipientDevices, deleteTransferFiles, setTransferState,
-  isPersonRoom,
+  isPersonRoom, TRANSFER_DELIVERED_GRACE_MS,
 } from './transfers.js'
 import { joinedAgentIds } from './participants.js'
-import { fileTransferConsentItem, closeTransferConsentItem } from './transfer-consent.js'
+import { fileTransferConsentItem, closeTransferConsentItem, releaseIfReady, readyTransferView, humanSize } from './transfer-consent.js'
 import { nudgeCoordinator } from './consent.js'
+import { codeSpan } from './consent-items.js'
+import { appendAndBroadcast } from './journal.js'
 
 export const TRANSFER_NAME_MAX = 255
 export const TRANSFER_REASON_MAX = 1000
@@ -83,16 +91,20 @@ function isRoomMember(db, room, roomId, deviceId) {
   return room.agent_device_id === deviceId || joinedAgentIds(db, roomId).includes(deviceId)
 }
 
+const isRecipient = (db, row, deviceId) => recipientDevices(db, row.room_id, row.sender_device_id).includes(deviceId)
+
 // The row, when the caller may see it: the sender's device, or (unless
-// senderOnly) one of the room's recipient devices — always of the row's
-// own user.
-function visibleTransfer(db, who, id, { senderOnly = false } = {}) {
+// senderOnly) one of the room's recipient devices; with recipientOnly, a
+// recipient device only (in a same-device room the sender's device is one).
+// Always of the row's own user.
+function visibleTransfer(db, who, id, { senderOnly = false, recipientOnly = false } = {}) {
   if (!isTransferId(id)) return null
   const row = getTransfer(db, id)
   if (!row || row.user_id !== who.userId) return null
+  if (recipientOnly) return isRecipient(db, row, who.deviceId) ? row : null
   if (row.sender_device_id === who.deviceId) return row
   if (senderOnly) return null
-  return recipientDevices(db, row.room_id, row.sender_device_id).includes(who.deviceId) ? row : null
+  return isRecipient(db, row, who.deviceId) ? row : null
 }
 
 const statusView = (db, row, chunkBytes) => ({
@@ -186,8 +198,180 @@ function cancel(ctx, res, who, id) {
   return true
 }
 
+// Stream chunks [first, last] of a transfer in order, each read only over
+// the slice of [start, end] (inclusive, file offsets) it holds.
+async function* chunkBytes(mediaDir, row, chunkSize, start, end) {
+  for (let n = Math.floor(start / chunkSize); n * chunkSize <= end; n++) {
+    const base = n * chunkSize
+    const from = Math.max(start, base) - base
+    const to = Math.min(end, base + expectedChunkSize(row.size, n, chunkSize) - 1) - base
+    yield* fs.createReadStream(transferChunkPath(mediaDir, row.id, n), { start: from, end: to })
+  }
+}
+
+const progress = (row) => ({ id: row.id, consent: row.consent, upload: row.upload, phase: row.phase })
+
+// The whole file's sha256 over its chunks on disk, in order. → the hex
+// digest, or {missing: n} when a recorded chunk's file has gone.
+async function hashChunks(mediaDir, row, chunkSize) {
+  const h = crypto.createHash('sha256')
+  for (let n = 0; n < chunkCount(row.size, chunkSize); n++) {
+    try {
+      await pipeline(fs.createReadStream(transferChunkPath(mediaDir, row.id, n)), async (source) => {
+        for await (const b of source) h.update(b)
+      })
+    } catch (e) {
+      if (e.code === 'ENOENT') return { missing: n }
+      throw e
+    }
+  }
+  return h.digest('hex')
+}
+
+// The upload failed its whole-file check: end the transfer, delete its
+// bytes, close the card and tell the sender. → false when something else
+// ended it first.
+function failUpload(ctx, row) {
+  const { db, hub, mediaDir } = ctx
+  if (!setTransferState(db, row.id, { upload: 'failed', phase: 'failed', deleted_at: Date.now() })) return false
+  deleteTransferFiles(mediaDir, row.id)
+  forgetChunks(db, row.id)
+  closeTransferConsentItem(ctx, row.id, { outcome: 'failed' })
+  hub.sendToDevice(row.user_id, row.sender_device_id, { kind: 'transfer', event: 'failed', transfer_id: row.id, reason: 'sha256_mismatch' })
+  console.log(`journal: transfer failed id=${row.id} reason=sha256_mismatch`)
+  return true
+}
+
+async function completeUpload(ctx, res, who, id) {
+  const { db, mediaDir, chunkBytes: chunkSize } = ctx
+  const row = visibleTransfer(db, who, id, { senderOnly: true })
+  if (!row) return notFound(res)
+  if (row.upload === 'uploaded' && row.phase !== 'failed') { json(res, 200, progress(row)); return true }
+  if (!writable(row)) { json(res, 409, { error: 'closed' }); return true }
+  const have = new Set(receivedChunks(db, id))
+  const missing = []
+  for (let n = 0; n < chunkCount(row.size, chunkSize); n++) if (!have.has(n)) missing.push(n)
+  if (missing.length) { json(res, 409, { error: 'missing_chunks', missing }); return true }
+  const digest = await hashChunks(mediaDir, row, chunkSize)
+  // The hash took a while: re-read the row before acting on it.
+  const now = getTransfer(db, id)
+  if (now.upload === 'uploaded' && now.phase !== 'failed') { json(res, 200, progress(now)); return true }
+  if (!writable(now)) { json(res, 409, { error: 'closed' }); return true }
+  if (typeof digest === 'object') {
+    db.prepare('DELETE FROM transfer_chunks WHERE transfer_id=? AND n=?').run(id, digest.missing)
+    json(res, 409, { error: 'missing_chunks', missing: [digest.missing] })
+    return true
+  }
+  if (digest !== row.sha256) {
+    if (!failUpload(ctx, now)) { json(res, 409, { error: 'closed' }); return true }
+    json(res, 422, { error: 'sha256_mismatch' })
+    return true
+  }
+  if (setTransferState(db, id, { upload: 'uploaded', uploaded_at: Date.now() })) {
+    console.log(`journal: transfer uploaded id=${id}`)
+    releaseIfReady(ctx, id)
+  }
+  json(res, 200, progress(getTransfer(db, id)))
+  return true
+}
+
+// Downloadable: released, or delivered less than the grace period ago.
+const downloadable = (row, now = Date.now()) => row.phase === 'released'
+  || (row.phase === 'delivered' && row.delivered_at != null && now - row.delivered_at < TRANSFER_DELIVERED_GRACE_MS)
+
+// `bytes=a-` or `bytes=a-b` → {start, end} (inclusive, end clamped to the
+// file), null for no Range header, or 'bad' for any other form or a start
+// past the end.
+function parseRange(header, size) {
+  if (header === undefined) return null
+  const m = /^bytes=(\d{1,15})-(\d{0,15})$/.exec(String(header).trim())
+  if (!m) return 'bad'
+  const start = Number(m[1])
+  const end = m[2] === '' ? size - 1 : Math.min(Number(m[2]), size - 1)
+  if (start >= size || end < start) return 'bad'
+  return { start, end }
+}
+
+// The stored content type when it is a plain ASCII header value, else
+// octet-stream (a peer-chosen type may carry characters no header takes).
+const headerSafe = (type) => (/^[\x20-\x7e]+$/.test(type) ? type : 'application/octet-stream')
+
+async function content(ctx, req, res, who, id) {
+  const { db, mediaDir, chunkBytes: chunkSize } = ctx
+  const row = visibleTransfer(db, who, id, { recipientOnly: true })
+  if (!row || !downloadable(row)) return notFound(res)
+  const range = parseRange(req.headers.range, row.size)
+  if (range === 'bad') {
+    res.writeHead(416, { 'content-range': `bytes */${row.size}`, 'content-length': '0' })
+    res.end()
+    return true
+  }
+  const { start, end } = range ?? { start: 0, end: row.size - 1 }
+  // Every chunk the range touches must be on disk at its exact size; a
+  // short or missing one is a clean 500, not a truncated 200.
+  for (let n = Math.floor(start / chunkSize); n * chunkSize <= end; n++) {
+    let size = -1
+    try { size = fs.statSync(transferChunkPath(mediaDir, id, n)).size } catch { /* missing */ }
+    if (size !== expectedChunkSize(row.size, n, chunkSize)) {
+      console.error(`transfer: ${id} chunk ${n} is missing or the wrong size on disk`)
+      json(res, 500, { error: 'internal' })
+      return true
+    }
+  }
+  res.writeHead(range ? 206 : 200, {
+    'content-type': headerSafe(row.content_type),
+    'content-length': String(end - start + 1),
+    ...(range ? { 'content-range': `bytes ${start}-${end}/${row.size}` } : {}),
+    'accept-ranges': 'bytes',
+    'cache-control': 'private, no-store',
+    // The content type is sender-chosen: never sniffed, never rendered.
+    'x-content-type-options': 'nosniff',
+    'content-disposition': 'attachment',
+  })
+  // pipeline, so a client abort mid-body closes the open chunk's fd.
+  await pipeline(chunkBytes(mediaDir, row, chunkSize, start, end), res).catch(() => {})
+  return true
+}
+
+async function receipt(ctx, req, res, who, id) {
+  const { db, hub } = ctx
+  const row = visibleTransfer(db, who, id, { recipientOnly: true })
+  if (!row) return notFound(res)
+  const { sha256 } = await readBody(req)
+  if (typeof sha256 !== 'string' || sha256.toLowerCase() !== row.sha256) return bad(res)
+  if (row.phase === 'delivered') { json(res, 200, progress(row)); return true }
+  if (row.phase !== 'released') { json(res, 409, { error: 'closed' }); return true }
+  if (!setTransferState(db, id, { phase: 'delivered', delivered_at: Date.now() })) {
+    const now = getTransfer(db, id)
+    if (now.phase === 'delivered') { json(res, 200, progress(now)); return true }
+    json(res, 409, { error: 'closed' })
+    return true
+  }
+  hub.sendToDevice(row.user_id, row.sender_device_id, { kind: 'transfer', event: 'delivered', transfer_id: id })
+  try {
+    appendAndBroadcast(db, hub, {
+      userId: row.user_id, convoId: row.room_id, sender: 'journal', type: 'text',
+      payload: { body: `Delivered ${codeSpan(row.name)} (${humanSize(row.size)}), sha256 verified.` },
+    })
+  } catch (err) {
+    console.error(`transfer: delivered notice for ${id} failed (the receipt stands)`, err)
+  }
+  console.log(`journal: transfer delivered id=${id} device=${who.deviceId}`)
+  json(res, 200, progress(getTransfer(db, id)))
+  return true
+}
+
+// The bridge's catch-up on hello: every released, undelivered transfer of
+// the caller's user that the caller's device is a recipient of.
+function readyForMe(ctx, res, who) {
+  const { db } = ctx
+  const rows = db.prepare("SELECT * FROM transfers WHERE user_id=? AND phase='released' ORDER BY created_at, id").all(who.userId)
+  json(res, 200, { transfers: rows.filter((r) => isRecipient(db, r, who.deviceId)).map((r) => readyTransferView(db, r)) })
+  return true
+}
+
 export async function handleTransferRoute(ctx, req, res, url, who, { rejectEarly }) {
-  const m = url.pathname.match(/^\/transfers(?:\/([^/]+)(?:\/chunks\/([^/]+))?)?$/)
+  const m = url.pathname.match(/^\/transfers(?:\/([^/]+)(?:\/chunks\/([^/]+)|\/(complete|content|received))?)?$/)
   if (!m) return false
   const full = {
     ...ctx,
@@ -195,9 +379,14 @@ export async function handleTransferRoute(ctx, req, res, url, who, { rejectEarly
     transferUserQuotaBytes: ctx.transferUserQuotaBytes ?? TRANSFER_USER_QUOTA_BYTES_DEFAULT,
     chunkBytes: ctx.transferChunkBytes ?? TRANSFER_CHUNK_BYTES,
   }
-  const [, id, n] = m
+  const [, id, n, sub] = m
   if (who.kind !== 'agent') { rejectEarly(req, res, 403, { error: 'forbidden' }); return true }
   if (!id && req.method === 'POST') return create(full, req, res, who)
+  if (!id && req.method === 'GET') return url.searchParams.get('for') === 'me' ? readyForMe(full, res, who) : bad(res)
+  if (sub === 'complete' && req.method === 'POST') return completeUpload(full, res, who, id)
+  if (sub === 'content' && req.method === 'GET') return content(full, req, res, who, id)
+  if (sub === 'received' && req.method === 'POST') return receipt(full, req, res, who, id)
+  if (sub) return false
   if (id && n !== undefined && req.method === 'PUT') return putChunk(full, req, res, who, id, n, rejectEarly)
   if (id && n === undefined && req.method === 'GET') {
     const row = visibleTransfer(full.db, who, id)

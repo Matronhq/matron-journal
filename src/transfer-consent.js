@@ -16,6 +16,7 @@ import { sanitizePeerText, PEER_NAME_CAP, plainText as plain } from './peer-text
 import { appendAndBroadcast } from './journal.js'
 import { participantConvoIds } from './participants.js'
 import { recordAndAnnounce } from './consent-answer.js'
+import { wakeIfOffline } from './wake.js'
 import { getTransfer, setTransferState, deleteTransferFiles, forgetChunks, recipientDevices, isTransferId, parseFindings } from './transfers.js'
 
 export const TRANSFER_ACTIONS = Object.freeze(['Approve', 'Decline'])
@@ -170,10 +171,42 @@ export function closeTransferConsentItem({ db, hub }, id, { outcome, decidedBy =
   }
 }
 
-// Task 3 fills this: release the file to the room once it is both approved
-// and fully uploaded, exactly once.
-export function releaseIfReady(_ctx, _id) {
-  return false
+// What a recipient bridge needs to fetch and file a released transfer: the
+// `ready` frame's `transfer` and each row of GET /transfers?for=me.
+export function readyTransferView(db, row) {
+  return {
+    id: row.id, room_id: row.room_id, name: row.name, size: row.size, sha256: row.sha256, content_type: row.content_type,
+    from_name: name(db.prepare('SELECT name FROM devices WHERE id=?').get(row.sender_device_id)?.name), from_convo_id: row.from_convo_id,
+  }
+}
+
+// Release the file to the room once it is both approved and fully
+// uploaded. Called after each of the two (whichever comes second does it);
+// the guarded open -> released move picks a single winner, so a repeat or
+// racing call writes nothing. The room gets a durable `file` event in the
+// journal's voice (no blob: the bytes are fetched by transfer_id), and
+// every recipient device a `ready` frame; a box that is asleep is woken,
+// and its bridge catches up on hello (GET /transfers?for=me). → true when
+// this call released it.
+export function releaseIfReady({ db, hub, waker = null }, id) {
+  const row = getTransfer(db, id)
+  if (!row || row.consent !== 'approved' || row.upload !== 'uploaded' || row.phase !== 'open') return false
+  if (!setTransferState(db, id, { phase: 'released', released_at: Date.now() })) return false
+  const view = readyTransferView(db, row)
+  try {
+    appendAndBroadcast(db, hub, {
+      userId: row.user_id, convoId: row.room_id, sender: 'journal', type: 'file',
+      payload: { name: view.name, size: view.size, sha256: view.sha256, content_type: view.content_type, transfer_id: id, from_name: view.from_name, from_convo_id: view.from_convo_id },
+    })
+  } catch (err) {
+    console.error(`transfer: room file event for ${id} failed (the release stands)`, err)
+  }
+  for (const deviceId of recipientDevices(db, row.room_id, row.sender_device_id)) {
+    hub.sendToDevice(row.user_id, deviceId, { kind: 'transfer', event: 'ready', transfer: view })
+    wakeIfOffline({ db, hub, waker }, row.user_id, deviceId)
+  }
+  console.log(`journal: transfer released id=${id} room=${row.room_id}`)
+  return true
 }
 
 const awaiting = (row) => row.consent === 'awaiting_user' && row.phase === 'open'
@@ -203,7 +236,7 @@ export function answerTransferAsk(ctx, { userId, transferId, decision, decidedBy
     const reason = decidedBy?.kind === 'coordinator' ? `Declined by the Coordinator: ${decidedBy.reason}` : 'Declined by the user.'
     hub.sendToDevice(userId, row.sender_device_id, { kind: 'transfer', event: 'declined', transfer_id: transferId, reason })
     try {
-      appendAndBroadcast(db, hub, { userId, convoId: row.room_id, sender: 'journal', type: 'text', payload: { body: `File "${row.name}" was declined; nothing was delivered.` } })
+      appendAndBroadcast(db, hub, { userId, convoId: row.room_id, sender: 'journal', type: 'text', payload: { body: `File ${codeSpan(row.name)} was declined; nothing was delivered.` } })
     } catch (err) {
       console.error('transfer consent: room notice failed (the decline stands)', err)
     }
