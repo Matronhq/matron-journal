@@ -449,7 +449,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
             oldPassword: old_password, newPassword: new_password,
             deviceId: who.deviceId, signOutOthers: sign_out_others === true,
           })
-          if (out.ok) loginGuard.ok(user.name)
+          if (out.ok) { loginGuard.ok(user.name); signInTickets.dropUser(who.userId) }
           else if (!out.revoked) loginGuard.fail(user.name)
           return out
         })
