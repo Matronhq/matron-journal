@@ -1,7 +1,7 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { pipeline } from 'node:stream/promises'
-import { checkPassword, makeRateLimiter, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
+import { checkPassword, makeRateLimiter, makeKeyedQueue, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice, deviceStatuses } from './db.js'
 import { receiveBlob } from './media.js'
@@ -118,6 +118,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
   const twoFactorBox = tokenBox || PLAIN_BOX
   const signInTickets = tickets || makeTwoFactorTickets()
   const codeLimiter = twoFactorLimiter || makeRateLimiter({ max: 10 })
+  const passwordChecks = makeKeyedQueue()
   // Alertmanager webhook (src/alerts-http.js): built once so its in-flight
   // bound is per process. Off (declines every request) without config.
   const handleAlerts = makeAlertsHandler({
@@ -438,19 +439,26 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         if (typeof new_password !== 'string' || new_password.length < 8) return json(res, 400, { error: 'weak_password' })
         // Wrong current passwords count against the username's lockout like a
         // sign-in, so a stolen device token cannot grind the password here.
-        const user = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId)
-        const gate = loginGuard.check(user.name)
-        if (!gate.allowed) {
-          const retryAfter = Math.ceil(gate.retryAfterMs / 1000)
-          res.setHeader('Retry-After', retryAfter)
-          return json(res, 429, { error: 'locked_out', retry_after: retryAfter })
-        }
-        const r = await changePassword(db, who.userId, {
-          oldPassword: old_password, newPassword: new_password,
-          signOutFrom: sign_out_others ? who.deviceId : null,
+        // One check per user at a time: parallel guesses would otherwise all
+        // pass the gate before the first failure is counted.
+        const r = await passwordChecks.run(who.userId, async () => {
+          const user = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId)
+          const gate = loginGuard.check(user.name)
+          if (!gate.allowed) return { locked: Math.ceil(gate.retryAfterMs / 1000) }
+          const out = await changePassword(db, who.userId, {
+            oldPassword: old_password, newPassword: new_password,
+            deviceId: who.deviceId, signOutOthers: sign_out_others === true,
+          })
+          if (out.ok) loginGuard.ok(user.name)
+          else if (!out.revoked) loginGuard.fail(user.name)
+          return out
         })
-        if (!r.ok) { loginGuard.fail(user.name); return json(res, 401, { error: 'bad_password' }) }
-        loginGuard.ok(user.name)
+        if (r.locked) {
+          res.setHeader('Retry-After', r.locked)
+          return json(res, 429, { error: 'locked_out', retry_after: r.locked })
+        }
+        if (r.revoked) return json(res, 401, { error: 'unauthenticated' })
+        if (!r.ok) return json(res, 401, { error: 'bad_password' })
         return json(res, 200, { ok: true, signed_out: r.signedOut })
       }
       if (req.method === 'GET' && url.pathname === '/devices') {

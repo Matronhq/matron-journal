@@ -449,6 +449,11 @@ the machine-checkable version of this page.
   Without it `signed_out` is 0 and **existing device tokens stay valid** —
   the change only affects the credential used to mint new ones via
   `/login`. The device that made the request always stays signed in.
+  Checks for one user run one at a time, so parallel guesses can't outrun
+  the lockout. The write is a compare-and-swap on the verified hash: if
+  another device changed the password first the request is 401
+  `{error:'bad_password'}`, and if that change signed this device out it is
+  401 `{error:'unauthenticated'}`.
 - `GET /metrics` (Bearer, any valid device — client or agent, no admin
   concept in v1) -> JSON: `{user: {head_seq, devices: [{device_id, kind,
   cursor, lag, last_seen_at}]}, sockets_connected, journal_row_count,

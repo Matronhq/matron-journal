@@ -25,11 +25,16 @@ export async function setPassword(db, name, password) {
 // against), so no dummy-hash path is needed. Returns {ok:false} on a bad
 // old password rather than throwing, so http.js can map it to 401 cleanly.
 //
-// signOutFrom: the calling device's id to sign every OTHER client device of
-// the user out (their rows deleted, as POST /devices/:id/revoke does), or
-// null to leave them signed in. Agent devices are never touched: a bridge
+// signOutOthers: sign every OTHER client device of the user out (their rows
+// deleted, as POST /devices/:id/revoke does). Agent devices are never touched: a bridge
 // never held the password, so changing it is no reason to cut off a box.
-export async function changePassword(db, userId, { oldPassword, newPassword, signOutFrom = null }) {
+//
+// deviceId: the calling device. The write is a compare-and-swap on the hash
+// that was verified, and needs that device to still exist: the hashing
+// awaits leave room for another device to change the password (and sign
+// this one out) first, and a stale check must not then overwrite it.
+// { ok:false, revoked:true } means the caller was signed out meanwhile.
+export async function changePassword(db, userId, { oldPassword, newPassword, deviceId, signOutOthers = false }) {
   const user = db.prepare('SELECT password_hash FROM users WHERE id=?').get(userId)
   // Defensive only: Bearer auth (authToken) already guarantees a devices row
   // whose user_id references a real users row — this should be unreachable.
@@ -37,14 +42,15 @@ export async function changePassword(db, userId, { oldPassword, newPassword, sig
   const verified = await argon2.verify(user.password_hash, oldPassword)
   if (!verified) return { ok: false }
   const hash = await argon2.hash(newPassword, { type: argon2.argon2id })
-  let signedOut = 0
-  db.transaction(() => {
-    db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hash, userId)
-    if (signOutFrom != null) {
-      signedOut = db.prepare("DELETE FROM devices WHERE user_id=? AND kind='client' AND id<>?").run(userId, signOutFrom).changes
-    }
+  return db.transaction(() => {
+    if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(deviceId, userId)) return { ok: false, revoked: true }
+    const swapped = db.prepare('UPDATE users SET password_hash=? WHERE id=? AND password_hash=?').run(hash, userId, user.password_hash).changes
+    if (!swapped) return { ok: false }
+    const signedOut = signOutOthers
+      ? db.prepare("DELETE FROM devices WHERE user_id=? AND kind='client' AND id<>?").run(userId, deviceId).changes
+      : 0
+    return { ok: true, signedOut }
   })()
-  return { ok: true, signedOut }
 }
 
 function issueDevice(db, userId, kind, name, tagChar = null) {
@@ -234,6 +240,23 @@ export function makeRateLimiter({ max = 5, windowMs = 60000 } = {}) {
     blocked(key) {
       const now = Date.now()
       return (hits.get(key) || []).filter((t) => now - t < windowMs).length >= max
+    },
+  }
+}
+
+// Runs async jobs one at a time per key, in arrival order (POST /password's
+// per-user check, so the lockout counts every guess before the next one).
+// The map only holds keys with a job pending.
+export function makeKeyedQueue() {
+  const tails = new Map()
+  return {
+    run(key, job) {
+      const prev = tails.get(key) || Promise.resolve()
+      const result = prev.then(job, job)
+      const tail = result.catch(() => {})
+      tails.set(key, tail)
+      tail.then(() => { if (tails.get(key) === tail) tails.delete(key) })
+      return result
     },
   }
 }

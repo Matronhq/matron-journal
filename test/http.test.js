@@ -329,6 +329,35 @@ test('POST /password: wrong current passwords count against the username lockout
   assert.equal(login.status, 429, 'the lockout is the same one sign-in uses')
 })
 
+test('POST /password: parallel wrong guesses are all counted before the next is checked', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'alice', 'hunter22')
+  const token = (await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'hunter22', device_name: 'mac' } })).json.token
+  const guesses = await Promise.all(Array.from({ length: 8 }, (_, i) =>
+    s.http('/password', { method: 'POST', token, body: { old_password: `wrong-${i}`, new_password: 'newlongpw1' } })))
+  const statuses = guesses.map((r) => r.status).sort()
+  assert.deepEqual(statuses, [401, 401, 401, 401, 401, 429, 429, 429], 'only the lockout threshold of guesses is ever checked')
+})
+
+test('POST /password: two devices changing at once with sign-out — one wins, the other is refused', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'alice', 'hunter22')
+  const signIn = async (device_name) =>
+    (await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'hunter22', device_name } })).json.token
+  const mac = await signIn('mac')
+  const phone = await signIn('phone')
+  const [a, b] = await Promise.all([
+    s.http('/password', { method: 'POST', token: mac, body: { old_password: 'hunter22', new_password: 'mac-new-pw-1', sign_out_others: true } }),
+    s.http('/password', { method: 'POST', token: phone, body: { old_password: 'hunter22', new_password: 'phone-new-pw', sign_out_others: true } }),
+  ])
+  assert.deepEqual([a.status, b.status].sort(), [200, 401])
+  const winner = a.status === 200 ? 'mac-new-pw-1' : 'phone-new-pw'
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: winner, device_name: 'x' } })
+  assert.equal(login.status, 200, "the winner's password is the one that stuck")
+})
+
 test('POST /password: happy path, all three rejects, agent 403, and the old device token stays valid after change', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())
