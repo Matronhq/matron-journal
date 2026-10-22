@@ -432,12 +432,26 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // Self-service change, client devices only — an agent (the bridge)
         // never holds/knows a user's password.
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
-        const { old_password, new_password } = await readBody(req)
+        const { old_password, new_password, sign_out_others } = await readBody(req)
         if (typeof old_password !== 'string' || !old_password) return json(res, 400, { error: 'bad_request' })
+        if (sign_out_others !== undefined && typeof sign_out_others !== 'boolean') return json(res, 400, { error: 'bad_request' })
         if (typeof new_password !== 'string' || new_password.length < 8) return json(res, 400, { error: 'weak_password' })
-        const r = await changePassword(db, who.userId, { oldPassword: old_password, newPassword: new_password })
-        if (!r.ok) return json(res, 401, { error: 'bad_password' })
-        return json(res, 200, { ok: true })
+        // Wrong current passwords count against the username's lockout like a
+        // sign-in, so a stolen device token cannot grind the password here.
+        const user = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId)
+        const gate = loginGuard.check(user.name)
+        if (!gate.allowed) {
+          const retryAfter = Math.ceil(gate.retryAfterMs / 1000)
+          res.setHeader('Retry-After', retryAfter)
+          return json(res, 429, { error: 'locked_out', retry_after: retryAfter })
+        }
+        const r = await changePassword(db, who.userId, {
+          oldPassword: old_password, newPassword: new_password,
+          signOutFrom: sign_out_others ? who.deviceId : null,
+        })
+        if (!r.ok) { loginGuard.fail(user.name); return json(res, 401, { error: 'bad_password' }) }
+        loginGuard.ok(user.name)
+        return json(res, 200, { ok: true, signed_out: r.signedOut })
       }
       if (req.method === 'GET' && url.pathname === '/devices') {
         // Management surface: client devices only, same gating as /password —

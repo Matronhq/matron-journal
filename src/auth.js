@@ -24,7 +24,12 @@ export async function setPassword(db, name, password) {
 // with a valid device token has a real password_hash row to verify
 // against), so no dummy-hash path is needed. Returns {ok:false} on a bad
 // old password rather than throwing, so http.js can map it to 401 cleanly.
-export async function changePassword(db, userId, { oldPassword, newPassword }) {
+//
+// signOutFrom: the calling device's id to sign every OTHER client device of
+// the user out (their rows deleted, as POST /devices/:id/revoke does), or
+// null to leave them signed in. Agent devices are never touched: a bridge
+// never held the password, so changing it is no reason to cut off a box.
+export async function changePassword(db, userId, { oldPassword, newPassword, signOutFrom = null }) {
   const user = db.prepare('SELECT password_hash FROM users WHERE id=?').get(userId)
   // Defensive only: Bearer auth (authToken) already guarantees a devices row
   // whose user_id references a real users row — this should be unreachable.
@@ -32,8 +37,14 @@ export async function changePassword(db, userId, { oldPassword, newPassword }) {
   const verified = await argon2.verify(user.password_hash, oldPassword)
   if (!verified) return { ok: false }
   const hash = await argon2.hash(newPassword, { type: argon2.argon2id })
-  db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hash, userId)
-  return { ok: true }
+  let signedOut = 0
+  db.transaction(() => {
+    db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hash, userId)
+    if (signOutFrom != null) {
+      signedOut = db.prepare("DELETE FROM devices WHERE user_id=? AND kind='client' AND id<>?").run(userId, signOutFrom).changes
+    }
+  })()
+  return { ok: true, signedOut }
 }
 
 function issueDevice(db, userId, kind, name, tagChar = null) {

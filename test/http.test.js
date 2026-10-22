@@ -287,6 +287,48 @@ test('POST /push/register: client devices can register/unregister an apns token;
   assert.equal(noAuth.status, 401)
 })
 
+test('POST /password sign_out_others: other client devices are signed out, the caller and agents stay', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const alice = await createUser(s.db, 'alice', 'hunter22')
+  const bob = await createUser(s.db, 'bob', 'hunter22')
+  const signIn = async (username, device_name) =>
+    (await s.http('/login', { method: 'POST', body: { username, password: 'hunter22', device_name } })).json.token
+  const mac = await signIn('alice', 'mac')
+  const phone = await signIn('alice', 'phone')
+  const bobPhone = await signIn('bob', 'phone')
+  const box = createAgent(s.db, alice.id, 'box-a')
+
+  const bad = await s.http('/password', { method: 'POST', token: mac, body: { old_password: 'hunter22', new_password: 'newlongpw1', sign_out_others: 'yes' } })
+  assert.equal(bad.status, 400)
+  assert.deepEqual(bad.json, { error: 'bad_request' })
+
+  const ok = await s.http('/password', { method: 'POST', token: mac, body: { old_password: 'hunter22', new_password: 'newlongpw1', sign_out_others: true } })
+  assert.equal(ok.status, 200)
+  assert.deepEqual(ok.json, { ok: true, signed_out: 1 })
+
+  assert.equal((await s.http('/snapshot', { token: mac })).status, 200, 'the device that changed it stays signed in')
+  assert.equal((await s.http('/snapshot', { token: phone })).status, 401, 'the other client device is signed out')
+  assert.equal((await s.http('/snapshot', { token: box.token })).status, 200, 'agent devices are untouched')
+  assert.equal((await s.http('/snapshot', { token: bobPhone })).status, 200, 'another user is untouched')
+})
+
+test('POST /password: wrong current passwords count against the username lockout', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  await createUser(s.db, 'alice', 'hunter22')
+  const token = (await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'hunter22', device_name: 'mac' } })).json.token
+  for (let i = 0; i < 5; i++) { // makeLoginGuard's default threshold
+    const r = await s.http('/password', { method: 'POST', token, body: { old_password: 'wrong-one', new_password: 'newlongpw1' } })
+    assert.equal(r.status, 401)
+  }
+  const locked = await s.http('/password', { method: 'POST', token, body: { old_password: 'hunter22', new_password: 'newlongpw1' } })
+  assert.equal(locked.status, 429, 'even the right password is refused while locked')
+  assert.equal(locked.json.error, 'locked_out')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'hunter22', device_name: 'x' } })
+  assert.equal(login.status, 429, 'the lockout is the same one sign-in uses')
+})
+
 test('POST /password: happy path, all three rejects, agent 403, and the old device token stays valid after change', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())
@@ -329,7 +371,7 @@ test('POST /password: happy path, all three rejects, agent 403, and the old devi
   // happy path
   const ok = await s.http('/password', { method: 'POST', token, body: { old_password: 'hunter22', new_password: 'newlongpw1' } })
   assert.equal(ok.status, 200)
-  assert.deepEqual(ok.json, { ok: true })
+  assert.deepEqual(ok.json, { ok: true, signed_out: 0 })
 
   // the old password no longer logs in, the new one does
   const oldFails = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'hunter22', device_name: 'x' } })
