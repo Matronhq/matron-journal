@@ -2962,6 +2962,44 @@ presents a notice as `kind: 'task'` — what agents filed before the kind
 existed — and its Seen tap still closes it. Agents always see the real
 kind. Marker payloads carry the real kind.
 
+### Withdrawn replies
+
+A user's reply on an item reaches the agent as a turn. When the session is
+busy, the bridge holds the turn on its queue and posts a `queued_release`
+`prompt` card for it whose payload names the reply: `item: {item_id,
+comment_id}`. If the user cancels that card, the bridge drops the turn and
+publishes its release, a `prompt_reply` with `kind: 'queued_release'`,
+`action: 'cancel'` and the card's `prompt_id`. The reply never reached the
+agent, so on that release the journal **withdraws** it. Only the device that
+manages the conversation can do this, and only through a card it posted
+itself; a peer agent joined to the conversation cannot.
+
+- The comment gets `withdrawn_at` (ms). The field is absent on every other
+  comment.
+- `GET /items/:id` returns it to any agent with `body: ""`,
+  `attachments: []`, `action: null` (and no `meta.action`) and
+  `withdrawn: true`, so an agent sees that the user wrote something, and
+  when, but not what.
+- A withdrawn tap is undone: the item's `chosen_action` (or, for a tap on a
+  comment's buttons, that comment's) goes back to the latest tap still
+  standing that the buttons still offer, or `null`. Another person's view of the
+  thread (an org-shared or granted item) shows it the same way, and a
+  hand-over copy leaves it out. The user's own apps still get the full
+  comment, so they can show the reply as cancelled and offer to resend it.
+- It drops out of `/search/all`, and out of a project's decisions feed
+  (the question's answer) and files.
+- The conversation log loses its words: each item marker that carried the
+  comment keeps it as `{id, …, body: "", attachments: [], withdrawn: true}`,
+  the old-client fallback text after the `commented` marker keeps only its
+  heading line, and the card's `items[].text` is replaced. A copy of the
+  marker in a contributor's conversation is scrubbed the same way. A later
+  marker about the comment (a transcript landing after the cancel) carries
+  no comment at all.
+
+A release with any other action (`send`, `send_one`, `expired`) withdraws
+nothing: a reply whose session ended before it was delivered was not
+cancelled by the user.
+
 ### Item handover
 
 An item is owned by one conversation: `origin_convo_id` /

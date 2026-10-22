@@ -1203,6 +1203,13 @@ export function openDb(path) {
   if (!commentActionCols.some((c) => c.name === 'convo_id')) {
     db.exec('ALTER TABLE item_comments ADD COLUMN convo_id TEXT')
   }
+  // Withdrawn replies (src/withdrawn-comments.js): when the user cancelled a
+  // reply while it waited on a busy session's queue, so it never reached the
+  // agent. The row stays for the user; agents and search no longer see its
+  // words. NULL = never withdrawn.
+  if (!commentActionCols.some((c) => c.name === 'withdrawn_at')) {
+    db.exec('ALTER TABLE item_comments ADD COLUMN withdrawn_at INTEGER')
+  }
   // Notice items (mission: For you): kind 'notice' widens the items CHECK.
   // SQLite cannot ALTER a CHECK, so a database from before it is rebuilt once
   // from its OWN stored definition (every column added by the ALTERs above
