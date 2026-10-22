@@ -6,6 +6,7 @@ import { randomBytes } from 'node:crypto'
 import { sharedConvoSql, grantedMissionSql } from './visibility.js'
 import { blobImageDims, isPrivateDevice } from './db.js'
 import { yieldTurn } from './background.js'
+import { presentWithdrawn } from './withdrawn-comments.js'
 
 export const ITEM_KINDS = ['task', 'question', 'decision', 'notice']
 // A notice (mission: For you) is something the user needs to read but not
@@ -243,7 +244,7 @@ export function requestTurn(db, itemId, now = Date.now()) {
 // reader may not learn them (hidePrivateAuthors, listSharedComments).
 export function rowToComment(row) {
   if (!row) return null
-  const { attachments, meta, actions, idem_key: _idemKey, user_id: _userId, ...rest } = row
+  const { attachments, meta, actions, idem_key: _idemKey, user_id: _userId, withdrawn_at: withdrawnAt, ...rest } = row
   const agent = rest.author === 'agent'
   rest.device_name = agent ? rest.device_name ?? null : null
   rest.convo_id = agent ? rest.convo_id ?? null : null
@@ -259,6 +260,10 @@ export function rowToComment(row) {
   // `contributor` {name, via}: written by a contributor to the item's
   // mission (src/contribute.js). Absent otherwise, like attribution.
   if (m?.contributor && typeof m.contributor.name === 'string') attribution.contributor = { name: m.contributor.name, via: m.contributor.via === 'user' ? 'user' : 'agent' }
+  // `withdrawn_at`: when the user cancelled this reply before it reached the
+  // agent (src/withdrawn-comments.js). Absent on every other comment, like
+  // attribution.
+  if (withdrawnAt != null) attribution.withdrawn_at = withdrawnAt
   return {
     ...rest, attachments: parseJson(attachments, []), meta: m, action, reply_to: replyTo, ...attribution,
     actions: parseJson(actions ?? '[]', []), chosen_action: rest.chosen_action ?? null,
@@ -677,10 +682,11 @@ export function listGrantedComments(db, itemId) {
 
 // Another person's view of a thread: the handover lines (src/item-handover.js)
 // are dropped — they name the user's conversations and boxes — and so are
-// the author's box and conversation on every comment.
+// the author's box and conversation on every comment. A reply the user
+// withdrew (src/withdrawn-comments.js) shows without its words.
 export function listSharedComments(db, itemId) {
   return listComments(db, itemId).filter((c) => !c.meta?.handover)
-    .map((c) => ({ ...c, device_name: null, convo_id: null, convo_title: null }))
+    .map((c) => presentWithdrawn({ ...c, device_name: null, convo_id: null, convo_title: null }))
 }
 
 export function listSharedItems(db, viewerUserId, { kind = null, state = null, awaiting = null, limit = 100, cursor = null } = {}) {

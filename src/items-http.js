@@ -23,6 +23,7 @@ import { handleConsentTap, isSharingMirror } from './sharing-http.js'
 import { handlePeopleRoomTap, isPeopleRoomMirror } from './person-rooms-http.js'
 import { notifyGrantees } from './sharing-events.js'
 import { inlineRefsToText, knowsInlineRefs, strayInlineRef } from './inline-refs.js'
+import { presentWithdrawn } from './withdrawn-comments.js'
 import { handleHandoverRoute, approvalQuestionOf, handleApprovalTap, withdrawOnClose } from './item-handover-http.js'
 
 const SORTS = ['rank', 'updated', 'acted']
@@ -519,8 +520,12 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
 
   if (!sub) {
     if (req.method === 'GET') {
-      const comments = listComments(db, item.id)
-      replyItems(who, res, 200, { item, comments: filteredAgent(db, who) ? hidePrivateAuthors(db, comments) : comments })
+      let comments = listComments(db, item.id)
+      if (filteredAgent(db, who)) comments = hidePrivateAuthors(db, comments)
+      // A reply the user withdrew before it reached the agent: every agent
+      // reads that it was there, never what it said (src/withdrawn-comments.js).
+      if (who.kind === 'agent') comments = comments.map(presentWithdrawn)
+      replyItems(who, res, 200, { item, comments })
       return true
     }
     if (req.method === 'PATCH') return handlePatch(ctx, req, res, who, item)

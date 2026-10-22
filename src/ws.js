@@ -26,6 +26,7 @@ import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentS
 import { listPins, isSuccessorOfAPin, pinHintBeforeAppend, sendPinsFrame } from './pins.js'
 import { archiveChanges, sendArchiveFrame } from './archive.js'
 import { coordinatorFor } from './coordinator.js'
+import { withdrawForQueuedCancel } from './withdrawn-comments.js'
 import { getMission } from './missions.js'
 import { sanitizeConvoStatus, upsertConvoStatus } from './convo-status.js'
 import { validateSessionControl, authorizeSessionControl, sessionControlResultFrame } from './session-control.js'
@@ -2073,7 +2074,19 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           blobRef: publishBlobRef(msg.type, msg),
           idemKey: msg.idem_key ? `agent:${conn.deviceId}:${msg.idem_key}` : null,
         }
-        copyOut(publishArgs, appendAndFan(publishArgs))
+        const published = appendAndFan(publishArgs)
+        copyOut(publishArgs, published)
+        // The bridge's cancel of a queued item reply: the reply never reached
+        // the agent, so no agent may read it any other way either. After the
+        // append, so it runs only once the release itself is on record. A
+        // republished release runs it again, a no-op once it is done.
+        if (msg.type === 'prompt_reply') {
+          try {
+            withdrawForQueuedCancel(db, { userId: conn.userId, convoId: msg.convo_id, payload: msg.payload })
+          } catch (err) {
+            console.error('ws: withdrawing a cancelled item reply failed', err)
+          }
+        }
         // After the append (which authorized the write): a message into a
         // room should also start any joined peer whose box is asleep. The
         // writer's own box is awake by definition. Additive, like the

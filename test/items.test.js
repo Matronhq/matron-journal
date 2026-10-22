@@ -18,7 +18,7 @@ test('schema: items, item_comments, item_counters exist with the expected column
     'contributor_user_id', 'contributor_convo_id', 'contributor_name', 'contributor_via',
   ])
   assert.deepEqual(cols('item_comments'), [
-    'id', 'item_id', 'user_id', 'author', 'device_id', 'kind', 'body', 'attachments', 'meta', 'idem_key', 'created_at', 'actions', 'chosen_action', 'convo_id',
+    'id', 'item_id', 'user_id', 'author', 'device_id', 'kind', 'body', 'attachments', 'meta', 'idem_key', 'created_at', 'actions', 'chosen_action', 'convo_id', 'withdrawn_at',
   ])
   assert.deepEqual(cols('item_counters'), ['user_id', 'next_num'])
   // (user_id, num) is unique
