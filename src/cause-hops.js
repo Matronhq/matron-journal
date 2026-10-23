@@ -29,8 +29,18 @@
 // spawn outcome, the causes of that conversation's own earlier ask. A cause
 // that claims a Coordinator hop the journal cannot check — a carry-on with no
 // usable ref, or one issued to another session; a room it is not in; a room
-// cause with no seq from a room the Coordinator spoke in; a list cut short —
-// is UNCHECKABLE: it can only make the ask stricter, never let it through.
+// cause with no seq from a room the Coordinator spoke in — is UNCHECKABLE: it
+// can only make the ask stricter, never let it through.
+//
+// Two things can hide a hop without claiming one: a walk cut short (a list
+// the bridge truncated, a spawn chain past the depth limit, too many
+// lookups), and a turn whose causes say nothing of where it came from (none
+// at all, or only a reminder, a handoff or `other`, as when the harness
+// starts a turn by itself). Neither can be told apart from an ordinary turn,
+// so they count as UNCHECKABLE only for a session the Coordinator reached in
+// the last 48 h (a carry-on sent to it, a relay it posted, a Coordinator hop
+// in a room it is in), or when the walk had already found a hop. Every
+// other session's asks are answered as before.
 //
 // The causes are peer data, as everywhere: a ref is only ever parsed, and
 // every claim in it is looked up again, scoped to the asking user.
@@ -51,10 +61,15 @@ export const HOP_TTL_MS = 14 * 24 * 60 * 60 * 1000
 export const ORIGINS_MAX = 8
 // Lookups in one originsOf walk.
 const ORIGIN_LOOKUPS_MAX = 32
-// Recorded messages one room cause's span may hold. Many of them are relays
-// that lead back to the same Coordinator hop, so this bounds the read, not
-// the origins (ORIGINS_MAX counts those).
-const ROOM_SPAN_ROWS_MAX = 64
+// Recorded messages one room cause's span may hold (a read of a room takes
+// in up to 200 messages). Many of them are relays that lead back to the same
+// Coordinator hop, so this bounds the read, not the origins (ORIGINS_MAX
+// counts those).
+const ROOM_SPAN_ROWS_MAX = 200
+// Rooms with recent hops checked for a session's membership.
+const TOUCHED_ROOMS_MAX = 32
+// Cause kinds that say nothing of where a turn's work came from.
+const LINEAGE_HIDING = new Set(['other', 'reminder', 'handoff'])
 // The origin that stands for a Coordinator hop the journal cannot check.
 export const UNCHECKABLE = '?'
 
@@ -123,10 +138,33 @@ const isMember = (db, roomId, convoId) => typeof convoId === 'string' && partici
 // when none. `at` bounds every hop (none recorded after it may be cited).
 export function originsOf(db, { userId, convoId, causes, at }) {
   const out = new Set()
-  const state = { lookups: 0 }
-  walk(db, { userId, convoId, at, state }, causes, 0, out)
+  const ctx = { userId, convoId, at, state: { lookups: 0, cut: false } }
+  walk(db, ctx, causes, 0, out)
   if (out.size > ORIGINS_MAX) return [UNCHECKABLE]
-  return [...out]
+  if (out.size > 0) {
+    // A hop was found, and the cut may have hidden another that fails.
+    if (ctx.state.cut) out.add(UNCHECKABLE)
+    return [...out]
+  }
+  if ((ctx.state.cut || hidesLineage(causes)) && touchedByCoordinator(db, ctx)) return [UNCHECKABLE]
+  return []
+}
+
+function hidesLineage(causes) {
+  const list = normalizeCauses(causes)
+  return !list || list.every((c) => LINEAGE_HIDING.has(c.kind))
+}
+
+// Whether the Coordinator reached this conversation in the 48 h before `at`.
+function touchedByCoordinator(db, { userId, convoId, at }) {
+  if (typeof convoId !== 'string' || !convoId) return false
+  const from = at - SELF_APPROVAL_USER_WINDOW_MS
+  const to = at + FUTURE_SLACK_MS
+  if (db.prepare('SELECT 1 FROM cause_hops WHERE user_id=? AND to_convo_id=? AND created_at BETWEEN ? AND ? LIMIT 1').get(userId, convoId, from, to)) return true
+  if (db.prepare('SELECT 1 FROM cause_hops WHERE user_id=? AND from_convo_id=? AND coordinator=0 AND created_at BETWEEN ? AND ? LIMIT 1').get(userId, convoId, from, to)) return true
+  const rooms = db.prepare('SELECT DISTINCT room_id FROM cause_hops WHERE user_id=? AND room_id IS NOT NULL AND created_at BETWEEN ? AND ? LIMIT ?')
+    .all(userId, from, to, TOUCHED_ROOMS_MAX)
+  return rooms.some((r) => isMember(db, r.room_id, convoId))
 }
 
 function walk(db, ctx, causes, depth, out) {
@@ -134,14 +172,14 @@ function walk(db, ctx, causes, depth, out) {
   if (!list) return
   for (const cause of list) {
     if (out.has(UNCHECKABLE)) return
-    if (++ctx.state.lookups > ORIGIN_LOOKUPS_MAX) { out.add(UNCHECKABLE); return }
+    if (++ctx.state.lookups > ORIGIN_LOOKUPS_MAX) { ctx.state.cut = true; return }
     switch (cause.kind) {
       case 'carry_on': carryOnOrigin(db, ctx, cause, out); break
       case 'room_message': roomOrigins(db, ctx, cause, out); break
       case 'spawn_outcome': spawnOrigins(db, ctx, cause, depth, out); break
       // A list the bridge had to cut short: the dropped causes may have
       // held a Coordinator hop.
-      case 'other': if (cause.ref === 'truncated') out.add(UNCHECKABLE); break
+      case 'other': if (cause.ref === 'truncated') ctx.state.cut = true; break
       default: break
     }
   }
@@ -193,7 +231,7 @@ function spawnOrigins(db, ctx, cause, depth, out) {
   const m = typeof cause.ref === 'string' ? /^spawn:(.+)$/.exec(cause.ref) : null
   const row = m ? getSpawn(db, m[1]) : null
   if (!row || row.user_id !== ctx.userId || row.from_convo_id !== ctx.convoId) return
-  if (depth + 1 > CAUSE_CHAIN_MAX_DEPTH) { out.add(UNCHECKABLE); return }
+  if (depth + 1 > CAUSE_CHAIN_MAX_DEPTH) { ctx.state.cut = true; return }
   walk(db, ctx, parseCauses(row.causes), depth + 1, out)
 }
 

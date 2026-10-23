@@ -2893,10 +2893,18 @@ ask, envelope and verifier included. Anything else is **403**
 saying the relay could not be checked: a carry-on with no ref, an unknown
 one or one sent to another session; room messages in a room the asking
 session is not in; a room cause with no seq from a room the Coordinator
-posted in during the last 48 h; a list the bridge cut short; more than 8
-Coordinator records; a spawn chain more than 4 deep. Room messages the
-Coordinator had no hand in are never recorded, so an ask between sessions
-that does not lead back to the Coordinator is answered exactly as before.
+posted in during the last 48 h; more than 8 Coordinator records, or more
+than 200 recorded messages in one room cause's span.
+
+Some turns can hide a relay without claiming one: a walk cut short (a list
+the bridge cut short, a spawn chain more than 4 deep, too many lookups),
+or a turn whose causes say nothing of where it came from (none at all, or
+only `reminder`, `handoff` or `other`). These are refused as unchecked when
+the walk had already found a Coordinator record, or when the asking session
+is one the Coordinator reached in the 48 h before the ask: a carry-on sent
+to it, a relayed message it posted, or a Coordinator record in a room it is
+in. Room messages the Coordinator had no hand in are never recorded, so an
+ask from any other session is answered exactly as before.
 
 **User-only boxes.** `devices.consent_user_only`, set and cleared only by
 `matron-admin device consent <device_id> user-only|any` (no bridge can

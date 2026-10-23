@@ -34,6 +34,10 @@ test.before(async () => {
   upsertConversation(s.db, { id: 'a', ownerUserId: alice.id, title: 'A', agentDeviceId: boxA.deviceId })
   upsertConversation(s.db, { id: 'b', ownerUserId: alice.id, title: 'B', agentDeviceId: boxB.deviceId })
   upsertConversation(s.db, { id: 'a2', ownerUserId: alice.id, title: 'A2', agentDeviceId: boxA.deviceId })
+  // A session the Coordinator never reaches in this file, and one it reaches
+  // only through a room.
+  upsertConversation(s.db, { id: 'u', ownerUserId: alice.id, title: 'U', agentDeviceId: boxA.deviceId })
+  upsertConversation(s.db, { id: 'm', ownerUserId: alice.id, title: 'M', agentDeviceId: boxA.deviceId })
   setCoordinatorConvoId(s.db, alice.id, 'coord')
   // The Coordinator approves: its box is the caller.
   who = { kind: 'agent', userId: alice.id, deviceId: boxC.deviceId, name: 'box-c' }
@@ -83,9 +87,9 @@ const spawn = ({ fromConvoId, causes, state = 'started' }) => {
 
 test('an ask no Coordinator hop reached is not relayed: answered as before', () => {
   // The session's own words, a reminder, a plain room message, nothing at all.
-  assert.deepEqual(relayed(userSays('a').causes), { relayed: false })
-  assert.deepEqual(relayed([{ kind: 'reminder' }, { kind: 'alert' }, { kind: 'other' }]), { relayed: false })
-  assert.deepEqual(relayed(null), { relayed: false })
+  assert.deepEqual(relayed(userSays('u').causes, { fromConvoId: 'u' }), { relayed: false })
+  assert.deepEqual(relayed([{ kind: 'reminder' }, { kind: 'alert' }, { kind: 'other' }], { fromConvoId: 'u' }), { relayed: false })
+  assert.deepEqual(relayed(null, { fromConvoId: 'u' }), { relayed: false })
   // A room between two ordinary sessions: their messages are not even kept.
   const r = room({ owner: 'a', ownerDev: boxA, member: 'b', memberDev: boxB })
   const seq = post(r, { from: 'a', dev: boxA, causes: userSays('a').causes })
@@ -260,8 +264,45 @@ test('a routine root through a relay is a routine root; the user\'s words beside
   assert.equal(relayed([...carryOn(fire), ...carryOn(said.causes)]).root.kind, 'user')
 })
 
-test('a list the bridge cut short, or too many Coordinator hops, is unchecked', () => {
-  assert.deepEqual(relayed([{ kind: 'other', ref: 'truncated' }]), { relayed: true, ok: false, why: WHY_RELAY_UNCHECKED })
+test('a cut walk or a turn of hidden lineage: unchecked for a session the Coordinator reached, as before for any other', () => {
+  carryOn(userSays().causes, { to: 'a' })
+  // A list the bridge cut short.
+  const truncated = [{ kind: 'user_message', ref: 'u:1' }, { kind: 'other', ref: 'truncated' }]
+  assert.deepEqual(relayed(truncated), { relayed: true, ok: false, why: WHY_RELAY_UNCHECKED })
+  assert.deepEqual(relayed(truncated, { fromConvoId: 'u' }), { relayed: false })
+  // A turn that says nothing of where it came from: none, a reminder, a
+  // handoff, a turn the harness started by itself.
+  for (const causes of [null, [{ kind: 'reminder' }], [{ kind: 'handoff' }], [{ kind: 'other' }, { kind: 'reminder' }]]) {
+    assert.deepEqual(relayed(causes), { relayed: true, ok: false, why: WHY_RELAY_UNCHECKED }, JSON.stringify(causes))
+    assert.deepEqual(relayed(causes, { fromConvoId: 'u' }), { relayed: false }, JSON.stringify(causes))
+  }
+  // A reminder that names the turn it was set in has a lineage again.
+  assert.deepEqual(relayed([{ kind: 'reminder' }, ...userSays('a').causes]), { relayed: false })
+  // A spawn chain longer than the depth limit, in a session no hop reached.
+  let id = spawn({ fromConvoId: 'u', causes: userSays('u').causes })
+  for (let i = 0; i < 5; i++) id = spawn({ fromConvoId: 'u', causes: [{ kind: 'spawn_outcome', ref: `spawn:${id}` }] })
+  assert.deepEqual(relayed([{ kind: 'spawn_outcome', ref: `spawn:${id}` }], { fromConvoId: 'u' }), { relayed: false })
+  // Reached through a room: a member of a room the Coordinator spoke in.
+  assert.deepEqual(relayed([{ kind: 'reminder' }], { fromConvoId: 'm' }), { relayed: false })
+  const r = room({ member: 'm', memberDev: boxA })
+  post(r, { from: 'coord', dev: boxC, causes: userSays().causes })
+  assert.deepEqual(relayed([{ kind: 'reminder' }], { fromConvoId: 'm' }), { relayed: true, ok: false, why: WHY_RELAY_UNCHECKED })
+  // ... but not two days later.
+  assert.deepEqual(relayed([{ kind: 'reminder' }], { fromConvoId: 'm', createdAt: Date.now() + 49 * HOUR }), { relayed: false })
+  // A cut beside a hop that resolves: the cut may have hidden one that fails.
+  const good = carryOn(userSays().causes, { to: 'a' })
+  assert.equal(relayed(good).ok, true)
+  assert.deepEqual(relayed([...good, { kind: 'other', ref: 'truncated' }]), { relayed: true, ok: false, why: WHY_RELAY_UNCHECKED })
+})
+
+test('a relay posted in a turn of hidden lineage, by a session the Coordinator reached, is unchecked', () => {
+  const r = room({ owner: 'a', ownerDev: boxA, member: 'b', memberDev: boxB })
+  carryOn(userSays().causes, { to: 'a' })
+  const seq = post(r, { from: 'a', dev: boxA, causes: [{ kind: 'other' }] })
+  assert.deepEqual(relayed(roomCause(r, seq), { fromConvoId: 'b' }), { relayed: true, ok: false, why: WHY_RELAY_UNCHECKED })
+})
+
+test('too many Coordinator hops is unchecked', () => {
   // ORIGINS_MAX + 1 distinct Coordinator messages in one range.
   const said = userSays()
   const r = room()
