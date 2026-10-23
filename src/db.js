@@ -1569,6 +1569,30 @@ export function openDb(path) {
   if (!userCols.some((c) => c.name === 'unlisted')) {
     db.exec('ALTER TABLE users ADD COLUMN unlisted INTEGER NOT NULL DEFAULT 0')
   }
+  // Forgot password (src/password-reset.js): an optional address per
+  // account, unique whatever its case, so an address names one account.
+  // Reset links are stored only as a SHA-256 of their token, with a hash
+  // of the password and address they were mailed for (account_state);
+  // password_reset_sends counts the mails per account for the hourly cap.
+  if (!userCols.some((c) => c.name === 'email')) {
+    db.exec('ALTER TABLE users ADD COLUMN email TEXT')
+  }
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower ON users(lower(email)) WHERE email IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS password_resets(
+      token_hash TEXT PRIMARY KEY,
+      user_id    INTEGER NOT NULL REFERENCES users(id),
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      account_state TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS password_resets_user ON password_resets(user_id);
+    CREATE TABLE IF NOT EXISTS password_reset_sends(
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      sent_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS password_reset_sends_user ON password_reset_sends(user_id, sent_at);
+  `)
   // One-time title cleanup (spec: agent box rename). Gated on user_version
   // inside, so this is a cheap pragma read on every subsequent open.
   healBakedTitles(db, { log: (m) => console.log(m) })
