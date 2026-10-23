@@ -171,7 +171,11 @@ function expiringAllowances(db, userId, trigger, { now, excludePrivateOwned }) {
     const left = g.resetAt - now
     if (g.percent >= trigger.pct || left < trigger.from_hours * 3600000 || left > trigger.to_hours * 3600000) continue
     const boxes = [...new Set(g.boxes)].join(', ')
-    out.push({ subject: `allowance:${g.key}@${new Date(g.resetAt).toISOString()}`, line: `- ${sanitizePeerText(g.label, 64)} at ${g.percent}%, resets ${g.resetIso} (in ${inWords(left)}); boxes: ${boxes}` })
+    // Boxes on one account report the same reset a minute apart (11:59 and
+    // 12:00, as their /usage text rounds); the subject takes the nearest
+    // hour so a weekly window stays one subject whichever box reported last.
+    const hour = Math.round(g.resetAt / 3600000) * 3600000
+    out.push({ subject: `allowance:${g.key}@${new Date(hour).toISOString()}`, line: `- ${sanitizePeerText(g.label, 64)} at ${g.percent}%, resets ${g.resetIso} (in ${inWords(left)}); boxes: ${boxes}` })
   }
   return out
 }

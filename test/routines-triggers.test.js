@@ -255,6 +255,9 @@ test('allowance_expiring: grouped by account, fires once per weekly window, only
   assert.equal(first.fresh.length, 2)
   // Once per window: still matching later in the window, nothing new.
   assert.deepEqual(trippedSubjects(db, r, { now: NOW + H, ...view }).fresh, [])
+  // A box on the account reporting the same reset a minute early is the same window.
+  report(jade, [week(25, NOW + 9 * H - 60000)], { asOf: NOW + 2 * H })
+  assert.deepEqual(trippedSubjects(db, r, { now: NOW + 2 * H, ...view }).fresh, [])
   // The next week's window is a new subject.
   report(maple, [week(30, NOW + (7 * 24 + 9) * H)], { asOf: NOW + 7 * 24 * H })
   report(jade, [week(30, NOW + (7 * 24 + 9) * H)], { asOf: NOW + 7 * 24 * H })
