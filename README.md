@@ -35,6 +35,14 @@ download.
 Node 20+. A systemd unit template is in
 [`deploy/matron-journal.service`](deploy/matron-journal.service).
 
+`npm start` runs `bin/matron-journal`, which starts `src/server.js`. On macOS
+it runs from a copy of the node binary named `matron-journal` (kept in
+`~/.matron/bin`, refreshed after a node upgrade), so per-app firewalls, which
+identify a program by its executable, show the journal under its own name
+rather than as `node`. The copy keeps node's code signature; the firewall may
+ask once more after a node upgrade. Set `MATRON_NAMED_NODE=0` to run under
+node itself; on Linux that is what always happens.
+
 ### Create users and devices
 
     printf %s "$PW" | MATRON_DB=./matron.db npx matron-admin user add alice --password-stdin
