@@ -436,11 +436,25 @@ the machine-checkable version of this page.
   always verified against the real argon2 hash (no shortcuts); a wrong one
   is 401 `{error:'bad_password'}`. `new_password` must be a string of at
   least 8 characters, otherwise 400 `{error:'weak_password'}`; a
-  missing/non-string `old_password` is 400 `{error:'bad_request'}`. On
-  success the user's hash is rotated to a fresh argon2id hash; **existing
-  device tokens (including the one used to make this request) stay valid**
-  — a password change does not revoke sessions, only the credential used to
-  mint new ones via `/login`.
+  missing/non-string `old_password` is 400 `{error:'bad_request'}`.
+  Optional `sign_out_others` (boolean; anything else is 400
+  `{error:'bad_request'}`). A wrong `old_password` counts against the
+  username's sign-in lockout (`/login`), and while it is locked every
+  attempt, a right one included, is 429 `{error:'locked_out', retry_after}`
+  with a `Retry-After` header. On success the user's hash is rotated to a
+  fresh argon2id hash and the response is `{ok:true, signed_out}`. With
+  `sign_out_others: true` every OTHER client device of the user is revoked
+  (as `POST /devices/:id/revoke`) and `signed_out` is how many; agent
+  devices are never touched, since a bridge never held the password.
+  Without it `signed_out` is 0 and **existing device tokens stay valid** —
+  the change only affects the credential used to mint new ones via
+  `/login`. The device that made the request always stays signed in, and
+  any two-factor sign-in ticket still pending for the user is dropped.
+  Checks for one user run one at a time, so parallel guesses can't outrun
+  the lockout. The write is a compare-and-swap on the verified hash: if
+  another device changed the password first the request is 401
+  `{error:'bad_password'}`, and if that change signed this device out it is
+  401 `{error:'unauthenticated'}`.
 - `GET /metrics` (Bearer, any valid device — client or agent, no admin
   concept in v1) -> JSON: `{user: {head_seq, devices: [{device_id, kind,
   cursor, lag, last_seen_at}]}, sockets_connected, journal_row_count,

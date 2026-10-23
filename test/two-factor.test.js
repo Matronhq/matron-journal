@@ -351,3 +351,23 @@ test('wrong codes at /2fa/enable count toward the lockout', async (t) => {
   assert.equal(locked.status, 429)
   assert.equal(locked.json.error, 'locked_out')
 })
+
+test('a password change drops sign-in tickets earned with the old password', async (t) => {
+  const { s, token } = await setup(t)
+  const { secret } = await enrol(s, token)
+  const first = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'hunter22', device_name: 'phone' } })
+  const ticket = first.json.two_factor_ticket
+  const changed = await s.http('/password', { method: 'POST', token, body: { old_password: 'hunter22', new_password: 'brand-new-pw' } })
+  assert.equal(changed.status, 200)
+  const late = await s.http('/login/2fa', { method: 'POST', body: { ticket, code: codeFor(secret, 1) } })
+  assert.equal(late.status, 401, 'the ticket went with the old password')
+})
+
+test('makeTwoFactorTickets.dropUser drops only that user\'s tickets', () => {
+  const tickets = makeTwoFactorTickets()
+  const a = tickets.issue({ userId: 1, username: 'alice', deviceName: 'x', purpose: 'verify' })
+  const b = tickets.issue({ userId: 2, username: 'bob', deviceName: 'x', purpose: 'verify' })
+  tickets.dropUser(1)
+  assert.equal(tickets.get(a.ticket), null)
+  assert.equal(tickets.get(b.ticket).username, 'bob')
+})

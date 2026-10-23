@@ -248,5 +248,8 @@ export function makeTwoFactorTickets({ ttlMs = 5 * 60000, maxAttempts = 5, maxPe
       return true
     },
     consume(ticket) { tickets.delete(ticket) },
+    // A password change or reset: a ticket earned with the old password
+    // must not still finish a sign-in.
+    dropUser(userId) { for (const [k, t] of tickets) if (t.userId === userId) tickets.delete(k) },
   }
 }
