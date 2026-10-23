@@ -40,6 +40,9 @@ export const STARTER_ROUTINES = Object.freeze([
   { name: 'context-over', title: 'Session context over the threshold', trigger: { kind: 'context_over', pct: 40 }, prompt: 'Routine context-over: follow the Session context over the threshold section of your playbook.' },
   { name: 'stalled-session', title: 'Session stalled on a usage limit', trigger: { kind: 'stalled', reset_minutes: 120 }, prompt: 'Routine stalled-session: follow the Session stalled on a usage limit section of your playbook.' },
   { name: 'disk-low', title: 'Box disk under the threshold', trigger: { kind: 'disk_under', pct: 20 }, prompt: 'Routine disk-low: follow the Box disk under the threshold section of your playbook.' },
+  // Spends a weekly allowance that would otherwise expire on the
+  // spare-allowance backlog: up to two sessions a fire, no chats.
+  { name: 'spare-allowance', title: 'Spare weekly allowance before its reset', trigger: { kind: 'allowance_expiring', pct: 70 }, envelope: { spawns_per_fire: 2, chats: false, boxes: null }, prompt: 'Routine spare-allowance: follow the Spare weekly allowance section of your playbook.' },
 ])
 
 // Triggers (spec "Triggers"): what a routine can fire on instead of a clock.
@@ -47,9 +50,16 @@ export const STARTER_ROUTINES = Object.freeze([
 //   stalled {reset_minutes}   a session stalled on a usage limit whose reset
 //                             is at least reset_minutes away, or unknown
 //   disk_under {pct}          an agent box with under pct% free disk
-export const TRIGGER_KINDS = Object.freeze(['context_over', 'stalled', 'disk_under'])
+//   allowance_expiring {pct, from_hours, to_hours}
+//                             an account's weekly meter under pct% with its
+//                             reset from_hours..to_hours away (default 6..12),
+//                             while the spare-allowance backlog has a task
+export const TRIGGER_KINDS = Object.freeze(['context_over', 'stalled', 'disk_under', 'allowance_expiring'])
 const STALLED_DEFAULT_MINUTES = 120
 const STALLED_MAX_MINUTES = 7 * 24 * 60
+export const ALLOWANCE_FROM_HOURS = 6
+export const ALLOWANCE_TO_HOURS = 12
+const WEEK_HOURS = 7 * 24
 
 export function validateTrigger(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
@@ -60,6 +70,14 @@ export function validateTrigger(raw) {
     const m = raw.reset_minutes === undefined ? STALLED_DEFAULT_MINUTES : raw.reset_minutes
     if (!Number.isInteger(m) || m < 0 || m > STALLED_MAX_MINUTES) return null
     return { kind: 'stalled', reset_minutes: m }
+  }
+  if (raw.kind === 'allowance_expiring') {
+    if (keys.some((k) => !['kind', 'pct', 'from_hours', 'to_hours'].includes(k))) return null
+    if (!Number.isInteger(raw.pct) || raw.pct < 1 || raw.pct > 99) return null
+    const from = raw.from_hours === undefined ? ALLOWANCE_FROM_HOURS : raw.from_hours
+    const to = raw.to_hours === undefined ? ALLOWANCE_TO_HOURS : raw.to_hours
+    if (!Number.isInteger(from) || !Number.isInteger(to) || from < 0 || to <= from || to > WEEK_HOURS) return null
+    return { kind: 'allowance_expiring', pct: raw.pct, from_hours: from, to_hours: to }
   }
   if (keys.some((k) => !['kind', 'pct'].includes(k))) return null
   if (!Number.isInteger(raw.pct) || raw.pct < 1 || raw.pct > 99) return null
