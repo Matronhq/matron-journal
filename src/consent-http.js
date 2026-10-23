@@ -10,7 +10,8 @@
 // awaiting (409 conflict); an approval of an ask a user-only box takes part
 // in is 403 user_only (declines stay allowed); a spawn approval into an
 // offline, unwakeable box is 409 target_offline; an approval of the
-// Coordinator's OWN ask is refused unless its cause checks out
+// Coordinator's OWN ask — or of another session's ask the Coordinator had
+// it make — is refused unless its cause checks out
 // (src/consent-own-ask.js: own_ask_unverified, envelope, verifier,
 // verifier_unavailable, routine_cap); approvals at the rolling 24 h cap are
 // 409 daily_cap (a cap of 0 is no cap). Declines skip every approval check.
@@ -79,7 +80,7 @@ export async function handleConsentRoute(ctx, req, res, url, who) {
         json(res, 409, { error: 'conflict', detail: 'target_offline' }); return true
       }
       const ask = spawnAsk(db, who, body, row)
-      const verdict = ask.own ? await verifyOwnAsk(ctx, { who, convoId: body.convo_id, reason, ask }) : null
+      const verdict = await verifyOwnAsk(ctx, { who, convoId: body.convo_id, reason, ask })
       if (!approvalAllowed(ctx, res, who, ask, verdict, decidedBy)) return true
     }
     const r = answerSpawnAsk(ctx, { userId: who.userId, requestId: body.id, decision: body.decision, decidedBy })
@@ -90,7 +91,7 @@ export async function handleConsentRoute(ctx, req, res, url, who) {
   if (body.decision === 'approve') {
     if (isUserOnlyChat(db, who.userId, key.roomId, key.targetDeviceId)) return forbidden(res, 'user_only')
     const ask = chatAsk(db, who, body, key)
-    const verdict = ask?.own ? await verifyOwnAsk(ctx, { who, convoId: body.convo_id, reason, ask }) : null
+    const verdict = ask ? await verifyOwnAsk(ctx, { who, convoId: body.convo_id, reason, ask }) : null
     if (!approvalAllowed(ctx, res, who, ask, verdict, decidedBy)) return true
   }
   const r = answerChatAsk(ctx, { userId: who.userId, roomId: key.roomId, targetDeviceId: key.targetDeviceId, decision: body.decision, decidedBy })
@@ -99,7 +100,8 @@ export async function handleConsentRoute(ctx, req, res, url, who) {
 }
 
 // The last checks on an approval, run synchronously right before the
-// answer writes anything: for the Coordinator's own ask the verdict of
+// answer writes anything: for the Coordinator's own ask (or one it had
+// another session make) the verdict of
 // verifyOwnAsk (src/consent-own-ask.js) and its re-checks after the wait,
 // its root landing on decidedBy for the decision row; then the daily cap
 // (0 = unlimited, MATRON_COORDINATOR_CONSENT_DAILY_CAP=0). `ask` is null

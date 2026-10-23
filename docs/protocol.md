@@ -776,6 +776,8 @@ malformed citation is a 400. Every answer is logged
 | `file` with sender `user:<account>` and audio `content_type` | the blob's transcript, if the journal's own transcriber wrote it (`blobs.transcript_status = 'done'`; the upload-time job never runs for an agent's upload). Once the audio has expired, the transcript retention moved onto the event, but only when it carries `transcript_by: 'journal'`. Retention stamps it only when the words were the blob's own; an item attachment's transcript, which an agent may have written, stays unstamped | `voice` |
 | the same, never transcribed by the journal (a bridge did it) | refused: `voice_not_transcribed_by_journal`, unless it has a typed caption | |
 | `file`/`image` with a caption | the caption | `typed` |
+| `prompt_reply` with sender `user:<account>` (only a client `prompt_reply` op writes one): the user's answer on a question card, by button or by the card's text box | `payload.text` when it has any, else `payload.choice`; `choice` is returned beside it | `tap` |
+| a `prompt_reply` with no text and no choice | refused: `no_text` | |
 | an agent's `text` starting `[Voice note transcription]:` (the bridge's copy) | the user's own voice note before it, in the same conversation and within a day, whose journal transcript is exactly those words. The answer's `seq` is the note, and `cited_seq` is the copy | `voice` |
 | any other agent event | refused: `agent_message` | |
 
@@ -796,7 +798,9 @@ carries that message's real `ts`.
 ```
 
 `before` is the last prose event before the user's message (up to 4000
-characters), with its sender. It is context for a reply like "yes, do
+characters), with its sender; for a `tap` it is the card the reply
+answers (its `question`, the event at `payload.target_seq` when that is a
+`prompt` of the same conversation). It is context for a reply like "yes, do
 that", never the user's words. Show it as an agent's text, as with the
 question behind an item tap.
 
@@ -1111,6 +1115,15 @@ Rows from before the stamp carry neither, and don't count.
   (fans out and replays to all devices), never FTS-indexed, never increment
   `unread_count`, and never trigger APNs push (journal-sync-only, like
   `convo_meta` — clients learn them from the replay, not from notifications).
+- Agent `publish` of a `text`, `file` or `image` into a room may name the
+  session that wrote it and that session's turn causes:
+  `from_convo_id` (a conversation the publishing device owns, not the room
+  itself) and `causes` (the `[{kind, ref?, at?}]` list of a `spawn_request`).
+  Neither is stored on the event or fanned out. The journal keeps them only
+  when the Coordinator's conversation wrote the message, or when a turn the
+  Coordinator reached wrote it (*Asks relayed from the Coordinator*, under
+  *Coordinator consent*); a field it cannot use never fails the publish,
+  and a publish without `from_convo_id` is recorded as nothing.
 - Agent `publish` rejects any `idem_key` starting with `fin:` (reserved for
   `finalize`'s internally composed `fin:<ref>` keys) with
   `{op:'error', code:'bad_request', detail:'idem_key prefix fin: is
@@ -2408,7 +2421,8 @@ bridge switch its model or backend, compact it, or tell it to carry on.
 The journal is the relay: it checks the caller **is** the Coordinator (the
 one route the role gates), resolves the target to its box, wakes it if
 asleep, issues a journal-originated RPC and hands the reply back. Nothing
-is journaled here; the target bridge writes the visible record (a notice)
+is journaled here (a carry-on is recorded for the consent guard, below, but
+writes no event); the target bridge writes the visible record (a notice)
 into the session's own chat.
 
 ```json
@@ -2417,8 +2431,16 @@ into the session's own chat.
   "action": "set_model" | "compact" | "carry_on",
   "model": "sonnet", "agent": "claude" | "codex",      // set_model: at least one
   "message": "…", "when": "now" | "after_limit_reset", // carry_on: message required
+  "causes": [{ "kind": "user_message", "ref": "…" }],   // carry_on: optional, the Coordinator turn's
   "reason": "context at 92%" }                          // optional, shown in the target chat
 ```
+
+A carry-on's `causes` are validated as on a `spawn_request` (`bad_request`
+`bad causes`), never relayed, and kept on the journal's record of the
+carry-on, whose id the relayed RPC carries as `carry_on_id` (`co_` and 16
+hex digits). The target bridge names it as the ref of its turn's
+`carry_on` cause (`carry_on:<id>`), so an ask that turn makes is held to
+the Coordinator's own-ask rule (*Asks relayed from the Coordinator*).
 
 Checks, in order — every failure after the `request_id` check is a
 `{kind:'control', op:'error', code, ref:'session_control', request_id, detail?}`
@@ -2437,7 +2459,7 @@ once with `{kind:'session_control', event:'sent', request_id, target_waking?}`
 and, off the socket's message loop, the box is woken if needed and waited
 for (`MATRON_SPAWN_WAKE_WAIT_MS`), a journal-originated RPC
 `session_control {convo_id, action, model?, agent?, message?, when?, reason?,
-from_convo_id, from_name}` is issued (`MATRON_SESSION_CONTROL_TIMEOUT_MS`,
+from_convo_id, from_name, carry_on_id?}` is issued (`MATRON_SESSION_CONTROL_TIMEOUT_MS`,
 default 30 s) and its reply delivered to every live socket of the caller's
 device as `{kind:'session_control', event:'result', request_id, ok,
 result?|error:{code, detail?}}` (`timeout` / `agent_unreachable` /
@@ -2807,10 +2829,15 @@ nothing is written until every check has passed.
 
 **Causes.** A `spawn_request`, `agent_invite` or `agent_join` may carry
 `causes`: the causes of the bridge's turn that made the ask, a list of 1–8
-`{kind, ref?, at?}` — `kind` one of `user_message` (ref `<convo>:<seq>`),
+`{kind, ref?, at?}` — `kind` one of `user_message` (ref `<convo>:<seq>`: a message, voice note
+or question-card answer the user sent, anything `GET /said` verifies),
 `item_reply` / `item_tap` (ref `item:<num>@<ISO time>`), `routine` (ref
 `routine:<name>@<ISO fire time>`), `spawn_outcome` (ref `spawn:<id>`),
-`room_message`, `reminder`, `carry_on`, `alert`, `handoff`, `other`; `ref` at
+`room_message` (ref `room:<room id>@<seq>` for one message,
+`room:<room id>@<from>-<to>` for the messages of one room a turn took
+together, or `room:<room id>` when the seq is unknown), `reminder`,
+`carry_on` (ref `carry_on:<carry_on_id>`, see *Session control*), `alert`,
+`handoff`, `other` (ref `truncated` when the bridge cut the list short); `ref` at
 most 200 characters; `at` a hint in ms. Absent or `null` is an ask with no
 causes; any other unusable value refuses the op `bad_request` `bad causes`.
 They are stored on the parked row and listed on `/consent/pending`.
@@ -2842,7 +2869,42 @@ note in `why`. Last, routine-born approvals in the last 24 h at the
 cap) are **409** `routine_cap`. An approval that passes records its root on
 the decision (`consent_decisions.cause_kind` `user`|`item`|`routine`,
 `cause_ref`, and `verifier_note` for a routine root); every other decision
-leaves them null. Another agent's ask is answered exactly as before.
+leaves them null. Another agent's ask is answered exactly as before, unless
+the Coordinator had it made (below).
+
+**Asks relayed from the Coordinator** (`src/cause-hops.js`). The
+Coordinator could otherwise step around the rule above by having another
+session make the ask: a carry-on telling it to, or a message in a room
+they share. So the journal keeps its own record of every carry-on the
+Coordinator sends and every room message it posts, each with the causes of
+the Coordinator's turn that sent it, and of every room message another
+session posts in a turn one of those reached (with the Coordinator records
+behind it). An ask another session made is **relayed** when its causes
+lead back to such a record: a `carry_on` cause, a `room_message` cause
+whose room messages include the Coordinator's or such a relay's, or a
+`spawn_outcome` of that session's own earlier relayed ask, however many
+sessions the chain passed through. Every Coordinator record behind a
+relayed ask must then resolve exactly as the Coordinator's own ask would,
+from the Coordinator's conversation, against that turn's causes, with
+every window measured from the relayed ask's time; the root (the user's or
+an item's before a routine's) is then checked and recorded as for an own
+ask, envelope and verifier included. Anything else is **403**
+`own_ask_unverified`, with `why` naming the record and its reason, or
+saying the relay could not be checked: a carry-on with no ref, an unknown
+one or one sent to another session; room messages in a room the asking
+session is not in; a room cause with no seq from a room the Coordinator
+posted in during the last 48 h; more than 8 Coordinator records, or more
+than 200 recorded messages in one room cause's span.
+
+Some turns can hide a relay without claiming one: a walk cut short (a list
+the bridge cut short, a spawn chain more than 4 deep, too many lookups),
+or a turn whose causes say nothing of where it came from (none at all, or
+only `reminder`, `handoff` or `other`). These are refused as unchecked when
+the walk had already found a Coordinator record, or when the asking session
+is one the Coordinator reached in the 48 h before the ask: a carry-on sent
+to it, a relayed message it posted, or a Coordinator record in a room it is
+in. Room messages the Coordinator had no hand in are never recorded, so an
+ask from any other session is answered exactly as before.
 
 **User-only boxes.** `devices.consent_user_only`, set and cleared only by
 `matron-admin device consent <device_id> user-only|any` (no bridge can

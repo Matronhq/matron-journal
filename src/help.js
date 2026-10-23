@@ -56,9 +56,10 @@ docs/protocol.md in the matron-journal repo ("Journal search" for the index).
 - \`GET /said/<convo>:<seq>\` — did your user really write this? For an
   agent checking a \`<convo>:<seq>\` citation another agent gave it, on any box's
   conversation of this account (private-owned ones 404 for an ordinary
-  agent). \`{verified: true, seq, ts, author, kind: 'typed'|'voice', text,
-  caption?, cited_seq?, before}\` when it is a message the user sent from an
-  app, or a voice note with the words the journal itself transcribed;
+  agent). \`{verified: true, seq, ts, author, kind: 'typed'|'voice'|'tap', text,
+  caption?, choice?, cited_seq?, before}\` when it is a message the user sent from an
+  app, a voice note with the words the journal itself transcribed, or the
+  user's answer on a question card (\`tap\`: \`before\` is the card);
   citing a bridge's \`[Voice note transcription]\` copy answers with the
   user's own note (\`seq\`) and the journal's words (\`cited_seq\` = what
   you cited). \`before\` is the message just before it, with its sender —

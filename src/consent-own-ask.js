@@ -12,7 +12,14 @@
 //    injected, and only under the rolling 24 h routine cap.
 // Every check is a read; nothing is written until all of them pass.
 // Declines are never gated and never come here.
+//
+// An ask ANOTHER session made is held to the same rule when the Coordinator
+// had it made — by a carry-on, or a room message, however many sessions it
+// passed through (src/cause-hops.js resolveRelayedAsk): each Coordinator hop
+// behind it must resolve as the Coordinator's own ask would. Every other ask
+// is answered as before.
 import { resolveAskCause } from './ask-cause.js'
+import { resolveRelayedAsk } from './cause-hops.js'
 import { parseCauses } from './ask-causes.js'
 import { getParticipant } from './participants.js'
 import { getSpawn } from './spawns.js'
@@ -38,7 +45,7 @@ const deviceName = (db, userId, deviceId) =>
 export function spawnAsk(db, who, body, row) {
   const targetBox = deviceName(db, who.userId, row.target_device_id)
   return {
-    kind: 'spawn', id: row.id, own: isOwnAsk(who, body, row), causes: row.causes, createdAt: row.created_at, targetBox,
+    kind: 'spawn', id: row.id, own: isOwnAsk(who, body, row), askConvoId: row.from_convo_id, causes: row.causes, createdAt: row.created_at, targetBox,
     verifier: { kind: 'spawn', task: row.task, target_box: targetBox, workdir: row.workdir, topic: row.topic || '' },
   }
 }
@@ -57,7 +64,7 @@ export function chatAsk(db, who, body, { roomId, targetDeviceId }) {
   const isJoin = row.initiator_device_id === targetDeviceId
   const targetBox = deviceName(db, who.userId, isJoin ? room.agent_device_id : targetDeviceId)
   return {
-    kind: 'chat', roomId, targetDeviceId, own: isOwnAsk(who, body, row), causes: row.causes, createdAt: row.created_at, targetBox,
+    kind: 'chat', roomId, targetDeviceId, own: isOwnAsk(who, body, row), askConvoId: row.initiator_convo_id, causes: row.causes, createdAt: row.created_at, targetBox,
     verifier: { kind: 'chat', justification: row.justification, target_box: targetBox, topic: row.topic || '' },
   }
 }
@@ -123,11 +130,18 @@ async function askVerifier(verifier, args) {
 // verifier, then the re-checks, envelope again, routine_cap. `who` is the
 // route's authenticated caller.
 //
+// For another session's ask: null when the Coordinator had no hand in it
+// (nothing to check), else the same verdict an own ask gets.
+//
 // → { ok: true, root, cause: {causeKind, causeRef, verifierNote?} }
-//   or { ok: false, status, body }.
+//   or { ok: false, status, body }, or null.
 export async function verifyOwnAsk(ctx, { who, convoId, reason, ask }) {
   const { db } = ctx
-  const res = resolveAskCause(db, { who, userId: who.userId, causes: parseCauses(ask.causes), createdAt: ask.createdAt, fromConvoId: convoId })
+  const causes = parseCauses(ask.causes)
+  const res = ask.own
+    ? resolveAskCause(db, { who, userId: who.userId, causes, createdAt: ask.createdAt, fromConvoId: convoId })
+    : resolveRelayedAsk(db, { who, userId: who.userId, causes, createdAt: ask.createdAt, fromConvoId: ask.askConvoId })
+  if (!ask.own && !res.relayed) return null
   if (!res.ok) return refusal(403, 'own_ask_unverified', { why: res.why })
   const { root } = res
   if (root.kind !== 'routine') return { ok: true, root, cause: { causeKind: root.kind, causeRef: root.ref } }

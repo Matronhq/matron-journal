@@ -1421,6 +1421,30 @@ export function openDb(path) {
     const cols = db.prepare(`PRAGMA table_info(${table})`).all()
     if (!cols.some((c) => c.name === 'causes')) db.exec(`ALTER TABLE ${table} ADD COLUMN causes TEXT`)
   }
+  // The journal's own record of the hops an ask the Coordinator had another
+  // session make passes through (src/cause-hops.js): every carry-on the
+  // Coordinator sends (`carry_on:<id>`, with its target) and every room
+  // message it posts (`room:<room>@<seq>`), each with the causes of the
+  // Coordinator's turn that sent it (coordinator = 1); and every room
+  // message another session posts in a turn such a hop reached, with the
+  // keys of those hops in `origins` (coordinator = 0). Pruned after 14 days.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS cause_hops(
+      user_id       INTEGER NOT NULL,
+      key           TEXT NOT NULL,
+      room_id       TEXT,
+      seq           INTEGER,
+      from_convo_id TEXT NOT NULL,
+      to_convo_id   TEXT,
+      coordinator   INTEGER NOT NULL,
+      causes        TEXT,
+      origins       TEXT,
+      created_at    INTEGER NOT NULL,
+      PRIMARY KEY(user_id, key)
+    );
+    CREATE INDEX IF NOT EXISTS cause_hops_room ON cause_hops(user_id, room_id, seq) WHERE room_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS cause_hops_age ON cause_hops(created_at);
+  `)
   // When the Coordinator approves an ask it made itself, the root cause the
   // journal resolved it to ('user' | 'item' | 'routine', and its ref) and
   // what the verifier said about it. NULL on every other decision and on
