@@ -72,8 +72,13 @@ const seconds = (ms) => Math.floor(ms / 1000)
 
 test('run-named-node: both launchers are executable POSIX sh scripts', posix, () => {
   for (const file of [LAUNCHER, JOURNAL]) {
-    assert.notEqual(fs.statSync(file).mode & 0o111, 0)
-    assert.equal(fs.readFileSync(file, 'utf8').split('\n')[0], '#!/bin/sh')
+    const fd = fs.openSync(file, 'r')
+    try {
+      assert.notEqual(fs.fstatSync(fd).mode & 0o111, 0)
+      assert.equal(fs.readFileSync(fd, 'utf8').split('\n')[0], '#!/bin/sh')
+    } finally {
+      fs.closeSync(fd)
+    }
   }
 })
 
@@ -105,10 +110,17 @@ test('run-named-node: refreshes the copy when node changes size', posix, (t) => 
   const s = sandbox(t)
   s.run(['matron-test', 'a.js'])
   const upgraded = `${FAKE_NODE}# upgraded\n`
-  fs.writeFileSync(s.fakeNode, upgraded)
-  // Same mtime as the old copy, so only the size gives the change away.
-  const { atime, mtime } = fs.statSync(s.copy)
-  fs.utimesSync(s.fakeNode, atime, mtime)
+  // Rewrite node but keep its mtime (which the copy shares, via cp -p), so
+  // only the size gives the change away.
+  const fd = fs.openSync(s.fakeNode, 'r+')
+  try {
+    const { atime, mtime } = fs.fstatSync(fd)
+    fs.ftruncateSync(fd, 0)
+    fs.writeSync(fd, upgraded, 0)
+    fs.futimesSync(fd, atime, mtime)
+  } finally {
+    fs.closeSync(fd)
+  }
   assert.equal(parse(s.run(['matron-test', 'b.js']).stdout).argv0, s.copy)
   assert.equal(fs.readFileSync(s.copy, 'utf8'), upgraded)
 })
