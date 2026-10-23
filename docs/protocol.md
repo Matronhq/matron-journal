@@ -776,6 +776,8 @@ malformed citation is a 400. Every answer is logged
 | `file` with sender `user:<account>` and audio `content_type` | the blob's transcript, if the journal's own transcriber wrote it (`blobs.transcript_status = 'done'`; the upload-time job never runs for an agent's upload). Once the audio has expired, the transcript retention moved onto the event, but only when it carries `transcript_by: 'journal'`. Retention stamps it only when the words were the blob's own; an item attachment's transcript, which an agent may have written, stays unstamped | `voice` |
 | the same, never transcribed by the journal (a bridge did it) | refused: `voice_not_transcribed_by_journal`, unless it has a typed caption | |
 | `file`/`image` with a caption | the caption | `typed` |
+| `prompt_reply` with sender `user:<account>` (only a client `prompt_reply` op writes one): the user's answer on a question card, by button or by the card's text box | `payload.text` when it has any, else `payload.choice`; `choice` is returned beside it | `tap` |
+| a `prompt_reply` with no text and no choice | refused: `no_text` | |
 | an agent's `text` starting `[Voice note transcription]:` (the bridge's copy) | the user's own voice note before it, in the same conversation and within a day, whose journal transcript is exactly those words. The answer's `seq` is the note, and `cited_seq` is the copy | `voice` |
 | any other agent event | refused: `agent_message` | |
 
@@ -796,7 +798,9 @@ carries that message's real `ts`.
 ```
 
 `before` is the last prose event before the user's message (up to 4000
-characters), with its sender. It is context for a reply like "yes, do
+characters), with its sender; for a `tap` it is the card the reply
+answers (its `question`, the event at `payload.target_seq` when that is a
+`prompt` of the same conversation). It is context for a reply like "yes, do
 that", never the user's words. Show it as an agent's text, as with the
 question behind an item tap.
 
@@ -2807,7 +2811,8 @@ nothing is written until every check has passed.
 
 **Causes.** A `spawn_request`, `agent_invite` or `agent_join` may carry
 `causes`: the causes of the bridge's turn that made the ask, a list of 1–8
-`{kind, ref?, at?}` — `kind` one of `user_message` (ref `<convo>:<seq>`),
+`{kind, ref?, at?}` — `kind` one of `user_message` (ref `<convo>:<seq>`: a message, voice note
+or question-card answer the user sent, anything `GET /said` verifies),
 `item_reply` / `item_tap` (ref `item:<num>@<ISO time>`), `routine` (ref
 `routine:<name>@<ISO fire time>`), `spawn_outcome` (ref `spawn:<id>`),
 `room_message`, `reminder`, `carry_on`, `alert`, `handoff`, `other`; `ref` at

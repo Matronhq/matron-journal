@@ -126,6 +126,31 @@ test('user_message: an agent message fails', () => {
   assert.match(r.why, /agent_message/)
 })
 
+test('user_message: the user\'s tap on a question card resolves like their words', () => {
+  const c = convo()
+  const { seq: promptSeq } = append(s.db, { userId: alice.id, convoId: c, sender: 'agent:box-a', type: 'prompt', payload: { question: 'Start a helper on box-b?', options: [] } })
+  const tap = (sender, convoId = c) => {
+    const { seq } = append(s.db, { userId: alice.id, convoId, sender, type: 'prompt_reply', payload: { target_seq: promptSeq, choice: 'Yes', text: null } })
+    const { ts } = s.db.prepare('SELECT ts FROM events WHERE user_id=? AND seq=?').get(alice.id, seq)
+    return { seq, ts, ref: `${convoId}:${seq}` }
+  }
+  const mine = tap('user:alice')
+  assert.deepEqual(resolve([{ kind: 'user_message', ref: mine.ref }], { fromConvoId: c, createdAt: mine.ts + MIN }), { ok: true, root: { kind: 'user', ref: mine.ref, at: mine.ts } })
+  // A reply row a bridge published (its own queue-card release) is not the user's.
+  const agents = tap('agent:box-a')
+  const r = resolve([{ kind: 'user_message', ref: agents.ref }], { fromConvoId: c, createdAt: agents.ts })
+  assert.equal(r.ok, false)
+  assert.match(r.why, /agent_message/)
+  // Another person's reply in a shared room is not the user's either.
+  const foreign = tap('person:bob')
+  assert.match(resolve([{ kind: 'user_message', ref: foreign.ref }], { fromConvoId: c, createdAt: foreign.ts }).why, /not_from_user/)
+  // The same rules as words: only this conversation's, only within 48 h.
+  const elsewhere = convo()
+  const away = tap('user:alice', elsewhere)
+  assert.deepEqual(resolve([{ kind: 'user_message', ref: away.ref }], { fromConvoId: c, createdAt: away.ts }), { ok: false, why: WHY_OTHER_CONVO_MESSAGE })
+  assert.match(resolve([{ kind: 'user_message', ref: mine.ref }], { fromConvoId: c, createdAt: mine.ts + 49 * HOUR }).why, /48 h/)
+})
+
 test('user_message: words 49 h old fail', () => {
   const c = convo()
   const m = say(c, 'user:alice', 'start a helper')
