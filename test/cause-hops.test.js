@@ -10,7 +10,7 @@ import { inviteParticipant, answerInvite } from '../src/participants.js'
 import { WHY_NO_CAUSE } from '../src/ask-cause.js'
 import {
   recordCarryOn, recordRoomPublish, originsOf, resolveRelayedAsk, roomHopKey,
-  UNCHECKABLE, WHY_RELAY_UNCHECKED, HOP_TTL_MS, ORIGINS_MAX,
+  UNCHECKABLE, WHY_RELAY_UNCHECKED, HOP_TTL_MS, ORIGINS_MAX, TOUCHED_ROOMS_MAX,
 } from '../src/cause-hops.js'
 
 const MIN = 60 * 1000
@@ -300,6 +300,25 @@ test('a relay posted in a turn of hidden lineage, by a session the Coordinator r
   carryOn(userSays().causes, { to: 'a' })
   const seq = post(r, { from: 'a', dev: boxA, causes: [{ kind: 'other' }] })
   assert.deepEqual(relayed(roomCause(r, seq), { fromConvoId: 'b' }), { relayed: true, ok: false, why: WHY_RELAY_UNCHECKED })
+})
+
+test('more rooms with recent hops than are checked: every session counts as reached', async () => {
+  // A fresh user, so only this case's rooms are in the window.
+  const carol = await createUser(s.db, 'carol', 'pw')
+  {
+    const dev = createAgent(s.db, carol.id, 'carol-box')
+    upsertConversation(s.db, { id: 'carol-coord', ownerUserId: carol.id, title: 'C', agentDeviceId: dev.deviceId })
+    upsertConversation(s.db, { id: 'carol-x', ownerUserId: carol.id, title: 'X', agentDeviceId: dev.deviceId })
+    setCoordinatorConvoId(s.db, carol.id, 'carol-coord')
+    const carolWho = { kind: 'agent', userId: carol.id, deviceId: dev.deviceId, name: 'carol-box' }
+    const ask = () => resolveRelayedAsk(s.db, { who: carolWho, userId: carol.id, causes: [{ kind: 'reminder' }], createdAt: Date.now() + 1000, fromConvoId: 'carol-x' })
+    const hopIn = (i) => s.db.prepare(`INSERT INTO cause_hops(user_id, key, room_id, seq, from_convo_id, coordinator, created_at) VALUES(?,?,?,?,?,1,?)`)
+      .run(carol.id, `room:carol-room-${i}@1`, `carol-room-${i}`, 1, 'carol-coord', Date.now())
+    for (let i = 0; i < TOUCHED_ROOMS_MAX; i++) hopIn(i)
+    assert.deepEqual(ask(), { relayed: false })
+    hopIn(TOUCHED_ROOMS_MAX)
+    assert.deepEqual(ask(), { relayed: true, ok: false, why: WHY_RELAY_UNCHECKED })
+  }
 })
 
 test('too many Coordinator hops is unchecked', () => {

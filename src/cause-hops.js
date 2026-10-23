@@ -66,8 +66,9 @@ const ORIGIN_LOOKUPS_MAX = 32
 // Coordinator hop, so this bounds the read, not the origins (ORIGINS_MAX
 // counts those).
 const ROOM_SPAN_ROWS_MAX = 200
-// Rooms with recent hops checked for a session's membership.
-const TOUCHED_ROOMS_MAX = 32
+// Rooms with recent hops checked for a session's membership; past it, the
+// session counts as reached.
+export const TOUCHED_ROOMS_MAX = 32
 // Cause kinds that say nothing of where a turn's work came from.
 const LINEAGE_HIDING = new Set(['other', 'reminder', 'handoff'])
 // The origin that stands for a Coordinator hop the journal cannot check.
@@ -163,7 +164,10 @@ function touchedByCoordinator(db, { userId, convoId, at }) {
   if (db.prepare('SELECT 1 FROM cause_hops WHERE user_id=? AND to_convo_id=? AND created_at BETWEEN ? AND ? LIMIT 1').get(userId, convoId, from, to)) return true
   if (db.prepare('SELECT 1 FROM cause_hops WHERE user_id=? AND from_convo_id=? AND coordinator=0 AND created_at BETWEEN ? AND ? LIMIT 1').get(userId, convoId, from, to)) return true
   const rooms = db.prepare('SELECT DISTINCT room_id FROM cause_hops WHERE user_id=? AND room_id IS NOT NULL AND created_at BETWEEN ? AND ? LIMIT ?')
-    .all(userId, from, to, TOUCHED_ROOMS_MAX)
+    .all(userId, from, to, TOUCHED_ROOMS_MAX + 1)
+  // More rooms than are checked: the unchecked ones may hold this session,
+  // so it counts as reached, like every other bound here.
+  if (rooms.length > TOUCHED_ROOMS_MAX) return true
   return rooms.some((r) => isMember(db, r.room_id, convoId))
 }
 
