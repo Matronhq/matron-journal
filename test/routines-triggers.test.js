@@ -247,10 +247,10 @@ test('allowance_expiring: grouped by account, fires once per weekly window, only
   // Empty backlog: matching, but nothing fires and nothing is consumed.
   assert.deepEqual(trippedSubjects(db, r, { now: NOW, ...view }).fresh, [])
   const mk = (title, labels) => createItem(db, { userId: alice.id, originDeviceId: maple.deviceId, originConvoId: 'coord', createdBy: 'agent', kind: 'task', title, labels }).item
-  const audit = mk('Security audit: yearbook-app', ['spare-allowance'])
+  const audit = mk('Flaky-test hunt: storefront suite', ['spare-allowance'])
   mk('Unrelated task', [])
   mk('Already running', ['spare-allowance', 'dispatched'])
-  assert.deepEqual(spareBacklog(db, alice.id).map((t) => t.title), ['Security audit: yearbook-app'])
+  assert.deepEqual(spareBacklog(db, alice.id).map((t) => t.title), ['Flaky-test hunt: storefront suite'])
   const first = trippedSubjects(db, r, { now: NOW + 1, ...view })
   assert.equal(first.fresh.length, 2)
   // Once per window: still matching later in the window, nothing new.
@@ -266,7 +266,7 @@ test('allowance_expiring: grouped by account, fires once per weekly window, only
   // The turn names the head of the backlog.
   const msg = fireMessage(db, r, first.fresh)
   assert.match(msg, /^p\n\nTripped by:\n- Week/)
-  assert.match(msg, new RegExp(`Next in the spare-allowance backlog:\n- #${audit.num} Security audit: yearbook-app$`))
+  assert.match(msg, new RegExp(`Next in the spare-allowance backlog:\n- #${audit.num} Flaky-test hunt: storefront suite$`))
   assert.equal(fireMessage(db, { ...r, trigger: { kind: 'disk_under', pct: 20 } }, first.fresh), trigMessage('p', first.fresh))
   assert.ok(fireMessage(db, r, first.fresh, 120).length <= 120)
 
