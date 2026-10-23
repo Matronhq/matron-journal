@@ -22,6 +22,7 @@ import { ownerTalkAsk, sweepTalkAsks } from './talk-requests-events.js'
 import { onPersonRoomOutcome, onGuestAck, onGuestAnswered, onGuestExpired, endAndNotify, copyRoomMessage, onShareAnswered } from './person-rooms-events.js'
 import { predictSpawnRun } from './spawn-model.js'
 import { causesFromFrame } from './ask-causes.js'
+import { recordCarryOn, recordRoomPublish } from './cause-hops.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableDevice } from './wake.js'
 import { listPins, isSuccessorOfAPin, pinHintBeforeAppend, sendPinsFrame } from './pins.js'
 import { archiveChanges, sendArchiveFrame } from './archive.js'
@@ -2076,6 +2077,16 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         }
         const published = appendAndFan(publishArgs)
         copyOut(publishArgs, published)
+        // A room message names the session that wrote it and that session's
+        // turn causes: kept when the Coordinator wrote it, or reached the
+        // turn that did (src/cause-hops.js). Never fatal to the publish.
+        if (!published.duplicate && ROOM_WAKE_PUBLISH_TYPES.has(msg.type) && msg.from_convo_id != null) {
+          try {
+            recordRoomPublish(db, { userId: conn.userId, deviceId: conn.deviceId, roomId: msg.convo_id, seq: published.seq, msg })
+          } catch (err) {
+            console.error(`publish: recording a room hop failed: ${err?.message || err}`)
+          }
+        }
         // The bridge's cancel of a queued item reply: the reply never reached
         // the agent, so no agent may read it any other way either. After the
         // append, so it runs only once the release itself is on record. A
@@ -2203,6 +2214,17 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         conn.ws.send(JSON.stringify({ kind: 'session_control', event: 'sent', request_id: v.rid, ...(waking ? { target_waking: true } : {}) }))
         const fromName = sanitizePeerText(db.prepare('SELECT name FROM devices WHERE id=?').get(conn.deviceId)?.name || '', PEER_NAME_CAP) || 'coordinator'
         const params = { ...v.params, from_convo_id: msg.from_convo_id, from_name: fromName }
+        // A carry-on is recorded before it is relayed, so the target's turn
+        // can name it (src/cause-hops.js): an ask that turn makes is then
+        // held to the Coordinator's own-ask rule. Without the record the
+        // target stamps a bare carry_on, which that rule refuses.
+        if (v.params.action === 'carry_on') {
+          try {
+            params.carry_on_id = recordCarryOn(db, { userId: conn.userId, fromConvoId: msg.from_convo_id, targetConvoId: msg.target_convo_id, causes: v.causes })
+          } catch (err) {
+            console.error(`session_control: recording a carry-on failed: ${err?.message || err}`)
+          }
+        }
         const rid = v.rid
         conn._sessionControlInflight = (conn._sessionControlInflight || 0) + 1
         void (async () => {
