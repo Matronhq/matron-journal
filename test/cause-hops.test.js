@@ -270,6 +270,15 @@ test('a list the bridge cut short, or too many Coordinator hops, is unchecked', 
   assert.equal(relayed(roomCause(r, seqs[0], seqs[ORIGINS_MAX - 1]), { fromConvoId: 'b' }).ok, true)
 })
 
+test('a span of many relays leading back to one Coordinator hop is one origin', () => {
+  const said = userSays()
+  const r = room({ owner: 'a', ownerDev: boxA, member: 'b', memberDev: boxB })
+  const co = carryOn(said.causes, { to: 'a' })
+  // A has a long say in one turn the carry-on started: twelve relays.
+  const seqs = Array.from({ length: ORIGINS_MAX + 4 }, () => post(r, { from: 'a', dev: boxA, causes: co }))
+  assert.deepEqual(relayed(roomCause(r, seqs[0], seqs.at(-1)), { fromConvoId: 'b' }), { relayed: true, ok: true, root: { kind: 'user', ref: said.ref, at: said.ts } })
+})
+
 test('hops older than the keep window are pruned on the next write', () => {
   const old = Date.now() - HOP_TTL_MS - HOUR
   const id = recordCarryOn(s.db, { userId: alice.id, fromConvoId: 'coord', targetConvoId: 'a', causes: null, now: old })

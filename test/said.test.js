@@ -89,6 +89,10 @@ test('/said: the user\'s tap on a question card is verified, with the card as co
   // A reply naming no card of this conversation falls back to the prose before it.
   const loose = add('user:alice', 'prompt_reply', { target_seq: 999999, choice: 'Yes' })
   assert.equal((await said(boxB.token, `c1:${loose}`)).json.before.text, 'Waiting for your answer.')
+  // So does one naming a card that only came after it.
+  const early = add('user:alice', 'prompt_reply', { target_seq: loose + 2, choice: 'Yes' })
+  add('agent:box-a', 'prompt', { question: 'A later question?', options: [] })
+  assert.equal((await said(boxB.token, `c1:${early}`)).json.before.text, 'Waiting for your answer.')
 })
 
 test('/said: a prompt_reply an agent published, another person\'s, or an empty one is refused', async (t) => {

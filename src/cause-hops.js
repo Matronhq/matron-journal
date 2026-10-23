@@ -51,6 +51,10 @@ export const HOP_TTL_MS = 14 * 24 * 60 * 60 * 1000
 export const ORIGINS_MAX = 8
 // Lookups in one originsOf walk.
 const ORIGIN_LOOKUPS_MAX = 32
+// Recorded messages one room cause's span may hold. Many of them are relays
+// that lead back to the same Coordinator hop, so this bounds the read, not
+// the origins (ORIGINS_MAX counts those).
+const ROOM_SPAN_ROWS_MAX = 64
 // The origin that stands for a Coordinator hop the journal cannot check.
 export const UNCHECKABLE = '?'
 
@@ -170,10 +174,10 @@ function roomOrigins(db, ctx, cause, out) {
   if (to < from) { out.add(UNCHECKABLE); return }
   const rows = db.prepare(`SELECT key, coordinator, origins FROM cause_hops
     WHERE user_id=? AND room_id=? AND seq BETWEEN ? AND ? AND created_at <= ? ORDER BY seq LIMIT ?`)
-    .all(ctx.userId, roomId, from, to, ctx.at + FUTURE_SLACK_MS, ORIGINS_MAX + 1)
+    .all(ctx.userId, roomId, from, to, ctx.at + FUTURE_SLACK_MS, ROOM_SPAN_ROWS_MAX + 1)
   if (rows.length === 0) return
   // The messages reached this conversation only if it is in the room.
-  if (rows.length > ORIGINS_MAX || !isMember(db, roomId, ctx.convoId)) { out.add(UNCHECKABLE); return }
+  if (rows.length > ROOM_SPAN_ROWS_MAX || !isMember(db, roomId, ctx.convoId)) { out.add(UNCHECKABLE); return }
   for (const row of rows) {
     if (row.coordinator === 1) { out.add(row.key); continue }
     let origins = null

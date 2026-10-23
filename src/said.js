@@ -94,9 +94,10 @@ function journalTranscript(db, userId, ev) {
 }
 
 // The question card a prompt_reply answers, as context: { seq, sender, text },
-// or null when target_seq names no prompt of this conversation.
-function answeredPrompt(db, convoId, targetSeq) {
-  if (!Number.isSafeInteger(targetSeq) || targetSeq <= 0) return null
+// or null when target_seq names no prompt of this conversation BEFORE the
+// reply (a card that came later cannot be what the user answered).
+function answeredPrompt(db, convoId, targetSeq, replySeq) {
+  if (!Number.isSafeInteger(targetSeq) || targetSeq <= 0 || targetSeq >= replySeq) return null
   const r = db.prepare(`SELECT seq, sender, payload FROM events WHERE convo_id=? AND seq=? AND type='prompt'`).get(convoId, targetSeq)
   if (!r) return null
   const ev = parse(r)
@@ -188,7 +189,7 @@ export function verifySaid(db, who, { convoId, seq }) {
     return { status: 200, body: { verified: false, convo_id: convoId, seq, sender: ev.sender, reason: words.reason } }
   }
   const before = ev.type === 'prompt_reply'
-    ? answeredPrompt(db, convoId, ev.payload.target_seq) ?? previousProse(db, convoId, ev.seq)
+    ? answeredPrompt(db, convoId, ev.payload.target_seq, ev.seq) ?? previousProse(db, convoId, ev.seq)
     : previousProse(db, convoId, ev.seq)
   return {
     status: 200,
