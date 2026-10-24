@@ -184,8 +184,16 @@ the machine-checkable version of this page.
     excerpt}}]}`: one row per conversation, at most `limit` (clamped to
     50). Conversations holding the query as an exact phrase (`exact:
     true`) come first, then those containing every word; newest first
-    (highest seq) within each. `count` is every matching message in the
-    conversation, `top` the previewed one — the newest exact match when
+    (highest seq) within each. Each tier groups only its own newest
+    2,000 matching messages across the journal (`CHAT_SCAN_CAP`), so a
+    common word answers as fast as a rare one: a conversation whose
+    matches are all older than that is left out of that tier (an older
+    exact-phrase match can still be listed, since the exact tier has its
+    own window), and `count` is the conversation's matches among the
+    newest 2,000 all-terms matches, or among its own newest 2,000 when it
+    is listed only through the exact tier. Every match counts for any
+    query with fewer than 2,000 in all. "Newest" is index order, which
+    follows message order for everything indexed live. `top` the previewed one — the newest exact match when
     there is one, else the newest match — and `excerpt` up to ~1 KB of
     its body around the first literal occurrence (the phrase if present,
     else the earliest word; the head of the body when neither is found
