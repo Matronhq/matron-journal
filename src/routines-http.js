@@ -22,7 +22,7 @@ import {
 } from './routines.js'
 import { emitRoutineMarker } from './routines-marker.js'
 import { coordinatorDevice } from './consent.js'
-import { currentSubjects, trigMessage } from './routines-triggers.js'
+import { currentSubjects, fireMessage } from './routines-triggers.js'
 import { causesFromFrame } from './ask-causes.js'
 import { resolveAskCause } from './ask-cause.js'
 
@@ -107,7 +107,7 @@ export async function handleRoutinesRoute(ctx, req, res, url, who) {
     json(res, 202, { accepted: true })
     // A triggered routine run by hand carries whatever is tripped right now
     // (state untouched, so the sweep's own bookkeeping is unaffected).
-    const message = routine.trigger ? trigMessage(routine.prompt, currentSubjects(db, row, { now: Date.now() })) : null
+    const message = routine.trigger ? fireMessage(db, row, currentSubjects(db, row, { now: Date.now() })) : null
     void ctx.routineFirer.fire(row, { message, onOutcome: (outcome) => db.prepare('UPDATE routines SET last_outcome=? WHERE id=?').run(outcome, routine.id) })
       .catch((err) => console.error(`routines: run of ${routine.name} failed`, err))
     return true

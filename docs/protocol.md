@@ -2517,8 +2517,15 @@ compacts itself), whose context tokens are at or past `pct` of its window — 1M
 least for the 1M-class models, Opus, Fable, Mythos and any `[1m]` alias,
 whose bridges can only prove 1M once the gauge passes 200k), `{kind:'stalled', reset_minutes}` (0–10080, default 120: a live
 session stalled on a usage limit whose reset is at least that far away or
-unknown) or `{kind:'disk_under', pct}` (an agent box under `pct`% free
-disk), evaluated against `conversation_status` and `device_status` by a
+unknown), `{kind:'disk_under', pct}` (an agent box under `pct`% free
+disk) or `{kind:'allowance_expiring', pct, from_hours, to_hours}` (1–99;
+window 0–168 h, default 6–12: a weekly usage meter — `week_all`, or a
+Codex `… · Weekly` line — under `pct`% whose reset is `from_hours` to
+`to_hours` away; boxes reporting the same account are one allowance, read
+as the highest percent and the freshest report's reset; the subject is
+`allowance:<account or device>@<reset iso>`, so one weekly window fires
+once; it is not consumed while the `spare-allowance` backlog — open tasks
+labelled `spare-allowance` and not `dispatched` — is empty), evaluated against `conversation_status` and `device_status` by a
 sweep every five minutes (`src/routines-triggers.js`), as the Coordinator's
 box may see them (private-owned sessions and private boxes are invisible
 to a Coordinator on an ordinary box). Each matching subject (`convo:<id>`
@@ -2527,7 +2534,10 @@ records the subjects fired for and forgets them when they stop matching.
 The fire's `message` is the prompt plus a `Tripped by:` list, one line per
 fresh subject (`- [title](matron://convo/<id>) at 42% of its window
 (420k/1M, model)`, `- […] stalled on <model>, resets <iso> (in 5 h)` / `no reset
-time`, `- <box>: 15% free (15.0 GB of 100.0 GB)`). Pausing a triggered
+time`, `- <box>: 15% free (15.0 GB of 100.0 GB)`, `- Week (all models) at
+32%, resets <iso> (in 9 h); boxes: a, b`). An `allowance_expiring` fire
+adds `Next in the spare-allowance backlog:` and the first three such tasks
+(`- #<num> <title>`). Pausing a triggered
 routine or changing its trigger clears its records. A triggered routine
 fires at most once per 15 minutes — a resting routine still forgets
 subjects that stop matching, and subjects crossing inside the gap are
@@ -2631,7 +2641,9 @@ per user and never again after the user empties the list: `daily-sweep`
 07:05, `session-health` every 2 h, `project-status` 08:00 and 17:00,
 `unseen-digest` 12:00 and 18:00, `deploy-window` 18:30 Mon–Fri, all
 Europe/London, plus the triggered `context-over` (`context_over` 40),
-`stalled-session` (`stalled` 120) and `disk-low` (`disk_under` 20) — each
+`stalled-session` (`stalled` 120), `disk-low` (`disk_under` 20) and
+`spare-allowance` (`allowance_expiring` 70, 6–12 h, envelope 2 spawns per
+fire, no chats, any box) — each
 prompt one line pointing at the Coordinator playbook's section of that
 name.
 
