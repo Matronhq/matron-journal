@@ -187,10 +187,17 @@ export const BACKLOG_LABEL = 'spare-allowance'
 export const DISPATCHED_LABEL = 'dispatched'
 const BACKLOG_SHOWN = 3
 
-export function spareBacklog(db, userId, limit = BACKLOG_SHOWN) {
+// With excludePrivateOwned (a Coordinator on an ordinary box), tasks filed
+// from a private box's conversations are left out, as listItems does for
+// any ordinary agent: the Coordinator could not read or act on them.
+export function spareBacklog(db, userId, { limit = BACKLOG_SHOWN, excludePrivateOwned = false } = {}) {
+  const hidePrivate = excludePrivateOwned
+    ? `AND NOT EXISTS (SELECT 1 FROM conversations cv JOIN private_devices d ON d.id = cv.agent_device_id WHERE cv.id = i.origin_convo_id)`
+    : ''
   return db.prepare(`SELECT num, title FROM items i WHERE user_id=? AND state='open' AND kind='task'
       AND EXISTS (SELECT 1 FROM json_each(i.labels) WHERE value=?)
       AND NOT EXISTS (SELECT 1 FROM json_each(i.labels) WHERE value=?)
+      ${hidePrivate}
     ORDER BY rank LIMIT ?`).all(userId, BACKLOG_LABEL, DISPATCHED_LABEL, limit)
 }
 
@@ -215,12 +222,23 @@ export function trigMessage(prompt, subjects, cap = PROMPT_MAX) {
 // of the backlog it is meant to spend the allowance on.
 export function fireMessage(db, routine, subjects, cap = PROMPT_MAX) {
   if (routine.trigger?.kind !== 'allowance_expiring' || !subjects.length) return trigMessage(routine.prompt, subjects, cap)
-  const tasks = spareBacklog(db, routine.user_id)
-  const tail = tasks.length
-    ? `\n\nNext in the ${BACKLOG_LABEL} backlog:\n${tasks.map((t) => `- #${t.num} ${linkLabel(t.title)}`).join('\n')}`
-    : `\n\nThe ${BACKLOG_LABEL} backlog is empty.`
-  const head = trigMessage(routine.prompt, subjects, cap - tail.length)
-  return head.length + tail.length <= cap ? head + tail : trigMessage(routine.prompt, subjects, cap)
+  const tasks = spareBacklog(db, routine.user_id, { excludePrivateOwned: viewFor(db, routine).excludePrivateOwned })
+  if (!tasks.length) {
+    const tail = `\n\nThe ${BACKLOG_LABEL} backlog is empty.`
+    const head = trigMessage(routine.prompt, subjects, cap - tail.length)
+    return head.length + tail.length <= cap ? head + tail : trigMessage(routine.prompt, subjects, cap)
+  }
+  // Every allowance line first, then as many backlog lines as fit, in order
+  // (the head of the backlog is the one the Coordinator needs most); only
+  // when not even one task fits beside them are allowance lines folded.
+  const lines = tasks.map((t) => `- #${t.num} ${linkLabel(t.title)}`)
+  const tailOf = (keep) => `\n\nNext in the ${BACKLOG_LABEL} backlog:\n${lines.slice(0, keep).join('\n')}`
+  const full = trigMessage(routine.prompt, subjects, cap)
+  for (let keep = lines.length; keep >= 1; keep--) {
+    if (full.length + tailOf(keep).length <= cap) return full + tailOf(keep)
+  }
+  const head = trigMessage(routine.prompt, subjects, cap - tailOf(1).length)
+  return head.length + tailOf(1).length <= cap ? head + tailOf(1) : full
 }
 
 function viewFor(db, routine) {
@@ -254,7 +272,7 @@ export function trippedSubjects(db, routine, { now = Date.now(), coordinatorConv
     for (const s of known) if (!still.has(s)) forget.run(routine.id, s)
     // An allowance with nothing to spend it on is not consumed: it fires
     // when a task lands in the backlog, if that is still inside the window.
-    const idle = routine.trigger.kind === 'allowance_expiring' && !spareBacklog(db, routine.user_id, 1).length
+    const idle = routine.trigger.kind === 'allowance_expiring' && !spareBacklog(db, routine.user_id, { limit: 1, excludePrivateOwned }).length
     const fresh = idle ? [] : matching.filter((s) => !known.has(s.subject))
     if (record) {
       const mark = db.prepare('INSERT OR IGNORE INTO routine_trigger_state(routine_id, subject, tripped_at) VALUES(?,?,?)')

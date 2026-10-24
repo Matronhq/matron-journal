@@ -269,6 +269,15 @@ test('allowance_expiring: grouped by account, fires once per weekly window, only
   assert.match(msg, new RegExp(`Next in the spare-allowance backlog:\n- #${audit.num} Flaky-test hunt: storefront suite$`))
   assert.equal(fireMessage(db, { ...r, trigger: { kind: 'disk_under', pct: 20 } }, first.fresh), trigMessage('p', first.fresh))
   assert.ok(fireMessage(db, r, first.fresh, 120).length <= 120)
+  // Only part of the backlog fits: the head is kept.
+  mk('Second backlog task', ['spare-allowance'])
+  const tight = fireMessage(db, r, first.fresh, msg.length + 5)
+  assert.match(tight, new RegExp(`Next in the spare-allowance backlog:\\n- #${audit.num} [^\\n]+$`))
+  // A task filed from a private box's conversation is invisible to an ordinary Coordinator.
+  upsertConversation(db, { id: 'p-task', ownerUserId: alice.id, title: 'Private', sessionState: 'running', agentDeviceId: priv.deviceId })
+  createItem(db, { userId: alice.id, originDeviceId: priv.deviceId, originConvoId: 'p-task', createdBy: 'agent', kind: 'task', title: 'Private backlog task', labels: ['spare-allowance'], position: 'top' })
+  assert.equal(spareBacklog(db, alice.id, { excludePrivateOwned: true }).some((t) => t.title === 'Private backlog task'), false)
+  assert.equal(spareBacklog(db, alice.id).some((t) => t.title === 'Private backlog task'), true)
 
 })
 
