@@ -112,8 +112,10 @@ export function spawnAskInvolvesPrivate(db, row) {
 
 export function chatAskInvolvesPrivate(db, userId, roomId, targetDeviceId) {
   const row = db.prepare(`SELECT c.agent_device_id AS owner, ca.initiator_device_id AS initiator
-    FROM conversations c LEFT JOIN convo_agents ca ON ca.convo_id = c.id AND ca.agent_device_id = ?
+    FROM conversations c JOIN convo_agents ca ON ca.convo_id = c.id AND ca.agent_device_id = ? AND ca.state = 'awaiting_user'
     WHERE c.id = ? AND c.owner_user_id = ?`).get(targetDeviceId, roomId, userId)
+  // No such waiting ask: not involved, so the answer path gives its usual
+  // 404/409 and the reply says nothing about whether a device is private.
   if (!row) return false
   return isPrivateDevice(db, targetDeviceId) ||
     (row.owner != null && isPrivateDevice(db, row.owner)) ||

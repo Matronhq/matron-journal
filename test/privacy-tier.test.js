@@ -142,3 +142,11 @@ test('convo_upsert: no other device can take over the Coordinator conversation w
   assert.ok(!f.asker.frames.some((x) => x.op === 'error' && x.ref === 'convo_upsert'))
   assert.equal(f.s.db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get('coord').agent_device_id, f.askerDev.deviceId, 'a revoked owner hands it on')
 })
+
+test('consent: answering a chat ask that does not exist is the same answer for a private and an ordinary device', async (t) => {
+  const f = await withPrivateAsker(t)
+  const priv = await answer(f, f.coordDev.token, { kind: 'chat', id: `room/${f.privDev.deviceId}`, decision: 'decline', reason: 'tidy' })
+  const ordinary = await answer(f, f.coordDev.token, { kind: 'chat', id: `room/${f.targetDev.deviceId}`, decision: 'decline', reason: 'tidy' })
+  assert.equal(priv.status, ordinary.status)
+  assert.deepEqual(priv.json, ordinary.json)
+})

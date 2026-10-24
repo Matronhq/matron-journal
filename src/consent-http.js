@@ -78,7 +78,7 @@ export async function handleConsentRoute(ctx, req, res, url, who) {
     if (typeof body.id !== 'string' || !body.id || body.id.length > 128) { json(res, 400, { error: 'bad_request' }); return true }
     if (ordinary) {
       const row = getSpawn(db, body.id)
-      if (row && row.user_id === who.userId && spawnAskInvolvesPrivate(db, row)) { json(res, 404, { error: 'not_found' }); return true }
+      if (row && row.user_id === who.userId && row.state === 'awaiting_user' && spawnAskInvolvesPrivate(db, row)) { json(res, 404, { error: 'not_found' }); return true }
     }
     if (body.decision === 'approve') {
       const row = getSpawn(db, body.id)
