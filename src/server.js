@@ -569,6 +569,7 @@ export function startServer({
   const resolvedGithub = github !== undefined ? github : makeGithub({
     clientId: process.env.MATRON_GITHUB_CLIENT_ID ?? DEFAULT_GITHUB_CLIENT_ID,
     clientSecret: process.env.MATRON_GITHUB_CLIENT_SECRET || null,
+    deviceFlow: process.env.MATRON_GITHUB_DEVICE_FLOW !== '0',
     host: (process.env.MATRON_GITHUB_HOST || 'github.com').toLowerCase(),
   })
   // Static hosting of the web app (spec 2026-09-23 tracker web/teams). The

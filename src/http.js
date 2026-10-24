@@ -357,7 +357,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           user: { id: user.id, name: user.name, is_admin: !!user.is_admin },
           two_factor: { enabled: isTwoFactorEnabled(db, who.userId), required: twoFactorRequiredNow(db, twoFactorBox) },
           github: githubAccountView(db, who.userId),
-          github_linking: { enabled: !!(github && github.enabled), web_flow: !!(github && github.webFlow) },
+          github_linking: { enabled: !!(github && github.enabled), web_flow: !!(github && github.webFlow), device_flow: !!(github && github.deviceFlow) },
         })
       }
       if (await handleCoordinatorRoute({ db, hub }, req, res, url, who)) return
