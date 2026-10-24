@@ -11,6 +11,8 @@ import { getCoordinatorConvoId } from './coordinator.js'
 import { isWakeableDevice } from './wake.js'
 import { predictSpawnRun } from './spawn-model.js'
 import { parseCauses } from './ask-causes.js'
+import { isPrivateDevice } from './db.js'
+import { privateOwnedConvo } from './privacy.js'
 
 export const CONSENT_REASON_MAX = 200
 export const CONSENT_DAILY_CAP_DEFAULT = 20
@@ -97,12 +99,36 @@ const causesField = (text) => {
   return causes ? { causes } : {}
 }
 
+// Does an ask involve a private device (docs/protocol.md "Device privacy")?
+// A spawn ask does when its asking box, its target box or the conversation
+// it was asked from is private; a chat ask when the room's owner, the
+// initiator or the invitee is. An ordinary (non-private) Coordinator never
+// sees such an ask in its list or nudge, and answering one is the same 404
+// as an unknown id: the user answers it, or a private Coordinator does.
+export function spawnAskInvolvesPrivate(db, row) {
+  return isPrivateDevice(db, row.from_device_id) || isPrivateDevice(db, row.target_device_id) ||
+    (row.from_convo_id != null && privateOwnedConvo(db, row.from_convo_id))
+}
+
+export function chatAskInvolvesPrivate(db, userId, roomId, targetDeviceId) {
+  const row = db.prepare(`SELECT c.agent_device_id AS owner, ca.initiator_device_id AS initiator
+    FROM conversations c JOIN convo_agents ca ON ca.convo_id = c.id AND ca.agent_device_id = ? AND ca.state = 'awaiting_user'
+    WHERE c.id = ? AND c.owner_user_id = ?`).get(targetDeviceId, roomId, userId)
+  // No such waiting ask: not involved, so the answer path gives its usual
+  // 404/409 and the reply says nothing about whether a device is private.
+  if (!row) return false
+  return isPrivateDevice(db, targetDeviceId) ||
+    (row.owner != null && isPrivateDevice(db, row.owner)) ||
+    (row.initiator != null && isPrivateDevice(db, row.initiator))
+}
+
 // Every ask awaiting this user's decision, both tables, oldest first. The
 // shape is what the Coordinator's consent_list renders and what the nudge
 // frame carries: enough to decide without opening the card, all of it
 // peer text already sanitised at the ws boundary (names re-sieved here as
-// the pending endpoint does).
-export function listPendingAsks({ db, hub, waker }, userId) {
+// the pending endpoint does). `excludePrivate` drops the asks a private
+// device takes part in, for an ordinary Coordinator.
+export function listPendingAsks({ db, hub, waker }, userId, { excludePrivate = false } = {}) {
   const spawns = db.prepare(`
     SELECT r.id, r.from_device_id, r.from_convo_id, r.target_device_id, r.workdir, r.task, r.topic, r.model, r.effort, r.agent, r.link, r.mission_num, r.causes, r.created_at,
            fd.name AS from_name, td.name AS target_name, fc.title AS from_convo_title, i.num AS item_num
@@ -112,7 +138,7 @@ export function listPendingAsks({ db, hub, waker }, userId) {
     LEFT JOIN conversations fc ON fc.id = r.from_convo_id
     LEFT JOIN items i ON i.id = r.item_id
     WHERE r.user_id=? AND r.state='awaiting_user'
-  `).all(userId).map((r) => ({
+  `).all(userId).filter((r) => !excludePrivate || !spawnAskInvolvesPrivate(db, r)).map((r) => ({
     kind: 'spawn', id: r.id, created_at: r.created_at,
     from_device_id: r.from_device_id, from_name: name(r.from_name), from_convo_id: r.from_convo_id, from_convo_title: name(r.from_convo_title),
     target_device_id: r.target_device_id, target_name: name(r.target_name), target_state: deviceState({ db, hub, waker }, userId, r.target_device_id),
@@ -142,7 +168,7 @@ export function listPendingAsks({ db, hub, waker }, userId) {
     LEFT JOIN conversations tc ON tc.id = ca.target_convo_id
     LEFT JOIN items i ON i.id = ca.item_id
     WHERE ca.state='awaiting_user' AND c.owner_user_id=?
-  `).all(userId).map((r) => {
+  `).all(userId).filter((r) => !excludePrivate || !chatAskInvolvesPrivate(db, userId, r.convo_id, r.agent_device_id)).map((r) => {
     const join = r.initiator_device_id === r.agent_device_id
     // Who is being asked: the invitee, or (for a join) the room's owner.
     const askedDevice = join ? r.room_owner_id : r.agent_device_id
@@ -210,7 +236,8 @@ export function nudgeCoordinator({ db, hub, waker = null }, userId, ask, { asker
     const coord = coordinatorDevice(db, userId)
     if (!coord) return false
     if (askerConvoId != null ? askerConvoId === coord.convoId : askerDeviceId === coord.deviceId) return false
-    const full = listPendingAsks({ db, hub, waker }, userId).find((a) => a.kind === ask.kind && a.id === ask.id)
+    const excludePrivate = !isPrivateDevice(db, coord.deviceId)
+    const full = listPendingAsks({ db, hub, waker }, userId, { excludePrivate }).find((a) => a.kind === ask.kind && a.id === ask.id)
     if (!full) return false
     hub.sendToDevice(userId, coord.deviceId, { kind: 'consent', event: 'pending', ask: full })
     return true

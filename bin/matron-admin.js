@@ -236,7 +236,9 @@ export async function runAdmin(db, argv, deps = {}) {
   // Visibility flag override (spec: agent visibility & privacy). on/off PIN
   // the flag — the bridge's per-hello MATRON_AGENT_PRIVATE assertion is
   // ignored until `auto` releases it. This is what makes admin authoritative:
-  // a deploy that forgot the env var cannot unmark a pinned machine.
+  // a deploy that forgot the env var cannot unmark a pinned machine. The pin
+  // also sets whether the bridge may raise the flag after `auto` (on: yes,
+  // off: no) — an ordinary device can never make itself private.
   if (a === 'device' && b === 'private') {
     const deviceId = Number(argv[2])
     const mode = argv[3]
@@ -245,7 +247,7 @@ export async function runAdmin(db, argv, deps = {}) {
     if (!existing) throw new Error(`no such device: ${deviceId}`)
     if (mode === 'auto') {
       unpinDevicePrivate(db, deviceId)
-      return `device ${deviceId} privacy unpinned — the flag now follows the bridge's hello assertion (MATRON_AGENT_PRIVATE) from its next connect`
+      return `device ${deviceId} privacy unpinned — the flag now follows the bridge's hello assertion (MATRON_AGENT_PRIVATE) from its next connect; a device last pinned off may lower but not raise it`
     }
     pinDevicePrivate(db, deviceId, mode === 'on')
     return `device ${deviceId} pinned private=${mode} — the bridge's hello assertion is ignored until 'auto' releases it`

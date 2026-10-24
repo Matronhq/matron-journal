@@ -754,6 +754,19 @@ export function openDb(path) {
   if (!deviceCols.some((c) => c.name === 'private_pinned')) {
     db.exec('ALTER TABLE devices ADD COLUMN private_pinned INTEGER NOT NULL DEFAULT 0')
   }
+  // `private_eligible` decides whether the bridge's hello may RAISE the flag.
+  // NULL = the device has not said hello yet: its first hello decides (a box
+  // paired with MATRON_AGENT_PRIVATE set comes up private, as before). After
+  // that a hello may only raise the flag on an eligible device (1); lowering
+  // is always allowed and never clears eligibility, so a private box whose
+  // env var goes missing for a restart can come back. An ordinary device
+  // (0) cannot make itself private: being private lifts every sieve, so it
+  // takes the operator (matron-admin device private <id> on). Existing rows
+  // are backfilled from their current flag.
+  if (!deviceCols.some((c) => c.name === 'private_eligible')) {
+    db.exec('ALTER TABLE devices ADD COLUMN private_eligible INTEGER')
+    db.exec('UPDATE devices SET private_eligible = private')
+  }
   // Revoked private devices keep a tombstone. Revocation deletes the
   // devices row (the cascades and the token check depend on that), but the
   // conversations, milestones, items, mission and project statuses a private
@@ -1930,8 +1943,10 @@ export function setDeviceConsentUserOnly(db, deviceId, on) {
 
 // matron-admin's write: sets the value AND takes ownership (pin). Both
 // directions pin — `off` is "force-visible", not "hands off".
+// The pin also sets eligibility, so `auto` afterwards hands back a flag the
+// bridge may keep raising (on) or may not raise (off).
 export function pinDevicePrivate(db, deviceId, value) {
-  db.prepare('UPDATE devices SET private=?, private_pinned=1 WHERE id=?').run(value ? 1 : 0, deviceId)
+  db.prepare('UPDATE devices SET private=?, private_eligible=?, private_pinned=1 WHERE id=?').run(value ? 1 : 0, value ? 1 : 0, deviceId)
 }
 
 // Hands the flag back to the bridge's hello assertion. Deliberately does not
@@ -1943,9 +1958,15 @@ export function unpinDevicePrivate(db, deviceId) {
 // The bridge's per-hello assertion (MATRON_AGENT_PRIVATE on the bridge
 // side). A no-op while pinned. Hello-without-the-field asserts false — a
 // bridge-set flag does NOT survive a re-register without the env var; an
-// admin-set one does (the pin).
+// admin-set one does (the pin). Raising needs eligibility (see
+// private_eligible): the first hello decides it, later ones may only lower
+// the flag of a device that came up ordinary.
 export function applyBridgePrivate(db, deviceId, value) {
-  db.prepare('UPDATE devices SET private=? WHERE id=? AND private_pinned=0').run(value ? 1 : 0, deviceId)
+  const v = value ? 1 : 0
+  db.prepare(`UPDATE devices SET
+      private = CASE WHEN ? = 0 THEN 0 WHEN COALESCE(private_eligible, 1) = 1 THEN 1 ELSE private END,
+      private_eligible = COALESCE(private_eligible, ?)
+    WHERE id=? AND private_pinned=0`).run(v, v, deviceId)
 }
 
 const ITEM_KIND_CHECK_OLD = "CHECK(kind IN ('task','question','decision'))"
