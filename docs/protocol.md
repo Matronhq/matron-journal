@@ -2530,7 +2530,9 @@ labelled `spare-allowance` and not `dispatched` — is empty), or
 tiers; `unused_pct` 1–99, `hours_left` 1–168: the same meter and subject,
 met when any tier has at least `unused_pct`% of it unused with its reset
 at most `hours_left` away, e.g. 50% with 12 h or 25% with 2 h — still once
-per weekly window, the first tier to be met firing it), evaluated against `conversation_status` and `device_status` by a
+per weekly window, the first tier to be met firing it: an allowance
+subject is remembered until an hour after its reset, not just while it
+matches, so dropping between tiers does not re-arm it), evaluated against `conversation_status` and `device_status` by a
 sweep every five minutes (`src/routines-triggers.js`), as the Coordinator's
 box may see them (private-owned sessions and private boxes are invisible
 to a Coordinator on an ordinary box). Each matching subject (`convo:<id>`

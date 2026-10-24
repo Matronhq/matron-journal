@@ -242,6 +242,26 @@ test('allowance_expiring tiers: any tier met fires; the legacy band is unchanged
   assert.equal(allowanceMet({ kind: 'allowance_expiring', pct: 70, from_hours: 6, to_hours: 12 }, 40, 3 * H), false, 'the legacy band keeps its lower bound')
 })
 
+test('allowance_expiring tiers: a window that drops between tiers does not fire again at the later tier', async () => {
+  const { db, alice, maple } = await seedDb()
+  const H = 3600000
+  const reset = Math.round((NOW + 12 * H) / H) * H
+  const report = (percent, at) => upsertDeviceStatus(db, { userId: alice.id, deviceId: maple.deviceId, status: { limits: { as_of: at, lines: [{ id: 'week_all', label: 'Week (all models)', percent, resets_at: new Date(reset).toISOString() }] }, account: { email: 'shared@example.com' } }, reportedAt: at })
+  createRoutine(db, { userId: alice.id, origin: 'seed', fields: validateRoutineFields({ name: 'spare', title: 'S', prompt: 'p', trigger: { kind: 'allowance_expiring', tiers: [{ unused_pct: 50, hours_left: 12 }, { unused_pct: 25, hours_left: 2 }] } }).value, now: NOW })
+  createItem(db, { userId: alice.id, originDeviceId: maple.deviceId, originConvoId: 'coord', createdBy: 'agent', kind: 'task', title: 'Backlog task', labels: ['spare-allowance'] })
+  const routine = getRoutine(db, alice.id, 'spare')
+  report(40, NOW)
+  assert.equal(trippedSubjects(db, routine, { now: NOW, excludePrivateOwned: true }).fresh.length, 1, 'tier 1 fires')
+  report(60, NOW + 5 * H)
+  assert.equal(trippedSubjects(db, routine, { now: NOW + 5 * H, excludePrivateOwned: true }).matching.length, 0, 'between tiers')
+  report(70, NOW + 10.5 * H)
+  assert.equal(trippedSubjects(db, routine, { now: NOW + 10.5 * H, excludePrivateOwned: true }).fresh.length, 0, 'tier 2 is the same window')
+  // The next window is a new subject once this one has reset.
+  report(10, NOW + 14 * H)
+  trippedSubjects(db, routine, { now: NOW + 14 * H, excludePrivateOwned: true })
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM routine_trigger_state WHERE routine_id=?').get(routine.id).n, 0, 'forgotten after the reset')
+})
+
 test('allowance_expiring: grouped by account, fires once per weekly window, only while the backlog has an undispatched task', async () => {
   const { db, alice, maple, jade, priv } = await seedDb()
   const oak = createAgent(db, alice.id, 'oak')

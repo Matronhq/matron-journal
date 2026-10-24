@@ -267,6 +267,17 @@ export function currentSubjects(db, routine, { now = Date.now() } = {}) {
 // routine resting inside its gap) the forgetting still happens, so a
 // subject that clears and crosses again inside the gap fires at the first
 // sweep after it, but nothing is recorded and `fresh` is only a report.
+// An allowance subject is kept until its weekly window has reset, not just
+// while it matches: a tiered trigger can stop matching between tiers (the
+// first fire's sessions spend the unused share) and match again at a later
+// tier, and that must not fire the same window twice. The subject's reset
+// is rounded to the hour, so it is kept an hour past it.
+function allowanceWindowOpen(subject, now) {
+  if (!subject.startsWith('allowance:')) return false
+  const reset = Date.parse(subject.slice(subject.lastIndexOf('@') + 1))
+  return Number.isFinite(reset) && reset + 3600000 > now
+}
+
 export function trippedSubjects(db, routine, { now = Date.now(), coordinatorConvoId = null, excludePrivateOwned = false, record = true } = {}) {
   return db.transaction(() => {
     // Paused (or deleted) since the sweep listed it: nothing is recorded
@@ -277,7 +288,7 @@ export function trippedSubjects(db, routine, { now = Date.now(), coordinatorConv
     const known = new Set(db.prepare('SELECT subject FROM routine_trigger_state WHERE routine_id=?').all(routine.id).map((r) => r.subject))
     const still = new Set(matching.map((s) => s.subject))
     const forget = db.prepare('DELETE FROM routine_trigger_state WHERE routine_id=? AND subject=?')
-    for (const s of known) if (!still.has(s)) forget.run(routine.id, s)
+    for (const s of known) if (!still.has(s) && !allowanceWindowOpen(s, now)) forget.run(routine.id, s)
     // An allowance with nothing to spend it on is not consumed: it fires
     // when a task lands in the backlog, if that is still inside the window.
     const idle = routine.trigger.kind === 'allowance_expiring' && !spareBacklog(db, routine.user_id, { limit: 1, excludePrivateOwned }).length
