@@ -97,7 +97,7 @@ async function released(f, over) {
   return id
 }
 
-function assertReleasedOnce(f, id) {
+function assertReleasedOnce(f, id, { reason = null } = {}) {
   const row = getTransfer(f.s.db, id)
   assert.equal(row.phase, 'released')
   assert.ok(row.released_at)
@@ -106,13 +106,14 @@ function assertReleasedOnce(f, id) {
   assert.equal(events[0].sender, 'journal')
   assert.equal(events[0].blob_ref, null)
   assert.deepEqual(events[0].payload, {
-    name: 'notes.txt', size: DATA.length, sha256: sha(DATA), content_type: 'text/plain', transfer_id: id, from_name: 'box-a', from_convo_id: 'sess-a',
+    name: 'notes.txt', size: DATA.length, sha256: sha(DATA), content_type: 'text/plain', transfer_id: id, from_name: 'box-a', from_convo_id: 'sess-a', reason,
   })
   const ready = frames(f, 'ready')
   assert.equal(ready.length, 1, 'one ready frame')
   assert.equal(ready[0].deviceId, f.b.deviceId)
+  assert.equal(ready[0].frame.transfer_id, id, 'top-level transfer_id, like every transfer frame')
   assert.deepEqual(ready[0].frame.transfer, {
-    id, room_id: 'room', name: 'notes.txt', size: DATA.length, sha256: sha(DATA), content_type: 'text/plain', from_name: 'box-a', from_convo_id: 'sess-a',
+    id, room_id: 'room', name: 'notes.txt', size: DATA.length, sha256: sha(DATA), content_type: 'text/plain', from_name: 'box-a', from_convo_id: 'sess-a', reason,
   })
 }
 
@@ -133,6 +134,16 @@ test('approve, then complete: released exactly once; a repeat complete is a no-o
   const again = await complete(f, id)
   assert.equal(again.status, 200)
   assertReleasedOnce(f, id)
+})
+
+test("the sender's note rides on the ready frame, the room's file event and the catch-up list", async (t) => {
+  const f = await fleet(t)
+  const note = 'the notes you asked for'
+  const id = await released(f, { reason: note })
+  assertReleasedOnce(f, id, { reason: note })
+  const mine = await f.s.http('/transfers?for=me', { token: f.b.token })
+  assert.equal(mine.json.transfers.length, 1)
+  assert.equal(mine.json.transfers[0].reason, note)
 })
 
 test('complete, then approve: released exactly once', async (t) => {
@@ -333,7 +344,7 @@ test('GET /transfers?for=me lists only released, undelivered transfers for a rec
   const mine = await f.s.http('/transfers?for=me', { token: f.b.token })
   assert.equal(mine.status, 200)
   assert.deepEqual(mine.json.transfers, [{
-    id: out, room_id: 'room', name: 'notes.txt', size: DATA.length, sha256: sha(DATA), content_type: 'text/plain', from_name: 'box-a', from_convo_id: 'sess-a',
+    id: out, room_id: 'room', name: 'notes.txt', size: DATA.length, sha256: sha(DATA), content_type: 'text/plain', from_name: 'box-a', from_convo_id: 'sess-a', reason: null,
   }])
   for (const token of [f.c.token, f.a.token]) {
     const other = await f.s.http('/transfers?for=me', { token })

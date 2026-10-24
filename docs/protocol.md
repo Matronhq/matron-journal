@@ -2016,7 +2016,7 @@ Every transfer event sent to a live device takes the shape `{kind:'transfer', ev
 
 | event | to | when |
 |---|---|---|
-| `ready` | every recipient device | released — carries the whole `transfer` object (`id, room_id, name, size, sha256, content_type, from_name, from_convo_id`) so a bridge can file its own card without a follow-up request; an offline recipient box is woken |
+| `ready` | every recipient device | released — carries `transfer_id` like every transfer frame, and the whole `transfer` object (`id, room_id, name, size, sha256, content_type, from_name, from_convo_id, reason`; `id` repeats `transfer_id`, and `reason` is the sender's note from `POST /transfers`, the text the card shows, or `null` when there was none) so a bridge can file its own card without a follow-up request; an offline recipient box is woken |
 | `declined` | the sender | the user or Coordinator declined |
 | `failed` | the sender | the uploaded bytes didn't match the declared sha256 |
 | `delivered` | the sender | a recipient verified its own copy |
@@ -2024,7 +2024,7 @@ Every transfer event sent to a live device takes the shape `{kind:'transfer', ev
 
 A recipient bridge that was offline when `ready` fired catches up with `GET /transfers?for=me` on reconnect — the same information, as a list.
 
-The room itself only ever sees two kinds of durable event for a transfer: a `file` event (sender `journal`, no `blob_ref` — the bytes live behind the transfer id, not a media blob) when it is released, and a plain `text` line in the journal's voice for a decline, a successful delivery, or an expiry, e.g. `` Delivered `notes.txt` (2.0 KB), sha256 verified. ``
+The room itself only ever sees two kinds of durable event for a transfer: a `file` event (sender `journal`, no `blob_ref` — the bytes live behind the transfer id, not a media blob; payload `{name, size, sha256, content_type, transfer_id, from_name, from_convo_id, reason}`, the same values as the `ready` frame's `transfer`) when it is released, and a plain `text` line in the journal's voice for a decline, a successful delivery, or an expiry, e.g. `` Delivered `notes.txt` (2.0 KB), sha256 verified. ``
 
 ### Retention
 

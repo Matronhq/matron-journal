@@ -173,10 +173,13 @@ export function closeTransferConsentItem({ db, hub }, id, { outcome, decidedBy =
 
 // What a recipient bridge needs to fetch and file a released transfer: the
 // `ready` frame's `transfer` and each row of GET /transfers?for=me.
+// `reason` is the sender's note as stored at create (the text the card
+// shows), or null when there was none.
 export function readyTransferView(db, row) {
   return {
     id: row.id, room_id: row.room_id, name: row.name, size: row.size, sha256: row.sha256, content_type: row.content_type,
     from_name: name(db.prepare('SELECT name FROM devices WHERE id=?').get(row.sender_device_id)?.name), from_convo_id: row.from_convo_id,
+    reason: row.reason || null,
   }
 }
 
@@ -196,13 +199,13 @@ export function releaseIfReady({ db, hub, waker = null }, id) {
   try {
     appendAndBroadcast(db, hub, {
       userId: row.user_id, convoId: row.room_id, sender: 'journal', type: 'file',
-      payload: { name: view.name, size: view.size, sha256: view.sha256, content_type: view.content_type, transfer_id: id, from_name: view.from_name, from_convo_id: view.from_convo_id },
+      payload: { name: view.name, size: view.size, sha256: view.sha256, content_type: view.content_type, transfer_id: id, from_name: view.from_name, from_convo_id: view.from_convo_id, reason: view.reason },
     })
   } catch (err) {
     console.error(`transfer: room file event for ${id} failed (the release stands)`, err)
   }
   for (const deviceId of recipientDevices(db, row.room_id, row.sender_device_id)) {
-    hub.sendToDevice(row.user_id, deviceId, { kind: 'transfer', event: 'ready', transfer: view })
+    hub.sendToDevice(row.user_id, deviceId, { kind: 'transfer', event: 'ready', transfer_id: id, transfer: view })
     wakeIfOffline({ db, hub, waker }, row.user_id, deviceId)
   }
   console.log(`journal: transfer released id=${id} room=${row.room_id}`)
