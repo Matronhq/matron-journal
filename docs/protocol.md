@@ -2923,15 +2923,15 @@ predates it ignores the type.
 ### Consent approval (`/consent/pending`, `/consent/answer`)
 
 The Coordinator may answer the
-parked chat invites, join requests and spawn requests that otherwise wait
+parked chat invites, join requests, spawn requests and file transfers that otherwise wait
 for a tap — on the user's behalf and under guardrails the journal enforces.
 Tool permission prompts and secret requests never exist as journal asks,
 so nothing here can reach them.
 
 | Route | Who | Body / query | Returns |
 |---|---|---|---|
-| `GET /consent/pending` | agent, Coordinator only | `?convo_id=<the Coordinator conversation>` | 200 `{pending:[…]}`, oldest first. A spawn row: `{kind:'spawn', id: request_id, created_at, from_device_id, from_name, from_convo_id, from_convo_title, target_device_id, target_name, target_state, workdir, task, topic, model?, link?, mission_num?, item_num?, user_only?, causes?}`. A chat row: `{kind:'chat', id: '<room_id>/<target_device_id>', request:'invite'\|'join', room_id, room_title, target_device_id, from_device_id, from_name, from_convo_id, from_convo_title, to_device_id, to_name, to_convo_id, to_convo_title, target_state, topic, justification, item_num?, user_only?, causes?}` — `id` is the same pair the consent link `matron://consent/chat/<room>/<device>` carries, and `POST /agent-chat/answer` keys on. `target_state` is `online` (a live socket), `asleep` (no socket, but the box can be woken) or `offline`. `causes` is the list the asking bridge stamped on the ask (below), omitted when it stamped none. |
-| `POST /consent/answer` | agent, Coordinator only | `{convo_id, kind:'chat'\|'spawn', id, decision:'approve'\|'decline', reason}` | 200 `{ok:true}` (`delivered` too for a chat approval, as `/agent-chat/answer`). |
+| `GET /consent/pending` | agent, Coordinator only | `?convo_id=<the Coordinator conversation>` | 200 `{pending:[…]}`, oldest first. A spawn row: `{kind:'spawn', id: request_id, created_at, from_device_id, from_name, from_convo_id, from_convo_title, target_device_id, target_name, target_state, workdir, task, topic, model?, link?, mission_num?, item_num?, user_only?, causes?}`. A chat row: `{kind:'chat', id: '<room_id>/<target_device_id>', request:'invite'\|'join', room_id, room_title, target_device_id, from_device_id, from_name, from_convo_id, from_convo_title, to_device_id, to_name, to_convo_id, to_convo_title, target_state, topic, justification, item_num?, user_only?, causes?}` — `id` is the same pair the consent link `matron://consent/chat/<room>/<device>` carries, and `POST /agent-chat/answer` keys on. `target_state` is `online` (a live socket), `asleep` (no socket, but the box can be woken) or `offline`. `causes` is the list the asking bridge stamped on the ask (below), omitted when it stamped none. A transfer row: `{kind:'transfer', id: transfer_id, created_at, from_device_id, from_name, from_convo_id, from_convo_title, room_id, room_title, to_names[], name, size, sha256, scan_verdict, scan_findings:[{kind,line}], reason, item_num, user_only?}` (see File transfers). |
+| `POST /consent/answer` | agent, Coordinator only | `{convo_id, kind:'chat'\|'spawn'\|'transfer', id, decision:'approve'\|'decline', reason}` | 200 `{ok:true}` (`delivered` too for a chat approval, as `/agent-chat/answer`). |
 
 **Gate**, in order, every failure a bare error body: a client connection
 **403** `forbidden`; a bad shape **400**; `convo_id` not a top-level
