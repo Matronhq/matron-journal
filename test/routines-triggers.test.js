@@ -6,7 +6,7 @@ import { setCoordinatorConvoId } from '../src/coordinator.js'
 import { upsertConversation } from '../src/journal.js'
 import { upsertConvoStatus } from '../src/convo-status.js'
 import { validateRoutineFields, createRoutine, getRoutine, seedRoutines, listRoutines, STARTER_ROUTINES, TRIGGER_KINDS } from '../src/routines.js'
-import { evaluateTrigger, trippedSubjects, trigMessage, fireMessage, describeTrigger, contextWindowOf, isCodexModel, spareBacklog } from '../src/routines-triggers.js'
+import { evaluateTrigger, trippedSubjects, trigMessage, fireMessage, describeTrigger, allowanceMet, contextWindowOf, isCodexModel, spareBacklog } from '../src/routines-triggers.js'
 import { createItem } from '../src/items.js'
 import { startTestServer, makeWsClient } from './helpers.js'
 
@@ -216,6 +216,52 @@ test('validateTrigger: allowance_expiring takes a percent and an optional 6–12
   assert.equal(describeTrigger({ kind: 'allowance_expiring', pct: 70, from_hours: 6, to_hours: 12 }), 'when a weekly limit resets within 6–12 h and is under 70%')
 })
 
+test('validateTrigger: allowance_expiring takes 1–4 tiers of unused percent and hours left', () => {
+  const base = { name: 'spare', title: 'Spare', prompt: 'p' }
+  const v = (trigger) => validateRoutineFields({ ...base, trigger })
+  const tiers = [{ unused_pct: 50, hours_left: 12 }, { unused_pct: 25, hours_left: 2 }]
+  assert.deepEqual(v({ kind: 'allowance_expiring', tiers }).value.trigger, { kind: 'allowance_expiring', tiers })
+  const t = (x) => ({ kind: 'allowance_expiring', tiers: [x] })
+  for (const bad of [{ kind: 'allowance_expiring', tiers: [] }, { kind: 'allowance_expiring', tiers: 'x' }, { kind: 'allowance_expiring', tiers, pct: 70 },
+    { kind: 'allowance_expiring', tiers, from_hours: 6 }, { kind: 'allowance_expiring', tiers: Array(5).fill(tiers[0]) },
+    t({ unused_pct: 0, hours_left: 2 }), t({ unused_pct: 100, hours_left: 2 }), t({ unused_pct: 50, hours_left: 0 }), t({ unused_pct: 50, hours_left: 169 }),
+    t({ unused_pct: 50.5, hours_left: 2 }), t({ unused_pct: 50 }), t({ unused_pct: 50, hours_left: 2, pct: 3 }), t(null), t([50, 2])]) {
+    assert.equal(v(bad).ok, false, JSON.stringify(bad))
+  }
+  assert.equal(describeTrigger({ kind: 'allowance_expiring', tiers }), 'when a weekly limit has 50% unused with 12 h left or 25% unused with 2 h left')
+})
+
+test('allowance_expiring tiers: any tier met fires; the legacy band is unchanged', () => {
+  const H = 3600000
+  const tiers = [{ unused_pct: 50, hours_left: 12 }, { unused_pct: 25, hours_left: 2 }]
+  const trig = { kind: 'allowance_expiring', tiers }
+  // [percent used, hours to reset, fires?]
+  for (const [pct, h, want] of [[40, 11, true], [50, 12, true], [51, 11, false], [40, 13, false], [70, 2, true], [75, 1, true], [76, 1, false], [70, 3, false], [10, 0.1, true]]) {
+    assert.equal(allowanceMet(trig, pct, h * H), want, `${pct}% used, ${h} h left`)
+  }
+  assert.equal(allowanceMet({ kind: 'allowance_expiring', pct: 70, from_hours: 6, to_hours: 12 }, 40, 3 * H), false, 'the legacy band keeps its lower bound')
+})
+
+test('allowance_expiring tiers: a window that drops between tiers does not fire again at the later tier', async () => {
+  const { db, alice, maple } = await seedDb()
+  const H = 3600000
+  const reset = Math.round((NOW + 12 * H) / H) * H
+  const report = (percent, at) => upsertDeviceStatus(db, { userId: alice.id, deviceId: maple.deviceId, status: { limits: { as_of: at, lines: [{ id: 'week_all', label: 'Week (all models)', percent, resets_at: new Date(reset).toISOString() }] }, account: { email: 'shared@example.com' } }, reportedAt: at })
+  createRoutine(db, { userId: alice.id, origin: 'seed', fields: validateRoutineFields({ name: 'spare', title: 'S', prompt: 'p', trigger: { kind: 'allowance_expiring', tiers: [{ unused_pct: 50, hours_left: 12 }, { unused_pct: 25, hours_left: 2 }] } }).value, now: NOW })
+  createItem(db, { userId: alice.id, originDeviceId: maple.deviceId, originConvoId: 'coord', createdBy: 'agent', kind: 'task', title: 'Backlog task', labels: ['spare-allowance'] })
+  const routine = getRoutine(db, alice.id, 'spare')
+  report(40, NOW)
+  assert.equal(trippedSubjects(db, routine, { now: NOW, excludePrivateOwned: true }).fresh.length, 1, 'tier 1 fires')
+  report(60, NOW + 5 * H)
+  assert.equal(trippedSubjects(db, routine, { now: NOW + 5 * H, excludePrivateOwned: true }).matching.length, 0, 'between tiers')
+  report(70, NOW + 10.5 * H)
+  assert.equal(trippedSubjects(db, routine, { now: NOW + 10.5 * H, excludePrivateOwned: true }).fresh.length, 0, 'tier 2 is the same window')
+  // The next window is a new subject once this one has reset.
+  report(10, NOW + 14 * H)
+  trippedSubjects(db, routine, { now: NOW + 14 * H, excludePrivateOwned: true })
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM routine_trigger_state WHERE routine_id=?').get(routine.id).n, 0, 'forgotten after the reset')
+})
+
 test('allowance_expiring: grouped by account, fires once per weekly window, only while the backlog has an undispatched task', async () => {
   const { db, alice, maple, jade, priv } = await seedDb()
   const oak = createAgent(db, alice.id, 'oak')
@@ -289,7 +335,7 @@ test('seedRoutines: the starter set includes the three trigger routines', async 
   assert.deepEqual(byName['context-over'].trigger, { kind: 'context_over', pct: 40 })
   assert.deepEqual(byName['stalled-session'].trigger, { kind: 'stalled', reset_minutes: 120 })
   assert.deepEqual(byName['disk-low'].trigger, { kind: 'disk_under', pct: 20 })
-  assert.deepEqual(byName['spare-allowance'].trigger, { kind: 'allowance_expiring', pct: 70, from_hours: 6, to_hours: 12 })
+  assert.deepEqual(byName['spare-allowance'].trigger, { kind: 'allowance_expiring', tiers: [{ unused_pct: 50, hours_left: 12 }, { unused_pct: 25, hours_left: 2 }] })
   assert.deepEqual(byName['spare-allowance'].envelope, { spawns_per_fire: 2, chats: false, boxes: null })
   for (const n of ['context-over', 'stalled-session', 'disk-low', 'spare-allowance']) {
     assert.equal(byName[n].schedule, null); assert.equal(byName[n].next_at, null)

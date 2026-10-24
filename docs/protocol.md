@@ -2525,7 +2525,14 @@ Codex `… · Weekly` line — under `pct`% whose reset is `from_hours` to
 as the highest percent and the freshest report's reset; the subject is
 `allowance:<account or device>@<reset iso>`, so one weekly window fires
 once; it is not consumed while the `spare-allowance` backlog — open tasks
-labelled `spare-allowance` and not `dispatched` — is empty), evaluated against `conversation_status` and `device_status` by a
+labelled `spare-allowance` and not `dispatched` — is empty), or
+`{kind:'allowance_expiring', tiers:[{unused_pct, hours_left}, …]}` (1–4
+tiers; `unused_pct` 1–99, `hours_left` 1–168: the same meter and subject,
+met when any tier has at least `unused_pct`% of it unused with its reset
+at most `hours_left` away, e.g. 50% with 12 h or 25% with 2 h — still once
+per weekly window, the first tier to be met firing it: an allowance
+subject is remembered until an hour after its reset, not just while it
+matches, so dropping between tiers does not re-arm it), evaluated against `conversation_status` and `device_status` by a
 sweep every five minutes (`src/routines-triggers.js`), as the Coordinator's
 box may see them (private-owned sessions and private boxes are invisible
 to a Coordinator on an ordinary box). Each matching subject (`convo:<id>`
@@ -2642,7 +2649,7 @@ per user and never again after the user empties the list: `daily-sweep`
 `unseen-digest` 12:00 and 18:00, `deploy-window` 18:30 Mon–Fri, all
 Europe/London, plus the triggered `context-over` (`context_over` 40),
 `stalled-session` (`stalled` 120), `disk-low` (`disk_under` 20) and
-`spare-allowance` (`allowance_expiring` 70, 6–12 h, envelope 2 spawns per
+`spare-allowance` (`allowance_expiring` tiers 50% unused with 12 h left or 25% with 2 h, envelope 2 spawns per
 fire, no chats, any box) — each
 prompt one line pointing at the Coordinator playbook's section of that
 name.
