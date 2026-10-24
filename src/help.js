@@ -223,7 +223,8 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   \`schedule\` (5-field cron in \`tz\`) or when a \`trigger\` trips
   (\`{kind: context_over|disk_under, pct}\`, \`{kind: stalled,
   reset_minutes}\` or \`{kind: allowance_expiring, pct, from_hours?,
-  to_hours?}\`), by \`name\`. \`GET /routines/:name\` (or the \`rt_…\` id)
+  to_hours?}\` or \`{kind: allowance_expiring, tiers: [{unused_pct,
+  hours_left}]}\`), by \`name\`. \`GET /routines/:name\` (or the \`rt_…\` id)
   → \`{routine}\` with \`enabled\`, \`next_at\`, \`last_fired_at\`,
   \`last_outcome\`.
 - \`POST /routines\` \`{name, title, schedule | trigger, prompt (≤2000),

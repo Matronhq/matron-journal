@@ -42,7 +42,7 @@ export const STARTER_ROUTINES = Object.freeze([
   { name: 'disk-low', title: 'Box disk under the threshold', trigger: { kind: 'disk_under', pct: 20 }, prompt: 'Routine disk-low: follow the Box disk under the threshold section of your playbook.' },
   // Spends a weekly allowance that would otherwise expire on the
   // spare-allowance backlog: up to two sessions a fire, no chats.
-  { name: 'spare-allowance', title: 'Spare weekly allowance before its reset', trigger: { kind: 'allowance_expiring', pct: 70 }, envelope: { spawns_per_fire: 2, chats: false, boxes: null }, prompt: 'Routine spare-allowance: follow the Spare weekly allowance section of your playbook.' },
+  { name: 'spare-allowance', title: 'Spare weekly allowance before its reset', trigger: { kind: 'allowance_expiring', tiers: [{ unused_pct: 50, hours_left: 12 }, { unused_pct: 25, hours_left: 2 }] }, envelope: { spawns_per_fire: 2, chats: false, boxes: null }, prompt: 'Routine spare-allowance: follow the Spare weekly allowance section of your playbook.' },
 ])
 
 // Triggers (spec "Triggers"): what a routine can fire on instead of a clock.
@@ -54,12 +54,18 @@ export const STARTER_ROUTINES = Object.freeze([
 //                             an account's weekly meter under pct% with its
 //                             reset from_hours..to_hours away (default 6..12),
 //                             while the spare-allowance backlog has a task
+//   allowance_expiring {tiers: [{unused_pct, hours_left}, …]}
+//                             the same, met by any tier: at least unused_pct%
+//                             of the meter left with its reset at most
+//                             hours_left away (1..4 tiers, e.g. 50% with 12 h,
+//                             25% with 2 h); still once per weekly window
 export const TRIGGER_KINDS = Object.freeze(['context_over', 'stalled', 'disk_under', 'allowance_expiring'])
 const STALLED_DEFAULT_MINUTES = 120
 const STALLED_MAX_MINUTES = 7 * 24 * 60
 export const ALLOWANCE_FROM_HOURS = 6
 export const ALLOWANCE_TO_HOURS = 12
 const WEEK_HOURS = 7 * 24
+export const ALLOWANCE_TIERS_MAX = 4
 
 export function validateTrigger(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
@@ -70,6 +76,19 @@ export function validateTrigger(raw) {
     const m = raw.reset_minutes === undefined ? STALLED_DEFAULT_MINUTES : raw.reset_minutes
     if (!Number.isInteger(m) || m < 0 || m > STALLED_MAX_MINUTES) return null
     return { kind: 'stalled', reset_minutes: m }
+  }
+  if (raw.kind === 'allowance_expiring' && raw.tiers !== undefined) {
+    if (keys.some((k) => !['kind', 'tiers'].includes(k))) return null
+    if (!Array.isArray(raw.tiers) || raw.tiers.length < 1 || raw.tiers.length > ALLOWANCE_TIERS_MAX) return null
+    const tiers = []
+    for (const t of raw.tiers) {
+      if (!t || typeof t !== 'object' || Array.isArray(t)) return null
+      if (Object.keys(t).some((k) => t[k] !== undefined && !['unused_pct', 'hours_left'].includes(k))) return null
+      if (!Number.isInteger(t.unused_pct) || t.unused_pct < 1 || t.unused_pct > 99) return null
+      if (!Number.isInteger(t.hours_left) || t.hours_left < 1 || t.hours_left > WEEK_HOURS) return null
+      tiers.push({ unused_pct: t.unused_pct, hours_left: t.hours_left })
+    }
+    return { kind: 'allowance_expiring', tiers }
   }
   if (raw.kind === 'allowance_expiring') {
     if (keys.some((k) => !['kind', 'pct', 'from_hours', 'to_hours'].includes(k))) return null

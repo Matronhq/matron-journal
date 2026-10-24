@@ -63,6 +63,7 @@ export function describeTrigger(t) {
   if (!t || typeof t !== 'object') return 'no trigger'
   if (t.kind === 'context_over') return `when a session passes ${t.pct}% of its context window`
   if (t.kind === 'disk_under') return `when a box drops under ${t.pct}% free disk`
+  if (t.kind === 'allowance_expiring' && Array.isArray(t.tiers)) return `when a weekly limit has ${t.tiers.map((x) => `${x.unused_pct}% unused with ${x.hours_left} h left`).join(' or ')}`
   if (t.kind === 'allowance_expiring') return `when a weekly limit resets within ${t.from_hours}–${t.to_hours} h and is under ${t.pct}%`
   if (t.kind === 'stalled') return t.reset_minutes > 0 ? `when a session stalls on a usage limit with no reset within ${inWords(t.reset_minutes * 60000)}` : 'when a session stalls on a usage limit'
   return 'no trigger'
@@ -144,6 +145,13 @@ export function evaluateTrigger(db, userId, trigger, { now = Date.now(), coordin
 // at most once and the next window is a new subject.
 const isWeekly = (l) => l?.id === 'week_all' || (typeof l?.id === 'string' && l.id.startsWith('codex:') && /· Weekly$/.test(l.label || ''))
 
+// Tiers: any tier met is enough; the window is from now to hours_left out.
+// The legacy form is one band: under pct% used, from_hours..to_hours away.
+export function allowanceMet(trigger, percent, left) {
+  if (Array.isArray(trigger.tiers)) return trigger.tiers.some((t) => 100 - percent >= t.unused_pct && left <= t.hours_left * 3600000)
+  return percent < trigger.pct && left >= trigger.from_hours * 3600000 && left <= trigger.to_hours * 3600000
+}
+
 function expiringAllowances(db, userId, trigger, { now, excludePrivateOwned }) {
   const statuses = deviceStatuses(db, userId)
   const devices = db.prepare("SELECT id, name, private FROM devices WHERE user_id=? AND kind='agent' ORDER BY name").all(userId)
@@ -169,7 +177,7 @@ function expiringAllowances(db, userId, trigger, { now, excludePrivateOwned }) {
   const out = []
   for (const g of groups.values()) {
     const left = g.resetAt - now
-    if (g.percent >= trigger.pct || left < trigger.from_hours * 3600000 || left > trigger.to_hours * 3600000) continue
+    if (!allowanceMet(trigger, g.percent, left)) continue
     const boxes = [...new Set(g.boxes)].join(', ')
     // Boxes on one account report the same reset a minute apart (11:59 and
     // 12:00, as their /usage text rounds); the subject takes the nearest
