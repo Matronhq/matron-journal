@@ -1039,7 +1039,12 @@ Rows from before the stamp carry neither, and don't count.
   own sessions — **except when the recorded owner is a private device**
   (see "Device privacy" below): there, an ordinary caller's takeover is
   refused instead, and a conversation with no recorded owner (legacy NULL)
-  stays writable by anyone. Accepted trade-off for v1: a re-paired owner
+  stays writable by anyone. **The user's designated Coordinator conversation
+  never changes hands this way**: while its recorded device still exists,
+  any other device's upsert of it is refused with the same `forbidden`,
+  private callers included, because the Coordinator's authority follows
+  that device. A re-paired Coordinator bridge gets it back once the old
+  device is revoked, or the user designates a new Coordinator conversation. Accepted trade-off for v1: a re-paired owner
   (new device id after a bridge restart pairs fresh) can no longer reclaim
   a room it created once that room has participant history, because the
   gate sees a mismatched non-NULL owner and a populated `convo_agents`
@@ -2826,6 +2831,10 @@ conversation this device owns **404**; not `user_settings.coordinator_convo_id`
 1–200 characters after the usual peer-text sanitising — and is the audit
 line the user reads; the ask must exist (**404**, unknown and another
 user's indistinguishable) and still be `awaiting_user` (**409** `conflict`).
+An ordinary (non-private) Coordinator answering an ask a private device
+takes part in gets the same **404** as an unknown ask, for a decline too;
+such asks are also left out of its `GET /consent/pending` and its nudge
+(see "Device privacy").
 Then, for an **approval** only, in this order: an ask a **user-only box**
 takes part in is **403** `{detail:'user_only'}` (below); a **spawn** into a
 target box that is `offline` (no socket and no wake possible) is **409**
@@ -3337,7 +3346,8 @@ on one agent box gets when nobody names them. Three nullable columns on
 
 Any of the user's devices may read or write any of the user's agent boxes —
 the apps from Settings ▸ Devices, the Coordinator from chat through its own
-bridge's token. `:id` must be one of the user's devices: unknown or another
+bridge's token — except that an ordinary agent gets 404 for a private box
+(see "Device privacy"). `:id` must be one of the user's devices: unknown or another
 user's is 404 `not_found`; the user's own client device is 400
 `{error:'not_agent_device'}`. Values are trimmed and lowercased:
 
@@ -4850,21 +4860,34 @@ malformed value gets no such leniency from either kind. Omitting the field
 asserts `false`: an unpinned flag follows the hello assertion exactly,
 including its removal — bridge-set privacy does NOT survive a re-register
 without the env var.
+**Only the first hello may raise it.** Being private lifts every sieve
+below, so a device must not be able to promote itself: `devices.private_eligible`
+(nullable) records whether the bridge's hello may set `private=1`. It is
+`NULL` until the device's first hello, which decides it — a box paired with
+`MATRON_AGENT_PRIVATE` set comes up private exactly as before, an ordinary
+box comes up ordinary for good. After that a hello may always **lower** the
+flag and may **raise** it only on an eligible device (`1`); lowering never
+clears eligibility, so a private box whose env var went missing for one
+restart comes back private on the next. A device that came up ordinary and
+should become private takes the operator: `matron-admin device private <id> on`.
+Rows that existed before the column are backfilled from their current flag.
 `matron-admin device private <device_id> on|off|auto` is the authoritative
 override: `on`/`off` both PIN the flag (`private_pinned=1`) — `off` is
 "force-visible", not "hands off" — so a deploy that forgot the env var can
 never silently unmark a pinned machine; `auto` releases the pin and hands the
-flag back to the next hello, without itself changing the value.
+flag back to the next hello, without itself changing the value. The pin
+also sets eligibility (`on` → eligible, `off` → not), so after `auto` a box
+last pinned `off` may lower but not raise its flag.
 `matron-admin device list` renders `private=yes|no`, with a `(pinned)` suffix
 when pinned.
 
-**The enforced surfaces — one caller rule, ten enforcement points.** Every
+**The enforced surfaces — one caller rule, twelve enforcement points.** Every
 rule is conditioned on the identical predicate: filtering applies **only
 when the caller is an ordinary (non-private) agent**. `kind='client'`
 callers are never filtered, and a private agent caller is never filtered
 either — it is invisible, not blinded, so two private agents see each other
 and a private agent still gets the whole unfiltered roster/search/room set.
-The ten:
+The twelve:
 
 - **`GET /roster`** — omits private agent devices and every top-level
   conversation whose `agent_device_id` is private.
@@ -4936,6 +4959,17 @@ The ten:
   caller, via an `excludePrivateDevices` option computed with the same
   predicate at the HTTP layer; a client or a private agent caller gets the
   unfiltered list, byte-identical to today.
+- **`GET`/`PUT /devices/:id/defaults`** — a private agent device is the
+  same 404 `not_found` an unknown id gets, on both methods, so an ordinary
+  agent can neither find a private box by probing ids nor change its
+  defaults.
+- **Coordinator consent** — `GET /consent/pending` and the live
+  `consent`/`pending` nudge leave out every ask a private device takes part
+  in (a spawn ask whose asking box, target box or asking conversation is
+  private; a chat ask whose room owner, initiator or invitee is), and
+  `POST /consent/answer` on such an ask is 404 `not_found` for approve and
+  decline alike — when the Coordinator's own device is ordinary. The user's
+  tap, and a private Coordinator, see and answer everything.
 
 **Byte-identical, deliberately — with one accepted exception.** Every
 filtered surface's refusal is indistinguishable from the same surface's

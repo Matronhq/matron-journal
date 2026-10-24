@@ -15,6 +15,9 @@
 // (src/consent-own-ask.js: own_ask_unverified, envelope, verifier,
 // verifier_unavailable, routine_cap); approvals at the rolling 24 h cap are
 // 409 daily_cap (a cap of 0 is no cap). Declines skip every approval check.
+// An ordinary (non-private) Coordinator neither lists nor answers an ask a
+// private device takes part in: such an ask is left out of the list and is
+// 404 on answer, approve or decline (docs/protocol.md "Device privacy").
 // Nothing here can reach a tool permission prompt or a secret request —
 // those never exist as journal asks.
 import { json, readBody } from './http-body.js'
@@ -23,8 +26,9 @@ import { getCoordinatorConvoId } from './coordinator.js'
 import {
   CONSENT_REASON_MAX, CONSENT_DAILY_CAP_DEFAULT, CONSENT_DAILY_WINDOW_MS, CONSENT_KINDS, CONSENT_DECISIONS,
   getConsentEnabled, listPendingAsks, parseChatAskId, coordinatorApprovalsSince, deviceState,
-  isUserOnlySpawn, isUserOnlyChat,
+  isUserOnlySpawn, isUserOnlyChat, spawnAskInvolvesPrivate, chatAskInvolvesPrivate,
 } from './consent.js'
+import { filteredAgent } from './privacy.js'
 import { answerChatAsk, answerSpawnAsk } from './consent-answer.js'
 import { verifyOwnAsk, confirmOwnAsk, spawnAsk, chatAsk } from './consent-own-ask.js'
 import { getSpawn } from './spawns.js'
@@ -55,7 +59,7 @@ export async function handleConsentRoute(ctx, req, res, url, who) {
   if (req.method === 'GET' && url.pathname === '/consent/pending') {
     const gate = coordinatorCaller(db, who, url.searchParams.get('convo_id'))
     if (!gate.ok) return refuse(res, gate)
-    json(res, 200, { pending: listPendingAsks({ db, hub, waker }, who.userId) })
+    json(res, 200, { pending: listPendingAsks({ db, hub, waker }, who.userId, { excludePrivate: filteredAgent(db, who) }) })
     return true
   }
   if (req.method !== 'POST' || url.pathname !== '/consent/answer') return false
@@ -67,10 +71,15 @@ export async function handleConsentRoute(ctx, req, res, url, who) {
   const reason = sanitizePeerText(body.reason, CONSENT_REASON_MAX)
   if (!reason) { json(res, 400, { error: 'bad_request' }); return true }
   const decidedBy = { kind: 'coordinator', deviceId: who.deviceId, convoId: body.convo_id, reason }
+  const ordinary = filteredAgent(db, who)
   // Every refusal comes BEFORE any state changes, so a refused answer
   // leaves the ask exactly as it was — for the user.
   if (body.kind === 'spawn') {
     if (typeof body.id !== 'string' || !body.id || body.id.length > 128) { json(res, 400, { error: 'bad_request' }); return true }
+    if (ordinary) {
+      const row = getSpawn(db, body.id)
+      if (row && row.user_id === who.userId && spawnAskInvolvesPrivate(db, row)) { json(res, 404, { error: 'not_found' }); return true }
+    }
     if (body.decision === 'approve') {
       const row = getSpawn(db, body.id)
       if (!row || row.user_id !== who.userId) { json(res, 404, { error: 'not_found' }); return true }
@@ -88,6 +97,7 @@ export async function handleConsentRoute(ctx, req, res, url, who) {
   }
   const key = parseChatAskId(body.id)
   if (!key) { json(res, 400, { error: 'bad_request' }); return true }
+  if (ordinary && chatAskInvolvesPrivate(db, who.userId, key.roomId, key.targetDeviceId)) { json(res, 404, { error: 'not_found' }); return true }
   if (body.decision === 'approve') {
     if (isUserOnlyChat(db, who.userId, key.roomId, key.targetDeviceId)) return forbidden(res, 'user_only')
     const ask = chatAsk(db, who, body, key)

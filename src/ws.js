@@ -26,7 +26,7 @@ import { recordCarryOn, recordRoomPublish } from './cause-hops.js'
 import { wakeIfOffline as wakeIfOfflineShared, wakeConvoAgent as wakeConvoAgentShared, isWakeableDevice } from './wake.js'
 import { listPins, isSuccessorOfAPin, pinHintBeforeAppend, sendPinsFrame } from './pins.js'
 import { archiveChanges, sendArchiveFrame } from './archive.js'
-import { coordinatorFor } from './coordinator.js'
+import { coordinatorFor, getCoordinatorConvoId } from './coordinator.js'
 import { withdrawForQueuedCancel } from './withdrawn-comments.js'
 import { getMission } from './missions.js'
 import { sanitizeConvoStatus, upsertConvoStatus } from './convo-status.js'
@@ -1962,6 +1962,16 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           // owner can't reach this branch at all (the outer condition above
           // already requires agent_device_id !== conn.deviceId).
           if (isPrivateDevice(db, existingRoom.agent_device_id) && !isPrivateDevice(db, conn.deviceId)) {
+            return fail('forbidden', 'only the room owner may upsert a room')
+          }
+          // Coordinator takeover guard. The Coordinator's authority (consent
+          // answers, session control, routines) follows the device recorded
+          // on the conversation the user designated, so no other device may
+          // take that conversation over while its owner still exists — not
+          // even a private one. A re-paired Coordinator bridge gets it back
+          // once the old device is revoked, or the user designates a new one.
+          if (getCoordinatorConvoId(db, conn.userId) === msg.convo_id &&
+              db.prepare('SELECT 1 FROM devices WHERE id=?').get(existingRoom.agent_device_id)) {
             return fail('forbidden', 'only the room owner may upsert a room')
           }
         }
