@@ -3994,18 +3994,21 @@ is `404 not_configured`),
 belong to the same OAuth App as `MATRON_GITHUB_CLIENT_ID`, so a journal
 that sets a secret also sets its own app's client id; the default id has
 no secret to pair with),
+`MATRON_GITHUB_DEVICE_FLOW` (set to `0` to turn the device flow off; it is
+also off whenever a client secret is set, so a journal with the web flow
+offers only the web flow),
 `MATRON_GITHUB_HOST` (default `github.com`). The token scope is `read:org`.
 
 | Route | Body / query | Response |
 |---|---|---|
-| `POST /github/link` | `{flow:'device'}` | `{flow_id, user_code, verification_uri, interval, expires_in}` |
+| `POST /github/link` | `{flow:'device'}` (400 when the device flow is off) | `{flow_id, user_code, verification_uri, interval, expires_in}` |
 | `POST /github/link` | `{flow:'web'}` (400 without a client secret) | `{url}` — send the browser there |
-| `POST /github/link/:flow_id/poll` | — | `{status:'pending', interval?}` \| `{status:'linked', github}` \| `{status:'denied'\|'expired'}`; 404 unknown/finished/another user's; 409 if the GitHub account is linked to another user; 502 `upstream` if GitHub is unreachable |
+| `POST /github/link/:flow_id/poll` | — | `{status:'pending', interval?}` \| `{status:'linked', github}` \| `{status:'denied'\|'expired'}`; 404 unknown/finished/another user's, or once the device flow is off; 409 if the GitHub account is linked to another user; 502 `upstream` if GitHub is unreachable |
 | `GET /github/callback?code&state` | no Bearer; `state` is the single-use flow credential | **200 HTML confirm page** naming the GitHub login and the journal user, with the token parked on a `github_link_confirms` row (10 min, single-use nonce) — nothing is linked yet; or 302 to `/app/account?link_error=<expired\|bad_request\|conflict\|upstream\|not_configured>` |
 | `POST /github/callback/confirm` | no Bearer; form or JSON `{nonce, decision:'link'\|'cancel'}` — the nonce is the credential | 302 to `/app/account?linked=1` (linked) or `/app/account?link_error=<denied\|expired\|bad_request\|conflict\|not_configured>`; the parked token is deleted either way |
 | `POST /github/refresh` | — | `{github}`; marks the link `stale` on 401/403 from GitHub; 502 `upstream` if unreachable (nothing changes); 404 if this user has no linked account |
 | `DELETE /github/link` | — | `{ok:true}`; 404 if not linked |
-| `GET /me` | — | `{user:{id,name,is_admin}, github: {…} \| null, github_linking:{enabled, web_flow}}` |
+| `GET /me` | — | `{user:{id,name,is_admin}, github: {…} \| null, github_linking:{enabled, web_flow, device_flow}}` |
 | `GET /lookup?user=<name>&num=<n>` | also `GET /u/<name>/<n>` with `Accept: application/json` | `{kind:'item'\|'mission'\|'milestone'\|'project', id, num, title, owner:{user_id,name}}`; 404 unknown or invisible. `num` and `title` are the row's own, so a "go to number" field or a search box can label the hit without a second read. A milestone also carries `mission: {id, num}`, the mission it sits on, when the caller may read that mission. A merged project resolves to the project it was merged into, with `merged_from: <the id asked for>`. |
 
 Why the confirm page: an authorize URL can be handed to anyone, and GitHub's
@@ -4015,7 +4018,11 @@ is saved. The device flow has no equivalent hook (the authorizer only sees
 GitHub's device page), so a `user_code` handed to a victim can bind their
 identity to the attacker's journal account; the guards there are the 409 on
 an identity already linked elsewhere and the admin's ability to clear a
-link. Prefer the web flow where an OAuth App can be registered.
+link. No confirm step can close this: a prompt shown to the journal user
+who started the flow is shown to the very person who handed the code out.
+So the journal turns the device flow off wherever the web flow is
+configured, and an operator who cannot register an OAuth App can still
+turn it off with `MATRON_GITHUB_DEVICE_FLOW=0`.
 
 The journal re-reads every linked user's memberships daily
 (`src/github-refresh.js`) and on `POST /github/refresh`. Flows expire

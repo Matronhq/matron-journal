@@ -87,6 +87,7 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_BIND` | `127.0.0.1` | Bind address (put a TLS-terminating proxy in front for `wss://`) |
 | `MATRON_GITHUB_CLIENT_ID` | Matron's published OAuth App id (`Ov23likaFmqoegaDMTtz`) | GitHub OAuth App client id for account linking (device flow works with the id alone). Set to the empty string to disable linking; set your own app's id, with its secret, for the web flow |
 | `MATRON_GITHUB_CLIENT_SECRET` | unset | Client secret of an OAuth App registered for this journal (callback `https://<journal>/github/callback`). Enables the one-click web flow |
+| `MATRON_GITHUB_DEVICE_FLOW` | on | Set to `0` to turn off the device flow (code entered on GitHub's site). It is always off when a client secret is set, so a journal with the web flow offers only that |
 | `MATRON_GITHUB_HOST` | `github.com` | GitHub Enterprise host, if any |
 | `MATRON_TOKEN_KEY` | unset (tokens stored as-is) | 64 hex chars (`openssl rand -hex 32`). Seals stored GitHub tokens and two-factor secrets with AES-256-GCM; existing GitHub rows are sealed at the next start. Two-factor sign-in needs it. Losing it means every user re-links GitHub, and two-factor users need `matron-admin user 2fa-reset` |
 | `MATRON_WEB_DIR` | unset (nothing served) | Directory of the built tracker web app. Served read-only with `index.html` fallback for `/u/*` and `/app/*` |
