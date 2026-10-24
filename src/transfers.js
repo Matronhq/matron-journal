@@ -20,14 +20,19 @@ import { joinedAgentIds } from './participants.js'
 export const TRANSFER_CHUNK_BYTES = 33554432
 export const TRANSFER_MAX_BYTES_DEFAULT = 10737418240 // 10 GB per file
 export const TRANSFER_USER_QUOTA_BYTES_DEFAULT = 21474836480 // 20 GB per user
+// How many of one sender device's transfers may wait on the user's card at
+// once (consent awaiting_user, phase open); the next create is refused.
+export const TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT = 10
 
 export const TRANSFER_STATES = Object.freeze({
   consent: Object.freeze(['awaiting_user', 'approved', 'declined']),
   upload: Object.freeze(['uploading', 'uploaded', 'failed']),
   phase: Object.freeze(['open', 'released', 'delivered', 'expired', 'cancelled', 'failed', 'declined']),
 })
-// Phases that still hold (or will hold) bytes on disk: they reserve their
-// declared size against the user's quota and accept state changes.
+// Phases still waiting to be collected: they accept state changes and can
+// expire. A delivered transfer is no longer live, but its bytes stay on
+// disk for TRANSFER_DELIVERED_GRACE_MS, so it keeps its quota reservation
+// until retention deletes them (reservedTransferBytes).
 export const LIVE_PHASES = Object.freeze(['open', 'released'])
 export const isTerminalPhase = (phase) => !LIVE_PHASES.includes(phase)
 
@@ -112,9 +117,17 @@ export function forgetChunks(db, id) {
 }
 
 // Declared bytes of the user's transfers that still hold or will hold
-// files: reserved at create, released when the phase ends.
+// files: reserved at create; kept through a delivered transfer's grace
+// period (its bytes are still on disk until retention stamps deleted_at);
+// released when any other phase ends it.
 export function reservedTransferBytes(db, userId) {
-  return db.prepare(`SELECT COALESCE(SUM(size), 0) AS n FROM transfers WHERE user_id=? AND phase IN ('${LIVE_PHASES.join("','")}')`).get(userId).n
+  return db.prepare(`SELECT COALESCE(SUM(size), 0) AS n FROM transfers WHERE user_id=?
+    AND (phase IN ('${LIVE_PHASES.join("','")}') OR (phase='delivered' AND deleted_at IS NULL))`).get(userId).n
+}
+
+// The sender device's transfers still waiting on the user's card.
+export function awaitingTransfersOf(db, senderDeviceId) {
+  return db.prepare("SELECT COUNT(*) AS n FROM transfers WHERE sender_device_id=? AND consent='awaiting_user' AND phase='open'").get(senderDeviceId).n
 }
 
 // The agent devices a transfer in `roomId` goes to: the room's recorded

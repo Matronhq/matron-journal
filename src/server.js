@@ -44,7 +44,7 @@ import { CONSENT_DAILY_CAP_DEFAULT, CONSENT_ROUTINE_CAP_DEFAULT } from './consen
 import { makeVerifier } from './verifier.js'
 import { warnAlertWebhookConfig } from './alerts-http.js'
 import { throttle, cancellableDelay } from './background.js'
-import { TRANSFER_MAX_BYTES_DEFAULT, TRANSFER_USER_QUOTA_BYTES_DEFAULT } from './transfers.js'
+import { TRANSFER_MAX_BYTES_DEFAULT, TRANSFER_USER_QUOTA_BYTES_DEFAULT, TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT } from './transfers.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
@@ -417,7 +417,7 @@ function warnIfBindTrustsSpoofableIp(bind) {
 }
 
 export function startServer({
-  dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, transferMaxBytes, transferUserQuotaBytes, transferChunkBytes, apnsClient, replayBackpressureBytes,
+  dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, apnsClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
   toolLogTtlHours, voiceNoteTtlDays, deviceRetention, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
   // How long an approved spawn waits for a woken target box to attach
@@ -523,6 +523,7 @@ export function startServer({
   // their own, apart from the media ones (src/transfers.js).
   const resolvedTransferMaxBytes = transferMaxBytes ?? resolveNumericEnv('MATRON_TRANSFER_MAX_BYTES', process.env.MATRON_TRANSFER_MAX_BYTES, TRANSFER_MAX_BYTES_DEFAULT)
   const resolvedTransferUserQuotaBytes = transferUserQuotaBytes ?? resolveNumericEnv('MATRON_TRANSFER_USER_QUOTA_BYTES', process.env.MATRON_TRANSFER_USER_QUOTA_BYTES, TRANSFER_USER_QUOTA_BYTES_DEFAULT)
+  const resolvedTransferMaxAwaiting = transferMaxAwaitingPerSender ?? resolveNumericEnv('MATRON_TRANSFER_MAX_AWAITING_PER_SENDER', process.env.MATRON_TRANSFER_MAX_AWAITING_PER_SENDER, TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT)
   const resolvedMaxReplay = maxReplay ?? resolveNumericEnv('MATRON_MAX_REPLAY', process.env.MATRON_MAX_REPLAY, DEFAULT_MAX_REPLAY)
   const hub = makeHub()
   const broker = makeRpcBroker()
@@ -626,7 +627,7 @@ export function startServer({
     db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     // transferChunkBytes: tests only (small chunks); production uses TRANSFER_CHUNK_BYTES.
-    transferMaxBytes: resolvedTransferMaxBytes, transferUserQuotaBytes: resolvedTransferUserQuotaBytes, transferChunkBytes,
+    transferMaxBytes: resolvedTransferMaxBytes, transferUserQuotaBytes: resolvedTransferUserQuotaBytes, transferMaxAwaitingPerSender: resolvedTransferMaxAwaiting, transferChunkBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentRoutineCap, verifier,
     github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,

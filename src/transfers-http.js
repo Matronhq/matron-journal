@@ -18,10 +18,10 @@ import { json, readBody } from './http-body.js'
 import { sanitizePeerText } from './peer-text.js'
 import { receiveToPath } from './media.js'
 import {
-  TRANSFER_CHUNK_BYTES, TRANSFER_MAX_BYTES_DEFAULT, TRANSFER_USER_QUOTA_BYTES_DEFAULT, SCAN_VERDICTS,
+  TRANSFER_CHUNK_BYTES, TRANSFER_MAX_BYTES_DEFAULT, TRANSFER_USER_QUOTA_BYTES_DEFAULT, TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT, SCAN_VERDICTS,
   isTransferId, chunkCount, expectedChunkSize, transferChunkPath, createTransfer, getTransfer, recordChunk,
   receivedChunks, forgetChunks, reservedTransferBytes, recipientDevices, deleteTransferFiles, setTransferState,
-  isPersonRoom, TRANSFER_DELIVERED_GRACE_MS,
+  isPersonRoom, TRANSFER_DELIVERED_GRACE_MS, awaitingTransfersOf,
 } from './transfers.js'
 import { joinedAgentIds } from './participants.js'
 import { fileTransferConsentItem, closeTransferConsentItem, releaseIfReady, readyTransferView, humanSize } from './transfer-consent.js'
@@ -37,6 +37,14 @@ const FINDING_LINE_MAX = 300
 const CONTENT_TYPE_MAX = 255
 const ID_MAX = 128
 const SHA_RE = /^[0-9a-f]{64}$/
+
+// Transfer ids whose /complete is hashing the chunks right now. While one
+// is held, a second /complete is 409 hashing and a chunk PUT is 409
+// closed, so the bytes cannot change under the hash. In memory only: a
+// restart drops the hold along with the request that held it.
+export const hashingTransfers = new Set()
+
+const conflict = (res, detail, message) => { json(res, 409, { error: 'conflict', detail, ...(message ? { message } : {}) }); return true }
 
 const bad = (res) => { json(res, 400, { error: 'bad_request' }); return true }
 const notFound = (res) => { json(res, 404, { error: 'not_found' }); return true }
@@ -113,7 +121,7 @@ const statusView = (db, row, chunkBytes) => ({
 })
 
 async function create(ctx, req, res, who) {
-  const { db, transferMaxBytes, transferUserQuotaBytes, chunkBytes } = ctx
+  const { db, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, chunkBytes } = ctx
   const t = parseCreate(await readBody(req))
   if (!t) return bad(res)
   const room = db.prepare('SELECT owner_user_id, agent_device_id, system FROM conversations WHERE id=?').get(t.roomId)
@@ -122,6 +130,10 @@ async function create(ctx, req, res, who) {
   if (!from || from.owner_user_id !== who.userId || from.agent_device_id !== who.deviceId) return notFound(res)
   if (isPersonRoom(db, t.roomId)) { json(res, 403, { error: 'person_room' }); return true }
   if (t.size > transferMaxBytes) { json(res, 413, { error: 'too_large' }); return true }
+  if (recipientDevices(db, t.roomId, who.deviceId).length === 0) return conflict(res, 'no_recipients', 'Nobody else in this room can receive a file.')
+  if (awaitingTransfersOf(db, who.deviceId) >= transferMaxAwaitingPerSender) {
+    return conflict(res, 'too_many_awaiting', `Too many transfers (${transferMaxAwaitingPerSender}) are already waiting for the user's approval.`)
+  }
   // Check and insert with no await between them: the quota read and the
   // reservation are one synchronous step, so two creates cannot both pass.
   if (reservedTransferBytes(db, who.userId) + t.size > transferUserQuotaBytes) { json(res, 413, { error: 'quota_exceeded' }); return true }
@@ -148,7 +160,7 @@ async function putChunk(ctx, req, res, who, id, nRaw, rejectEarly) {
   const n = /^\d{1,9}$/.test(nRaw) ? Number(nRaw) : -1
   const digest = String(req.headers['x-chunk-sha256'] ?? '').toLowerCase()
   if (n < 0 || n >= chunkCount(row.size, chunkBytes) || !SHA_RE.test(digest)) return early(400, 'bad_request')
-  if (!writable(row)) return early(409, 'closed')
+  if (!writable(row) || hashingTransfers.has(id)) return early(409, 'closed')
   const expected = expectedChunkSize(row.size, n, chunkBytes)
   const declared = req.headers['content-length']
   if (declared !== undefined && Number(declared) !== expected) return early(400, 'chunk_mismatch')
@@ -248,6 +260,19 @@ async function completeUpload(ctx, res, who, id) {
   if (!row) return notFound(res)
   if (row.upload === 'uploaded' && row.phase !== 'failed') { json(res, 200, progress(row)); return true }
   if (!writable(row)) { json(res, 409, { error: 'closed' }); return true }
+  if (hashingTransfers.has(id)) return conflict(res, 'hashing', 'This transfer is already being checked; try again shortly.')
+  hashingTransfers.add(id)
+  try {
+    return await completeHeld(ctx, res, row)
+  } finally {
+    hashingTransfers.delete(id)
+  }
+}
+
+// completeUpload with the hashing hold taken.
+async function completeHeld(ctx, res, row) {
+  const { db, mediaDir, chunkBytes: chunkSize } = ctx
+  const { id } = row
   const have = new Set(receivedChunks(db, id))
   const missing = []
   for (let n = 0; n < chunkCount(row.size, chunkSize); n++) if (!have.has(n)) missing.push(n)
@@ -377,6 +402,7 @@ export async function handleTransferRoute(ctx, req, res, url, who, { rejectEarly
     ...ctx,
     transferMaxBytes: ctx.transferMaxBytes ?? TRANSFER_MAX_BYTES_DEFAULT,
     transferUserQuotaBytes: ctx.transferUserQuotaBytes ?? TRANSFER_USER_QUOTA_BYTES_DEFAULT,
+    transferMaxAwaitingPerSender: ctx.transferMaxAwaitingPerSender ?? TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT,
     chunkBytes: ctx.transferChunkBytes ?? TRANSFER_CHUNK_BYTES,
   }
   const [, id, n, sub] = m

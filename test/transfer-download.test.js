@@ -165,9 +165,11 @@ test('releaseIfReady twice, and two completes at once, give one room event', asy
   const id = await createTransfer(f)
   await uploadAll(f, id)
   assert.equal((await tap(f, id, 'Approve')).status, 200)
-  const [r1, r2] = await Promise.all([complete(f, id), complete(f, id)])
-  assert.equal(r1.status, 200)
-  assert.equal(r2.status, 200)
+  // One hashes; the other is either a no-op 200 (it arrived after) or a
+  // 409 hashing (it overlapped), never a second release.
+  const both = await Promise.all([complete(f, id), complete(f, id)])
+  assert.ok(both.some((r) => r.status === 200))
+  for (const r of both) assert.ok(r.status === 200 || (r.status === 409 && r.json.detail === 'hashing'), JSON.stringify(r.json))
   assertReleasedOnce(f, id)
 
   const id2 = await createTransfer(f, { name: 'more.txt' })

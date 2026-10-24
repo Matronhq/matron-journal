@@ -114,7 +114,8 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_VOICE_NOTE_TTL_DAYS` | `7` | Delete an item voice note's audio this many days after its transcript landed; the transcript stays (`0` disables) |
 | `MATRON_DEVICE_RETENTION` | unset (off) | Comma-separated `<deviceId>:<days>` (e.g. `4:30,9:7`): expire the content of each device's sessions and rooms once older than that many days — payloads become tombstones, search rows and unshared blobs are deleted. Any invalid entry disables the whole setting. See docs/protocol.md *Per-device content expiry* |
 | `MATRON_TRANSFER_MAX_BYTES` | 10 GiB (`10737418240`) | Per-file size cap for agent-to-agent file transfers |
-| `MATRON_TRANSFER_USER_QUOTA_BYTES` | 20 GiB (`21474836480`) | Per-user cap on the declared size of transfers still in flight (not yet collected or ended), separate from the media/attachment quota |
+| `MATRON_TRANSFER_USER_QUOTA_BYTES` | 20 GiB (`21474836480`) | Per-user cap on the declared size of transfers whose bytes the journal still holds or will hold (in flight, or delivered within the last hour before their copy is deleted), separate from the media/attachment quota |
+| `MATRON_TRANSFER_MAX_AWAITING_PER_SENDER` | `10` | How many of one sending box's transfers may wait for the user's approval at once; the next `POST /transfers` is `409 too_many_awaiting` |
 | `MATRON_WS_PING_MS` | `55000` | WebSocket heartbeat interval (kept under common 60s proxy idle timeouts) |
 | `MATRON_RPC_MAX_BYTES` | `16384` | Max inbound WebSocket RPC frame size |
 | `MATRON_TOOL_STREAM_MAX_BYTES` | `1048576` | Max bytes per live tool-output stream buffer |

@@ -7,7 +7,8 @@ import crypto from 'node:crypto'
 import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { recordJoined } from '../src/participants.js'
-import { TRANSFER_CHUNK_BYTES, chunkCount, transferChunkPath, recipientDevices, setTransferState, getTransfer } from '../src/transfers.js'
+import { TRANSFER_CHUNK_BYTES, TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT, chunkCount, transferChunkPath, recipientDevices, setTransferState, getTransfer, reservedTransferBytes } from '../src/transfers.js'
+import { hashingTransfers } from '../src/transfers-http.js'
 
 // Agent-to-agent file transfers, the journal half (Task 1): the row, the
 // chunked resumable upload, status and cancel. Small sizes throughout: the
@@ -252,4 +253,98 @@ test('recipientDevices: owner + joined minus the sender; the sender only in a sa
   addConvo(s.db, 'same', alice.id, a.deviceId)
   recordJoined(s.db, { convoId: 'same', agentDeviceId: a.deviceId, initiatorDeviceId: a.deviceId })
   assert.deepEqual(recipientDevices(s.db, 'same', a.deviceId), [a.deviceId])
+})
+
+test('create: once a sender has the cap of transfers awaiting the user, the next is 409 too_many_awaiting', async (t) => {
+  const { s, a } = await fleet(t, { transferMaxAwaitingPerSender: 2 })
+  const one = await create(s, a.token, { size: 5 })
+  const two = await create(s, a.token, { size: 5 })
+  assert.equal(one.status, 201)
+  assert.equal(two.status, 201)
+  const before = s.db.prepare('SELECT COUNT(*) c FROM transfers').get().c
+  const third = await create(s, a.token, { size: 5 })
+  assert.equal(third.status, 409)
+  assert.equal(third.json.error, 'conflict')
+  assert.equal(third.json.detail, 'too_many_awaiting')
+  assert.match(third.json.message, /waiting for the user's approval/)
+  assert.equal(s.db.prepare('SELECT COUNT(*) c FROM transfers').get().c, before, 'nothing was created')
+
+  // An approved one no longer counts, nor does a cancelled one.
+  assert.ok(setTransferState(s.db, one.json.transfer_id, { consent: 'approved' }))
+  assert.equal((await create(s, a.token, { size: 5 })).status, 201)
+  assert.equal((await create(s, a.token, { size: 5 })).status, 409)
+  assert.equal((await s.http(`/transfers/${two.json.transfer_id}`, { method: 'DELETE', token: a.token })).status, 200)
+  assert.equal((await create(s, a.token, { size: 5 })).status, 201)
+})
+
+test('the awaiting cap defaults to 10 and reads MATRON_TRANSFER_MAX_AWAITING_PER_SENDER', async (t) => {
+  assert.equal(TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT, 10)
+  const prev = process.env.MATRON_TRANSFER_MAX_AWAITING_PER_SENDER
+  process.env.MATRON_TRANSFER_MAX_AWAITING_PER_SENDER = '1'
+  t.after(() => {
+    if (prev === undefined) delete process.env.MATRON_TRANSFER_MAX_AWAITING_PER_SENDER
+    else process.env.MATRON_TRANSFER_MAX_AWAITING_PER_SENDER = prev
+  })
+  const { s, a } = await fleet(t)
+  assert.equal((await create(s, a.token, { size: 5 })).status, 201)
+  const r = await create(s, a.token, { size: 5 })
+  assert.equal(r.status, 409)
+  assert.equal(r.json.detail, 'too_many_awaiting')
+})
+
+test('create: a room with nobody to receive is 409 no_recipients and reserves nothing', async (t) => {
+  const { s, a, alice } = await fleet(t)
+  addConvo(s.db, 'solo', alice.id, a.deviceId)
+  const r = await create(s, a.token, { room_id: 'solo' })
+  assert.equal(r.status, 409)
+  assert.equal(r.json.error, 'conflict')
+  assert.equal(r.json.detail, 'no_recipients')
+  assert.equal(s.db.prepare('SELECT COUNT(*) c FROM transfers').get().c, 0)
+  assert.equal(reservedTransferBytes(s.db, alice.id), 0)
+})
+
+test('complete: while one complete is hashing, a second is 409 hashing and a chunk PUT is 409 closed', async (t) => {
+  const { s, a } = await fleet(t)
+  const data = Buffer.from('abcdefghijklmnopqrstuvwxy')
+  const id = (await create(s, a.token, { sha256: sha(data) })).json.transfer_id
+  for (let n = 0; n < 3; n++) assert.equal((await putChunk(s, a.token, id, n, data.subarray(n * CHUNK, (n + 1) * CHUNK))).status, 200)
+
+  hashingTransfers.add(id)
+  try {
+    const second = await s.http(`/transfers/${id}/complete`, { method: 'POST', token: a.token })
+    assert.equal(second.status, 409)
+    assert.equal(second.json.error, 'conflict')
+    assert.equal(second.json.detail, 'hashing')
+    const put = await putChunk(s, a.token, id, 0, data.subarray(0, CHUNK))
+    assert.equal(put.status, 409)
+    assert.equal(put.json.error, 'closed')
+  } finally {
+    hashingTransfers.delete(id)
+  }
+  assert.equal(getTransfer(s.db, id).upload, 'uploading', 'the refused calls changed nothing')
+
+  const done = await s.http(`/transfers/${id}/complete`, { method: 'POST', token: a.token })
+  assert.equal(done.status, 200)
+  assert.equal(getTransfer(s.db, id).upload, 'uploaded')
+  assert.equal(hashingTransfers.has(id), false, 'released after the hash')
+})
+
+test('complete: two at once; one hashes, the other is 409 hashing or a 200 no-op', async (t) => {
+  const { s, a } = await fleet(t)
+  const data = Buffer.from('abcdefghijklmnopqrstuvwxy')
+  const id = (await create(s, a.token, { sha256: sha(data) })).json.transfer_id
+  for (let n = 0; n < 3; n++) assert.equal((await putChunk(s, a.token, id, n, data.subarray(n * CHUNK, (n + 1) * CHUNK))).status, 200)
+  const both = await Promise.all([1, 2].map(() => s.http(`/transfers/${id}/complete`, { method: 'POST', token: a.token })))
+  for (const r of both) assert.ok(r.status === 200 || (r.status === 409 && r.json.detail === 'hashing'), JSON.stringify(r.json))
+  assert.ok(both.some((r) => r.status === 200))
+  assert.equal(hashingTransfers.has(id), false)
+})
+
+test('complete: the hashing hold is released when the hash fails (sha256 mismatch)', async (t) => {
+  const { s, a } = await fleet(t)
+  const data = Buffer.from('abcdefghijklmnopqrstuvwxy')
+  const id = (await create(s, a.token)).json.transfer_id // declared sha256 is 'a'*64: a mismatch
+  for (let n = 0; n < 3; n++) assert.equal((await putChunk(s, a.token, id, n, data.subarray(n * CHUNK, (n + 1) * CHUNK))).status, 200)
+  assert.equal((await s.http(`/transfers/${id}/complete`, { method: 'POST', token: a.token })).status, 422)
+  assert.equal(hashingTransfers.has(id), false)
 })

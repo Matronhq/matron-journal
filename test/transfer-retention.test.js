@@ -353,3 +353,22 @@ test('crash safety: a live (open/released) row\'s directory, and an undelivered 
   assert.ok(fs.existsSync(transferDir(f.mediaDir, releasedId)), 'released: kept')
   assert.ok(fs.existsSync(transferDir(f.mediaDir, deliveredId)), 'delivered, not yet past grace: kept')
 })
+
+test('quota: a delivered transfer still counts until its 1h deletion frees its bytes', async (t) => {
+  const f = await fleet(t, { transferUserQuotaBytes: DATA.length })
+  const id = await released(f)
+  assert.equal((await received(f, id)).status, 200)
+  assert.equal(getTransfer(f.s.db, id).phase, 'delivered')
+  assert.equal(reservedTransferBytes(f.s.db, f.alice.id), DATA.length, 'the bytes are still on disk')
+  const blocked = await f.s.http('/transfers', {
+    method: 'POST', token: f.a.token,
+    body: { room_id: 'room', from_convo_id: 'sess-a', name: 'other.txt', size: DATA.length, sha256: sha(DATA), content_type: 'text/plain', scan: { verdict: 'clean', findings: [] } },
+  })
+  assert.equal(blocked.status, 413)
+  assert.equal(blocked.json.error, 'quota_exceeded')
+
+  const r = runExpireTransfers(f.s.db, { mediaDir: f.mediaDir, hub: f.s.hub, now: getTransfer(f.s.db, id).delivered_at + TRANSFER_DELIVERED_GRACE_MS })
+  assert.equal(r.deleted, 1)
+  assert.equal(reservedTransferBytes(f.s.db, f.alice.id), 0, 'freed once the bytes are deleted')
+  assert.equal((await createTransfer(f, { name: 'other.txt' })), getTransfer(f.s.db, f.s.db.prepare("SELECT id FROM transfers WHERE name='other.txt'").get().id).id)
+})
