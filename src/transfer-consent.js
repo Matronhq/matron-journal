@@ -19,6 +19,15 @@ import { recordAndAnnounce } from './consent-answer.js'
 import { wakeIfOffline } from './wake.js'
 import { getTransfer, setTransferState, deleteTransferFiles, forgetChunks, recipientDevices, isTransferId, parseFindings } from './transfers.js'
 
+// "by the user." or "by the Coordinator: <reason>", for the decline's
+// room line: the reason flattened to one line, without markdown, capped.
+const DECLINE_REASON_MAX = 200
+function declineWhy(decidedBy) {
+  if (decidedBy?.kind !== 'coordinator') return 'by the user.'
+  const why = plain(sanitizePeerText(decidedBy.reason, DECLINE_REASON_MAX * 2)).replace(/\s+/g, ' ').trim().slice(0, DECLINE_REASON_MAX).trim()
+  return why ? `by the Coordinator: ${why}` : 'by the Coordinator.'
+}
+
 export const TRANSFER_ACTIONS = Object.freeze(['Approve', 'Decline'])
 const quietPush = { onAppend() {} }
 const cut = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
@@ -239,7 +248,7 @@ export function answerTransferAsk(ctx, { userId, transferId, decision, decidedBy
     const reason = decidedBy?.kind === 'coordinator' ? `Declined by the Coordinator: ${decidedBy.reason}` : 'Declined by the user.'
     hub.sendToDevice(userId, row.sender_device_id, { kind: 'transfer', event: 'declined', transfer_id: transferId, reason })
     try {
-      appendAndBroadcast(db, hub, { userId, convoId: row.room_id, sender: 'journal', type: 'text', payload: { body: `File ${codeSpan(row.name)} was declined; nothing was delivered.` } })
+      appendAndBroadcast(db, hub, { userId, convoId: row.room_id, sender: 'journal', type: 'text', payload: { body: `Not sent: ${codeSpan(row.name)} was declined ${declineWhy(decidedBy)}` } })
     } catch (err) {
       console.error('transfer consent: room notice failed (the decline stands)', err)
     }

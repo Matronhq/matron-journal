@@ -329,7 +329,7 @@ test('room notices in the journal\'s voice put the file name in a code span', as
   assert.equal((await tap(f, declined, 'Decline')).status, 200)
   assert.deepEqual(roomTexts(f).map((e) => e.body), [
     'Delivered `[click](example.com) **now**.txt` (25 B), sha256 verified.',
-    'File `[click](example.com) **now**.txt` was declined; nothing was delivered.',
+    'Not sent: `[click](example.com) **now**.txt` was declined by the user.',
   ])
   assert.ok(roomTexts(f).every((e) => e.sender === 'journal'))
 })
@@ -363,4 +363,76 @@ test('download: a content type that is not a plain header value is served as oct
   assert.equal(r.status, 200)
   assert.equal(r.headers.get('content-type'), 'application/octet-stream')
   assert.ok(Buffer.from(await r.arrayBuffer()).equals(DATA))
+})
+
+const reportFailed = (f, id, body, token = f.b.token) => f.s.http(`/transfers/${id}/failed`, { method: 'POST', token, body })
+
+test('POST /failed: a recipient that could not save the file ends it; bytes go, sender and room are told; a repeat is a 200 no-op', async (t) => {
+  const f = await fleet(t)
+  const id = await released(f)
+  const r = await reportFailed(f, id, { reason: 'disk full' })
+  assert.equal(r.status, 200, JSON.stringify(r.json))
+  assert.equal(r.json.phase, 'failed')
+  const row = getTransfer(f.s.db, id)
+  assert.equal(row.phase, 'failed')
+  assert.ok(row.deleted_at)
+  assert.equal(fs.existsSync(transferDir(f.mediaDir, id)), false)
+  assert.equal(f.s.db.prepare('SELECT COUNT(*) c FROM transfer_chunks WHERE transfer_id=?').get(id).c, 0)
+  const failed = frames(f, 'failed')
+  assert.equal(failed.length, 1)
+  assert.equal(failed[0].deviceId, f.a.deviceId)
+  assert.deepEqual(failed[0].frame, { kind: 'transfer', event: 'failed', transfer_id: id, reason: 'receiver: disk full' })
+  assert.deepEqual(roomTexts(f), [{ sender: 'journal', body: 'Not received: `notes.txt` could not be saved on the receiving box: disk full' }])
+  const dl = await download(f, id)
+  assert.equal(dl.status, 404)
+  await dl.arrayBuffer()
+
+  const again = await reportFailed(f, id, { reason: 'disk full' })
+  assert.equal(again.status, 200)
+  assert.equal(frames(f, 'failed').length, 1, 'no second frame')
+  assert.equal(roomTexts(f).length, 1, 'no second room line')
+})
+
+test('POST /failed: only a recipient device; the sender, a box outside the room and an unknown id are 404', async (t) => {
+  const f = await fleet(t)
+  const id = await released(f)
+  for (const token of [f.a.token, f.c.token]) {
+    const r = await reportFailed(f, id, { reason: 'nope' }, token)
+    assert.equal(r.status, 404)
+    assert.equal(r.json.error, 'not_found')
+  }
+  assert.equal((await reportFailed(f, 'tr_' + '0'.repeat(32), { reason: 'x' })).status, 404)
+  assert.equal((await reportFailed(f, id, { reason: 'x' }, f.client)).status, 403)
+  assert.equal(getTransfer(f.s.db, id).phase, 'released', 'nothing changed')
+  assert.equal(frames(f, 'failed').length, 0)
+})
+
+test('POST /failed: only while released; open or delivered is 409 closed', async (t) => {
+  const f = await fleet(t)
+  const open = await createTransfer(f)
+  const r = await reportFailed(f, open, { reason: 'x' })
+  assert.equal(r.status, 409)
+  assert.equal(r.json.error, 'closed')
+  assert.equal(getTransfer(f.s.db, open).phase, 'open')
+
+  const done = await released(f, { name: 'done.txt' })
+  assert.equal((await received(f, done, { sha256: sha(DATA) })).status, 200)
+  const late = await reportFailed(f, done, { reason: 'x' })
+  assert.equal(late.status, 409)
+  assert.equal(late.json.error, 'closed')
+  assert.equal(getTransfer(f.s.db, done).phase, 'delivered')
+})
+
+test('POST /failed: the reason is flattened, stripped of markdown and capped at 200; a non-string is 400', async (t) => {
+  const f = await fleet(t)
+  const id = await released(f)
+  assert.equal((await reportFailed(f, id, { reason: 42 })).status, 400)
+  assert.equal(getTransfer(f.s.db, id).phase, 'released')
+  const r = await reportFailed(f, id, { reason: 'no\nspace **left** ' + 'y'.repeat(400) })
+  assert.equal(r.status, 200)
+  const [frame] = frames(f, 'failed')
+  assert.ok(frame.frame.reason.startsWith('receiver: no space left y'), frame.frame.reason)
+  assert.ok(frame.frame.reason.length <= 'receiver: '.length + 200)
+  const [line] = roomTexts(f)
+  assert.ok(!/[\n*]/.test(line.body))
 })

@@ -6,6 +6,7 @@
 //   POST   /transfers/:id/complete     every chunk in, whole-file sha256 checked (the sender)
 //   GET    /transfers/:id/content      the bytes, Range-able, once released (recipients)
 //   POST   /transfers/:id/received     {sha256}: the receiver verified its copy (recipients)
+//   POST   /transfers/:id/failed       {reason}: the receiver could not save it (recipients)
 //   GET    /transfers?for=me           released, undelivered transfers for the caller (recipients)
 // Agent devices only: a client gets 403. A transfer the caller may not see
 // is 404, never 403, so its id confirms nothing. A refusal before a chunk
@@ -15,7 +16,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { pipeline } from 'node:stream/promises'
 import { json, readBody } from './http-body.js'
-import { sanitizePeerText } from './peer-text.js'
+import { sanitizePeerText, plainText } from './peer-text.js'
 import { receiveToPath } from './media.js'
 import {
   TRANSFER_CHUNK_BYTES, TRANSFER_MAX_BYTES_DEFAULT, TRANSFER_USER_QUOTA_BYTES_DEFAULT, TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT, SCAN_VERDICTS,
@@ -32,6 +33,7 @@ import { appendAndBroadcast } from './journal.js'
 export const TRANSFER_NAME_MAX = 255
 export const TRANSFER_REASON_MAX = 1000
 export const TRANSFER_FINDINGS_MAX = 50
+export const TRANSFER_FAILED_REASON_MAX = 200
 const FINDING_KIND_MAX = 64
 const FINDING_LINE_MAX = 300
 const CONTENT_TYPE_MAX = 255
@@ -51,8 +53,9 @@ const notFound = (res) => { json(res, 404, { error: 'not_found' }); return true 
 
 const isId = (v) => typeof v === 'string' && v.length > 0 && v.length <= ID_MAX
 
-// {kind, line} only: line is a 1-based line number, or `member:line` inside
-// an archive. Anything else on a finding (a matched value) is dropped.
+// {kind, line} only: line is a 1-based line number, or a short label —
+// `member:line` inside an archive, or a bare member name for a finding
+// about the file name itself (kind sensitive_file). Anything else on a finding (a matched value) is dropped.
 function parseScan(scan) {
   if (scan === undefined || scan === null) return { verdict: 'not_scanned', findings: [] }
   if (typeof scan !== 'object' || !SCAN_VERDICTS.includes(scan.verdict)) return null
@@ -65,7 +68,7 @@ function parseScan(scan) {
     if (!kind) return null
     let line
     if (Number.isSafeInteger(f.line) && f.line >= 1) line = f.line
-    else if (typeof f.line === 'string' && f.line.length <= FINDING_LINE_MAX && /^.+:[1-9]\d*$/.test(f.line)) line = sanitizePeerText(f.line, FINDING_LINE_MAX)
+    else if (typeof f.line === 'string' && f.line.length <= FINDING_LINE_MAX && sanitizePeerText(f.line, FINDING_LINE_MAX)) line = sanitizePeerText(f.line, FINDING_LINE_MAX)
     else return null
     findings.push({ kind, line })
   }
@@ -386,6 +389,40 @@ async function receipt(ctx, req, res, who, id) {
   return true
 }
 
+// A recipient could not save a released file (disk full, a write error):
+// the transfer ends as failed, its bytes go, the sender is told and the
+// room gets a line. Already failed is a no-op 200; any other phase is 409.
+async function receiverFailed(ctx, req, res, who, id) {
+  const { db, hub, mediaDir } = ctx
+  const row = visibleTransfer(db, who, id, { recipientOnly: true })
+  if (!row) return notFound(res)
+  const { reason: raw } = await readBody(req)
+  if (raw !== undefined && raw !== null && typeof raw !== 'string') return bad(res)
+  const reason = plainText(sanitizePeerText(raw, TRANSFER_FAILED_REASON_MAX)).trim() || 'no reason given'
+  if (row.phase === 'failed') { json(res, 200, progress(row)); return true }
+  if (row.phase !== 'released' || !setTransferState(db, id, { phase: 'failed', deleted_at: Date.now() })) {
+    const now = getTransfer(db, id)
+    if (now.phase === 'failed') { json(res, 200, progress(now)); return true }
+    json(res, 409, { error: 'closed' })
+    return true
+  }
+  deleteTransferFiles(mediaDir, id)
+  forgetChunks(db, id)
+  closeTransferConsentItem(ctx, id, { outcome: 'failed' })
+  hub.sendToDevice(row.user_id, row.sender_device_id, { kind: 'transfer', event: 'failed', transfer_id: id, reason: `receiver: ${reason}` })
+  try {
+    appendAndBroadcast(db, hub, {
+      userId: row.user_id, convoId: row.room_id, sender: 'journal', type: 'text',
+      payload: { body: `Not received: ${codeSpan(row.name)} could not be saved on the receiving box: ${reason}` },
+    })
+  } catch (err) {
+    console.error(`transfer: failed notice for ${id} failed (the failure stands)`, err)
+  }
+  console.log(`journal: transfer failed id=${id} reason=receiver device=${who.deviceId}`)
+  json(res, 200, progress(getTransfer(db, id)))
+  return true
+}
+
 // The bridge's catch-up on hello: every released, undelivered transfer of
 // the caller's user that the caller's device is a recipient of.
 function readyForMe(ctx, res, who) {
@@ -396,7 +433,7 @@ function readyForMe(ctx, res, who) {
 }
 
 export async function handleTransferRoute(ctx, req, res, url, who, { rejectEarly }) {
-  const m = url.pathname.match(/^\/transfers(?:\/([^/]+)(?:\/chunks\/([^/]+)|\/(complete|content|received))?)?$/)
+  const m = url.pathname.match(/^\/transfers(?:\/([^/]+)(?:\/chunks\/([^/]+)|\/(complete|content|received|failed))?)?$/)
   if (!m) return false
   const full = {
     ...ctx,
@@ -412,6 +449,7 @@ export async function handleTransferRoute(ctx, req, res, url, who, { rejectEarly
   if (sub === 'complete' && req.method === 'POST') return completeUpload(full, res, who, id)
   if (sub === 'content' && req.method === 'GET') return content(full, req, res, who, id)
   if (sub === 'received' && req.method === 'POST') return receipt(full, req, res, who, id)
+  if (sub === 'failed' && req.method === 'POST') return receiverFailed(full, req, res, who, id)
   if (sub) return false
   if (id && n !== undefined && req.method === 'PUT') return putChunk(full, req, res, who, id, n, rejectEarly)
   if (id && n === undefined && req.method === 'GET') {
