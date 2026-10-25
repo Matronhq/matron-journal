@@ -1390,8 +1390,14 @@ malformed id is never echoed back. Other ops' error frames are unchanged.
   it and so carries no `from_device_id`.
 - **`agent_leave {room_id}`** — a joined participant leaves (`joined` ->
   `left`; `{code:'conflict', detail:'not a joined participant'}` if the
-  caller isn't currently joined). If the room has a recorded owner other
-  than the caller, that owner is told:
+  caller isn't currently joined). If other participants are still joined
+  after the leave, the room goes on: the recorded owner and every remaining
+  joined participant are told
+  `{kind:'invite', event:'member_left', room_id, from_device_id, participants}`,
+  where `participants` is the membership that remains (as in the membership
+  `convo_meta`). A client that does not know `member_left` should ignore it
+  and keep the room. Only when the caller was the last joined participant
+  is the recorded owner, if any, told the room is over:
   `{kind:'invite', event:'left', room_id, from_device_id}`. When the
   caller IS the room's recorded owner (who has no `convo_agents` row of
   its own) **and the conversation is actually a room** — it has at least
