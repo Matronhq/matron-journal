@@ -6,7 +6,7 @@ import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceSta
 import { settingsView } from './settings.js'
 import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, agentTargetsFor, CONVO_ID_MAX_CHARS } from './journal.js'
 import { parseRepo, REPO_MAX } from './repo-identity.js'
-import { participantIds, participantConvoIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
+import { participantIds, participantConvoIds, joinedAgentIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, inheritedSpawnMission, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, sanitizeBoxDefaults, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
@@ -1798,11 +1798,26 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           if (hit && LIVE_ROOM_STATES.includes(hit.link.state)) endAndNotify(personCtx, hit.link.id, 'guest_agent')
           break
         }
-        // A participant left: tell the room's recorded owner, if there is
-        // one. (No need to exclude the caller — a caller that IS the owner
-        // has no convo_agents row to have been 'joined' in, so leaveConvo
-        // above would have failed it into the conflict.)
-        if (room.agent_device_id != null) {
+        // A participant left. While other members are still joined the room
+        // goes on, so the owner and every remaining member hear
+        // `member_left` with the membership that remains, and nobody's room
+        // ends. Bridges read `left` as "this room is over" (rooms began as
+        // pairs), so it is kept for the last guest leaving, when the owner
+        // is left alone. A bridge that predates `member_left` ignores the
+        // event and keeps the room live, which is the right outcome for
+        // it too. (No need to exclude the caller from the owner — a caller
+        // that IS the owner has no convo_agents row to have been 'joined'
+        // in, so leaveConvo above would have failed it into the conflict.)
+        const remaining = joinedAgentIds(db, msg.room_id)
+        if (remaining.length > 0) {
+          const participants = participantIds(db, msg.room_id)
+          for (const deviceId of participants) {
+            if (deviceId === conn.deviceId) continue
+            notify(deviceId, {
+              kind: 'invite', event: 'member_left', room_id: msg.room_id, from_device_id: conn.deviceId, participants,
+            })
+          }
+        } else if (room.agent_device_id != null) {
           notify(room.agent_device_id, {
             kind: 'invite', event: 'left', room_id: msg.room_id, from_device_id: conn.deviceId,
           })
