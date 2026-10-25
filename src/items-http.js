@@ -21,6 +21,7 @@ import { contributableItem } from './contribute.js'
 import { filteredAgent, privateOwnedConvo } from './privacy.js'
 import { handleConsentTap, isSharingMirror } from './sharing-http.js'
 import { transferTapAnswer } from './transfer-consent.js'
+import { consentItemTapAnswer } from './consent-answer.js'
 import { handlePeopleRoomTap, isPeopleRoomMirror } from './person-rooms-http.js'
 import { notifyGrantees } from './sharing-events.js'
 import { inlineRefsToText, knowsInlineRefs, strayInlineRef } from './inline-refs.js'
@@ -590,10 +591,12 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       // answer to the card, applied by the journal itself — never a comment
       // for an agent to read.
       if (isSharingMirror(item)) return handleConsentTap(ctx, res, who, item, action, body.reply_to ?? null)
-      // A file transfer's card: the tap is the answer (transfer-consent.js).
-      if (item.consent === 'transfer') {
+      // A file transfer's card, or a spawn or chat ask's mirror: the tap is
+      // the answer, through the same path as the card (transfer-consent.js,
+      // consent-answer.js).
+      if (item.consent === 'transfer' || item.consent === 'spawn' || item.consent === 'chat') {
         if (body.reply_to != null) { json(res, 400, { error: 'unknown_action' }); return true }
-        const r = transferTapAnswer(ctx, who, item, action)
+        const r = item.consent === 'transfer' ? transferTapAnswer(ctx, who, item, action) : consentItemTapAnswer(ctx, who, item, action)
         if (r.status !== 200) { json(res, r.status, r.body); return true }
         json(res, 200, { item: getItem(db, who.userId, item.id) ?? item, ...r.body })
         return true

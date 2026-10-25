@@ -268,7 +268,19 @@ export function answerTransferAsk(ctx, { userId, transferId, decision, decidedBy
 // waiting is 409 whatever it says.
 export function transferTapAnswer(ctx, who, item, action) {
   const row = ctx.db.prepare('SELECT * FROM transfers WHERE item_id=? AND user_id=?').get(item.id, who.userId)
-  if (!row || !awaiting(row)) return { status: 409, body: { error: 'conflict' } }
+  if (!row || !awaiting(row)) return staleTransferTap(row)
   if (!TRANSFER_ACTIONS.includes(action)) return { status: 400, body: { error: 'unknown_action' } }
-  return answerTransferAsk(ctx, { userId: who.userId, transferId: row.id, decision: action === 'Decline' ? 'decline' : 'approve', decidedBy: { kind: 'user', deviceId: who.deviceId } })
+  const r = answerTransferAsk(ctx, { userId: who.userId, transferId: row.id, decision: action === 'Decline' ? 'decline' : 'approve', decidedBy: { kind: 'user', deviceId: who.deviceId } })
+  return r.status === 409 ? staleTransferTap(getTransfer(ctx.db, row.id)) : r
+}
+
+// A tap on a card whose ask is no longer waiting: 409, with a message an
+// app shows as it is, saying how the ask ended.
+function staleTransferTap(row) {
+  const message = row?.consent === 'approved' ? 'Already answered: this file was approved.'
+    : row?.consent === 'declined' ? 'Already answered: this file was declined.'
+      : row?.phase === 'expired' ? 'This file expired before it was answered.'
+        : row?.phase === 'cancelled' ? 'The sender cancelled this file before it was answered.'
+          : 'This file is no longer waiting for an answer.'
+  return { status: 409, body: { error: 'conflict', reason: 'already_answered', message } }
 }
