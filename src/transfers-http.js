@@ -21,7 +21,7 @@ import { receiveToPath } from './media.js'
 import {
   TRANSFER_CHUNK_BYTES, TRANSFER_MAX_BYTES_DEFAULT, TRANSFER_USER_QUOTA_BYTES_DEFAULT, TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT, SCAN_VERDICTS,
   isTransferId, chunkCount, expectedChunkSize, transferChunkPath, createTransfer, getTransfer, recordChunk,
-  receivedChunks, forgetChunks, reservedTransferBytes, recipientDevices, deleteTransferFiles, setTransferState,
+  receivedChunks, forgetChunks, reservedTransferBytes, recipientCandidates, transferRecipients, deleteTransferFiles, setTransferState,
   isPersonRoom, TRANSFER_DELIVERED_GRACE_MS, awaitingTransfersOf,
 } from './transfers.js'
 import { joinedAgentIds } from './participants.js'
@@ -46,6 +46,18 @@ const SHA_RE = /^[0-9a-f]{64}$/
 // closed, so the bytes cannot change under the hash. In memory only: a
 // restart drops the hold along with the request that held it.
 export const hashingTransfers = new Set()
+
+// Transfer id -> how many of its chunk PUTs are reading a body or renaming
+// it into place right now. While any is, /complete is 409 hashing, so the
+// hash never runs over a chunk that is about to change. In memory only,
+// like hashingTransfers.
+export const chunkPutsInFlight = new Map()
+const putStarted = (id) => chunkPutsInFlight.set(id, (chunkPutsInFlight.get(id) ?? 0) + 1)
+function putEnded(id) {
+  const n = (chunkPutsInFlight.get(id) ?? 1) - 1
+  if (n > 0) chunkPutsInFlight.set(id, n)
+  else chunkPutsInFlight.delete(id)
+}
 
 const conflict = (res, detail, message) => { json(res, 409, { error: 'conflict', detail, ...(message ? { message } : {}) }); return true }
 
@@ -107,11 +119,11 @@ function isRoomMember(db, room, roomId, deviceId) {
   return room.agent_device_id === deviceId || joinedAgentIds(db, roomId).includes(deviceId)
 }
 
-const isRecipient = (db, row, deviceId) => recipientDevices(db, row.room_id, row.sender_device_id).includes(deviceId)
+const isRecipient = (db, row, deviceId) => transferRecipients(db, row).includes(deviceId)
 
 // The row, when the caller may see it: the sender's device, or (unless
-// senderOnly) one of the room's recipient devices; with recipientOnly, a
-// recipient device only (in a same-device room the sender's device is one).
+// senderOnly) the transfer's recipient device; with recipientOnly, the
+// recipient device only (in a same-device room it is the sender's device).
 // Always of the row's own user.
 function visibleTransfer(db, who, id, { senderOnly = false, recipientOnly = false } = {}) {
   if (!isTransferId(id)) return null
@@ -138,7 +150,12 @@ async function create(ctx, req, res, who) {
   if (!from || from.owner_user_id !== who.userId || from.agent_device_id !== who.deviceId) return notFound(res)
   if (isPersonRoom(db, t.roomId)) { json(res, 403, { error: 'person_room' }); return true }
   if (t.size > transferMaxBytes) { json(res, 413, { error: 'too_large' }); return true }
-  if (recipientDevices(db, t.roomId, who.deviceId).length === 0) return conflict(res, 'no_recipients', 'Nobody else in this room can receive a file.')
+  // One recipient device per transfer: delivery (the receipt, a failed
+  // save) is tracked per transfer, so a second recipient would lose the
+  // file the moment the first settled it.
+  const recipients = recipientCandidates(db, t.roomId, who.deviceId)
+  if (recipients.length === 0) return conflict(res, 'no_recipients', 'Nobody else in this room can receive a file.')
+  if (recipients.length > 1) return conflict(res, 'multiple_recipients', 'A file goes to exactly one other box; this room has more than one. Send it from a room with just the receiving box.')
   if (awaitingTransfersOf(db, who.deviceId) >= transferMaxAwaitingPerSender) {
     return conflict(res, 'too_many_awaiting', `Too many transfers (${transferMaxAwaitingPerSender}) are already waiting for the user's approval.`)
   }
@@ -146,7 +163,7 @@ async function create(ctx, req, res, who) {
   // reservation are one synchronous step, so two creates cannot both pass.
   if (reservedTransferBytes(db, who.userId) + t.size > transferUserQuotaBytes) { json(res, 413, { error: 'quota_exceeded' }); return true }
   const row = createTransfer(db, {
-    userId: who.userId, roomId: t.roomId, senderDeviceId: who.deviceId, fromConvoId: t.fromConvoId,
+    userId: who.userId, roomId: t.roomId, senderDeviceId: who.deviceId, recipientDeviceId: recipients[0], fromConvoId: t.fromConvoId,
     name: t.name, size: t.size, sha256: t.sha256, contentType: t.contentType, reason: t.reason, scan: t.scan, causes: t.causes,
   })
   console.log(`journal: transfer created id=${row.id} room=${row.room_id} device=${who.deviceId} size=${row.size} scan=${row.scan_verdict}`)
@@ -160,8 +177,13 @@ async function create(ctx, req, res, who) {
 
 const writable = (row) => row && row.phase === 'open' && row.upload === 'uploading'
 
+// Phases whose bytes are gone for good (the route that ended it deleted
+// them): a chunk PUT still in flight clears whatever it left behind. Not
+// open, released or delivered: their chunks are the verified file.
+const BYTES_GONE = new Set(['cancelled', 'declined', 'failed', 'expired'])
+
 async function putChunk(ctx, req, res, who, id, nRaw, rejectEarly) {
-  const { db, mediaDir, chunkBytes } = ctx
+  const { db, chunkBytes } = ctx
   const early = (status, error) => { rejectEarly(req, res, status, { error }); return true }
   const row = visibleTransfer(db, who, id, { senderOnly: true })
   if (!row) return early(404, 'not_found')
@@ -172,37 +194,58 @@ async function putChunk(ctx, req, res, who, id, nRaw, rejectEarly) {
   const expected = expectedChunkSize(row.size, n, chunkBytes)
   const declared = req.headers['content-length']
   if (declared !== undefined && Number(declared) !== expected) return early(400, 'chunk_mismatch')
+  // Counted from here (no await since the checks above) until the chunk is
+  // in place or refused, so a /complete cannot start hashing meanwhile.
+  putStarted(id)
+  try {
+    return await receiveChunk(ctx, req, res, id, n, expected, digest, early)
+  } finally {
+    putEnded(id)
+  }
+}
 
+// putChunk once counted in flight.
+async function receiveChunk(ctx, req, res, id, n, expected, digest, early) {
+  const { db, mediaDir } = ctx
   const finalPath = transferChunkPath(mediaDir, id, n)
   // A temp name of its own per request, so two retries of one chunk in
   // flight at once never write into the same file.
   const tmpPath = `${finalPath}.${crypto.randomBytes(6).toString('hex')}.tmp`
   const mismatch = () => Object.assign(new Error('chunk mismatch'), { code: 'chunk_mismatch' })
+  const closed = () => Object.assign(new Error('transfer closed'), { code: 'closed' })
+  // Refused after the body was read: the transfer stopped taking chunks. A
+  // terminal end clears the directory (this request may have recreated it
+  // after the route that ended it deleted it); a finished upload keeps its
+  // verified chunks, and only this request's temp file (already removed by
+  // receiveToPath) goes.
+  const refuse = (send) => {
+    if (BYTES_GONE.has(getTransfer(db, id)?.phase)) deleteTransferFiles(mediaDir, id)
+    return send(409, 'closed')
+  }
   try {
     await receiveToPath(req, {
       tmpPath, finalPath, maxBytes: expected,
-      accept: ({ size, sha256 }) => { if (size !== expected || sha256 !== digest) throw mismatch() },
+      accept: ({ size, sha256 }) => {
+        if (size !== expected || sha256 !== digest) throw mismatch()
+        // The body took a while: re-check before the rename. A cancel ends
+        // it; a /complete hashing now (the in-flight count should already
+        // have refused one) must not see the chunk change under it.
+        if (hashingTransfers.has(id) || !writable(getTransfer(db, id))) throw closed()
+      },
     })
   } catch (e) {
-    // Cancelled while this chunk was in flight: the directory is gone (or
-    // about to be); whatever this request wrote goes with it.
-    if (!writable(getTransfer(db, id))) {
-      deleteTransferFiles(mediaDir, id)
-      return early(409, 'closed')
-    }
+    if (e.code === 'closed' || !writable(getTransfer(db, id))) return refuse(e.code === 'closed' ? sendJson(res) : early)
     if (e.code === 'too_large') return early(400, 'chunk_mismatch')
     if (e.code === 'chunk_mismatch') { json(res, 400, { error: 'chunk_mismatch' }); return true }
     throw e
   }
-  if (!writable(getTransfer(db, id))) {
-    deleteTransferFiles(mediaDir, id)
-    json(res, 409, { error: 'closed' })
-    return true
-  }
+  if (!writable(getTransfer(db, id))) return refuse(sendJson(res))
   recordChunk(db, id, n, expected)
   json(res, 200, { n })
   return true
 }
+
+const sendJson = (res) => (status, error) => { json(res, status, { error }); return true }
 
 function cancel(ctx, res, who, id) {
   const { db, mediaDir } = ctx
@@ -269,6 +312,7 @@ async function completeUpload(ctx, res, who, id) {
   if (row.upload === 'uploaded' && row.phase !== 'failed') { json(res, 200, progress(row)); return true }
   if (!writable(row)) { json(res, 409, { error: 'closed' }); return true }
   if (hashingTransfers.has(id)) return conflict(res, 'hashing', 'This transfer is already being checked; try again shortly.')
+  if (chunkPutsInFlight.has(id)) return conflict(res, 'hashing', 'A chunk of this transfer is still uploading; try again shortly.')
   hashingTransfers.add(id)
   try {
     return await completeHeld(ctx, res, row)

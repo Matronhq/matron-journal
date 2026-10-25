@@ -17,7 +17,7 @@ import { appendAndBroadcast } from './journal.js'
 import { participantConvoIds } from './participants.js'
 import { recordAndAnnounce } from './consent-answer.js'
 import { wakeIfOffline } from './wake.js'
-import { getTransfer, setTransferState, deleteTransferFiles, forgetChunks, recipientDevices, isTransferId, parseFindings } from './transfers.js'
+import { getTransfer, setTransferState, deleteTransferFiles, forgetChunks, transferRecipients, isTransferId, parseFindings } from './transfers.js'
 
 // "by the user." or "by the Coordinator: <reason>", for the decline's
 // room line: the reason flattened to one line, without markdown, capped.
@@ -98,7 +98,7 @@ export function transferNames(db, row) {
   const title = (id) => name(db.prepare('SELECT title FROM conversations WHERE id=?').get(id)?.title)
   const convos = participantConvoIds(db, row.room_id).filter((c) => c !== row.from_convo_id)
   const ownerOf = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?')
-  const recipients = recipientDevices(db, row.room_id, row.sender_device_id).map((d) => ({
+  const recipients = transferRecipients(db, row).map((d) => ({
     box: deviceName(d),
     sessions: convos.filter((c) => ownerOf.get(c)?.agent_device_id === d).map(title).filter(Boolean),
   }))
@@ -197,7 +197,7 @@ export function readyTransferView(db, row) {
 // the guarded open -> released move picks a single winner, so a repeat or
 // racing call writes nothing. The room gets a durable `file` event in the
 // journal's voice (no blob: the bytes are fetched by transfer_id), and
-// every recipient device a `ready` frame; a box that is asleep is woken,
+// the recipient device a `ready` frame; a box that is asleep is woken,
 // and its bridge catches up on hello (GET /transfers?for=me). → true when
 // this call released it.
 export function releaseIfReady({ db, hub, waker = null }, id) {
@@ -213,7 +213,7 @@ export function releaseIfReady({ db, hub, waker = null }, id) {
   } catch (err) {
     console.error(`transfer: room file event for ${id} failed (the release stands)`, err)
   }
-  for (const deviceId of recipientDevices(db, row.room_id, row.sender_device_id)) {
+  for (const deviceId of transferRecipients(db, row)) {
     hub.sendToDevice(row.user_id, deviceId, { kind: 'transfer', event: 'ready', transfer_id: id, transfer: view })
     wakeIfOffline({ db, hub, waker }, row.user_id, deviceId)
   }

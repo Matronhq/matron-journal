@@ -4,11 +4,13 @@ import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
+import http from 'node:http'
 import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { recordJoined } from '../src/participants.js'
 import { getTransfer, transferDir, transferChunkPath, setTransferState } from '../src/transfers.js'
-import { releaseIfReady } from '../src/transfer-consent.js'
+import { releaseIfReady, transferNames } from '../src/transfer-consent.js'
+import { hashingTransfers } from '../src/transfers-http.js'
 
 // Agent-to-agent file transfers (Task 3): completing an upload against the
 // declared sha256, the release once both approved and uploaded (exactly
@@ -435,4 +437,171 @@ test('POST /failed: the reason is flattened, stripped of markdown and capped at 
   assert.ok(frame.frame.reason.length <= 'receiver: '.length + 200)
   const [line] = roomTexts(f)
   assert.ok(!/[\n*]/.test(line.body))
+})
+
+// A chunk PUT held open mid-body: one byte is sent at once, the rest on
+// finish(). Resolves {status, json} once the server answers; destroyed
+// after 5 s if finish() never comes.
+function slowPut(f, id, n, bytes) {
+  const req = http.request(`${f.s.base}/transfers/${id}/chunks/${n}`, {
+    method: 'PUT',
+    headers: { authorization: `Bearer ${f.a.token}`, 'content-type': 'application/octet-stream', 'x-chunk-sha256': sha(bytes), 'content-length': String(bytes.length) },
+  })
+  const done = new Promise((resolve, reject) => {
+    req.on('response', (res) => {
+      let text = ''
+      res.on('data', (c) => { text += c })
+      res.on('end', () => resolve({ status: res.statusCode, json: text ? JSON.parse(text) : null }))
+    })
+    req.on('error', reject)
+  })
+  req.write(bytes.subarray(0, 1))
+  // A test that fails before finish() must not leave the server waiting on
+  // this socket at close.
+  const guard = setTimeout(() => req.destroy(), 5000)
+  guard.unref()
+  return { finish: () => { clearTimeout(guard); req.end(bytes.subarray(1)); return done } }
+}
+
+const tmpFiles = (f, id) => { try { return fs.readdirSync(transferDir(f.mediaDir, id)).filter((x) => x.endsWith('.tmp')) } catch { return [] } }
+
+// Until the slow PUT's temp file is on disk: its body is being read.
+async function untilInFlight(f, id) {
+  for (let i = 0; i < 500 && tmpFiles(f, id).length === 0; i++) await new Promise((r) => setTimeout(r, 10))
+  assert.ok(tmpFiles(f, id).length > 0, 'the slow PUT reached the body')
+}
+
+test('a chunk PUT that finishes after the upload completed leaves the verified chunks in place; the file stays downloadable', async (t) => {
+  const f = await fleet(t)
+  const id = await createTransfer(f)
+  await uploadAll(f, id)
+  const put = slowPut(f, id, 0, Buffer.from('ZZZZZZZZZZ'))
+  await untilInFlight(f, id)
+  // The state a /complete leaves, as if one had won the race with this PUT.
+  assert.ok(setTransferState(f.s.db, id, { upload: 'uploaded', uploaded_at: Date.now() }))
+  assert.equal((await tap(f, id, 'Approve')).status, 200)
+  assert.equal(getTransfer(f.s.db, id).phase, 'released')
+  const r = await put.finish()
+  assert.equal(r.status, 409)
+  assert.equal(r.json.error, 'closed')
+  assert.deepEqual(tmpFiles(f, id), [], 'its temp file is gone')
+  assert.deepEqual(fs.readFileSync(transferChunkPath(f.mediaDir, id, 0)), DATA.subarray(0, CHUNK), 'chunk 0 is the verified one')
+  const got = await download(f, id)
+  assert.equal(got.status, 200)
+  assert.deepEqual(Buffer.from(await got.arrayBuffer()), DATA)
+})
+
+test('complete while a chunk PUT is in flight is 409 hashing; once it lands, complete succeeds', async (t) => {
+  const f = await fleet(t)
+  const id = await createTransfer(f)
+  await uploadAll(f, id)
+  const put = slowPut(f, id, 0, DATA.subarray(0, CHUNK))
+  await untilInFlight(f, id)
+  const early = await complete(f, id)
+  assert.equal(early.status, 409)
+  assert.equal(early.json.error, 'conflict')
+  assert.equal(early.json.detail, 'hashing')
+  assert.equal(getTransfer(f.s.db, id).upload, 'uploading')
+  assert.equal((await put.finish()).status, 200)
+  assert.equal((await complete(f, id)).status, 200)
+  assert.equal(getTransfer(f.s.db, id).upload, 'uploaded')
+})
+
+test('a chunk PUT whose body lands while a complete is hashing is 409 closed and never renamed into place', async (t) => {
+  const f = await fleet(t)
+  const id = await createTransfer(f)
+  await uploadAll(f, id)
+  const put = slowPut(f, id, 0, Buffer.from('ZZZZZZZZZZ'))
+  await untilInFlight(f, id)
+  hashingTransfers.add(id)
+  try {
+    const r = await put.finish()
+    assert.equal(r.status, 409)
+    assert.equal(r.json.error, 'closed')
+  } finally {
+    hashingTransfers.delete(id)
+  }
+  assert.deepEqual(fs.readFileSync(transferChunkPath(f.mediaDir, id, 0)), DATA.subarray(0, CHUNK))
+  assert.deepEqual(tmpFiles(f, id), [])
+  assert.equal((await complete(f, id)).status, 200)
+})
+
+test('a chunk PUT that finishes after a cancel still clears the transfer directory', async (t) => {
+  const f = await fleet(t)
+  const id = await createTransfer(f)
+  await putChunk(f, id, 0, DATA.subarray(0, CHUNK))
+  const put = slowPut(f, id, 1, DATA.subarray(CHUNK, 2 * CHUNK))
+  await untilInFlight(f, id)
+  assert.equal((await f.s.http(`/transfers/${id}`, { method: 'DELETE', token: f.a.token })).status, 200)
+  const r = await put.finish()
+  assert.equal(r.status, 409)
+  assert.equal(fs.existsSync(transferDir(f.mediaDir, id)), false)
+})
+
+// One recipient device per transfer.
+
+test('create: a room with two possible recipient devices is 409 multiple_recipients and creates nothing', async (t) => {
+  const f = await fleet(t)
+  recordJoined(f.s.db, { convoId: 'room', agentDeviceId: f.c.deviceId, initiatorDeviceId: f.a.deviceId })
+  const r = await f.s.http('/transfers', {
+    method: 'POST', token: f.a.token,
+    body: { room_id: 'room', from_convo_id: 'sess-a', name: 'notes.txt', size: DATA.length, sha256: sha(DATA), scan: { verdict: 'clean', findings: [] } },
+  })
+  assert.equal(r.status, 409)
+  assert.equal(r.json.error, 'conflict')
+  assert.equal(r.json.detail, 'multiple_recipients')
+  assert.match(r.json.message, /one/)
+  assert.equal(f.s.db.prepare('SELECT COUNT(*) c FROM transfers').get().c, 0)
+})
+
+test('the recipient device is stored at create; a box that joins later is not a recipient', async (t) => {
+  const f = await fleet(t)
+  const id = await createTransfer(f)
+  assert.equal(getTransfer(f.s.db, id).recipient_device_id, f.b.deviceId)
+  recordJoined(f.s.db, { convoId: 'room', agentDeviceId: f.c.deviceId, initiatorDeviceId: f.a.deviceId })
+  assert.deepEqual(transferNames(f.s.db, getTransfer(f.s.db, id)).recipients.map((r) => r.box), ['box-b'], 'the card names only the stored recipient')
+  await uploadAll(f, id)
+  assert.equal((await complete(f, id)).status, 200)
+  assert.equal((await tap(f, id, 'Approve')).status, 200)
+  assert.deepEqual(frames(f, 'ready').map((x) => x.deviceId), [f.b.deviceId])
+  const r = await download(f, id, f.c.token)
+  assert.equal(r.status, 404)
+  await r.arrayBuffer()
+  assert.equal((await received(f, id, { sha256: sha(DATA) }, f.c.token)).status, 404)
+  assert.equal((await f.s.http(`/transfers/${id}/failed`, { method: 'POST', token: f.c.token, body: { reason: 'x' } })).status, 404)
+  assert.deepEqual((await f.s.http('/transfers?for=me', { token: f.c.token })).json.transfers, [])
+  assert.equal((await f.s.http('/transfers?for=me', { token: f.b.token })).json.transfers.length, 1)
+  const ok = await download(f, id)
+  assert.equal(ok.status, 200)
+  await ok.arrayBuffer()
+})
+
+test('a same-device room delivers to the sender\'s own device', async (t) => {
+  const f = await fleet(t)
+  addConvo(f.s.db, 'same', f.alice.id, f.a.deviceId, 'Two sessions')
+  recordJoined(f.s.db, { convoId: 'same', agentDeviceId: f.a.deviceId, initiatorDeviceId: f.a.deviceId })
+  const id = await released(f, { room_id: 'same' })
+  assert.equal(getTransfer(f.s.db, id).recipient_device_id, f.a.deviceId)
+  assert.deepEqual(frames(f, 'ready').map((x) => x.deviceId), [f.a.deviceId])
+  const got = await download(f, id, f.a.token)
+  assert.equal(got.status, 200)
+  assert.deepEqual(Buffer.from(await got.arrayBuffer()), DATA)
+  const r = await download(f, id, f.b.token)
+  assert.equal(r.status, 404)
+  await r.arrayBuffer()
+  assert.equal((await received(f, id, { sha256: sha(DATA) }, f.a.token)).status, 200)
+  assert.equal(getTransfer(f.s.db, id).phase, 'delivered')
+})
+
+test('a row from before the recipient column falls back to the room\'s recipients', async (t) => {
+  const f = await fleet(t)
+  const id = await released(f)
+  f.s.db.prepare('UPDATE transfers SET recipient_device_id=NULL WHERE id=?').run(id)
+  const r = await download(f, id)
+  assert.equal(r.status, 200)
+  await r.arrayBuffer()
+  assert.equal((await f.s.http('/transfers?for=me', { token: f.b.token })).json.transfers.length, 1)
+  const c = await download(f, id, f.c.token)
+  assert.equal(c.status, 404)
+  await c.arrayBuffer()
 })

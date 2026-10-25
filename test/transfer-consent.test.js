@@ -10,7 +10,7 @@ import { recordJoined } from '../src/participants.js'
 import { getTransfer, transferDir, recordChunk } from '../src/transfers.js'
 import { recordConsentDecision } from '../src/consent.js'
 import { transferConsentItemFields, humanSize } from '../src/transfer-consent.js'
-import { widenConsentDecisionKinds, addTransferCauses } from '../src/db.js'
+import { widenConsentDecisionKinds, addTransferCauses, addTransferRecipient } from '../src/db.js'
 import { recordCarryOn } from '../src/cause-hops.js'
 import Database from 'better-sqlite3'
 
@@ -306,9 +306,11 @@ test('Coordinator: bad id is 400, an unknown or another user\'s transfer is 404,
   const f = await fleet(t)
   assert.equal((await answer(f, { id: 'nope', decision: 'approve', reason: 'x' })).status, 400)
   assert.equal((await answer(f, { id: 'tr_' + 'f'.repeat(32), decision: 'approve', reason: 'x' })).status, 404)
-  // A transfer sent from the Coordinator's own conversation.
-  recordJoined(f.s.db, { convoId: 'room', agentDeviceId: f.coord.deviceId, initiatorDeviceId: f.a.deviceId })
-  const own = await f.s.http('/transfers', { method: 'POST', token: f.coord.token, body: createBody({ from_convo_id: 'coord' }) })
+  // A transfer sent from the Coordinator's own conversation, into a room
+  // of its own with box-a (one recipient per transfer).
+  addConvo(f.s.db, 'pair', f.alice.id, f.a.deviceId, 'Pair')
+  recordJoined(f.s.db, { convoId: 'pair', agentDeviceId: f.coord.deviceId, initiatorDeviceId: f.a.deviceId })
+  const own = await f.s.http('/transfers', { method: 'POST', token: f.coord.token, body: createBody({ room_id: 'pair', from_convo_id: 'coord' }) })
   assert.equal(own.status, 201)
   const r = await answer(f, { id: own.json.transfer_id, decision: 'approve', reason: 'mine' })
   assert.equal(r.status, 403)
@@ -499,4 +501,13 @@ test('migration: an existing transfers table gains a nullable causes column, row
   addTransferCauses(db)
   addTransferCauses(db)
   assert.deepEqual({ ...db.prepare('SELECT id, causes FROM transfers').get() }, { id: 'tr_1', causes: null })
+})
+
+test('migration: an existing transfers table gains a nullable recipient_device_id column, rows kept', () => {
+  const db = new Database(':memory:')
+  db.exec(`CREATE TABLE transfers(id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, name TEXT NOT NULL)`)
+  db.prepare("INSERT INTO transfers(id, user_id, name) VALUES('tr_1', 1, 'a.txt')").run()
+  addTransferRecipient(db)
+  addTransferRecipient(db)
+  assert.deepEqual({ ...db.prepare('SELECT id, recipient_device_id FROM transfers').get() }, { id: 'tr_1', recipient_device_id: null })
 })

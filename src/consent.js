@@ -13,7 +13,7 @@ import { predictSpawnRun } from './spawn-model.js'
 import { parseCauses } from './ask-causes.js'
 import { isPrivateDevice } from './db.js'
 import { privateOwnedConvo } from './privacy.js'
-import { recipientDevices, parseFindings } from './transfers.js'
+import { transferRecipients, parseFindings } from './transfers.js'
 
 export const CONSENT_REASON_MAX = 200
 export const CONSENT_DAILY_CAP_DEFAULT = 20
@@ -94,7 +94,7 @@ export function isUserOnlyChat(db, userId, roomId, targetDeviceId) {
 
 // A transfer: the sending box or any box it goes to.
 export function isUserOnlyTransfer(db, userId, row) {
-  return [row.sender_device_id, ...recipientDevices(db, row.room_id, row.sender_device_id)].some((d) => userOnlyDevice(db, userId, d))
+  return [row.sender_device_id, ...transferRecipients(db, row)].some((d) => userOnlyDevice(db, userId, d))
 }
 
 const name = (raw) => (raw == null ? '' : sanitizePeerText(raw, PEER_NAME_CAP))
@@ -135,7 +135,7 @@ export function chatAskInvolvesPrivate(db, userId, roomId, targetDeviceId) {
 export function transferAskInvolvesPrivate(db, userId, row) {
   if (!row || row.user_id !== userId || row.consent !== 'awaiting_user' || row.phase !== 'open') return false
   return isPrivateDevice(db, row.sender_device_id) ||
-    recipientDevices(db, row.room_id, row.sender_device_id).some((d) => isPrivateDevice(db, d)) ||
+    transferRecipients(db, row).some((d) => isPrivateDevice(db, d)) ||
     privateOwnedConvo(db, row.room_id) || privateOwnedConvo(db, row.from_convo_id)
 }
 
@@ -216,7 +216,7 @@ export function listPendingAsks({ db, hub, waker }, userId, { excludePrivate = f
     kind: 'transfer', id: r.id, created_at: r.created_at,
     from_device_id: r.sender_device_id, from_name: name(r.from_name), from_convo_id: r.from_convo_id, from_convo_title: name(r.from_convo_title),
     room_id: r.room_id, room_title: name(r.room_title),
-    to_names: recipientDevices(db, r.room_id, r.sender_device_id).map((d) => name(deviceName.get(d, userId)?.name)),
+    to_names: transferRecipients(db, r).map((d) => name(deviceName.get(d, userId)?.name)),
     name: r.name, size: r.size, sha256: r.sha256, scan_verdict: r.scan_verdict, scan_findings: parseFindings(r.scan_findings),
     reason: r.reason, item_num: r.item_num ?? null,
     ...(isUserOnlyTransfer(db, userId, r) ? { user_only: true } : {}),

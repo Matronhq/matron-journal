@@ -91,11 +91,11 @@ export function deleteTransferFiles(mediaDir, id) {
   fs.rmSync(transferDir(mediaDir, id), { recursive: true, force: true })
 }
 
-export function createTransfer(db, { userId, roomId, senderDeviceId, fromConvoId, name, size, sha256, contentType, reason = '', scan = { verdict: 'not_scanned', findings: [] }, causes = null, now = Date.now() }) {
+export function createTransfer(db, { userId, roomId, senderDeviceId, recipientDeviceId = null, fromConvoId, name, size, sha256, contentType, reason = '', scan = { verdict: 'not_scanned', findings: [] }, causes = null, now = Date.now() }) {
   const id = `tr_${crypto.randomBytes(16).toString('hex')}`
-  db.prepare(`INSERT INTO transfers(id, user_id, room_id, sender_device_id, from_convo_id, name, size, sha256, content_type, reason, scan_verdict, scan_findings, causes, created_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(id, userId, roomId, senderDeviceId, fromConvoId, name, size, sha256, contentType, reason, scan.verdict, JSON.stringify(scan.findings ?? []), causes ? JSON.stringify(causes) : null, now)
+  db.prepare(`INSERT INTO transfers(id, user_id, room_id, sender_device_id, recipient_device_id, from_convo_id, name, size, sha256, content_type, reason, scan_verdict, scan_findings, causes, created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(id, userId, roomId, senderDeviceId, recipientDeviceId, fromConvoId, name, size, sha256, contentType, reason, scan.verdict, JSON.stringify(scan.findings ?? []), causes ? JSON.stringify(causes) : null, now)
   return getTransfer(db, id)
 }
 
@@ -145,6 +145,25 @@ export function recipientDevices(db, roomId, senderDeviceId) {
   if (!sameDevice) ids.delete(senderDeviceId)
   const own = db.prepare("SELECT 1 FROM devices WHERE id=? AND user_id=? AND kind='agent'")
   return [...ids].filter((d) => own.get(d, room.owner_user_id)).sort((x, y) => x - y)
+}
+
+// The devices a new transfer from `senderDeviceId` into `roomId` could go
+// to under the one-recipient rule: recipientDevices without the sender's
+// own device, or, when that leaves none, the sender's device itself in a
+// same-device room. A transfer is created only when this is exactly one
+// device; that device is stored on the row (recipient_device_id).
+export function recipientCandidates(db, roomId, senderDeviceId) {
+  const all = recipientDevices(db, roomId, senderDeviceId)
+  const others = all.filter((d) => d !== senderDeviceId)
+  return others.length ? others : all
+}
+
+// The device a transfer goes to: the one stored at create, as a list. A
+// row from before the column was added falls back to the room's
+// recipientDevices as they are now.
+export function transferRecipients(db, row) {
+  if (row.recipient_device_id != null) return [row.recipient_device_id]
+  return recipientDevices(db, row.room_id, row.sender_device_id)
 }
 
 // A guarded update. `patch` may set consent / upload / phase (each moved

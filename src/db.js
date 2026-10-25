@@ -1510,6 +1510,7 @@ export function openDb(path) {
   }
   widenConsentDecisionKinds(db)
   addTransferCauses(db)
+  addTransferRecipient(db)
   // A routine's envelope (JSON): the bounds on what an ask born of one of
   // its fires may do — how many spawns per fire, whether chats, which boxes.
   // NULL = no envelope, the value for every routine predating the column.
@@ -2090,6 +2091,14 @@ export function migratePersonRoomsForTalk(db) {
 export function addTransferCauses(db) {
   const cols = db.prepare('PRAGMA table_info(transfers)').all()
   if (!cols.some((c) => c.name === 'causes')) db.exec('ALTER TABLE transfers ADD COLUMN causes TEXT')
+}
+
+// The one device a transfer goes to (src/transfers.js recipientCandidates),
+// fixed at create. NULL on every row predating the column: those fall back
+// to the room's current recipients (transferRecipients). Idempotent.
+export function addTransferRecipient(db) {
+  const cols = db.prepare('PRAGMA table_info(transfers)').all()
+  if (!cols.some((c) => c.name === 'recipient_device_id')) db.exec('ALTER TABLE transfers ADD COLUMN recipient_device_id INTEGER')
 }
 
 // The Coordinator answers file transfers too: consent_decisions.kind gains
