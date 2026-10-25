@@ -45,6 +45,7 @@ import { handleBriefingsRoute } from './briefings-http.js'
 import { handleRoutinesRoute } from './routines-http.js'
 import { handleSeenRoute } from './seen-http.js'
 import { handleConsentRoute } from './consent-http.js'
+import { handleTransferRoute } from './transfers-http.js'
 import { answerChatAsk, answerSpawnAsk } from './consent-answer.js'
 import { coordinatorFor } from './coordinator.js'
 import { json, readBody } from './http-body.js'
@@ -113,7 +114,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, blobTranscripts = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, blobTranscripts = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null }) {
   // Two-factor sign-in (src/two-factor-http.js). The server passes its own;
   // the defaults keep a bare handler (tests) working the same way.
   const twoFactorBox = tokenBox || PLAIN_BOX
@@ -316,7 +317,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       // The tracker's own surface (src/items-http.js) — mounted first so
       // its /items* paths never collide with the chain below, and inside the
       // outer try/catch so readBody's 400/413 map like every other route's.
-      if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription, broker, spawnStartTimeoutMs, spawnWakeWaitMs }, req, res, url, who)) return
+      if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription, broker, spawnStartTimeoutMs, spawnWakeWaitMs, mediaDir }, req, res, url, who)) return
       // Ahead of the missions routes: /missions/:id/shares is its own surface.
       if (await handleSharingRoute({ db, hub, pushPipeline, waker, broker, spawnStartTimeoutMs, spawnWakeWaitMs }, req, res, url, who)) return
       if (await handlePersonRoomRoute({ db, hub, pushPipeline, waker, broker, spawnStartTimeoutMs, spawnWakeWaitMs }, req, res, url, who)) return
@@ -371,7 +372,10 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       if (await handleSettingsRoute({ db, hub }, req, res, url, who)) return
       // Coordinator consent approval (src/consent-http.js): the same answer
       // path the two client routes below use, gated on the Coordinator.
-      if (await handleConsentRoute({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs, consentDailyCap, consentRoutineCap, verifier }, req, res, url, who)) return
+      if (await handleConsentRoute({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs, consentDailyCap, consentRoutineCap, verifier, mediaDir }, req, res, url, who)) return
+      // Agent-to-agent file transfers (src/transfers-http.js): agent tokens
+      // only. Chunk bodies are streamed to disk there, never read here.
+      if (await handleTransferRoute({ db, hub, waker, mediaDir, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes }, req, res, url, who, { rejectEarly })) return
       if (req.method === 'GET' && url.pathname === '/help') {
         // API discovery for agent callers (see src/help.js). Behind auth like
         // the rest of the device surface: it describes the API, and the

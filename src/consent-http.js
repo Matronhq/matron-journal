@@ -1,5 +1,5 @@
 // HTTP surface of Coordinator consent approval:
-//   GET  /consent/pending?convo_id=…   the parked asks, both kinds
+//   GET  /consent/pending?convo_id=…   the parked asks, every kind (chat, spawn, transfer)
 //   POST /consent/answer {convo_id, kind, id, decision, reason}
 // Agent connections only, and only when convo_id is a top-level
 // conversation this device owns AND the user's Coordinator — the same gate
@@ -26,12 +26,16 @@ import { getCoordinatorConvoId } from './coordinator.js'
 import {
   CONSENT_REASON_MAX, CONSENT_DAILY_CAP_DEFAULT, CONSENT_DAILY_WINDOW_MS, CONSENT_KINDS, CONSENT_DECISIONS,
   getConsentEnabled, listPendingAsks, parseChatAskId, coordinatorApprovalsSince, deviceState,
-  isUserOnlySpawn, isUserOnlyChat, spawnAskInvolvesPrivate, chatAskInvolvesPrivate,
+  isUserOnlySpawn, isUserOnlyChat, isUserOnlyTransfer, spawnAskInvolvesPrivate, chatAskInvolvesPrivate, transferAskInvolvesPrivate,
 } from './consent.js'
 import { filteredAgent } from './privacy.js'
 import { answerChatAsk, answerSpawnAsk } from './consent-answer.js'
+import { answerTransferAsk } from './transfer-consent.js'
+import { getTransfer, isTransferId } from './transfers.js'
 import { verifyOwnAsk, confirmOwnAsk, spawnAsk, chatAsk } from './consent-own-ask.js'
 import { getSpawn } from './spawns.js'
+import { resolveRelayedAsk } from './cause-hops.js'
+import { parseCauses } from './ask-causes.js'
 
 const forbidden = (res, detail) => { json(res, 403, { error: 'forbidden', ...(detail ? { detail } : {}) }); return true }
 
@@ -95,6 +99,7 @@ export async function handleConsentRoute(ctx, req, res, url, who) {
     const r = answerSpawnAsk(ctx, { userId: who.userId, requestId: body.id, decision: body.decision, decidedBy })
     json(res, r.status, r.body); return true
   }
+  if (body.kind === 'transfer') return answerTransfer(ctx, res, who, body, decidedBy, ordinary)
   const key = parseChatAskId(body.id)
   if (!key) { json(res, 400, { error: 'bad_request' }); return true }
   if (ordinary && chatAskInvolvesPrivate(db, who.userId, key.roomId, key.targetDeviceId)) { json(res, 404, { error: 'not_found' }); return true }
@@ -105,6 +110,38 @@ export async function handleConsentRoute(ctx, req, res, url, who) {
     if (!approvalAllowed(ctx, res, who, ask, verdict, decidedBy)) return true
   }
   const r = answerChatAsk(ctx, { userId: who.userId, roomId: key.roomId, targetDeviceId: key.targetDeviceId, decision: body.decision, decidedBy })
+  json(res, r.status, r.body)
+  return true
+}
+
+// A file transfer. For an ordinary Coordinator, one a private device takes
+// part in is the 404 an unknown id gets, decline included. An approval is
+// refused, before anything changes, when the sender's secret scan flagged
+// the file (the user alone may let that through), when a user-only box
+// sends or receives it, and when the Coordinator sent it — from its own
+// session, or by having another session send it (its causes lead back to a
+// carry-on or room message of the Coordinator's, src/cause-hops.js): a file
+// the Coordinator sends is the user's to approve, whatever its causes say;
+// then the daily cap, as for the other kinds.
+function answerTransfer(ctx, res, who, body, decidedBy, ordinary) {
+  if (!isTransferId(body.id)) { json(res, 400, { error: 'bad_request' }); return true }
+  if (ordinary && transferAskInvolvesPrivate(ctx.db, who.userId, getTransfer(ctx.db, body.id))) { json(res, 404, { error: 'not_found' }); return true }
+  if (body.decision === 'approve') {
+    const row = getTransfer(ctx.db, body.id)
+    if (!row || row.user_id !== who.userId) { json(res, 404, { error: 'not_found' }); return true }
+    if (row.consent !== 'awaiting_user' || row.phase !== 'open') { json(res, 409, { error: 'conflict' }); return true }
+    if (row.scan_verdict === 'flagged') return forbidden(res, 'secret_scan_flagged')
+    if (isUserOnlyTransfer(ctx.db, who.userId, row)) return forbidden(res, 'user_only')
+    if (row.from_convo_id === body.convo_id) {
+      json(res, 403, { error: 'forbidden', detail: 'own_ask_unverified', why: 'a file the Coordinator sends is the user\'s to approve' }); return true
+    }
+    const relay = resolveRelayedAsk(ctx.db, { who, userId: who.userId, causes: parseCauses(row.causes), createdAt: row.created_at, fromConvoId: row.from_convo_id })
+    if (relay.relayed) {
+      json(res, 403, { error: 'forbidden', detail: 'own_ask_unverified', why: 'a file the Coordinator had another session send is the user\'s to approve' }); return true
+    }
+    if (!approvalAllowed(ctx, res, who, { kind: 'transfer', own: false }, null, decidedBy)) return true
+  }
+  const r = answerTransferAsk(ctx, { userId: who.userId, transferId: body.id, decision: body.decision, decidedBy })
   json(res, r.status, r.body)
   return true
 }

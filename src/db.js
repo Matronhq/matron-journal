@@ -325,7 +325,7 @@ CREATE TABLE IF NOT EXISTS user_settings(
 CREATE TABLE IF NOT EXISTS consent_decisions(
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id    INTEGER NOT NULL REFERENCES users(id),
-  kind       TEXT NOT NULL CHECK(kind IN ('chat','spawn')),
+  kind       TEXT NOT NULL CHECK(kind IN ('chat','spawn','transfer')),
   ask_id     TEXT NOT NULL,
   decision   TEXT NOT NULL CHECK(decision IN ('approve','decline')),
   convo_id   TEXT NOT NULL,
@@ -675,6 +675,48 @@ CREATE TABLE IF NOT EXISTS two_factor_recovery(
 CREATE TABLE IF NOT EXISTS journal_settings(
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
+);
+-- Agent-to-agent file transfers (src/transfers.js): one row per file a
+-- session sends into a room. Three axes: consent (the user's card), upload
+-- (the sender's chunks) and phase (where the file is in its life; every
+-- phase but open and released is terminal). size is the declared size,
+-- reserved against the user's transfer quota while the phase is live.
+-- scan_findings is a JSON array of {kind, line}, never the matched value.
+-- Chunk bytes live under <mediaDir>/transfers/<id>/<n>; transfer_chunks
+-- records which of them arrived whole and verified.
+CREATE TABLE IF NOT EXISTS transfers(
+  id               TEXT PRIMARY KEY,
+  user_id          INTEGER NOT NULL REFERENCES users(id),
+  room_id          TEXT NOT NULL,
+  sender_device_id INTEGER NOT NULL,
+  from_convo_id    TEXT NOT NULL,
+  name             TEXT NOT NULL,
+  size             INTEGER NOT NULL,
+  sha256           TEXT NOT NULL,
+  content_type     TEXT NOT NULL,
+  reason           TEXT NOT NULL DEFAULT '',
+  scan_verdict     TEXT NOT NULL CHECK(scan_verdict IN ('clean','flagged','not_scanned')),
+  scan_findings    TEXT NOT NULL DEFAULT '[]',
+  consent          TEXT NOT NULL DEFAULT 'awaiting_user' CHECK(consent IN ('awaiting_user','approved','declined')),
+  upload           TEXT NOT NULL DEFAULT 'uploading' CHECK(upload IN ('uploading','uploaded','failed')),
+  phase            TEXT NOT NULL DEFAULT 'open' CHECK(phase IN ('open','released','delivered','expired','cancelled','failed','declined')),
+  item_id          TEXT,
+  decided_by       TEXT,
+  decided_reason   TEXT,
+  created_at       INTEGER NOT NULL,
+  approved_at      INTEGER,
+  uploaded_at      INTEGER,
+  released_at      INTEGER,
+  delivered_at     INTEGER,
+  deleted_at       INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_transfers_user_phase ON transfers(user_id, phase);
+CREATE INDEX IF NOT EXISTS idx_transfers_room ON transfers(room_id);
+CREATE TABLE IF NOT EXISTS transfer_chunks(
+  transfer_id TEXT NOT NULL,
+  n           INTEGER NOT NULL,
+  size        INTEGER NOT NULL,
+  PRIMARY KEY(transfer_id, n)
 );
 `
 
@@ -1466,6 +1508,9 @@ export function openDb(path) {
   for (const c of ['cause_kind', 'cause_ref', 'verifier_note']) {
     if (!decisionCols.some((d) => d.name === c)) db.exec(`ALTER TABLE consent_decisions ADD COLUMN ${c} TEXT`)
   }
+  widenConsentDecisionKinds(db)
+  addTransferCauses(db)
+  addTransferRecipient(db)
   // A routine's envelope (JSON): the bounds on what an ask born of one of
   // its fires may do — how many spawns per fire, whether chats, which boxes.
   // NULL = no envelope, the value for every routine predating the column.
@@ -2037,4 +2082,51 @@ export function migratePersonRoomsForTalk(db) {
   add('contact_by_talk', 'contact_by_talk INTEGER NOT NULL DEFAULT 0')
   add('pick_options', 'pick_options TEXT')
   add('spawn_id', 'spawn_id TEXT')
+}
+
+// The causes the sending bridge stamped on a transfer (src/ask-causes.js),
+// as on a spawn or chat ask: a JSON array of {kind, ref?, at?}, NULL when
+// it stamped none — a bridge that predates the field, and every row
+// predating the column. Idempotent.
+export function addTransferCauses(db) {
+  const cols = db.prepare('PRAGMA table_info(transfers)').all()
+  if (!cols.some((c) => c.name === 'causes')) db.exec('ALTER TABLE transfers ADD COLUMN causes TEXT')
+}
+
+// The one device a transfer goes to (src/transfers.js recipientCandidates),
+// fixed at create. NULL on every row predating the column: those fall back
+// to the room's current recipients (transferRecipients). Idempotent.
+export function addTransferRecipient(db) {
+  const cols = db.prepare('PRAGMA table_info(transfers)').all()
+  if (!cols.some((c) => c.name === 'recipient_device_id')) db.exec('ALTER TABLE transfers ADD COLUMN recipient_device_id INTEGER')
+}
+
+// The Coordinator answers file transfers too: consent_decisions.kind gains
+// 'transfer'. SQLite cannot widen a CHECK, so a table from before is
+// rebuilt once, the same procedure as rebuildItemsForNotice (its own
+// definition with the one CHECK replaced, so every column added by ALTER
+// since is kept). Idempotent.
+const DECISION_KIND_CHECK_OLD = "CHECK(kind IN ('chat','spawn'))"
+const DECISION_KIND_CHECK_NEW = "CHECK(kind IN ('chat','spawn','transfer'))"
+export function widenConsentDecisionKinds(db) {
+  const def = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='consent_decisions'").get()
+  if (!def || def.sql.includes("'transfer'")) return false
+  if (!def.sql.includes(DECISION_KIND_CHECK_OLD)) throw new Error('consent_decisions: unexpected kind CHECK, cannot add transfer')
+  const createNew = def.sql
+    .replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?["`]?consent_decisions["`]?\s*\(/i, 'CREATE TABLE consent_decisions_transfer_new(')
+    .replace(DECISION_KIND_CHECK_OLD, DECISION_KIND_CHECK_NEW)
+  const indexes = db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='consent_decisions' AND sql IS NOT NULL").all().map((r) => r.sql)
+  db.pragma('foreign_keys = OFF')
+  try {
+    db.transaction(() => {
+      db.exec(createNew)
+      db.exec('INSERT INTO consent_decisions_transfer_new SELECT * FROM consent_decisions')
+      db.exec('DROP TABLE consent_decisions')
+      db.exec('ALTER TABLE consent_decisions_transfer_new RENAME TO consent_decisions')
+      for (const sql of indexes) db.exec(sql)
+    })()
+  } finally {
+    db.pragma('foreign_keys = ON')
+  }
+  return true
 }

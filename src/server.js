@@ -16,7 +16,7 @@ import { makeApnsClient } from './apns.js'
 import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline } from './push.js'
 import { resolveMediaDir } from './media.js'
-import { runOffload, runExpireLogs, runReapMedia, runExpireVoiceNotes, runExpireDeviceContent } from './retention.js'
+import { runOffload, runExpireLogs, runReapMedia, runExpireVoiceNotes, runExpireDeviceContent, runExpireTransfers } from './retention.js'
 import { backfillSearchIndex, backfillIsDiff } from './search.js'
 import { loadEmbedder } from './embedder.js'
 import { ensureVectorSchema, runVectorIndexer, createVectorStore } from './vector-index.js'
@@ -44,6 +44,7 @@ import { CONSENT_DAILY_CAP_DEFAULT, CONSENT_ROUTINE_CAP_DEFAULT } from './consen
 import { makeVerifier } from './verifier.js'
 import { warnAlertWebhookConfig } from './alerts-http.js'
 import { throttle, cancellableDelay } from './background.js'
+import { TRANSFER_MAX_BYTES_DEFAULT, TRANSFER_USER_QUOTA_BYTES_DEFAULT, TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT } from './transfers.js'
 
 export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
@@ -254,9 +255,10 @@ export function resolveReapPcts({ mediaReapHighPct, mediaReapLowPct } = {}) {
 // expiry runs FIRST: what it tombstones the later passes skip, so an old
 // tool log of such a device is never offloaded to a blob only to be
 // deleted, and the reaper sees the bytes it freed. Its rules are logged
-// once, here, at boot. Returns the interval handle (for close()) or null
-// only when ALL passes are disabled.
-function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, deviceRetention }) {
+// once, here, at boot. The transfer-expiry pass (runExpireTransfers) runs
+// LAST and unconditionally — see the comment at its call site below.
+// Returns the interval handle (for close()).
+function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, deviceRetention }) {
   const days = resolveRetentionDays(retentionDays)
   const ttlHours = resolveToolLogTtlHours(toolLogTtlHours)
   const voiceDays = resolveVoiceNoteTtlDays(voiceNoteTtlDays)
@@ -265,7 +267,12 @@ function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, t
   if (deviceRules) {
     console.log(`retention: device content expiry on — ${deviceRules.map((r) => `device ${r.deviceId} after ${r.days}d`).join(', ')}`)
   }
-  if (days === null && ttlHours === null && voiceDays === null && reapPcts === null && deviceRules === null) return null
+  // Transfer expiry (runExpireTransfers) has no knob and no disable path —
+  // unlike every pass above it deletes only bytes the state machine has
+  // already decided are done for (a collected copy past its grace, an
+  // uncollected one past 7 days), never "everything older than N" against
+  // a setting that could be misconfigured — so the schedule always runs,
+  // even when every other pass below is off.
   const run = () => {
     if (deviceRules !== null) {
       try {
@@ -311,6 +318,15 @@ function scheduleRetention(db, { mediaDir, retentionDays, retentionIntervalMs, t
       } catch (err) {
         console.error('retention: media reap run failed', err)
       }
+    }
+    // Agent-to-agent file transfers: a collected copy past its 1h grace,
+    // and an open or released transfer nobody collected within 7 days —
+    // always on, see the comment above.
+    try {
+      const r = runExpireTransfers(db, { mediaDir, hub })
+      if (r.deleted > 0 || r.expired > 0) console.log(`retention: transfers — ${r.deleted} copy/copies deleted, ${r.expired} expired after 7 days uncollected`)
+    } catch (err) {
+      console.error('retention: transfer expiry run failed', err)
     }
   }
   run()
@@ -401,7 +417,7 @@ function warnIfBindTrustsSpoofableIp(bind) {
 }
 
 export function startServer({
-  dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, apnsClient, replayBackpressureBytes,
+  dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, apnsClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
   toolLogTtlHours, voiceNoteTtlDays, deviceRetention, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
   // How long an approved spawn waits for a woken target box to attach
@@ -503,6 +519,11 @@ export function startServer({
   const resolvedPreapproveKey = preapproveKey || ensurePreapproveKey(resolvedDbPath, preapproveKeyPath)
   const resolvedMediaMaxBytes = mediaMaxBytes ?? resolveNumericEnv('MATRON_MEDIA_MAX_BYTES', process.env.MATRON_MEDIA_MAX_BYTES, DEFAULT_MEDIA_MAX_BYTES)
   const resolvedMediaUserQuotaBytes = mediaUserQuotaBytes ?? resolveNumericEnv('MATRON_MEDIA_USER_QUOTA_BYTES', process.env.MATRON_MEDIA_USER_QUOTA_BYTES, DEFAULT_MEDIA_USER_QUOTA_BYTES)
+  // Agent-to-agent file transfers: a per-file cap and a per-user quota of
+  // their own, apart from the media ones (src/transfers.js).
+  const resolvedTransferMaxBytes = transferMaxBytes ?? resolveNumericEnv('MATRON_TRANSFER_MAX_BYTES', process.env.MATRON_TRANSFER_MAX_BYTES, TRANSFER_MAX_BYTES_DEFAULT)
+  const resolvedTransferUserQuotaBytes = transferUserQuotaBytes ?? resolveNumericEnv('MATRON_TRANSFER_USER_QUOTA_BYTES', process.env.MATRON_TRANSFER_USER_QUOTA_BYTES, TRANSFER_USER_QUOTA_BYTES_DEFAULT)
+  const resolvedTransferMaxAwaiting = transferMaxAwaitingPerSender ?? resolveNumericEnv('MATRON_TRANSFER_MAX_AWAITING_PER_SENDER', process.env.MATRON_TRANSFER_MAX_AWAITING_PER_SENDER, TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT)
   const resolvedMaxReplay = maxReplay ?? resolveNumericEnv('MATRON_MAX_REPLAY', process.env.MATRON_MAX_REPLAY, DEFAULT_MAX_REPLAY)
   const hub = makeHub()
   const broker = makeRpcBroker()
@@ -605,6 +626,8 @@ export function startServer({
   const server = http.createServer(makeHttpHandler({
     db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
+    // transferChunkBytes: tests only (small chunks); production uses TRANSFER_CHUNK_BYTES.
+    transferMaxBytes: resolvedTransferMaxBytes, transferUserQuotaBytes: resolvedTransferUserQuotaBytes, transferMaxAwaitingPerSender: resolvedTransferMaxAwaiting, transferChunkBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentRoutineCap, verifier,
     github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
@@ -630,7 +653,7 @@ export function startServer({
     server.listen(port, bind, () => {
       const startDelay = cancellableDelay(backgroundDelayMs)
       retentionInterval = scheduleRetention(db, {
-        mediaDir: resolvedMediaDir, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays,
+        mediaDir: resolvedMediaDir, hub, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays,
         mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes, deviceRetention,
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
