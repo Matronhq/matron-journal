@@ -10,7 +10,8 @@ import { recordJoined } from '../src/participants.js'
 import { getTransfer, transferDir, recordChunk } from '../src/transfers.js'
 import { recordConsentDecision } from '../src/consent.js'
 import { transferConsentItemFields, humanSize } from '../src/transfer-consent.js'
-import { widenConsentDecisionKinds } from '../src/db.js'
+import { widenConsentDecisionKinds, addTransferCauses } from '../src/db.js'
+import { recordCarryOn } from '../src/cause-hops.js'
 import Database from 'better-sqlite3'
 
 // The `transfer` consent kind (Task 2): the card filed as a tracker item
@@ -386,4 +387,116 @@ test('scan: a sensitive_file finding names an archive member with no line number
   assert.equal(empty.status, 400, 'an empty member name is still refused')
   const long = await f.s.http('/transfers', { method: 'POST', token: f.a.token, body: createBody({ scan: { verdict: 'flagged', findings: [{ kind: 'sensitive_file', line: 'a'.repeat(301) }] } }) })
   assert.equal(long.status, 400, 'over FINDING_LINE_MAX is refused')
+})
+
+// Device privacy: an ordinary (non-private) Coordinator neither lists, is
+// nudged about, nor answers a transfer a private device takes part in —
+// the same rule as chat and spawn asks.
+const markPrivate = (f, deviceId) => f.s.db.prepare('UPDATE devices SET private=1 WHERE id=?').run(deviceId)
+const nudges = (f) => f.sent.filter((x) => x.deviceId === f.coord.deviceId && x.frame.kind === 'consent' && x.frame.event === 'pending')
+
+for (const [who, pick] of [['sending box', (f) => f.a.deviceId], ['receiving box', (f) => f.b.deviceId]]) {
+  test(`private: a transfer whose ${who} is private is hidden from an ordinary Coordinator and is 404 to answer`, async (t) => {
+    const f = await fleet(t)
+    markPrivate(f, pick(f))
+    const id = await createTransfer(f)
+    assert.ok(!(await pending(f)).json.pending.some((p) => p.id === id))
+    assert.equal(nudges(f).length, 0, 'no nudge either')
+    for (const decision of ['approve', 'decline']) {
+      const r = await answer(f, { id, decision, reason: 'ok' })
+      assert.equal(r.status, 404, decision)
+      assert.deepEqual(r.json, { error: 'not_found' })
+    }
+    assert.equal(getTransfer(f.s.db, id).consent, 'awaiting_user')
+    assert.equal(f.s.db.prepare('SELECT COUNT(*) c FROM consent_decisions').get().c, 0)
+  })
+}
+
+test('private: a transfer from a private-owned conversation, or into a private-owned room, is hidden from an ordinary Coordinator', async (t) => {
+  const f = await fleet(t)
+  const priv = createAgent(f.s.db, f.alice.id, 'box-p')
+  // The sending session is handed to a private box after the ask parked.
+  const fromConvo = await createTransfer(f)
+  f.s.db.prepare("UPDATE conversations SET agent_device_id=? WHERE id='sess-a'").run(priv.deviceId)
+  markPrivate(f, priv.deviceId)
+  assert.ok(!(await pending(f)).json.pending.some((p) => p.id === fromConvo))
+  assert.equal((await answer(f, { id: fromConvo, decision: 'decline', reason: 'x' })).status, 404)
+  f.s.db.prepare("UPDATE conversations SET agent_device_id=? WHERE id='sess-a'").run(f.a.deviceId)
+  assert.ok((await pending(f)).json.pending.some((p) => p.id === fromConvo), 'back with an ordinary owner')
+  // The room's recorded owner is a private box (box-b, joined, sends).
+  addConvo(f.s.db, 'room-p', f.alice.id, priv.deviceId, 'Private room')
+  recordJoined(f.s.db, { convoId: 'room-p', agentDeviceId: f.a.deviceId, initiatorDeviceId: priv.deviceId })
+  const room = await createTransfer(f, { room_id: 'room-p' })
+  assert.ok(!(await pending(f)).json.pending.some((p) => p.id === room))
+  assert.equal((await answer(f, { id: room, decision: 'approve', reason: 'x' })).status, 404)
+})
+
+test('private: a private Coordinator lists and answers a transfer a private box takes part in', async (t) => {
+  const f = await fleet(t)
+  markPrivate(f, f.b.deviceId)
+  markPrivate(f, f.coord.deviceId)
+  const id = await createTransfer(f)
+  assert.ok((await pending(f)).json.pending.some((p) => p.id === id))
+  assert.equal(nudges(f).length, 1)
+  assert.equal((await answer(f, { id, decision: 'approve', reason: 'between my own sessions' })).status, 200)
+})
+
+test('private: only a waiting transfer counts — an answered one is the same 409 whatever box it involves', async (t) => {
+  const f = await fleet(t)
+  const id = await createTransfer(f)
+  assert.equal((await tap(f, itemOf(f, id).id, 'Decline')).status, 200)
+  const ordinary = await answer(f, { id, decision: 'approve', reason: 'x' })
+  markPrivate(f, f.b.deviceId)
+  const priv = await answer(f, { id, decision: 'approve', reason: 'x' })
+  assert.equal(ordinary.status, 409)
+  assert.equal(priv.status, ordinary.status)
+  assert.deepEqual(priv.json, ordinary.json)
+})
+
+// Turn causes: the sender may stamp the causes of the asking turn on the
+// create, in the shape a chat or spawn ask frame carries them.
+test('causes: stored on the transfer and shown on its pending row; absent or null stores none', async (t) => {
+  const f = await fleet(t)
+  const causes = [{ kind: 'user_message', ref: 'sess-a:12', at: 5 }, { kind: 'room_message', ref: 'room:room@3' }]
+  const id = await createTransfer(f, { causes })
+  assert.deepEqual(JSON.parse(getTransfer(f.s.db, id).causes), causes)
+  assert.deepEqual((await pending(f)).json.pending.find((p) => p.id === id).causes, causes)
+  for (const none of [undefined, null]) {
+    const other = await createTransfer(f, { causes: none, name: `n-${none}.txt` })
+    assert.equal(getTransfer(f.s.db, other).causes, null)
+    assert.ok(!('causes' in (await pending(f)).json.pending.find((p) => p.id === other)))
+  }
+})
+
+test('causes: a bad shape is 400 and nothing is created', async (t) => {
+  const f = await fleet(t)
+  const bads = [
+    [], 'user_message', {}, [{ kind: 'nope' }], [{ kind: 'user_message', ref: 7 }],
+    [{ kind: 'user_message', ref: 'x'.repeat(201) }], Array.from({ length: 9 }, () => ({ kind: 'other' })),
+  ]
+  for (const causes of bads) {
+    const r = await f.s.http('/transfers', { method: 'POST', token: f.a.token, body: createBody({ causes }) })
+    assert.equal(r.status, 400, JSON.stringify(causes))
+  }
+  assert.equal(f.s.db.prepare('SELECT COUNT(*) c FROM transfers').get().c, 0)
+})
+
+test('causes: a transfer the Coordinator had another session send is the user\'s to approve (own_ask_unverified)', async (t) => {
+  const f = await fleet(t)
+  const coId = recordCarryOn(f.s.db, { userId: f.alice.id, fromConvoId: 'coord', targetConvoId: 'sess-a', causes: [{ kind: 'user_message', ref: 'coord:1' }] })
+  const id = await createTransfer(f, { causes: [{ kind: 'carry_on', ref: `carry_on:${coId}` }] })
+  const r = await answer(f, { id, decision: 'approve', reason: 'the user asked me' })
+  assert.equal(r.status, 403)
+  assert.equal(r.json.detail, 'own_ask_unverified')
+  assert.equal(getTransfer(f.s.db, id).consent, 'awaiting_user')
+  assert.equal((await answer(f, { id, decision: 'decline', reason: 'not mine to allow' })).status, 200)
+})
+
+test('migration: an existing transfers table gains a nullable causes column, rows kept', () => {
+  const db = new Database(':memory:')
+  db.exec(`CREATE TABLE transfers(id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, name TEXT NOT NULL)`)
+  db.prepare("INSERT INTO transfers(id, user_id, name) VALUES('tr_1', 1, 'a.txt')").run()
+  addTransferCauses(db)
+  addTransferCauses(db)
+  assert.deepEqual({ ...db.prepare('SELECT id, causes FROM transfers').get() }, { id: 'tr_1', causes: null })
 })

@@ -1509,6 +1509,7 @@ export function openDb(path) {
     if (!decisionCols.some((d) => d.name === c)) db.exec(`ALTER TABLE consent_decisions ADD COLUMN ${c} TEXT`)
   }
   widenConsentDecisionKinds(db)
+  addTransferCauses(db)
   // A routine's envelope (JSON): the bounds on what an ask born of one of
   // its fires may do — how many spawns per fire, whether chats, which boxes.
   // NULL = no envelope, the value for every routine predating the column.
@@ -2080,6 +2081,15 @@ export function migratePersonRoomsForTalk(db) {
   add('contact_by_talk', 'contact_by_talk INTEGER NOT NULL DEFAULT 0')
   add('pick_options', 'pick_options TEXT')
   add('spawn_id', 'spawn_id TEXT')
+}
+
+// The causes the sending bridge stamped on a transfer (src/ask-causes.js),
+// as on a spawn or chat ask: a JSON array of {kind, ref?, at?}, NULL when
+// it stamped none — a bridge that predates the field, and every row
+// predating the column. Idempotent.
+export function addTransferCauses(db) {
+  const cols = db.prepare('PRAGMA table_info(transfers)').all()
+  if (!cols.some((c) => c.name === 'causes')) db.exec('ALTER TABLE transfers ADD COLUMN causes TEXT')
 }
 
 // The Coordinator answers file transfers too: consent_decisions.kind gains

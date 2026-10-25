@@ -91,11 +91,11 @@ export function deleteTransferFiles(mediaDir, id) {
   fs.rmSync(transferDir(mediaDir, id), { recursive: true, force: true })
 }
 
-export function createTransfer(db, { userId, roomId, senderDeviceId, fromConvoId, name, size, sha256, contentType, reason = '', scan = { verdict: 'not_scanned', findings: [] }, now = Date.now() }) {
+export function createTransfer(db, { userId, roomId, senderDeviceId, fromConvoId, name, size, sha256, contentType, reason = '', scan = { verdict: 'not_scanned', findings: [] }, causes = null, now = Date.now() }) {
   const id = `tr_${crypto.randomBytes(16).toString('hex')}`
-  db.prepare(`INSERT INTO transfers(id, user_id, room_id, sender_device_id, from_convo_id, name, size, sha256, content_type, reason, scan_verdict, scan_findings, created_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(id, userId, roomId, senderDeviceId, fromConvoId, name, size, sha256, contentType, reason, scan.verdict, JSON.stringify(scan.findings ?? []), now)
+  db.prepare(`INSERT INTO transfers(id, user_id, room_id, sender_device_id, from_convo_id, name, size, sha256, content_type, reason, scan_verdict, scan_findings, causes, created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(id, userId, roomId, senderDeviceId, fromConvoId, name, size, sha256, contentType, reason, scan.verdict, JSON.stringify(scan.findings ?? []), causes ? JSON.stringify(causes) : null, now)
   return getTransfer(db, id)
 }
 

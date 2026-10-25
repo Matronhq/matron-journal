@@ -108,7 +108,7 @@ const causesField = (text) => {
 // Does an ask involve a private device (docs/protocol.md "Device privacy")?
 // A spawn ask does when its asking box, its target box or the conversation
 // it was asked from is private; a chat ask when the room's owner, the
-// initiator or the invitee is. An ordinary (non-private) Coordinator never
+// initiator or the invitee is; a transfer as below. An ordinary (non-private) Coordinator never
 // sees such an ask in its list or nudge, and answering one is the same 404
 // as an unknown id: the user answers it, or a private Coordinator does.
 export function spawnAskInvolvesPrivate(db, row) {
@@ -126,6 +126,17 @@ export function chatAskInvolvesPrivate(db, userId, roomId, targetDeviceId) {
   return isPrivateDevice(db, targetDeviceId) ||
     (row.owner != null && isPrivateDevice(db, row.owner)) ||
     (row.initiator != null && isPrivateDevice(db, row.initiator))
+}
+
+// A transfer ask does when the sending box or any box it goes to is
+// private, or the room or the conversation it was sent from is
+// private-owned. Like a chat ask, only a transfer still waiting for the
+// user counts: any other id gets its usual 404 / 409.
+export function transferAskInvolvesPrivate(db, userId, row) {
+  if (!row || row.user_id !== userId || row.consent !== 'awaiting_user' || row.phase !== 'open') return false
+  return isPrivateDevice(db, row.sender_device_id) ||
+    recipientDevices(db, row.room_id, row.sender_device_id).some((d) => isPrivateDevice(db, d)) ||
+    privateOwnedConvo(db, row.room_id) || privateOwnedConvo(db, row.from_convo_id)
 }
 
 // Every ask awaiting this user's decision, all three tables, oldest first. The
@@ -201,7 +212,7 @@ export function listPendingAsks({ db, hub, waker }, userId, { excludePrivate = f
     LEFT JOIN conversations rc ON rc.id = t.room_id
     LEFT JOIN items i ON i.id = t.item_id
     WHERE t.user_id=? AND t.consent='awaiting_user' AND t.phase='open'
-  `).all(userId).map((r) => ({
+  `).all(userId).filter((r) => !excludePrivate || !transferAskInvolvesPrivate(db, userId, r)).map((r) => ({
     kind: 'transfer', id: r.id, created_at: r.created_at,
     from_device_id: r.sender_device_id, from_name: name(r.from_name), from_convo_id: r.from_convo_id, from_convo_title: name(r.from_convo_title),
     room_id: r.room_id, room_title: name(r.room_title),
@@ -209,6 +220,7 @@ export function listPendingAsks({ db, hub, waker }, userId, { excludePrivate = f
     name: r.name, size: r.size, sha256: r.sha256, scan_verdict: r.scan_verdict, scan_findings: parseFindings(r.scan_findings),
     reason: r.reason, item_num: r.item_num ?? null,
     ...(isUserOnlyTransfer(db, userId, r) ? { user_only: true } : {}),
+    ...causesField(r.causes),
   }))
   return [...spawns, ...chats, ...transfers].sort((a, b) => a.created_at - b.created_at)
 }

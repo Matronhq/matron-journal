@@ -27,6 +27,7 @@ import {
 import { joinedAgentIds } from './participants.js'
 import { fileTransferConsentItem, closeTransferConsentItem, releaseIfReady, readyTransferView, humanSize } from './transfer-consent.js'
 import { nudgeCoordinator } from './consent.js'
+import { causesFromFrame } from './ask-causes.js'
 import { codeSpan } from './consent-items.js'
 import { appendAndBroadcast } from './journal.js'
 
@@ -89,11 +90,15 @@ function parseCreate(body) {
   if (reason !== undefined && reason !== null && typeof reason !== 'string') return null
   const scan = parseScan(body.scan)
   if (!scan) return null
+  // The asking turn's causes, same rules as a chat or spawn ask frame's:
+  // absent or null is none, anything else must normalise or it is a 400.
+  const causes = causesFromFrame(body)
+  if (!causes.ok) return null
   return {
     roomId, fromConvoId, name: cleanName, size, sha256,
     contentType: sanitizePeerText(contentType, CONTENT_TYPE_MAX) || 'application/octet-stream',
     reason: sanitizePeerText(reason, TRANSFER_REASON_MAX),
-    scan,
+    scan, causes: causes.causes,
   }
 }
 
@@ -142,7 +147,7 @@ async function create(ctx, req, res, who) {
   if (reservedTransferBytes(db, who.userId) + t.size > transferUserQuotaBytes) { json(res, 413, { error: 'quota_exceeded' }); return true }
   const row = createTransfer(db, {
     userId: who.userId, roomId: t.roomId, senderDeviceId: who.deviceId, fromConvoId: t.fromConvoId,
-    name: t.name, size: t.size, sha256: t.sha256, contentType: t.contentType, reason: t.reason, scan: t.scan,
+    name: t.name, size: t.size, sha256: t.sha256, contentType: t.contentType, reason: t.reason, scan: t.scan, causes: t.causes,
   })
   console.log(`journal: transfer created id=${row.id} room=${row.room_id} device=${who.deviceId} size=${row.size} scan=${row.scan_verdict}`)
   // The user's card, then a nudge to the Coordinator (skipped when it is
