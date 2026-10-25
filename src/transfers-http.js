@@ -305,7 +305,7 @@ async function completeHeld(ctx, res, row) {
 
 // Downloadable: released, or delivered less than the grace period ago.
 const downloadable = (row, now = Date.now()) => row.phase === 'released'
-  || (row.phase === 'delivered' && row.delivered_at != null && now - row.delivered_at < TRANSFER_DELIVERED_GRACE_MS)
+  || (row.phase === 'delivered' && row.deleted_at == null && row.delivered_at != null && now - row.delivered_at < TRANSFER_DELIVERED_GRACE_MS)
 
 // `bytes=a-` or `bytes=a-b` → {start, end} (inclusive, end clamped to the
 // file), null for no Range header, or 'bad' for any other form or a start

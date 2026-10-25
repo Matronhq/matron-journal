@@ -145,6 +145,10 @@ test('delivered copy: kept at +59 min, deleted (files and chunk rows gone, delet
   assert.ok(row.deleted_at)
   assert.equal(fs.existsSync(transferDir(f.mediaDir, id)), false)
   assert.equal(chunkRows(f, id), 0)
+  // Still inside the grace by the wall clock, but the bytes are gone: a 404, not a 500.
+  const gone = await fetch(`${f.s.base}/transfers/${id}/content`, { headers: { authorization: `Bearer ${f.b.token}` } })
+  assert.equal(gone.status, 404)
+  await gone.body?.cancel()
 
   // Idempotent: nothing left to delete a second time.
   const again = runExpireTransfers(f.s.db, { mediaDir: f.mediaDir, hub: f.s.hub, now: deliveredAt + TRANSFER_DELIVERED_GRACE_MS + 120000 })
