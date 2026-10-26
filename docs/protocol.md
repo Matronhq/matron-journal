@@ -1801,7 +1801,7 @@ Like agent-chat cards, this is a **client-only event** excluded from agent deliv
 
 **Model.** `model` is optional and names which Claude model the child session should run — an alias like `opus` or a full model id like `claude-opus-4-20250514`. The vocabulary is the **target bridge's**, not the journal's: this is a length bound (`SPAWN_MODEL_MAX_CHARS`, 64) and the usual peer-text sanitisation only, never an allowlist, so a bridge that learns a new alias keeps working against an older journal. It is stored on the spawn row and relayed to the target in the `start` RPC params **only when non-empty** — a request that names no model produces the exact params a pre-`model` journal sent, and the consent card omits the key rather than carrying an empty one. An unrecognised model is the target's business to reject (its `start` error surfaces as the usual `failed` outcome).
 
-**Agent and effort.** `agent` (`claude` | `codex`) and `effort` follow the same rule: stored on the row (`agent_spawn_requests.agent`, `.effort`) and relayed in the `start` params only when the ask named them, so the target bridge otherwise starts its own box default. The `start` params are `{workdir, prompt, room_id?, from_name?, model?, mission_num?, effort?, agent?}`.
+**Agent and effort.** `agent` (`claude` | `codex`) and `effort` follow the same rule: stored on the row (`agent_spawn_requests.agent`, `.effort`) and relayed in the `start` params only when the ask named them, so the target bridge otherwise starts its own box default. The `start` params are `{workdir, prompt, spawn_id, room_id?, from_name?, model?, mission_num?, effort?, agent?}`; `spawn_id` is the request id, which the child's bridge names on its opening turn's cause (*The Coordinator's own asks*).
 
 **What will run (`*_source`).** The card says which agent, model and effort the child will actually get (`predictSpawnRun` in `src/spawn-model.js`). A value the ask named is carried with `<field>_source: "explicit"`. One it did not name is predicted from the target's box defaults — its last reported `defaults` block, else the journal's stored values (see *Box defaults*) — and carried with `<field>_source: "box_default"`; with neither, the key is omitted as before. The box's model and effort belong to its default agent, so an ask that names a *different* agent gets neither predicted. A Codex child never carries the Fable fallback below; a box-default model other than Fable suppresses it like a named one. **Claude model on a Codex box.** When the ask names no `agent`, the target's default agent is codex, and the ask names a Claude model — an alias (`opus`, `opus[1m]`, `sonnet`, `sonnet[1m]`, `haiku`, `opusplan`, `fable`, `default`) or anything starting `claude-` (`isClaudeModel` in `src/spawn-model.js`, mirroring the bridge) — the target bridge drops that model, and a Claude-only effort (`max`), and runs Codex on its box defaults. The card then carries `agent: "codex"` (`box_default`), the box's model and effort as `box_default` (omitted when the box has none), and `dropped_model` / `dropped_effort` naming what will be ignored; an effort both agents share stays `explicit`. The item body adds "Model `opus` is ignored: this box runs Codex" (and the same for the effort). Naming `agent` explicitly turns this off: the ask runs as named. The consent item's body reads e.g. "Agent: Codex (box default)", "Model: `gpt-5.1-codex` (box default)", and `GET /consent/pending` carries the same `agent`/`model`/`effort`, `*_source` and `dropped_*` keys on each spawn row, predicted again at list time.
 
@@ -2995,7 +2995,9 @@ or question-card answer the user sent, anything `GET /said` verifies),
 `room:<room id>@<from>-<to>` for the messages of one room a turn took
 together, or `room:<room id>` when the seq is unknown), `reminder`,
 `carry_on` (ref `carry_on:<carry_on_id>`, see *Session control*), `alert`,
-`handoff`, `other` (ref `truncated` when the bridge cut the list short); `ref` at
+`handoff`, `other` (ref `truncated` when the bridge cut the list short, or
+`spawned:<spawn id>` on a spawned session's opening turn, from the `start`
+params' `spawn_id`); `ref` at
 most 200 characters; `at` a hint in ms. Absent or `null` is an ask with no
 causes; any other unusable value refuses the op `bad_request` `bad causes`.
 They are stored on the parked row and listed on `/consent/pending`.
@@ -3011,7 +3013,12 @@ items, within 48 h of the ask (a `spawn_outcome` stands for the causes of
 the spawn it reports, a few hops at most); or a fire of one of the user's
 routines within 6 h, and only when the turn had no user or item cause. Any
 other kind of cause (a peer's room message, a reminder, an alert, …) fails
-the ask. A user or item root is approved like any other ask. A **routine**
+the ask, except a `room_message` span whose messages are all ones the
+Coordinator conversation itself posted (by the journal's record below) or
+the user's own: reading back what it wrote is set aside. A bridge stamps a
+room message the Coordinator takes in mid-turn (a reply while it waits in
+`agent_chat_send`, or `agent_chat_read`) on that turn, so a peer's words
+read that way fail the ask as a delivered message does. A user or item root is approved like any other ask. A **routine**
 root must also fit the routine's **envelope** (*Routines*): none at all, a
 spawn when the fire's approved spawns already reach `spawns_per_fire`, a
 chat when `chats` is false, or a target box (the spawn's target; the
@@ -3032,15 +3039,18 @@ the Coordinator had it made (below).
 
 **Asks relayed from the Coordinator** (`src/cause-hops.js`). The
 Coordinator could otherwise step around the rule above by having another
-session make the ask: a carry-on telling it to, or a message in a room
-they share. So the journal keeps its own record of every carry-on the
-Coordinator sends and every room message it posts, each with the causes of
-the Coordinator's turn that sent it, and of every room message another
-session posts in a turn one of those reached (with the Coordinator records
-behind it). An ask another session made is **relayed** when its causes
+session make the ask: a carry-on telling it to, a message in a room
+they share, or the task of a session it spawned. So the journal keeps its
+own record of every carry-on the Coordinator sends, every room message it
+posts and every spawn it asked for once the spawn has started (key
+`spawn:<id>`, naming the child conversation), each with the causes of the
+Coordinator's turn that sent it, and of every room message another
+session posts, and every spawn it asks for, in a turn one of those reached
+(with the Coordinator records behind it). An ask another session made is **relayed** when its causes
 lead back to such a record: a `carry_on` cause, a `room_message` cause
-whose room messages include the Coordinator's or such a relay's, or a
-`spawn_outcome` of that session's own earlier relayed ask, however many
+whose room messages include the Coordinator's or such a relay's, an
+`other` cause `spawned:<id>` naming the recorded spawn that started that
+session, or a `spawn_outcome` of that session's own earlier relayed ask, however many
 sessions the chain passed through. Every Coordinator record behind a
 relayed ask must then resolve exactly as the Coordinator's own ask would,
 from the Coordinator's conversation, against that turn's causes, with
@@ -3049,7 +3059,8 @@ an item's before a routine's) is then checked and recorded as for an own
 ask, envelope and verifier included. Anything else is **403**
 `own_ask_unverified`, with `why` naming the record and its reason, or
 saying the relay could not be checked: a carry-on with no ref, an unknown
-one or one sent to another session; room messages in a room the asking
+one or one sent to another session; a `spawned:` ref naming a recorded spawn
+that started another session; room messages in a room the asking
 session is not in; a room cause with no seq from a room the Coordinator
 posted in during the last 48 h; more than 8 Coordinator records, or more
 than 200 recorded messages in one room cause's span.
@@ -3060,8 +3071,8 @@ or a turn whose causes say nothing of where it came from (none at all, or
 only `reminder`, `handoff` or `other`). These are refused as unchecked when
 the walk had already found a Coordinator record, or when the asking session
 is one the Coordinator reached in the 48 h before the ask: a carry-on sent
-to it, a relayed message it posted, or a Coordinator record in a room it is
-in. Room messages the Coordinator had no hand in are never recorded, so an
+to it, a recorded spawn that started it, a relayed message it posted, or a
+Coordinator record in a room it is in. Room messages the Coordinator had no hand in are never recorded, so an
 ask from any other session is answered exactly as before.
 
 **User-only boxes.** `devices.consent_user_only`, set and cleared only by

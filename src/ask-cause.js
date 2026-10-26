@@ -24,6 +24,11 @@
 //    cited message must be in it, the cited item owned by it;
 //  - a routine fire is the root only when the turn had no user or item
 //    cause;
+//  - a room message cause whose span holds only messages the asking
+//    conversation itself posted (by the journal's record of them, see
+//    src/cause-hops.js) and the user's own is set aside: the Coordinator
+//    reading back what it wrote took in no one else's words. Any other room
+//    message fails the ask like every untrusted kind;
 //  - a spawn outcome stands for the causes of the ask that spawn answered,
 //    followed at most CAUSE_CHAIN_MAX_DEPTH hops. A chain that ends in a
 //    user or item cause that does not resolve counts as a user failure
@@ -39,6 +44,7 @@ import { normalizeCauses, parseCauses } from './ask-causes.js'
 import { verifySaid, parseCitation } from './said.js'
 import { getSpawn } from './spawns.js'
 import { getRoutine, parseEnvelope, NAME_RE } from './routines.js'
+import { MESSAGE_TYPES_SQL } from './message-types.js'
 
 // How old the user's words (or item comment) may be when the ask is made.
 export const SELF_APPROVAL_USER_WINDOW_MS = 48 * 60 * 60 * 1000
@@ -161,6 +167,53 @@ function resolveRoutine(db, ctx, cause) {
   }
 }
 
+// room:<room id>@<seq> or room:<room id>@<from>-<to>, as the bridge writes
+// it (the bare room:<room id> has no span to check).
+const ROOM_SPAN_RE = /^room:([^@]+)@([1-9][0-9]{0,14})(?:-([1-9][0-9]{0,14}))?$/
+// Messages one span may hold and still be checked (a read takes in at most
+// 200).
+const ROOM_ECHO_ROWS_MAX = 200
+// The content types a Coordinator's room post can be (what the publish path
+// records as a hop).
+const POST_TYPES = new Set(['text', 'file', 'image'])
+
+// Whether a room_message cause names only what the asking conversation
+// posted itself (each of its messages recorded as a Coordinator hop from
+// that conversation) and the user's own messages. Anything else — another
+// session's or another person's content of any type (a diff or a prompt as
+// much as text), a span with no messages of the user's rooms in it, one too
+// long to read — is not an echo.
+function isOwnRoomEcho(db, ctx, cause) {
+  const m = typeof cause.ref === 'string' ? ROOM_SPAN_RE.exec(cause.ref) : null
+  if (!m) return false
+  const roomId = m[1]
+  const from = Number(m[2])
+  const to = m[3] ? Number(m[3]) : from
+  if (to < from) return false
+  // Every content event in the span (src/message-types.js), not only text: a
+  // peer's diff or prompt is words the turn may have taken in just as its
+  // text is. Metadata (read markers, convo_meta, cards) is no one's words.
+  const rows = db.prepare(`SELECT seq, sender, type FROM events WHERE user_id=? AND convo_id=? AND seq BETWEEN ? AND ?
+    AND type IN (${MESSAGE_TYPES_SQL}) ORDER BY seq LIMIT ?`).all(ctx.userId, roomId, from, to, ROOM_ECHO_ROWS_MAX + 1)
+  if (rows.length > ROOM_ECHO_ROWS_MAX) return false
+  const hop = db.prepare('SELECT coordinator, from_convo_id FROM cause_hops WHERE user_id=? AND key=?')
+  let messages = 0
+  for (const r of rows) {
+    // A client's sender is always user:<account>, and only in the user's
+    // own conversations; the journal's own notices are no one's words.
+    if (r.sender === 'journal' || (typeof r.sender === 'string' && r.sender.startsWith('user:'))) {
+      messages++
+      continue
+    }
+    // Only a post can be one of the Coordinator's recorded messages.
+    if (!POST_TYPES.has(r.type)) return false
+    const h = hop.get(ctx.userId, `room:${roomId}@${r.seq}`)
+    if (!h || h.coordinator !== 1 || h.from_convo_id !== ctx.fromConvoId) return false
+    messages++
+  }
+  return messages > 0
+}
+
 const SPAWN_REF_RE = /^spawn:(.+)$/
 function resolveSpawnOutcome(db, ctx, cause, depth) {
   if (++ctx.hops > CAUSE_CHAIN_MAX_HOPS) return { ...fail(WHY_CHAIN_TOO_LONG), abort: true }
@@ -189,8 +242,10 @@ function resolveOne(db, ctx, cause, depth) {
 function resolveLevel(db, ctx, causes, depth) {
   if (depth > CAUSE_CHAIN_MAX_DEPTH) return fail(WHY_CHAIN_TOO_DEEP)
   if (causes == null || (Array.isArray(causes) && causes.length === 0)) return fail(WHY_NO_CAUSE)
-  const list = normalizeCauses(causes)
-  if (!list) return fail('the ask\'s causes are not a usable list')
+  const all = normalizeCauses(causes)
+  if (!all) return fail('the ask\'s causes are not a usable list')
+  const list = all.filter((c) => !(c.kind === 'room_message' && isOwnRoomEcho(db, ctx, c)))
+  if (list.length === 0) return fail(whyStartedBy('room_message'))
   const other = list.find((c) => !RESOLVABLE.has(c.kind))
   if (other) return fail(whyStartedBy(other.kind))
   let firstFail = null

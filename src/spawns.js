@@ -18,6 +18,7 @@ import { topLevelActiveCount } from './mission-links.js'
 import { MISSION_EVENT_TYPE, missionMarkerPayload } from './missions-marker.js'
 import { markerTitleAllowed, privateOwnedConvo } from './privacy.js'
 import { startReplyFallback } from './spawn-model.js'
+import { recordSpawnStart } from './cause-hops.js'
 
 // `model` is the optional Claude model the child session should run — an
 // alias ('opus') or a full model id, defaulted to '' like topic so a caller
@@ -486,7 +487,10 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
     }
     const r = await broker.issue(hub, row.user_id, row.target_device_id, 'start',
       {
-        workdir: row.workdir, prompt: row.task, ...(roomId ? { room_id: roomId } : {}), ...(fromName ? { from_name: fromName } : {}), ...(row.model ? { model: row.model } : {}),
+        // spawn_id: the child's bridge names it on the opening turn's cause,
+        // so the journal can follow the child's asks back to this spawn
+        // (cause-hops.js). A bridge predating it ignores the key.
+        workdir: row.workdir, prompt: row.task, spawn_id: row.id, ...(roomId ? { room_id: roomId } : {}), ...(fromName ? { from_name: fromName } : {}), ...(row.model ? { model: row.model } : {}),
         // Omit-when-absent like model: a bridge predating the field never
         // sees the key; one that knows it names the mission in the opening turn.
         ...(row.mission_num ? { mission_num: row.mission_num } : {}),
@@ -516,6 +520,7 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
         console.error('approveSpawn: start reply arrived after the row was already resolved — outcome frame suppressed')
         return 'failed'
       }
+      recordSpawnStart(db, { row, childConvoId: r.result.convo_id })
       // Before the room retitle and the outcome: the parent (and every app)
       // must never hear `started` for a child that is not yet on its mission.
       joinSpawnMission(db, hub, row, r.result.convo_id)
