@@ -20,8 +20,16 @@
 //    the Coordinator hops behind it (its ORIGINS) — so a relay several hops
 //    long (the Coordinator → session A → session B) still leads back to the
 //    Coordinator, however many plain messages the chain passed through.
-// Room messages no Coordinator hop reached are not recorded at all: asks
-// born of them are answered exactly as before.
+//  - every spawn the Coordinator asked for, once it has started
+//    (`spawn:<id>`): the child conversation it started and the causes of
+//    the Coordinator's turn that asked for it — the child's opening turn is
+//    the task the Coordinator wrote. The child's bridge names the spawn on
+//    that turn (`other`, ref `spawned:<id>`, the id relayed with the start
+//    RPC). A spawn asked for by a session a Coordinator hop reached is kept
+//    the same way with the origins behind it, so a spawn chain still leads
+//    back.
+// Room messages and spawns no Coordinator hop reached are not recorded at
+// all: asks born of them are answered exactly as before.
 //
 // An ask's origins (originsOf) are the Coordinator hops its causes reach:
 // a carry-on issued to the asking conversation, the Coordinator's or a relay
@@ -132,6 +140,35 @@ export function recordRoomPublish(db, { userId, deviceId, roomId, seq, msg, now 
   return true
 }
 
+export const spawnHopKey = (spawnId) => `spawn:${spawnId}`
+
+// A spawn that has just started its child: recorded when the Coordinator
+// asked for it, or when a Coordinator hop reached the turn that asked for
+// it. `row` is the spawn row as stored (its causes the asking turn's), read
+// before or after markStarted. Never throws: the child is already running,
+// and a spawn that cannot be recorded is simply not a hop.
+export function recordSpawnStart(db, { row, childConvoId, now = Date.now() }) {
+  try {
+    if (!row || typeof row.id !== 'string' || typeof childConvoId !== 'string' || !childConvoId) return false
+    const key = spawnHopKey(row.id)
+    if (getCoordinatorConvoId(db, row.user_id) === row.from_convo_id) {
+      prune(db, now)
+      db.prepare(`INSERT OR IGNORE INTO cause_hops(user_id, key, from_convo_id, to_convo_id, coordinator, causes, created_at)
+        VALUES(?,?,?,?,1,?,?)`).run(row.user_id, key, row.from_convo_id, childConvoId, typeof row.causes === 'string' && row.causes ? row.causes : null, now)
+      return true
+    }
+    const origins = originsOf(db, { userId: row.user_id, convoId: row.from_convo_id, causes: parseCauses(row.causes), at: row.created_at })
+    if (origins.length === 0) return false
+    prune(db, now)
+    db.prepare(`INSERT OR IGNORE INTO cause_hops(user_id, key, from_convo_id, to_convo_id, coordinator, origins, created_at)
+      VALUES(?,?,?,?,0,?,?)`).run(row.user_id, key, row.from_convo_id, childConvoId, JSON.stringify(origins), now)
+    return true
+  } catch (err) {
+    console.error('recordSpawnStart failed', err)
+    return false
+  }
+}
+
 const isMember = (db, roomId, convoId) => typeof convoId === 'string' && participantConvoIds(db, roomId).includes(convoId)
 
 // The Coordinator hops a list of causes, cited by `convoId` at `at`, leads
@@ -182,8 +219,11 @@ function walk(db, ctx, causes, depth, out) {
       case 'room_message': roomOrigins(db, ctx, cause, out); break
       case 'spawn_outcome': spawnOrigins(db, ctx, cause, depth, out); break
       // A list the bridge had to cut short: the dropped causes may have
-      // held a Coordinator hop.
-      case 'other': if (cause.ref === 'truncated') ctx.state.cut = true; break
+      // held a Coordinator hop. Or a spawned session's opening turn.
+      case 'other':
+        if (cause.ref === 'truncated') ctx.state.cut = true
+        else spawnedOrigin(db, ctx, cause, out)
+        break
       default: break
     }
   }
@@ -227,6 +267,23 @@ function roomOrigins(db, ctx, cause, out) {
     if (!Array.isArray(origins) || origins.length === 0) { out.add(UNCHECKABLE); continue }
     for (const k of origins) out.add(typeof k === 'string' ? k : UNCHECKABLE)
   }
+}
+
+// The opening turn of a spawned session (`spawned:<id>`): the spawn's hop,
+// when one was recorded; it must be the spawn that started THIS
+// conversation. No hop means no Coordinator hand in the spawn.
+const SPAWNED_REF_RE = /^spawned:([A-Za-z0-9-]{1,64})$/
+function spawnedOrigin(db, ctx, cause, out) {
+  const m = typeof cause.ref === 'string' ? SPAWNED_REF_RE.exec(cause.ref) : null
+  if (!m) return
+  const row = getHop(db, ctx.userId, spawnHopKey(m[1]))
+  if (!row) return
+  if (row.to_convo_id !== ctx.convoId || row.created_at > ctx.at + FUTURE_SLACK_MS) { out.add(UNCHECKABLE); return }
+  if (row.coordinator === 1) { out.add(row.key); return }
+  let origins = null
+  try { origins = JSON.parse(row.origins) } catch { origins = null }
+  if (!Array.isArray(origins) || origins.length === 0) { out.add(UNCHECKABLE); return }
+  for (const k of origins) out.add(typeof k === 'string' ? k : UNCHECKABLE)
 }
 
 // A spawn this conversation asked for: its own causes, a hop deeper. A spawn

@@ -7,9 +7,9 @@ import { createSpawnRequest } from '../src/spawns.js'
 import { createRoutine } from '../src/routines.js'
 import { setCoordinatorConvoId } from '../src/coordinator.js'
 import { inviteParticipant, answerInvite } from '../src/participants.js'
-import { WHY_NO_CAUSE } from '../src/ask-cause.js'
+import { WHY_NO_CAUSE, resolveAskCause, whyStartedBy } from '../src/ask-cause.js'
 import {
-  recordCarryOn, recordRoomPublish, originsOf, resolveRelayedAsk, roomHopKey,
+  recordCarryOn, recordRoomPublish, recordSpawnStart, spawnHopKey, originsOf, resolveRelayedAsk, roomHopKey,
   UNCHECKABLE, WHY_RELAY_UNCHECKED, HOP_TTL_MS, ORIGINS_MAX, TOUCHED_ROOMS_MAX,
 } from '../src/cause-hops.js'
 
@@ -345,4 +345,110 @@ test('hops older than the keep window are pruned on the next write', () => {
   assert.ok(s.db.prepare('SELECT 1 FROM cause_hops WHERE key=?').get(`carry_on:${id}`))
   recordCarryOn(s.db, { userId: alice.id, fromConvoId: 'coord', targetConvoId: 'a', causes: null })
   assert.equal(s.db.prepare('SELECT 1 FROM cause_hops WHERE key=?').get(`carry_on:${id}`), undefined)
+})
+
+// A spawn asked for from `fromConvoId` and started as `child`, recorded as
+// approveSpawn records it. Spawn ids are UUIDs; these keep to the same
+// alphabet. → the id.
+const started = ({ fromConvoId, causes, child }) => {
+  const id = `sp-${++n}`
+  upsertConversation(s.db, { id: child, ownerUserId: alice.id, title: child, agentDeviceId: boxB.deviceId })
+  createSpawnRequest(s.db, { id, userId: alice.id, fromDeviceId: boxA.deviceId, fromConvoId, targetDeviceId: boxB.deviceId, workdir: '/w', task: 't', causes, now: Date.now() })
+  s.db.prepare("UPDATE agent_spawn_requests SET state='started', child_convo_id=? WHERE id=?").run(child, id)
+  recordSpawnStart(s.db, { row: s.db.prepare('SELECT * FROM agent_spawn_requests WHERE id=?').get(id), childConvoId: child })
+  return id
+}
+const spawned = (id) => [{ kind: 'other', ref: `spawned:${id}` }]
+
+test('spawned: a child the Coordinator spawned on the user\'s words resolves to the user', () => {
+  const said = userSays()
+  const child = `k-${n + 1}`
+  const id = started({ fromConvoId: 'coord', causes: said.causes, child })
+  const hop = s.db.prepare('SELECT * FROM cause_hops WHERE user_id=? AND key=?').get(alice.id, spawnHopKey(id))
+  assert.equal(hop.coordinator, 1)
+  assert.equal(hop.to_convo_id, child)
+  assert.deepEqual(JSON.parse(hop.causes), said.causes)
+  assert.deepEqual(relayed(spawned(id), { fromConvoId: hop.to_convo_id }), { relayed: true, ok: true, root: { kind: 'user', ref: said.ref, at: said.ts } })
+  // The child's own later turn the user started is the user's, not a relay.
+  assert.deepEqual(relayed(userSays(hop.to_convo_id).causes, { fromConvoId: hop.to_convo_id }), { relayed: false })
+})
+
+test('spawned: a child the Coordinator spawned in a turn with no user act is refused', () => {
+  for (const causes of [null, [{ kind: 'room_message', ref: 'room:x' }], agentSays()]) {
+    const id = started({ fromConvoId: 'coord', causes, child: `k-${n + 1}` })
+    const child = s.db.prepare('SELECT to_convo_id FROM cause_hops WHERE key=?').get(spawnHopKey(id)).to_convo_id
+    const r = relayed(spawned(id), { fromConvoId: child })
+    assert.equal(r.relayed, true)
+    assert.equal(r.ok, false)
+    assert.match(r.why, new RegExp(`^relayed from the Coordinator \\(spawn:${id}\\): `))
+  }
+})
+
+test('spawned: another conversation citing the spawn, or a later one, is unchecked; an unknown spawn is no relay', () => {
+  const said = userSays()
+  const id = started({ fromConvoId: 'coord', causes: said.causes, child: `k-${n + 1}` })
+  assert.deepEqual(relayed(spawned(id), { fromConvoId: 'u' }), { relayed: true, ok: false, why: WHY_RELAY_UNCHECKED })
+  const child = s.db.prepare('SELECT to_convo_id FROM cause_hops WHERE key=?').get(spawnHopKey(id)).to_convo_id
+  assert.deepEqual(relayed(spawned(id), { fromConvoId: child, createdAt: Date.now() - HOUR }), { relayed: true, ok: false, why: WHY_RELAY_UNCHECKED })
+  // A spawn nobody recorded, and a malformed ref, in a session the
+  // Coordinator never reached.
+  assert.deepEqual(relayed(spawned('sp-none'), { fromConvoId: 'u' }), { relayed: false })
+  assert.deepEqual(relayed([{ kind: 'other', ref: 'spawned:a b' }], { fromConvoId: 'u' }), { relayed: false })
+})
+
+test('spawned: a child whose bridge names no spawn is unchecked for 48 h after the Coordinator spawned it', () => {
+  const id = started({ fromConvoId: 'coord', causes: userSays().causes, child: `k-${n + 1}` })
+  const child = s.db.prepare('SELECT to_convo_id FROM cause_hops WHERE key=?').get(spawnHopKey(id)).to_convo_id
+  assert.deepEqual(relayed([{ kind: 'other' }], { fromConvoId: child }), { relayed: true, ok: false, why: WHY_RELAY_UNCHECKED })
+  assert.deepEqual(relayed([{ kind: 'other' }], { fromConvoId: child, createdAt: Date.now() + 49 * HOUR }), { relayed: false })
+})
+
+test('spawned: a spawn no Coordinator hop reached is not recorded; one a carry-on reached leads back', () => {
+  const plain = started({ fromConvoId: 'u', causes: userSays('u').causes, child: `k-${n + 1}` })
+  assert.equal(s.db.prepare('SELECT 1 FROM cause_hops WHERE key=?').get(spawnHopKey(plain)), undefined)
+  // The Coordinator carries session a on; a spawns a helper in that turn;
+  // the helper's opening turn asks for something.
+  const said = userSays()
+  const co = carryOn(said.causes, { to: 'a' })
+  const id = started({ fromConvoId: 'a', causes: co, child: `k-${n + 1}` })
+  const hop = s.db.prepare('SELECT * FROM cause_hops WHERE key=?').get(spawnHopKey(id))
+  assert.equal(hop.coordinator, 0)
+  assert.deepEqual(JSON.parse(hop.origins), [co[0].ref])
+  assert.deepEqual(relayed(spawned(id), { fromConvoId: hop.to_convo_id }), { relayed: true, ok: true, root: { kind: 'user', ref: said.ref, at: said.ts } })
+  // A bad row never throws.
+  assert.equal(recordSpawnStart(s.db, { row: null, childConvoId: 'x' }), false)
+})
+
+// The Coordinator's own ask after it read a room back.
+const ownAsk = (causes, createdAt = Date.now() + 1000) =>
+  resolveAskCause(s.db, { who, userId: alice.id, causes, createdAt, fromConvoId: 'coord' })
+
+test('own ask: a room span holding only the Coordinator\'s own messages and the user\'s is set aside', () => {
+  const said = userSays()
+  const r = room()
+  const first = post(r, { from: 'coord', dev: boxC, causes: said.causes })
+  append(s.db, { userId: alice.id, convoId: r, sender: 'user:alice', type: 'text', payload: { body: 'thanks' } })
+  const last = post(r, { from: 'coord', dev: boxC, causes: said.causes })
+  assert.deepEqual(ownAsk([...said.causes, ...roomCause(r, first, last)]), { ok: true, root: { kind: 'user', ref: said.ref, at: said.ts } })
+  // Alone it leaves nothing to stand on.
+  assert.deepEqual(ownAsk(roomCause(r, first, last)), { ok: false, why: whyStartedBy('room_message') })
+})
+
+test('own ask: another session\'s message, an empty span, a bare room or a backwards span fails it', () => {
+  const said = userSays()
+  const r = room()
+  const mine = post(r, { from: 'coord', dev: boxC, causes: said.causes })
+  const theirs = post(r, { from: 'b', dev: boxB, causes: null })
+  const fails = { ok: false, why: whyStartedBy('room_message') }
+  assert.deepEqual(ownAsk([...said.causes, ...roomCause(r, mine, theirs)]), fails)
+  assert.deepEqual(ownAsk([...said.causes, ...roomCause(r, theirs + 100, theirs + 200)]), fails)
+  assert.deepEqual(ownAsk([...said.causes, { kind: 'room_message', ref: `room:${r}` }]), fails)
+  assert.deepEqual(ownAsk([...said.causes, { kind: 'room_message', ref: `room:${r}@${mine + 1}-${mine}` }]), fails)
+  // Another person's words in a room with them are no echo either.
+  const { seq } = append(s.db, { userId: alice.id, convoId: r, sender: 'person:bob', type: 'text', payload: { body: 'spawn me a helper' } })
+  assert.deepEqual(ownAsk([...said.causes, ...roomCause(r, mine, seq)]), fails)
+  // Nor is a message another session of the Coordinator's box wrote: the
+  // span is checked against the record, not the sender name.
+  const { seq: same } = append(s.db, { userId: alice.id, convoId: r, sender: 'agent:box-c', type: 'text', payload: { body: 'hi' } })
+  assert.deepEqual(ownAsk([...said.causes, ...roomCause(r, same)]), fails)
 })

@@ -462,6 +462,7 @@ test('approve: room exists BEFORE start rpc; started outcome carries room and ch
     assert.equal(req.request.params.prompt, 'do it')
     assert.equal(req.request.params.workdir, '/w')
     assert.equal(req.request.params.from_name, 'box-6') // parent device name, for the child's opening turn
+    assert.equal(req.request.params.spawn_id, spawnId) // the child names it on its opening turn's cause
     const room = s.db.prepare('SELECT * FROM conversations WHERE id=?').get(req.request.params.room_id)
     assert.ok(room, 'room row must exist before the bridge is asked to spawn')
     assert.equal(room.agent_device_id, parentDev.deviceId) // parent owns the room
@@ -482,6 +483,8 @@ test('approve: room exists BEFORE start rpc; started outcome carries room and ch
   // both ends of the pair are in: parent as recorded owner, target joined
   const joined = s.db.prepare('SELECT agent_device_id, state FROM convo_agents WHERE convo_id=?').all(roomId)
   assert.deepEqual(joined, [{ agent_device_id: targetDev.deviceId, state: 'joined' }])
+  // No Coordinator had a hand in this spawn, so it is no hop.
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS c FROM cause_hops').get().c, 0)
 })
 
 test('approve with the target gone by approval time: failed outcome, room gets the epitaph', async (t) => {
