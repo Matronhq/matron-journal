@@ -6,7 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { makeCloudTts } from '../src/cloud-tts.js'
+import { makeCloudTts, TTS_CACHE_TTL_MS } from '../src/cloud-tts.js'
 
 const quiet = { log() {}, error() {} }
 const audio = (bytes) => { const b = Buffer.from(bytes); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) }
@@ -225,4 +225,46 @@ test('startServer builds the synthesiser from the environment: a key turns it on
   delete process.env.MATRON_TTS_AZURE_KEY
   const none = await setup(t, { serverOpts: { tts: undefined } })
   assert.equal(none.s.tts, null)
+})
+
+test('the cache sweep runs at boot and on its timer, in tts-cache beside the database', async (t) => {
+  const origLog = console.log
+  const logs = []
+  console.log = (...a) => logs.push(a.join(' '))
+  t.after(() => { console.log = origLog })
+  withEnv(t, { ...TTS_ENV_OFF, MATRON_TTS_AZURE_KEY: 'not-a-real-key' })
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-tts-sweep-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const cacheDir = path.join(dir, 'tts-cache')
+  fs.mkdirSync(cacheDir)
+  const plant = (name, ageMs) => {
+    const p = path.join(cacheDir, name)
+    fs.writeFileSync(p, 'clip')
+    const at = new Date(Date.now() - ageMs)
+    fs.utimesSync(p, at, at)
+    return p
+  }
+  const old = plant(`${'a'.repeat(64)}.mp3`, TTS_CACHE_TTL_MS + 60000)
+  const fresh = plant(`${'b'.repeat(64)}.wav`, 60000)
+  const s = await startTestServer({ dbPath: path.join(dir, 'test.db'), ttsSweepIntervalMs: 20 })
+  t.after(() => s.close())
+  assert.equal(fs.existsSync(old), false, 'swept at boot')
+  assert.equal(fs.existsSync(fresh), true)
+  assert.ok(logs.some((l) => l === 'tts: removed 1 cached clip(s) older than 24h'))
+  const later = plant(`${'c'.repeat(64)}.mp3`, TTS_CACHE_TTL_MS + 60000)
+  await until(() => !fs.existsSync(later))
+  assert.equal(fs.existsSync(fresh), true)
+})
+
+test('close(): a POST /tts still waiting on Azure is answered 502 at once instead of holding shutdown for its timeout', async (t) => {
+  const g = gatedAzure()
+  const { s, speak } = await setup(t, { fetchImpl: g.impl, autoClose: false })
+  const pending = speak({ text: 'never answered' })
+  await until(() => g.gates.length === 1)
+  const closing = s.close()
+  t.after(() => closing)
+  const r = await Promise.race([pending, new Promise((res) => setTimeout(() => res(null), 2000))])
+  assert.ok(r, 'answered within 2 seconds of close(), not after the 20 s Azure timeout')
+  assert.equal(r.status, 502)
+  assert.deepEqual(await r.json(), { error: 'tts_failed' })
 })
