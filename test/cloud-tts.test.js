@@ -41,7 +41,7 @@ test('constants: the contract values', () => {
 
 test('cleanTtsText: trims, strips control characters and lone surrogates, keeps tab and newline, null for a non-string', () => {
   assert.equal(cleanTtsText('  Hello there.  '), 'Hello there.')
-  assert.equal(cleanTtsText('a\u0000b\u0007c\u001bd\u007fe\u0085f￾g'), 'abcdefg')
+  assert.equal(cleanTtsText('a\u0000b\u0007c\u001bd\u007fe\u0085f\ufffeg'), 'abcdefg')
   assert.equal(cleanTtsText('line one\n\tline two\r\n'), 'line one\n\tline two')
   assert.equal(cleanTtsText('ok 😀 done'), 'ok 😀 done', 'a whole emoji survives')
   assert.equal(cleanTtsText('half \ud83d pair'), 'half  pair', 'a lone surrogate is dropped')

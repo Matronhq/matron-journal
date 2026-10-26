@@ -7,7 +7,7 @@
 // Prints, per clip, the time to the first byte of audio and the total time.
 //
 // This is the only thing in the repo that calls Azure for speech, and it is
-// run by hand. It costs about 1,000 characters (under 2 US cents).
+// run by hand. It costs about 800 characters (under 2 US cents).
 //
 // Usage:
 //   MATRON_TTS_AZURE_KEY=... node tools/tts-listen.js [--out DIR]

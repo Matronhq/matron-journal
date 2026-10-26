@@ -61,7 +61,7 @@ export class TtsError extends Error {
 // What XML 1.0 cannot carry (C0 controls other than tab, LF and CR), DEL and
 // the C1 controls, the two non-characters, and U+FFFD (what toWellFormed
 // leaves in place of a lone surrogate).
-const UNSPEAKABLE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f�￾￿]/g
+const UNSPEAKABLE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\ufffd\ufffe\uffff]/g
 
 // The text as it is hashed, counted and spoken: control characters removed,
 // then trimmed. null for anything that is not a string.
