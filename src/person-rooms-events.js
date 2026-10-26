@@ -370,10 +370,11 @@ export function copyRoomMessage(ctx, { userId, convoId, sender, type, payload, s
 // wake: the invite delivery that follows is what reaches the guest's agent,
 // and its backlog read finds these.
 export const BACKFILL_MAX = 50
+// `+user_id` keeps the read on idx_events_convo, as isFreshRoom's.
 function backfillTwin(ctx, l) {
   const { db, hub } = ctx
   safely('backfill', () => {
-    const rows = db.prepare(`SELECT seq, sender, payload FROM events WHERE user_id=? AND convo_id=? AND type='text'
+    const rows = db.prepare(`SELECT seq, sender, payload FROM events WHERE +user_id=? AND convo_id=? AND type='text'
       AND sender <> 'journal' AND sender NOT LIKE 'person:%' ORDER BY seq DESC LIMIT ?`).all(l.owner_user_id, l.owner_room_id, BACKFILL_MAX).reverse()
     const copySender = `${PERSON_SENDER_PREFIX}${l.owner_name}`
     for (const r of rows) {

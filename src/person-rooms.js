@@ -259,14 +259,28 @@ export function personRoomRow(link, side) {
 // messages — the opening an agent_chat_start posts before it invites. The
 // room's own consent mirrors (an earlier ask on it that was declined or
 // expired) are not history: they are what a re-ask renews.
+//
+// A session turn shows as a `running` status. The bridge creates every room
+// with a `waiting` one (and marks a room it gave up on `done`), so a status
+// in any other state says nothing about history; counting those refused
+// every room an agent_chat_start made.
+//
+// `+user_id`: the unary plus keeps SQLite on idx_events_convo (the room's
+// few events) instead of the events primary key (user_id, seq), which it
+// otherwise prefers without ANALYZE statistics, reading every event the
+// user has. On a large log that took long enough for the asking bridge to
+// give up waiting for the answer.
 export const FRESH_TEXT_MAX = 5
-export function isFreshRoom(db, { userId, roomId, ownerSender }) {
-  const r = db.prepare(`SELECT
+// Exported for the query-plan test.
+export const FRESH_ROOM_SQL = `SELECT
       SUM(type='text') AS texts,
-      SUM(type IN ('session_status','prompt_reply','file','image','milestone','summary')
+      SUM(type IN ('prompt_reply','file','image','milestone','summary')
+        OR (type='session_status' AND COALESCE(json_extract(payload,'$.state'),'') = 'running')
         OR (type='item' AND COALESCE(json_extract(payload,'$.consent'),'') <> 'room')) AS session_like,
       SUM(type='text' AND sender <> @s) AS others
-    FROM events WHERE user_id=@u AND convo_id=@r`).get({ u: userId, r: roomId, s: ownerSender })
+    FROM events WHERE +user_id=@u AND convo_id=@r`
+export function isFreshRoom(db, { userId, roomId, ownerSender }) {
+  const r = db.prepare(FRESH_ROOM_SQL).get({ u: userId, r: roomId, s: ownerSender })
   return (r.texts ?? 0) <= FRESH_TEXT_MAX && !(r.session_like > 0) && !(r.others > 0)
 }
 

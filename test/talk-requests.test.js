@@ -611,3 +611,30 @@ test('a guest tap after the week gets the sweep\'s answer', async (t) => {
   // Over HTTP too.
   assert.equal((await w.bobPhone(`/person-rooms/${talkRow(w).id}/answer`, post({ decision: 'accept', target: 'coordinator' }))).status, 409)
 })
+
+// The room exactly as agent_chat_start makes it: a convo_upsert carrying the
+// title and a `waiting` state (which journals a session_status), then the
+// opening message, then the ask. That status is no session history.
+test('a room made the way agent_chat_start makes it is fresh: the ask parks and the asking user gets the card', async (t) => {
+  const w = await world(t)
+  await makeContacts(w)
+  w.ws.aliceBox.send({ op: 'convo_upsert', convo_id: 'made', title: 'A:2c ↔️ 👤 bob — Cover editor', session_state: 'waiting' })
+  await askTalk(w, {}, 'made')
+  const reply = await w.ws.aliceBox.waitFor((f) => (f.kind === 'invite' && f.event === 'delivered') || (f.op === 'error' && f.ref === 'agent_invite'))
+  assert.equal(reply.event, 'delivered', JSON.stringify(reply))
+  await settle()
+  const card = w.ws.alicePhone.journal().find((f) => f.type === 'permission_request' && f.payload.kind === 'person_room')
+  assert.equal(card.convo_id, 'made')
+  assert.equal((await openItems(w.alicePhone, 'room')).length, 1, 'the Send item is in her For you')
+})
+
+test('a room where a session turn ran is not fresh', async (t) => {
+  const w = await world(t)
+  await makeContacts(w)
+  w.ws.aliceBox.send({ op: 'convo_upsert', convo_id: 'used', title: 'Some session', session_state: 'running' })
+  w.ws.aliceBox.send({ op: 'convo_upsert', convo_id: 'used', session_state: 'waiting' })
+  await askTalk(w, {}, 'used')
+  const err = await w.ws.aliceBox.waitFor((f) => f.op === 'error' && f.ref === 'agent_invite')
+  assert.equal(err.code, 'conflict')
+  assert.match(err.detail, /not_fresh/)
+})
