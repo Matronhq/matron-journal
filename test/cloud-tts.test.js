@@ -8,7 +8,7 @@ import {
   cleanTtsText, escapeXml, azureVoiceName, buildSsml, ttsCacheKey, resolveTtsCacheDir, resolveTtsKey, resolveTtsRegion,
   TtsError, TTS_ERROR_STATUS, TTS_VOICES, TTS_FORMATS, TTS_TEXT_MAX, TTS_CACHE_TTL_MS, TTS_USER_AGENT,
   DEFAULT_TTS_REGION, DEFAULT_TTS_MODEL, DEFAULT_TTS_VOICE, DEFAULT_TTS_DAILY_CHARS,
-  makeCloudTts,
+  makeCloudTts, makeConfiguredTts,
 } from '../src/cloud-tts.js'
 
 const tmpDir = (t, prefix = 'matron-tts-') => {
@@ -402,4 +402,64 @@ test('close: aborts what is in flight, fails what is queued, refuses what comes 
   assert.equal(g.seen[0].signal.aborted, true)
   await rejectsWith(tts.synthesize({ userId: 1, text: 'three' }), 'tts_failed')
   await tts.close()
+})
+
+// ---- makeConfiguredTts: the synthesiser the environment describes ----
+
+test('makeConfiguredTts: off without a key; on with the transcription key (never logged); its own settings from the environment', async (t) => {
+  const dir = tmpDir(t)
+  const logs = []
+  const log = { log: (m) => logs.push(m), error: (m) => logs.push(m) }
+  assert.equal(makeConfiguredTts({ env: {}, cacheDir: dir, log }), null)
+  assert.equal(logs.length, 0)
+
+  const shared = makeConfiguredTts({ env: { MATRON_STT_AZURE_KEY: 'sekrit' }, cacheDir: dir, log })
+  assert.equal(shared.kind, 'cloud')
+  assert.equal(shared.label, 'Azure MAI-Voice-2.1-Flash at northeurope.tts.speech.microsoft.com')
+  assert.equal(shared.voices().default, 'en-GB-Harry')
+  assert.equal(shared.usage(1).limit, 300000)
+  assert.equal(logs.length, 1)
+  assert.match(logs[0], /^tts: speech is synthesised by Azure MAI-Voice-2\.1-Flash at northeurope\.tts\.speech\.microsoft\.com \(default voice en-GB-Harry, 300000 characters per user per day\)$/)
+  assert.ok(logs.every((l) => !l.includes('sekrit')))
+
+  const seen = []
+  const own = makeConfiguredTts({
+    env: {
+      MATRON_TTS_AZURE_KEY: 'tts-key', MATRON_STT_AZURE_KEY: 'stt-key', MATRON_TTS_AZURE_REGION: 'uksouth',
+      MATRON_TTS_MODEL: 'MAI-Voice-3', MATRON_TTS_VOICE: 'en-GB-Emily', MATRON_TTS_DAILY_CHARS: '1000',
+    },
+    cacheDir: dir, log, fetchImpl: fakeFetch({}, seen),
+  })
+  assert.equal(own.label, 'Azure MAI-Voice-3 at uksouth.tts.speech.microsoft.com')
+  assert.equal(own.voices().default, 'en-GB-Emily')
+  assert.equal(own.usage(1).limit, 1000)
+  await own.synthesize({ userId: 1, text: 'hi' })
+  assert.equal(seen[0].headers['Ocp-Apim-Subscription-Key'], 'tts-key')
+  assert.match(seen[0].body, /<voice name="en-GB-Emily:MAI-Voice-3">/)
+})
+
+test('makeConfiguredTts: MATRON_TTS_DISABLED=1 wins over a key; an unreadable key file is loud and off; bad voice and budget fall back', (t) => {
+  const dir = tmpDir(t)
+  const logs = []
+  const log = { log: (m) => logs.push(m), error: (m) => logs.push(m) }
+  assert.equal(makeConfiguredTts({ env: { MATRON_STT_AZURE_KEY: 'k', MATRON_TTS_DISABLED: '1' }, cacheDir: dir, log }), null)
+  assert.match(logs[0], /MATRON_TTS_DISABLED=1.*OFF/)
+  assert.notEqual(makeConfiguredTts({ env: { MATRON_STT_AZURE_KEY: 'k', MATRON_TTS_DISABLED: '0' }, cacheDir: dir, log: quiet }), null)
+
+  logs.length = 0
+  assert.equal(makeConfiguredTts({ env: { MATRON_TTS_AZURE_KEY_FILE: '/nonexistent/key', MATRON_STT_AZURE_KEY: 'k' }, cacheDir: dir, log }), null)
+  assert.match(logs[0], /MATRON_TTS_AZURE_KEY_FILE is set but unreadable.*OFF/)
+  logs.length = 0
+  assert.equal(makeConfiguredTts({ env: { MATRON_STT_AZURE_KEY_FILE: '/nonexistent/key' }, cacheDir: dir, log }), null)
+  assert.match(logs[0], /MATRON_STT_AZURE_KEY_FILE is set but unreadable.*OFF/)
+
+  logs.length = 0
+  const t1 = makeConfiguredTts({ env: { MATRON_STT_AZURE_KEY: 'k', MATRON_TTS_VOICE: 'en-US-Jenny', MATRON_TTS_DAILY_CHARS: 'lots' }, cacheDir: dir, log })
+  assert.equal(t1.voices().default, 'en-GB-Harry')
+  assert.equal(t1.usage(1).limit, 300000)
+  assert.match(logs[0], /MATRON_TTS_VOICE="en-US-Jenny" is not one of en-GB-Harry, en-GB-Emily/)
+  assert.match(logs[1], /MATRON_TTS_DAILY_CHARS="lots" is invalid/)
+
+  // An empty model means the bare voice id.
+  assert.equal(makeConfiguredTts({ env: { MATRON_STT_AZURE_KEY: 'k', MATRON_TTS_MODEL: '' }, cacheDir: dir, log: quiet }).label, 'Azure standard voices at northeurope.tts.speech.microsoft.com')
 })

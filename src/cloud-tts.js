@@ -323,3 +323,46 @@ export function makeCloudTts({
     },
   }
 }
+
+function positiveInt(name, raw, defaultValue, log) {
+  if (raw === undefined) return defaultValue
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n <= 0) {
+    log.error(`tts: ${name}=${JSON.stringify(raw)} is invalid (must be a positive integer) — using default ${defaultValue}`)
+    return defaultValue
+  }
+  return n
+}
+
+// The speech synthesiser this journal runs, or null: MATRON_TTS_DISABLED=1,
+// no key, or a key file that is set but unreadable (said loudly at boot
+// rather than failing every request).
+export function makeConfiguredTts({ env = process.env, cacheDir, log = console, ...overrides } = {}) {
+  if (env.MATRON_TTS_DISABLED === '1') {
+    log.log('tts: MATRON_TTS_DISABLED=1 — cloud speech is OFF')
+    return null
+  }
+  let key = ''
+  try { key = resolveTtsKey(env) } catch (err) {
+    const which = env.MATRON_TTS_AZURE_KEY_FILE ? 'MATRON_TTS_AZURE_KEY_FILE' : 'MATRON_STT_AZURE_KEY_FILE'
+    log.error(`tts: ${which} is set but unreadable (${err.code ?? err.message}) — cloud speech is OFF`)
+  }
+  if (!key) return null
+  let defaultVoice = env.MATRON_TTS_VOICE || DEFAULT_TTS_VOICE
+  if (!TTS_VOICES.some((v) => v.id === defaultVoice)) {
+    log.error(`tts: MATRON_TTS_VOICE=${JSON.stringify(defaultVoice)} is not one of ${TTS_VOICES.map((v) => v.id).join(', ')} — using ${DEFAULT_TTS_VOICE}`)
+    defaultVoice = DEFAULT_TTS_VOICE
+  }
+  const t = makeCloudTts({
+    key,
+    region: resolveTtsRegion(env, { log }),
+    model: env.MATRON_TTS_MODEL ?? DEFAULT_TTS_MODEL,
+    defaultVoice,
+    dailyChars: positiveInt('MATRON_TTS_DAILY_CHARS', env.MATRON_TTS_DAILY_CHARS, DEFAULT_TTS_DAILY_CHARS, log),
+    cacheDir,
+    log,
+    ...overrides,
+  })
+  log.log(`tts: speech is synthesised by ${t.label} (default voice ${defaultVoice}, ${t.usage(0).limit} characters per user per day)`)
+  return t
+}
