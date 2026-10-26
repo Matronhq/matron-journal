@@ -105,6 +105,12 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_WHISPER_CLI` | `<model dir>/../build/bin/whisper-cli` | whisper-cli binary, if not in whisper.cpp's own layout |
 | `MATRON_WHISPER_LANGUAGE` | `en` | Language passed to whisper |
 | `MATRON_WHISPER_PROMPT` | built-in Matron vocabulary | Vocabulary hint passed to whisper-cli as `--prompt`: names and terms it should spell right (box names, `sudo`, `PR`). Set your own list, or the empty string to send no prompt |
+| `MATRON_TTS_AZURE_KEY` / `MATRON_TTS_AZURE_KEY_FILE` | unset: the transcription key, `MATRON_STT_AZURE_KEY` / `MATRON_STT_AZURE_KEY_FILE` | Azure Speech key (or a file holding it) for voice mode's cloud voice, `POST /tts`. With no key at all the route answers 501 and the apps use the on-device voice. See "Text to speech" in `docs/protocol.md` |
+| `MATRON_TTS_AZURE_REGION` | `northeurope` | Region of the speech key |
+| `MATRON_TTS_MODEL` | `MAI-Voice-2.1-Flash` | Speech model; the Azure voice name is `<voice>:<model>` |
+| `MATRON_TTS_VOICE` | `en-GB-Harry` | Default voice (`en-GB-Harry` or `en-GB-Emily`) |
+| `MATRON_TTS_DAILY_CHARS` | `300000` | Characters of text per user per UTC day that may be sent for speech; over it `POST /tts` answers 429 |
+| `MATRON_TTS_DISABLED` | unset | `1` turns cloud speech off even when a key is present |
 | `MATRON_MEDIA_USER_QUOTA_BYTES` | 2 GiB (`2147483648`) | Per-user media storage quota |
 | `MATRON_MEDIA_REAP_HIGH_PCT` | `90` | Reap a user's oldest attachments once their footprint hits this % of the quota. `0`, a non-integer, or a value over `100` disables the reaper |
 | `MATRON_MEDIA_REAP_LOW_PCT` | `70` | Reap down to this % of the quota; reaped events tombstone to `expired: true`. Must be lower than the high %, or the reaper is disabled (same invalid-value rules) |

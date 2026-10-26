@@ -30,6 +30,7 @@ import { makeConfiguredTranscriber } from './cloud-transcribe.js'
 import { makeConfiguredMailer } from './mailer.js'
 import { makeConfiguredSummariser } from './summarise.js'
 import { makeBlobTranscripts } from './blob-transcripts.js'
+import { makeConfiguredTts, resolveTtsCacheDir } from './cloud-tts.js'
 import { makeItemTranscription } from './items-transcribe.js'
 import { emitTranscriptionMarker } from './items-http.js'
 import { makeGithub, DEFAULT_GITHUB_CLIENT_ID } from './github.js'
@@ -362,6 +363,28 @@ function scheduleWalCheckpoint(db, walCheckpointIntervalMs) {
   return interval
 }
 
+// Cached speech clips live 24 hours (src/cloud-tts.js). A clip past that age
+// is never served; this hourly pass is what takes it off the disk. Runs once
+// at boot too, for what a previous process left. Unref'd like the retention
+// timer; cleared in close(). null when speech is off.
+const TTS_SWEEP_INTERVAL_MS = 60 * 60 * 1000
+
+function scheduleTtsSweep(tts, ttsSweepIntervalMs) {
+  if (!tts) return null
+  const run = () => {
+    try {
+      const r = tts.sweep()
+      if (r.removed > 0) console.log(`tts: removed ${r.removed} cached clip(s) older than 24h`)
+    } catch (err) {
+      console.error('tts: cache sweep failed', err)
+    }
+  }
+  run()
+  const interval = setInterval(run, ttsSweepIntervalMs ?? TTS_SWEEP_INTERVAL_MS)
+  interval.unref()
+  return interval
+}
+
 // Push client selection, in strict priority order:
 //   1. injected (tests) — caller owns its lifecycle.
 //   2. all four MATRON_APNS_* set → direct APNs (full-content
@@ -452,6 +475,9 @@ export function startServer({
   routinesTriggerIntervalMs = null,
   routinesSweep = process.env.MATRON_ROUTINES !== '0',
   mediaReapHighPct, mediaReapLowPct, waker, transcriber, github, githubRefreshIntervalMs, webDir,
+  // Cloud speech (src/cloud-tts.js). `tts` is the test seam; `null` forces
+  // it off. `ttsCacheDir` overrides where the clips are kept.
+  tts, ttsCacheDir, ttsSweepIntervalMs,
   appleAppIds, androidPackage, androidCertSha256, tokenKey,
   // Alertmanager webhook (src/alerts-http.js): {token, username}. The
   // option is the test seam; env otherwise. Off unless both are usable.
@@ -588,6 +614,12 @@ export function startServer({
     blobTranscripts,
     onSettled: (out) => emitTranscriptionMarker({ db, hub, pushPipeline, waker: resolvedWaker }, out),
   })
+  // Speech for voice mode (spec 2026-10-03 voice mode, section 2): Azure,
+  // with MATRON_TTS_AZURE_KEY or, failing that, the transcription key. No
+  // key (or MATRON_TTS_DISABLED=1): null, and POST /tts answers 501.
+  const resolvedTts = tts === undefined
+    ? makeConfiguredTts({ cacheDir: resolveTtsCacheDir(resolvedDbPath, ttsCacheDir) })
+    : tts
   // GitHub account linking (spec 2026-09-23 tracker web/teams). `github` is
   // the test seam; env otherwise. An empty client id disables the routes.
   const resolvedGithub = github !== undefined ? github : makeGithub({
@@ -634,7 +666,7 @@ export function startServer({
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentTransferDailyCap, consentRoutineCap, verifier,
     github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
-    sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer,
+    sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
@@ -651,6 +683,7 @@ export function startServer({
   let retentionInterval = null
   let walCheckpointInterval = null
   let githubRefreshInterval = null
+  let ttsSweepInterval = null
   let closing = false
   return new Promise((resolve) => {
     server.listen(port, bind, () => {
@@ -661,6 +694,7 @@ export function startServer({
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
       githubRefreshInterval = scheduleGithubRefresh(db, resolvedGithub, { intervalMs: githubRefreshIntervalMs, box: tokenBox })
+      ttsSweepInterval = scheduleTtsSweep(resolvedTts, ttsSweepIntervalMs)
       // Whatever a previous process left mid-transcription: a bridge is
       // holding a turn for each, so finish them (or fail them) now.
       itemTranscription.recover()
@@ -759,6 +793,7 @@ export function startServer({
         pushPipeline,
         itemTranscription,
         blobTranscripts,
+        tts: resolvedTts,
         preapproveKey: resolvedPreapproveKey,
         searchBackfill,
         isDiffBackfill,
@@ -779,6 +814,7 @@ export function startServer({
           // `closing` right after its first pass (above) before ever
           // arming the timer this clears.
           if (semanticTimer) clearInterval(semanticTimer)
+          if (ttsSweepInterval) clearInterval(ttsSweepInterval)
           stallWakeSweep.stop()
           autoArchiveSweep.stop()
           unseenNudgeSweep.stop()
@@ -800,6 +836,9 @@ export function startServer({
           // embed call could otherwise still be mid-write when db.close()
           // below fires. Waiting for it here, alongside the other
           // background work, keeps that from racing a closed db handle.
+          // A POST /tts waiting on Azure would hold server.close() for up to
+          // its 20 s timeout: abort it, so the caller gets its 502 now.
+          if (resolvedTts) resolvedTts.close()
           server.close(() => { Promise.all([searchBackfill, isDiffBackfill, imageDimsBackfill, embedderReady.catch(() => {}), transcriptionDone, semanticInFlight]).then(() => { db.close(); r() }) })
         }),
       })

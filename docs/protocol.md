@@ -621,6 +621,103 @@ the machine-checkable version of this page.
   unknown/expired/other-device.
 - `POST /link/deny {link_code}` (Bearer, same binding as approve) ->
   `{status:'denied'}`. 404 for unknown/expired/other-device/already-resolved.
+- `POST /tts {text, voice?, format?}` and `GET /tts/voices` (Bearer, client
+  devices only) -> speech for voice mode: the audio of a line of text, and
+  the voices on offer. See "Text to speech".
+
+## Text to speech
+
+(spec: matron-apple `docs/superpowers/specs/2026-10-03-voice-mode-carplay-design.md`,
+section 2; code: `src/cloud-tts.js`, `src/tts-http.js`.)
+In voice mode the app speaks an agent's reply. It sends the journal the
+line to say and gets audio back; the journal synthesises it with Azure
+Speech and keeps the clip for 24 hours.
+
+Both routes are for **client devices only**: an agent token gets 403
+`{error:'forbidden'}`, whatever the configuration. On a journal with no
+speech key both answer 501 `{error:'tts_unconfigured'}`. An app treats
+that, or the 404 of a journal older than these routes, as "use the
+on-device voice"; `GET /tts/voices` is the cheap way to ask.
+
+### Routes (Bearer, client devices only)
+
+`POST /tts {text, voice?, format?}` -> 200 with the audio bytes as the
+body.
+
+- `text` (required): a string of 1 to 2,000 characters (UTF-16 length, as
+  other limits) once control characters are removed and it is trimmed. It
+  is spoken as plain text: the journal XML-escapes it into the SSML it
+  sends, so markup in it is read out, never obeyed.
+- `voice` (optional): an `id` from `GET /tts/voices`. Absent or `null`
+  means the journal's default.
+- `format` (optional): `mp3` (the default: 24 kHz, 48 kbit/s, mono,
+  `Content-Type: audio/mpeg`) or `wav` (16 kHz 16-bit mono PCM,
+  `Content-Type: audio/wav`, the form a notification sound needs).
+- Response headers: `Content-Type` as above, `Content-Length`, a strong
+  `ETag` (the SHA-256 of the bytes, quoted), `Cache-Control: private,
+  max-age=86400` and `X-Content-Type-Options: nosniff`. The route does not
+  act on `If-None-Match`; the ETag is for the app's own cache.
+
+Errors, each a JSON `{error}`:
+
+| Status | `error` | When |
+|---|---|---|
+| 400 | `bad_request` | `text` is missing, not a string, empty once cleaned, or over 2,000 characters; `format` is not `mp3` or `wav`; the body is not a JSON object |
+| 400 | `unknown_voice` | `voice` is not on the list |
+| 403 | `forbidden` | The caller is an agent device |
+| 413 | `too_large` | The request body is over 1 MB (the limit on every JSON route) |
+| 429 | `tts_budget_exceeded` | The user's daily allowance of characters has gone to Azure. Use the on-device voice until midnight UTC |
+| 501 | `tts_unconfigured` | The journal has no speech key, or speech is switched off |
+| 502 | `tts_failed` | Azure refused the request, sent no audio, or did not answer within 20 seconds |
+| 503 | `tts_busy` | Every slot and the queue are taken; carries `Retry-After: 1`. Use the on-device voice for this line |
+
+`GET /tts/voices` -> `{voices: [{id, name, locale, gender}], default}`.
+Today: `{voices: [{id:'en-GB-Harry', name:'Harry', locale:'en-GB',
+gender:'male'}, {id:'en-GB-Emily', name:'Emily', locale:'en-GB',
+gender:'female'}], default:'en-GB-Harry'}`. `default` is the `id` used when
+`voice` is omitted.
+
+### Cache
+
+A clip is stored under the SHA-256 of `voice|model|format|text` (the
+cleaned text), so the same line asked for again, by another device or
+later by a notification, is answered from disk: no call to Azure and
+nothing counted against the budget, even for a user who is over it. Two
+requests for the same line at the same moment make one call.
+
+Clips live in `tts-cache/` beside the database file, not in the media
+store: they belong to no user, count against no quota and have no `/media`
+id. A clip is served for 24 hours from when it was made; an hourly pass,
+and one at boot, deletes older files. The directory holds nothing else,
+can be deleted at any time and need not be backed up. The key does not
+include the user: a second user who asks for exactly the same words gets
+the same audio.
+
+### Limits
+
+At most `MATRON_TTS_DAILY_CHARS` characters of `text` per user per UTC day
+(default 300,000) go to Azure, counted when a request is sent there: a
+failed call still counts, a cache hit never does. The count is held in
+memory, so a journal restart starts the day again. Four requests run at
+Azure at once across all users; up to 16 more wait their turn, and one
+beyond that is refused with 503.
+
+### Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MATRON_TTS_AZURE_KEY` / `MATRON_TTS_AZURE_KEY_FILE` | unset | The Azure Speech key, or a file holding it. With neither set, the transcription key (`MATRON_STT_AZURE_KEY` / `MATRON_STT_AZURE_KEY_FILE`, see `POST /media`) is used. No key at all: speech is off (501) |
+| `MATRON_TTS_AZURE_REGION` | `northeurope` | The key's region. Requests go to `https://<region>.tts.speech.microsoft.com/cognitiveservices/v1`. When unset and the transcription key is the one in use, the region is taken from `MATRON_STT_AZURE_ENDPOINT` if that is a regional endpoint (`https://<region>.api.cognitive.microsoft.com`) |
+| `MATRON_TTS_MODEL` | `MAI-Voice-2.1-Flash` | The Azure voice name is `<voice id>:<model>`. Empty means the bare voice id |
+| `MATRON_TTS_VOICE` | `en-GB-Harry` | The default voice; must be on the list |
+| `MATRON_TTS_DAILY_CHARS` | `300000` | Per-user daily budget, in characters |
+| `MATRON_TTS_DISABLED` | unset | `1` turns speech off even when a key is present |
+
+### Privacy
+
+The text of the line goes to Azure, the vendor that already receives
+voice-note audio. Nothing else about the conversation is sent. The journal
+logs each line's length and how long Azure took, never the words.
 
 ## Journal search
 
@@ -1128,6 +1225,14 @@ Rows from before the stamp carry neither, and don't count.
   (fans out and replays to all devices), never FTS-indexed, never increment
   `unread_count`, and never trigger APNs push (journal-sync-only, like
   `convo_meta` — clients learn them from the replay, not from notifications).
+  A bridge whose summary pass writes a spoken version adds three optional
+  keys to the same payload: `spoken` (what to say aloud when the turn ends,
+  at most 400 characters), `spoken_more` (what to say if the listener asks
+  for more, at most 1,200 characters; left out when there is nothing to
+  add) and `spoken_ref` (the `message_ref` of the turn's last assistant
+  `text` event, so a client can tell which reply the lines belong to). The
+  caps are the bridge's. The journal stores and replays the payload as it
+  arrived, and a client that predates the keys ignores them.
 - Agent `publish` of a `text`, `file` or `image` into a room may name the
   session that wrote it and that session's turn causes:
   `from_convo_id` (a conversation the publishing device owns, not the room
