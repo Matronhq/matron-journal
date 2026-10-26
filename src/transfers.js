@@ -22,7 +22,7 @@ export const TRANSFER_MAX_BYTES_DEFAULT = 10737418240 // 10 GB per file
 export const TRANSFER_USER_QUOTA_BYTES_DEFAULT = 21474836480 // 20 GB per user
 // How many of one sender device's transfers may wait on the user's card at
 // once (consent awaiting_user, phase open); the next create is refused.
-export const TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT = 10
+export const TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT = 50
 
 export const TRANSFER_STATES = Object.freeze({
   consent: Object.freeze(['awaiting_user', 'approved', 'declined']),

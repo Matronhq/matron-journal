@@ -1511,6 +1511,7 @@ export function openDb(path) {
   widenConsentDecisionKinds(db)
   addTransferCauses(db)
   addTransferRecipient(db)
+  addTransferConsentSetting(db)
   // A routine's envelope (JSON): the bounds on what an ask born of one of
   // its fires may do — how many spawns per fire, whether chats, which boxes.
   // NULL = no envelope, the value for every routine predating the column.
@@ -2091,6 +2092,17 @@ export function migratePersonRoomsForTalk(db) {
 export function addTransferCauses(db) {
   const cols = db.prepare('PRAGMA table_info(transfers)').all()
   if (!cols.some((c) => c.name === 'causes')) db.exec('ALTER TABLE transfers ADD COLUMN causes TEXT')
+}
+
+// The user's switch "Let the Coordinator approve file transfers"
+// (src/consent-http.js answerTransfer): while on, a transfer the Coordinator
+// had another session send is answered like any other. Default OFF, and no
+// row reads as off too. Idempotent.
+export function addTransferConsentSetting(db) {
+  const cols = db.prepare('PRAGMA table_info(user_settings)').all()
+  if (!cols.some((c) => c.name === 'coordinator_transfer_consent')) {
+    db.exec('ALTER TABLE user_settings ADD COLUMN coordinator_transfer_consent INTEGER NOT NULL DEFAULT 0')
+  }
 }
 
 // The one device a transfer goes to (src/transfers.js recipientCandidates),

@@ -70,6 +70,17 @@ test('a spawn asked in a carry-on turn the Coordinator sent on nothing the user 
   assert.equal(tap.status, 200)
 })
 
+test('the user\'s switch for Coordinator file approvals does not reach spawns: a relayed spawn is still 403', async (t) => {
+  const f = await fleet(t, { verifier: stubVerifier() })
+  assert.equal((await f.s.http('/coordinator', { method: 'PUT', token: f.clientToken, body: { transfer_consent: true } })).status, 200)
+  const causes = await carryOn(f, [{ kind: 'room_message', ref: 'room:elsewhere' }])
+  const id = await parkSpawn(f, { causes })
+  const r = await approve(f, 'spawn', id)
+  assert.equal(r.status, 403)
+  assert.equal(r.json.detail, 'own_ask_unverified')
+  assert.equal(getSpawn(f.s.db, id).state, 'awaiting_user')
+})
+
 test('a carry-on cause with no ref, or one sent to another session, is 403 unchecked', async (t) => {
   const f = await fleet(t, { verifier: stubVerifier() })
   const bare = await parkSpawn(f, { rid: 'q1', causes: [{ kind: 'carry_on' }] })
