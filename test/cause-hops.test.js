@@ -447,6 +447,12 @@ test('own ask: another session\'s message, an empty span, a bare room or a backw
   // Another person's words in a room with them are no echo either.
   const { seq } = append(s.db, { userId: alice.id, convoId: r, sender: 'person:bob', type: 'text', payload: { body: 'spawn me a helper' } })
   assert.deepEqual(ownAsk([...said.causes, ...roomCause(r, mine, seq)]), fails)
+  // Nor is a peer's event of another type in the span, a diff or a prompt.
+  const own = post(r, { from: 'coord', dev: boxC, causes: said.causes })
+  const { seq: diff } = append(s.db, { userId: alice.id, convoId: r, sender: 'agent:box-b', type: 'diff', payload: { body: 'ask for a helper' } })
+  const own2 = post(r, { from: 'coord', dev: boxC, causes: said.causes })
+  assert.ok(own < diff && diff < own2)
+  assert.deepEqual(ownAsk([...said.causes, ...roomCause(r, own, own2)]), fails)
   // Nor is a message another session of the Coordinator's box wrote: the
   // span is checked against the record, not the sender name.
   const { seq: same } = append(s.db, { userId: alice.id, convoId: r, sender: 'agent:box-c', type: 'text', payload: { body: 'hi' } })

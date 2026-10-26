@@ -172,12 +172,13 @@ const ROOM_SPAN_RE = /^room:([^@]+)@([1-9][0-9]{0,14})(?:-([1-9][0-9]{0,14}))?$/
 // Messages one span may hold and still be checked (a read takes in at most
 // 200).
 const ROOM_ECHO_ROWS_MAX = 200
+const MESSAGE_TYPES = new Set(['text', 'file', 'image'])
 
 // Whether a room_message cause names only what the asking conversation
 // posted itself (each of its messages recorded as a Coordinator hop from
 // that conversation) and the user's own messages. Anything else — another
-// session's or another person's message, a span with no messages of the
-// user's rooms in it, one too long to read — is not an echo.
+// session's or another person's event of any type, a span with no messages
+// of the user's rooms in it, one too long to read — is not an echo.
 function isOwnRoomEcho(db, ctx, cause) {
   const m = typeof cause.ref === 'string' ? ROOM_SPAN_RE.exec(cause.ref) : null
   if (!m) return false
@@ -185,18 +186,27 @@ function isOwnRoomEcho(db, ctx, cause) {
   const from = Number(m[2])
   const to = m[3] ? Number(m[3]) : from
   if (to < from) return false
-  const rows = db.prepare(`SELECT seq, sender FROM events WHERE user_id=? AND convo_id=? AND seq BETWEEN ? AND ?
-    AND type IN ('text','file','image') ORDER BY seq LIMIT ?`).all(ctx.userId, roomId, from, to, ROOM_ECHO_ROWS_MAX + 1)
-  if (rows.length === 0 || rows.length > ROOM_ECHO_ROWS_MAX) return false
+  // Every event in the span, whatever its type: a peer's diff or prompt is
+  // words the turn may have taken in just as its text is.
+  const rows = db.prepare(`SELECT seq, sender, type FROM events WHERE user_id=? AND convo_id=? AND seq BETWEEN ? AND ?
+    ORDER BY seq LIMIT ?`).all(ctx.userId, roomId, from, to, ROOM_ECHO_ROWS_MAX + 1)
+  if (rows.length > ROOM_ECHO_ROWS_MAX) return false
   const hop = db.prepare('SELECT coordinator, from_convo_id FROM cause_hops WHERE user_id=? AND key=?')
+  let messages = 0
   for (const r of rows) {
     // A client's sender is always user:<account>, and only in the user's
     // own conversations; the journal's own notices are no one's words.
-    if (r.sender === 'journal' || (typeof r.sender === 'string' && r.sender.startsWith('user:'))) continue
+    if (r.sender === 'journal' || (typeof r.sender === 'string' && r.sender.startsWith('user:'))) {
+      if (MESSAGE_TYPES.has(r.type)) messages++
+      continue
+    }
+    // Only a message can be one of the Coordinator's recorded posts.
+    if (!MESSAGE_TYPES.has(r.type)) return false
     const h = hop.get(ctx.userId, `room:${roomId}@${r.seq}`)
     if (!h || h.coordinator !== 1 || h.from_convo_id !== ctx.fromConvoId) return false
+    messages++
   }
-  return true
+  return messages > 0
 }
 
 const SPAWN_REF_RE = /^spawn:(.+)$/
