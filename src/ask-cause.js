@@ -44,6 +44,7 @@ import { normalizeCauses, parseCauses } from './ask-causes.js'
 import { verifySaid, parseCitation } from './said.js'
 import { getSpawn } from './spawns.js'
 import { getRoutine, parseEnvelope, NAME_RE } from './routines.js'
+import { MESSAGE_TYPES_SQL } from './message-types.js'
 
 // How old the user's words (or item comment) may be when the ask is made.
 export const SELF_APPROVAL_USER_WINDOW_MS = 48 * 60 * 60 * 1000
@@ -172,13 +173,16 @@ const ROOM_SPAN_RE = /^room:([^@]+)@([1-9][0-9]{0,14})(?:-([1-9][0-9]{0,14}))?$/
 // Messages one span may hold and still be checked (a read takes in at most
 // 200).
 const ROOM_ECHO_ROWS_MAX = 200
-const MESSAGE_TYPES = new Set(['text', 'file', 'image'])
+// The content types a Coordinator's room post can be (what the publish path
+// records as a hop).
+const POST_TYPES = new Set(['text', 'file', 'image'])
 
 // Whether a room_message cause names only what the asking conversation
 // posted itself (each of its messages recorded as a Coordinator hop from
 // that conversation) and the user's own messages. Anything else — another
-// session's or another person's event of any type, a span with no messages
-// of the user's rooms in it, one too long to read — is not an echo.
+// session's or another person's content of any type (a diff or a prompt as
+// much as text), a span with no messages of the user's rooms in it, one too
+// long to read — is not an echo.
 function isOwnRoomEcho(db, ctx, cause) {
   const m = typeof cause.ref === 'string' ? ROOM_SPAN_RE.exec(cause.ref) : null
   if (!m) return false
@@ -186,10 +190,11 @@ function isOwnRoomEcho(db, ctx, cause) {
   const from = Number(m[2])
   const to = m[3] ? Number(m[3]) : from
   if (to < from) return false
-  // Every event in the span, whatever its type: a peer's diff or prompt is
-  // words the turn may have taken in just as its text is.
+  // Every content event in the span (src/message-types.js), not only text: a
+  // peer's diff or prompt is words the turn may have taken in just as its
+  // text is. Metadata (read markers, convo_meta, cards) is no one's words.
   const rows = db.prepare(`SELECT seq, sender, type FROM events WHERE user_id=? AND convo_id=? AND seq BETWEEN ? AND ?
-    ORDER BY seq LIMIT ?`).all(ctx.userId, roomId, from, to, ROOM_ECHO_ROWS_MAX + 1)
+    AND type IN (${MESSAGE_TYPES_SQL}) ORDER BY seq LIMIT ?`).all(ctx.userId, roomId, from, to, ROOM_ECHO_ROWS_MAX + 1)
   if (rows.length > ROOM_ECHO_ROWS_MAX) return false
   const hop = db.prepare('SELECT coordinator, from_convo_id FROM cause_hops WHERE user_id=? AND key=?')
   let messages = 0
@@ -197,11 +202,11 @@ function isOwnRoomEcho(db, ctx, cause) {
     // A client's sender is always user:<account>, and only in the user's
     // own conversations; the journal's own notices are no one's words.
     if (r.sender === 'journal' || (typeof r.sender === 'string' && r.sender.startsWith('user:'))) {
-      if (MESSAGE_TYPES.has(r.type)) messages++
+      messages++
       continue
     }
-    // Only a message can be one of the Coordinator's recorded posts.
-    if (!MESSAGE_TYPES.has(r.type)) return false
+    // Only a post can be one of the Coordinator's recorded messages.
+    if (!POST_TYPES.has(r.type)) return false
     const h = hop.get(ctx.userId, `room:${roomId}@${r.seq}`)
     if (!h || h.coordinator !== 1 || h.from_convo_id !== ctx.fromConvoId) return false
     messages++

@@ -428,6 +428,10 @@ test('own ask: a room span holding only the Coordinator\'s own messages and the 
   const r = room()
   const first = post(r, { from: 'coord', dev: boxC, causes: said.causes })
   append(s.db, { userId: alice.id, convoId: r, sender: 'user:alice', type: 'text', payload: { body: 'thanks' } })
+  // Metadata between them (a peer's read marker, the journal's convo_meta)
+  // is no one's words.
+  append(s.db, { userId: alice.id, convoId: r, sender: 'agent:box-b', type: 'read_marker', payload: { seq: first } })
+  append(s.db, { userId: alice.id, convoId: r, sender: 'journal', type: 'convo_meta', payload: { title: 'room' } })
   const last = post(r, { from: 'coord', dev: boxC, causes: said.causes })
   assert.deepEqual(ownAsk([...said.causes, ...roomCause(r, first, last)]), { ok: true, root: { kind: 'user', ref: said.ref, at: said.ts } })
   // Alone it leaves nothing to stand on.
