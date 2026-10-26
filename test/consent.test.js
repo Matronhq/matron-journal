@@ -6,15 +6,15 @@ import { upsertDeviceStatus } from '../src/db.js'
 
 test('GET /coordinator carries consent (default on); a client switches it off and on, alone or with convo_id; an agent PUT is 403', async (t) => {
   const f = await fleet(t)
-  assert.deepEqual((await f.s.http('/coordinator', { token: f.clientToken })).json, { convo_id: 'coord', consent: true })
-  assert.deepEqual((await f.s.http('/coordinator', { token: f.coordDev.token })).json, { convo_id: 'coord', consent: true })
+  assert.deepEqual((await f.s.http('/coordinator', { token: f.clientToken })).json, { convo_id: 'coord', consent: true, transfer_consent: false })
+  assert.deepEqual((await f.s.http('/coordinator', { token: f.coordDev.token })).json, { convo_id: 'coord', consent: true, transfer_consent: false })
   assert.equal((await f.s.http('/coordinator', { method: 'PUT', token: f.clientToken, body: { consent: 'no' } })).status, 400)
   const off = await f.s.http('/coordinator', { method: 'PUT', token: f.clientToken, body: { consent: false } })
-  assert.equal(off.status, 200); assert.deepEqual(off.json, { convo_id: 'coord', consent: false })
+  assert.equal(off.status, 200); assert.deepEqual(off.json, { convo_id: 'coord', consent: false, transfer_consent: false })
   assert.equal((await f.s.http('/coordinator', { method: 'PUT', token: f.coordDev.token, body: { consent: true } })).status, 403)
   assert.equal((await f.s.http('/coordinator', { token: f.clientToken })).json.consent, false)
   const on = await f.s.http('/coordinator', { method: 'PUT', token: f.clientToken, body: { convo_id: 'coord', consent: true } })
-  assert.deepEqual(on.json, { convo_id: 'coord', consent: true })
+  assert.deepEqual(on.json, { convo_id: 'coord', consent: true, transfer_consent: false })
 })
 
 test('GET /consent/pending: client 403; an ordinary agent 403 not_coordinator; a convo the caller does not own 404; the Coordinator lists a parked spawn and a parked invite', async (t) => {

@@ -8,9 +8,9 @@ import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { recordJoined } from '../src/participants.js'
 import { getTransfer, transferDir, recordChunk } from '../src/transfers.js'
-import { recordConsentDecision } from '../src/consent.js'
+import { recordConsentDecision, coordinatorApprovalsSince, getTransferConsentEnabled, CONSENT_TRANSFER_DAILY_CAP_DEFAULT } from '../src/consent.js'
 import { transferConsentItemFields, humanSize } from '../src/transfer-consent.js'
-import { widenConsentDecisionKinds, addTransferCauses, addTransferRecipient } from '../src/db.js'
+import { widenConsentDecisionKinds, addTransferCauses, addTransferRecipient, addTransferConsentSetting } from '../src/db.js'
 import { recordCarryOn } from '../src/cause-hops.js'
 import Database from 'better-sqlite3'
 
@@ -291,15 +291,41 @@ test('Coordinator: approving a clean transfer works, is recorded for the daily c
   assert.equal((await tap(f, item.id, 'Decline')).status, 409)
 })
 
-test('Coordinator: an approval at the daily cap is 409 daily_cap and leaves the ask for the user', async (t) => {
-  const f = await fleet(t, { consentDailyCap: 1 })
-  recordConsentDecision(f.s.db, { userId: f.alice.id, kind: 'chat', askId: 'room/1', decision: 'approve', convoId: 'coord', reason: 'earlier' })
+test('Coordinator: an approval at the transfer cap is 409 daily_cap and leaves the ask for the user', async (t) => {
+  const f = await fleet(t, { consentTransferDailyCap: 1 })
+  recordConsentDecision(f.s.db, { userId: f.alice.id, kind: 'transfer', askId: 'tr_' + '1'.repeat(32), decision: 'approve', convoId: 'coord', reason: 'earlier' })
   const id = await createTransfer(f)
   const r = await answer(f, { id, decision: 'approve', reason: 'ok' })
   assert.equal(r.status, 409)
-  assert.equal(r.json.detail, 'daily_cap')
+  assert.deepEqual(r.json, { error: 'conflict', detail: 'daily_cap', cap: 1 })
   assert.equal(getTransfer(f.s.db, id).consent, 'awaiting_user')
   assert.equal(itemOf(f, id).state, 'open')
+})
+
+test('Coordinator: transfers have a cap of their own: chat and spawn approvals do not use it up, and it does not use theirs', async (t) => {
+  assert.equal(CONSENT_TRANSFER_DAILY_CAP_DEFAULT, 100)
+  const f = await fleet(t, { consentDailyCap: 1, consentTransferDailyCap: 5 })
+  recordConsentDecision(f.s.db, { userId: f.alice.id, kind: 'chat', askId: 'room/1', decision: 'approve', convoId: 'coord', reason: 'earlier' })
+  const id = await createTransfer(f)
+  assert.equal((await answer(f, { id, decision: 'approve', reason: 'ok' })).status, 200)
+  assert.equal(coordinatorApprovalsSince(f.s.db, f.alice.id, 0), 1, 'the general count leaves transfers out')
+  assert.equal(coordinatorApprovalsSince(f.s.db, f.alice.id, 0, { kind: 'transfer' }), 1)
+})
+
+test('Coordinator: the transfer cap reads MATRON_COORDINATOR_TRANSFER_DAILY_CAP; 0 is no cap', async (t) => {
+  const prev = process.env.MATRON_COORDINATOR_TRANSFER_DAILY_CAP
+  t.after(() => { if (prev === undefined) delete process.env.MATRON_COORDINATOR_TRANSFER_DAILY_CAP; else process.env.MATRON_COORDINATOR_TRANSFER_DAILY_CAP = prev })
+  const earlier = (f, n) => {
+    for (let i = 0; i < n; i++) recordConsentDecision(f.s.db, { userId: f.alice.id, kind: 'transfer', askId: `tr_${String(i).padStart(32, '0')}`, decision: 'approve', convoId: 'coord', reason: 'earlier' })
+  }
+  process.env.MATRON_COORDINATOR_TRANSFER_DAILY_CAP = '2'
+  const two = await fleet(t)
+  earlier(two, 2)
+  assert.deepEqual((await answer(two, { id: await createTransfer(two), decision: 'approve', reason: 'ok' })).json, { error: 'conflict', detail: 'daily_cap', cap: 2 })
+  process.env.MATRON_COORDINATOR_TRANSFER_DAILY_CAP = '0'
+  const none = await fleet(t)
+  earlier(none, CONSENT_TRANSFER_DAILY_CAP_DEFAULT)
+  assert.equal((await answer(none, { id: await createTransfer(none), decision: 'approve', reason: 'ok' })).status, 200)
 })
 
 test('Coordinator: bad id is 400, an unknown or another user\'s transfer is 404, its own transfer cannot be approved', async (t) => {
@@ -492,6 +518,91 @@ test('causes: a transfer the Coordinator had another session send is the user\'s
   assert.equal(r.json.detail, 'own_ask_unverified')
   assert.equal(getTransfer(f.s.db, id).consent, 'awaiting_user')
   assert.equal((await answer(f, { id, decision: 'decline', reason: 'not mine to allow' })).status, 200)
+})
+
+// The user's switch "Let the Coordinator approve file transfers": off by
+// default; while on, a transfer the Coordinator had another session send is
+// answered like any other. Flagged files, user-only boxes and the
+// Coordinator's own sends stay the user's either way.
+const switchTransfers = (f, on, token = f.client) => f.s.http('/coordinator', { method: 'PUT', token, body: { transfer_consent: on } })
+async function relayedTransfer(f, over = {}) {
+  const coId = recordCarryOn(f.s.db, { userId: f.alice.id, fromConvoId: 'coord', targetConvoId: 'sess-a', causes: [{ kind: 'room_message', ref: 'room:elsewhere' }] })
+  return createTransfer(f, { causes: [{ kind: 'carry_on', ref: `carry_on:${coId}` }], ...over })
+}
+
+test('transfer switch: off by default; only the user\'s client sets it; GET carries it for both kinds; consent alone leaves it', async (t) => {
+  const f = await fleet(t)
+  assert.deepEqual((await f.s.http('/coordinator', { token: f.client })).json, { convo_id: 'coord', consent: true, transfer_consent: false })
+  assert.equal((await switchTransfers(f, true, f.coord.token)).status, 403)
+  assert.equal((await switchTransfers(f, true, f.a.token)).status, 403)
+  assert.equal((await switchTransfers(f, 'yes')).status, 400)
+  assert.equal(getTransferConsentEnabled(f.s.db, f.alice.id), false)
+  const on = await switchTransfers(f, true)
+  assert.equal(on.status, 200)
+  assert.deepEqual(on.json, { convo_id: 'coord', consent: true, transfer_consent: true })
+  assert.equal((await f.s.http('/coordinator', { token: f.coord.token })).json.transfer_consent, true)
+  assert.equal((await f.s.http('/coordinator', { method: 'PUT', token: f.client, body: { consent: false } })).json.transfer_consent, true)
+  const both = await f.s.http('/coordinator', { method: 'PUT', token: f.client, body: { convo_id: 'coord', consent: true, transfer_consent: false } })
+  assert.deepEqual(both.json, { convo_id: 'coord', consent: true, transfer_consent: false })
+})
+
+test('transfer switch off: a relayed transfer is refused, and the refusal names the switch', async (t) => {
+  const f = await fleet(t)
+  const id = await relayedTransfer(f)
+  const r = await answer(f, { id, decision: 'approve', reason: 'screenshots for the article' })
+  assert.equal(r.status, 403)
+  assert.equal(r.json.detail, 'own_ask_unverified')
+  assert.match(r.json.why, /Coordinator file approvals are off/)
+  assert.equal(getTransfer(f.s.db, id).consent, 'awaiting_user')
+})
+
+test('transfer switch on: the Coordinator approves a transfer it had another session send; the decision names the switch', async (t) => {
+  const f = await fleet(t)
+  assert.equal((await switchTransfers(f, true)).status, 200)
+  const id = await relayedTransfer(f)
+  const r = await answer(f, { id, decision: 'approve', reason: 'screenshots for the article' })
+  assert.equal(r.status, 200)
+  const row = getTransfer(f.s.db, id)
+  assert.equal(row.consent, 'approved')
+  assert.equal(row.decided_by, 'coordinator')
+  assert.equal(lastStatusNote(f, itemOf(f, id).id).body, 'Approved by the Coordinator — screenshots for the article.')
+  const dec = f.s.db.prepare('SELECT kind, ask_id, decision, cause_kind, cause_ref FROM consent_decisions').all()
+  assert.deepEqual(dec.map((x) => ({ ...x })), [{ kind: 'transfer', ask_id: id, decision: 'approve', cause_kind: 'setting', cause_ref: 'transfer_consent' }])
+})
+
+test('transfer switch on: flagged files, user-only boxes and the Coordinator\'s own sends stay the user\'s', async (t) => {
+  const f = await fleet(t)
+  assert.equal((await switchTransfers(f, true)).status, 200)
+  const flagged = await relayedTransfer(f, { scan: { verdict: 'flagged', findings: [{ kind: 'aws_key', line: 3 }] } })
+  assert.deepEqual((await answer(f, { id: flagged, decision: 'approve', reason: 'ok' })).json, { error: 'forbidden', detail: 'secret_scan_flagged' })
+  addConvo(f.s.db, 'pair', f.alice.id, f.a.deviceId, 'Pair')
+  recordJoined(f.s.db, { convoId: 'pair', agentDeviceId: f.coord.deviceId, initiatorDeviceId: f.a.deviceId })
+  const own = await f.s.http('/transfers', { method: 'POST', token: f.coord.token, body: createBody({ room_id: 'pair', from_convo_id: 'coord' }) })
+  const ownR = await answer(f, { id: own.json.transfer_id, decision: 'approve', reason: 'mine' })
+  assert.equal(ownR.status, 403)
+  assert.equal(ownR.json.detail, 'own_ask_unverified')
+  f.s.db.prepare('UPDATE devices SET consent_user_only=1 WHERE id=?').run(f.b.deviceId)
+  const desk = await relayedTransfer(f, { name: 'desk.txt' })
+  assert.deepEqual((await answer(f, { id: desk, decision: 'approve', reason: 'ok' })).json, { error: 'forbidden', detail: 'user_only' })
+  for (const id of [flagged, own.json.transfer_id, desk]) assert.equal(getTransfer(f.s.db, id).consent, 'awaiting_user')
+  assert.equal(f.s.db.prepare('SELECT COUNT(*) c FROM consent_decisions').get().c, 0)
+})
+
+test('transfer switch on, then off again: a relayed transfer is the user\'s once more', async (t) => {
+  const f = await fleet(t)
+  await switchTransfers(f, true)
+  await switchTransfers(f, false)
+  const id = await relayedTransfer(f)
+  assert.equal((await answer(f, { id, decision: 'approve', reason: 'ok' })).status, 403)
+})
+
+test('migration: an existing user_settings table gains coordinator_transfer_consent, off, rows kept', () => {
+  const db = new Database(':memory:')
+  db.exec('CREATE TABLE user_settings(user_id INTEGER PRIMARY KEY, coordinator_consent INTEGER NOT NULL DEFAULT 1, updated_at INTEGER)')
+  db.prepare('INSERT INTO user_settings(user_id, coordinator_consent, updated_at) VALUES(1, 1, 5)').run()
+  addTransferConsentSetting(db)
+  addTransferConsentSetting(db)
+  assert.deepEqual({ ...db.prepare('SELECT user_id, coordinator_consent, coordinator_transfer_consent FROM user_settings').get() }, { user_id: 1, coordinator_consent: 1, coordinator_transfer_consent: 0 })
 })
 
 test('migration: an existing transfers table gains a nullable causes column, rows kept', () => {

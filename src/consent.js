@@ -17,6 +17,10 @@ import { transferRecipients, parseFindings } from './transfers.js'
 
 export const CONSENT_REASON_MAX = 200
 export const CONSENT_DAILY_CAP_DEFAULT = 20
+// Transfer approvals per rolling 24 h (MATRON_COORDINATOR_TRANSFER_DAILY_CAP;
+// 0 = no cap). Counted apart from the daily cap: one help article can carry
+// a dozen screenshots, and those must not use up the chats and spawns.
+export const CONSENT_TRANSFER_DAILY_CAP_DEFAULT = 100
 export const CONSENT_DAILY_WINDOW_MS = 24 * 60 * 60 * 1000
 // Routine-born approvals of the Coordinator's own asks per rolling 24 h
 // (MATRON_COORDINATOR_ROUTINE_CAP; 0 = no cap), on top of the daily cap.
@@ -36,6 +40,21 @@ export function getConsentEnabled(db, userId) {
 export function setConsentEnabled(db, userId, on, now = Date.now()) {
   db.prepare(`INSERT INTO user_settings(user_id, coordinator_consent, updated_at) VALUES(?,?,?)
     ON CONFLICT(user_id) DO UPDATE SET coordinator_consent=excluded.coordinator_consent, updated_at=excluded.updated_at`)
+    .run(userId, on ? 1 : 0, now)
+}
+
+// The user's switch "Let the Coordinator approve file transfers": while on,
+// a transfer the Coordinator had another session send (src/cause-hops.js)
+// is answered like any other. Flagged files, user-only boxes and the
+// Coordinator's own sends stay the user's either way. Default OFF.
+export function getTransferConsentEnabled(db, userId) {
+  const row = db.prepare('SELECT coordinator_transfer_consent FROM user_settings WHERE user_id=?').get(userId)
+  return row ? Number(row.coordinator_transfer_consent) === 1 : false
+}
+
+export function setTransferConsentEnabled(db, userId, on, now = Date.now()) {
+  db.prepare(`INSERT INTO user_settings(user_id, coordinator_transfer_consent, updated_at) VALUES(?,?,?)
+    ON CONFLICT(user_id) DO UPDATE SET coordinator_transfer_consent=excluded.coordinator_transfer_consent, updated_at=excluded.updated_at`)
     .run(userId, on ? 1 : 0, now)
 }
 
@@ -235,8 +254,11 @@ export function recordConsentDecision(db, { userId, kind, askId, decision, convo
     .run(userId, kind, askId, decision, convoId, reason, causeKind, causeRef, verifierNote, now)
 }
 
-export function coordinatorApprovalsSince(db, userId, since) {
-  return db.prepare("SELECT COUNT(*) c FROM consent_decisions WHERE user_id=? AND decision='approve' AND created_at>?").get(userId, since).c
+export function coordinatorApprovalsSince(db, userId, since, { kind = null } = {}) {
+  // Transfers have a cap of their own: { kind: 'transfer' } counts those,
+  // and the default count (chats and spawns) leaves them out.
+  const which = kind === 'transfer' ? "kind='transfer'" : "kind!='transfer'"
+  return db.prepare(`SELECT COUNT(*) c FROM consent_decisions WHERE user_id=? AND decision='approve' AND ${which} AND created_at>?`).get(userId, since).c
 }
 
 // The routine cap's counter: approvals of the Coordinator's own asks that

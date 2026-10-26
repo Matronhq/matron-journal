@@ -24,8 +24,8 @@ import { json, readBody } from './http-body.js'
 import { sanitizePeerText } from './peer-text.js'
 import { getCoordinatorConvoId } from './coordinator.js'
 import {
-  CONSENT_REASON_MAX, CONSENT_DAILY_CAP_DEFAULT, CONSENT_DAILY_WINDOW_MS, CONSENT_KINDS, CONSENT_DECISIONS,
-  getConsentEnabled, listPendingAsks, parseChatAskId, coordinatorApprovalsSince, deviceState,
+  CONSENT_REASON_MAX, CONSENT_DAILY_CAP_DEFAULT, CONSENT_TRANSFER_DAILY_CAP_DEFAULT, CONSENT_DAILY_WINDOW_MS, CONSENT_KINDS, CONSENT_DECISIONS,
+  getConsentEnabled, getTransferConsentEnabled, listPendingAsks, parseChatAskId, coordinatorApprovalsSince, deviceState,
   isUserOnlySpawn, isUserOnlyChat, isUserOnlyTransfer, spawnAskInvolvesPrivate, chatAskInvolvesPrivate, transferAskInvolvesPrivate,
 } from './consent.js'
 import { filteredAgent } from './privacy.js'
@@ -118,11 +118,16 @@ export async function handleConsentRoute(ctx, req, res, url, who) {
 // part in is the 404 an unknown id gets, decline included. An approval is
 // refused, before anything changes, when the sender's secret scan flagged
 // the file (the user alone may let that through), when a user-only box
-// sends or receives it, and when the Coordinator sent it — from its own
-// session, or by having another session send it (its causes lead back to a
-// carry-on or room message of the Coordinator's, src/cause-hops.js): a file
-// the Coordinator sends is the user's to approve, whatever its causes say;
-// then the daily cap, as for the other kinds.
+// sends or receives it, and when the Coordinator sent it from its own
+// session: a file the Coordinator sends is the user's to approve, whatever
+// its causes say. One the Coordinator had another session send (its causes
+// lead back to a carry-on, room message or spawn of the Coordinator's,
+// src/cause-hops.js) is the user's too, unless the user switched on
+// "Let the Coordinator approve file transfers" (getTransferConsentEnabled):
+// then it is answered like any other, and its decision row names the
+// switch. The switch is for transfers alone; spawns and chats keep their
+// rule. Then the transfer cap, which counts transfers apart from the
+// daily cap on chats and spawns.
 function answerTransfer(ctx, res, who, body, decidedBy, ordinary) {
   if (!isTransferId(body.id)) { json(res, 400, { error: 'bad_request' }); return true }
   if (ordinary && transferAskInvolvesPrivate(ctx.db, who.userId, getTransfer(ctx.db, body.id))) { json(res, 404, { error: 'not_found' }); return true }
@@ -137,7 +142,10 @@ function answerTransfer(ctx, res, who, body, decidedBy, ordinary) {
     }
     const relay = resolveRelayedAsk(ctx.db, { who, userId: who.userId, causes: parseCauses(row.causes), createdAt: row.created_at, fromConvoId: row.from_convo_id })
     if (relay.relayed) {
-      json(res, 403, { error: 'forbidden', detail: 'own_ask_unverified', why: 'a file the Coordinator had another session send is the user\'s to approve' }); return true
+      if (!getTransferConsentEnabled(ctx.db, who.userId)) {
+        json(res, 403, { error: 'forbidden', detail: 'own_ask_unverified', why: 'a file the Coordinator had another session send is the user\'s to approve while Coordinator file approvals are off' }); return true
+      }
+      Object.assign(decidedBy, { causeKind: 'setting', causeRef: 'transfer_consent' })
     }
     if (!approvalAllowed(ctx, res, who, { kind: 'transfer', own: false }, null, decidedBy)) return true
   }
@@ -151,7 +159,8 @@ function answerTransfer(ctx, res, who, body, decidedBy, ordinary) {
 // another session make) the verdict of
 // verifyOwnAsk (src/consent-own-ask.js) and its re-checks after the wait,
 // its root landing on decidedBy for the decision row; then the daily cap
-// (0 = unlimited, MATRON_COORDINATOR_CONSENT_DAILY_CAP=0). `ask` is null
+// (0 = unlimited, MATRON_COORDINATOR_CONSENT_DAILY_CAP=0), or for a
+// transfer the transfer cap (MATRON_COORDINATOR_TRANSFER_DAILY_CAP). `ask` is null
 // for a chat ask that is not awaiting — the answer path gives its own
 // 404 / 409 then. → false once a refusal is sent.
 function approvalAllowed(ctx, res, who, ask, verdict, decidedBy) {
@@ -160,8 +169,10 @@ function approvalAllowed(ctx, res, who, ask, verdict, decidedBy) {
     if (refused) { json(res, refused.status, refused.body); return false }
     Object.assign(decidedBy, verdict.cause)
   }
-  const cap = Number.isInteger(ctx.consentDailyCap) && ctx.consentDailyCap >= 0 ? ctx.consentDailyCap : CONSENT_DAILY_CAP_DEFAULT
-  if (cap > 0 && coordinatorApprovalsSince(ctx.db, who.userId, Date.now() - CONSENT_DAILY_WINDOW_MS) >= cap) {
+  const transfer = ask?.kind === 'transfer'
+  const [setCap, defaultCap] = transfer ? [ctx.consentTransferDailyCap, CONSENT_TRANSFER_DAILY_CAP_DEFAULT] : [ctx.consentDailyCap, CONSENT_DAILY_CAP_DEFAULT]
+  const cap = Number.isInteger(setCap) && setCap >= 0 ? setCap : defaultCap
+  if (cap > 0 && coordinatorApprovalsSince(ctx.db, who.userId, Date.now() - CONSENT_DAILY_WINDOW_MS, { kind: transfer ? 'transfer' : null }) >= cap) {
     json(res, 409, { error: 'conflict', detail: 'daily_cap', cap }); return false
   }
   return true

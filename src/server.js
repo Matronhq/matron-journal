@@ -40,7 +40,7 @@ import { seedRoutines } from './routines.js'
 import { startStallWakeSweep } from './stall-wake.js'
 import { startAutoArchiveSweep } from './archive.js'
 import { sealStoredTokens } from './github-accounts.js'
-import { CONSENT_DAILY_CAP_DEFAULT, CONSENT_ROUTINE_CAP_DEFAULT } from './consent.js'
+import { CONSENT_DAILY_CAP_DEFAULT, CONSENT_ROUTINE_CAP_DEFAULT, CONSENT_TRANSFER_DAILY_CAP_DEFAULT } from './consent.js'
 import { makeVerifier } from './verifier.js'
 import { warnAlertWebhookConfig } from './alerts-http.js'
 import { throttle, cancellableDelay } from './background.js'
@@ -431,6 +431,9 @@ export function startServer({
   // Coordinator consent approvals per rolling 24 h (spec: 2026-09-29
   // coordinator consent); beyond it the ask stays for the user. 0 = no cap.
   consentDailyCap = resolveConsentDailyCap(process.env.MATRON_COORDINATOR_CONSENT_DAILY_CAP),
+  // Coordinator approvals of file transfers per rolling 24 h, counted apart
+  // from the daily cap above. 0 = no cap.
+  consentTransferDailyCap = resolveZeroableEnv('MATRON_COORDINATOR_TRANSFER_DAILY_CAP', process.env.MATRON_COORDINATOR_TRANSFER_DAILY_CAP, CONSENT_TRANSFER_DAILY_CAP_DEFAULT),
   // Approvals of the Coordinator's own routine-born asks per rolling 24 h
   // (src/consent-own-ask.js), on top of the daily cap. 0 = no cap.
   consentRoutineCap = resolveZeroableEnv('MATRON_COORDINATOR_ROUTINE_CAP', process.env.MATRON_COORDINATOR_ROUTINE_CAP, CONSENT_ROUTINE_CAP_DEFAULT),
@@ -629,7 +632,7 @@ export function startServer({
     // transferChunkBytes: tests only (small chunks); production uses TRANSFER_CHUNK_BYTES.
     transferMaxBytes: resolvedTransferMaxBytes, transferUserQuotaBytes: resolvedTransferUserQuotaBytes, transferMaxAwaitingPerSender: resolvedTransferMaxAwaiting, transferChunkBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
-    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentRoutineCap, verifier,
+    preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentTransferDailyCap, consentRoutineCap, verifier,
     github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer,
   }))

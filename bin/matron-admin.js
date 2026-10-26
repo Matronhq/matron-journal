@@ -12,6 +12,7 @@ import { runOffload, runExpireLogs } from '../src/retention.js'
 import { listAwaiting, answerParkedInvite } from '../src/participants.js'
 import { closeChatConsentItem } from '../src/consent-items.js'
 import { normaliseEmail, setUserEmail } from '../src/password-reset.js'
+import { setTransferConsentEnabled } from '../src/consent.js'
 import { disableTwoFactor, twoFactorState, isTwoFactorRequired, setTwoFactorRequired } from '../src/two-factor.js'
 
 const USAGE = `usage:
@@ -28,6 +29,7 @@ const USAGE = `usage:
   matron-admin device revoke <device_id>
   matron-admin device private <device_id> on|off|auto
   matron-admin device consent <device_id> user-only|any
+  matron-admin coordinator transfers <username> on|off
   matron-admin link-code <username> --server-url <url> [--port <n>] [--expires <30m|24h>] [--png <path>]
   matron-admin offload [--days N]
   matron-admin expire-logs [--hours N]
@@ -265,6 +267,21 @@ export async function runAdmin(db, argv, deps = {}) {
     return mode === 'user-only'
       ? `device ${deviceId} consent=user-only — only the user's tap approves its asks; the Coordinator may still decline`
       : `device ${deviceId} consent=any — the Coordinator may approve its asks again`
+  }
+  // The user's switch "Let the Coordinator approve file transfers" (also
+  // PUT /coordinator transfer_consent from the user's own app): while on,
+  // the Coordinator may approve a transfer it had another session send.
+  // Flagged files, user-only boxes and its own sends stay the user's.
+  if (a === 'coordinator' && b === 'transfers') {
+    const username = argv[2]
+    const mode = argv[3]
+    if (!username || !['on', 'off'].includes(mode)) throw new Error(USAGE)
+    const user = db.prepare('SELECT id FROM users WHERE name=?').get(username)
+    if (!user) throw new Error(`no such user: ${username}`)
+    setTransferConsentEnabled(db, user.id, mode === 'on')
+    return mode === 'on'
+      ? `${username}: the Coordinator may approve file transfers, including ones it had another session send (flagged files and user-only boxes stay the user's)`
+      : `${username}: file transfers the Coordinator had another session send are the user's to approve again`
   }
   if (a === 'link-code') {
     const username = argv[1]

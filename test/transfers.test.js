@@ -277,8 +277,8 @@ test('create: once a sender has the cap of transfers awaiting the user, the next
   assert.equal((await create(s, a.token, { size: 5 })).status, 201)
 })
 
-test('the awaiting cap defaults to 10 and reads MATRON_TRANSFER_MAX_AWAITING_PER_SENDER', async (t) => {
-  assert.equal(TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT, 10)
+test('the awaiting cap defaults to 50 and reads MATRON_TRANSFER_MAX_AWAITING_PER_SENDER', async (t) => {
+  assert.equal(TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT, 50)
   const prev = process.env.MATRON_TRANSFER_MAX_AWAITING_PER_SENDER
   process.env.MATRON_TRANSFER_MAX_AWAITING_PER_SENDER = '1'
   t.after(() => {
