@@ -6,8 +6,9 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   cleanTtsText, escapeXml, azureVoiceName, buildSsml, ttsCacheKey, resolveTtsCacheDir, resolveTtsKey, resolveTtsRegion,
-  TtsError, TTS_ERROR_STATUS, TTS_VOICES, TTS_FORMATS, TTS_TEXT_MAX, TTS_CACHE_TTL_MS,
+  TtsError, TTS_ERROR_STATUS, TTS_VOICES, TTS_FORMATS, TTS_TEXT_MAX, TTS_CACHE_TTL_MS, TTS_USER_AGENT,
   DEFAULT_TTS_REGION, DEFAULT_TTS_MODEL, DEFAULT_TTS_VOICE, DEFAULT_TTS_DAILY_CHARS,
+  makeCloudTts,
 } from '../src/cloud-tts.js'
 
 const tmpDir = (t, prefix = 'matron-tts-') => {
@@ -106,4 +107,299 @@ test('resolveTtsRegion: its own variable; else the transcription endpoint\'s reg
   assert.equal(logs.length, 0)
   assert.equal(resolveTtsRegion({ MATRON_TTS_AZURE_REGION: 'evil.example.com/x?' }, { log }), 'northeurope')
   assert.match(logs[0], /MATRON_TTS_AZURE_REGION.*not a region name/)
+})
+
+// ---- makeCloudTts: the request, the cache, the limits ----
+
+const quiet = { log() {}, error() {} }
+
+// fetch stand-in: records each request and answers with `reply`
+// ({status?, bytes?, text?}), an Error to throw, or a function of the call.
+function fakeFetch(reply = {}, seen = []) {
+  return async (url, init) => {
+    seen.push({ url, method: init.method, headers: init.headers, body: init.body, signal: init.signal })
+    const r = typeof reply === 'function' ? await reply(seen.length, init) : reply
+    if (r instanceof Error) throw r
+    const status = r.status ?? 200
+    return {
+      ok: status < 400,
+      status,
+      arrayBuffer: async () => { const b = Buffer.from(r.bytes ?? 'AUDIO'); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) },
+      text: async () => r.text ?? '',
+    }
+  }
+}
+
+// A fetch whose requests the test releases by hand; an aborted signal
+// rejects the request, as real fetch does.
+function gatedFetch(seen = []) {
+  const gates = []
+  const impl = (url, init) => new Promise((resolve, reject) => {
+    seen.push({ url, body: init.body, signal: init.signal })
+    const ok = (bytes = 'AUDIO') => resolve({ ok: true, status: 200, arrayBuffer: async () => { const b = Buffer.from(bytes); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) }, text: async () => '' })
+    gates.push({ ok, fail: (err = new Error('boom')) => reject(err) })
+    init.signal.addEventListener('abort', () => reject(init.signal.reason ?? new Error('aborted')), { once: true })
+  })
+  return { impl, gates, seen }
+}
+
+const tick = () => new Promise((r) => setTimeout(r, 5))
+const rejectsWith = (p, code) => assert.rejects(p, (err) => err instanceof TtsError && err.code === code)
+
+test('no key: no synthesiser; a key needs a cache directory', () => {
+  assert.equal(makeCloudTts({ key: '' }), null)
+  assert.equal(makeCloudTts({}), null)
+  assert.throws(() => makeCloudTts({ key: 'k' }), /cacheDir is required/)
+})
+
+test('the Azure request: endpoint, headers, SSML with the escaped text and <id>:<model>; the clip comes back with a strong ETag', async (t) => {
+  const seen = []
+  const tts = makeCloudTts({ key: 'k-123', cacheDir: tmpDir(t), fetchImpl: fakeFetch({ bytes: 'MP3DATA' }, seen), log: quiet })
+  assert.equal(tts.kind, 'cloud')
+  assert.equal(tts.label, 'Azure MAI-Voice-2.1-Flash at northeurope.tts.speech.microsoft.com')
+  assert.deepEqual(tts.voices(), { voices: [...TTS_VOICES], default: 'en-GB-Harry' })
+  const clip = await tts.synthesize({ userId: 1, text: '  Tom & Jerry <b>say</b> "hi"\u0007  ' })
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0].url, 'https://northeurope.tts.speech.microsoft.com/cognitiveservices/v1')
+  assert.equal(seen[0].method, 'POST')
+  assert.deepEqual(seen[0].headers, {
+    'Ocp-Apim-Subscription-Key': 'k-123',
+    'Content-Type': 'application/ssml+xml',
+    'X-Microsoft-OutputFormat': 'audio-24khz-48kbitrate-mono-mp3',
+    'User-Agent': TTS_USER_AGENT,
+  })
+  assert.equal(seen[0].body,
+    '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-GB"><voice name="en-GB-Harry:MAI-Voice-2.1-Flash">Tom &amp; Jerry &lt;b&gt;say&lt;/b&gt; &quot;hi&quot;</voice></speak>')
+  assert.deepEqual(clip.bytes, Buffer.from('MP3DATA'))
+  assert.equal(clip.contentType, 'audio/mpeg')
+  assert.equal(clip.format, 'mp3')
+  assert.equal(clip.voice, 'en-GB-Harry')
+  assert.equal(clip.cached, false)
+  assert.equal(clip.key, ttsCacheKey({ voice: 'en-GB-Harry', model: 'MAI-Voice-2.1-Flash', format: 'mp3', text: 'Tom & Jerry <b>say</b> "hi"' }))
+  assert.equal(clip.etag, `"${crypto.createHash('sha256').update('MP3DATA').digest('hex')}"`)
+})
+
+test('voice and format: Emily and wav reach Azure; region, model and default voice are configurable', async (t) => {
+  const seen = []
+  const tts = makeCloudTts({ key: 'k', cacheDir: tmpDir(t), fetchImpl: fakeFetch({ bytes: 'RIFF' }, seen), log: quiet })
+  const wav = await tts.synthesize({ userId: 1, text: 'Hello', voice: 'en-GB-Emily', format: 'wav' })
+  assert.equal(seen[0].headers['X-Microsoft-OutputFormat'], 'riff-16khz-16bit-mono-pcm')
+  assert.match(seen[0].body, /<voice name="en-GB-Emily:MAI-Voice-2.1-Flash">Hello<\/voice>/)
+  assert.equal(wav.contentType, 'audio/wav')
+  assert.equal(wav.format, 'wav')
+  assert.equal(wav.voice, 'en-GB-Emily')
+
+  const seen2 = []
+  const other = makeCloudTts({ key: 'k', region: 'uksouth', model: '', defaultVoice: 'en-GB-Emily', cacheDir: tmpDir(t), fetchImpl: fakeFetch({}, seen2), log: quiet })
+  assert.equal(other.label, 'Azure standard voices at uksouth.tts.speech.microsoft.com')
+  assert.equal(other.voices().default, 'en-GB-Emily')
+  await other.synthesize({ userId: 1, text: 'Hello', voice: null, format: null })
+  assert.equal(seen2[0].url, 'https://uksouth.tts.speech.microsoft.com/cognitiveservices/v1')
+  assert.match(seen2[0].body, /<voice name="en-GB-Emily">Hello<\/voice>/)
+  assert.equal(seen2[0].headers['X-Microsoft-OutputFormat'], 'audio-24khz-48kbitrate-mono-mp3')
+})
+
+test('validation: text 1 to 2,000 characters after cleaning, a known format, a voice on the list; nothing reaches Azure', async (t) => {
+  const seen = []
+  const tts = makeCloudTts({ key: 'k', cacheDir: tmpDir(t), fetchImpl: fakeFetch({}, seen), log: quiet })
+  for (const text of [undefined, null, 42, {}, '', '   ', '\u0000\u0001', 'x'.repeat(2001)]) {
+    await rejectsWith(tts.synthesize({ userId: 1, text }), 'bad_request')
+  }
+  for (const format of ['ogg', 'MP3', '', 7, {}, 'toString']) {
+    await rejectsWith(tts.synthesize({ userId: 1, text: 'hi', format }), 'bad_request')
+  }
+  for (const voice of ['en-US-Jenny', 'en-GB-Harry:MAI-Voice-2.1-Flash', '', 7, {}]) {
+    await rejectsWith(tts.synthesize({ userId: 1, text: 'hi', voice }), 'unknown_voice')
+  }
+  await assert.rejects(tts.synthesize({ text: 'hi' }), TypeError, 'a server-side caller must say whose budget it is')
+  assert.equal(seen.length, 0)
+  assert.equal(tts.usage(1).used, 0)
+  await tts.synthesize({ userId: 1, text: `  ${'x'.repeat(2000)}  ` })
+  assert.equal(seen.length, 1, 'the limit applies after trimming')
+})
+
+test('cache: the same line is synthesised once; a hit costs no budget; voice and format are separate clips; a restart keeps the cache', async (t) => {
+  const dir = tmpDir(t)
+  const seen = []
+  let n = 0
+  const fetchImpl = fakeFetch(() => ({ bytes: `AUDIO-${++n}` }), seen)
+  const tts = makeCloudTts({ key: 'k', cacheDir: dir, fetchImpl, log: quiet })
+  const first = await tts.synthesize({ userId: 1, text: 'Three things need you.' })
+  const again = await tts.synthesize({ userId: 1, text: '  Three things need you.  ' })
+  assert.equal(seen.length, 1)
+  assert.equal(first.cached, false)
+  assert.equal(again.cached, true)
+  assert.deepEqual(again.bytes, first.bytes)
+  assert.equal(again.etag, first.etag)
+  assert.equal(again.key, first.key)
+  assert.equal(tts.usage(1).used, 22, 'charged once, for the 22 characters')
+  assert.deepEqual(fs.readdirSync(dir), [`${first.key}.mp3`])
+  assert.equal(fs.statSync(path.join(dir, `${first.key}.mp3`)).mode & 0o777, 0o600)
+
+  // Another user's request for the same line is a hit too, and free.
+  assert.equal((await tts.synthesize({ userId: 2, text: 'Three things need you.' })).cached, true)
+  assert.equal(tts.usage(2).used, 0)
+
+  await tts.synthesize({ userId: 1, text: 'Three things need you.', format: 'wav' })
+  await tts.synthesize({ userId: 1, text: 'Three things need you.', voice: 'en-GB-Emily' })
+  assert.equal(seen.length, 3)
+  assert.equal(fs.readdirSync(dir).length, 3)
+
+  const reborn = makeCloudTts({ key: 'k', cacheDir: dir, fetchImpl, log: quiet })
+  assert.equal((await reborn.synthesize({ userId: 1, text: 'Three things need you.' })).cached, true)
+  assert.equal(seen.length, 3)
+})
+
+test('cache expiry: a clip older than 24 hours is not served and is synthesised again; sweep deletes old clips and only its own files', async (t) => {
+  const dir = tmpDir(t)
+  const seen = []
+  const tts = makeCloudTts({ key: 'k', cacheDir: dir, fetchImpl: fakeFetch({}, seen), log: quiet })
+  const age = (name, ms) => { const at = new Date(Date.now() - ms); fs.utimesSync(path.join(dir, name), at, at) }
+
+  const a = await tts.synthesize({ userId: 1, text: 'old line' })
+  age(`${a.key}.mp3`, TTS_CACHE_TTL_MS - 60000)
+  assert.equal((await tts.synthesize({ userId: 1, text: 'old line' })).cached, true, 'a minute short of 24 hours: still served')
+  age(`${a.key}.mp3`, TTS_CACHE_TTL_MS + 60000)
+  const b = await tts.synthesize({ userId: 1, text: 'old line' })
+  assert.equal(b.cached, false, 'past 24 hours the file is not served')
+  assert.equal(seen.length, 2)
+  assert.equal(b.key, a.key)
+  assert.equal((await tts.synthesize({ userId: 1, text: 'old line' })).cached, true, 'the new clip replaced the old file')
+
+  const stale = await tts.synthesize({ userId: 1, text: 'stale line' })
+  age(`${stale.key}.mp3`, TTS_CACHE_TTL_MS + 60000)
+  const abandoned = `${'a'.repeat(64)}.mp3.0123456789ab.tmp`
+  fs.writeFileSync(path.join(dir, abandoned), 'half a clip')
+  age(abandoned, TTS_CACHE_TTL_MS + 60000)
+  fs.writeFileSync(path.join(dir, 'README.txt'), 'not ours')
+  age('README.txt', 2 * TTS_CACHE_TTL_MS)
+  assert.deepEqual(tts.sweep(), { removed: 2 }, 'the stale clip and the abandoned temp file')
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['README.txt', `${b.key}.mp3`].sort())
+  assert.deepEqual(tts.sweep(), { removed: 0 })
+  assert.deepEqual(makeCloudTts({ key: 'k', cacheDir: path.join(dir, 'never-made'), log: quiet }).sweep(), { removed: 0 })
+})
+
+test('two requests for the same line at once make one Azure call; the second waits for the first', async (t) => {
+  const g = gatedFetch()
+  const tts = makeCloudTts({ key: 'k', cacheDir: tmpDir(t), fetchImpl: g.impl, log: quiet })
+  const p1 = tts.synthesize({ userId: 1, text: 'same line' })
+  const p2 = tts.synthesize({ userId: 2, text: 'same line' })
+  await tick()
+  assert.equal(g.seen.length, 1)
+  g.gates[0].ok('ONE')
+  const [c1, c2] = await Promise.all([p1, p2])
+  assert.deepEqual(c1.bytes, Buffer.from('ONE'))
+  assert.deepEqual(c2.bytes, Buffer.from('ONE'))
+  assert.equal(c1.cached, false)
+  assert.equal(c2.cached, true)
+  assert.equal(tts.usage(1).used, 9)
+  assert.equal(tts.usage(2).used, 0, 'the one who joined is not charged')
+})
+
+test('failures are tts_failed: HTTP error, network error, empty audio; logged without the key or the text; nothing cached', async (t) => {
+  const dir = tmpDir(t)
+  const logs = []
+  const log = { log: (m) => logs.push(m), error: (m) => logs.push(m) }
+  const mk = (reply) => makeCloudTts({ key: 'super-secret', cacheDir: dir, fetchImpl: fakeFetch(reply), log })
+  await rejectsWith(mk({ status: 401, text: 'Access denied due to invalid subscription key' }).synthesize({ userId: 1, text: 'private words' }), 'tts_failed')
+  await rejectsWith(mk(new Error('getaddrinfo ENOTFOUND')).synthesize({ userId: 1, text: 'private words' }), 'tts_failed')
+  await rejectsWith(mk({ bytes: '' }).synthesize({ userId: 1, text: 'private words' }), 'tts_failed')
+  assert.equal(logs.length, 3)
+  assert.match(logs[0], /^tts: synthesis failed: azure tts HTTP 401: Access denied/)
+  assert.match(logs[1], /ENOTFOUND/)
+  assert.match(logs[2], /empty audio/)
+  assert.ok(logs.every((l) => !l.includes('super-secret') && !l.includes('private words')))
+  assert.equal(fs.existsSync(dir) ? fs.readdirSync(dir).length : 0, 0)
+  // A later success for the same line still goes to Azure.
+  const seen = []
+  const ok = makeCloudTts({ key: 'k', cacheDir: dir, fetchImpl: fakeFetch({}, seen), log })
+  assert.equal((await ok.synthesize({ userId: 1, text: 'private words' })).cached, false)
+  assert.match(logs[3], /^tts: user 1: 13 chars, en-GB-Harry, mp3, 5 bytes in \d+ ms$/)
+})
+
+test('timeout: a request Azure never answers fails as tts_failed after requestTimeoutMs', async (t) => {
+  const g = gatedFetch()
+  const tts = makeCloudTts({ key: 'k', cacheDir: tmpDir(t), fetchImpl: g.impl, requestTimeoutMs: 30, log: quiet })
+  // AbortSignal.timeout's timer is unref'd: with nothing else pending, the
+  // test process would exit before it fires. The server's listener keeps
+  // the loop alive in production; here a plain timer does.
+  const keepAlive = setTimeout(() => {}, 5000)
+  t.after(() => clearTimeout(keepAlive))
+  const t0 = Date.now()
+  await rejectsWith(tts.synthesize({ userId: 1, text: 'slow' }), 'tts_failed')
+  assert.ok(Date.now() - t0 < 2000)
+  assert.equal(g.seen[0].signal.aborted, true)
+})
+
+test('daily budget: characters per user per UTC day, counted on a miss that goes to Azure; over it is tts_budget_exceeded; a new day resets', async (t) => {
+  const seen = []
+  let clock = Date.parse('2026-10-03T23:59:00Z')
+  const tts = makeCloudTts({ key: 'k', cacheDir: tmpDir(t), dailyChars: 25, fetchImpl: fakeFetch({}, seen), now: () => clock, log: quiet })
+  assert.deepEqual(tts.usage(1), { day: '2026-10-03', used: 0, limit: 25 })
+  await tts.synthesize({ userId: 1, text: 'x'.repeat(10) })
+  await tts.synthesize({ userId: 1, text: 'y'.repeat(15) })
+  assert.equal(tts.usage(1).used, 25, 'exactly the budget is allowed')
+  await rejectsWith(tts.synthesize({ userId: 1, text: 'z' }), 'tts_budget_exceeded')
+  assert.equal(seen.length, 2)
+  // A cached line still plays when the budget is spent.
+  assert.equal((await tts.synthesize({ userId: 1, text: 'x'.repeat(10) })).cached, true)
+  // Another user has their own budget.
+  await tts.synthesize({ userId: 2, text: 'z' })
+  assert.equal(tts.usage(2).used, 1)
+  // A failed call was still sent, so it still counts.
+  const failing = makeCloudTts({ key: 'k', cacheDir: tmpDir(t), dailyChars: 25, fetchImpl: fakeFetch({ status: 500 }), now: () => clock, log: quiet })
+  await rejectsWith(failing.synthesize({ userId: 1, text: 'x'.repeat(20) }), 'tts_failed')
+  assert.equal(failing.usage(1).used, 20)
+  // Midnight UTC.
+  clock = Date.parse('2026-10-04T00:00:01Z')
+  assert.deepEqual(tts.usage(1), { day: '2026-10-04', used: 0, limit: 25 })
+  await tts.synthesize({ userId: 1, text: 'z'.repeat(25) })
+  assert.equal(seen.length, 4)
+})
+
+test('concurrency: 4 requests at Azure at once across users, the next wait their turn, and past the queue it is tts_busy and not charged', async (t) => {
+  const g = gatedFetch()
+  const tts = makeCloudTts({ key: 'k', cacheDir: tmpDir(t), fetchImpl: g.impl, maxQueued: 2, log: quiet })
+  const running = [1, 2, 3, 4].map((i) => tts.synthesize({ userId: i, text: `line ${i}` }))
+  const queued = [5, 6].map((i) => tts.synthesize({ userId: i, text: `line ${i}` }))
+  await tick()
+  assert.equal(g.seen.length, 4, 'four in flight, two waiting')
+  await rejectsWith(tts.synthesize({ userId: 7, text: 'line 7' }), 'tts_busy')
+  assert.equal(tts.usage(7).used, 0)
+  assert.equal(g.seen.length, 4)
+
+  g.gates[0].ok()
+  await running[0]
+  await tick()
+  assert.equal(g.seen.length, 5, 'a finished request hands its slot to the first in the queue')
+  assert.match(g.seen[4].body, />line 5</)
+  g.gates[1].fail()
+  await rejectsWith(running[1], 'tts_failed')
+  await tick()
+  assert.equal(g.seen.length, 6, 'a failed request frees its slot too')
+  for (const i of [2, 3, 4, 5]) g.gates[i].ok()
+  await Promise.all([running[2], running[3], ...queued])
+  // Everything has drained: four more can start at once.
+  const more = [8, 9, 10, 11].map((i) => tts.synthesize({ userId: i, text: `line ${i}` }))
+  await tick()
+  assert.equal(g.seen.length, 10)
+  for (const i of [6, 7, 8, 9]) g.gates[i].ok()
+  await Promise.all(more)
+})
+
+test('close: aborts what is in flight, fails what is queued, refuses what comes after; resolves when all have returned', async (t) => {
+  const g = gatedFetch()
+  const tts = makeCloudTts({ key: 'k', cacheDir: tmpDir(t), fetchImpl: g.impl, concurrency: 1, log: quiet })
+  const inFlight = tts.synthesize({ userId: 1, text: 'one' })
+  const waiting = tts.synthesize({ userId: 1, text: 'two' })
+  await tick()
+  const flightFailed = rejectsWith(inFlight, 'tts_failed')
+  const waitFailed = rejectsWith(waiting, 'tts_failed')
+  await tts.close()
+  await flightFailed
+  await waitFailed
+  assert.equal(g.seen.length, 1, 'the queued one never reached Azure')
+  assert.equal(g.seen[0].signal.aborted, true)
+  await rejectsWith(tts.synthesize({ userId: 1, text: 'three' }), 'tts_failed')
+  await tts.close()
 })

@@ -125,3 +125,201 @@ export function resolveTtsRegion(env = process.env, { log = console } = {}) {
   const m = ownKey ? null : STT_REGIONAL_ENDPOINT_RE.exec(env.MATRON_STT_AZURE_ENDPOINT || '')
   return m ? m[1] : DEFAULT_TTS_REGION
 }
+
+const CLIP_FILE_RE = /^[0-9a-f]{64}\.(mp3|wav)(\.[0-9a-f]{12}\.tmp)?$/
+
+export function makeCloudTts({
+  key,
+  region = DEFAULT_TTS_REGION,
+  // '' = the bare voice id (one of Azure's older neural voices).
+  model = DEFAULT_TTS_MODEL,
+  voices = TTS_VOICES,
+  defaultVoice = DEFAULT_TTS_VOICE,
+  // Characters of text per user per UTC day that may be sent to Azure.
+  dailyChars = DEFAULT_TTS_DAILY_CHARS,
+  cacheDir,
+  cacheTtlMs = TTS_CACHE_TTL_MS,
+  fetchImpl = globalThis.fetch,
+  requestTimeoutMs = 20000,
+  // Requests to Azure at once, across all users; and how many more may wait
+  // for a slot before a caller is told tts_busy.
+  concurrency = 4,
+  maxQueued = 16,
+  now = Date.now,
+  log = console,
+} = {}) {
+  if (!key) return null
+  if (!cacheDir) throw new Error('makeCloudTts: cacheDir is required')
+  const url = `https://${region}.tts.speech.microsoft.com/cognitiveservices/v1`
+  const abort = new AbortController()
+  let closed = false
+  let running = 0
+  const waiting = []
+  // cache key -> promise of the audio bytes, from admission until settled:
+  // the same line asked for twice at once is synthesised once.
+  const inflight = new Map()
+  // userId -> {day, chars}. In memory, like the journal's other limiters
+  // (auth.js makeRateLimiter): a restart forgets the day's spend.
+  const spent = new Map()
+
+  const today = () => new Date(now()).toISOString().slice(0, 10)
+  const usedToday = (userId) => {
+    const s = spent.get(userId)
+    return s && s.day === today() ? s.chars : 0
+  }
+  const charge = (userId, chars) => spent.set(userId, { day: today(), chars: usedToday(userId) + chars })
+
+  function acquire() {
+    if (running < concurrency) { running += 1; return Promise.resolve(true) }
+    return new Promise((r) => waiting.push(r))
+  }
+  function release() {
+    const next = waiting.shift()
+    // The slot passes straight to the next waiter, so `running` is unchanged.
+    if (next) next(true)
+    else running -= 1
+  }
+
+  // The clip's bytes when the file exists and is younger than the TTL. Stat
+  // and read are synchronous, as sweep() is, so a sweep can never remove a
+  // file between the two or part-way through a read.
+  function readFresh(file) {
+    try {
+      if (now() - fs.statSync(file).mtimeMs >= cacheTtlMs) return null
+      const bytes = fs.readFileSync(file)
+      return bytes.length ? bytes : null
+    } catch {
+      return null
+    }
+  }
+
+  // tmp + rename, so a reader sees a whole clip or none. A full disk costs
+  // the cache, not the request.
+  function writeCache(file, bytes) {
+    try {
+      fs.mkdirSync(cacheDir, { recursive: true, mode: 0o700 })
+      const tmp = `${file}.${crypto.randomBytes(6).toString('hex')}.tmp`
+      fs.writeFileSync(tmp, bytes, { mode: 0o600 })
+      fs.renameSync(tmp, file)
+    } catch (err) {
+      log.error(`tts: could not cache a clip (${err.code ?? err.message})`)
+    }
+  }
+
+  async function callAzure(ssml, fmt) {
+    const timeout = AbortSignal.timeout(requestTimeoutMs)
+    const res = await fetchImpl(url, {
+      method: 'POST',
+      headers: {
+        'Ocp-Apim-Subscription-Key': key,
+        'Content-Type': 'application/ssml+xml',
+        'X-Microsoft-OutputFormat': fmt.azure,
+        'User-Agent': TTS_USER_AGENT,
+      },
+      body: ssml,
+      signal: AbortSignal.any([abort.signal, timeout]),
+    })
+    if (!res.ok) {
+      // Azure's error text; it never echoes the key.
+      const detail = (await res.text().catch(() => '')).slice(0, 200)
+      throw new Error(`azure tts HTTP ${res.status}: ${detail}`)
+    }
+    const bytes = Buffer.from(await res.arrayBuffer())
+    if (!bytes.length) throw new Error('empty audio')
+    return bytes
+  }
+
+  const clip = ({ key: cacheKey, fmt, format, voice, bytes, cached }) => ({
+    key: cacheKey,
+    format,
+    voice,
+    contentType: fmt.contentType,
+    bytes,
+    // Strong: the hash of exactly these bytes.
+    etag: `"${crypto.createHash('sha256').update(bytes).digest('hex')}"`,
+    cached,
+  })
+
+  return {
+    kind: 'cloud',
+    label: `Azure ${model || 'standard voices'} at ${new URL(url).host}`,
+    voices: () => ({ voices: voices.map((v) => ({ ...v })), default: defaultVoice }),
+    // What this user has sent to Azure today, for tests and diagnostics.
+    usage: (userId) => ({ day: today(), used: usedToday(userId), limit: dailyChars }),
+
+    // {userId, text, voice?, format?} -> {key, format, voice, contentType,
+    // bytes, etag, cached}. Throws TtsError (bad_request, unknown_voice,
+    // tts_budget_exceeded, tts_busy, tts_failed).
+    async synthesize({ userId, text, voice = null, format = null } = {}) {
+      if (userId == null) throw new TypeError('synthesize: userId is required')
+      const clean = cleanTtsText(text)
+      if (clean === null || clean.length < 1 || clean.length > TTS_TEXT_MAX) throw new TtsError('bad_request', 'text')
+      const formatName = format ?? 'mp3'
+      if (typeof formatName !== 'string' || !Object.hasOwn(TTS_FORMATS, formatName)) throw new TtsError('bad_request', 'format')
+      const fmt = TTS_FORMATS[formatName]
+      const v = voices.find((x) => x.id === (voice ?? defaultVoice))
+      if (!v) throw new TtsError('unknown_voice')
+      const cacheKey = ttsCacheKey({ voice: v.id, model, format: formatName, text: clean })
+      const file = path.join(cacheDir, `${cacheKey}.${fmt.ext}`)
+      const found = { key: cacheKey, fmt, format: formatName, voice: v.id }
+
+      const hit = readFresh(file)
+      if (hit) return clip({ ...found, bytes: hit, cached: true })
+      const already = inflight.get(cacheKey)
+      if (already) return clip({ ...found, bytes: await already, cached: true })
+
+      // Admission. Nothing below this line awaits before the job holds its
+      // slot or its place in the queue, so these checks cannot be raced.
+      if (closed) throw new TtsError('tts_failed', 'shutting down')
+      if (running >= concurrency && waiting.length >= maxQueued) throw new TtsError('tts_busy')
+      if (usedToday(userId) + clean.length > dailyChars) throw new TtsError('tts_budget_exceeded')
+      charge(userId, clean.length)
+
+      const job = (async () => {
+        if (!(await acquire())) throw new TtsError('tts_failed', 'shutting down')
+        try {
+          const started = now()
+          const bytes = await callAzure(buildSsml({ text: clean, voiceName: azureVoiceName(v.id, model), locale: v.locale }), fmt)
+          writeCache(file, bytes)
+          log.log(`tts: user ${userId}: ${clean.length} chars, ${v.id}, ${formatName}, ${bytes.length} bytes in ${now() - started} ms`)
+          return bytes
+        } catch (err) {
+          log.error(`tts: synthesis failed: ${err?.message ?? err}`)
+          throw new TtsError('tts_failed')
+        } finally {
+          release()
+        }
+      })()
+      inflight.set(cacheKey, job)
+      const settled = () => inflight.delete(cacheKey)
+      job.then(settled, settled)
+      return clip({ ...found, bytes: await job, cached: false })
+    },
+
+    // Deletes clips (and abandoned temp files) older than the TTL, and
+    // forgets yesterday's spend. Touches only names this module writes.
+    sweep() {
+      for (const [userId, s] of spent) if (s.day !== today()) spent.delete(userId)
+      let names
+      try { names = fs.readdirSync(cacheDir) } catch { return { removed: 0 } }
+      let removed = 0
+      for (const name of names) {
+        if (!CLIP_FILE_RE.test(name)) continue
+        const p = path.join(cacheDir, name)
+        try {
+          if (now() - fs.statSync(p).mtimeMs >= cacheTtlMs) { fs.unlinkSync(p); removed += 1 }
+        } catch { /* gone already, or unreadable: the next sweep tries again */ }
+      }
+      return { removed }
+    },
+
+    // Abort the requests in flight, fail the ones waiting for a slot, and
+    // resolve once they have all returned.
+    close() {
+      closed = true
+      abort.abort()
+      for (const w of waiting.splice(0)) w(false)
+      return Promise.allSettled([...inflight.values()]).then(() => {})
+    },
+  }
+}
