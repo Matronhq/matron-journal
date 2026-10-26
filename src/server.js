@@ -30,6 +30,7 @@ import { makeConfiguredTranscriber } from './cloud-transcribe.js'
 import { makeConfiguredMailer } from './mailer.js'
 import { makeConfiguredSummariser } from './summarise.js'
 import { makeBlobTranscripts } from './blob-transcripts.js'
+import { makeConfiguredTts, resolveTtsCacheDir } from './cloud-tts.js'
 import { makeItemTranscription } from './items-transcribe.js'
 import { emitTranscriptionMarker } from './items-http.js'
 import { makeGithub, DEFAULT_GITHUB_CLIENT_ID } from './github.js'
@@ -452,6 +453,9 @@ export function startServer({
   routinesTriggerIntervalMs = null,
   routinesSweep = process.env.MATRON_ROUTINES !== '0',
   mediaReapHighPct, mediaReapLowPct, waker, transcriber, github, githubRefreshIntervalMs, webDir,
+  // Cloud speech (src/cloud-tts.js). `tts` is the test seam; `null` forces
+  // it off. `ttsCacheDir` overrides where the clips are kept.
+  tts, ttsCacheDir,
   appleAppIds, androidPackage, androidCertSha256, tokenKey,
   // Alertmanager webhook (src/alerts-http.js): {token, username}. The
   // option is the test seam; env otherwise. Off unless both are usable.
@@ -588,6 +592,12 @@ export function startServer({
     blobTranscripts,
     onSettled: (out) => emitTranscriptionMarker({ db, hub, pushPipeline, waker: resolvedWaker }, out),
   })
+  // Speech for voice mode (spec 2026-10-03 voice mode, section 2): Azure,
+  // with MATRON_TTS_AZURE_KEY or, failing that, the transcription key. No
+  // key (or MATRON_TTS_DISABLED=1): null, and POST /tts answers 501.
+  const resolvedTts = tts === undefined
+    ? makeConfiguredTts({ cacheDir: resolveTtsCacheDir(resolvedDbPath, ttsCacheDir) })
+    : tts
   // GitHub account linking (spec 2026-09-23 tracker web/teams). `github` is
   // the test seam; env otherwise. An empty client id disables the routes.
   const resolvedGithub = github !== undefined ? github : makeGithub({
@@ -634,7 +644,7 @@ export function startServer({
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentTransferDailyCap, consentRoutineCap, verifier,
     github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
-    sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer,
+    sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
   }))
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
@@ -759,6 +769,7 @@ export function startServer({
         pushPipeline,
         itemTranscription,
         blobTranscripts,
+        tts: resolvedTts,
         preapproveKey: resolvedPreapproveKey,
         searchBackfill,
         isDiffBackfill,
