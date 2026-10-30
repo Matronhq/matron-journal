@@ -3491,11 +3491,22 @@ can never replace an active secret. Existing sessions stay
 signed in. While it is required, `/2fa/disable` is 409
 `two_factor_required`.
 
+**Exempt users.** The operator can exempt an account from the requirement
+(`matron-admin user 2fa-exempt <name> on`, stored as
+`users.two_factor_exempt`; there is no HTTP route to set it). While the
+switch is on, an exempt user without two-factor signs in with their
+password alone (200 with a token), and `/2fa/disable` is not refused for
+them. The exemption waives the requirement only: an exempt user who has
+two-factor on still gets 401 `two_factor_required` and needs a code. For
+an exempt user, `GET /2fa` and `GET /me` report `required:false`;
+`PUT /2fa/policy` always answers with the journal-wide switch.
+`user 2fa-reset` leaves the exemption as it was.
+
 ### Settings (Bearer, client devices only; agents get 403)
 
 | Route | Body | Answer |
 |---|---|---|
-| `GET /2fa` | — | `{enabled, enabled_at, recovery_codes_left, required, available}` (`available`: the token key is set) |
+| `GET /2fa` | — | `{enabled, enabled_at, recovery_codes_left, required, exempt, available}` (`required`: it is required for this user, so false when `exempt`; `available`: the token key is set) |
 | `POST /2fa/setup` | `{password, code?}` — `code` (TOTP or recovery) only when two-factor is already on (moving to a new app) | `{secret, otpauth_uri, issuer, account}`. Starts a pending setup (15 minutes); an active secret stays in force until the new one is confirmed |
 | `POST /2fa/enable` | `{code, sign_out_others?}` | `{recovery_codes, signed_out}` — the codes are shown this once. `sign_out_others:true` revokes the user's other **client** devices (never agents). 409 `no_pending_setup`, 403 `bad_code` |
 | `POST /2fa/disable` | `{password, code}` | `{ok:true}`; 409 `not_enabled` / `two_factor_required` |
@@ -3514,8 +3525,11 @@ the host is the request's `X-Forwarded-Host` or `Host`, without a port.
 - `matron-admin user 2fa-reset <name>` — the lockout escape hatch: turns
   two-factor off for a user, who then signs in with their password (and
   sets it up again at once when it is required).
-- `matron-admin two-factor status` — each user on or off, and whether it is
-  required.
+- `matron-admin two-factor status` — the journal-wide switch, a count of
+  users on and off, the exempt users (counted and named separately), and
+  each user on or off (`, exempt` after an exempt one).
+- `matron-admin user 2fa-exempt <name> on|off` — exempt one account from
+  the requirement (above).
 - `matron-admin two-factor require on|off`.
 
 ## User settings
@@ -4306,7 +4320,7 @@ page needs no shell.
 
 | Route | Body | Response |
 |---|---|---|
-| `GET /users` | — | `{users:[{id, name, email, is_admin, unlisted, created_at, two_factor, github:{login, state, host} \| null}]}` (no token, no hash; `two_factor` is a boolean) |
+| `GET /users` | — | `{users:[{id, name, email, is_admin, unlisted, two_factor_exempt, created_at, two_factor, github:{login, state, host} \| null}]}` (no token, no hash; `two_factor` and `two_factor_exempt` are booleans) |
 | `POST /users` | `{name, password, is_admin?}` — name `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, password ≥ 8 | `201 {user}`; `400 bad_request` \| `400 weak_password`; `409 conflict` if the name is taken |
 | `PATCH /users/:id` | `{is_admin: boolean}` | `{user}`; `409 conflict {reason:'last_admin'}` when it would demote the only admin |
 | `POST /users/:id/password` | `{password}` ≥ 8 | `{ok:true}`; device tokens stay valid (same as `matron-admin user passwd`) |
