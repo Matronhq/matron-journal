@@ -3525,7 +3525,7 @@ the host is the request's `X-Forwarded-Host` or `Host`, without a port.
 - `matron-admin user 2fa-reset <name>` — the lockout escape hatch: turns
   two-factor off for a user, who then signs in with their password (and
   sets it up again at once when it is required).
-- `matron-admin two-factor status` — whether it is required, a count of
+- `matron-admin two-factor status` — the journal-wide switch, a count of
   users on and off, the exempt users (counted and named separately), and
   each user on or off (`, exempt` after an exempt one).
 - `matron-admin user 2fa-exempt <name> on|off` — exempt one account from

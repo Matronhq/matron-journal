@@ -224,7 +224,7 @@ export async function runAdmin(db, argv, deps = {}) {
     })
     const keyNote = process.env.MATRON_TOKEN_KEY ? '' : ' (MATRON_TOKEN_KEY is not set in this shell; the server needs it for two-factor)'
     return [
-      `required for everyone: ${isTwoFactorRequired(db) ? 'yes' : 'no'}${keyNote}`,
+      `required for everyone: ${isTwoFactorRequired(db) ? 'yes' : 'no'}${exempt.length ? ` (journal-wide switch; exempt users are not held to it)` : ''}${keyNote}`,
       `users: ${users.length} (on: ${on}, off: ${users.length - on}), exempt: ${exempt.length}`,
       `exempt: ${exempt.length ? exempt.join(', ') : 'none'}`,
       ...lines,
@@ -234,9 +234,10 @@ export async function runAdmin(db, argv, deps = {}) {
     const value = argv[2]
     if (value !== 'on' && value !== 'off') throw new Error(USAGE)
     setTwoFactorRequired(db, value === 'on')
-    return value === 'on'
-      ? 'two-factor is now required: users without it set it up at their next password sign-in (existing sessions stay signed in)'
-      : 'two-factor is optional again'
+    if (value === 'off') return 'two-factor is optional again'
+    const exempt = db.prepare('SELECT COUNT(*) AS n FROM users WHERE two_factor_exempt=1').get().n
+    const exemptNote = exempt ? `; ${exempt} exempt ${exempt === 1 ? 'user is' : 'users are'} not (see \`two-factor status\`)` : ''
+    return `two-factor is now required: users without it set it up at their next password sign-in (existing sessions stay signed in)${exemptNote}`
   }
   if (a === 'agent' && b === 'add') {
     const [, , username, agentName] = argv
