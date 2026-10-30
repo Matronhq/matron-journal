@@ -1660,6 +1660,14 @@ export function openDb(path) {
   if (!userCols.some((c) => c.name === 'email')) {
     db.exec('ALTER TABLE users ADD COLUMN email TEXT')
   }
+  // Exempt from "two-factor required for everyone" (src/two-factor.js):
+  // such an account, without two-factor of its own, still signs in with
+  // its password while two-factor is required. It waives the requirement
+  // only, never a factor the user has set up. Set from the shell with
+  // `matron-admin user 2fa-exempt <name> on`. Default 0.
+  if (!userCols.some((c) => c.name === 'two_factor_exempt')) {
+    db.exec('ALTER TABLE users ADD COLUMN two_factor_exempt INTEGER NOT NULL DEFAULT 0')
+  }
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower ON users(lower(email)) WHERE email IS NOT NULL;
     CREATE TABLE IF NOT EXISTS password_resets(

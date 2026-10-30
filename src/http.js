@@ -179,7 +179,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // not 200, so an app that predates the code step shows a failed
         // sign-in rather than looking for a token that is not there.
         const enrolled = isTwoFactorEnabled(db, u.userId)
-        if (enrolled || twoFactorRequiredNow(db, twoFactorBox)) {
+        if (enrolled || twoFactorRequiredNow(db, twoFactorBox, u.userId)) {
           const purpose = enrolled ? 'verify' : 'enrol'
           const t = signInTickets.issue({ userId: u.userId, username, deviceName, purpose })
           if (!t) return json(res, 429, { error: 'rate_limited' })
@@ -359,7 +359,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         const user = db.prepare('SELECT id, name, is_admin FROM users WHERE id=?').get(who.userId)
         return json(res, 200, {
           user: { id: user.id, name: user.name, is_admin: !!user.is_admin },
-          two_factor: { enabled: isTwoFactorEnabled(db, who.userId), required: twoFactorRequiredNow(db, twoFactorBox) },
+          two_factor: { enabled: isTwoFactorEnabled(db, who.userId), required: twoFactorRequiredNow(db, twoFactorBox, who.userId) },
           github: githubAccountView(db, who.userId),
           github_linking: { enabled: !!(github && github.enabled), web_flow: !!(github && github.webFlow), device_flow: !!(github && github.deviceFlow) },
         })

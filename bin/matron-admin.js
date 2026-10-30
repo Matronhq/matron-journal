@@ -13,7 +13,9 @@ import { listAwaiting, answerParkedInvite } from '../src/participants.js'
 import { closeChatConsentItem } from '../src/consent-items.js'
 import { normaliseEmail, setUserEmail } from '../src/password-reset.js'
 import { setTransferConsentEnabled } from '../src/consent.js'
-import { disableTwoFactor, twoFactorState, isTwoFactorRequired, setTwoFactorRequired } from '../src/two-factor.js'
+import {
+  disableTwoFactor, twoFactorState, isTwoFactorRequired, setTwoFactorRequired, isTwoFactorExempt, setTwoFactorExempt,
+} from '../src/two-factor.js'
 
 const USAGE = `usage:
   matron-admin user add <name> (--password <pw> | --password-stdin | env MATRON_PASSWORD)
@@ -22,6 +24,7 @@ const USAGE = `usage:
   matron-admin user unlisted <name> on|off
   matron-admin user email <name> <address>|--clear
   matron-admin user 2fa-reset <name>
+  matron-admin user 2fa-exempt <name> on|off
   matron-admin two-factor status
   matron-admin two-factor require on|off
   matron-admin agent add <username> <agent-name>
@@ -181,18 +184,51 @@ export async function runAdmin(db, argv, deps = {}) {
     const name = argv[2]
     if (!name) throw new Error(USAGE)
     const user = requireUser(db, name)
+    // The exemption is the operator's choice about the requirement, not
+    // part of the factor, so a reset leaves it as it was.
+    const exemptNote = isTwoFactorExempt(db, user.id) ? ' (still exempt from the requirement)' : ''
     return disableTwoFactor(db, user.id)
-      ? `two-factor turned off for ${name}; they sign in with their password and can set it up again`
-      : `${name} did not have two-factor on`
+      ? `two-factor turned off for ${name}; they sign in with their password and can set it up again${exemptNote}`
+      : `${name} did not have two-factor on${exemptNote}`
+  }
+  // An account (a review or demo login, say) that keeps signing in with its
+  // password while two-factor is required for everyone else. It waives the
+  // requirement only: a user who has set two-factor up is still asked for
+  // their code. Shell only, like the other operator switches.
+  if (a === 'user' && b === '2fa-exempt') {
+    const name = argv[2]
+    const value = argv[3]
+    if (!name || (value !== 'on' && value !== 'off')) throw new Error(USAGE)
+    const user = requireUser(db, name)
+    const changed = setTwoFactorExempt(db, user.id, value === 'on')
+    if (value === 'off') {
+      return changed
+        ? `${name} is no longer exempt: when two-factor is required they set it up at their next password sign-in`
+        : `${name} was not exempt`
+    }
+    if (!changed) return `${name} is already exempt from the two-factor requirement`
+    return twoFactorState(db, user.id).enabled
+      ? `${name} is exempt from the two-factor requirement, but has two-factor on, so they are still asked for their code (turn it off with \`user 2fa-reset ${name}\`)`
+      : `${name} is exempt from the two-factor requirement: they sign in with their password alone, even while it is required`
   }
   if (a === 'two-factor' && b === 'status') {
-    const users = db.prepare('SELECT id, name FROM users ORDER BY name').all()
+    const users = db.prepare('SELECT id, name, two_factor_exempt FROM users ORDER BY name').all()
+    let on = 0
+    const exempt = []
     const lines = users.map((u) => {
       const s = twoFactorState(db, u.id)
-      return `${u.name}\t${s.enabled ? `on (${s.recoveryCodesLeft} recovery codes left)` : 'off'}`
+      if (s.enabled) on += 1
+      if (u.two_factor_exempt) exempt.push(u.name)
+      const state = s.enabled ? `on (${s.recoveryCodesLeft} recovery codes left)` : 'off'
+      return `${u.name}\t${state}${u.two_factor_exempt ? ', exempt' : ''}`
     })
     const keyNote = process.env.MATRON_TOKEN_KEY ? '' : ' (MATRON_TOKEN_KEY is not set in this shell; the server needs it for two-factor)'
-    return [`required for everyone: ${isTwoFactorRequired(db) ? 'yes' : 'no'}${keyNote}`, ...lines].join('\n')
+    return [
+      `required for everyone: ${isTwoFactorRequired(db) ? 'yes' : 'no'}${keyNote}`,
+      `users: ${users.length} (on: ${on}, off: ${users.length - on}), exempt: ${exempt.length}`,
+      `exempt: ${exempt.length ? exempt.join(', ') : 'none'}`,
+      ...lines,
+    ].join('\n')
   }
   if (a === 'two-factor' && b === 'require') {
     const value = argv[2]
