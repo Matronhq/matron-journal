@@ -61,8 +61,8 @@ node itself; on Linux that is what always happens.
     MATRON_DB=./matron.db npx matron-admin user 2fa-exempt demo-review on|off
 
 Passwords come from stdin (`--password-stdin`) or the `MATRON_PASSWORD` env
-var; the legacy `--password <pw>` flag still works but puts the plaintext on
-argv, where any local user can read it via `ps`.
+var, never from the command line, where any local user could read them via
+`ps`.
 
 Clients log in with `POST /login` and get their own device token; agents are
 provisioned with `matron-admin agent add`, which prints a token once.
