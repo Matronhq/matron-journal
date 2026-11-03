@@ -31,8 +31,6 @@ import { getMission } from './missions.js'
 import { isPrivateDevice } from './db.js'
 import { recordJoined } from './participants.js'
 
-export const SHARE_STATES = ['awaiting_user', 'active', 'declined', 'revoked', 'expired']
-export const ROOM_STATES = ['awaiting_owner', 'awaiting_guest', 'starting', 'invited', 'joined', 'declined', 'refused', 'withdrawn', 'left', 'expired']
 export const LIVE_ROOM_STATES = ['awaiting_owner', 'awaiting_guest', 'starting', 'invited', 'joined']
 const LIVE_SQL = `('${LIVE_ROOM_STATES.join("','")}')`
 export const PERSON_SENDER_PREFIX = 'person:'
