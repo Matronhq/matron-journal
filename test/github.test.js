@@ -95,14 +95,16 @@ test('fetchIdentity: 401/403 is unauthorized, a network failure is unreachable, 
 
 test('fetchIdentity: /user and the first memberships page overlap; /user failing is still the error reported', async () => {
   let finishUser
+  let finishMemberships
   const seen = []
   const g = makeGithub({ clientId: 'abc', fetchImpl: fakeFetch({
-    'GET https://api.github.com/user/memberships/orgs': async () => { seen.push('memberships'); return { json: [] } },
+    'GET https://api.github.com/user/memberships/orgs': () => { seen.push('memberships'); return new Promise((resolve) => { finishMemberships = resolve }) },
     'GET https://api.github.com/user': () => { seen.push('user'); return new Promise((resolve) => { finishUser = resolve }) },
   }).fetchImpl })
   const run = g.fetchIdentity('t')
   await new Promise((r) => setImmediate(r))
   assert.deepEqual(seen.sort(), ['memberships', 'user'])
+  finishMemberships({ json: [] })
   finishUser({ json: { id: 1, login: 'x' } })
   assert.deepEqual(await run, { github_id: 1, login: 'x', scopes: [] })
 
