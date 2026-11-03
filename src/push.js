@@ -1,5 +1,5 @@
 import { snippetOf } from './journal.js'
-import { clientDevicesForPush, parsePushPrefs, pruneApnsToken, unreadBadge } from './db.js'
+import { clientDevicesForPush, pruneApnsToken, unreadBadge } from './db.js'
 import { getCoordinatorConvoId } from './coordinator.js'
 import {
   effectiveEvents, eventKey, allowedForUser, allowedForDevice, getConvoNotify,
@@ -58,8 +58,7 @@ export function classify(type, payload, sender, prevState) {
     const state = payload && payload.state
     const turnFinished = prevState === 'running' && (state === 'waiting' || state === 'done')
     // `stopped` (running -> done: crashed or stopped mid-work) is its own
-    // switch in the notification settings; the kind stays 'done' for the
-    // legacy per-device prefs.
+    // switch in the notification settings; its APNs category stays 'done'.
     return turnFinished ? { priority: 10, coalesce: false, kind: 'done', stopped: state === 'done' } : null
   }
   if (type === 'convo_meta') return null
@@ -97,7 +96,7 @@ export function classify(type, payload, sender, prevState) {
 // cheap no-op).
 // `classify` is injectable (defaults to the real classifier above) purely
 // as a test seam — production callers never override it — so a test can
-// exercise a hypothetical future `cls.kind` the prefs object doesn't know
+// exercise a hypothetical future `cls.kind` the settings don't know
 // about without reaching into module internals.
 export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COALESCE_MS, consentHoldMs = CONSENT_HOLD_MS, resumeSlackMs = CONSENT_RESUME_SLACK_MS, classify: classifyEvent = classify } = {}) {
   const counters = { sent: 0, failed: 0, pruned: 0, byReason: {} }
@@ -281,12 +280,6 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
       if (!device.apns_env) continue
       // This device's own level ("On this device: all / needs me / off").
       if (!allowedForDevice(key, device.push_level)) continue
-      // Legacy per-device prefs (PUT /push/prefs), only where a device ever
-      // stored some: a NULL row's defaults (activity off) would otherwise
-      // overrule the user's synced switches. Skip the device only when its
-      // prefs explicitly disable this event's category; a `cls.kind` absent
-      // from the prefs object fails open rather than muting every device.
-      if (device.push_prefs != null && parsePushPrefs(device.push_prefs)[cls.kind] === false) continue
       if (hub.isViewing(userId, device.id, event.convo_id)) continue
       if (device.cursor >= event.seq) continue
       const buildOpts = () => ({

@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import { pipeline } from 'node:stream/promises'
 import { checkPassword, makeRateLimiter, makeKeyedQueue, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
-import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, setPushPrefs, getPushPrefs, isPrivateDevice, deviceStatuses } from './db.js'
+import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, isPrivateDevice, deviceStatuses } from './db.js'
 import { receiveBlob } from './media.js'
 import { readBlobTranscript, isTranscribableType, transcriptWaitS } from './blob-transcripts.js'
 import { imageSizeFromFile } from './image-size.js'
@@ -422,24 +422,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         const { apns_token, environment } = body
         if (apns_token === null) {
           setApnsRegistration(db, who.deviceId, { apnsToken: null, apnsEnv: null })
-          return json(res, 200, { ok: true, push_prefs: getPushPrefs(db, who.deviceId) })
+          return json(res, 200, { ok: true })
         }
         if (typeof apns_token !== 'string' || !apns_token) return json(res, 400, { error: 'bad_request' })
         if (environment !== 'sandbox' && environment !== 'prod') return json(res, 400, { error: 'bad_request' })
         setApnsRegistration(db, who.deviceId, { apnsToken: apns_token, apnsEnv: environment })
-        return json(res, 200, { ok: true, push_prefs: getPushPrefs(db, who.deviceId) })
-      }
-      if (req.method === 'PUT' && url.pathname === '/push/prefs') {
-        // Prefs live on the device row next to the APNs token they gate —
-        // same client-only surface as /push/register.
-        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
-        const body = await readBody(req)
-        for (const [k, v] of Object.entries(body)) {
-          if (!['attention', 'done', 'activity'].includes(k) || typeof v !== 'boolean') {
-            return json(res, 400, { error: 'bad_request' })
-          }
-        }
-        return json(res, 200, { ok: true, push_prefs: setPushPrefs(db, who.deviceId, body) })
+        return json(res, 200, { ok: true })
       }
       if (req.method === 'POST' && url.pathname === '/password') {
         // Self-service change, client devices only — an agent (the bridge)
@@ -500,7 +488,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // /devices (management, client-gated) this is deliberately open to
         // agent tokens, and deliberately NARROWER: agent devices only
         // (an agent still has no business enumerating its user's client
-        // devices), no cursor/lag/push_prefs, and only top-level
+        // devices), no cursor/lag, and only top-level
         // conversations (children are silenced sub-chats, never chat
         // targets). Same owner_user_id scoping as every other read.
         const live = new Set(hub.connsOf(who.userId).filter((c) => c.ws.readyState === 1).map((c) => c.deviceId))
