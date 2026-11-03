@@ -115,6 +115,14 @@ test('fetchIdentity: /user and the first memberships page overlap; /user failing
   await assert.rejects(both.fetchIdentity('t'), (e) => e instanceof GithubError && e.code === 'unauthorized')
 })
 
+test('fetchIdentity: a first memberships page failure is reported even when /user succeeds', async () => {
+  const g = makeGithub({ clientId: 'abc', fetchImpl: fakeFetch({
+    'GET https://api.github.com/user/memberships/orgs': async () => { throw new Error('ECONNRESET') },
+    'GET https://api.github.com/user': async () => ({ json: { id: 1, login: 'x' } }),
+  }).fetchImpl })
+  await assert.rejects(g.fetchIdentity('t'), (e) => e instanceof GithubError && e.code === 'unreachable')
+})
+
 test('GHES host: login and api URLs follow the configured host', async () => {
   const { fetchImpl, calls } = fakeFetch({
     'POST https://ghe.example.com/login/device/code': async () => ({ json: { device_code: 'd', user_code: 'u', verification_uri: 'v', interval: 5, expires_in: 9 } }),
