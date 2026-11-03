@@ -428,17 +428,9 @@ the machine-checkable version of this page.
   `{error:'forbidden'}`): `{apns_token, environment}` with `environment` in
   `{'sandbox','prod'}` registers a device for push; `{apns_token: null}`
   unregisters. 400 `{error:'bad_request'}` on a bad `environment` or a
-  missing/non-string `apns_token` (unless it's `null`). Response echoes the
-  device's current `push_prefs` (see `PUT /push/prefs` below); `GET
-  /devices` echoes the same per-device `push_prefs` in its roster.
-- `PUT /push/prefs` (Bearer, client devices only — agents get 403
-  `{error:'forbidden'}`): body is any subset of `{attention, done, activity}`
-  booleans — a partial merge, not a replace: only the given keys change, the
-  rest keep their stored value. 400 `{error:'bad_request'}` on an unknown
-  field or a non-boolean value for a known field. Response `{ok:true,
-  push_prefs}` echoes the full merged three-key shape. Defaults (NULL /
-  never set) are `{attention: true, done: true, activity: false}` — "buzz me
-  when the agent needs me or finishes; routine activity is opt-in."
+  missing/non-string `apns_token` (unless it's `null`). Response `{ok:true}`.
+  Which events push is decided by the user's synced notification settings
+  and the device's own level (`GET`/`PUT /notify`).
 - `POST /password` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`): `{old_password, new_password}`. `old_password` is
   always verified against the real argon2 hash (no shortcuts); a wrong one
@@ -525,7 +517,7 @@ the machine-checkable version of this page.
   as `not_allowed` against the device and logged, and never goes upstream.
 - `GET /devices` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`) -> `{devices: [{device_id, kind, name, created_at,
-  cursor, lag, last_seen_at, is_self, connected, push_prefs, status?, defaults?}]}`. The
+  cursor, lag, last_seen_at, is_self, connected, status?, defaults?}]}`. The
   caller's own user's devices only; `is_self` marks the requesting device.
   `status` (agent devices, omitted until the box has reported) is the box's
   last capacity report — `{reported_at, activity?, limits?, disk?,
@@ -535,8 +527,7 @@ the machine-checkable version of this page.
   `defaults` (agent devices only, always present for them) is the box's
   stored defaults for new sessions, `{agent, model, effort}`, each null
   when unset — see *Box defaults*.
-  `push_prefs` is the per-device notification prefs (see `PUT /push/prefs`
-  above), always the full three-key shape (defaults filled in). Overlaps `/metrics`'
+  Overlaps `/metrics`'
   `user.devices` deliberately — metrics is observability (agents may read
   it, no `name`), this is the management roster. `connected` is whether the
   device has a live WebSocket right now — the "can I start a session on
@@ -553,8 +544,8 @@ the machine-checkable version of this page.
   (management, client devices only) this is deliberately open to agent
   tokens too, and deliberately narrower. `agents`:
   `[{device_id, name, created_at, last_seen_at, connected, defaults}]` — this user's
-  `kind='agent'` devices only (never client devices; no `cursor`/`lag`/
-  `push_prefs`); `connected` is the same live-WebSocket check `/devices`
+  `kind='agent'` devices only (never client devices; no `cursor`/`lag`);
+  `connected` is the same live-WebSocket check `/devices`
   uses; `defaults` is the box's stored `{agent, model, effort}` as on
   `GET /devices` (see *Box defaults*). `conversations`:
   `[{id, title, session_state, last_seq, summary, agent_device_id,
@@ -5592,8 +5583,8 @@ considers each of that user's *client* devices with a registered token
 
 - skipped when that device is connected and actively `viewing` the event's
   conversation (any conversation in a connection's viewed set counts), or when its acked cursor already covers the event's `seq`,
-  or when its `push_prefs` (see `PUT /push/prefs`) explicitly disable the
-  event's category — `wake` background pushes are never prefs-filtered.
+  or when the user's notification settings or the device's level leave the
+  event out — `wake` background pushes are never filtered.
 - `prompt` / `permission_request` push immediately at priority 10
   (category `attention`).
 - `session_status` pushes on the turn-finished TRANSITION, not the new
