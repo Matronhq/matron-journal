@@ -93,73 +93,38 @@ export function resolveZeroableEnv(name, raw, defaultValue) {
   return resolveNumericEnv(name, raw, defaultValue)
 }
 
-// `override` is startServer's `retentionDays` opt — when given, it takes
-// precedence over the env var (this is how tests disable/shrink the window
-// without touching process.env), but BOTH sources run through the same
-// validation: unset means ENABLED at the 30-day default; `0` disables; and
+// The retention windows (`retentionDays`, `toolLogTtlHours`,
+// `voiceNoteTtlDays`). `override` is startServer's opt — when given, it
+// takes precedence over the env var (this is how tests disable/shrink a
+// window without touching process.env), but BOTH sources run through the
+// same validation: unset means ENABLED at the default; `0` disables; and
 // anything that isn't a non-negative integer disables with one log line —
 // fails closed. (A raw pass-through of a negative override would compute a
 // FUTURE cutoff and offload every payload including brand-new ones.)
-// Returns the window in days, or null when retention is disabled.
-function resolveRetentionDays(override) {
+// Returns the window, or null when the pass is disabled.
+function resolveWindow(override, { env, opt, fallback, what }) {
   const fromEnv = override === undefined
-  const raw = fromEnv ? process.env.MATRON_RETENTION_DAYS : override
-  if (raw === undefined) return DEFAULT_RETENTION_DAYS
-  const name = fromEnv ? 'MATRON_RETENTION_DAYS' : 'retentionDays'
+  const raw = fromEnv ? process.env[env] : override
+  if (raw === undefined) return fallback
+  const name = fromEnv ? env : opt
   const n = Number(raw)
   if (!Number.isInteger(n) || n < 0) {
-    console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid — retention disabled`)
+    console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid — ${what} disabled`)
     return null
   }
   if (n === 0) {
-    console.warn(`retention: ${name}=0 — retention disabled`)
+    console.warn(`retention: ${name}=0 — ${what} disabled`)
     return null
   }
   return n
 }
 
-// `override` is startServer's `toolLogTtlHours` opt — mirrors
-// resolveRetentionDays exactly (same precedence, same fail-closed
-// validation): unset means ENABLED at the 24h default; `0` disables; and
-// anything that isn't a non-negative integer disables with one log line.
-// Returns the TTL window in hours, or null when the TTL pass is disabled.
-function resolveToolLogTtlHours(override) {
-  const fromEnv = override === undefined
-  const raw = fromEnv ? process.env.MATRON_TOOL_LOG_TTL_HOURS : override
-  if (raw === undefined) return DEFAULT_TOOL_LOG_TTL_HOURS
-  const name = fromEnv ? 'MATRON_TOOL_LOG_TTL_HOURS' : 'toolLogTtlHours'
-  const n = Number(raw)
-  if (!Number.isInteger(n) || n < 0) {
-    console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid — retention disabled`)
-    return null
-  }
-  if (n === 0) {
-    console.warn(`retention: ${name}=0 — retention disabled`)
-    return null
-  }
-  return n
-}
-
-// `override` is startServer's `voiceNoteTtlDays` opt — same precedence and
-// fail-closed validation as the two above: unset means ENABLED at 7 days;
-// `0` disables; anything else that isn't a non-negative integer disables
-// with one log line. Returns the window in days, or null when disabled.
-function resolveVoiceNoteTtlDays(override) {
-  const fromEnv = override === undefined
-  const raw = fromEnv ? process.env.MATRON_VOICE_NOTE_TTL_DAYS : override
-  if (raw === undefined) return DEFAULT_VOICE_NOTE_TTL_DAYS
-  const name = fromEnv ? 'MATRON_VOICE_NOTE_TTL_DAYS' : 'voiceNoteTtlDays'
-  const n = Number(raw)
-  if (!Number.isInteger(n) || n < 0) {
-    console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid — voice-note expiry disabled`)
-    return null
-  }
-  if (n === 0) {
-    console.warn(`retention: ${name}=0 — voice-note expiry disabled`)
-    return null
-  }
-  return n
-}
+const resolveRetentionDays = (override) =>
+  resolveWindow(override, { env: 'MATRON_RETENTION_DAYS', opt: 'retentionDays', fallback: DEFAULT_RETENTION_DAYS, what: 'retention' })
+const resolveToolLogTtlHours = (override) =>
+  resolveWindow(override, { env: 'MATRON_TOOL_LOG_TTL_HOURS', opt: 'toolLogTtlHours', fallback: DEFAULT_TOOL_LOG_TTL_HOURS, what: 'retention' })
+const resolveVoiceNoteTtlDays = (override) =>
+  resolveWindow(override, { env: 'MATRON_VOICE_NOTE_TTL_DAYS', opt: 'voiceNoteTtlDays', fallback: DEFAULT_VOICE_NOTE_TTL_DAYS, what: 'voice-note expiry' })
 
 // `override` is startServer's `deviceRetention` opt and beats
 // MATRON_DEVICE_RETENTION, as with the other retention resolvers. The value
