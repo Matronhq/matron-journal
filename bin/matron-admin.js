@@ -18,8 +18,8 @@ import {
 } from '../src/two-factor.js'
 
 const USAGE = `usage:
-  matron-admin user add <name> (--password <pw> | --password-stdin | env MATRON_PASSWORD)
-  matron-admin user passwd <name> (--password <pw> | --password-stdin | env MATRON_PASSWORD)
+  matron-admin user add <name> (--password-stdin | env MATRON_PASSWORD)
+  matron-admin user passwd <name> (--password-stdin | env MATRON_PASSWORD)
   matron-admin user admin <name> on|off
   matron-admin user unlisted <name> on|off
   matron-admin user email <name> <address>|--clear
@@ -52,22 +52,22 @@ async function readAllStdin() {
   return Buffer.concat(chunks).toString('utf8')
 }
 
-// Resolve the password for `user add`/`user passwd` from an OFF-ARGV source
-// when asked, so the plaintext never lands in this process's argv (readable
-// by any local user via `ps`/`/proc/<pid>/cmdline`). Precedence:
+// Resolve the password for `user add`/`user passwd` from an OFF-ARGV source,
+// so the plaintext never lands in this process's argv (readable by any
+// local user via `ps`/`/proc/<pid>/cmdline`). Precedence:
 //   1. --password-stdin : read it from stdin (strip one trailing newline so
 //      `echo "$pw" | ...` and `printf %s "$pw" | ...` both work)
-//   2. --password <pw>  : legacy, on argv — kept for back-compat
-//   3. MATRON_PASSWORD  : env var (in the process environment, not argv)
-// Returns null when none is supplied; callers turn that into USAGE.
+//   2. MATRON_PASSWORD  : env var (in the process environment, not argv)
+// A password on argv (`--password <pw>`) is refused outright, not ignored,
+// so an old script fails loudly instead of creating a user with another
+// password. Returns null when none is supplied; callers turn that into USAGE.
 async function resolvePassword(argv, deps) {
   const env = deps.env ?? process.env
+  if (argv.includes('--password')) throw new Error('--password <pw> puts the password on argv and is no longer accepted: use --password-stdin or MATRON_PASSWORD')
   if (argv.includes('--password-stdin')) {
     const read = deps.readStdin ?? readAllStdin
     return (await read()).replace(/\r?\n$/, '')
   }
-  const flagged = flag(argv, '--password')
-  if (flagged != null) return flagged
   const envPw = env.MATRON_PASSWORD
   return envPw != null && envPw !== '' ? envPw : null
 }
