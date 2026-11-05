@@ -864,6 +864,14 @@ test('background wake: at most one per device per interval', async (t) => {
   assert.equal(wakes().length, 2)
 })
 
+test('background wake: a new token is not held to the old one\'s interval', async (t) => {
+  const { db, alice, phone, pipeline, wakes } = await setupWakes(t)
+  pipeline.onAppend(alice.id, textEvent(1), null)
+  setApnsRegistration(db, phone, { apnsToken: 'reinstalled-token', apnsEnv: 'prod' })
+  pipeline.onAppend(alice.id, textEvent(2), null)
+  assert.deepEqual(wakes().map((c) => c.deviceToken), ['phone-token', 'reinstalled-token'])
+})
+
 test('background wake: a device already connected is not woken', async (t) => {
   const { alice, hub, phone, pipeline, wakes } = await setupWakes(t)
   hub.register(fakeConn({ userId: alice.id, deviceId: phone }))

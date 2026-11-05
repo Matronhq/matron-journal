@@ -114,9 +114,10 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
   // resumeHeldConsent for the restart case).
   const held = new Set()
 
-  // device id -> when it was last sent a background wake. Memory only, like
-  // the coalescing state: a restart at worst sends one wake early. One small
-  // entry per push device, so it needs no eviction.
+  // APNs token -> when it was last sent a background wake. Keyed by token so a
+  // reused device id or a reinstall starts fresh. Memory only, like the
+  // coalescing state: a restart at worst sends one wake early. Entries past
+  // the interval decide nothing, so maybeWake drops them.
   const lastWakeAt = new Map()
 
   const bumpReason = (key) => { counters.byReason[key] = (counters.byReason[key] || 0) + 1 }
@@ -218,12 +219,14 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
   // time the app opens, which is the most Apple's budget allows anyway.
   function maybeWake(userId, event, devices, originDeviceId) {
     if (!backgroundWakeMs) return
+    for (const [token, at] of lastWakeAt) {
+      if (now() - at >= backgroundWakeMs) lastWakeAt.delete(token)
+    }
     let connected = null
     for (const device of devices) {
       if (device.id === originDeviceId || !device.apns_env) continue
       if (device.cursor >= event.seq) continue
-      const last = lastWakeAt.get(device.id)
-      if (last !== undefined && now() - last < backgroundWakeMs) continue
+      if (lastWakeAt.has(device.apns_token)) continue
       connected ??= new Set(hub.connsOf(userId).map((c) => c.deviceId))
       if (connected.has(device.id)) continue
       sendWake(device, userId)
@@ -231,7 +234,7 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
   }
 
   function sendWake(device, userId) {
-    lastWakeAt.set(device.id, now())
+    if (backgroundWakeMs) lastWakeAt.set(device.apns_token, now())
     doSend(device, userId, {
       payload: { aps: { 'content-available': 1 } },
       priority: 5,
