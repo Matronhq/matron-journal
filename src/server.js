@@ -14,7 +14,7 @@ import { attachWs } from './ws.js'
 import { makeToolStreamStore } from './tool-stream.js'
 import { makeApnsClient } from './apns.js'
 import { makeGatewayClient } from './gateway.js'
-import { makePushPipeline } from './push.js'
+import { makePushPipeline, BACKGROUND_WAKE_MS } from './push.js'
 import { resolveMediaDir } from './media.js'
 import { runOffload, runExpireLogs, runReapMedia, runExpireVoiceNotes, runExpireDeviceContent, runExpireTransfers } from './retention.js'
 import { backfillSearchIndex, backfillIsDiff } from './search.js'
@@ -560,7 +560,7 @@ export function startServer({
     ...(toolStreamOpts || {}),
   })
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
-  const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient })
+  const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient, backgroundWakeMs: BACKGROUND_WAKE_MS })
   // A consent-card push whose 30 s hold a restart swallowed still goes out.
   try { pushPipeline.resumeHeldConsent() } catch (err) { console.error('push: consent resume failed', err) }
   // Voice notes are transcribed here when the journal has a transcriber: a

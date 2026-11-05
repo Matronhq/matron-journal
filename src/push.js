@@ -16,6 +16,10 @@ export const CONSENT_HOLD_MS = 30000
 // before the restart or were never held; resuming them would push twice.
 // The slack covers the restart's own downtime.
 export const CONSENT_RESUME_SLACK_MS = 60 * 1000
+// Min gap between silent background wakes to one device. Apple advises at
+// most two or three background pushes an hour and throttles beyond that, so
+// a wake sent more often than this is wasted budget, not fresher data.
+export const BACKGROUND_WAKE_MS = 20 * 60 * 1000
 
 // Returns null for event types that must not push at all. Product call
 // (dispatcher decision): convo_meta (a title rename) is always journal-sync
@@ -98,7 +102,7 @@ export function classify(type, payload, sender, prevState) {
 // as a test seam — production callers never override it — so a test can
 // exercise a hypothetical future `cls.kind` the settings don't know
 // about without reaching into module internals.
-export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COALESCE_MS, consentHoldMs = CONSENT_HOLD_MS, resumeSlackMs = CONSENT_RESUME_SLACK_MS, classify: classifyEvent = classify } = {}) {
+export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COALESCE_MS, consentHoldMs = CONSENT_HOLD_MS, resumeSlackMs = CONSENT_RESUME_SLACK_MS, backgroundWakeMs = 0, now = Date.now, classify: classifyEvent = classify } = {}) {
   const counters = { sent: 0, failed: 0, pruned: 0, byReason: {} }
 
   // Coalescing state lives in memory only, keyed by `${deviceId}:${convoId}`.
@@ -109,6 +113,11 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
   // Consent-card pushes waiting out their hold (memory only; see
   // resumeHeldConsent for the restart case).
   const held = new Set()
+
+  // device id -> when it was last sent a background wake. Memory only, like
+  // the coalescing state: a restart at worst sends one wake early. One small
+  // entry per push device, so it needs no eviction.
+  const lastWakeAt = new Map()
 
   const bumpReason = (key) => { counters.byReason[key] = (counters.byReason[key] || 0) + 1 }
 
@@ -199,6 +208,38 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     state.timer.unref()
   }
 
+  // A phone only hears about new events while its app holds a socket, and iOS
+  // suspends the app soon after it leaves the screen. This silent push lets
+  // the app catch up in the background, so opening it does not start with a
+  // long replay. It is decided apart from the alert below, and regardless of
+  // the notification settings: it shows nothing, and those settings choose
+  // what buzzes, not how fresh the app is. Leading edge only: when a burst
+  // ends inside the interval the rest waits for the next event or the next
+  // time the app opens, which is the most Apple's budget allows anyway.
+  function maybeWake(userId, event, devices, originDeviceId) {
+    if (!backgroundWakeMs) return
+    let connected = null
+    for (const device of devices) {
+      if (device.id === originDeviceId || !device.apns_env) continue
+      if (device.cursor >= event.seq) continue
+      const last = lastWakeAt.get(device.id)
+      if (last !== undefined && now() - last < backgroundWakeMs) continue
+      connected ??= new Set(hub.connsOf(userId).map((c) => c.deviceId))
+      if (connected.has(device.id)) continue
+      sendWake(device, userId)
+    }
+  }
+
+  function sendWake(device, userId) {
+    lastWakeAt.set(device.id, now())
+    doSend(device, userId, {
+      payload: { aps: { 'content-available': 1 } },
+      priority: 5,
+      pushType: 'background',
+      category: 'wake',
+    })
+  }
+
   // `pushHint` is optional, in-memory-only extra context a caller (today:
   // ws.js's convo_upsert handler, for session_status's prevSessionState)
   // can pass through to classify(). Every other call site omits it.
@@ -224,15 +265,14 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
       for (const device of devices) {
         if (device.id === originDeviceId) continue // never push a device its own read_marker
         if (!device.apns_env) continue
-        doSend(device, userId, {
-          payload: { aps: { 'content-available': 1 } },
-          priority: 5,
-          pushType: 'background',
-          category: 'wake',
-        })
+        sendWake(device, userId)
       }
       return
     }
+
+    // Before the settings below can return. `noHold` is a consent card's
+    // second pass through here: its first pass has already been considered.
+    if (!noHold) maybeWake(userId, event, devices, originDeviceId)
 
     const cls = classifyEvent(event.type, event.payload, event.sender, pushHint && pushHint.prevSessionState)
     if (!cls) return // journal-sync-only type (convo_meta, a session_status transition that isn't turn-finished), or a user's own event (T2)
