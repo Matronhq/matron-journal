@@ -569,13 +569,14 @@ test('end-to-end wiring: real WS ops reach the push pipeline through both ws.js 
 
   const phone = await makeWsClient(s.base, { token: login.json.token, cursor: 0 })
   await phone.waitFor((f) => f.op === 'hello_ok')
+  const callsBeforeRead = stub.calls.length
   phone.send({ op: 'read_marker', convo_id: 'wire-1', up_to_seq: null })
   await phone.waitFor((f) => f.kind === 'journal' && f.type === 'read_marker')
   await new Promise((res) => setTimeout(res, 50))
 
   const laptopBackground = stub.calls.filter((c) => c.deviceToken === 'laptop-token' && c.pushType === 'background')
   assert.equal(laptopBackground.length, 1, 'read_marker fanOut call site does not appear to be wired to the push pipeline')
-  const phoneBackground = stub.calls.filter((c) => c.deviceToken === 'phone-token' && c.pushType === 'background')
+  const phoneBackground = stub.calls.slice(callsBeforeRead).filter((c) => c.deviceToken === 'phone-token' && c.pushType === 'background')
   assert.equal(phoneBackground.length, 0, 'the originating device must never get a push about its own read_marker')
 
   agent.close(); phone.close()
@@ -817,4 +818,95 @@ test('item markers: agent-created question pushes as attention; user-authored, n
   pipeline.onAppend(alice.id, { seq: 13, convo_id: convoId, ts: 4, sender: 'user:alice', type: 'item', payload: { ...base, action: 'created', awaiting: 'user' } }, 0)
   assert.equal(sent.length, 2, 'a user-authored marker must never push, even when action/awaiting alone would qualify')
   void hub; void db; void clientDevice
+})
+
+// ---- Background wakes ----------------------------------------------------
+
+async function setupWakes(t, { wakeIntervalMs = 1000, now } = {}) {
+  const db = openDb(':memory:')
+  const hub = makeHub()
+  const alice = await createUser(db, 'alice', 'pw')
+  const stub = makeStubApnsClient()
+  const pipeline = makePushPipeline({ db, hub, apnsClient: stub, backgroundWakeMs: wakeIntervalMs, now })
+  t.after(() => pipeline.close())
+  upsertConversation(db, { id: 'c1', ownerUserId: alice.id, title: 'convo one' })
+  // Nothing alerts: the wake must not depend on the notification settings.
+  setNotifyPrefs(db, alice.id, { mode: 'custom', events: Object.fromEntries(NOTIFY_EVENTS.map((k) => [k, false])) })
+  const phone = registerDevice(db, alice.id, 'phone')
+  const wakes = () => stub.calls.filter((c) => c.pushType === 'background')
+  return { db, hub, alice, stub, pipeline, phone, wakes }
+}
+
+const textEvent = (seq, sender = 'agent:box-a') => ({ seq, convo_id: 'c1', ts: seq, sender, type: 'text', payload: { body: `m${seq}` } })
+
+test('background wake: a new event wakes a phone with no live socket, silently', async (t) => {
+  const { alice, pipeline, stub, wakes } = await setupWakes(t)
+  pipeline.onAppend(alice.id, textEvent(1), null)
+  assert.equal(wakes().length, 1)
+  const wake = wakes()[0]
+  assert.equal(wake.priority, 5)
+  assert.equal(wake.payload.aps['content-available'], 1)
+  assert.equal(wake.payload.aps.alert, undefined)
+  assert.equal(wake.collapseId, undefined)
+  assert.equal(stub.calls.length, 1, 'the settings turned every alert off')
+})
+
+test('background wake: at most one per device per interval', async (t) => {
+  let clock = 1000000
+  const { alice, pipeline, wakes } = await setupWakes(t, { wakeIntervalMs: 1000, now: () => clock })
+  pipeline.onAppend(alice.id, textEvent(1), null)
+  pipeline.onAppend(alice.id, textEvent(2), null)
+  clock += 999
+  pipeline.onAppend(alice.id, textEvent(3), null)
+  assert.equal(wakes().length, 1)
+  clock += 1
+  pipeline.onAppend(alice.id, textEvent(4), null)
+  assert.equal(wakes().length, 2)
+})
+
+test('background wake: a new token is not held to the old one\'s interval', async (t) => {
+  const { db, alice, phone, pipeline, wakes } = await setupWakes(t)
+  pipeline.onAppend(alice.id, textEvent(1), null)
+  setApnsRegistration(db, phone, { apnsToken: 'reinstalled-token', apnsEnv: 'prod' })
+  pipeline.onAppend(alice.id, textEvent(2), null)
+  assert.deepEqual(wakes().map((c) => c.deviceToken), ['phone-token', 'reinstalled-token'])
+})
+
+test('background wake: a device already connected is not woken', async (t) => {
+  const { alice, hub, phone, pipeline, wakes } = await setupWakes(t)
+  hub.register(fakeConn({ userId: alice.id, deviceId: phone }))
+  pipeline.onAppend(alice.id, textEvent(1), null)
+  assert.equal(wakes().length, 0)
+})
+
+test('background wake: never for a device the event came from, or one already past it', async (t) => {
+  const { db, alice, phone, pipeline, wakes } = await setupWakes(t)
+  pipeline.onAppend(alice.id, textEvent(1, 'user:alice'), phone)
+  assert.equal(wakes().length, 0)
+  db.prepare('UPDATE devices SET cursor=? WHERE id=?').run(5, phone)
+  pipeline.onAppend(alice.id, textEvent(5), null)
+  assert.equal(wakes().length, 0)
+})
+
+test('background wake: a subagent child conversation wakes nobody', async (t) => {
+  const { db, alice, pipeline, wakes } = await setupWakes(t)
+  upsertConversation(db, { id: 'c1-child', ownerUserId: alice.id, parentConvoId: 'c1' })
+  pipeline.onAppend(alice.id, { ...textEvent(1), convo_id: 'c1-child' }, null)
+  assert.equal(wakes().length, 0)
+})
+
+test('background wake: a read marker\'s own wake counts against the interval', async (t) => {
+  const { alice, pipeline, wakes } = await setupWakes(t)
+  pipeline.onAppend(alice.id, { seq: 1, convo_id: 'c1', ts: 1, sender: 'user:alice', type: 'read_marker', payload: {} }, null)
+  assert.equal(wakes().length, 1)
+  pipeline.onAppend(alice.id, textEvent(2), null)
+  assert.equal(wakes().length, 1)
+})
+
+test('background wake: off unless the pipeline is given an interval', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t)
+  setNotifyPrefs(db, alice.id, { mode: 'custom', events: Object.fromEntries(NOTIFY_EVENTS.map((k) => [k, false])) })
+  registerDevice(db, alice.id, 'phone')
+  pipeline.onAppend(alice.id, textEvent(1), null)
+  assert.equal(stub.calls.length, 0)
 })

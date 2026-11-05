@@ -5577,6 +5577,18 @@ report that one message as seen (read state, op `seen`). The push relay
 (`MATRON_PUSH_GATEWAY_URL`) forwards only content-free fields and omits
 `seq`. A client must treat a missing `seq` as "no tap receipt".
 
+**Background wakes.** A new event also sends a silent background push
+(`content-available`, priority 5, no alert) to each of the user's push devices
+that has no live socket and hasn't reached that event, at most once per device
+every 20 minutes. It lets the app catch up while it isn't on screen. Any event
+type can trigger it, and the notification settings don't apply, since it
+carries no content. So where this document says an event never pushes, that
+means no alert. Subagent child conversations send none.
+
+A `read_marker` also sends a background push, which keeps the badge right on the
+user's other devices. It goes to each of them whether connected or not, and
+isn't limited to one per interval, but it restarts that device's interval.
+
 After a journal event fans out to a user's connections, the push pipeline
 considers each of that user's *client* devices with a registered token
 (agent devices are never pushed to):
