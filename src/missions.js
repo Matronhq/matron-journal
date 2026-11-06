@@ -873,6 +873,19 @@ export function getGrantedMission(db, viewerUserId, missionId) {
     WHERE m.id = @id AND ${MISSION_GRANTED}`).get({ viewer: viewerUserId, id: missionId }))
 }
 
+// The same grantee view for a contact on another journal, where there is no
+// grantee user here to check the grant against (src/federation-replica.js
+// builds what crosses from it): the sieved mission row, every sieved
+// milestone, and the items left to items.js grantedItemsExport. The
+// caller has checked the grant.
+export function grantedMissionExport(db, missionId) {
+  const row = db.prepare(`SELECT m.*, ${grantedCountsSql()}, ${OWNER_JSON} FROM missions m ${OWNER_FROM}
+    WHERE m.id = @id AND ${ORIGIN_SIEVE}`).get({ viewer: null, id: missionId })
+  if (!row) return null
+  const mission = grantedMissionRow(row)
+  return { mission, milestones: grantedMissionDetail(db, mission).milestones }
+}
+
 // Milestones as text: no conversation, seq or device — the jump target
 // they anchor is in a transcript that did not cross. Items: the open list,
 // as the owner's detail shows it, without the origin conversation.

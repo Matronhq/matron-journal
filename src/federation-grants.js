@@ -11,6 +11,8 @@
 //   grant.offer   owner → grantee  {grant, level, mission: {num, title}, preview}
 //   grant.answer  grantee → owner  {grant, decision: approve|decline}
 //   grant.revoke  either way       {grant}            urgent: cancels the grant's queue
+//   mission.snapshot owner → grantee, on accept: the mission's contents
+//                 (src/federation-replica.js)
 //
 // Every op of one grant shares the subject `grant:<owner's gr_ id>`, so an
 // answer never overtakes its offer and a revoke cancels whatever waits.
@@ -21,6 +23,7 @@ import { answerRemoteGrant, leaveRemoteGrant, getGrantRaw, sharePreview } from '
 import { card, fileMirror, closeMirror, audit, changed, fileNotice, peopleConvo, onGrantOutcome, onGrantRevoked, PEER_ACTIONS, SHARE_CARD_KIND } from './sharing-events.js'
 import { consentLink } from './consent-items.js'
 import { sanitizePeerText, plainText as plain } from './peer-text.js'
+import { SNAPSHOT_OP, sendSnapshot, applySnapshotPage } from './federation-replica.js'
 
 export const OFFER_OP = 'grant.offer'
 export const ANSWER_OP = 'grant.answer'
@@ -89,7 +92,14 @@ export function onIncomingEnded(ctx, before, by) {
       : by === 'owner' ? `${from} ended the share of ${words}`
         : `The share of ${words} from ${from} ended with the contact`,
   })
+  // Its copy is gone (db.js fed_replica_drop): the apps drop it too.
+  if (before.state === 'active' && before.replica_mission_id) sharedFrame(ctx, before.user_id, { event: 'mission_removed', mission_id: before.replica_mission_id, grant_id: before.id })
   changed(ctx, before.user_id, { grant_id: before.id })
+}
+
+// The grantee's apps, as for a share on one journal (sharing-events.js).
+function sharedFrame({ hub }, userId, frame) {
+  try { hub?.sendToClients(userId, { kind: 'shared', ...frame }) } catch { /* a frame is best-effort; the next read is right */ }
 }
 
 // `ctx` {db, hub, pushPipeline}; `federation` the loaded identity.
@@ -272,13 +282,52 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
         const { user } = party(d, envelope, peer)
         const out = answerRemoteGrant(d, { ownerUserId: user.id, grantId: ref, address: envelope.from, key: peer.key_pub, decision: envelope.body.decision, sent: envelope.body.sent, now })
         if (out.outcome !== 'same') pending.set(envelope, out)
+        // Accepted: the mission's contents follow, in the same transaction.
+        // An outbox too full for it leaves the share standing without a
+        // copy over there; the owner is told.
+        if (out.outcome === 'accepted') {
+          try { sendSnapshot(d, out.grant, { from: envelope.to, to: envelope.from, now }) } catch (err) {
+            if (err.message !== 'outbox_full' && err.message !== 'too_large') throw err
+            pending.set(envelope, { ...out, snapshotFailed: err.message })
+          }
+        }
         return { state: out.grant.state }
       },
       after({ envelope }) {
         const out = pending.get(envelope)
         if (out) onGrantOutcome(ctx, peerWho, out)
+        if (out?.outcome === 'accepted') kick()
+        if (out?.snapshotFailed) {
+          const g = out.grant
+          fileNotice(ctx, {
+            userId: g.owner_user_id, title: `Couldn't send mission #${g.mission_num} to ${plain(`${g.grantee_name}@${g.grantee_journal}`)}`,
+            body: `Too much is waiting to go to ${g.grantee_journal}, so mission **#${g.mission_num} ${titleOf(g.mission_title)}** was not sent. The share itself stands.`,
+            idemKey: `fed-snapshot-full:${g.id}:${g.updated_at}`,
+          })
+        }
       },
       errors: { malformed: 400, not_contact: 403, not_pending: 409 },
+    },
+    // The grantee's journal: a page of the mission's contents.
+    [SNAPSHOT_OP]: {
+      apply({ db: d, envelope, peer, now }) {
+        const ref = grantRef(envelope.body)
+        const { user } = party(d, envelope, peer)
+        const r = d.prepare(`${IN} WHERE user_id=? AND peer_host=? AND peer_grant_ref=? AND owner_name=?`).get(user.id, hostOf(envelope.from), ref, nameOf(envelope.from))
+        if (!r || r.state !== 'active') fail('not_active')
+        const out = applySnapshotPage(d, r, envelope.body, now)
+        if (out.done) pending.set(envelope, { ...out, row: r })
+        return {}
+      },
+      after({ envelope }) {
+        const p = pending.get(envelope)
+        if (!p) return
+        sharedFrame(ctx, p.row.user_id, {
+          event: p.done === 'added' ? 'mission_added' : 'mission_changed', mission_id: p.missionId, grant_id: p.row.id,
+          ...(p.done === 'changed' ? { what: 'snapshot' } : {}), owner: { user_id: 0, name: p.row.owner_address },
+        })
+      },
+      errors: { malformed: 400, not_contact: 403, not_active: 409 },
     },
     // Either side: the other one ended it.
     [REVOKE_OP]: {
@@ -361,6 +410,28 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
             idemKey: `fed-answer-dead:${entry.id}`,
           })
           changed(ctx, r.user_id, { grant_id: r.id })
+        }
+        return 'discard'
+      },
+    },
+    [SNAPSHOT_OP]: {
+      stillAllowed(d, entry) {
+        const g = getGrantRaw(d, bodyOf(entry).grant)
+        return !!g && g.state === 'active'
+      },
+      // The share stands, but their copy is not whole: the owner is told
+      // once per snapshot. A share that ended over there meanwhile is not
+      // news (its revoke is on the way).
+      onDead(d, entry, { error }) {
+        const body = bodyOf(entry)
+        const g = getGrantRaw(d, body.grant)
+        if (g && g.state === 'active' && error !== 'not_active') {
+          const to = plain(`${g.grantee_name}@${g.grantee_journal}`)
+          fileNotice(ctx, {
+            userId: g.owner_user_id, title: `Couldn't send mission #${g.mission_num} to ${to}`,
+            body: `Their journal at ${g.grantee_journal} ${why(error)}, so the copy of mission **#${g.mission_num} ${titleOf(g.mission_title)}** they read may be out of date or missing. The share itself stands.`,
+            idemKey: `fed-snapshot-dead:${g.id}:${body.snap}`,
+          })
         }
         return 'discard'
       },

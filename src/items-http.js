@@ -27,6 +27,7 @@ import { notifyGrantees } from './sharing-events.js'
 import { inlineRefsToText, knowsInlineRefs, strayInlineRef } from './inline-refs.js'
 import { presentWithdrawn } from './withdrawn-comments.js'
 import { handleHandoverRoute, approvalQuestionOf, handleApprovalTap, withdrawOnClose } from './item-handover-http.js'
+import { getReplicaItem } from './federation-replica.js'
 
 const SORTS = ['rank', 'updated', 'acted']
 const SCOPES = ['mine', 'shared']
@@ -498,7 +499,14 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
     // yours), which is safe to distinguish from 404 because the caller can
     // already read it.
     const shared = getSharedItem(db, who.userId, idOrNum)
-    if (!shared) return notFound(res)
+    if (!shared) {
+      // A copy of an item on a mission shared from another journal: read-only.
+      const replica = getReplicaItem(db, who.userId, idOrNum)
+      if (!replica) return notFound(res)
+      if (!sub && req.method === 'GET') { replyItems(who, res, 200, replica); return true }
+      json(res, 403, { error: 'forbidden' })
+      return true
+    }
     if (!sub && req.method === 'GET') {
       replyItems(who, res, 200, { item: shared, comments: shared.shared_via === 'grant' ? listGrantedComments(db, shared.id) : listSharedComments(db, shared.id) })
       return true
