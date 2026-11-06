@@ -73,7 +73,7 @@ const userName = (db, id) => db.prepare('SELECT name FROM users WHERE id=?').get
 // empty, and a request to it or from it is the same answer as a name that
 // does not exist — so it can be neither found nor used to probe for names.
 // Contact rows made before the flag was set are left as they are.
-const isUnlisted = (db, userId) => !!db.prepare('SELECT unlisted FROM users WHERE id=?').get(userId)?.unlisted
+export const isUnlisted = (db, userId) => !!db.prepare('SELECT unlisted FROM users WHERE id=?').get(userId)?.unlisted
 
 // "Add contact" on the same journal lists the journal's users — names only
 // (spec decision 4), never the caller, never an unlisted account.
@@ -118,7 +118,8 @@ export function isMutual(db, row) {
 export function parkedAsks(db, deviceId) {
   return db.prepare(`SELECT
       (SELECT COUNT(*) FROM contacts WHERE origin_device_id=@d AND state='awaiting_user')
-    + (SELECT COUNT(*) FROM grants WHERE origin_device_id=@d AND (state='awaiting_owner' OR pending_state='awaiting_owner')) AS n`).get({ d: deviceId }).n
+    + (SELECT COUNT(*) FROM grants WHERE origin_device_id=@d AND (state='awaiting_owner' OR pending_state='awaiting_owner'))
+    + (SELECT COUNT(*) FROM fed_invite_asks WHERE origin_device_id=@d AND state='awaiting_user') AS n`).get({ d: deviceId }).n
 }
 
 function upsertOwn(db, { userId, peer, state, requestedBy, convoId, deviceId, now }) {

@@ -5350,8 +5350,31 @@ POST   /contacts/invites/accept {link}   202 {contact, pending:'peer'}
 
 `invite`: `{id, state: open|used|expired|revoked, created_at, expires_at,
 used_at, used_by, revoked_at}`. Client devices only: an agent gets `403`
-on every one of these, and never sees a link. While federation is off
-they answer `409 blocked_by: federation_off`.
+on every one of these, and never sees a link, but for the one ask below.
+While federation is off they answer `409 blocked_by: federation_off`.
+
+**An agent's ask.** An agent may ask for an invite; it never gets one.
+
+```
+POST   /contacts/invites {convo_id}                 (agent) 202 {ask, pending:'user'}
+POST   /contacts/invites/asks/:id/answer {decision}  (client) {ask, invite?, link?}
+```
+
+`ask`: `{id, state: awaiting_user|approved|declined|expired, invite_id,
+origin_convo_id, created_at, updated_at}`. Nothing is minted by asking.
+The user gets a card (`permission_request`, kind `contact_invite`,
+client-only) in the asking conversation and its tracker mirror (consent
+`invite`, Approve / Decline). The answer route and a tap on the mirror do
+the same: `approve` mints the invite and returns `{invite, link}` in that
+answer, to the device that tapped, this once; the link is written to no
+event, item or comment, so no agent can read it. `decline` mints nothing.
+An ask unanswered for 24 h expires and its mirror closes as cancelled.
+One open ask per conversation (`409 blocked_by: pending`); open asks count
+toward the agent device's cap on parked asks, with its contact and share
+asks (`409 too_many_asks`). `400` without a conversation the agent may
+write to (`404` for one it may not). An approve refused for
+`too_many_invites` leaves the ask waiting; one already answered is `409
+not_pending`, one past its 24 h `409 expired`.
 
 **The inviter's journal** keeps only the SHA-256 of the token. An invite is
 single use and lasts 7 days; a user may have 20 open at once

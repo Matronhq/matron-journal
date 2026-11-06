@@ -704,6 +704,21 @@ CREATE TABLE IF NOT EXISTS fed_invites(
   revoked_at      INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_fed_invites_user ON fed_invites(user_id, created_at);
+-- An agent's ask for an invite link (src/federation-invite-asks.js): parked
+-- for the user's tap, which alone mints the invite (invite_id once approved).
+CREATE TABLE IF NOT EXISTS fed_invite_asks(
+  id               TEXT PRIMARY KEY,
+  user_id          INTEGER NOT NULL REFERENCES users(id),
+  state            TEXT NOT NULL,
+  origin_convo_id  TEXT NOT NULL,
+  origin_device_id INTEGER NOT NULL,
+  item_id          TEXT,
+  invite_id        TEXT,
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fed_invite_asks_device ON fed_invite_asks(origin_device_id, state);
+CREATE INDEX IF NOT EXISTS idx_fed_invite_asks_item ON fed_invite_asks(item_id);
 -- One row per op a peer's envelope applied here: the receiver's whole replay
 -- memory (30 days). hash is SHA-256 of the JCS form of {op, body}; status
 -- and response are what was answered, returned again for a repeat.

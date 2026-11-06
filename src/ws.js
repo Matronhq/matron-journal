@@ -13,6 +13,7 @@ import { countPendingAsks, createSpawnRequest, inheritedSpawnMission, discardSpa
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem, reconcileConsentItems } from './consent-items.js'
 import { nudgeCoordinator, chatAskId } from './consent.js'
 import { expireContactAsks } from './contacts.js'
+import { expireInviteAsks, onInviteAskExpired } from './federation-invite-asks.js'
 import { expireGrantAsks } from './grants.js'
 import { onContactAskExpired, onGrantAskExpired } from './sharing-events.js'
 import { sweepExpiredHandovers } from './item-handover-http.js'
@@ -372,6 +373,7 @@ export function attachWs({
       try {
         for (const row of expireContactAsks(db)) onContactAskExpired({ db, hub }, row)
         for (const row of expireGrantAsks(db)) onGrantAskExpired({ db, hub }, row)
+        for (const row of expireInviteAsks(db)) onInviteAskExpired({ db, hub }, row)
         // Room asks, session or talk (the owner's 24 h, a talk guest's week).
         sweepTalkAsks({ db, hub, broker, spawnStartTimeoutMs, spawnWakeWaitMs, waker })
         for (const row of expireSessionShareAsks(db)) onShareAnswered({ db, hub }, null, { outcome: 'expired', share: { ...row, state: 'expired' }, before: row })
