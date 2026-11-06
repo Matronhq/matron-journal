@@ -5083,6 +5083,65 @@ Audit events (`people`, client-only): `room.offered`, `room.received`,
 `room.accepted`, `room.declined`, `room.joined`, `room.ended`, each with
 `room_link_id`, `person` and the reader's own `room_id`.
 
+## Federation (between journals)
+
+Not enabled yet. Users on different journals will add each other as
+contacts and share missions and rooms as users on one journal do. A user's
+address across journals is `name@host`, where `host` names their journal.
+Journals talk directly over HTTPS, and every request is a signed envelope.
+This section grows as each part ships. So far it covers the envelope
+format, which `src/federation-envelope.js` implements.
+
+### Envelopes
+
+```
+{ v: 1, from: 'alice@a.example', to: 'bob@b.example', op, id, ts, body, sig }
+```
+
+| Field | |
+|---|---|
+| `v` | `1`. Any other value is `unsupported_version` |
+| `from`, `to` | addresses, `name@host`: a name of up to 64 characters `[A-Za-z0-9._-]` starting with a letter or digit, then a lower-case DNS host with an optional port |
+| `op` | the operation, lower-case dotted (`mission.event`) |
+| `id` | a ULID, given to the op once when it is queued and kept on every retry |
+| `ts` | milliseconds since the epoch, set afresh on every attempt |
+| `body` | an object |
+| `sig` | Ed25519 signature, base64url without padding (86 characters) |
+
+Exactly these eight fields, nothing else. An envelope is at most 1 MiB.
+Attachments never travel in one.
+
+**What is signed.** The ASCII bytes `matron-federation-v1\n`, followed by
+the RFC 8785 (JCS) serialisation of the envelope with `sig` removed. The
+prefix keeps a federation signature from being valid in any other context
+that uses the same key. The receiver verifies over the JCS form of the
+object it parsed, not over the bytes it received, so whitespace and key
+order on the wire do not matter.
+
+**Strict parsing.** Envelopes are parsed as I-JSON (RFC 7493), not with
+`JSON.parse`. Any of the following makes the envelope `malformed`:
+
+- bytes that are not valid UTF-8, or a byte-order mark;
+- anything outside the JSON grammar;
+- a duplicate key at any depth;
+- a lone surrogate, raw or escaped, or a Unicode noncharacter;
+- a number that is not finite;
+- an integer outside ±(2^53 − 1). Larger integers travel as strings;
+- nesting deeper than 64.
+
+**Freshness.** The signature is checked first, then `ts`. An attempt more
+than five minutes from the receiver's clock is `stale`, and the answer
+carries the receiver's clock. The window applies to the attempt, not to the
+op: a retry keeps its `id` and `body` and is signed again with a new `ts`,
+so an op that waited out a long outage is still accepted. A receiver tells
+a repeat of an op from a reused `id` by SHA-256 of the JCS form of
+`{op, body}`.
+
+**Keys.** A journal's public key is written as the raw 32 bytes in
+base64url (43 characters). Its fingerprint is the first 128 bits of SHA-256
+of those raw bytes in lower-case base32 (26 characters). People compare it
+in groups of four.
+
 ## Device privacy
 
 A per-device flag that makes an agent device — and what it manages — invisible
