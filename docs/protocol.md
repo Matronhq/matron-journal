@@ -5089,8 +5089,42 @@ Not enabled yet. Users on different journals will add each other as
 contacts and share missions and rooms as users on one journal do. A user's
 address across journals is `name@host`, where `host` names their journal.
 Journals talk directly over HTTPS, and every request is a signed envelope.
-This section grows as each part ships. So far it covers the envelope
-format, which `src/federation-envelope.js` implements.
+This section grows as each part ships. So far it covers the journal's
+identity (`src/federation-identity.js`) and the envelope format
+(`src/federation-envelope.js`).
+
+### Journal identity
+
+Federation is off unless the operator turns it on. It needs all three of:
+
+| Variable | |
+|---|---|
+| `MATRON_FEDERATION` | `on` (default `off`) |
+| `MATRON_PUBLIC_URL` | the journal's https origin (`http` only for `localhost`). Its host, with the port if there is one, is the journal's name in every address: `name@host` |
+| `MATRON_TOKEN_KEY` | the private key is stored sealed under the token box in `journal_settings`, never in the clear |
+
+If any of them is missing, or the stored key does not open under the token
+key, federation stays off and the journal logs one line saying why.
+Otherwise it logs `federation: on as <host>, key <fingerprint>`.
+
+The Ed25519 key is made the first time the journal starts with federation
+on, and it is kept for good: there is no rotation. Back it up with the
+database. A journal whose key changes is a new journal to every peer, and
+its users exchange fresh invites. `matron-admin federation status` shows
+the switch as the current shell sees it, plus the public key, its
+fingerprint and when it was made.
+
+```
+GET /.well-known/matron-journal
+{ v: 1, journal: 'a.example', base_url: 'https://a.example',
+  key: { alg: 'ed25519', pub: <43 chars base64url>, id: <fingerprint> },
+  federation: { max_envelope: 1048576 } }
+```
+
+The document is public and cacheable (5 minutes), and carries no user data.
+It is `404` while federation is off, so a journal that never turned it on
+asserts nothing. `key.id` is the fingerprint (below). An invite link
+carries it, and a peer refuses a document whose key does not match.
 
 ### Envelopes
 
