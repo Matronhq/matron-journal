@@ -5398,8 +5398,10 @@ answer for all four), `403 too_many_contacts`, `400 malformed`.
 **Removing or blocking** a contact on another journal ends it here at once,
 with every grant between the two, and queues `contact.remove` (body `{}`)
 in the same transaction, urgent, cancelling anything still queued for that
-contact. It is sent only while that journal still serves the key the
-contact was pinned to. A block
+contact. It goes under whatever key that journal is pinned with now: a
+removal only takes access away. One that cannot be delivered gives the
+user a notice that the other side may still see them as a contact, and
+does not hold up a later invite answer between the same two people. A block
 travels as a removal: the other person is told only that the contact
 ended. The block stays here and refuses every later invite answer from
 that address. On arrival `contact.remove` ends the receiver's row for the

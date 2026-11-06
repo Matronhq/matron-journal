@@ -462,11 +462,27 @@ export function makeContactFederation({ db, hub = null, pushPipeline = null, fed
       },
     },
     [REMOVE_OP]: {
-      // Only to the key this contact was pinned to: a journal now serving
-      // another key is not who the user knew, and is told nothing.
-      stillAllowed(d, entry) {
+      // Sent under whatever key that journal is pinned with now: a removal
+      // only takes access away, and tells that host nothing it does not
+      // already know. One that cannot go out (a journal that changed its
+      // key and was not re-pinned, one the operator now refuses, 7 days
+      // unreachable) is told to the user, and does not block a later
+      // invite answer between the same two people.
+      onDead(d, entry, { error }) {
         const row = rowFor(d, entry)
-        return !!row && row.journal_state === 'active' && row.peer_journal_key === row.journal_key_now
+        if (row) {
+          const host = row.peer_journal
+          const why = error === 'expired' ? `could not be reached for 7 days`
+            : error === 'journal_not_allowed' ? `is not one this journal federates with any more`
+              : error === 'peer_key_changed' ? `changed its key`
+                : `${REFUSALS[error] ?? 'refused it'}`
+          fileNotice(ctx, {
+            userId: row.user_id, title: `Couldn't tell ${host} that ${who(row)} is no longer a contact`,
+            body: `The contact is ended here, but the journal at ${host} ${why}, so ${plain(row.peer_user)} may still see you as a contact there.`,
+            idemKey: `fed-remove-dead:${entry.id}`,
+          })
+        }
+        return 'discard'
       },
     },
   }

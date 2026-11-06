@@ -423,3 +423,25 @@ test('consented key: an answer waiting when another key is pinned for that journ
   assert.match(notices(w.b, w.users.bob.id).at(-1).body, /changed its key while this was waiting/)
   assert.equal((await contactsOf(w.phones.alice)).length, 0, 'nothing reached alice')
 })
+
+test('remove: delivered under the journal\'s current key; one that cannot go out is told and blocks nothing', async (t) => {
+  const w = await world(t)
+  await befriend(w)
+  // bob's contact sits on an old key; carol has since pinned the real one.
+  const old = exportPublicKey(generateFederationKey().publicKey)
+  w.b.db.prepare("UPDATE contacts SET peer_journal_key=? WHERE peer_journal='a.example'").run(old)
+  const [bobSide] = await contactsOf(w.phones.bob)
+  assert.equal(bobSide.key_changed, true)
+  await w.phones.bob(`/contacts/${bobSide.id}`, { method: 'DELETE' })
+  await w.settle()
+  assert.equal((await contactsOf(w.phones.alice)).length, 0, 'alice was told')
+
+  // A journal marked key_changed and never re-pinned cannot be told.
+  await befriend(w)
+  w.b.db.prepare("UPDATE fed_peers SET state='key_changed' WHERE host='a.example'").run()
+  const [again] = await contactsOf(w.phones.bob)
+  await w.phones.bob(`/contacts/${again.id}`, { method: 'DELETE' })
+  await w.settle()
+  assert.equal(notices(w.b, w.users.bob.id).at(-1).title, "Couldn't tell a.example that alice@a.example is no longer a contact")
+  assert.equal(w.b.db.prepare("SELECT COUNT(*) AS n FROM fed_outbox WHERE state='dead'").get().n, 0, 'nothing left blocking the pair')
+})
