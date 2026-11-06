@@ -5248,7 +5248,8 @@ few seconds. The rules:
   peer in their People conversation, and dead ops keep blocking their
   subject until the user resends or discards them. A resend re-queues the
   same ids with a fresh 7 days, so a peer that already applied one answers
-  from its receipt. Ops waiting behind them also get a fresh 7 days. A
+  from its receipt. Ops waiting behind them on the same subject, which were
+  never attempted, also get a fresh 7 days. A
   resend is refused (counted in `too_old`) for an op queued more than 23
   days earlier: its last attempt could otherwise fall after the peer has
   pruned the op's 30-day receipt, and the peer would apply it twice.
