@@ -28,7 +28,11 @@
 //     on their own subject; they can also cancel what is queued there.
 //
 // Later stages register their ops with optional hooks:
-//   {stillAllowed(db, entry) -> bool, onAcked(db, entry, result), onDead(db, entry)}
+//   {stillAllowed(db, entry) -> bool, onAcked(db, entry, result),
+//    onDead(db, entry, {status, error}) -> 'discard' | undefined}
+// An onDead that answers 'discard' has told its user itself (an invite that
+// can no longer be used, say): the entry is ended as cancelled, so it does
+// not block its subject, and no undelivered notice is filed for it.
 
 import { canonicalize } from './federation-jcs.js'
 import { importPublicKey, isAddress, MAX_ENVELOPE_BYTES, newOpId, signEnvelope } from './federation-envelope.js'
@@ -55,6 +59,9 @@ const JOURNAL = 'journal'
 const HOOK_FAILED = Symbol('hook_failed')
 const fail = (code) => { throw new Error(code) }
 const hostOf = (address) => address.slice(address.indexOf('@') + 1)
+// An error is often the peer's own word, from its signed answer: in a
+// notice it keeps only what an error code is made of.
+const codeText = (e) => String(e ?? '').replace(/[^A-Za-z0-9_:. -]/g, '').slice(0, 80) || 'an error'
 
 // The delay before attempt `attempts + 1`: 30 s × 2^(attempts − 1), capped at
 // 1 h, then jittered into [50 %, 100 %] so a journal coming back up is not
@@ -175,7 +182,7 @@ export function makeOutbox({ db, hub = null, federation, client, ops = {}, now =
       const count = db.prepare("SELECT COUNT(*) AS n FROM fed_outbox WHERE user_id=? AND peer_host=? AND state='dead'").get(entry.user_id, entry.peer_host).n
       const reason = entry.last_error === 'expired'
         ? `could not be reached for 7 days`
-        : `refused ${count === 1 ? 'an update' : 'updates'} (${entry.last_error})`
+        : `refused ${count === 1 ? 'an update' : 'updates'} (${codeText(entry.last_error)})`
       const { item, duplicate } = createItem(db, {
         userId: entry.user_id, kind: 'notice', title: `Couldn't deliver to ${entry.peer_host}`,
         body: `The journal at ${entry.peer_host} ${reason}. ${count} ${count === 1 ? 'update was' : 'updates were'} not delivered, and later updates on the same thing wait behind ${count === 1 ? 'it' : 'them'}. Resend or discard them from the contact in the app.`,
@@ -194,7 +201,10 @@ export function makeOutbox({ db, hub = null, federation, client, ops = {}, now =
 
   function dead(entry, { status = null, error, at, counted = 1 }) {
     if (!markDead.run(counted, status, error, at, entry.seq).changes) return
-    hook(entry, 'onDead')
+    if (hook(entry, 'onDead', { status, error }) === 'discard') {
+      db.prepare("UPDATE fed_outbox SET state='cancelled' WHERE seq=? AND state='dead'").run(entry.seq)
+      return
+    }
     notifyDead({ ...entry, last_error: error, ended_at: at })
   }
 
@@ -272,6 +282,9 @@ export function makeOutbox({ db, hub = null, federation, client, ops = {}, now =
   let timer = null
   return {
     tick,
+    // A pass now rather than at the next interval: the user is waiting on
+    // the op just queued (an invite's acceptance). Never throws.
+    kick() { tick().catch((err) => log.error('federation: outbox pass failed', err)) },
     start(intervalMs = 5000) {
       if (timer) return
       timer = setInterval(() => { tick().catch((err) => log.error('federation: outbox pass failed', err)) }, intervalMs)

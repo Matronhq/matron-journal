@@ -57,10 +57,12 @@ export function isBlockedAddress(address) {
 
 export const parseAllowHosts = (raw) => String(raw || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
 
-// `allowHttp` is a test seam only: two journals in one test process talk
-// over plain HTTP on loopback. Nothing in production sets it.
+// `allowHttp` and `rewriteUrl` are test seams only: two journals in one test
+// process talk over plain HTTP on loopback, and `rewriteUrl(url) -> url`
+// sends the requests for a test host (`https://a.example/…`) to the
+// loopback server that plays it. Nothing in production sets either.
 export function makeFederationClient({
-  allowHosts = [], allowHttp = false, lookup = dns.lookup,
+  allowHosts = [], allowHttp = false, rewriteUrl = null, lookup = dns.lookup,
   connectTimeoutMs = 10_000, totalTimeoutMs = 30_000,
 } = {}) {
   const allowed = new Set(allowHosts.map((h) => h.toLowerCase()))
@@ -85,7 +87,7 @@ export function makeFederationClient({
   // One request. → {status, headers, body: Buffer}. Error codes:
   // 'destination_refused', 'network', 'timeout', 'too_large'.
   async function request(url, { method = 'GET', headers = {}, body = null, maxBytes = MAX_ENVELOPE_BYTES } = {}) {
-    const u = new URL(url)
+    const u = new URL(rewriteUrl ? rewriteUrl(String(url)) : url)
     const dest = await resolveDestination(u)
     const mod = u.protocol === 'https:' ? https : http
     return new Promise((resolve, reject) => {

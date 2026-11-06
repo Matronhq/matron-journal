@@ -8,6 +8,7 @@
 //   POST   /contacts/:id/block             DELETE /contacts/:id    (remove / withdraw)
 //   POST   /contacts/:id/unblock                                   (client only)
 //   GET    /contacts/:id/activity          the audit events for one contact
+//   /contacts/invites…                      contacts on other journals (src/federation-contacts-http.js)
 //   POST   /missions/:id/shares {contact, level, brief?, exclude_media?, keep_level?, convo_id?}
 //   GET    /missions/:id/shares            the owner's grants on one mission
 //   POST   /projects/:id/shares {contact, level:'owner', brief, exclude_media?, keep_level?, convo_id?}
@@ -45,6 +46,7 @@ import { getItem } from './items.js'
 import { USERNAME_RE } from './users-http.js'
 import { revokeSharesBetween } from './person-rooms.js'
 import { onContactEndedRooms, onGrantEndedRooms, onShareEnded } from './person-rooms-events.js'
+import { handleInviteRoute } from './federation-contacts-http.js'
 
 // Phase 2's share of a contact ending: every room between the two people
 // ends on both sides, and every session either one shared with the other
@@ -136,6 +138,7 @@ async function handleContactSub(ctx, req, res, url, who, id, sub) {
       if (!out) return notFound(res)
       onContactEnded(ctx, who, out, 'removed')
       endPeopleRooms(ctx, out)
+      ctx.federationContacts?.onLocalEnd(out)
       json(res, 200, { contact: contactRow(out.contact) })
       return true
     }
@@ -167,6 +170,7 @@ async function handleContactSub(ctx, req, res, url, who, id, sub) {
     if (!out) return notFound(res)
     onContactEnded(ctx, who, out, 'blocked')
     endPeopleRooms(ctx, out)
+    ctx.federationContacts?.onLocalEnd(out)
     json(res, 200, { contact: contactRow(out.contact) })
     return true
   }
@@ -441,6 +445,7 @@ export async function handleSharingRoute(ctx, req, res, url, who) {
     if (req.method === 'POST') return handleContactRequest(ctx, req, res, who)
     return false
   }
+  if (path === '/contacts/invites' || path.startsWith('/contacts/invites/')) return handleInviteRoute(ctx, req, res, url, who)
   if (path === '/contacts/users') {
     if (req.method !== 'GET') return false
     json(res, 200, { users: listJournalUsers(db, who.userId) })

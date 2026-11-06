@@ -48,7 +48,7 @@ const safely = (what, fn) => { try { return fn() } catch (err) { console.error(`
 const asking = (what, fn) => (...args) => { safely(what, () => fn(...args)) }
 const userName = (db, id) => db.prepare('SELECT name FROM users WHERE id=?').get(id)?.name ?? `user ${id}`
 const deviceName = (db, id) => db.prepare('SELECT name FROM devices WHERE id=?').get(id)?.name ?? null
-const addressOf = (row) => (row.peer_journal ? `${row.peer_user}@${row.peer_journal}` : row.peer_user)
+export const addressOf = (row) => (row.peer_journal ? `${row.peer_user}@${row.peer_journal}` : row.peer_user)
 const titleOf = (t) => plain(sanitizePeerText(t, MISSION_TITLE_CAP))
 
 // The user's People conversation, announced to connected clients the first
@@ -118,6 +118,27 @@ export function fileMirror({ db, hub }, { userId, convoId, deviceId, sender, con
       appendAndBroadcast(db, hub, {
         userId, convoId, sender, type: ITEM_EVENT_TYPE,
         payload: itemMarkerPayload({ item, action: 'created', by: 'agent', extra: { consent } }),
+      })
+    }
+    return item
+  })
+}
+
+// A notice in the user's People conversation: something about their
+// contacts they need to read but not decide (another journal's answer, a
+// changed key). It awaits the user with the built-in Seen button. Like a
+// mirror, its marker never wakes an agent; `idemKey` makes it once only.
+export function fileNotice({ db, hub }, { userId, title, body, idemKey }) {
+  return safely('notice', () => {
+    const convoId = peopleConvo({ db, hub }, userId)
+    const { item, duplicate } = createItem(db, {
+      userId, kind: 'notice', title: cut(title, TITLE_MAX), body, awaiting: 'user', position: 'top',
+      originConvoId: convoId, originDeviceId: 0, createdBy: 'agent', idemKey,
+    })
+    if (!duplicate) {
+      appendAndBroadcast(db, hub, {
+        userId, convoId, sender: JOURNAL, type: ITEM_EVENT_TYPE,
+        payload: itemMarkerPayload({ item, action: 'created', by: 'agent' }),
       })
     }
     return item
@@ -197,7 +218,7 @@ const contactPeerAsk = asking('contact request card', (ctx, peerRow) => {
 // answered, when there was one — the item-tap route answers with it.
 export function onContactOutcome(ctx, who, out) {
   const own = out.contact
-  const peer = plain(own.peer_user)
+  const peer = plain(addressOf(own))
   const before = out.before ?? null
   const tapped = (comment, resolution = 'decided') => closeMirror(ctx, {
     userId: own.user_id, itemId: before?.item_id, consent: 'contact', resolution, author: 'user', deviceId: who.deviceId, comment,
@@ -259,7 +280,7 @@ export function onContactOutcome(ctx, who, out) {
 // a block (spec: a block must not be an oracle).
 export function onContactEnded(ctx, who, out, verb) {
   const own = out.contact
-  const peer = plain(own.peer_user)
+  const peer = plain(addressOf(own))
   const pendingIn = out.before.state === 'pending_in'
   const awaiting = out.before.state === 'awaiting_user'
   // A card of mine that was still open is answered by this.
@@ -291,7 +312,7 @@ export function onContactEnded(ctx, who, out, verb) {
 }
 
 export function onContactUnblocked(ctx, out) {
-  audit(ctx, out.contact.user_id, { event: 'contact.unblocked', summary: `You unblocked ${plain(out.contact.peer_user)}`, contact: out.contact, by: 'user' })
+  audit(ctx, out.contact.user_id, { event: 'contact.unblocked', summary: `You unblocked ${plain(addressOf(out.contact))}`, contact: out.contact, by: 'user' })
   changed(ctx, out.contact.user_id, { contact_id: out.contact.id })
 }
 

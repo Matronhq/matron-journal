@@ -689,6 +689,21 @@ CREATE TABLE IF NOT EXISTS fed_peers(
   last_ok_at  INTEGER,
   last_error  TEXT
 );
+-- Contact invites across journals (src/federation-contacts.js): one row per
+-- link a user minted. Only the SHA-256 of the 256-bit token is kept, so a
+-- link is shown once, when it is made. Single use, 7 days; used_by_address
+-- is the name@host that used it.
+CREATE TABLE IF NOT EXISTS fed_invites(
+  id              TEXT PRIMARY KEY,
+  token_hash      TEXT NOT NULL UNIQUE,
+  user_id         INTEGER NOT NULL REFERENCES users(id),
+  created_at      INTEGER NOT NULL,
+  expires_at      INTEGER NOT NULL,
+  used_at         INTEGER,
+  used_by_address TEXT,
+  revoked_at      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_fed_invites_user ON fed_invites(user_id, created_at);
 -- One row per op a peer's envelope applied here: the receiver's whole replay
 -- memory (30 days). hash is SHA-256 of the JCS form of {op, body}; status
 -- and response are what was answered, returned again for a repeat.

@@ -5,7 +5,7 @@ import { openDb } from '../src/db.js'
 import { makeTokenBox } from '../src/token-box.js'
 import { importPublicKey, keyFingerprint, signEnvelope, verifyEnvelope, newOpId, MAX_ENVELOPE_BYTES } from '../src/federation-envelope.js'
 import {
-  resolveFederationConfig, ensureFederationKey, storedFederationKeyInfo, loadFederation, WELL_KNOWN_PATH,
+  resolveFederationConfig, journalAllowed, ensureFederationKey, storedFederationKeyInfo, loadFederation, WELL_KNOWN_PATH,
 } from '../src/federation-identity.js'
 import { runAdmin } from '../bin/matron-admin.js'
 import { startTestServer } from './helpers.js'
@@ -24,9 +24,25 @@ test('config: off unless switched on with an https public URL', () => {
   assert.deepEqual(resolveFederationConfig({ federation: 'on' }), { enabled: false, reason: 'no_public_url' })
   assert.deepEqual(resolveFederationConfig({ federation: 'on', publicUrl: 'http://a.example' }), { enabled: false, reason: 'no_public_url' })
   assert.deepEqual(resolveFederationConfig({ federation: 'on', publicUrl: 'https://Journal.Example.com/some/path' }),
-    { enabled: true, baseUrl: 'https://journal.example.com', host: 'journal.example.com' })
+    { enabled: true, baseUrl: 'https://journal.example.com', host: 'journal.example.com', allowJournals: [], denyJournals: [] })
   assert.deepEqual(resolveFederationConfig({ federation: 'ON', publicUrl: 'https://a.example:8443' }),
-    { enabled: true, baseUrl: 'https://a.example:8443', host: 'a.example:8443' })
+    { enabled: true, baseUrl: 'https://a.example:8443', host: 'a.example:8443', allowJournals: [], denyJournals: [] })
+})
+
+test('config: the allow and deny lists of other journals', () => {
+  const on = (lists) => resolveFederationConfig({ federation: 'on', publicUrl: 'https://a.example', ...lists })
+  const open = on({})
+  assert.equal(journalAllowed(open, 'b.example'), true)
+  assert.equal(journalAllowed(open, 'a.example'), false, 'never with itself')
+  assert.equal(journalAllowed({ enabled: false }, 'b.example'), false)
+  const denied = on({ denyJournals: ' B.example , c.example' })
+  assert.deepEqual(denied.denyJournals, ['b.example', 'c.example'])
+  assert.equal(journalAllowed(denied, 'b.example'), false)
+  assert.equal(journalAllowed(denied, 'd.example'), true)
+  const allowed = on({ allowJournals: 'b.example', denyJournals: 'b.example' })
+  assert.equal(journalAllowed(allowed, 'b.example'), false, 'deny wins')
+  assert.equal(journalAllowed(on({ allowJournals: 'b.example' }), 'c.example'), false)
+  assert.equal(journalAllowed(on({ allowJournals: 'b.example' }), 'B.EXAMPLE'), true)
 })
 
 test('key: made once, sealed at rest, the same key on every later start', () => {
