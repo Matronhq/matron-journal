@@ -81,6 +81,7 @@ export function expireInviteAsks(db, now = Date.now()) {
 
 const inviteLinkOf = (id) => ({ url: consentLink('invite', id), title: 'Invite link request' })
 
+// → the mirror, or null when it could not be filed (the ask is then gone).
 export function onInviteAskParked(ctx, who, ask) {
   const box = plain(sanitizePeerText(who.name, 80))
   card(ctx, {
@@ -99,8 +100,16 @@ export function onInviteAskParked(ctx, who, ask) {
     ].join('\n'),
     link: inviteLinkOf(ask.id), actions: OWNER_ACTIONS, idemKey: `consent:invite:${ask.id}`,
   })
-  if (item) ctx.db.prepare('UPDATE fed_invite_asks SET item_id=? WHERE id=?').run(item.id, ask.id)
+  // The mirror is where the user taps. Without it the ask would wait
+  // unseen and refuse a retry for 24 h: it is dropped, and the caller says
+  // the ask failed.
+  if (!item) {
+    ctx.db.prepare("DELETE FROM fed_invite_asks WHERE id=? AND state='awaiting_user'").run(ask.id)
+    return null
+  }
+  ctx.db.prepare('UPDATE fed_invite_asks SET item_id=? WHERE id=?').run(item.id, ask.id)
   changed(ctx, ask.user_id, { invite_ask_id: ask.id })
+  return item
 }
 
 const CLOSING = {

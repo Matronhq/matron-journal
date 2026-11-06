@@ -40,7 +40,7 @@ async function parkAsk(ctx, req, res, who) {
   if (typeof body.convo_id !== 'string' || !body.convo_id) return badRequest(res)
   if (!writableConvo(ctx.db, who, body.convo_id)) return notFound(res)
   const ask = parkInviteAsk(ctx.db, { userId: who.userId, convoId: body.convo_id, deviceId: who.deviceId })
-  onInviteAskParked(ctx, who, ask)
+  if (!onInviteAskParked(ctx, who, ask)) { json(res, 503, { error: 'unavailable' }); return true }
   json(res, 202, { ask: inviteAskView(ask), pending: 'user' })
   return true
 }

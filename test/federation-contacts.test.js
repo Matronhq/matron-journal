@@ -532,6 +532,17 @@ test('invite asks: declined, expired, capped, and waiting while the open invites
   assert.deepEqual([capped.status, capped.json.blocked_by], [409, 'too_many_asks'])
 })
 
+test('invite asks: a card that cannot be filed leaves nothing parked, so the agent can ask again', async (t) => {
+  const w = await world(t)
+  upsertConversation(w.a.db, { id: 'work', ownerUserId: w.users.alice.id, title: 'Work', agentDeviceId: w.aliceBoxId })
+  w.a.db.exec("CREATE TRIGGER no_items BEFORE INSERT ON items BEGIN SELECT RAISE(ABORT, 'disk full'); END")
+  const r = await w.aliceBox('/contacts/invites', post({ convo_id: 'work' }))
+  assert.deepEqual([r.status, r.json.error], [503, 'unavailable'])
+  assert.equal(w.a.db.prepare('SELECT COUNT(*) AS n FROM fed_invite_asks').get().n, 0)
+  w.a.db.exec('DROP TRIGGER no_items')
+  assert.equal((await w.aliceBox('/contacts/invites', post({ convo_id: 'work' }))).status, 202)
+})
+
 test('invite asks: with federation off an agent is told so and nothing parks', async (t) => {
   const s = await startTestServer({ tokenKey: KEY })
   t.after(() => s.close())

@@ -5372,7 +5372,8 @@ An ask unanswered for 24 h expires and its mirror closes as cancelled.
 One open ask per conversation (`409 blocked_by: pending`); open asks count
 toward the agent device's cap on parked asks, with its contact and share
 asks (`409 too_many_asks`). `400` without a conversation the agent may
-write to (`404` for one it may not). An approve refused for
+write to (`404` for one it may not). `503 unavailable` if the card could not be
+filed: nothing is kept, and the agent may ask again. An approve refused for
 `too_many_invites` leaves the ask waiting; one already answered is `409
 not_pending`, one past its 24 h `409 expired`.
 
