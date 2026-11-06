@@ -6,6 +6,7 @@ import { insertBlob } from '../src/db.js'
 import { world, post, grantOf, incoming, offer } from './federation-world.js'
 import { signEnvelope, newOpId } from '../src/federation-envelope.js'
 import { MEDIA_PATH, MEDIA_HEADER, purgeReplicaMedia } from '../src/federation-media.js'
+import { runReapMedia } from '../src/retention.js'
 
 // Attachments of a read share across journals (phase 5 stage 8): bob opens
 // an attachment of alice's shared mission on his own journal, which pulls
@@ -134,4 +135,35 @@ test('an attachment on the item\'s own description crosses too', async (t) => {
   const r = await raw(w.b, bobToken, `/media/${one.item.attachments[0].blob_ref}`)
   assert.equal(r.status, 200)
   assert.deepEqual(r.body, bytes)
+})
+
+test('the size that crosses is the blob\'s, not the one written on the attachment', async (t) => {
+  const { w, bobToken } = await shared(t)
+  const token = (await w.a.http('/login', post({ username: 'alice', password: 'pw', device_name: 'alice-phone-3' }))).json.token
+  const bytes = Buffer.from('a picture of the shed')
+  const up = await upload(w.a, token, bytes, 'image/png')
+  const q = (await w.aliceBox('/items', post({ convo_id: 'work', kind: 'task', title: 'Paint the shed' }))).json.item
+  await w.aliceBox(`/items/${q.id}/comments`, post({ convo_id: 'work', body: 'Like this', attachments: [{ blob_ref: up.media_id, mime: 'image/png', name: 'shed.png', size: up.size + 100 }] }))
+  await w.settle()
+  const item = (await w.phones.bob('/items?scope=shared')).json.items.find((i) => i.title === 'Paint the shed')
+  assert.equal(item.has_image, true, 'the list shows the picture hint')
+  const [att] = (await w.phones.bob(`/items/${item.id}`)).json.comments.at(-1).attachments
+  assert.equal(att.size, up.size)
+  const r = await raw(w.b, bobToken, `/media/${att.blob_ref}`)
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.body, bytes)
+})
+
+test('over quota, the reaper drops kept copies first and the next read pulls them again', async (t) => {
+  const { w, att, bobToken } = await shared(t)
+  assert.equal((await raw(w.b, bobToken, `/media/${att.blob_ref}`)).status, 200)
+  const file = w.b.db.prepare('SELECT disk_path FROM fed_media WHERE id=?').get(att.blob_ref).disk_path
+  const r = runReapMedia(w.b.db, { quotaBytes: w.bytes.length + 2 })
+  assert.equal(r.reaped, 1)
+  assert.equal(r.bytesFreed, w.bytes.length)
+  assert.ok(!fs.existsSync(file))
+  assert.equal(w.b.db.prepare('SELECT disk_path FROM fed_media WHERE id=?').get(att.blob_ref).disk_path, null)
+  const again = await raw(w.b, bobToken, `/media/${att.blob_ref}`)
+  assert.equal(again.status, 200)
+  assert.deepEqual(again.body, w.bytes)
 })

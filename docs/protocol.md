@@ -5660,10 +5660,13 @@ mirror, an owner-only item, an item from a private box, or a withdrawn
 reply. It answers with the bytes and `Matron-Media-SHA256`. There is no
 receipt: the pull changes nothing.
 
-The grantee's journal keeps the bytes only if their SHA-256 and size match
-the attachment record. They count in the grantee's media quota (`413
+The attachment record carries the blob's own size and SHA-256, never the
+size a client wrote on the attachment. The grantee's journal keeps the
+bytes only if both match. They count in the grantee's media quota (`413
 quota_exceeded` when it is full, `413 too_large` past
 `MATRON_MEDIA_MAX_BYTES`), and later reads are served from the kept copy.
+When the user is over the quota, the media reaper drops kept copies
+first, the least recently pulled first: the next read pulls them again.
 An attachment reads only while the share and its contact are active and
 the copy still shows it; otherwise it is `404`. A pull that fails is
 `502 peer_unreachable`, and the next read tries again. Kept bytes of a

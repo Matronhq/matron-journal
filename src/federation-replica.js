@@ -78,15 +78,16 @@ export function wireMilestone(l) {
 }
 
 // The blobs a thread names, as the owner's journal holds them: an
-// attachment crosses with its sha256 (the grantee's journal checks the bytes
-// it pulls against it) and only when its blob is here.
-export const blobsOf = (db) => (id) => db.prepare('SELECT sha256, width, height FROM blobs WHERE id=?').get(id) ?? null
+// attachment crosses with the blob's own size and sha256 (the grantee's
+// journal checks the bytes it pulls against both, so the size a client
+// wrote on the attachment never counts) and only when its blob is here.
+export const blobsOf = (db) => (id) => db.prepare('SELECT size, sha256, width, height FROM blobs WHERE id=?').get(id) ?? null
 
 function wireAttachment(a, blobOf) {
   const b = typeof a?.blob_ref === 'string' ? blobOf(a.blob_ref) : null
   if (!b) return null
   return {
-    media: a.blob_ref, name: typeof a.name === 'string' ? a.name : '', mime: a.mime, size: a.size, sha256: b.sha256,
+    media: a.blob_ref, name: typeof a.name === 'string' ? a.name : '', mime: a.mime, size: b.size, sha256: b.sha256,
     ...(b.width > 0 && b.height > 0 ? { width: b.width, height: b.height } : {}),
     ...(typeof a.transcript === 'string' ? { transcript: a.transcript } : {}),
   }
@@ -496,13 +497,15 @@ export function replicaMissionDetail(d, mission) {
 const ITEMS = `SELECT r.*, m.id AS mission_id, m.num AS mission_num, g.owner_name || '@' || g.peer_host AS owner_address
   FROM fed_replica_items r JOIN fed_replica_missions m ON m.fg_id = r.fg_id AND m.complete = 1 ${LIVE}`
 
+const IMAGE = (a) => typeof a?.mime === 'string' && a.mime.startsWith('image/')
+
 function itemOut(r) {
   return {
     id: r.id, user_id: 0, num: r.num, kind: r.kind, state: r.state, resolution: r.resolution, awaiting: r.awaiting, rank: 0,
     title: r.title, body: r.body, supersedes: null, origin_convo_id: '', origin_device_id: 0, created_by: r.created_by,
     created_at: r.created_at, updated_at: r.updated_at, closed_at: r.closed_at, mission_id: r.mission_id, consent: null, chosen_action: null,
     private: false, filed_convo_id: null, device_name: null, comment_count: r.comment_count, last_comment_at: r.last_comment_at,
-    last_user_input_at: null, has_image: false, mission_num: r.mission_num, origin_convo_title: null, handover: null, repo: null,
+    last_user_input_at: null, has_image: parse(r.attachments, []).some(IMAGE) || parse(r.comments, []).some((c) => (c.attachments ?? []).some(IMAGE)), mission_num: r.mission_num, origin_convo_title: null, handover: null, repo: null,
     labels: parse(r.labels, []), links: parse(r.links, []), attachments: parse(r.attachments, []), actions: [],
     ...(r.contributor_name ? { contributor: { name: r.contributor_name, via: r.contributor_via ?? 'agent' } } : {}),
     owner: ownerOf(r.owner_address), shared_via: 'grant',
