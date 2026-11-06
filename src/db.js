@@ -689,6 +689,21 @@ CREATE TABLE IF NOT EXISTS fed_peers(
   last_ok_at  INTEGER,
   last_error  TEXT
 );
+-- Contact invites across journals (src/federation-contacts.js): one row per
+-- link a user minted. Only the SHA-256 of the 256-bit token is kept, so a
+-- link is shown once, when it is made. Single use, 7 days; used_by_address
+-- is the name@host that used it.
+CREATE TABLE IF NOT EXISTS fed_invites(
+  id              TEXT PRIMARY KEY,
+  token_hash      TEXT NOT NULL UNIQUE,
+  user_id         INTEGER NOT NULL REFERENCES users(id),
+  created_at      INTEGER NOT NULL,
+  expires_at      INTEGER NOT NULL,
+  used_at         INTEGER,
+  used_by_address TEXT,
+  revoked_at      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_fed_invites_user ON fed_invites(user_id, created_at);
 -- One row per op a peer's envelope applied here: the receiver's whole replay
 -- memory (30 days). hash is SHA-256 of the JCS form of {op, body}; status
 -- and response are what was answered, returned again for a repeat.
@@ -735,7 +750,8 @@ CREATE TABLE IF NOT EXISTS fed_outbox(
   notified      INTEGER NOT NULL DEFAULT 0,
   created_at    INTEGER NOT NULL,
   acked_at      INTEGER,
-  ended_at      INTEGER
+  ended_at      INTEGER,
+  meta          TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_fed_outbox_due ON fed_outbox(state, next_at);
 CREATE INDEX IF NOT EXISTS idx_fed_outbox_subject ON fed_outbox(peer_host, subject, state, seq);
@@ -1833,6 +1849,9 @@ export function openDb(path) {
   addCols('items', [['contributor_user_id', 'INTEGER'], ['contributor_convo_id', 'TEXT'], ['contributor_name', 'TEXT'], ['contributor_via', 'TEXT']])
   addCols('milestones', [['contributor_name', 'TEXT'], ['contributor_via', 'TEXT']])
   addCols('missions', [['status_contributor', 'TEXT']])
+  // Federation outbox: the op's local-only context for its hooks (never
+  // sent), e.g. the key the user consented to for an invite answer.
+  addCols('fed_outbox', [['meta', 'TEXT']])
   // Unified search's tracker mirror (spec 2026-10-12 unified search §1).
   // Must stay LAST: it reads columns added by every migration above (e.g.
   // missions.name), and its triggers must be reinstalled after any table

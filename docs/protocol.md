@@ -4407,7 +4407,10 @@ to read. Nothing is derived from being on the same journal.
 
 A contact is one row per side; anything is shared only while both rows are
 `active`. `address` is `user` on this journal and `user@journal` across
-journals (later).
+journals. A contact on another journal is made only by an invite link
+(see "Contacts across journals"); its other row lives on that journal.
+Mission shares and rooms are same-journal only for now: offering one to a
+contact on another journal is `409 not_contact`.
 
 | State | Meaning |
 |---|---|
@@ -4422,7 +4425,7 @@ journals (later).
 GET    /contacts/users                    {users:[{name}]} — this journal's other listed users, names only
 GET    /contacts[?state=]                 {contacts:[contact]} — live rows unless a state is named
 POST   /contacts {user, convo_id?}        201 {contact, pending?:'peer'} | 202 {contact, pending:'owner'}
-GET    /contacts/:id                      :id is the row id (ct_…) or a same-journal user name
+GET    /contacts/:id                      :id is the row id (ct_…), a same-journal user name, or name@journal
 POST   /contacts/:id/answer {decision}    'approve' | 'decline' — client devices only
 DELETE /contacts/:id                      remove, or withdraw a request
 POST   /contacts/:id/block                POST /contacts/:id/unblock (client only)
@@ -4430,8 +4433,9 @@ GET    /contacts/:id/activity             {events:[…]} — the audit events na
 ```
 
 `contact`: `{id, address, peer_user, peer_journal, display_name, state,
-requested_by, origin_convo_id, created_at, updated_at, accepted_at,
-revoked_at}`.
+requested_by, origin_convo_id, key_changed, created_at, updated_at, accepted_at,
+revoked_at}`. `key_changed` is true for a contact on another journal whose
+journal now serves a different key than the one pinned for it.
 
 `POST /contacts` from a **client** is the user's own tap and goes straight
 to the other person. From an **agent** it needs `convo_id` (a conversation
@@ -5093,8 +5097,10 @@ This section grows as each part ships. So far it covers the journal's
 identity (`src/federation-identity.js`), the envelope format
 (`src/federation-envelope.js`), the endpoint that receives envelopes
 (`src/federation-inbound.js`), the rules for calling another journal
-(`src/federation-client.js`) and the outbox that delivers ops
-(`src/federation-outbox.js`). Only `ping` exists so far.
+(`src/federation-client.js`), the outbox that delivers ops
+(`src/federation-outbox.js`) and contacts across journals
+(`src/federation-contacts.js`). The ops so far are `ping`,
+`contact.accept_invite` and `contact.remove`.
 
 ### Journal identity
 
@@ -5106,7 +5112,18 @@ Federation is off unless the operator turns it on. It needs all three of:
 | `MATRON_PUBLIC_URL` | the journal's https origin (`http` only for `localhost`). Its host, with the port if there is one, is the journal's name in every address: `name@host` |
 | `MATRON_TOKEN_KEY` | the private key is stored sealed under the token box in `journal_settings`, never in the clear |
 
-If any of them is missing, or the stored key does not open under the token
+Two optional lists say which other journals may federate with this one:
+
+| Variable | |
+|---|---|
+| `MATRON_FEDERATION_ALLOW_JOURNALS` | comma-separated hosts. When set, only these journals |
+| `MATRON_FEDERATION_DENY_JOURNALS` | comma-separated hosts never allowed, even if also allowed |
+
+With no allow list, any journal a user exchanges an invite with may
+federate: the invite is the trust. A refused journal's envelopes are
+`403 peer_refused`, and its invite links are refused when opened.
+
+If any of the three required ones is missing, or the stored key does not open under the token
 key, federation stays off and the journal logs one line saying why.
 Otherwise it logs `federation: on as <host>, key <fingerprint>`.
 
@@ -5188,8 +5205,19 @@ POST /federation/v1      body: one envelope
 The body is read as bytes (at most 1 MiB) and parsed strictly. Then:
 
 1. `to` must name a user of this journal, on this journal's host.
-2. `from`'s host must be a journal this one knows (`fed_peers`, `active`),
-   and the key pinned for that journal must verify `sig`.
+2. `from`'s host must be allowed by the operator's lists, and a journal
+   this one knows (`fed_peers`, `active`), and the key pinned for that
+   journal must verify `sig`.
+   **Discovery** is the one exception: `contact.accept_invite`, the answer
+   to an invite this journal minted, may come from a journal it has never
+   seen, or one whose pinned key no longer verifies. Only when the envelope
+   carries one of this journal's open invites for `to` (a lookup, no other
+   work) does the journal fetch the sender's well-known, through the rules
+   in "Calling another journal", and verify `sig` against the key it
+   serves. The op's own apply then pins that key. Any other envelope from
+   an unknown journal is `403 unknown_journal` before any work. If the
+   sender's well-known cannot be fetched, the answer is
+   `503 peer_unreachable`, which the sender retries.
 3. The attempt must be fresh.
 4. **Receipts.** In one transaction, the journal looks up a receipt for
    (the peer's key, `id`). If one exists with the same SHA-256 of
@@ -5212,6 +5240,7 @@ against the state at that time.
 | 405 | only `POST` | no |
 | 409 | `id_reused` | no |
 | 413 | `too_large` | no |
+| 503 | `peer_unreachable`: discovery could not fetch the sender's well-known | yes |
 
 **Signed answers.** Every answer from step 1 on carries
 `matron-federation-sig`: Ed25519 by the receiving journal over the ASCII
@@ -5255,7 +5284,11 @@ few seconds. The rules:
   pruned the op's 30-day receipt, and the peer would apply it twice.
 - **Checks before sending.** Before each attempt the sender checks its own
   records again. An op whose grant or contact has ended here is cancelled
-  rather than sent.
+  rather than sent, and an op for a journal the operator's lists now
+  refuse goes dead (`journal_not_allowed`).
+- **Acknowledgement.** An entry is marked sent, and its op's own records
+  updated, in one transaction, and only if the entry was still queued: an
+  answer to an entry cancelled while its request was out changes nothing.
 - **Urgent ops** (revocation, contact removal, block) go ahead of
   everything queued for the peer. They do not wait behind earlier ops on
   their own subject, and may cancel what is still waiting there.
@@ -5293,6 +5326,94 @@ Every request a journal makes to another journal follows these rules:
 **A peer's well-known document** is accepted only if `journal` is the host
 it was fetched from, `base_url` is that host's origin, `key.alg` is
 `ed25519`, and `key.id` is the fingerprint of `key.pub`.
+
+### Contacts across journals
+
+Only an invite link makes a contact on another journal. Nobody can ask an
+address they typed: an invite is a capability its owner chose to hand out.
+
+```
+matron://contact?v=1&j=<journal host>&u=<inviter's name>&t=<token>&fp=<journal fingerprint>
+```
+
+`t` is 256 random bits (base64url, 43 characters). `fp` is the inviter's
+journal key fingerprint (26 characters, base32). A link with any other
+field, or one twice, is refused.
+
+```
+POST   /contacts/invites                 201 {invite, link} — the link is returned this once
+GET    /contacts/invites                 {invites:[invite]} — the last 30 days, newest first
+DELETE /contacts/invites/:id             {invite} — withdraw an open invite
+POST   /contacts/invites/open {link}     {inviter:{address, name, journal, fingerprint}, key_changed, contact}
+POST   /contacts/invites/accept {link}   202 {contact, pending:'peer'}
+```
+
+`invite`: `{id, state: open|used|expired|revoked, created_at, expires_at,
+used_at, used_by, revoked_at}`. Client devices only: an agent gets `403`
+on every one of these, and never sees a link. While federation is off
+they answer `409 blocked_by: federation_off`.
+
+**The inviter's journal** keeps only the SHA-256 of the token. An invite is
+single use and lasts 7 days; a user may have 20 open at once
+(`409 too_many_invites`). An unlisted account cannot mint one (`403`).
+
+**Opening a link** (`open`) changes nothing for the user and sends nothing.
+The journal fetches the inviter's journal's well-known and refuses a link
+whose `fp` is not that document's key (`409 fingerprint_mismatch`), so the
+link itself authenticates the key and there is no trust on first use.
+Also `400` for a link it cannot read, and `409 blocked_by`: `own_journal`,
+`journal_not_allowed` (the operator's lists), `journal_blocked`. `502`
+`unreachable` or `bad_journal` when the well-known could not be fetched or
+is not a journal's identity. `fingerprint` comes grouped in fours, for
+people comparing it. `contact` is the user's existing live row for that
+address, if any.
+
+**Accepting** (`accept`) is the user's consent. The journal makes the same
+checks, pins the inviter's journal key, writes the user's row as
+`pending_out`, and queues `contact.accept_invite`. Also `409 blocked_by`:
+`already_contact`, `pending`, `blocked`, `too_many_contacts` (200 live
+contacts on other journals). The row turns `active` when the inviter's
+journal acknowledges, and only under the key the user consented to: if
+another key is pinned for that journal while the answer waits, the answer
+ends instead. If it is refused, cannot be delivered for 7 days, or ends
+that way, the row goes `expired`, the user gets a notice saying why, and
+nothing is left to resend: a new link is needed. A live contact on an old
+key that accepts a fresh invite (a reconnect) keeps its row as it was
+until the answer is acknowledged; a failed reconnect hides nothing.
+
+`contact.accept_invite`, body `{token, display_name}`. The inviter's
+journal admits it through discovery (above). In the transaction that
+writes the receipt it checks the invite again, pins the sender's key,
+writes the inviter's row `active`, and marks the invite used. The invite
+must be open. A spent one is accepted again only as a retry of the same
+answer: from the address that used it, while the contact it made is still
+`active` and signed by the key that contact is pinned to. Once that
+contact has ended, a spent link is spent, and it never restores a removed
+contact. Minting the invite was the inviter's
+consent, so the inviter gets a notice, not a card. The answer is
+`{user, display_name}`. Refusals: `403 invite_invalid` (used by someone
+else, expired, withdrawn, or the inviter has blocked that address: one
+answer for all four), `403 too_many_contacts`, `400 malformed`.
+
+**Removing or blocking** a contact on another journal ends it here at once,
+with every grant between the two, and queues `contact.remove` (body `{}`)
+in the same transaction, urgent, cancelling anything still queued for that
+contact. It goes under whatever key that journal is pinned with now: a
+removal only takes access away. One that cannot be delivered gives the
+user a notice that the other side may still see them as a contact, and
+does not hold up a later invite answer between the same two people. A block
+travels as a removal: the other person is told only that the contact
+ended. The block stays here and refuses every later invite answer from
+that address. On arrival `contact.remove` ends the receiver's row for the
+sender's address, if it is live and pinned to the sender's key. Otherwise
+it does nothing, and the answer is the same.
+
+**A changed key.** When a well-known fetched for a known journal serves a
+different key, that journal is marked `key_changed`: nothing is sent to or
+accepted from it, every contact pinned to its old key reads
+`key_changed: true`, and each user with such a contact gets one notice.
+There is no rotation. Accepting a fresh invite from that journal pins its
+new key for that contact.
 
 ## Device privacy
 

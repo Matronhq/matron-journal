@@ -24,15 +24,43 @@ const KEY_SETTING = 'federation_key'
 const KEY_CREATED_SETTING = 'federation_key_created_at'
 
 // The switch and the name, from env (or the test seam). Never throws.
-// {enabled:false, reason} when off; {enabled:true, baseUrl, host} when the
-// operator turned it on with a usable public URL.
-export function resolveFederationConfig({ federation, publicUrl } = {}) {
+// {enabled:false, reason} when off; {enabled:true, baseUrl, host,
+// allowJournals, denyJournals} when the operator turned it on with a usable
+// public URL. The two lists (MATRON_FEDERATION_ALLOW_JOURNALS and
+// MATRON_FEDERATION_DENY_JOURNALS, comma-separated hosts) say which other
+// journals may federate with this one; see journalAllowed.
+export function resolveFederationConfig({ federation, publicUrl, allowJournals = '', denyJournals = '' } = {}) {
   const raw = String(federation ?? '').trim().toLowerCase()
   if (raw === '' || raw === 'off' || raw === '0') return { enabled: false, reason: 'off' }
   if (raw !== 'on' && raw !== '1') return { enabled: false, reason: 'bad_switch' }
   const baseUrl = parsePublicUrl(publicUrl)
   if (!baseUrl) return { enabled: false, reason: 'no_public_url' }
-  return { enabled: true, baseUrl, host: new URL(baseUrl).host.toLowerCase() }
+  return {
+    enabled: true, baseUrl, host: new URL(baseUrl).host.toLowerCase(),
+    allowJournals: hostList(allowJournals), denyJournals: hostList(denyJournals),
+  }
+}
+
+const hostList = (raw) => (Array.isArray(raw) ? raw : String(raw ?? '').split(','))
+  .map((s) => String(s).trim().toLowerCase()).filter(Boolean)
+
+// May this journal federate with the journal at `host`? Never with itself,
+// never with a denied host, and, when there is an allow list, only with a
+// host on it. With no allow list, any journal a user exchanges an invite
+// with may federate: the invite is the trust.
+export function journalAllowed(federation, host) {
+  if (!federation?.enabled || typeof host !== 'string') return false
+  if (host.toLowerCase() === federation.host) return false
+  return journalListed(federation, host)
+}
+
+// The operator's two lists alone: what the outbox checks before every
+// attempt, so a journal denied after an op was queued gets nothing more.
+export function journalListed(federation, host) {
+  const h = String(host).toLowerCase()
+  if (federation?.denyJournals?.includes(h)) return false
+  if (federation?.allowJournals?.length && !federation.allowJournals.includes(h)) return false
+  return true
 }
 
 const readSetting = (db, key) => db.prepare('SELECT value FROM journal_settings WHERE key=?').get(key)?.value ?? null
@@ -85,8 +113,8 @@ const OFF_REASONS = {
 // Everything the server needs at boot: the config plus the key, or off with
 // the reason logged once. {enabled:false} | {enabled:true, host, baseUrl,
 // key}.
-export function loadFederation(db, tokenBox, { federation, publicUrl, log = console, now } = {}) {
-  const config = resolveFederationConfig({ federation, publicUrl })
+export function loadFederation(db, tokenBox, { federation, publicUrl, allowJournals, denyJournals, log = console, now } = {}) {
+  const config = resolveFederationConfig({ federation, publicUrl, allowJournals, denyJournals })
   if (!config.enabled) {
     if (config.reason !== 'off') log.error(`federation: ${OFF_REASONS[config.reason]} — it is off`)
     return { enabled: false }

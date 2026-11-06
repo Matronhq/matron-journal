@@ -8,6 +8,7 @@
 //   POST   /contacts/:id/block             DELETE /contacts/:id    (remove / withdraw)
 //   POST   /contacts/:id/unblock                                   (client only)
 //   GET    /contacts/:id/activity          the audit events for one contact
+//   /contacts/invites…                      contacts on other journals (src/federation-contacts-http.js)
 //   POST   /missions/:id/shares {contact, level, brief?, exclude_media?, keep_level?, convo_id?}
 //   GET    /missions/:id/shares            the owner's grants on one mission
 //   POST   /projects/:id/shares {contact, level:'owner', brief, exclude_media?, keep_level?, convo_id?}
@@ -45,6 +46,7 @@ import { getItem } from './items.js'
 import { USERNAME_RE } from './users-http.js'
 import { revokeSharesBetween } from './person-rooms.js'
 import { onContactEndedRooms, onGrantEndedRooms, onShareEnded } from './person-rooms-events.js'
+import { handleInviteRoute } from './federation-contacts-http.js'
 
 // Phase 2's share of a contact ending: every room between the two people
 // ends on both sides, and every session either one shared with the other
@@ -59,6 +61,15 @@ function endPeopleRooms(ctx, out) {
     console.error('person rooms: contact end failed (the contact change stands)', err)
   }
 }
+
+// Removing or blocking, and for a contact on another journal the message
+// that tells its journal, in one transaction: the ending never commits
+// without the message that carries it.
+const endContact = (ctx, end) => ctx.db.transaction(() => {
+  const out = end()
+  if (out) ctx.federationContacts?.queueEnd(out)
+  return out
+})()
 
 const forbidden = (res) => { json(res, 403, { error: 'forbidden' }); return true }
 const blocked = (res, by, extra = {}) => conflict(res, { blocked_by: by, ...extra })
@@ -129,13 +140,14 @@ async function handleContactSub(ctx, req, res, url, who, id, sub) {
     if (req.method === 'GET') { json(res, 200, { contact: contactRow(own) }); return true }
     if (req.method === 'DELETE') {
       let out
-      try { out = removeContact(db, { userId: who.userId, contactId: own.id }) } catch (err) {
+      try { out = endContact(ctx, () => removeContact(db, { userId: who.userId, contactId: own.id })) } catch (err) {
         if (CONTACT_CONFLICTS.has(err.message)) return blocked(res, err.message)
         throw err
       }
       if (!out) return notFound(res)
       onContactEnded(ctx, who, out, 'removed')
       endPeopleRooms(ctx, out)
+      ctx.federationContacts?.kick()
       json(res, 200, { contact: contactRow(out.contact) })
       return true
     }
@@ -160,13 +172,14 @@ async function handleContactSub(ctx, req, res, url, who, id, sub) {
   }
   if (sub === 'block') {
     let out
-    try { out = blockContact(db, { userId: who.userId, contactId: own.id }) } catch (err) {
+    try { out = endContact(ctx, () => blockContact(db, { userId: who.userId, contactId: own.id })) } catch (err) {
       if (CONTACT_CONFLICTS.has(err.message)) return blocked(res, err.message)
       throw err
     }
     if (!out) return notFound(res)
     onContactEnded(ctx, who, out, 'blocked')
     endPeopleRooms(ctx, out)
+    ctx.federationContacts?.kick()
     json(res, 200, { contact: contactRow(out.contact) })
     return true
   }
@@ -441,6 +454,7 @@ export async function handleSharingRoute(ctx, req, res, url, who) {
     if (req.method === 'POST') return handleContactRequest(ctx, req, res, who)
     return false
   }
+  if (path === '/contacts/invites' || path.startsWith('/contacts/invites/')) return handleInviteRoute(ctx, req, res, url, who)
   if (path === '/contacts/users') {
     if (req.method !== 'GET') return false
     json(res, 200, { users: listJournalUsers(db, who.userId) })

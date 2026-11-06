@@ -20,10 +20,23 @@
 //
 // Ops register a sync `apply({db, envelope, peer, now})` that returns the
 // result object, or throws Error(code) for a refusal named in its `errors`
-// map (code -> status). Phase 5's later stages add the ops; this one only
-// knows `ping`.
+// map (code -> status). An optional `after({db, envelope, peer, result,
+// now})` runs once the transaction has committed, and only when the op was
+// applied (not for an answer from a receipt): the place for side effects
+// that reach users (cards, notices, live frames).
+//
+// Discovery. An op may name a journal this one has never seen, or one whose
+// key no longer verifies: `contact.accept_invite`, the answer to an invite
+// this journal minted. Such an op registers `admits({db, envelope, now})`,
+// a cheap check that the envelope carries something this journal handed
+// out (an open invite for `to`). Only then is the sender's well-known
+// fetched (through the destination policy), the envelope verified against
+// the key it serves, and the op applied with `peer.discovered` set: the
+// op's own apply pins that key. Every other envelope from an unknown
+// journal is refused before any work.
 
 import { MAX_ENVELOPE_BYTES, opHash, parseEnvelope, RESPONSE_SIG_HEADER, signResponse, verifyEnvelope, importPublicKey } from './federation-envelope.js'
+import { journalAllowed } from './federation-identity.js'
 
 export const FEDERATION_PATH = '/federation/v1'
 export const RECEIPT_TTL_MS = 30 * 24 * 3600 * 1000
@@ -61,7 +74,7 @@ export function pruneReceipts(db, now = Date.now()) {
   return db.prepare('DELETE FROM fed_receipts WHERE created_at < ?').run(now - RECEIPT_TTL_MS).changes
 }
 
-export function makeFederationHandler({ db, federation, ops = DEFAULT_OPS, now = Date.now }) {
+export function makeFederationHandler({ db, federation, ops = DEFAULT_OPS, client = null, now = Date.now, log = console }) {
   const findPeer = db.prepare('SELECT host, key_pub, state FROM fed_peers WHERE host=?')
   const findUser = db.prepare('SELECT id FROM users WHERE name=?')
   const findReceipt = db.prepare('SELECT hash, status, response FROM fed_receipts WHERE peer_key=? AND id=?')
@@ -108,20 +121,56 @@ export function makeFederationHandler({ db, federation, ops = DEFAULT_OPS, now =
       send(res, 403, { error: 'not_here' }, id)
       return true
     }
-    const peer = findPeer.get(hostOf(envelope.from))
-    if (!peer) { send(res, 403, { error: 'unknown_journal' }, id); return true }
-    if (peer.state !== 'active') { send(res, 403, { error: 'peer_refused' }, id); return true }
+    const host = hostOf(envelope.from)
+    if (!journalAllowed(federation, host)) { send(res, 403, { error: 'peer_refused' }, id); return true }
+    const handler = Object.hasOwn(ops, envelope.op) ? ops[envelope.op] : null
+    const known = findPeer.get(host)
+    if (known?.state === 'blocked') { send(res, 403, { error: 'peer_refused' }, id); return true }
 
     const at = now()
-    try {
-      verifyEnvelope(envelope, keyFor(peer.key_pub), { now: at })
-    } catch (err) {
-      if (err.message === 'stale') send(res, 401, { error: 'stale', clock: err.clock }, id)
-      else send(res, 403, { error: 'bad_signature' }, id)
-      return true
+    let peer = null
+    if (known?.state === 'active') {
+      try {
+        verifyEnvelope(envelope, keyFor(known.key_pub), { now: at })
+        peer = known
+      } catch (err) {
+        if (err.message === 'stale') { send(res, 401, { error: 'stale', clock: err.clock }, id); return true }
+        // A bad signature from a known journal may still be an invite's
+        // answer from a journal whose key changed: discovery decides.
+      }
     }
+    if (!peer) {
+      let admitted = false
+      if (handler?.admits && client) {
+        try { admitted = !!handler.admits({ db, envelope, now: at }) } catch (err) { log.error(`federation: ${envelope.op} admits check failed`, err) }
+      }
+      if (!admitted) {
+        const error = !known ? 'unknown_journal' : known.state !== 'active' ? 'peer_refused' : 'bad_signature'
+        send(res, 403, { error }, id)
+        return true
+      }
+      let wk
+      try {
+        wk = await client.fetchWellKnown(host)
+      } catch (err) {
+        // Ours to retry, not theirs to give up on: a 503 is retried.
+        send(res, 503, { error: 'peer_unreachable', why: err.why ?? err.message }, id)
+        return true
+      }
+      if (known?.state === 'active' && wk.pub === known.key_pub) { send(res, 403, { error: 'bad_signature' }, id); return true }
+      try {
+        verifyEnvelope(envelope, wk.publicKey, { now: at })
+      } catch (err) {
+        if (err.message === 'stale') send(res, 401, { error: 'stale', clock: err.clock }, id)
+        else send(res, 403, { error: 'bad_signature' }, id)
+        return true
+      }
+      peer = { host, base_url: wk.baseUrl, key_pub: wk.pub, state: 'active', discovered: true, previous: known ?? null }
+    }
+    // The fetch took time: what the op checks (an invite's expiry) is judged
+    // now, not when the envelope arrived.
+    const applyAt = peer.discovered ? now() : at
 
-    const handler = Object.hasOwn(ops, envelope.op) ? ops[envelope.op] : null
     if (!handler) { send(res, 400, { error: 'unknown_op' }, id); return true }
 
     const hash = opHash(envelope)
@@ -133,11 +182,11 @@ export function makeFederationHandler({ db, federation, ops = DEFAULT_OPS, now =
           if (prior.hash !== hash) return { status: 409, body: { error: 'id_reused' } }
           return { status: prior.status, body: JSON.parse(prior.response) }
         }
-        const result = handler.apply({ db, envelope, peer, now: at })
+        const result = handler.apply({ db, envelope, peer, now: applyAt })
         const body = { ok: true, result: result ?? {} }
-        putReceipt.run(peer.key_pub, id, hash, 200, JSON.stringify(body), at)
-        touchPeer.run(at, peer.host)
-        return { status: 200, body }
+        putReceipt.run(peer.key_pub, id, hash, 200, JSON.stringify(body), applyAt)
+        touchPeer.run(applyAt, peer.host)
+        return { status: 200, body, applied: true, result: result ?? {} }
       })()
     } catch (err) {
       const status = handler.errors?.[err.message]
@@ -145,6 +194,9 @@ export function makeFederationHandler({ db, federation, ops = DEFAULT_OPS, now =
       answer = { status, body: { error: err.message } }
     }
     send(res, answer.status, answer.body, id)
+    if (answer.applied && handler.after) {
+      try { handler.after({ db, envelope, peer, result: answer.result, now: applyAt }) } catch (err) { log.error(`federation: ${envelope.op} after hook failed (the op stands)`, err) }
+    }
     return true
   }
 }

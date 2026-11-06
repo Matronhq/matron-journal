@@ -26,7 +26,8 @@ import { makeRpcBroker } from './rpc-broker.js'
 import { resolveWebDir, makeStaticHandler } from './static-http.js'
 import { makeWellKnown, parseList } from './well-known.js'
 import { loadFederation, makeFederationWellKnown } from './federation-identity.js'
-import { makeFederationHandler, pruneReceipts } from './federation-inbound.js'
+import { makeFederationHandler, pruneReceipts, DEFAULT_OPS } from './federation-inbound.js'
+import { makeContactFederation } from './federation-contacts.js'
 import { makeOutbox } from './federation-outbox.js'
 import { makeConfiguredFederationClient } from './federation-client.js'
 import { makeWaker, markWakeRefused, clearWakeRefused } from './wake.js'
@@ -614,17 +615,28 @@ export function startServer({
   })
   const federation = loadFederation(db, tokenBox, federationEnv ?? {
     federation: process.env.MATRON_FEDERATION, publicUrl: process.env.MATRON_PUBLIC_URL,
+    allowJournals: process.env.MATRON_FEDERATION_ALLOW_JOURNALS, denyJournals: process.env.MATRON_FEDERATION_DENY_JOURNALS,
   })
   const handleFederationWellKnown = makeFederationWellKnown(federation)
   const handleWellKnown = (req, res, url) => handleFederationWellKnown(req, res, url) || handleAppWellKnown(req, res, url)
-  // POST /federation/v1 (src/federation-inbound.js): 404 while off.
-  // `federationOps` is the test seam for the op table.
-  const handleFederation = makeFederationHandler({ db, federation, ...(federationOps ? { ops: federationOps } : {}) })
-  // The outbox (src/federation-outbox.js): built only when federation is
-  // on. `federationClient` is the test seam for the outbound client.
-  const federationOutbox = federation.enabled
-    ? makeOutbox({ db, hub, federation, client: federationClient ?? makeConfiguredFederationClient() })
+  // The outbound client (src/federation-client.js): `federationClient` is
+  // its test seam. Contacts across journals (src/federation-contacts.js)
+  // register their ops with both ends.
+  const federationClientInUse = federation.enabled ? (federationClient ?? makeConfiguredFederationClient()) : null
+  const federationContacts = federation.enabled
+    ? makeContactFederation({ db, hub, pushPipeline, federation, client: federationClientInUse })
     : null
+  // POST /federation/v1 (src/federation-inbound.js): 404 while off.
+  // `federationOps` is the test seam: extra ops, over the journal's own.
+  const handleFederation = makeFederationHandler({
+    db, federation, client: federationClientInUse,
+    ops: { ...DEFAULT_OPS, ...(federationContacts?.inbound ?? {}), ...(federationOps ?? {}) },
+  })
+  // The outbox (src/federation-outbox.js): built only when federation is on.
+  const federationOutbox = federation.enabled
+    ? makeOutbox({ db, hub, federation, client: federationClientInUse, ops: federationContacts.outbound })
+    : null
+  federationContacts?.setOutbox(federationOutbox)
   const resolvedAlertWebhook = alertWebhook !== undefined ? alertWebhook : {
     token: process.env.MATRON_ALERT_WEBHOOK_TOKEN || null,
     username: process.env.MATRON_ALERT_WEBHOOK_USER || null,
@@ -651,7 +663,7 @@ export function startServer({
     transferMaxBytes: resolvedTransferMaxBytes, transferUserQuotaBytes: resolvedTransferUserQuotaBytes, transferMaxAwaitingPerSender: resolvedTransferMaxAwaiting, transferChunkBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentTransferDailyCap, consentRoutineCap, verifier,
-    github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, handleStatic, tokenBox,
+    github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
   }))
   const wss = attachWs({
@@ -799,6 +811,7 @@ export function startServer({
         routineFirer,
         github: resolvedGithub,
         federationOutbox,
+        federationContacts,
         close: () => new Promise((r) => {
           closing = true
           startDelay.cancel()
