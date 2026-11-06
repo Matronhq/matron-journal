@@ -236,3 +236,29 @@ test('the grantee ending the contact is logged as theirs', async (t) => {
   assert.equal((await w.phones.bob(`/contacts/${aliceOnB.id}`, { method: 'DELETE' })).status, 200)
   assert.equal(audits(w.b, w.users.bob.id).at(-1).summary, 'The share of mission "Garden Club" from alice@a.example ended with the contact')
 })
+
+test('a decline that crosses the offer sent again is stale', async (t) => {
+  const w = await world(t)
+  const g = await offer(w)
+  // alice's journal refuses bob's accept, so her grant stays pending.
+  const row = w.a.db.prepare("SELECT id FROM contacts WHERE user_id=? AND peer_journal='b.example'").get(w.users.alice.id)
+  w.a.db.prepare("UPDATE contacts SET state='removed' WHERE id=?").run(row.id)
+  await w.phones.bob(`/grants/${incoming(w.b)[0].id}/answer`, post({ decision: 'approve' }))
+  await w.settle()
+  w.a.db.prepare("UPDATE contacts SET state='active' WHERE id=?").run(row.id)
+  // Offered again; then bob declines the new card, but his decline names the
+  // first sending (as if it had left before the new offer arrived).
+  await new Promise((r) => setTimeout(r, 5))
+  await offer(w)
+  const fg = incoming(w.b)[0]
+  assert.equal(fg.state, 'pending')
+  w.b.db.prepare('UPDATE fed_grants_in SET offer_sent=? WHERE id=?').run(fg.offer_sent - 1, fg.id)
+  await w.phones.bob(`/grants/${fg.id}/answer`, post({ decision: 'decline' }))
+  await w.settle()
+  assert.equal(grantOf(w.a, g.id).state, 'pending', 'a stale decline changes nothing')
+  // A current one does.
+  w.b.db.prepare("UPDATE fed_grants_in SET state='pending', offer_sent=? WHERE id=?").run(fg.offer_sent, fg.id)
+  await w.phones.bob(`/grants/${fg.id}/answer`, post({ decision: 'decline' }))
+  await w.settle()
+  assert.equal(grantOf(w.a, g.id).state, 'declined')
+})

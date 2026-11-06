@@ -398,16 +398,24 @@ function remoteGrant(db, { ownerUserId, grantId, address, key }) {
   return { g, contact }
 }
 
+// An answer naming an earlier sending of a still-pending offer (`sent`, the
+// offer's sent_at as their journal last heard it) crossed the owner's offer
+// again: their journal has reopened the offer, so a decline or leave of the
+// earlier one is stale. An accept never is (their journal keeps it).
+const staleFor = (g, sent) => g.state === 'pending' && Number.isSafeInteger(sent) && sent !== g.sent_at
+
 // Their answer to an offer, arriving from their journal. Outcomes as
-// answerGrant ('accepted' | 'declined'); answering what is already so again
-// is 'same' (a resend). Errors: not_pending (withdrawn, ended, or not theirs).
-export function answerRemoteGrant(db, { ownerUserId, grantId, address, key, decision, now = Date.now() }) {
+// answerGrant ('accepted' | 'declined'); answering what is already so again,
+// or a stale decline, is 'same'. Errors: not_pending (withdrawn, ended, or
+// not theirs).
+export function answerRemoteGrant(db, { ownerUserId, grantId, address, key, decision, sent = null, now = Date.now() }) {
   return db.transaction(() => {
     const hit = remoteGrant(db, { ownerUserId, grantId, address, key })
     if (!hit) fail('not_pending')
     const { g, contact } = hit
     const done = (outcome) => ({ outcome, grant: getGrantRaw(db, g.id), before: g })
     if (g.state === (decision === 'decline' ? 'declined' : 'active') && !g.pending_state) return done('same')
+    if (decision === 'decline' && staleFor(g, sent)) return done('same')
     if (g.state !== 'pending' || !isLiveRemote(db, contact)) fail('not_pending')
     if (decision === 'decline') setState(db, g.id, 'declined', now, `, answered_at=${Number(now)}`)
     else setState(db, g.id, 'active', now, `, answered_at=${Number(now)}`)
@@ -417,10 +425,10 @@ export function answerRemoteGrant(db, { ownerUserId, grantId, address, key, deci
 
 // They ended a share from their side. null = nothing live to end (the
 // answer is the same: it is over here too).
-export function leaveRemoteGrant(db, { ownerUserId, grantId, address, key, now = Date.now() }) {
+export function leaveRemoteGrant(db, { ownerUserId, grantId, address, key, sent = null, now = Date.now() }) {
   return db.transaction(() => {
     const hit = remoteGrant(db, { ownerUserId, grantId, address, key })
-    if (!hit || !['pending', 'active'].includes(hit.g.state)) return null
+    if (!hit || !['pending', 'active'].includes(hit.g.state) || staleFor(hit.g, sent)) return null
     setState(db, hit.g.id, 'revoked', now, `, revoked_by='grantee', revoked_at=${Number(now)}, pending_level=NULL, pending_state=NULL, pending_by=NULL, pending_at=NULL`)
     return { grant: getGrantRaw(db, hit.g.id), before: hit.g, by: 'grantee' }
   })()

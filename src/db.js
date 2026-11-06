@@ -719,6 +719,7 @@ CREATE TABLE IF NOT EXISTS fed_grants_in(
   mission_title   TEXT NOT NULL,
   mission_num     INTEGER NOT NULL,
   preview         TEXT,
+  offer_sent      INTEGER,
   item_id         TEXT,
   revoked_by      TEXT,
   created_at      INTEGER NOT NULL,

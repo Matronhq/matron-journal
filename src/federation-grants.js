@@ -111,7 +111,7 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
       enqueue(db, {
         userId: g.owner_user_id, from, to, op: OFFER_OP, subject: subjectOf(g.id), now: clock(),
         body: {
-          grant: g.id, level: g.level,
+          grant: g.id, level: g.level, sent: g.sent_at,
           mission: { num: g.mission_num, title: sanitizePeerText(g.mission_title, TITLE_CAP) },
           preview: { milestones: p.milestones, items: p.items, comments: p.comments, attachments: p.attachments },
         },
@@ -164,7 +164,7 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
       const state = decision === 'decline' ? 'declined' : 'active'
       db.prepare('UPDATE fed_grants_in SET state=?, answered_at=?, updated_at=? WHERE id=?').run(state, at, at, before.id)
       const to = before.owner_address
-      enqueue(db, { userId, from: addressOfUser(userId), to, op: ANSWER_OP, body: { grant: before.peer_grant_ref, decision }, subject: subjectOf(before.peer_grant_ref), now: at })
+      enqueue(db, { userId, from: addressOfUser(userId), to, op: ANSWER_OP, body: { grant: before.peer_grant_ref, decision, sent: before.offer_sent }, subject: subjectOf(before.peer_grant_ref), now: at })
       return { outcome: decision === 'decline' ? 'declined' : 'accepted', row: incomingById(db, before.id), before }
     })()
     if (!out) return null
@@ -190,7 +190,7 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
       const at = clock()
       db.prepare("UPDATE fed_grants_in SET state='revoked', revoked_by='grantee', revoked_at=?, updated_at=? WHERE id=?").run(at, at, before.id)
       enqueue(db, {
-        userId, from: addressOfUser(userId), to: before.owner_address, op: REVOKE_OP, body: { grant: before.peer_grant_ref },
+        userId, from: addressOfUser(userId), to: before.owner_address, op: REVOKE_OP, body: { grant: before.peer_grant_ref, sent: before.offer_sent },
         subject: subjectOf(before.peer_grant_ref), urgent: true, cancelSubject: true, now: at,
       })
       return { row: incomingById(db, before.id), before }
@@ -224,24 +224,29 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
       apply({ db: d, envelope, peer, now }) {
         const ref = grantRef(envelope.body)
         const { level, mission, preview } = envelope.body
+        const sent = Number.isSafeInteger(envelope.body.sent) ? envelope.body.sent : null
         if (typeof mission !== 'object' || mission === null || typeof mission.title !== 'string' || !Number.isSafeInteger(mission.num) || mission.num < 1) fail('malformed')
         if (level !== 'read') fail('level_unavailable')
         const { user, contact } = party(d, envelope, peer)
         const host = hostOf(envelope.from)
         const cur = d.prepare(`${IN} WHERE peer_host=? AND peer_grant_ref=?`).get(host, ref)
         if (cur && cur.user_id !== user.id) fail('not_contact')
-        // Offered again while live: nothing new to ask.
-        if (cur && ['pending', 'active'].includes(cur.state)) return { state: cur.state }
+        // Offered again while live: nothing new to ask, but our answer from
+        // now on names this offer.
+        if (cur && ['pending', 'active'].includes(cur.state)) {
+          d.prepare('UPDATE fed_grants_in SET offer_sent=? WHERE id=?').run(sent, cur.id)
+          return { state: cur.state }
+        }
         const fields = [level, sanitizePeerText(mission.title, TITLE_CAP) || 'Untitled', mission.num,
-          JSON.stringify({ milestones: count(preview?.milestones), items: count(preview?.items), comments: count(preview?.comments), attachments: count(preview?.attachments) })]
+          JSON.stringify({ milestones: count(preview?.milestones), items: count(preview?.items), comments: count(preview?.comments), attachments: count(preview?.attachments) }), sent]
         let id = cur?.id
         if (cur) {
-          d.prepare(`UPDATE fed_grants_in SET level=?, mission_title=?, mission_num=?, preview=?, state='pending', contact_id=?, item_id=NULL, revoked_by=NULL,
+          d.prepare(`UPDATE fed_grants_in SET level=?, mission_title=?, mission_num=?, preview=?, offer_sent=?, state='pending', contact_id=?, item_id=NULL, revoked_by=NULL,
             answered_at=NULL, revoked_at=NULL, updated_at=? WHERE id=?`).run(...fields, contact.id, now, cur.id)
         } else {
           id = newId('fg')
-          d.prepare(`INSERT INTO fed_grants_in(id, user_id, contact_id, peer_host, peer_grant_ref, owner_name, level, mission_title, mission_num, preview, state, created_at, updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?,?)`).run(id, user.id, contact.id, host, ref, nameOf(envelope.from), ...fields, now, now)
+          d.prepare(`INSERT INTO fed_grants_in(id, user_id, contact_id, peer_host, peer_grant_ref, owner_name, level, mission_title, mission_num, preview, offer_sent, state, created_at, updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,'pending',?,?)`).run(id, user.id, contact.id, host, ref, nameOf(envelope.from), ...fields, now, now)
         }
         pending.set(envelope, incomingById(d, id))
         return { state: 'pending' }
@@ -261,7 +266,7 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
         const ref = grantRef(envelope.body)
         if (!['approve', 'decline'].includes(envelope.body.decision)) fail('malformed')
         const { user } = party(d, envelope, peer)
-        const out = answerRemoteGrant(d, { ownerUserId: user.id, grantId: ref, address: envelope.from, key: peer.key_pub, decision: envelope.body.decision, now })
+        const out = answerRemoteGrant(d, { ownerUserId: user.id, grantId: ref, address: envelope.from, key: peer.key_pub, decision: envelope.body.decision, sent: envelope.body.sent, now })
         if (out.outcome !== 'same') pending.set(envelope, out)
         return { state: out.grant.state }
       },
@@ -277,7 +282,7 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
         const ref = grantRef(envelope.body)
         const { user } = party(d, envelope, peer)
         // The grantee left the owner's grant...
-        const left = leaveRemoteGrant(d, { ownerUserId: user.id, grantId: ref, address: envelope.from, key: peer.key_pub, now })
+        const left = leaveRemoteGrant(d, { ownerUserId: user.id, grantId: ref, address: envelope.from, key: peer.key_pub, sent: envelope.body.sent, now })
         if (left) { pending.set(envelope, { left }); return {} }
         // ...or the owner withdrew one this user was offered.
         const cur = d.prepare(`${IN} WHERE user_id=? AND peer_host=? AND peer_grant_ref=? AND owner_name=? AND state IN ('pending','active')`)

@@ -5469,8 +5469,9 @@ lives on the owner's journal.
 
 Three ops carry a grant, all on the subject `grant:<owner's gr_ id>`:
 
-- `grant.offer`, owner to grantee, body `{grant, level: 'read', mission:
-  {num, title}, preview: {milestones, items, comments, attachments}}`, sent
+- `grant.offer`, owner to grantee, body `{grant, level: 'read', sent,
+  mission: {num, title}, preview: {milestones, items, comments,
+  attachments}}`, sent
   when the ask is sent (a client's ask at once, an agent's on the owner's
   approval). The receiver needs a live contact for the sender under the key
   that signed (`403 not_contact`). A grant it already holds live is the
@@ -5484,6 +5485,11 @@ Three ops carry a grant, all on the subject `grant:<owner's gr_ id>`:
   nothing then, so while its grant is `pending` the owner (a client, not
   an agent) may offer it again rather than get `409 pending`: the same
   grant is sent again, and a grantee holding it live just keeps it.
+  `sent` is the offer's `sent_at`, new with each sending; the grantee's
+  journal keeps the last it heard and names it in its `grant.answer` and
+  `grant.revoke` (`sent`). A decline or leave naming an earlier sending of
+  a grant that is still `pending` crossed the offer again, which reopened
+  it on the grantee's journal: it changes nothing (the same answer).
 - `grant.revoke`, either way, body `{grant}`: urgent, and it cancels
   whatever is still queued for the grant. The owner's withdrawal ends the
   grantee's row (its card closes if still open); the grantee's ends the
