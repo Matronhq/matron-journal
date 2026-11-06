@@ -235,65 +235,71 @@ export function applySnapshotPage(d, incoming, body, now) {
   if (!Array.isArray(body.milestones ?? []) || !Array.isArray(body.items ?? [])) fail('malformed')
   const milestones = (body.milestones ?? []).map(readMilestone)
   const items = (body.items ?? []).map(readItem)
-  let rep = d.prepare('SELECT * FROM fed_replica_missions WHERE fg_id=?').get(incoming.id)
+  const mission = page === 0 ? readMission(body.mission) : null
+  const repId = () => d.prepare('SELECT id FROM fed_replica_missions WHERE fg_id=?').get(incoming.id)?.id ?? null
+  // Pages wait in fed_replica_pages, already read, until the last one is
+  // in: only a whole snapshot touches the copy.
   if (page === 0) {
-    const m = readMission(body.mission)
-    // The same local id across every snapshot of this grant, and again if
-    // it ends and is accepted anew.
-    const id = rep?.id ?? incoming.replica_mission_id ?? newId('ms')
-    if (incoming.replica_mission_id !== id) d.prepare('UPDATE fed_grants_in SET replica_mission_id=? WHERE id=?').run(id, incoming.id)
-    const cols = [m.num, m.title, m.name, m.body, m.state, m.status, m.status_by, m.status_updated_at, m.close_summary, m.closed_by, m.created_by, m.created_at, m.updated_at, m.closed_at]
-    if (rep) {
-      d.prepare(`UPDATE fed_replica_missions SET num=?, title=?, name=?, body=?, state=?, status=?, status_by=?, status_updated_at=?, close_summary=?, closed_by=?,
-        created_by=?, created_at=?, updated_at=?, closed_at=?, loading_snap=?, loaded_pages=1, received_at=? WHERE fg_id=?`).run(...cols, snap, now, incoming.id)
-    } else {
-      d.prepare(`INSERT INTO fed_replica_missions(id, fg_id, user_id, num, title, name, body, state, status, status_by, status_updated_at, close_summary, closed_by,
-        created_by, created_at, updated_at, closed_at, loading_snap, loaded_pages, complete, received_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,0,?)`)
-        .run(id, incoming.id, incoming.user_id, ...cols, snap, now)
-    }
-    rep = d.prepare('SELECT * FROM fed_replica_missions WHERE fg_id=?').get(incoming.id)
-  } else if (!rep || rep.loading_snap !== snap) {
+    d.prepare('DELETE FROM fed_replica_pages WHERE fg_id=?').run(incoming.id)
+  } else {
+    const loading = d.prepare('SELECT snap, COUNT(*) AS n FROM fed_replica_pages WHERE fg_id=? GROUP BY snap').get(incoming.id)
     // A page of a snapshot that is not the one being loaded (one a newer
     // snapshot replaced, or one given up on below): nothing to do.
-    return { done: null, missionId: rep?.id ?? null }
-  } else if (page !== rep.loaded_pages) {
-    // A page missing before this one (refused, and dropped from the
-    // owner's outbox): this snapshot can never be whole, so it is given up
-    // on, and the copy stays as the last whole one left it.
-    d.prepare('UPDATE fed_replica_missions SET loading_snap=NULL WHERE fg_id=?').run(incoming.id)
-    return { done: null, missionId: rep.id }
+    if (!loading || loading.snap !== snap) return { done: null, missionId: repId() }
+    if (page !== loading.n) {
+      // A page missing before this one (refused, and dropped from the
+      // owner's outbox): this snapshot can never be whole, so it is given
+      // up on, and the copy stays as the last whole one left it.
+      d.prepare('DELETE FROM fed_replica_pages WHERE fg_id=?').run(incoming.id)
+      return { done: null, missionId: repId() }
+    }
+  }
+  if (page < pages - 1) {
+    d.prepare('INSERT INTO fed_replica_pages(fg_id, snap, page, body, received_at) VALUES(?,?,?,?,?)')
+      .run(incoming.id, snap, page, JSON.stringify({ mission, milestones, items }), now)
+    return { done: null, missionId: repId() }
+  }
+  // The last page: apply the whole snapshot.
+  const staged = d.prepare('SELECT body FROM fed_replica_pages WHERE fg_id=? AND snap=? ORDER BY page').all(incoming.id, snap).map((r) => JSON.parse(r.body))
+  d.prepare('DELETE FROM fed_replica_pages WHERE fg_id=?').run(incoming.id)
+  const all = [...staged, { mission, milestones, items }]
+  const m = all[0].mission
+  let rep = d.prepare('SELECT * FROM fed_replica_missions WHERE fg_id=?').get(incoming.id)
+  // The same local id across every snapshot of this grant, and again if it
+  // ends and is accepted anew.
+  const id = rep?.id ?? incoming.replica_mission_id ?? newId('ms')
+  if (incoming.replica_mission_id !== id) d.prepare('UPDATE fed_grants_in SET replica_mission_id=? WHERE id=?').run(id, incoming.id)
+  const cols = [m.num, m.title, m.name, m.body, m.state, m.status, m.status_by, m.status_updated_at, m.close_summary, m.closed_by, m.created_by, m.created_at, m.updated_at, m.closed_at]
+  if (rep) {
+    d.prepare(`UPDATE fed_replica_missions SET num=?, title=?, name=?, body=?, state=?, status=?, status_by=?, status_updated_at=?, close_summary=?, closed_by=?,
+      created_by=?, created_at=?, updated_at=?, closed_at=?, applied_snap=?, complete=1, received_at=? WHERE fg_id=?`).run(...cols, snap, now, incoming.id)
   } else {
-    d.prepare('UPDATE fed_replica_missions SET loaded_pages=loaded_pages+1 WHERE fg_id=?').run(incoming.id)
+    d.prepare(`INSERT INTO fed_replica_missions(id, fg_id, user_id, num, title, name, body, state, status, status_by, status_updated_at, close_summary, closed_by,
+      created_by, created_at, updated_at, closed_at, applied_snap, complete, received_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)`)
+      .run(id, incoming.id, incoming.user_id, ...cols, snap, now)
   }
-  const countOf = (table) => d.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE fg_id=? AND seen_snap=?`).get(incoming.id, snap).n
-  let room = MAX_RECORDS - countOf('fed_replica_milestones')
-  for (const l of milestones) {
-    if (room-- <= 0) break
-    d.prepare(`INSERT INTO fed_replica_milestones(id, fg_id, ref, num, kind, title, body, created_by, created_at, contributor_name, contributor_via, seen_snap)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fg_id, ref) DO UPDATE SET num=excluded.num, kind=excluded.kind, title=excluded.title, body=excluded.body,
-      created_by=excluded.created_by, created_at=excluded.created_at, contributor_name=excluded.contributor_name, contributor_via=excluded.contributor_via, seen_snap=excluded.seen_snap`)
-      .run(newId('ml'), incoming.id, l.ref, l.num, l.kind, l.title, l.body, l.created_by, l.created_at, l.contributor_name, l.contributor_via, snap)
+  const insMilestone = d.prepare(`INSERT INTO fed_replica_milestones(id, fg_id, ref, num, kind, title, body, created_by, created_at, contributor_name, contributor_via, seen_snap)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fg_id, ref) DO UPDATE SET num=excluded.num, kind=excluded.kind, title=excluded.title, body=excluded.body,
+    created_by=excluded.created_by, created_at=excluded.created_at, contributor_name=excluded.contributor_name, contributor_via=excluded.contributor_via, seen_snap=excluded.seen_snap`)
+  const insItem = d.prepare(`INSERT INTO fed_replica_items(id, fg_id, user_id, ref, num, kind, state, resolution, awaiting, title, body, created_by, created_at, updated_at, closed_at,
+    labels, links, comment_count, last_comment_at, contributor_name, contributor_via, comments, comments_truncated, seen_snap)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fg_id, ref) DO UPDATE SET num=excluded.num, kind=excluded.kind, state=excluded.state,
+    resolution=excluded.resolution, awaiting=excluded.awaiting, title=excluded.title, body=excluded.body, created_by=excluded.created_by,
+    created_at=excluded.created_at, updated_at=excluded.updated_at, closed_at=excluded.closed_at, labels=excluded.labels, links=excluded.links,
+    comment_count=excluded.comment_count, last_comment_at=excluded.last_comment_at, contributor_name=excluded.contributor_name,
+    contributor_via=excluded.contributor_via, comments=excluded.comments, comments_truncated=excluded.comments_truncated, seen_snap=excluded.seen_snap`)
+  for (const l of all.flatMap((p) => p.milestones).slice(0, MAX_RECORDS)) {
+    insMilestone.run(newId('ml'), incoming.id, l.ref, l.num, l.kind, l.title, l.body, l.created_by, l.created_at, l.contributor_name, l.contributor_via, snap)
   }
-  room = MAX_RECORDS - countOf('fed_replica_items')
-  for (const i of items) {
-    if (room-- <= 0) break
-    d.prepare(`INSERT INTO fed_replica_items(id, fg_id, user_id, ref, num, kind, state, resolution, awaiting, title, body, created_by, created_at, updated_at, closed_at,
-      labels, links, comment_count, last_comment_at, contributor_name, contributor_via, comments, comments_truncated, seen_snap)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fg_id, ref) DO UPDATE SET num=excluded.num, kind=excluded.kind, state=excluded.state,
-      resolution=excluded.resolution, awaiting=excluded.awaiting, title=excluded.title, body=excluded.body, created_by=excluded.created_by,
-      created_at=excluded.created_at, updated_at=excluded.updated_at, closed_at=excluded.closed_at, labels=excluded.labels, links=excluded.links,
-      comment_count=excluded.comment_count, last_comment_at=excluded.last_comment_at, contributor_name=excluded.contributor_name,
-      contributor_via=excluded.contributor_via, comments=excluded.comments, comments_truncated=excluded.comments_truncated, seen_snap=excluded.seen_snap`)
-      .run(newId('it'), incoming.id, incoming.user_id, i.ref, i.num, i.kind, i.state, i.resolution, i.awaiting, i.title, i.body, i.created_by, i.created_at,
-        i.updated_at, i.closed_at, JSON.stringify(i.labels), JSON.stringify(i.links), i.comment_count, i.last_comment_at, i.contributor_name, i.contributor_via,
-        JSON.stringify(i.comments), i.comments_truncated ? 1 : 0, snap)
+  for (const i of all.flatMap((p) => p.items).slice(0, MAX_RECORDS)) {
+    insItem.run(newId('it'), incoming.id, incoming.user_id, i.ref, i.num, i.kind, i.state, i.resolution, i.awaiting, i.title, i.body, i.created_by, i.created_at,
+      i.updated_at, i.closed_at, JSON.stringify(i.labels), JSON.stringify(i.links), i.comment_count, i.last_comment_at, i.contributor_name, i.contributor_via,
+      JSON.stringify(i.comments), i.comments_truncated ? 1 : 0, snap)
   }
-  if (page < pages - 1) return { done: null, missionId: rep.id }
-  // The last page: whatever this snapshot did not carry is gone.
+  // Whatever this snapshot did not carry is gone.
   d.prepare('DELETE FROM fed_replica_milestones WHERE fg_id=? AND seen_snap IS NOT ?').run(incoming.id, snap)
   d.prepare('DELETE FROM fed_replica_items WHERE fg_id=? AND seen_snap IS NOT ?').run(incoming.id, snap)
-  d.prepare('UPDATE fed_replica_missions SET loading_snap=NULL, applied_snap=?, complete=1, received_at=? WHERE fg_id=?').run(snap, now, incoming.id)
-  return { done: rep.complete ? 'changed' : 'added', missionId: rep.id }
+  return { done: rep?.complete ? 'changed' : 'added', missionId: id }
 }
 
 // --- Reads: the grantee's journal -----------------------------------------

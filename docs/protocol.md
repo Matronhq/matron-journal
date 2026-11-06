@@ -5535,12 +5535,14 @@ fields cross:
 Attachments do not cross yet. `ref` is the owner journal's id.
 
 The grantee's journal refuses a page for a grant that is not active there
-(`409 not_active`) and otherwise keeps a copy: page 0 starts loading
-`snap`, a page of any other snapshot is ignored, and the last page drops
-every record that snapshot did not carry. Pages apply only in order: a
-page that arrives with one missing before it (refused, and dropped from
-the owner's outbox) gives that snapshot up, and the copy stays as the last
-whole snapshot left it. Peer text is checked on arrival:
+(`409 not_active`) and otherwise keeps a copy. Page 0 starts loading
+`snap` and a page of any other snapshot is ignored. Pages are held, not
+applied, until the last one arrives; the whole snapshot is then applied
+at once, and every record it did not carry is dropped. Pages must arrive
+in order: one that arrives with a page missing before it (refused, and
+dropped from the owner's outbox) gives that snapshot up, the held pages
+are discarded, and the copy stays as the last whole snapshot left it.
+Peer text is checked on arrival:
 one-line fields are flattened, bodies keep their lines without other
 control characters, unknown enum values fall back (`kind` to `task` or
 `progress`, `state` to `open`, `author` to `agent`), only http(s) links are
