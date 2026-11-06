@@ -62,6 +62,15 @@ function endPeopleRooms(ctx, out) {
   }
 }
 
+// Removing or blocking, and for a contact on another journal the message
+// that tells its journal, in one transaction: the ending never commits
+// without the message that carries it.
+const endContact = (ctx, end) => ctx.db.transaction(() => {
+  const out = end()
+  if (out) ctx.federationContacts?.queueEnd(out)
+  return out
+})()
+
 const forbidden = (res) => { json(res, 403, { error: 'forbidden' }); return true }
 const blocked = (res, by, extra = {}) => conflict(res, { blocked_by: by, ...extra })
 const CONTACT_CONFLICTS = new Set(['already_contact', 'pending', 'pending_in', 'blocked', 'too_many_asks', 'not_pending', 'not_active', 'not_blocked'])
@@ -131,14 +140,14 @@ async function handleContactSub(ctx, req, res, url, who, id, sub) {
     if (req.method === 'GET') { json(res, 200, { contact: contactRow(own) }); return true }
     if (req.method === 'DELETE') {
       let out
-      try { out = removeContact(db, { userId: who.userId, contactId: own.id }) } catch (err) {
+      try { out = endContact(ctx, () => removeContact(db, { userId: who.userId, contactId: own.id })) } catch (err) {
         if (CONTACT_CONFLICTS.has(err.message)) return blocked(res, err.message)
         throw err
       }
       if (!out) return notFound(res)
       onContactEnded(ctx, who, out, 'removed')
       endPeopleRooms(ctx, out)
-      ctx.federationContacts?.onLocalEnd(out)
+      ctx.federationContacts?.kick()
       json(res, 200, { contact: contactRow(out.contact) })
       return true
     }
@@ -163,14 +172,14 @@ async function handleContactSub(ctx, req, res, url, who, id, sub) {
   }
   if (sub === 'block') {
     let out
-    try { out = blockContact(db, { userId: who.userId, contactId: own.id }) } catch (err) {
+    try { out = endContact(ctx, () => blockContact(db, { userId: who.userId, contactId: own.id })) } catch (err) {
       if (CONTACT_CONFLICTS.has(err.message)) return blocked(res, err.message)
       throw err
     }
     if (!out) return notFound(res)
     onContactEnded(ctx, who, out, 'blocked')
     endPeopleRooms(ctx, out)
-    ctx.federationContacts?.onLocalEnd(out)
+    ctx.federationContacts?.kick()
     json(res, 200, { contact: contactRow(out.contact) })
     return true
   }

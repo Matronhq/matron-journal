@@ -430,3 +430,49 @@ test('the first undelivered notice announces the People conversation to clients'
   assert.equal(types[0], 'convo_meta')
   assert.ok(types.includes('item'))
 })
+
+test('hooks: onAcked commits with the acknowledgement, never runs for an entry cancelled in flight, and a throw retries', async () => {
+  const r = await rig()
+  const acked = []
+  const after = []
+  r.ops['test.op'] = {
+    onAcked: (db, entry, result) => {
+      if (entry.meta?.fail) throw new Error('boom')
+      acked.push([entry.id, entry.meta, result])
+      return () => after.push(entry.id)
+    },
+  }
+  const ok = r.q({ meta: { key: 'k1' } })
+  await r.outbox.tick()
+  assert.deepEqual(acked, [[ok, { key: 'k1' }, { applied: true }]])
+  assert.deepEqual(after, [ok])
+
+  // Cancelled while the request was in flight: the answer changes nothing.
+  const gone = r.q({ subject: 'mission:m2' })
+  // The entry is cancelled while its request is out; the answer comes after.
+  r.answers.push({ get status() { r.db.prepare("UPDATE fed_outbox SET state='cancelled' WHERE id=?").run(gone); return 200 }, body: { ok: true, result: {} }, signed: true })
+  await r.outbox.tick()
+  assert.equal(r.row(gone).state, 'cancelled')
+  assert.equal(acked.length, 1)
+
+  // A throwing onAcked rolls the acknowledgement back; the entry retries.
+  const bad = r.q({ subject: 'mission:m3', meta: { fail: true } })
+  await r.outbox.tick()
+  assert.deepEqual([r.row(bad).state, r.row(bad).last_error], ['queued', 'ack_failed'])
+})
+
+test('hooks: a string from stillAllowed ends the entry dead with that error; a denied journal gets nothing more', async () => {
+  const r = await rig()
+  const dead = []
+  r.ops['test.op'] = { stillAllowed: () => 'key_changed', onDead: (db, entry, info) => { dead.push(info.error); return 'discard' } }
+  const id = r.q()
+  await r.outbox.tick()
+  assert.deepEqual([r.row(id).state, r.row(id).last_error, dead], ['cancelled', 'key_changed', ['key_changed']])
+  assert.equal(r.sent.length, 0)
+  assert.equal(r.notices().length, 0, 'a discarded entry files no undelivered notice')
+
+  const denied = makeOutbox({ db: r.db, federation: { key: { privateKey: r.self.privateKey }, denyJournals: ['b.example'] }, client: { postEnvelope: async () => assert.fail('sent') }, log: quietLog, now: r.now })
+  const d = r.q({ op: 'other.op', subject: 'x' })
+  await denied.tick()
+  assert.deepEqual([r.row(d).state, r.row(d).last_error], ['dead', 'journal_not_allowed'])
+})

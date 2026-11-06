@@ -275,7 +275,7 @@ test('remove: either side ends it on both journals', async (t) => {
   await befriend(w)
   const [bobSide] = await contactsOf(w.phones.bob)
   assert.equal((await w.phones.bob(`/contacts/${bobSide.id}`, { method: 'DELETE' })).status, 200)
-  assert.deepEqual(w.b.db.prepare("SELECT op, urgent FROM fed_outbox WHERE state='queued'").all(), [{ op: 'contact.remove', urgent: 1 }])
+  assert.deepEqual(w.b.db.prepare("SELECT op, urgent FROM fed_outbox WHERE op='contact.remove' AND state IN ('queued','sent')").all(), [{ op: 'contact.remove', urgent: 1 }])
   await w.settle()
   assert.equal((await contactsOf(w.phones.alice)).length, 0)
   assert.equal(w.a.db.prepare("SELECT state FROM contacts WHERE peer_journal='b.example'").get().state, 'removed')
@@ -385,4 +385,41 @@ test('reconnect: a failed answer on a new key leaves the live contact as it was'
   await w.settle()
   assert.deepEqual((await contactsOf(w.phones.bob)).map((c) => [c.address, c.state, c.key_changed]), [['alice@a.example', 'active', true]])
   assert.equal(notices(w.b, w.users.bob.id).at(-1).title, "Couldn't reconnect with alice@a.example")
+})
+
+// b's own outbox stopped (accept's immediate kick does nothing), and one
+// that runs b's contact hooks only when the test says so.
+async function pauseB(w) {
+  await w.b.federationOutbox.stop()
+  return makeOutbox({ db: w.b.db, federation: { key: ensureFederationKey(w.b.db, makeTokenBox(KEY)) }, client: w.client, ops: w.b.federationContacts.outbound, log: { log() {}, error() {} } })
+}
+
+test('subjects: two users accepting invites from the same address never cancel each other', async (t) => {
+  const w = await world(t)
+  const b = await pauseB(w)
+  const one = await invite(w)
+  const two = await invite(w)
+  await w.phones.bob('/contacts/invites/accept', post({ link: one.link }))
+  await w.phones.carol('/contacts/invites/accept', post({ link: two.link }))
+  assert.equal(w.b.db.prepare('SELECT COUNT(DISTINCT subject) AS n FROM fed_outbox').get().n, 2)
+  // Bob withdraws: only his answer is cancelled.
+  const [bobSide] = await contactsOf(w.phones.bob)
+  await w.phones.bob(`/contacts/${bobSide.id}`, { method: 'DELETE' })
+  await b.tick()
+  await b.tick()
+  assert.deepEqual((await contactsOf(w.phones.carol)).map((c) => c.state), ['active'])
+  assert.deepEqual((await contactsOf(w.phones.alice)).map((c) => c.address), ['carol@b.example'])
+})
+
+test('consented key: an answer waiting when another key is pinned for that journal ends instead of being acknowledged', async (t) => {
+  const w = await world(t)
+  const b = await pauseB(w)
+  const { link } = await invite(w)
+  await w.phones.bob('/contacts/invites/accept', post({ link }))
+  // Meanwhile something else is pinned for a.example here.
+  w.b.db.prepare("UPDATE fed_peers SET key_pub=? WHERE host='a.example'").run(exportPublicKey(generateFederationKey().publicKey))
+  await b.tick()
+  assert.equal(w.b.db.prepare("SELECT state FROM contacts WHERE peer_journal='a.example'").get().state, 'expired')
+  assert.match(notices(w.b, w.users.bob.id).at(-1).body, /changed its key while this was waiting/)
+  assert.equal((await contactsOf(w.phones.alice)).length, 0, 'nothing reached alice')
 })

@@ -66,7 +66,10 @@ const fail = (code) => { throw new Error(code) }
 const hostOf = (address) => address.slice(address.indexOf('@') + 1)
 const nameOf = (address) => address.slice(0, address.indexOf('@'))
 const hashToken = (token) => createHash('sha256').update(token).digest('hex')
-const subjectOf = (address) => `contact:${address}`
+// The outbox orders ops per (peer, subject): one subject per pair of
+// people, so two users here with contacts at the same address never wait
+// for, or cancel, each other's ops.
+const subjectOf = (local, remote) => `contact:${local}|${remote}`
 const userById = (db, id) => db.prepare('SELECT id, name, unlisted FROM users WHERE id=?').get(id)
 const userByName = (db, name) => db.prepare('SELECT id, name, unlisted FROM users WHERE name=?').get(name)
 // An address in a sentence of the journal's: peer text, flattened (plainText
@@ -197,10 +200,11 @@ function pinPeer(db, { host, baseUrl, pub, now }) {
 const queuedAnswer = (db, userId, address) =>
   !!db.prepare("SELECT 1 FROM fed_outbox WHERE user_id=? AND to_addr=? AND op=? AND state='queued'").get(userId, address, ACCEPT_OP)
 
-// The row is waiting on its invite answer: a new contact (pending_out), or
-// a live one reconnecting on its journal's new key.
-const awaitingAnswer = (row) => row?.state === 'pending_out' ||
-  (row?.state === 'active' && row.journal_key_now != null && row.peer_journal_key !== row.journal_key_now)
+// The row is waiting on the answer `entry` carries: a new contact
+// (pending_out), or a live one reconnecting under the key the user
+// consented to (entry.meta.key).
+const awaitingAnswer = (row, entry) => row?.state === 'pending_out' ||
+  (row?.state === 'active' && !!entry?.meta?.key && row.peer_journal_key !== entry.meta.key)
 
 const liveRemoteCount = (db, userId) =>
   db.prepare(`SELECT COUNT(*) AS n FROM contacts WHERE user_id=? AND peer_journal IS NOT NULL AND state IN ${LIVE_REMOTE}`).get(userId).n
@@ -225,7 +229,7 @@ function putRemoteRow(db, { userId, name, host, pub, state, displayName, request
 
 // `ctx` is {db, hub, pushPipeline}; `federation` the loaded identity;
 // `client` the federation client; the outbox is set once it exists.
-// → {createInvite, listInvites, revokeInvite, preview, accept, onLocalEnd,
+// → {createInvite, listInvites, revokeInvite, preview, accept, queueEnd, kick,
 //    inbound, outbound, setOutbox}
 export function makeContactFederation({ db, hub = null, pushPipeline = null, federation, client, now: clock = Date.now, log = console }) {
   const ctx = { db, hub, pushPipeline }
@@ -265,9 +269,11 @@ export function makeContactFederation({ db, hub = null, pushPipeline = null, fed
     try { wk = await client.fetchWellKnown(inv.host) } catch (err) {
       fail(err.message === 'bad_well_known' ? 'bad_journal' : 'unreachable')
     }
-    if (wk.fingerprint !== inv.fingerprint) fail('fingerprint_mismatch')
+    // What the journal serves is news whatever the link says: an old link
+    // opened after a key change still reveals the change.
     const { seen, cut } = observeKey(db, inv.host, wk.pub, clock())
     if (cut.length) noticeCut(cut, inv.host)
+    if (wk.fingerprint !== inv.fingerprint) fail('fingerprint_mismatch')
     if (seen === 'blocked') fail('journal_blocked')
     return { inv, wk, user, address: `${inv.user}@${inv.host}`, seen }
   }
@@ -303,9 +309,12 @@ export function makeContactFederation({ db, hub = null, pushPipeline = null, fed
       const own = reconnect
         ? remoteContactRaw(db, userId, inv.user, inv.host)
         : putRemoteRow(db, { userId, name: inv.user, host: inv.host, pub: wk.pub, state: 'pending_out', displayName: inv.user, requestedBy: 'user', now: at })
+      const from = `${user.name}@${federation.host}`
+      // meta.key: the key this user consented to. The answer is acknowledged
+      // under it or not at all, whatever another user here pins meanwhile.
       enqueue(db, {
-        userId, from: `${user.name}@${federation.host}`, to: address, op: ACCEPT_OP,
-        body: { token: inv.token, display_name: user.name }, subject: subjectOf(address), now: at,
+        userId, from, to: address, op: ACCEPT_OP, body: { token: inv.token, display_name: user.name },
+        subject: subjectOf(from, address), meta: { key: wk.pub }, now: at,
       })
       return { row: own, cut: cutOff.filter((c) => c.id !== own.id) }
     })()
@@ -316,22 +325,17 @@ export function makeContactFederation({ db, hub = null, pushPipeline = null, fed
     return row
   }
 
-  // After removeContact / blockContact on a contact on another journal:
-  // tell that journal the contact ended (a block reads as a removal there).
-  // Anything still queued for the contact (an invite answer) is cancelled.
-  function onLocalEnd(out) {
-    const before = out.before
+  // Inside the transaction that ends a contact on another journal (removeContact
+  // or blockContact): queue `contact.remove` to tell that journal, so the
+  // ending and the message are one commit. A block reads as a removal
+  // there. Anything still queued for the contact (an invite answer) is
+  // cancelled. kick() afterwards, once committed.
+  function queueEnd(out) {
+    const before = out?.before
     if (!before?.peer_journal || !['active', 'pending_out'].includes(before.state)) return
-    const address = addressOf(before)
-    try {
-      enqueue(db, {
-        userId: before.user_id, from: myAddress(before.user_id), to: address, op: REMOVE_OP, body: {},
-        subject: subjectOf(address), urgent: true, cancelSubject: true, now: clock(),
-      })
-      outbox?.kick()
-    } catch (err) {
-      log.error('federation: could not queue the contact removal (it stands here)', err)
-    }
+    const from = myAddress(before.user_id)
+    const to = addressOf(before)
+    enqueue(db, { userId: before.user_id, from, to, op: REMOVE_OP, body: {}, subject: subjectOf(from, to), urgent: true, cancelSubject: true, now: clock() })
   }
 
   // --- Inbound ops (the inviter's journal, and either side for remove) -------
@@ -387,7 +391,7 @@ export function makeContactFederation({ db, hub = null, pushPipeline = null, fed
         const out = removeContact(d, { userId: user.id, contactId: cur.id, now })
         // An invite answer of ours still queued for them has nothing to do.
         d.prepare("UPDATE fed_outbox SET state='cancelled', ended_at=?, last_error='contact_ended' WHERE user_id=? AND peer_host=? AND subject=? AND state='queued'")
-          .run(now, user.id, hostOf(envelope.from), subjectOf(envelope.from))
+          .run(now, user.id, hostOf(envelope.from), subjectOf(envelope.to, envelope.from))
         pending.set(envelope, out)
         return {}
       },
@@ -411,29 +415,39 @@ export function makeContactFederation({ db, hub = null, pushPipeline = null, fed
   const rowFor = (d, entry) => remoteContactRaw(d, entry.user_id, nameOf(entry.to_addr), hostOf(entry.to_addr))
   const outbound = {
     [ACCEPT_OP]: {
-      stillAllowed: (d, entry) => awaitingAnswer(rowFor(d, entry)),
+      stillAllowed(d, entry) {
+        const row = rowFor(d, entry)
+        if (!awaitingAnswer(row, entry)) return false
+        // Another user here pinned a different key for that journal since:
+        // this answer would be acknowledged under a key nobody asked this
+        // user about. It ends, and onDead says so.
+        if (entry.meta?.key && row.journal_key_now !== entry.meta.key) return 'key_changed'
+        return true
+      },
       onAcked(d, entry, result) {
         const row = rowFor(d, entry)
-        if (!awaitingAnswer(row)) return
+        if (!awaitingAnswer(row, entry)) return undefined
         const at = clock()
         const displayName = sanitizePeerText(result?.display_name, NAME_CAP) || row.peer_user
-        // The key the answer went out under: the journal's, as pinned when
-        // the user accepted.
         d.prepare("UPDATE contacts SET state='active', peer_journal_key=?, display_name=?, accepted_at=?, updated_at=? WHERE id=?")
-          .run(row.journal_key_now ?? row.peer_journal_key, displayName, at, at, row.id)
+          .run(entry.meta?.key ?? row.peer_journal_key, displayName, at, at, row.id)
         const fresh = rowFor(d, entry)
-        audit(ctx, row.user_id, { event: 'contact.accepted', summary: `You and ${who(fresh)} are now contacts`, contact: fresh })
-        changed(ctx, row.user_id, { contact_id: row.id })
+        return () => {
+          audit(ctx, row.user_id, { event: 'contact.accepted', summary: `You and ${who(fresh)} are now contacts`, contact: fresh })
+          changed(ctx, row.user_id, { contact_id: row.id })
+        }
       },
       onDead(d, entry, { error }) {
         const row = rowFor(d, entry)
-        if (awaitingAnswer(row)) {
+        if (awaitingAnswer(row, entry)) {
           const at = clock()
           const reconnect = row.state === 'active'
           // A new contact ends; a live one reconnecting stays as it was.
           if (!reconnect) d.prepare("UPDATE contacts SET state='expired', updated_at=? WHERE id=? AND state='pending_out'").run(at, row.id)
           const name = who(row)
-          const why = error === 'invite_invalid'
+          const why = error === 'key_changed'
+            ? `The journal at ${row.peer_journal} changed its key while this was waiting. Ask ${plain(row.peer_user)} for a fresh invite link.`
+            : error === 'invite_invalid'
             ? `The invite link has already been used, has expired or was withdrawn. Ask ${plain(row.peer_user)} for a new one.`
             : error === 'expired'
               ? `Their journal at ${row.peer_journal} could not be reached for 7 days. Ask ${plain(row.peer_user)} for a new link and try again.`
@@ -447,13 +461,22 @@ export function makeContactFederation({ db, hub = null, pushPipeline = null, fed
         return 'discard'
       },
     },
+    [REMOVE_OP]: {
+      // Only to the key this contact was pinned to: a journal now serving
+      // another key is not who the user knew, and is told nothing.
+      stillAllowed(d, entry) {
+        const row = rowFor(d, entry)
+        return !!row && row.journal_state === 'active' && row.peer_journal_key === row.journal_key_now
+      },
+    },
   }
 
   return {
     createInvite: (userId) => createInvite(db, { userId, federation, now: clock() }),
     listInvites: (userId) => listInvites(db, userId, clock()),
     revokeInvite: (userId, inviteId) => revokeInvite(db, { userId, inviteId, now: clock() }),
-    preview, accept, onLocalEnd, inbound, outbound,
+    preview, accept, queueEnd, inbound, outbound,
+    kick() { outbox?.kick() },
     setOutbox(o) { outbox = o },
   }
 }

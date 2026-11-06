@@ -28,8 +28,16 @@
 //     on their own subject; they can also cancel what is queued there.
 //
 // Later stages register their ops with optional hooks:
-//   {stillAllowed(db, entry) -> bool, onAcked(db, entry, result),
+//   {stillAllowed(db, entry) -> true | false | '<error>',
+//    onAcked(db, entry, result) -> after() | undefined,
 //    onDead(db, entry, {status, error}) -> 'discard' | undefined}
+// stillAllowed false cancels the entry quietly; a string ends it dead with
+// that error, so its onDead can tell the user. onAcked runs in the
+// transaction that marks the entry sent, and only if this attempt is what
+// marked it: a throw rolls both back and the entry is retried (the peer
+// answers the retry from its receipt). The function it may return runs
+// after the commit, for side effects that reach users. `entry.meta` is
+// the op's local context (enqueue's `meta`), never sent.
 // An onDead that answers 'discard' has told its user itself (an invite that
 // can no longer be used, say): the entry is ended as cancelled, so it does
 // not block its subject, and no undelivered notice is filed for it.
@@ -42,6 +50,7 @@ import { itemMarkerPayload, ITEM_EVENT_TYPE } from './items-marker.js'
 import { ensurePeopleConvo } from './people-convo.js'
 import { peopleConvo } from './sharing-events.js'
 import { RECEIPT_TTL_MS } from './federation-inbound.js'
+import { journalListed } from './federation-identity.js'
 
 export const OUTBOX_MAX_AGE_MS = 7 * 24 * 3600 * 1000
 export const BACKOFF_BASE_MS = 30_000
@@ -77,7 +86,7 @@ export function backoffMs(attempts, random = Math.random) {
 // or dead on its subject (a revocation that must not wait behind events the
 // peer is no longer allowed to see). Returns the op id. Errors:
 // 'bad_address', 'not_canonical', 'too_large', 'outbox_full'.
-export function enqueue(db, { userId = null, from, to, op, body, subject = null, urgent = false, cancelSubject = false, now = Date.now() }) {
+export function enqueue(db, { userId = null, from, to, op, body, subject = null, urgent = false, cancelSubject = false, meta = null, now = Date.now() }) {
   if (!isAddress(from) || !isAddress(to)) fail('bad_address')
   const text = canonicalize(body)
   if (Buffer.byteLength(text) > MAX_ENVELOPE_BYTES - 4096) fail('too_large')
@@ -91,8 +100,8 @@ export function enqueue(db, { userId = null, from, to, op, body, subject = null,
       db.prepare("UPDATE fed_outbox SET state='cancelled', ended_at=?, last_error='superseded' WHERE peer_host=? AND subject=? AND state IN ('queued','dead')")
         .run(now, peer, subj)
     }
-    db.prepare(`INSERT INTO fed_outbox(id, user_id, peer_host, from_addr, to_addr, subject, op, body, urgent, next_at, expires_at, created_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, userId, peer, from, to, subj, op, text, urgent ? 1 : 0, now, now + OUTBOX_MAX_AGE_MS, now)
+    db.prepare(`INSERT INTO fed_outbox(id, user_id, peer_host, from_addr, to_addr, subject, op, body, urgent, next_at, expires_at, created_at, meta)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, userId, peer, from, to, subj, op, text, urgent ? 1 : 0, now, now + OUTBOX_MAX_AGE_MS, now, meta == null ? null : JSON.stringify(meta))
     return id
   })()
 }
@@ -211,12 +220,15 @@ export function makeOutbox({ db, hub = null, federation, client, ops = {}, now =
   async function attempt(selected) {
     // The pass selected it before earlier attempts awaited; read it again so
     // a cancellation (or a resend) made meanwhile is what counts.
-    const entry = current.get(selected.seq)
-    if (!entry || entry.state !== 'queued') return
+    const row = current.get(selected.seq)
+    if (!row || row.state !== 'queued') return
+    const entry = { ...row, meta: row.meta ? JSON.parse(row.meta) : null }
     const at = now()
     if (at >= entry.expires_at) return dead(entry, { error: 'expired', at, counted: 0 })
+    if (!journalListed(federation, entry.peer_host)) return dead(entry, { error: 'journal_not_allowed', at, counted: 0 })
     const allowed = hook(entry, 'stillAllowed')
     if (allowed === false) { markCancelled.run('no_longer_allowed', at, entry.seq); return }
+    if (typeof allowed === 'string') return dead(entry, { error: allowed, at, counted: 0 })
     if (allowed === HOOK_FAILED) { markRetry.run(at + backoffMs(entry.attempts + 1, random), null, 'check_failed', entry.seq); return }
     const peer = peerOf.get(entry.peer_host)
     if (!peer || peer.state !== 'active') return dead(entry, { error: peer ? `peer_${peer.state}` : 'unknown_journal', at, counted: 0 })
@@ -237,9 +249,24 @@ export function makeOutbox({ db, hub = null, federation, client, ops = {}, now =
     const s = r.status
     const error = r.body?.error ?? null
     if (s >= 200 && s < 300 && r.signed) {
-      markSent.run(s, at, at, entry.seq)
-      db.prepare('UPDATE fed_peers SET last_ok_at=?, last_error=NULL WHERE host=?').run(at, entry.peer_host)
-      hook(entry, 'onAcked', r.body?.result ?? {})
+      let after
+      try {
+        after = db.transaction(() => {
+          // Cancelled while the request was in flight: the answer changes
+          // nothing here.
+          if (!markSent.run(s, at, at, entry.seq).changes) return null
+          db.prepare('UPDATE fed_peers SET last_ok_at=?, last_error=NULL WHERE host=?').run(at, entry.peer_host)
+          const fn = Object.hasOwn(ops, entry.op) ? ops[entry.op]?.onAcked : undefined
+          return fn ? fn(db, entry, r.body?.result ?? {}) : null
+        })()
+      } catch (err) {
+        log.error(`federation: ${entry.op} onAcked hook failed (retried)`, err)
+        markRetry.run(at + backoffMs(entry.attempts + 1, random), s, 'ack_failed', entry.seq)
+        return
+      }
+      if (typeof after === 'function') {
+        try { after() } catch (err) { log.error(`federation: ${entry.op} after-ack failed (the op stands)`, err) }
+      }
       return
     }
     if (s === 401 && error === 'stale' && r.signed) {

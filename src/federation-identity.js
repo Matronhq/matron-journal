@@ -50,10 +50,16 @@ const hostList = (raw) => (Array.isArray(raw) ? raw : String(raw ?? '').split(',
 // with may federate: the invite is the trust.
 export function journalAllowed(federation, host) {
   if (!federation?.enabled || typeof host !== 'string') return false
-  const h = host.toLowerCase()
-  if (h === federation.host) return false
-  if (federation.denyJournals?.includes(h)) return false
-  if (federation.allowJournals?.length && !federation.allowJournals.includes(h)) return false
+  if (host.toLowerCase() === federation.host) return false
+  return journalListed(federation, host)
+}
+
+// The operator's two lists alone: what the outbox checks before every
+// attempt, so a journal denied after an op was queued gets nothing more.
+export function journalListed(federation, host) {
+  const h = String(host).toLowerCase()
+  if (federation?.denyJournals?.includes(h)) return false
+  if (federation?.allowJournals?.length && !federation.allowJournals.includes(h)) return false
   return true
 }
 

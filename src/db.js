@@ -750,7 +750,8 @@ CREATE TABLE IF NOT EXISTS fed_outbox(
   notified      INTEGER NOT NULL DEFAULT 0,
   created_at    INTEGER NOT NULL,
   acked_at      INTEGER,
-  ended_at      INTEGER
+  ended_at      INTEGER,
+  meta          TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_fed_outbox_due ON fed_outbox(state, next_at);
 CREATE INDEX IF NOT EXISTS idx_fed_outbox_subject ON fed_outbox(peer_host, subject, state, seq);
@@ -1848,6 +1849,9 @@ export function openDb(path) {
   addCols('items', [['contributor_user_id', 'INTEGER'], ['contributor_convo_id', 'TEXT'], ['contributor_name', 'TEXT'], ['contributor_via', 'TEXT']])
   addCols('milestones', [['contributor_name', 'TEXT'], ['contributor_via', 'TEXT']])
   addCols('missions', [['status_contributor', 'TEXT']])
+  // Federation outbox: the op's local-only context for its hooks (never
+  // sent), e.g. the key the user consented to for an invite answer.
+  addCols('fed_outbox', [['meta', 'TEXT']])
   // Unified search's tracker mirror (spec 2026-10-12 unified search §1).
   // Must stay LAST: it reads columns added by every migration above (e.g.
   // missions.name), and its triggers must be reinstalled after any table

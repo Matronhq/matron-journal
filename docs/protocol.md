@@ -5284,7 +5284,11 @@ few seconds. The rules:
   pruned the op's 30-day receipt, and the peer would apply it twice.
 - **Checks before sending.** Before each attempt the sender checks its own
   records again. An op whose grant or contact has ended here is cancelled
-  rather than sent.
+  rather than sent, and an op for a journal the operator's lists now
+  refuse goes dead (`journal_not_allowed`).
+- **Acknowledgement.** An entry is marked sent, and its op's own records
+  updated, in one transaction, and only if the entry was still queued: an
+  answer to an entry cancelled while its request was out changes nothing.
 - **Urgent ops** (revocation, contact removal, block) go ahead of
   everything queued for the peer. They do not wait behind earlier ops on
   their own subject, and may cancel what is still waiting there.
@@ -5369,23 +5373,33 @@ checks, pins the inviter's journal key, writes the user's row as
 `pending_out`, and queues `contact.accept_invite`. Also `409 blocked_by`:
 `already_contact`, `pending`, `blocked`, `too_many_contacts` (200 live
 contacts on other journals). The row turns `active` when the inviter's
-journal acknowledges. If it refuses or cannot be reached for 7 days, the
-row goes `expired`, the user gets a notice saying why, and nothing is left
-to resend: a new link is needed.
+journal acknowledges, and only under the key the user consented to: if
+another key is pinned for that journal while the answer waits, the answer
+ends instead. If it is refused, cannot be delivered for 7 days, or ends
+that way, the row goes `expired`, the user gets a notice saying why, and
+nothing is left to resend: a new link is needed. A live contact on an old
+key that accepts a fresh invite (a reconnect) keeps its row as it was
+until the answer is acknowledged; a failed reconnect hides nothing.
 
 `contact.accept_invite`, body `{token, display_name}`. The inviter's
 journal admits it through discovery (above). In the transaction that
-writes the receipt it checks the invite again (open, or already used by
-this same address), pins the sender's key, writes the inviter's row
-`active`, and marks the invite used. Minting the invite was the inviter's
+writes the receipt it checks the invite again, pins the sender's key,
+writes the inviter's row `active`, and marks the invite used. The invite
+must be open. A spent one is accepted again only as a retry of the same
+answer: from the address that used it, while the contact it made is still
+`active` and signed by the key that contact is pinned to. Once that
+contact has ended, a spent link is spent, and it never restores a removed
+contact. Minting the invite was the inviter's
 consent, so the inviter gets a notice, not a card. The answer is
 `{user, display_name}`. Refusals: `403 invite_invalid` (used by someone
 else, expired, withdrawn, or the inviter has blocked that address: one
 answer for all four), `403 too_many_contacts`, `400 malformed`.
 
 **Removing or blocking** a contact on another journal ends it here at once,
-with every grant between the two, and queues `contact.remove` (body `{}`),
-urgent, cancelling anything still queued for that contact. A block
+with every grant between the two, and queues `contact.remove` (body `{}`)
+in the same transaction, urgent, cancelling anything still queued for that
+contact. It is sent only while that journal still serves the key the
+contact was pinned to. A block
 travels as a removal: the other person is told only that the contact
 ended. The block stays here and refuses every later invite answer from
 that address. On arrival `contact.remove` ends the receiver's row for the

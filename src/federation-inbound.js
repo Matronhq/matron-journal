@@ -167,6 +167,9 @@ export function makeFederationHandler({ db, federation, ops = DEFAULT_OPS, clien
       }
       peer = { host, base_url: wk.baseUrl, key_pub: wk.pub, state: 'active', discovered: true, previous: known ?? null }
     }
+    // The fetch took time: what the op checks (an invite's expiry) is judged
+    // now, not when the envelope arrived.
+    const applyAt = peer.discovered ? now() : at
 
     if (!handler) { send(res, 400, { error: 'unknown_op' }, id); return true }
 
@@ -179,10 +182,10 @@ export function makeFederationHandler({ db, federation, ops = DEFAULT_OPS, clien
           if (prior.hash !== hash) return { status: 409, body: { error: 'id_reused' } }
           return { status: prior.status, body: JSON.parse(prior.response) }
         }
-        const result = handler.apply({ db, envelope, peer, now: at })
+        const result = handler.apply({ db, envelope, peer, now: applyAt })
         const body = { ok: true, result: result ?? {} }
-        putReceipt.run(peer.key_pub, id, hash, 200, JSON.stringify(body), at)
-        touchPeer.run(at, peer.host)
+        putReceipt.run(peer.key_pub, id, hash, 200, JSON.stringify(body), applyAt)
+        touchPeer.run(applyAt, peer.host)
         return { status: 200, body, applied: true, result: result ?? {} }
       })()
     } catch (err) {
@@ -192,7 +195,7 @@ export function makeFederationHandler({ db, federation, ops = DEFAULT_OPS, clien
     }
     send(res, answer.status, answer.body, id)
     if (answer.applied && handler.after) {
-      try { handler.after({ db, envelope, peer, result: answer.result, now: at }) } catch (err) { log.error(`federation: ${envelope.op} after hook failed (the op stands)`, err) }
+      try { handler.after({ db, envelope, peer, result: answer.result, now: applyAt }) } catch (err) { log.error(`federation: ${envelope.op} after hook failed (the op stands)`, err) }
     }
     return true
   }
