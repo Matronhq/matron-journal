@@ -5092,8 +5092,9 @@ Journals talk directly over HTTPS, and every request is a signed envelope.
 This section grows as each part ships. So far it covers the journal's
 identity (`src/federation-identity.js`), the envelope format
 (`src/federation-envelope.js`), the endpoint that receives envelopes
-(`src/federation-inbound.js`) and the rules for calling another journal
-(`src/federation-client.js`). Only `ping` exists so far.
+(`src/federation-inbound.js`), the rules for calling another journal
+(`src/federation-client.js`) and the outbox that delivers ops
+(`src/federation-outbox.js`). Only `ping` exists so far.
 
 ### Journal identity
 
@@ -5220,6 +5221,50 @@ signed answer as an acknowledgement. An unsigned one (a proxy's error page,
 say) is judged by its status alone.
 
 `ping` (`body: {}`) answers `{pong: true, clock}`.
+
+### The outbox
+
+Every op a journal sends is queued first, and a worker delivers it every
+few seconds. The rules:
+
+- **One id per op.** The id is set when the op is queued. Every attempt
+  keeps that id and body, takes a fresh `ts`, and is signed again.
+- **Order.** Ops are delivered first in, first out per (peer, subject),
+  where the subject is a mission, room, contact or grant. An op waits
+  while an earlier one on its subject is queued or dead. Ops on other
+  subjects never wait.
+- **Retries.** 408, 429, 5xx, network errors, and any answer the peer did
+  not sign are retried. The backoff starts at 30 s and doubles up to 1 h,
+  jittered into the upper half of each step.
+- **Permanent refusals.** Any other 4xx is permanent, and so are an
+  unknown or blocked peer and a refused destination.
+- **Clock skew.** A signed `401 stale` is retried at once with a fresh
+  `ts`, and the skew it reports is logged. Skew that survives three
+  attempts is permanent, with an error that names the skew.
+- **Seven days.** An op not acknowledged within 7 days goes dead.
+- **Dead ops** are never dropped silently. The user gets one `notice` per
+  peer in their People conversation, and dead ops keep blocking their
+  subject until the user resends or discards them. A resend re-queues the
+  same ids with a fresh 7 days, so a peer that already applied one answers
+  from its receipt.
+- **Checks before sending.** Before each attempt the sender checks its own
+  records again. An op whose grant or contact has ended here is cancelled
+  rather than sent.
+- **Urgent ops** (revocation, contact removal, block) go ahead of
+  everything queued for the peer, and may cancel what is still waiting on
+  their subject.
+- **Limits.** A peer may have at most 10,000 waiting ops (queued or dead)
+  and 50 MiB of them. Past that, a new op for that peer fails at once
+  instead of the queue growing. Urgent ops are never refused for space.
+
+```
+GET  /federation/outbox[?state=dead|queued|sent|cancelled]   {entries:[{id, peer, op, subject, state, attempts, last_status, last_error, created_at, ended_at}]}
+POST /federation/outbox/resend  {peer}                       {resent}
+POST /federation/outbox/discard {peer}                       {discarded}
+```
+
+Client devices only (`403` to an agent). A client sees only its own
+user's entries, and never their bodies.
 
 ### Calling another journal
 

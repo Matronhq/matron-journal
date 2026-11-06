@@ -702,6 +702,44 @@ CREATE TABLE IF NOT EXISTS fed_receipts(
   PRIMARY KEY(peer_key, id)
 );
 CREATE INDEX IF NOT EXISTS idx_fed_receipts_created ON fed_receipts(created_at);
+-- The outbox (src/federation-outbox.js): every op this journal sends to
+-- another one, kept until the peer acknowledges it or the sender gives up.
+-- id is the op's ULID, fixed when it is queued and kept on every attempt.
+-- Delivery is FIFO per (peer_host, subject) by seq: an entry is not sent
+-- while an earlier one on its subject is queued or dead. urgent entries
+-- (revocations) go ahead of everything else for that peer. user_id is the
+-- user an undelivered op is reported to (NULL: the journal's own).
+--   queued     waiting for its next attempt (next_at)
+--   sent       acknowledged by a signed 2xx
+--   dead       a permanent refusal, or 7 days without an acknowledgement:
+--              blocks its subject until resent or discarded
+--   cancelled  ended here before it was delivered
+CREATE TABLE IF NOT EXISTS fed_outbox(
+  seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+  id            TEXT NOT NULL UNIQUE,
+  user_id       INTEGER REFERENCES users(id),
+  peer_host     TEXT NOT NULL,
+  from_addr     TEXT NOT NULL,
+  to_addr       TEXT NOT NULL,
+  subject       TEXT NOT NULL,
+  op            TEXT NOT NULL,
+  body          TEXT NOT NULL,
+  urgent        INTEGER NOT NULL DEFAULT 0,
+  state         TEXT NOT NULL DEFAULT 'queued' CHECK(state IN ('queued','sent','dead','cancelled')),
+  attempts      INTEGER NOT NULL DEFAULT 0,
+  skew_attempts INTEGER NOT NULL DEFAULT 0,
+  next_at       INTEGER NOT NULL,
+  expires_at    INTEGER NOT NULL,
+  last_status   INTEGER,
+  last_error    TEXT,
+  notified      INTEGER NOT NULL DEFAULT 0,
+  created_at    INTEGER NOT NULL,
+  acked_at      INTEGER,
+  ended_at      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_fed_outbox_due ON fed_outbox(state, next_at);
+CREATE INDEX IF NOT EXISTS idx_fed_outbox_subject ON fed_outbox(peer_host, subject, state, seq);
+CREATE INDEX IF NOT EXISTS idx_fed_outbox_user ON fed_outbox(user_id, peer_host, state);
 -- Agent-to-agent file transfers (src/transfers.js): one row per file a
 -- session sends into a room. Three axes: consent (the user's card), upload
 -- (the sender's chunks) and phase (where the file is in its life; every

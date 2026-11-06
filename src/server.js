@@ -27,6 +27,8 @@ import { resolveWebDir, makeStaticHandler } from './static-http.js'
 import { makeWellKnown, parseList } from './well-known.js'
 import { loadFederation, makeFederationWellKnown } from './federation-identity.js'
 import { makeFederationHandler, pruneReceipts } from './federation-inbound.js'
+import { makeOutbox } from './federation-outbox.js'
+import { makeConfiguredFederationClient } from './federation-client.js'
 import { makeWaker, markWakeRefused, clearWakeRefused } from './wake.js'
 import { makeConfiguredTranscriber } from './cloud-transcribe.js'
 import { makeConfiguredMailer } from './mailer.js'
@@ -449,7 +451,7 @@ export function startServer({
   // Federation between journals (src/federation-identity.js): the test
   // seam, {federation, publicUrl}; env (MATRON_FEDERATION,
   // MATRON_PUBLIC_URL) otherwise. Off unless turned on.
-  federationEnv, federationOps,
+  federationEnv, federationOps, federationClient,
   // Alertmanager webhook (src/alerts-http.js): {token, username}. The
   // option is the test seam; env otherwise. Off unless both are usable.
   alertWebhook,
@@ -618,6 +620,11 @@ export function startServer({
   // POST /federation/v1 (src/federation-inbound.js): 404 while off.
   // `federationOps` is the test seam for the op table.
   const handleFederation = makeFederationHandler({ db, federation, ...(federationOps ? { ops: federationOps } : {}) })
+  // The outbox (src/federation-outbox.js): built only when federation is
+  // on. `federationClient` is the test seam for the outbound client.
+  const federationOutbox = federation.enabled
+    ? makeOutbox({ db, hub, federation, client: federationClient ?? makeConfiguredFederationClient() })
+    : null
   const resolvedAlertWebhook = alertWebhook !== undefined ? alertWebhook : {
     token: process.env.MATRON_ALERT_WEBHOOK_TOKEN || null,
     username: process.env.MATRON_ALERT_WEBHOOK_USER || null,
@@ -644,7 +651,7 @@ export function startServer({
     transferMaxBytes: resolvedTransferMaxBytes, transferUserQuotaBytes: resolvedTransferUserQuotaBytes, transferMaxAwaitingPerSender: resolvedTransferMaxAwaiting, transferChunkBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentTransferDailyCap, consentRoutineCap, verifier,
-    github: resolvedGithub, handleWellKnown, handleFederation, handleStatic, tokenBox,
+    github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
   }))
   const wss = attachWs({
@@ -679,6 +686,7 @@ export function startServer({
           try { pruneReceipts(db) } catch (err) { console.error('federation: receipt prune failed', err) }
         }, 3600_000)
         receiptPruneInterval.unref()
+        federationOutbox.start()
       }
       githubRefreshInterval = scheduleGithubRefresh(db, resolvedGithub, { intervalMs: githubRefreshIntervalMs, box: tokenBox })
       ttsSweepInterval = scheduleTtsSweep(resolvedTts, ttsSweepIntervalMs)
@@ -790,12 +798,16 @@ export function startServer({
         autoArchive: autoArchiveSweep,
         routineFirer,
         github: resolvedGithub,
+        federationOutbox,
         close: () => new Promise((r) => {
           closing = true
           startDelay.cancel()
           if (retentionInterval) clearInterval(retentionInterval)
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
           if (receiptPruneInterval) clearInterval(receiptPruneInterval)
+          // A delivery pass in flight finishes (its requests time out at
+          // 30 s) before the db handle closes.
+          const outboxDone = federationOutbox ? federationOutbox.stop() : Promise.resolve()
           if (githubRefreshInterval) clearInterval(githubRefreshInterval)
           // No new reindex pass can start after this: the only other
           // starter is embedderReady's own `.then`, which re-checks
@@ -827,7 +839,7 @@ export function startServer({
           // A POST /tts waiting on Azure would hold server.close() for up to
           // its 20 s timeout: abort it, so the caller gets its 502 now.
           if (resolvedTts) resolvedTts.close()
-          server.close(() => { Promise.all([searchBackfill, isDiffBackfill, imageDimsBackfill, embedderReady.catch(() => {}), transcriptionDone, semanticInFlight]).then(() => { db.close(); r() }) })
+          server.close(() => { Promise.all([searchBackfill, isDiffBackfill, imageDimsBackfill, embedderReady.catch(() => {}), transcriptionDone, semanticInFlight, outboxDone]).then(() => { db.close(); r() }) })
         }),
       })
     })
