@@ -275,6 +275,8 @@ async function handleJoin(ctx, req, res, who, mission) {
   // its join succeed. The marker says what happened to this conversation.
   if (out.action) emitMissionMarker(ctx, who, { mission: out.mission, action: out.action, convoId: body.convo_id })
   fanRetitled(db, ctx.hub, out.retitled)
+  // The conversation's unfiled items came with it.
+  for (const id of out.repointed ?? []) notifyGrantees(ctx, out.mission.id, 'item', id)
   json(res, 200, { mission: out.mission })
   return true
 }
@@ -448,7 +450,7 @@ async function handleMilestoneCreate(ctx, req, res, who) {
       payload: milestoneMarkerPayload({ milestone: out.milestone, mission: out.mission, by: byOf(who), withTitle: out.markerWithTitle }),
     })
   } catch (err) { console.error('missions: milestone broadcast failed (row and marker already committed)', err) }
-  notifyGrantees({ db, hub }, out.mission.id, 'milestone')
+  notifyGrantees({ db, hub }, out.mission.id, 'milestone', out.milestone.id)
   json(res, 201, { milestone: out.milestone, mission: out.mission })
   return true
 }

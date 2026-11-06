@@ -16,7 +16,7 @@ import { nudgeCoordinator, chatAskId } from './consent.js'
 import { expireContactAsks } from './contacts.js'
 import { expireInviteAsks, onInviteAskExpired } from './federation-invite-asks.js'
 import { expireGrantAsks } from './grants.js'
-import { onContactAskExpired, onGrantAskExpired } from './sharing-events.js'
+import { onContactAskExpired, onGrantAskExpired, notifyGrantees } from './sharing-events.js'
 import { sweepExpiredHandovers } from './item-handover-http.js'
 import { parkPersonRoom, linkOfRoom, isGuestRoom, onGuestAgentAnswer, onGuestInviteExpired, expireSessionShareAsks, LIVE_ROOM_STATES } from './person-rooms.js'
 import { parkTalk } from './talk-requests.js'
@@ -2161,7 +2161,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // republished release runs it again, a no-op once it is done.
         if (msg.type === 'prompt_reply') {
           try {
-            withdrawForQueuedCancel(db, { userId: conn.userId, deviceId: conn.deviceId, convoId: msg.convo_id, sender: publishArgs.sender, payload: msg.payload })
+            const withdrawn = withdrawForQueuedCancel(db, { userId: conn.userId, deviceId: conn.deviceId, convoId: msg.convo_id, sender: publishArgs.sender, payload: msg.payload })
+            // A shared mission's grantees lose its words too.
+            const it = withdrawn && db.prepare('SELECT i.id, i.mission_id, i.consent, i.private FROM item_comments c JOIN items i ON i.id = c.item_id WHERE c.id=?').get(withdrawn)
+            if (it?.mission_id && it.consent == null && !it.private) notifyGrantees({ db, hub }, it.mission_id, 'item', it.id)
           } catch (err) {
             console.error('ws: withdrawing a cancelled item reply failed', err)
           }

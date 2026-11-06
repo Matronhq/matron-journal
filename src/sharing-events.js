@@ -651,6 +651,7 @@ function announceHandover(ctx, g, h) {
     if (!m) continue
     marker(owner, m.origin_convo_id, m, 'closed')
     for (const it of o.closedItems) {
+      notifyGrantees(ctx, m.id, 'item', it.item.id)
       safely('handover item marker', () => {
         const item = withdrawOnClose(ctx, owner, it.item.id) ?? getItem(db, owner, it.item.id) ?? it.item
         appendAndBroadcast(db, hub, { userId: owner, convoId: item.origin_convo_id, sender: JOURNAL, type: ITEM_EVENT_TYPE, payload: itemMarkerPayload({ item, action: 'closed', by: 'agent', comment: it.comment }) })
@@ -802,8 +803,16 @@ function onHandoverOutcome(ctx, who, out) {
 // content — the grantee refetches through the sieved reads, so nothing
 // here can leak what those reads would withhold. `what` is 'mission' |
 // 'milestone' | 'item'. Client sockets only; never throws.
-export function notifyGrantees({ db, hub }, missionId, what) {
+//
+// Contacts on other journals get the record itself instead
+// (federation-grants.js registers here): `ref` names the milestone or item
+// that changed; for 'mission' the mission's own fields.
+const remoteWriters = new WeakMap()
+export function onRemoteMissionWrite(db, fn) { remoteWriters.set(db, fn) }
+
+export function notifyGrantees({ db, hub }, missionId, what, ref = null) {
   if (!missionId) return
+  safely('remote events', () => remoteWriters.get(db)?.(missionId, what, ref))
   safely('live frame', () => {
     const ids = activeGranteeIds(db, missionId)
     if (!ids.length) return
