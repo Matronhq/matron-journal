@@ -40,6 +40,7 @@ import { enqueue } from './federation-outbox.js'
 import { sanitizePeerText, plainText as plain } from './peer-text.js'
 import { contactRow, getContactRaw, remoteContactRaw, removeContact } from './contacts.js'
 import { audit, changed, fileNotice, onGrantRevoked, addressOf } from './sharing-events.js'
+import { onIncomingEnded } from './federation-grants.js'
 
 export const INVITE_TTL_MS = 7 * 24 * 3600 * 1000
 export const MAX_OPEN_INVITES = 20
@@ -404,6 +405,7 @@ export function makeContactFederation({ db, hub = null, pushPipeline = null, fed
           summary: out.before.state === 'active' ? `${name} is no longer your contact` : `${name}'s invite ended`,
         })
         for (const g of out.revokedGrants) onGrantRevoked(ctx, g, 'contact_removed')
+        for (const r of out.endedIncoming ?? []) onIncomingEnded(ctx, r, 'contact_removed')
         changed(ctx, out.contact.user_id, { contact_id: out.contact.id })
       },
       errors: {},

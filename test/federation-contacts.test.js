@@ -306,12 +306,13 @@ test('block: the other side sees a removal; the block refuses every later invite
   assert.equal((await w.phones.alice('/contacts/invites')).json.invites[0].state, 'open', 'the refused answer did not spend the invite')
 })
 
-test('shares: a contact on another journal cannot be offered a mission yet', async (t) => {
+test('shares: a contact whose journal changed its key cannot be offered a mission', async (t) => {
   const w = await world(t)
   await befriend(w)
   upsertConversation(w.a.db, { id: 'work', ownerUserId: w.users.alice.id, title: 'Work', agentDeviceId: w.aliceBoxId })
   const m = await w.aliceBox('/missions', post({ convo_id: 'work', title: 'Garden Club' }))
   assert.equal(m.status, 201)
+  w.a.db.prepare("UPDATE fed_peers SET state='key_changed' WHERE host='b.example'").run()
   const r = await w.phones.alice(`/missions/${m.json.mission.id}/shares`, post({ contact: 'bob@b.example', level: 'read' }))
   assert.deepEqual([r.status, r.json.blocked_by], [409, 'not_contact'])
 })

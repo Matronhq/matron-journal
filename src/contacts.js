@@ -115,6 +115,15 @@ export function isMutual(db, row) {
   return !!row && row.state === 'active' && peerRowOf(db, row)?.state === 'active'
 }
 
+// A contact on another journal that may be offered something: active here,
+// and pinned to the key that journal serves now (no key change since).
+// There is no row of theirs to check: their journal answers for them.
+export function isLiveRemote(db, row) {
+  if (!row?.peer_journal || row.state !== 'active') return false
+  const peer = db.prepare('SELECT key_pub, state FROM fed_peers WHERE host=?').get(row.peer_journal)
+  return !!peer && peer.state === 'active' && peer.key_pub === row.peer_journal_key
+}
+
 export function parkedAsks(db, deviceId) {
   return db.prepare(`SELECT
       (SELECT COUNT(*) FROM contacts WHERE origin_device_id=@d AND state='awaiting_user')
@@ -145,6 +154,17 @@ const setState = (db, id, state, now, extra = '') =>
 // hand-over (level owner, active) is a record of something done, not
 // access, and is left as it is.
 const LIVE_NOT_HANDED = `state IN ${LIVE_GRANT_STATES} AND NOT (level = 'owner' AND state = 'active')`
+// The incoming grants (fed_grants_in) a contact on another journal offered,
+// still live: ended as the contact ends. Rows as they stood, with the
+// owner's address.
+function endIncomingGrants(db, contactId, now) {
+  const rows = db.prepare("SELECT *, owner_name || '@' || peer_host AS owner_address FROM fed_grants_in WHERE contact_id=? AND state IN ('pending','active')").all(contactId)
+  if (rows.length) {
+    db.prepare("UPDATE fed_grants_in SET state='revoked', revoked_by='contact_removed', revoked_at=?, updated_at=? WHERE contact_id=? AND state IN ('pending','active')").run(now, now, contactId)
+  }
+  return rows
+}
+
 function revokeGrantsBetween(db, contactIds, now) {
   const ids = contactIds.filter(Boolean)
   if (!ids.length) return []
@@ -297,10 +317,13 @@ function end(db, { userId, contactId, to, now }) {
     const touchPeer = !!theirs && ['pending_in', 'pending_out', 'active'].includes(theirs.state)
     if (touchPeer) setState(db, theirs.id, 'removed', now, `, revoked_at=${Number(now)}`)
     const revokedGrants = revokeGrantsBetween(db, [own.id, theirs?.id], now)
+    // Shares a contact on another journal offered this user end with it
+    // (src/federation-grants.js); their journal hears of it by contact.remove.
+    const endedIncoming = own.peer_journal ? endIncomingGrants(db, own.id, now) : []
     return {
       contact: rawById(db, own.id), before: own,
       peer: touchPeer ? rawById(db, theirs.id) : null, peerBefore: touchPeer ? theirs : null,
-      revokedGrants,
+      revokedGrants, endedIncoming,
     }
   })()
 }
