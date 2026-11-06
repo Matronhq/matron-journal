@@ -593,6 +593,11 @@ export function attachWs({
               return d
             }
             for (;;) {
+              // Re-read per batch: the role can move while the loop yields,
+              // and this socket is not registered yet, so hub.broadcastJournal
+              // cannot tell it. Replayed `coordinator` frames are history; the
+              // current holder is what a for_you socket follows.
+              if (scoped) conn.coordinatorConvoId = coordinatorFor(db, who.userId)
               const batch = scoped
                 ? scopedEventsAfter(db, who.userId, cursor, conn.coordinatorConvoId, 500)
                 : eventsAfter(db, who.userId, cursor, 500)

@@ -216,3 +216,19 @@ test('replay: a for_you backlog longer than one batch arrives whole and in order
   assert.deepEqual(p.journal().map((f) => f.seq), want)
   p.close()
 })
+
+test('replay: a Coordinator move while a long for_you replay runs is followed', async (t) => {
+  const { s, login, add } = await fixture(t)
+  for (let i = 0; i < 1500; i++) add('work', 'item', { item_id: `it_${i}`, action: 'updated' })
+  const phone = await login('phone')
+  const mac = await login('mac')
+  const p = await makeWsClient(s.base, { token: phone.token, cursor: 0, hello: { sync: 'for_you' } })
+  // Lands while the replay yields between batches, or just after it.
+  assert.equal((await s.http('/coordinator', { method: 'PUT', token: mac.token, body: { convo_id: 'next' } })).status, 200)
+  await p.waitFor((f) => f.op === 'cursor', 10000)
+  const m = await makeWsClient(s.base, { token: mac.token, cursor: null })
+  await m.waitFor((f) => f.op === 'hello_ok')
+  m.send({ op: 'send', convo_id: 'next', payload: { body: 'to the new coordinator' }, local_id: 'l1' })
+  await p.waitFor((f) => f.kind === 'journal' && f.payload?.body === 'to the new coordinator')
+  p.close(); m.close()
+})
