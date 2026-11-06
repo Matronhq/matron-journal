@@ -207,3 +207,19 @@ test('a snapshot for a share that ended over there is refused, and the owner is 
   assert.equal(w.a.db.prepare("SELECT COUNT(*) AS n FROM fed_outbox WHERE op='mission.snapshot' AND last_error='not_active'").get().n >= 1, true)
   assert.deepEqual(notices(w.a, w.users.alice.id).filter((n) => n.title.startsWith("Couldn't send")), [])
 })
+
+test('a snapshot with a page missing is given up on, and the copy stays whole', async (t) => {
+  const { w } = await shared(t, fillBasics)
+  const r = incoming(w.b)[0]
+  const before = (await w.phones.bob('/items?scope=shared')).json.items.map((i) => i.title).sort()
+  const mission = { num: w.mission.num, title: 'Garden Club', state: 'open', created_at: 1, updated_at: 2 }
+  const page = (n, items) => ({ grant: r.peer_grant_ref, snap: 'sn_gap', page: n, pages: 3, ...(n === 0 ? { mission } : {}), milestones: [], items })
+  const item = (ref, title) => ({ ref, num: 90, kind: 'task', state: 'open', title, body: '', created_at: 1, updated_at: 2, comments: [] })
+  assert.equal(applySnapshotPage(w.b.db, r, page(0, [item('it_a', 'On page 0')]), Date.now()).done, null)
+  // Page 1 never arrives; page 2, the last, does.
+  assert.equal(applySnapshotPage(w.b.db, r, page(2, [item('it_c', 'On page 2')]), Date.now()).done, null)
+  const after = (await w.phones.bob('/items?scope=shared')).json.items.map((i) => i.title)
+  for (const title of before) assert.ok(after.includes(title), `${title} is still there`)
+  assert.ok(!after.includes('On page 2'))
+  assert.equal(w.b.db.prepare('SELECT loading_snap FROM fed_replica_missions').get().loading_snap, null)
+})

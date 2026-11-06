@@ -245,17 +245,25 @@ export function applySnapshotPage(d, incoming, body, now) {
     const cols = [m.num, m.title, m.name, m.body, m.state, m.status, m.status_by, m.status_updated_at, m.close_summary, m.closed_by, m.created_by, m.created_at, m.updated_at, m.closed_at]
     if (rep) {
       d.prepare(`UPDATE fed_replica_missions SET num=?, title=?, name=?, body=?, state=?, status=?, status_by=?, status_updated_at=?, close_summary=?, closed_by=?,
-        created_by=?, created_at=?, updated_at=?, closed_at=?, loading_snap=?, received_at=? WHERE fg_id=?`).run(...cols, snap, now, incoming.id)
+        created_by=?, created_at=?, updated_at=?, closed_at=?, loading_snap=?, loaded_pages=1, received_at=? WHERE fg_id=?`).run(...cols, snap, now, incoming.id)
     } else {
       d.prepare(`INSERT INTO fed_replica_missions(id, fg_id, user_id, num, title, name, body, state, status, status_by, status_updated_at, close_summary, closed_by,
-        created_by, created_at, updated_at, closed_at, loading_snap, complete, received_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)`)
+        created_by, created_at, updated_at, closed_at, loading_snap, loaded_pages, complete, received_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,0,?)`)
         .run(id, incoming.id, incoming.user_id, ...cols, snap, now)
     }
     rep = d.prepare('SELECT * FROM fed_replica_missions WHERE fg_id=?').get(incoming.id)
   } else if (!rep || rep.loading_snap !== snap) {
     // A page of a snapshot that is not the one being loaded (one a newer
-    // snapshot replaced): nothing to do.
+    // snapshot replaced, or one given up on below): nothing to do.
     return { done: null, missionId: rep?.id ?? null }
+  } else if (page !== rep.loaded_pages) {
+    // A page missing before this one (refused, and dropped from the
+    // owner's outbox): this snapshot can never be whole, so it is given up
+    // on, and the copy stays as the last whole one left it.
+    d.prepare('UPDATE fed_replica_missions SET loading_snap=NULL WHERE fg_id=?').run(incoming.id)
+    return { done: null, missionId: rep.id }
+  } else {
+    d.prepare('UPDATE fed_replica_missions SET loaded_pages=loaded_pages+1 WHERE fg_id=?').run(incoming.id)
   }
   const countOf = (table) => d.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE fg_id=? AND seen_snap=?`).get(incoming.id, snap).n
   let room = MAX_RECORDS - countOf('fed_replica_milestones')

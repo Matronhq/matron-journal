@@ -736,7 +736,8 @@ CREATE INDEX IF NOT EXISTS idx_fed_grants_in_item ON fed_grants_in(item_id);
 -- milestones and its items (each with its thread, as JSON). Every row has
 -- an id of its own here; ref is the owner journal's. seen_snap is the
 -- snapshot that last carried the row: the last page of a snapshot drops
--- the rows it did not carry. Served only while the grant is active, and
+-- the rows it did not carry. Pages apply only in order (loaded_pages is
+-- the next one expected); a gap gives that snapshot up. Served only while the grant is active, and
 -- deleted the moment it is not (the trigger below).
 CREATE TABLE IF NOT EXISTS fed_replica_missions(
   id                 TEXT PRIMARY KEY,
@@ -757,6 +758,7 @@ CREATE TABLE IF NOT EXISTS fed_replica_missions(
   updated_at         INTEGER NOT NULL,
   closed_at          INTEGER,
   loading_snap       TEXT,
+  loaded_pages       INTEGER NOT NULL DEFAULT 0,
   applied_snap       TEXT,
   complete           INTEGER NOT NULL DEFAULT 0,
   received_at        INTEGER NOT NULL
