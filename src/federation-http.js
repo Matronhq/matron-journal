@@ -22,9 +22,9 @@ export async function handleFederationRoute({ db, outbox = null }, req, res, url
     const { peer } = await readBody(req)
     if (typeof peer !== 'string' || !HOST.test(peer)) { json(res, 400, { error: 'bad_request' }); return true }
     if (m[1] === 'resend') {
-      const resent = resendDead(db, who.userId, peer)
-      if (resent && outbox) outbox.tick().catch(() => {})
-      json(res, 200, { resent })
+      const out = resendDead(db, who.userId, peer)
+      if (out.resent && outbox) outbox.tick().catch(() => {})
+      json(res, 200, out)
     } else {
       json(res, 200, { discarded: discardDead(db, who.userId, peer) })
     }

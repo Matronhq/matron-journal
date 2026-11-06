@@ -11,6 +11,7 @@ import {
   BACKOFF_BASE_MS, BACKOFF_CAP_MS, OUTBOX_MAX_AGE_MS, PEER_LIVE_CAP,
 } from '../src/federation-outbox.js'
 import { startTestServer } from './helpers.js'
+import { RESEND_WINDOW_MS } from '../src/federation-outbox.js'
 
 const KEY = 'd'.repeat(64)
 const quietLog = { log() {}, error() {}, warn() {} }
@@ -111,7 +112,7 @@ test('retries keep the id and body, re-sign with a new ts, and wait out the back
   assert.equal(new Set(r.sent.map((s) => s.envelope.ts)).size, 4)
 })
 
-test('an unsigned 2xx is not an acknowledgement; an unsigned 4xx is permanent', async () => {
+test('an unsigned answer is never the peer\'s word: a 2xx is not an acknowledgement and a 4xx is retried', async () => {
   const r = await rig()
   const a = r.q({ subject: 's-a' })
   const b = r.q({ subject: 's-b' })
@@ -119,7 +120,7 @@ test('an unsigned 2xx is not an acknowledgement; an unsigned 4xx is permanent', 
   await r.outbox.tick()
   assert.equal(r.row(a).state, 'queued')
   assert.equal(r.row(a).last_error, 'unsigned answer')
-  assert.equal(r.row(b).state, 'dead')
+  assert.deepEqual([r.row(b).state, r.row(b).last_status, r.row(b).last_error], ['queued', 403, 'unsigned answer'])
 })
 
 test('FIFO per subject: a waiting entry holds back later ones on its subject only', async () => {
@@ -161,7 +162,7 @@ test('dead: a permanent refusal blocks its subject, files one notice per peer, a
   assert.match(notices[0].body, /refused an update \(grant_revoked\)/)
   assert.deepEqual(listOutbox(r.db, r.alice.id).map((e) => e.id), [a, b])
 
-  assert.equal(resendDead(r.db, r.alice.id, 'b.example', r.now()), 2)
+  assert.deepEqual(resendDead(r.db, r.alice.id, 'b.example', r.now()), { resent: 2, too_old: 0 })
   await r.outbox.tick()
   await r.outbox.tick()
   assert.deepEqual(r.sent.slice(2).map((s) => s.envelope.id), [a, b, behind])
@@ -306,7 +307,7 @@ test('routes: a client lists, resends and discards its own undelivered entries; 
   assert.ok(!('body' in list.json.entries[0]))
   assert.equal((await s.http('/federation/outbox?state=nope', { token })).status, 400)
   assert.equal((await s.http('/federation/outbox/resend', { method: 'POST', token, body: { peer: 'Bad Host' } })).status, 400)
-  assert.deepEqual((await s.http('/federation/outbox/resend', { method: 'POST', token, body: { peer: 'b.example' } })).json, { resent: 1 })
+  assert.deepEqual((await s.http('/federation/outbox/resend', { method: 'POST', token, body: { peer: 'b.example' } })).json, { resent: 1, too_old: 0 })
   s.db.prepare("UPDATE fed_outbox SET state='dead' WHERE id=?").run(id)
   assert.deepEqual((await s.http('/federation/outbox/discard', { method: 'POST', token, body: { peer: 'b.example' } })).json, { discarded: 1 })
   assert.equal((await s.http('/federation/outbox/discard', { method: 'POST', token: agent.token, body: { peer: 'b.example' } })).status, 403)
@@ -319,4 +320,104 @@ test('a pass with nothing due does not stop later passes', async () => {
   const id = r.q()
   await r.outbox.tick()
   assert.equal(r.row(id).state, 'sent')
+})
+
+test('resend: only while the peer is sure to hold the receipt; blocked successors get a fresh 7 days', async () => {
+  const r = await rig()
+  const old = r.q({ subject: 's1' })
+  const behind = r.q({ subject: 's1' })
+  r.answers.push({ status: 403, body: { error: 'x' }, signed: true })
+  await r.outbox.tick()
+  r.advance(6 * 24 * 3600 * 1000)
+  assert.deepEqual(resendDead(r.db, r.alice.id, 'b.example', r.now()), { resent: 1, too_old: 0 })
+  assert.equal(r.row(behind).expires_at, r.now() + OUTBOX_MAX_AGE_MS)
+  r.answers.push({ status: 403, body: { error: 'x' }, signed: true })
+  await r.outbox.tick()
+  assert.equal(r.row(old).state, 'dead')
+  r.advance(RESEND_WINDOW_MS)
+  assert.deepEqual(resendDead(r.db, r.alice.id, 'b.example', r.now()), { resent: 0, too_old: 1 })
+  assert.equal(r.row(old).state, 'dead')
+})
+
+test('a second death after a resend files a new notice', async () => {
+  const r = await rig()
+  r.q()
+  r.answers.push({ status: 403, body: { error: 'x' }, signed: true })
+  await r.outbox.tick()
+  assert.equal(r.notices().length, 1)
+  r.advance(1000)
+  resendDead(r.db, r.alice.id, 'b.example', r.now())
+  r.answers.push({ status: 403, body: { error: 'x' }, signed: true })
+  await r.outbox.tick()
+  assert.equal(r.notices().length, 2)
+})
+
+test('urgent ops do not wait behind an earlier op on their subject', async () => {
+  const r = await rig()
+  const early = r.q({ subject: 'contact:c1', op: 'mission.event' })
+  r.answers.push({ status: 503, body: null, signed: false })
+  await r.outbox.tick()
+  const remove = r.q({ subject: 'contact:c1', op: 'contact.remove', urgent: true })
+  await r.outbox.tick()
+  assert.equal(r.row(remove).state, 'sent')
+  assert.equal(r.row(early).state, 'queued')
+})
+
+test('a stillAllowed check that throws holds the op back for a retry', async () => {
+  const r = await rig()
+  r.ops['test.op'] = { stillAllowed: () => { throw new Error('boom') } }
+  const id = r.q()
+  await r.outbox.tick()
+  assert.equal(r.sent.length, 0)
+  assert.deepEqual([r.row(id).state, r.row(id).last_error], ['queued', 'check_failed'])
+})
+
+test('a cancellation made while an attempt is in flight stands, and a cancelled entry selected by the pass is not sent', async () => {
+  const r = await rig()
+  const a = r.q({ subject: 's1' })
+  const b = r.q({ subject: 's2' })
+  let release
+  const gate = new Promise((res) => { release = res })
+  const client = {
+    postEnvelope: async (url, e) => {
+      if (e.id === a) {
+        // While a is in flight, both rows are cancelled here.
+        r.db.prepare("UPDATE fed_outbox SET state='cancelled' WHERE id IN (?,?)").run(a, b)
+        await gate
+        return { status: 403, body: { error: 'x' }, signed: true }
+      }
+      r.sent.push(e)
+      return { status: 200, body: { ok: true, result: {} }, signed: true }
+    },
+  }
+  const box = makeOutbox({ db: r.db, federation: { key: { privateKey: r.self.privateKey } }, client, now: r.now, log: quietLog })
+  const pass = box.tick()
+  release()
+  await pass
+  assert.equal(r.row(a).state, 'cancelled')
+  assert.equal(r.row(b).state, 'cancelled')
+  assert.equal(r.sent.length, 0)
+})
+
+test('after stop, no pass starts', async () => {
+  const r = await rig()
+  await r.outbox.stop()
+  const id = r.q()
+  await r.outbox.tick()
+  assert.equal(r.row(id).state, 'queued')
+})
+
+test('the first undelivered notice announces the People conversation to clients', async (t) => {
+  const s = await startTestServer({ tokenKey: KEY, federationEnv: { federation: 'on', publicUrl: 'https://a.example' },
+    federationClient: { postEnvelope: async () => ({ status: 403, body: { error: 'x' }, signed: true }) } })
+  t.after(() => s.close())
+  const alice = await createUser(s.db, 'alice', 'pw')
+  s.db.prepare('INSERT INTO fed_peers(host, base_url, key_pub, first_seen) VALUES(?,?,?,?)').run('b.example', 'https://b.example', exportPublicKey(generateFederationKey().publicKey), 1)
+  enqueue(s.db, { userId: alice.id, from: 'alice@a.example', to: 'bob@b.example', op: 'test.op', body: {} })
+  await s.federationOutbox.tick()
+  const convo = s.db.prepare("SELECT id FROM conversations WHERE owner_user_id=? AND system='people'").get(alice.id)
+  assert.ok(convo)
+  const types = s.db.prepare('SELECT type FROM events WHERE convo_id=? ORDER BY seq').all(convo.id).map((e) => e.type)
+  assert.equal(types[0], 'convo_meta')
+  assert.ok(types.includes('item'))
 })

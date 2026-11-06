@@ -5236,8 +5236,10 @@ few seconds. The rules:
 - **Retries.** 408, 429, 5xx, network errors, and any answer the peer did
   not sign are retried. The backoff starts at 30 s and doubles up to 1 h,
   jittered into the upper half of each step.
-- **Permanent refusals.** Any other 4xx is permanent, and so are an
-  unknown or blocked peer and a refused destination.
+- **Permanent refusals.** Any other 4xx is permanent, but only when the
+  peer signed it: an unsigned 4xx (a proxy's error page) is retried like
+  a 5xx. An unknown or blocked peer and a refused destination are also
+  permanent.
 - **Clock skew.** A signed `401 stale` is retried at once with a fresh
   `ts`, and the skew it reports is logged. Skew that survives three
   attempts is permanent, with an error that names the skew.
@@ -5246,20 +5248,23 @@ few seconds. The rules:
   peer in their People conversation, and dead ops keep blocking their
   subject until the user resends or discards them. A resend re-queues the
   same ids with a fresh 7 days, so a peer that already applied one answers
-  from its receipt.
+  from its receipt. Ops waiting behind them also get a fresh 7 days. A
+  resend is refused (counted in `too_old`) for an op queued more than 23
+  days earlier: its last attempt could otherwise fall after the peer has
+  pruned the op's 30-day receipt, and the peer would apply it twice.
 - **Checks before sending.** Before each attempt the sender checks its own
   records again. An op whose grant or contact has ended here is cancelled
   rather than sent.
 - **Urgent ops** (revocation, contact removal, block) go ahead of
-  everything queued for the peer, and may cancel what is still waiting on
-  their subject.
+  everything queued for the peer. They do not wait behind earlier ops on
+  their own subject, and may cancel what is still waiting there.
 - **Limits.** A peer may have at most 10,000 waiting ops (queued or dead)
   and 50 MiB of them. Past that, a new op for that peer fails at once
   instead of the queue growing. Urgent ops are never refused for space.
 
 ```
 GET  /federation/outbox[?state=dead|queued|sent|cancelled]   {entries:[{id, peer, op, subject, state, attempts, last_status, last_error, created_at, ended_at}]}
-POST /federation/outbox/resend  {peer}                       {resent}
+POST /federation/outbox/resend  {peer}                       {resent, too_old}
 POST /federation/outbox/discard {peer}                       {discarded}
 ```
 
