@@ -5,7 +5,9 @@ import { createUser } from '../src/auth.js'
 import { insertBlob } from '../src/db.js'
 import { world, post, grantOf, incoming, offer } from './federation-world.js'
 import { signEnvelope, newOpId } from '../src/federation-envelope.js'
-import { MEDIA_PATH, MEDIA_HEADER, purgeReplicaMedia } from '../src/federation-media.js'
+import crypto from 'node:crypto'
+import { Writable } from 'node:stream'
+import { MEDIA_PATH, MEDIA_HEADER, purgeReplicaMedia, makeReplicaMedia, localMedia } from '../src/federation-media.js'
 import { runReapMedia } from '../src/retention.js'
 
 // Attachments of a read share across journals (phase 5 stage 8): bob opens
@@ -177,4 +179,43 @@ test('kept copies go even when the rest of the user\'s files cannot be reaped', 
   assert.equal(r.reaped, 1)
   assert.equal(w.b.db.prepare('SELECT disk_path FROM fed_media WHERE id=?').get(att.blob_ref).disk_path, null)
   assert.equal(w.b.db.prepare('SELECT COUNT(*) AS n FROM blobs').get().n, 1, 'bob\'s own upload stays')
+})
+
+test('a record naming other bytes for the same media drops the kept copy', async (t) => {
+  const { w, up, att, bobToken } = await shared(t)
+  assert.equal((await raw(w.b, bobToken, `/media/${att.blob_ref}`)).status, 200)
+  const row = w.b.db.prepare('SELECT * FROM fed_media WHERE id=?').get(att.blob_ref)
+  const incoming = w.b.db.prepare('SELECT * FROM fed_grants_in WHERE id=?').get(row.fg_id)
+  // The same bytes again keep the copy.
+  localMedia(w.b.db, incoming, { media: up.media_id, mime: row.mime, size: row.size, sha256: row.sha256 })
+  assert.equal(w.b.db.prepare('SELECT disk_path FROM fed_media WHERE id=?').get(att.blob_ref).disk_path, row.disk_path)
+  localMedia(w.b.db, incoming, { media: up.media_id, mime: row.mime, size: row.size, sha256: '1'.repeat(64) })
+  assert.equal(w.b.db.prepare('SELECT disk_path FROM fed_media WHERE id=?').get(att.blob_ref).disk_path, null)
+  assert.ok(!fs.existsSync(row.disk_path))
+})
+
+test('pulls of different files at once count against the quota together', async (t) => {
+  const { w, att } = await shared(t)
+  const token = (await w.a.http('/login', post({ username: 'alice', password: 'pw', device_name: 'alice-phone-3' }))).json.token
+  const more = Buffer.from('a second garden plan, same size')
+  const up = await upload(w.a, token, more, 'text/plain')
+  const q = (await w.aliceBox('/items', post({ convo_id: 'work', kind: 'task', title: 'Second plan' }))).json.item
+  await w.aliceBox(`/items/${q.id}/comments`, post({ convo_id: 'work', body: 'And this', attachments: [{ blob_ref: up.media_id, mime: 'text/plain', name: 'two.txt', size: up.size }] }))
+  await w.settle()
+  const second = w.b.db.prepare('SELECT id FROM fed_media WHERE ref=?').get(up.media_id).id
+  const bySha = new Map([[crypto.createHash('sha256').update(w.bytes).digest('hex'), w.bytes], [crypto.createHash('sha256').update(more).digest('hex'), more]])
+  const client = {
+    async request(url, opts) {
+      await new Promise((r) => setTimeout(r, 50))
+      const env = JSON.parse(Buffer.from(opts.headers[MEDIA_HEADER], 'base64url').toString())
+      const row = w.b.db.prepare('SELECT sha256 FROM fed_media WHERE ref=?').get(env.body.media)
+      return { status: 200, body: bySha.get(row.sha256) }
+    },
+  }
+  const media = makeReplicaMedia({ db: w.b.db, federation: w.b.federation, client, mediaDir: fs.mkdtempSync('/tmp/fedmedia-'), mediaMaxBytes: 1e6, quotaBytes: w.bytes.length + more.length - 1 })
+  const bob = w.b.db.prepare("SELECT id FROM users WHERE name='bob'").get().id
+  const res = () => Object.assign(new Writable({ write(_c, _e, cb) { cb() } }), { status: 0, writeHead(s) { this.status = s } })
+  const [r1, r2] = [res(), res()]
+  await Promise.all([media.serve({}, r1, { userId: bob }, att.blob_ref).catch(() => {}), media.serve({}, r2, { userId: bob }, second).catch(() => {})])
+  assert.deepEqual([r1.status, r2.status].sort(), [200, 413])
 })

@@ -127,8 +127,15 @@ const MIME = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,63}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,63}$
 // the rest): the local row for it, created on first sight. → the local id.
 export function localMedia(d, incoming, a) {
   const mime = MIME.test(a.mime) ? a.mime.toLowerCase() : 'application/octet-stream'
+  // Kept bytes stay bound to the hash they were checked against: a record
+  // naming other bytes for the same media drops the copy, and the next read
+  // pulls the new ones.
+  const was = d.prepare('SELECT disk_path, sha256, size FROM fed_media WHERE fg_id=? AND ref=?').get(incoming.id, a.media)
+  if (was?.disk_path && (was.sha256 !== a.sha256 || was.size !== a.size)) fs.rmSync(was.disk_path, { force: true })
   d.prepare(`INSERT INTO fed_media(id, fg_id, user_id, ref, mime, size, sha256, created_at) VALUES(?,?,?,?,?,?,?,?)
-    ON CONFLICT(fg_id, ref) DO UPDATE SET mime=excluded.mime, size=excluded.size, sha256=excluded.sha256`)
+    ON CONFLICT(fg_id, ref) DO UPDATE SET mime=excluded.mime, size=excluded.size, sha256=excluded.sha256,
+      disk_path = CASE WHEN fed_media.sha256 = excluded.sha256 AND fed_media.size = excluded.size THEN fed_media.disk_path END,
+      fetched_at = CASE WHEN fed_media.sha256 = excluded.sha256 AND fed_media.size = excluded.size THEN fed_media.fetched_at END`)
     .run(crypto.randomBytes(16).toString('hex'), incoming.id, incoming.user_id, a.media, mime, a.size, a.sha256, Date.now())
   return d.prepare('SELECT id FROM fed_media WHERE fg_id=? AND ref=?').get(incoming.id, a.media).id
 }
@@ -148,6 +155,9 @@ function readableRow(db, userId, id) {
 // `federation` the identity, `client` the outbound client. → {serve, purge}
 export function makeReplicaMedia({ db, federation, client, mediaDir, mediaMaxBytes, quotaBytes = Infinity, now = Date.now, log = console }) {
   const inFlight = new Map()
+  // Bytes being pulled, per user: pulls of different files at once count
+  // against the quota together.
+  const pending = new Map()
   const root = path.join(mediaDir, 'fed')
 
   async function fetchBytes(row) {
@@ -176,19 +186,31 @@ export function makeReplicaMedia({ db, federation, client, mediaDir, mediaMaxByt
   function cache(row) {
     if (inFlight.has(row.id)) return inFlight.get(row.id)
     const p = (async () => {
-      if (userBlobBytes(db, row.user_id) + row.size > quotaBytes) fail('quota_exceeded')
-      const bytes = await fetchBytes(row)
-      const finalPath = path.join(root, row.id.slice(0, 2), row.id)
-      await fs.promises.mkdir(path.dirname(finalPath), { recursive: true })
-      await fs.promises.writeFile(`${finalPath}.tmp`, bytes)
-      await fs.promises.rename(`${finalPath}.tmp`, finalPath)
-      // The share may have ended while the bytes were on their way.
-      const kept = db.prepare('UPDATE fed_media SET disk_path=?, fetched_at=? WHERE id=? AND disk_path IS NULL').run(finalPath, now(), row.id).changes
-      if (!kept || !readableRow(db, row.user_id, row.id)) { await fs.promises.unlink(finalPath).catch(() => {}); fail('gone') }
-      return finalPath
+      const held = pending.get(row.user_id) ?? 0
+      if (userBlobBytes(db, row.user_id) + held + row.size > quotaBytes) fail('quota_exceeded')
+      pending.set(row.user_id, held + row.size)
+      try { return await keep(row) } finally {
+        const left = (pending.get(row.user_id) ?? 0) - row.size
+        if (left > 0) pending.set(row.user_id, left); else pending.delete(row.user_id)
+      }
     })().finally(() => inFlight.delete(row.id))
     inFlight.set(row.id, p)
     return p
+  }
+
+  async function keep(row) {
+    const bytes = await fetchBytes(row)
+    const finalPath = path.join(root, row.id.slice(0, 2), row.id)
+    await fs.promises.mkdir(path.dirname(finalPath), { recursive: true })
+    await fs.promises.writeFile(`${finalPath}.tmp`, bytes)
+    await fs.promises.rename(`${finalPath}.tmp`, finalPath)
+    // The share may have ended while the bytes were on their way.
+    // So may the record, naming other bytes: keep these only if they are
+    // still the ones it names.
+    const kept = db.prepare('UPDATE fed_media SET disk_path=?, fetched_at=? WHERE id=? AND disk_path IS NULL AND sha256=? AND size=?')
+      .run(finalPath, now(), row.id, row.sha256, row.size).changes
+    if (!kept || !readableRow(db, row.user_id, row.id)) { await fs.promises.unlink(finalPath).catch(() => {}); fail('gone') }
+    return finalPath
   }
 
   // GET /media/:id for an attachment of a copy. → false when `id` is none

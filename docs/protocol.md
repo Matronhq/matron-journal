@@ -5665,8 +5665,12 @@ size a client wrote on the attachment. The grantee's journal keeps the
 bytes only if both match. They count in the grantee's media quota (`413
 quota_exceeded` when it is full, `413 too_large` past
 `MATRON_MEDIA_MAX_BYTES`), and later reads are served from the kept copy.
-When the user is over the quota, the media reaper drops kept copies
-first, the least recently pulled first: the next read pulls them again.
+Pulls of different files running at once count against the quota
+together. When the user is over the quota, the media reaper drops kept
+copies first, the least recently pulled first: the next read pulls them
+again. A later record naming other bytes for the same media (a different
+SHA-256 or size) drops the kept copy, and the next read pulls the new
+bytes.
 An attachment reads only while the share and its contact are active and
 the copy still shows it; otherwise it is `404`. A pull that fails is
 `502 peer_unreachable`, and the next read tries again. Kept bytes of a
