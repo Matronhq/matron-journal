@@ -231,6 +231,10 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
         const host = hostOf(envelope.from)
         const cur = d.prepare(`${IN} WHERE peer_host=? AND peer_grant_ref=?`).get(host, ref)
         if (cur && cur.user_id !== user.id) fail('not_contact')
+        // An offer no newer than the last one heard (one still in flight
+        // when it was withdrawn or sent again) changes nothing: offer_sent
+        // only moves forward, and an ended share is not reopened by it.
+        if (cur && cur.offer_sent != null && (sent == null || sent <= cur.offer_sent)) return { state: cur.state }
         // Offered again while live: nothing new to ask, but our answer from
         // now on names this offer.
         if (cur && ['pending', 'active'].includes(cur.state)) {

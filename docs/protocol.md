@@ -5486,7 +5486,8 @@ Three ops carry a grant, all on the subject `grant:<owner's gr_ id>`:
   an agent) may offer it again rather than get `409 pending`: the same
   grant is sent again, and a grantee holding it live just keeps it.
   `sent` is the offer's `sent_at`, new with each sending; the grantee's
-  journal keeps the last it heard and names it in its `grant.answer` and
+  journal keeps the latest it heard (an offer no newer is the same answer
+  and reopens nothing) and names it in its `grant.answer` and
   `grant.revoke` (`sent`). A decline or leave naming an earlier sending of
   a grant that is still `pending` crossed the offer again, which reopened
   it on the grantee's journal: it changes nothing (the same answer).

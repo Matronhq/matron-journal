@@ -4,6 +4,7 @@ import { createUser, createAgent } from '../src/auth.js'
 import { makeFederationClient } from '../src/federation-client.js'
 import { startTestServer } from './helpers.js'
 import { upsertConversation } from '../src/journal.js'
+import { enqueue } from '../src/federation-outbox.js'
 
 // Read shares across journals (phase 5 stage 7a), end to end between two
 // journals on loopback: alice on a.example shares her mission with bob on
@@ -261,4 +262,20 @@ test('a decline that crosses the offer sent again is stale', async (t) => {
   await w.phones.bob(`/grants/${fg.id}/answer`, post({ decision: 'decline' }))
   await w.settle()
   assert.equal(grantOf(w.a, g.id).state, 'declined')
+})
+
+test('an older offer arriving late neither rewinds nor reopens', async (t) => {
+  const w = await world(t)
+  const g = await offer(w)
+  const [fg] = incoming(w.b)
+  await w.phones.bob(`/grants/${fg.id}/answer`, post({ decision: 'decline' }))
+  await w.settle()
+  // A copy of the first offer, delayed in flight, arrives after the decline
+  // (alice's grant held pending just long enough for it to go out).
+  const { body } = w.a.db.prepare("SELECT body FROM fed_outbox WHERE op='grant.offer'").get()
+  w.a.db.prepare("UPDATE grants SET state='pending' WHERE id=?").run(g.id)
+  enqueue(w.a.db, { userId: w.users.alice.id, from: 'alice@a.example', to: 'bob@b.example', op: 'grant.offer', body: JSON.parse(body), subject: `grant:${g.id}` })
+  await w.settle()
+  const [after] = incoming(w.b)
+  assert.deepEqual([after.state, after.offer_sent], ['declined', fg.offer_sent])
 })
