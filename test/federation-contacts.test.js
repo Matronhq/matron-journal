@@ -5,6 +5,9 @@ import { exportPublicKey, generateFederationKey, formatFingerprint, signEnvelope
 import { makeFederationClient } from '../src/federation-client.js'
 import { inviteLink, parseInviteLink, MAX_OPEN_INVITES } from '../src/federation-contacts.js'
 import { startTestServer } from './helpers.js'
+import { enqueue, makeOutbox } from '../src/federation-outbox.js'
+import { ensureFederationKey } from '../src/federation-identity.js'
+import { makeTokenBox } from '../src/token-box.js'
 import { upsertConversation } from '../src/journal.js'
 
 // Contacts across journals (phase 5 stage 5), end to end between two real
@@ -48,7 +51,7 @@ async function world(t, { a: aEnv = {}, b: bEnv = {} } = {}) {
       if (!live(a) && !live(b)) return
     }
   }
-  return { a, b, users, phones, fetched, settle, aliceBoxId: aliceBox.deviceId, aliceBox: (path, opts = {}) => a.http(path, { token: aliceBox.token, ...opts }) }
+  return { a, b, users, phones, fetched, settle, client: real, aliceBoxId: aliceBox.deviceId, aliceBox: (path, opts = {}) => a.http(path, { token: aliceBox.token, ...opts }) }
 }
 
 const contactsOf = async (phone) => (await phone('/contacts')).json.contacts
@@ -343,4 +346,43 @@ test('key change: a journal serving a new key cuts its contacts off until a fres
   assert.equal(r.status, 202)
   await w.settle()
   assert.deepEqual((await contactsOf(w.phones.bob)).map((c) => [c.state, c.key_changed]), [['active', false]])
+})
+
+test('spent: an answer under a used link counts only as a retry while its contact is live', async (t) => {
+  const w = await world(t)
+  const link = await befriend(w)
+  const { token } = parseInviteLink(link)
+  // A retry from bob's journal under a new op id, while they are contacts,
+  // sent past b's own checks: alice's journal takes it as the same yes.
+  const id = enqueue(w.b.db, { userId: w.users.bob.id, from: 'bob@b.example', to: 'alice@a.example', op: 'contact.accept_invite', body: { token, display_name: 'bob' }, subject: 'test:retry' })
+  const bare = makeOutbox({ db: w.b.db, federation: { key: ensureFederationKey(w.b.db, makeTokenBox(KEY)) }, client: w.client, log: { log() {}, error() {} } })
+  await bare.tick()
+  assert.equal(w.b.db.prepare('SELECT state FROM fed_outbox WHERE id=?').get(id).state, 'sent')
+  assert.equal(notices(w.a, w.users.alice.id).length, 1, 'no second notice')
+
+  // Alice removes bob: the old link no longer brings him back.
+  const [aliceSide] = await contactsOf(w.phones.alice)
+  await w.phones.alice(`/contacts/${aliceSide.id}`, { method: 'DELETE' })
+  await w.settle()
+  assert.equal((await contactsOf(w.phones.bob)).length, 0)
+  assert.equal((await w.phones.bob('/contacts/invites/accept', post({ link }))).status, 202)
+  await w.settle()
+  assert.equal((await contactsOf(w.phones.alice)).length, 0, 'still removed')
+  assert.equal(w.b.db.prepare("SELECT state FROM contacts WHERE peer_journal='a.example'").get().state, 'expired')
+  assert.equal(notices(w.b, w.users.bob.id).at(-1).title, "Couldn't add alice@a.example")
+})
+
+test('reconnect: a failed answer on a new key leaves the live contact as it was', async (t) => {
+  const w = await world(t)
+  await befriend(w)
+  const old = exportPublicKey(generateFederationKey().publicKey)
+  w.b.db.prepare("UPDATE fed_peers SET key_pub=? WHERE host='a.example'").run(old)
+  w.b.db.prepare("UPDATE contacts SET peer_journal_key=? WHERE peer_journal='a.example'").run(old)
+  const { invite: inv, link } = await invite(w)
+  await w.phones.alice(`/contacts/invites/${inv.id}`, { method: 'DELETE' })
+  const r = await w.phones.bob('/contacts/invites/accept', post({ link }))
+  assert.deepEqual([r.status, r.json.contact.state, r.json.contact.key_changed], [202, 'active', true])
+  await w.settle()
+  assert.deepEqual((await contactsOf(w.phones.bob)).map((c) => [c.address, c.state, c.key_changed]), [['alice@a.example', 'active', true]])
+  assert.equal(notices(w.b, w.users.bob.id).at(-1).title, "Couldn't reconnect with alice@a.example")
 })

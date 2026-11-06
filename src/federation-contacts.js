@@ -139,16 +139,22 @@ export function revokeInvite(db, { userId, inviteId, now = Date.now() }) {
 }
 
 // The invite `token` names, if `userName` minted it and `from` may use it:
-// open, or already used by that same address (a second answer from the
-// same person is the same yes, not a new one).
+// open, or already used by that same address while the contact it made is
+// still live. A second answer from the same person is a retry of the same
+// yes, never a new one: once the contact has ended, a spent link is spent.
+// `retryKey` is then the key that contact is pinned to; the retry must be
+// signed by it.
 function usableInvite(db, userName, token, from, now) {
   if (typeof token !== 'string' || !TOKEN_RE.test(token)) return null
   const user = userByName(db, userName)
   if (!user || user.unlisted) return null
   const row = db.prepare('SELECT * FROM fed_invites WHERE token_hash=? AND user_id=?').get(hashToken(token), user.id)
   if (!row || row.revoked_at || row.expires_at <= now) return null
-  if (row.used_at && row.used_by_address !== from) return null
-  return { row, user }
+  if (!row.used_at) return { row, user, retryKey: null }
+  if (row.used_by_address !== from) return null
+  const made = remoteContactRaw(db, user.id, nameOf(from), hostOf(from))
+  if (made?.state !== 'active') return null
+  return { row, user, retryKey: made.peer_journal_key }
 }
 
 // --- Peers --------------------------------------------------------------------
@@ -187,6 +193,14 @@ function pinPeer(db, { host, baseUrl, pub, now }) {
   db.prepare("UPDATE fed_peers SET base_url=?, key_pub=?, state='active', last_error=NULL WHERE host=?").run(baseUrl, pub, host)
   return row.key_pub === pub && row.state === 'active' ? [] : contactsOnOtherKeys(db, host, pub)
 }
+
+const queuedAnswer = (db, userId, address) =>
+  !!db.prepare("SELECT 1 FROM fed_outbox WHERE user_id=? AND to_addr=? AND op=? AND state='queued'").get(userId, address, ACCEPT_OP)
+
+// The row is waiting on its invite answer: a new contact (pending_out), or
+// a live one reconnecting on its journal's new key.
+const awaitingAnswer = (row) => row?.state === 'pending_out' ||
+  (row?.state === 'active' && row.journal_key_now != null && row.peer_journal_key !== row.journal_key_now)
 
 const liveRemoteCount = (db, userId) =>
   db.prepare(`SELECT COUNT(*) AS n FROM contacts WHERE user_id=? AND peer_journal IS NOT NULL AND state IN ${LIVE_REMOTE}`).get(userId).n
@@ -279,9 +293,16 @@ export function makeContactFederation({ db, hub = null, pushPipeline = null, fed
       if (cur?.state === 'blocked') fail('blocked')
       if (cur?.state === 'pending_out') fail('pending')
       if (cur?.state === 'active' && cur.peer_journal_key === wk.pub) fail('already_contact')
-      if (!(cur && ['active', 'pending_out'].includes(cur.state)) && liveRemoteCount(db, userId) >= MAX_REMOTE_CONTACTS) fail('too_many_contacts')
+      // A live contact on an old key reconnecting: its row stays as it is
+      // (listed, key_changed) until the answer is acknowledged, so a
+      // reconnect that fails hides nothing.
+      const reconnect = cur?.state === 'active'
+      if (reconnect && queuedAnswer(db, userId, address)) fail('pending')
+      if (!reconnect && liveRemoteCount(db, userId) >= MAX_REMOTE_CONTACTS) fail('too_many_contacts')
       const cutOff = pinPeer(db, { host: inv.host, baseUrl: wk.baseUrl, pub: wk.pub, now: at })
-      const own = putRemoteRow(db, { userId, name: inv.user, host: inv.host, pub: wk.pub, state: 'pending_out', displayName: inv.user, requestedBy: 'user', now: at })
+      const own = reconnect
+        ? remoteContactRaw(db, userId, inv.user, inv.host)
+        : putRemoteRow(db, { userId, name: inv.user, host: inv.host, pub: wk.pub, state: 'pending_out', displayName: inv.user, requestedBy: 'user', now: at })
       enqueue(db, {
         userId, from: `${user.name}@${federation.host}`, to: address, op: ACCEPT_OP,
         body: { token: inv.token, display_name: user.name }, subject: subjectOf(address), now: at,
@@ -323,7 +344,8 @@ export function makeContactFederation({ db, hub = null, pushPipeline = null, fed
         if (!body || typeof body !== 'object' || typeof body.display_name !== 'string') fail('malformed')
         const found = usableInvite(d, nameOf(envelope.to), body.token, envelope.from, now)
         if (!found) fail('invite_invalid')
-        const { row: invite, user } = found
+        const { row: invite, user, retryKey } = found
+        if (retryKey && retryKey !== peer.key_pub) fail('invite_invalid')
         const name = nameOf(envelope.from)
         const host = hostOf(envelope.from)
         const cur = remoteContactRaw(d, user.id, name, host)
@@ -389,30 +411,36 @@ export function makeContactFederation({ db, hub = null, pushPipeline = null, fed
   const rowFor = (d, entry) => remoteContactRaw(d, entry.user_id, nameOf(entry.to_addr), hostOf(entry.to_addr))
   const outbound = {
     [ACCEPT_OP]: {
-      stillAllowed: (d, entry) => rowFor(d, entry)?.state === 'pending_out',
+      stillAllowed: (d, entry) => awaitingAnswer(rowFor(d, entry)),
       onAcked(d, entry, result) {
         const row = rowFor(d, entry)
-        if (row?.state !== 'pending_out') return
+        if (!awaitingAnswer(row)) return
         const at = clock()
         const displayName = sanitizePeerText(result?.display_name, NAME_CAP) || row.peer_user
-        d.prepare("UPDATE contacts SET state='active', display_name=?, accepted_at=?, updated_at=? WHERE id=? AND state='pending_out'").run(displayName, at, at, row.id)
+        // The key the answer went out under: the journal's, as pinned when
+        // the user accepted.
+        d.prepare("UPDATE contacts SET state='active', peer_journal_key=?, display_name=?, accepted_at=?, updated_at=? WHERE id=?")
+          .run(row.journal_key_now ?? row.peer_journal_key, displayName, at, at, row.id)
         const fresh = rowFor(d, entry)
         audit(ctx, row.user_id, { event: 'contact.accepted', summary: `You and ${who(fresh)} are now contacts`, contact: fresh })
         changed(ctx, row.user_id, { contact_id: row.id })
       },
       onDead(d, entry, { error }) {
         const row = rowFor(d, entry)
-        if (row?.state === 'pending_out') {
+        if (awaitingAnswer(row)) {
           const at = clock()
-          d.prepare("UPDATE contacts SET state='expired', updated_at=? WHERE id=? AND state='pending_out'").run(at, row.id)
+          const reconnect = row.state === 'active'
+          // A new contact ends; a live one reconnecting stays as it was.
+          if (!reconnect) d.prepare("UPDATE contacts SET state='expired', updated_at=? WHERE id=? AND state='pending_out'").run(at, row.id)
           const name = who(row)
           const why = error === 'invite_invalid'
             ? `The invite link has already been used, has expired or was withdrawn. Ask ${plain(row.peer_user)} for a new one.`
             : error === 'expired'
               ? `Their journal at ${row.peer_journal} could not be reached for 7 days. Ask ${plain(row.peer_user)} for a new link and try again.`
               : `Their journal at ${row.peer_journal} ${REFUSALS[error] ?? 'refused it'}.`
-          audit(ctx, row.user_id, { event: 'contact.invite_failed', summary: `Couldn't add ${name}`, contact: remoteContactRaw(d, row.user_id, row.peer_user, row.peer_journal) })
-          fileNotice(ctx, { userId: row.user_id, title: `Couldn't add ${name}`, body: why, idemKey: `fed-invite-dead:${entry.id}` })
+          const title = reconnect ? `Couldn't reconnect with ${name}` : `Couldn't add ${name}`
+          audit(ctx, row.user_id, { event: 'contact.invite_failed', summary: title, contact: rowFor(d, entry) })
+          fileNotice(ctx, { userId: row.user_id, title, body: why, idemKey: `fed-invite-dead:${entry.id}` })
           changed(ctx, row.user_id, { contact_id: row.id })
         }
         // Told just now: no undelivered notice, and nothing for Resend.
