@@ -266,3 +266,20 @@ test('configured client: MATRON_FEDERATION_ALLOW_HOSTS lets listed hosts through
   await assert.rejects(c.resolveDestination(new URL('https://other.example/')), { message: 'destination_refused' })
   await assert.rejects(makeConfiguredFederationClient({ env: {}, lookup }).resolveDestination(new URL('https://lan.example/')), { message: 'destination_refused' })
 })
+
+test('inbound: an answer sent before the body was read closes the connection', async (t) => {
+  const { b } = await setup(t)
+  const net = await import('node:net')
+  const { port } = new URL(b.base)
+  for (const [method, len, want] of [['GET', 10, '405'], ['POST', MAX_ENVELOPE_BYTES + 100, '413']]) {
+    const sock = net.connect(Number(port), '127.0.0.1')
+    let got = ''
+    sock.on('data', (d) => { got += d })
+    const closed = new Promise((r) => sock.on('close', r))
+    sock.write(`${method} /federation/v1 HTTP/1.1\r\nhost: x\r\ncontent-length: ${len}\r\n\r\n`)
+    sock.write(Buffer.alloc(Math.min(len, MAX_ENVELOPE_BYTES + 10), 0x20), () => {})
+    await closed
+    assert.match(got, new RegExp(`^HTTP/1.1 ${want}`))
+    assert.match(got, /connection: close/i)
+  }
+})

@@ -73,9 +73,17 @@ export function makeFederationHandler({ db, federation, ops = DEFAULT_OPS, now =
     return keys.get(pub)
   }
 
-  const send = (res, status, body, id = null) => {
+  // `unread`: the answer goes before the body was read to its end (off,
+  // wrong method, too large). The connection is closed once the answer is
+  // flushed, so an unbounded body is never drained and no leftover bytes
+  // desync the next request on a keep-alive socket (as http.js rejectEarly).
+  const send = (res, status, body, id = null, { req = null } = {}) => {
     const text = JSON.stringify(body)
     const headers = { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(text)), 'cache-control': 'no-store' }
+    if (req) {
+      headers.connection = 'close'
+      res.on('finish', () => req.destroy())
+    }
     if (id) headers[RESPONSE_SIG_HEADER] = signResponse({ id, status, body }, federation.key.privateKey)
     res.writeHead(status, headers)
     res.end(text)
@@ -83,15 +91,15 @@ export function makeFederationHandler({ db, federation, ops = DEFAULT_OPS, now =
 
   return async function handleFederation(req, res, url) {
     if (url.pathname !== FEDERATION_PATH) return false
-    if (!federation?.enabled) { send(res, 404, { error: 'not_found' }); return true }
-    if (req.method !== 'POST') { res.setHeader('allow', 'POST'); send(res, 405, { error: 'method_not_allowed' }); return true }
+    if (!federation?.enabled) { send(res, 404, { error: 'not_found' }, null, { req }); return true }
+    if (req.method !== 'POST') { res.setHeader('allow', 'POST'); send(res, 405, { error: 'method_not_allowed' }, null, { req }); return true }
 
     let envelope
     try {
       envelope = parseEnvelope(await readBytes(req, MAX_ENVELOPE_BYTES))
     } catch (err) {
       const code = err.message === 'too_large' ? 'too_large' : err.message === 'unsupported_version' ? 'unsupported_version' : 'malformed'
-      send(res, code === 'too_large' ? 413 : 400, { error: code })
+      send(res, code === 'too_large' ? 413 : 400, { error: code }, null, code === 'too_large' ? { req } : {})
       return true
     }
     const { id } = envelope
