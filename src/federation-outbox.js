@@ -112,8 +112,7 @@ export function listOutbox(db, userId, { state = 'dead' } = {}) {
 // applied a second time by a peer that has pruned its receipt, so it stays
 // dead (`too_old` counts them) and can only be discarded. Entries waiting
 // behind the resent ones on their subjects, never attempted, get a fresh 7
-// days too (they were blocked, not undeliverable), capped so that they too
-// stay inside RESEND_WINDOW_MS + 7 days of being queued. → {resent, too_old}
+// days too (they were blocked, not undeliverable). → {resent, too_old}
 export function resendDead(db, userId, peerHost, now = Date.now()) {
   return db.transaction(() => {
     const subjects = db.prepare(`SELECT DISTINCT subject FROM fed_outbox WHERE user_id=? AND peer_host=? AND state='dead' AND created_at>=?`)
@@ -123,10 +122,11 @@ export function resendDead(db, userId, peerHost, now = Date.now()) {
       .run(now, now + OUTBOX_MAX_AGE_MS, userId, peerHost, now - RESEND_WINDOW_MS).changes
     const tooOld = db.prepare("SELECT COUNT(*) AS n FROM fed_outbox WHERE user_id=? AND peer_host=? AND state='dead'").get(userId, peerHost).n
     // Only the ops queued behind a resent one on its subject, which FIFO
-    // kept from ever being attempted; never past their own receipt window.
-    const extend = db.prepare(`UPDATE fed_outbox SET expires_at=MAX(expires_at, MIN(?, created_at + ?))
+    // kept from ever being attempted: no peer can hold a receipt for them,
+    // so a full fresh 7 days is safe.
+    const extend = db.prepare(`UPDATE fed_outbox SET expires_at=MAX(expires_at, ?)
       WHERE user_id=? AND peer_host=? AND subject=? AND state='queued' AND attempts=0 AND urgent=0`)
-    for (const subject of subjects) extend.run(now + OUTBOX_MAX_AGE_MS, RECEIPT_TTL_MS - OUTBOX_MAX_AGE_MS, userId, peerHost, subject)
+    for (const subject of subjects) extend.run(now + OUTBOX_MAX_AGE_MS, userId, peerHost, subject)
     return { resent, too_old: tooOld }
   })()
 }
