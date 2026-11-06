@@ -481,31 +481,10 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
   let bytesFreed = 0
   const graceCutoff = now - orphanGraceMs
   for (const user of users) {
-    const copies = kept.all(user.userId)
-    const garbage = orphans.all(user.userId, graceCutoff)
-    // One list, oldest reference first, a blob once (a blob both a chat
-    // event and an item comment name keeps its older timestamp).
-    const byBlob = new Map()
-    for (const c of [...candidates.all(user.userId), ...itemCandidates.all(user.userId, user.userId)]) {
-      const prev = byBlob.get(c.blobRef)
-      if (!prev || c.oldestTs < prev.oldestTs) byBlob.set(c.blobRef, c)
-    }
-    const cands = [...byBlob.values()].sort((a, b) => a.oldestTs - b.oldestTs)
-    const reapable = copies.reduce((n, c) => n + c.size, 0) + garbage.reduce((n, c) => n + c.size, 0) + cands.reduce((n, c) => n + c.size, 0)
-    if (user.bytes - reapable >= target) {
-      const floor = user.bytes - reapable
-      const parts = floorParts.get(graceCutoff, user.userId)
-      const other = floor - parts.toolBytes - parts.freshBytes
-      console.warn(
-        `retention: user ${user.userId} holds ${user.bytes} blob bytes but ${floor} are un-reapable ` +
-        `(${parts.toolBytes} in tool logs, ` +
-        `${parts.freshBytes} in uploads under ${Math.round(orphanGraceMs / 3600000)}h old, ${other} named only by non-attachment events) ` +
-        '— media reap skipped; raise the quota or shorten tool-log retention'
-      )
-      continue
-    }
+    // Kept copies go even when the rest cannot get the user under target:
+    // dropping them loses nothing.
     let used = user.bytes
-    for (const copy of copies) {
+    for (const copy of kept.all(user.userId)) {
       if (used <= target) break
       if (!forget.run(copy.id, copy.disk_path).changes) continue
       try {
@@ -516,6 +495,29 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
       used -= copy.size
       bytesFreed += copy.size
       reaped += 1
+    }
+    const garbage = orphans.all(user.userId, graceCutoff)
+    // One list, oldest reference first, a blob once (a blob both a chat
+    // event and an item comment name keeps its older timestamp).
+    const byBlob = new Map()
+    for (const c of [...candidates.all(user.userId), ...itemCandidates.all(user.userId, user.userId)]) {
+      const prev = byBlob.get(c.blobRef)
+      if (!prev || c.oldestTs < prev.oldestTs) byBlob.set(c.blobRef, c)
+    }
+    const cands = [...byBlob.values()].sort((a, b) => a.oldestTs - b.oldestTs)
+    const reapable = garbage.reduce((n, c) => n + c.size, 0) + cands.reduce((n, c) => n + c.size, 0)
+    if (used <= target) continue
+    if (used - reapable >= target) {
+      const floor = used - reapable
+      const parts = floorParts.get(graceCutoff, user.userId)
+      const other = floor - parts.toolBytes - parts.freshBytes
+      console.warn(
+        `retention: user ${user.userId} holds ${user.bytes} blob bytes but ${floor} are un-reapable ` +
+        `(${parts.toolBytes} in tool logs, ` +
+        `${parts.freshBytes} in uploads under ${Math.round(orphanGraceMs / 3600000)}h old, ${other} named only by non-attachment events) ` +
+        '— media reap skipped; raise the quota or shorten tool-log retention'
+      )
+      continue
     }
     for (const orphan of garbage) {
       if (used <= target) break

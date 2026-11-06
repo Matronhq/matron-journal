@@ -167,3 +167,14 @@ test('over quota, the reaper drops kept copies first and the next read pulls the
   assert.equal(again.status, 200)
   assert.deepEqual(again.body, w.bytes)
 })
+
+test('kept copies go even when the rest of the user\'s files cannot be reaped', async (t) => {
+  const { w, att, bobToken } = await shared(t)
+  assert.equal((await raw(w.b, bobToken, `/media/${att.blob_ref}`)).status, 200)
+  // A fresh upload of bob's own: under the orphan grace period, never reaped.
+  await upload(w.b, bobToken, Buffer.alloc(200, 1), 'application/octet-stream')
+  const r = runReapMedia(w.b.db, { quotaBytes: 100 })
+  assert.equal(r.reaped, 1)
+  assert.equal(w.b.db.prepare('SELECT disk_path FROM fed_media WHERE id=?').get(att.blob_ref).disk_path, null)
+  assert.equal(w.b.db.prepare('SELECT COUNT(*) AS n FROM blobs').get().n, 1, 'bob\'s own upload stays')
+})
