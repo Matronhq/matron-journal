@@ -9,6 +9,8 @@ import { enqueue, makeOutbox } from '../src/federation-outbox.js'
 import { ensureFederationKey } from '../src/federation-identity.js'
 import { makeTokenBox } from '../src/token-box.js'
 import { upsertConversation } from '../src/journal.js'
+import { expireInviteAsks, onInviteAskExpired } from '../src/federation-invite-asks.js'
+import { MAX_PARKED_PER_DEVICE } from '../src/contacts.js'
 
 // Contacts across journals (phase 5 stage 5), end to end between two real
 // journals on loopback: a.example (alice) and b.example (bob, carol). The
@@ -104,7 +106,8 @@ test('invites: a client mints, lists and withdraws them; an agent never sees one
   assert.deepEqual(listed.map((i) => [i.id, i.state]), [[inv.id, 'open']])
   assert.equal(JSON.stringify(listed).includes(parsed.token), false)
 
-  for (const [path, opts] of [['/contacts/invites', post({})], ['/contacts/invites', {}], [`/contacts/invites/${inv.id}`, { method: 'DELETE' }],
+  assert.equal((await w.aliceBox('/contacts/invites', post({}))).status, 400, 'an agent only asks, from a conversation')
+  for (const [path, opts] of [['/contacts/invites', {}], [`/contacts/invites/${inv.id}`, { method: 'DELETE' }],
     ['/contacts/invites/open', post({ link })], ['/contacts/invites/accept', post({ link })]]) {
     assert.equal((await w.aliceBox(path, opts)).status, 403, path)
   }
@@ -444,4 +447,109 @@ test('remove: delivered under the journal\'s current key; one that cannot go out
   await w.settle()
   assert.equal(notices(w.b, w.users.bob.id).at(-1).title, "Couldn't tell a.example that alice@a.example is no longer a contact")
   assert.equal(w.b.db.prepare("SELECT COUNT(*) AS n FROM fed_outbox WHERE state='dead'").get().n, 0, 'nothing left blocking the pair')
+})
+
+// --- An agent's ask for an invite link ----------------------------------------
+
+const mirrorOf = (s, userId) => s.db.prepare("SELECT * FROM items WHERE user_id=? AND consent='invite' ORDER BY rowid DESC").get(userId)
+const agentHeard = (s, convoId) => s.db.prepare("SELECT type, payload FROM events WHERE convo_id=? ORDER BY seq").all(convoId)
+  .filter((e) => JSON.stringify(e.payload).includes('matron://contact'))
+
+test('invite asks: an agent parks one, the tap mints it and only the tapping device sees the link', async (t) => {
+  const w = await world(t)
+  upsertConversation(w.a.db, { id: 'work', ownerUserId: w.users.alice.id, title: 'Work', agentDeviceId: w.aliceBoxId })
+  assert.equal((await w.aliceBox('/contacts/invites', post({ convo_id: 'nope' }))).status, 404)
+  const r = await w.aliceBox('/contacts/invites', post({ convo_id: 'work' }))
+  assert.deepEqual([r.status, r.json.ask.state, r.json.pending], [202, 'awaiting_user', 'user'])
+  assert.equal(r.json.link, undefined)
+  assert.equal(w.a.db.prepare('SELECT COUNT(*) AS n FROM fed_invites').get().n, 0, 'nothing is minted by asking')
+  const again = await w.aliceBox('/contacts/invites', post({ convo_id: 'work' }))
+  assert.deepEqual([again.status, again.json.blocked_by], [409, 'pending'])
+
+  const card = w.a.db.prepare("SELECT payload FROM events WHERE convo_id='work' AND type='permission_request'").get()
+  assert.equal(JSON.parse(card.payload).kind, 'contact_invite')
+  const mirror = mirrorOf(w.a, w.users.alice.id)
+  assert.equal(mirror.title, 'Approve making an invite link for someone on another Matron')
+  assert.equal(mirror.awaiting, 'user')
+
+  // The agent cannot answer, by either route.
+  assert.equal((await w.aliceBox(`/items/${mirror.id}/comments`, post({ action: 'Approve' }))).status, 404, 'a consent mirror is not the agent\'s to see')
+  assert.equal((await w.aliceBox(`/contacts/invites/asks/${r.json.ask.id}/answer`, post({ decision: 'approve' }))).status, 403)
+
+  const tap = await w.phones.alice(`/items/${mirror.id}/comments`, post({ action: 'Approve' }))
+  assert.equal(tap.status, 200)
+  assert.equal(tap.json.ask.state, 'approved')
+  assert.equal(parseInviteLink(tap.json.link).user, 'alice')
+  assert.equal(tap.json.ask.invite_id, tap.json.invite.id)
+  assert.match(tap.json.comment.body, /shown on the device you tapped on/)
+  assert.equal(JSON.stringify(tap.json.comment).includes('matron://contact'), false)
+  assert.deepEqual(agentHeard(w.a, 'work'), [], 'the link is in no event')
+  assert.equal(w.a.db.prepare("SELECT COUNT(*) AS n FROM items WHERE body LIKE '%matron://contact%'").get().n, 0)
+  assert.equal(w.a.db.prepare("SELECT COUNT(*) AS n FROM item_comments WHERE body LIKE '%matron://contact%'").get().n, 0)
+  assert.equal(w.a.db.prepare('SELECT state FROM items WHERE id=?').get(mirror.id).state, 'closed')
+
+  // The link it made works like any other.
+  const accepted = await w.phones.bob('/contacts/invites/accept', post({ link: tap.json.link }))
+  assert.equal(accepted.status, 202)
+  await w.settle()
+  assert.equal((await contactsOf(w.phones.alice)).find((c) => c.address === 'bob@b.example').state, 'active')
+
+  const twice = await w.phones.alice(`/contacts/invites/asks/${r.json.ask.id}/answer`, post({ decision: 'approve' }))
+  assert.deepEqual([twice.status, twice.json.blocked_by], [409, 'not_pending'])
+})
+
+test('invite asks: declined, expired, capped, and waiting while the open invites are full', async (t) => {
+  const w = await world(t)
+  for (const id of ['c1', 'c2', 'c3']) upsertConversation(w.a.db, { id, ownerUserId: w.users.alice.id, title: id, agentDeviceId: w.aliceBoxId })
+  const ask = async (convo) => (await w.aliceBox('/contacts/invites', post({ convo_id: convo }))).json.ask
+
+  const a1 = await ask('c1')
+  const no = await w.phones.alice(`/contacts/invites/asks/${a1.id}/answer`, post({ decision: 'decline' }))
+  assert.deepEqual([no.status, no.json.ask.state, no.json.link], [200, 'declined', undefined])
+  assert.equal(w.a.db.prepare('SELECT COUNT(*) AS n FROM fed_invites').get().n, 0)
+  assert.equal((await w.phones.alice(`/contacts/invites/asks/${a1.id}/answer`, post({ decision: 'maybe' }))).status, 400)
+  assert.equal((await w.phones.bob(`/contacts/invites/asks/${a1.id}/answer`, post({ decision: 'approve' }))).status, 404, 'not theirs')
+
+  // Full open invites: the approve is refused and the ask still waits.
+  for (let i = 0; i < MAX_OPEN_INVITES; i++) await invite(w)
+  const a2 = await ask('c2')
+  const full = await w.phones.alice(`/contacts/invites/asks/${a2.id}/answer`, post({ decision: 'approve' }))
+  assert.deepEqual([full.status, full.json.blocked_by], [409, 'too_many_invites'])
+  assert.equal(w.a.db.prepare('SELECT state FROM fed_invite_asks WHERE id=?').get(a2.id).state, 'awaiting_user')
+
+  // The 24 h sweep.
+  const rows = expireInviteAsks(w.a.db, Date.now() + 25 * 3600 * 1000)
+  assert.deepEqual(rows.map((r) => r.id), [a2.id])
+  for (const row of rows) onInviteAskExpired({ db: w.a.db, hub: w.a.hub }, row)
+  const m2 = w.a.db.prepare('SELECT item_id FROM fed_invite_asks WHERE id=?').get(a2.id).item_id
+  assert.equal(w.a.db.prepare('SELECT state, resolution FROM items WHERE id=?').get(m2).resolution, 'cancelled')
+
+  // Parked asks count against the agent's device like contact asks do.
+  const fill = w.a.db.prepare(`INSERT INTO fed_invite_asks(id, user_id, state, origin_convo_id, origin_device_id, created_at, updated_at)
+    VALUES(?, ?, 'awaiting_user', ?, ?, ?, ?)`)
+  for (let i = 0; i < MAX_PARKED_PER_DEVICE; i++) fill.run(`ia_fill${i}`, w.users.alice.id, `elsewhere${i}`, w.aliceBoxId, Date.now(), Date.now())
+  const capped = await w.aliceBox('/contacts/invites', post({ convo_id: 'c3' }))
+  assert.deepEqual([capped.status, capped.json.blocked_by], [409, 'too_many_asks'])
+})
+
+test('invite asks: a card that cannot be filed leaves nothing parked, so the agent can ask again', async (t) => {
+  const w = await world(t)
+  upsertConversation(w.a.db, { id: 'work', ownerUserId: w.users.alice.id, title: 'Work', agentDeviceId: w.aliceBoxId })
+  w.a.db.exec("CREATE TRIGGER no_items BEFORE INSERT ON items BEGIN SELECT RAISE(ABORT, 'disk full'); END")
+  const r = await w.aliceBox('/contacts/invites', post({ convo_id: 'work' }))
+  assert.deepEqual([r.status, r.json.error], [503, 'unavailable'])
+  assert.equal(w.a.db.prepare('SELECT COUNT(*) AS n FROM fed_invite_asks').get().n, 0)
+  w.a.db.exec('DROP TRIGGER no_items')
+  assert.equal((await w.aliceBox('/contacts/invites', post({ convo_id: 'work' }))).status, 202)
+})
+
+test('invite asks: with federation off an agent is told so and nothing parks', async (t) => {
+  const s = await startTestServer({ tokenKey: KEY })
+  t.after(() => s.close())
+  const u = await createUser(s.db, 'alice', 'pw')
+  const box = createAgent(s.db, u.id, 'alice-box')
+  upsertConversation(s.db, { id: 'work', ownerUserId: u.id, title: 'Work', agentDeviceId: box.deviceId })
+  const r = await s.http('/contacts/invites', { token: box.token, ...post({ convo_id: 'work' }) })
+  assert.deepEqual([r.status, r.json.blocked_by], [409, 'federation_off'])
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM fed_invite_asks').get().n, 0)
 })

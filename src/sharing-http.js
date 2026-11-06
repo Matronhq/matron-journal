@@ -8,7 +8,8 @@
 //   POST   /contacts/:id/block             DELETE /contacts/:id    (remove / withdraw)
 //   POST   /contacts/:id/unblock                                   (client only)
 //   GET    /contacts/:id/activity          the audit events for one contact
-//   /contacts/invites…                      contacts on other journals (src/federation-contacts-http.js)
+//   /contacts/invites…                      contacts on other journals, and an agent's ask for an
+//                                           invite link (src/federation-contacts-http.js)
 //   POST   /missions/:id/shares {contact, level, brief?, exclude_media?, keep_level?, convo_id?}
 //   GET    /missions/:id/shares            the owner's grants on one mission
 //   POST   /projects/:id/shares {contact, level:'owner', brief, exclude_media?, keep_level?, convo_id?}
@@ -47,6 +48,7 @@ import { USERNAME_RE } from './users-http.js'
 import { revokeSharesBetween } from './person-rooms.js'
 import { onContactEndedRooms, onGrantEndedRooms, onShareEnded } from './person-rooms-events.js'
 import { handleInviteRoute } from './federation-contacts-http.js'
+import { applyInviteAnswer } from './federation-invite-asks.js'
 
 // Phase 2's share of a contact ending: every room between the two people
 // ends on both sides, and every session either one shared with the other
@@ -396,7 +398,11 @@ export function handleConsentTap(ctx, res, who, item, action, replyTo = null) {
   if (!item.actions.includes(action)) { json(res, 400, { error: 'unknown_action' }); return true }
   const decision = action === 'Decline' ? 'decline' : 'approve'
   let r
-  if (item.consent === 'contact') {
+  if (item.consent === 'invite') {
+    const row = db.prepare('SELECT id FROM fed_invite_asks WHERE user_id=? AND item_id=?').get(who.userId, item.id)
+    if (!row) return conflict(res)
+    r = applyInviteAnswer(ctx, who, row.id, decision)
+  } else if (item.consent === 'contact') {
     const row = db.prepare('SELECT id FROM contacts WHERE user_id=? AND item_id=?').get(who.userId, item.id)
     if (!row) return conflict(res)
     r = applyContactAnswer(ctx, who, row.id, decision)
@@ -410,7 +416,7 @@ export function handleConsentTap(ctx, res, who, item, action, replyTo = null) {
   return true
 }
 
-export const isSharingMirror = (item) => item?.consent === 'contact' || item?.consent === 'share' || item?.consent === 'handover'
+export const isSharingMirror = (item) => item?.consent === 'contact' || item?.consent === 'invite' || item?.consent === 'share' || item?.consent === 'handover'
 
 export async function handleSharingRoute(ctx, req, res, url, who) {
   const { db } = ctx
