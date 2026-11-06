@@ -5582,7 +5582,7 @@ ended there, and its revoke is on the way).
 on the same subject, so it applies after the snapshot it follows:
 
 ```
-{grant, kind: 'mission'|'milestone'|'item', ref?, record}
+{grant, sent, kind: 'mission'|'milestone'|'item', ref?, record}
 ```
 
 `record` is the one record the write changed, its whole state as the
@@ -5593,10 +5593,17 @@ moved to another one, crosses as `record: null`, and the grantee drops
 it. A record the grantee view never shows (an owner-only item, an item or
 milestone from a private box) sends nothing, so not even its id crosses.
 Items a conversation brings along when it joins the mission each send
-one. The grantee's journal applies an event only to a whole copy: one
-that arrives before the first snapshot is whole, or after a snapshot was
-given up on, is dropped, and the next snapshot carries its record. Over
-5,000 of a kind, the oldest goes, as a snapshot keeps the newest.
+one. Before an event is sent, the owner's journal checks again that the
+grantee view still shows its record (a box can turn private while it
+waits). `sent` is the grant's offer `sent_at`: an event naming an earlier
+offer of the same grant, one that ended and was offered again, is
+dropped. The grantee's journal applies an event only to a whole copy: one
+that arrives before the first snapshot is whole is dropped, and the next
+snapshot carries its record. After a later snapshot was given up on,
+events apply to the last whole copy; each carries a record's whole state,
+so the copy only moves forward. A comment keeps its local id across
+updates of its item. Over 5,000 of a kind, the oldest goes, as a snapshot
+keeps the newest.
 
 A `mission.event` is checked on arrival like a snapshot page (`400
 malformed`, `409 not_active`). One that dies leaves the share standing;

@@ -24,7 +24,7 @@ import { answerRemoteGrant, leaveRemoteGrant, getGrantRaw, sharePreview } from '
 import { onRemoteMissionWrite, card, fileMirror, closeMirror, audit, changed, fileNotice, peopleConvo, onGrantOutcome, onGrantRevoked, PEER_ACTIONS, SHARE_CARD_KIND } from './sharing-events.js'
 import { consentLink } from './consent-items.js'
 import { sanitizePeerText, plainText as plain } from './peer-text.js'
-import { SNAPSHOT_OP, EVENT_OP, sendSnapshot, sendEvent, applySnapshotPage, applyEvent } from './federation-replica.js'
+import { SNAPSHOT_OP, EVENT_OP, sendSnapshot, sendEvent, eventBody, applySnapshotPage, applyEvent } from './federation-replica.js'
 
 export const OFFER_OP = 'grant.offer'
 export const ANSWER_OP = 'grant.answer'
@@ -110,6 +110,8 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
   let outbox = null
   const pending = new WeakMap()
   const addressOfUser = (userId) => `${db.prepare('SELECT name FROM users WHERE id=?').get(userId).name}@${federation.host}`
+  // One notice a day per share, whichever way its events failed.
+  const eventNoticeKey = (g) => `fed-event:${g.id}:${new Date(clock()).toISOString().slice(0, 10)}`
   const kick = () => { try { outbox?.kick() } catch (err) { log.error?.('federation: outbox kick failed', err) } }
 
   // --- The owner's journal: grants.js calls this inside its transaction ------
@@ -151,7 +153,7 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
         fileNotice(ctx, {
           userId: g.owner_user_id, title: `Couldn't update mission #${g.mission_num} for ${plain(to)}`,
           body: `Too much is waiting to go to ${g.grantee_journal}, so a change to mission **#${g.mission_num} ${titleOf(g.mission_title)}** was not sent. The copy they read may be behind. The share itself stands.`,
-          idemKey: `fed-event-full:${g.id}:${new Date(clock()).toISOString().slice(0, 10)}`,
+          idemKey: eventNoticeKey(g),
         })
       }
     }
@@ -483,9 +485,13 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
       },
     },
     [EVENT_OP]: {
+      // And the record is still one the grantee view shows: a box that went
+      // private since the event was queued keeps what it wrote at home.
       stillAllowed(d, entry) {
-        const g = getGrantRaw(d, bodyOf(entry).grant)
-        return !!g && g.state === 'active'
+        const body = bodyOf(entry)
+        const g = getGrantRaw(d, body.grant)
+        if (!g || g.state !== 'active') return false
+        return body.record === null || !!eventBody(d, g, body.kind, body.ref ?? null)
       },
       // As for a snapshot: the share stands, their copy may be behind. Once
       // a day per share, however many events died.
@@ -496,7 +502,7 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
           fileNotice(ctx, {
             userId: g.owner_user_id, title: `Couldn't update mission #${g.mission_num} for ${to}`,
             body: `Their journal at ${g.grantee_journal} ${why(error)}, so the copy of mission **#${g.mission_num} ${titleOf(g.mission_title)}** they read may be behind. The share itself stands.`,
-            idemKey: `fed-event-dead:${g.id}:${new Date(clock()).toISOString().slice(0, 10)}`,
+            idemKey: eventNoticeKey(g),
           })
         }
         return 'discard'

@@ -54,7 +54,7 @@ test('each write on the mission reaches the copy, and the apps are told', async 
   const kinds = events(w).map((e) => [e.kind, e.ref ? e.ref.slice(0, 3) : null])
   assert.deepEqual(kinds.map((k) => k[0]).filter((k, i, a) => a.indexOf(k) === i).sort(), ['item', 'milestone', 'mission'])
   for (const e of events(w)) {
-    assert.deepEqual(Object.keys(e).filter((k) => !['grant', 'kind', 'ref', 'record'].includes(k)), [])
+    assert.deepEqual(Object.keys(e).filter((k) => !['grant', 'sent', 'kind', 'ref', 'record'].includes(k)), [])
     assert.ok(!JSON.stringify(e).includes('"work"') && !JSON.stringify(e).includes(w.mission.id), 'no conversation or mission id crosses')
   }
   const frame = await ws.waitFor((f) => f.kind === 'shared' && f.event === 'mission_changed' && f.what === 'item')
@@ -68,7 +68,8 @@ test('an item that leaves the mission leaves the copy; one that joins it arrives
   assert.equal((await w.aliceBox(`/items/${q.id}`, { method: 'PATCH', body: { mission: null } })).status, 200)
   await w.settle()
   assert.deepEqual(await bobItems(w), [])
-  assert.deepEqual(events(w).at(-1), { grant: events(w).at(-1).grant, kind: 'item', ref: q.id, record: null })
+  const last = events(w).at(-1)
+  assert.deepEqual(last, { grant: last.grant, sent: last.sent, kind: 'item', ref: q.id, record: null })
 
   assert.equal((await w.aliceBox(`/items/${q.id}`, { method: 'PATCH', body: { mission: w.mission.id } })).status, 200)
   await w.settle()
@@ -112,17 +113,52 @@ test('an event is applied only to a whole copy, and checked like a snapshot', as
   const { w, q } = await shared(t)
   const r = incoming(w.b)[0]
   const item = { ref: q.id, num: q.num, kind: 'question', state: 'open', title: 'Renamed\u0007 over there', body: '', created_at: 1, updated_at: Date.now(), comments: [] }
-  assert.deepEqual(applyEvent(w.b.db, r, { grant: r.peer_grant_ref, kind: 'item', ref: q.id, record: item }).kind, 'item')
+  assert.deepEqual(applyEvent(w.b.db, r, { grant: r.peer_grant_ref, sent: r.offer_sent, kind: 'item', ref: q.id, record: item }).kind, 'item')
   assert.deepEqual((await bobItems(w)).map((i) => i.title), ['Renamed over there'])
   for (const bad of [
     { kind: 'nope', record: {} }, { kind: 'item', ref: 'gr_1', record: null }, { kind: 'item', ref: 'it_other', record: item },
-    { kind: 'milestone', ref: 'ml_1', record: null }, { kind: 'mission', record: null }, { kind: 'item', ref: q.id },
+    { kind: 'milestone', ref: 'ml_1', record: null }, { kind: 'mission', record: null }, { kind: 'item', ref: q.id }, { kind: 'item', ref: q.id, record: null, sent: 'x' },
   ]) {
-    assert.throws(() => applyEvent(w.b.db, r, { grant: r.peer_grant_ref, ...bad }), /malformed/, JSON.stringify(bad))
+    assert.throws(() => applyEvent(w.b.db, r, { grant: r.peer_grant_ref, sent: r.offer_sent, ...bad }), /malformed/, JSON.stringify(bad))
   }
   // No whole copy yet: dropped.
   w.b.db.prepare('UPDATE fed_replica_missions SET complete=0').run()
-  assert.equal(applyEvent(w.b.db, r, { grant: r.peer_grant_ref, kind: 'item', ref: q.id, record: null }), null)
+  assert.equal(applyEvent(w.b.db, r, { grant: r.peer_grant_ref, sent: r.offer_sent, kind: 'item', ref: q.id, record: null }), null)
   w.b.db.prepare('UPDATE fed_replica_missions SET complete=1').run()
+  // From an earlier offer of the same grant: dropped.
+  assert.equal(applyEvent(w.b.db, r, { grant: r.peer_grant_ref, sent: r.offer_sent - 1, kind: 'item', ref: q.id, record: null }), null)
   assert.equal((await bobItems(w)).length, 1)
+})
+
+test('a comment keeps its id on the copy as its item changes', async (t) => {
+  const { w, q } = await shared(t)
+  await w.aliceBox(`/items/${q.id}/comments`, post({ body: 'First thought', convo_id: 'work' }))
+  await w.settle()
+  const [bq] = await bobItems(w)
+  const ids = (await w.phones.bob(`/items/${bq.id}`)).json.comments.map((c) => c.id)
+  await w.aliceBox(`/items/${q.id}`, { method: 'PATCH', body: { title: 'Tomatoes, beans or peas?' } })
+  await w.aliceBox(`/items/${q.id}/comments`, post({ body: 'Second thought', convo_id: 'work' }))
+  await w.settle()
+  const after = (await w.phones.bob(`/items/${bq.id}`)).json
+  assert.equal(after.item.title, 'Tomatoes, beans or peas?')
+  assert.deepEqual(after.comments.map((c) => c.body), ['First thought', 'Second thought'])
+  assert.equal(after.comments[0].id, ids[0])
+})
+
+test('an event whose box turned private while it waited is not sent', async (t) => {
+  const { w } = await shared(t)
+  const box = createAgent(w.a.db, w.users.alice.id, 'shed-box')
+  upsertConversation(w.a.db, { id: 'shed', ownerUserId: w.users.alice.id, title: 'Shed', agentDeviceId: box.deviceId })
+  await w.a.http(`/missions/${w.mission.id}/join`, { token: box.token, ...post({ convo_id: 'shed' }) })
+  await w.settle()
+  // Hold the share's queue: an earlier event at its head, not yet due.
+  await w.aliceBox(`/missions/${w.mission.id}`, { method: 'PATCH', body: { status: 'Held', convo_id: 'work' } })
+  w.a.db.prepare("UPDATE fed_outbox SET next_at=? WHERE rowid=(SELECT MAX(rowid) FROM fed_outbox WHERE op='mission.event')").run(Date.now() + 3600_000)
+  await w.a.http('/items', { token: box.token, ...post({ convo_id: 'shed', kind: 'task', title: 'Before it went private' }) })
+  assert.ok(events(w).some((e) => e.record?.title === 'Before it went private'), 'queued while the box was ordinary')
+  w.a.db.prepare("UPDATE devices SET private=1 WHERE name='shed-box'").run()
+  w.a.db.prepare("UPDATE fed_outbox SET next_at=0 WHERE state='queued'").run()
+  await w.settle()
+  assert.equal((await bobMission(w)).status, 'Held')
+  assert.deepEqual((await bobItems(w)).map((i) => i.title), ['Tomatoes or beans?'])
 })

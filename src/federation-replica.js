@@ -3,7 +3,7 @@
 // this is what the grant lets the grantee read.
 //
 //   mission.snapshot  owner → grantee  {grant, snap, page, pages, mission?, milestones, items}
-//   mission.event     owner → grantee  {grant, kind, ref?, record}
+//   mission.event     owner → grantee  {grant, sent, kind, ref?, record}
 //
 // The owner's journal builds what crosses from the grantee view a contact
 // on the same journal reads (missions.js grantedMissionExport, items.js
@@ -155,18 +155,19 @@ export function sendSnapshot(db, g, { from, to, now }) {
 export function eventBody(db, g, kind, ref = null) {
   const view = grantedMissionExport(db, g.subject_id)
   if (!view) return null
-  if (kind === 'mission') return { grant: g.id, kind, record: wireMission(view.mission) }
+  const at = { grant: g.id, sent: g.sent_at, kind }
+  if (kind === 'mission') return { ...at, record: wireMission(view.mission) }
   if (typeof ref !== 'string') return null
   if (kind === 'milestone') {
     const l = view.milestones.find((x) => x.id === ref)
-    return l ? { grant: g.id, kind, ref, record: wireMilestone(l) } : null
+    return l ? { ...at, ref, record: wireMilestone(l) } : null
   }
   if (kind !== 'item') return null
   const [x] = grantedItemsExport(db, g.subject_id, { limit: 1, only: ref })
-  if (x) return { grant: g.id, kind, ref, record: wireItem(x) }
+  if (x) return { ...at, ref, record: wireItem(x) }
   const hidden = db.prepare(`SELECT 1 FROM items i WHERE i.id = ? AND (i.consent IS NOT NULL OR i.private = 1
     OR EXISTS (SELECT 1 FROM conversations pc JOIN private_devices pd ON pd.id = pc.agent_device_id WHERE pc.id = i.origin_convo_id))`).get(ref)
-  return hidden ? null : { grant: g.id, kind, ref, record: null }
+  return hidden ? null : { ...at, ref, record: null }
 }
 
 // Queues one mission.event for grant `g`. Returns whether it queued one.
@@ -272,6 +273,12 @@ function putMilestone(d, incoming, l, snap) {
 }
 
 function putItem(d, incoming, i, snap) {
+  // Each comment keeps the id it was first given here, by its ref.
+  const was = d.prepare('SELECT comments FROM fed_replica_items WHERE fg_id=? AND ref=?').get(incoming.id, i.ref)
+  if (was) {
+    const ids = new Map(parse(was.comments, []).map((c) => [c.ref, c.id]))
+    i = { ...i, comments: i.comments.map((c) => (ids.has(c.ref) ? { ...c, id: ids.get(c.ref) } : c)) }
+  }
   d.prepare(`INSERT INTO fed_replica_items(id, fg_id, user_id, ref, num, kind, state, resolution, awaiting, title, body, created_by, created_at, updated_at, closed_at,
     labels, links, comment_count, last_comment_at, contributor_name, contributor_via, comments, comments_truncated, seen_snap)
     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fg_id, ref) DO UPDATE SET num=excluded.num, kind=excluded.kind, state=excluded.state,
@@ -347,17 +354,21 @@ export function applySnapshotPage(d, incoming, body, now) {
 }
 
 // One mission.event, inside the inbound transaction. Applied only to a
-// whole copy: an event that arrives before the first snapshot is whole
-// (or after one was given up on) is dropped, and the next snapshot carries
-// its record anyway. → {kind, missionId} when it changed the copy, else null.
+// whole copy: an event that arrives before the first snapshot is whole is
+// dropped, and the next snapshot carries its record anyway. After a later
+// snapshot was given up on, events apply to the last whole one: each is a
+// record's whole state, so the copy only moves forward. → {kind, missionId} when it changed the copy, else null.
 export function applyEvent(d, incoming, body) {
-  const { kind, ref = null, record } = body
-  if (!EVENT_KINDS.includes(kind) || record === undefined) fail('malformed')
+  const { kind, ref = null, record, sent } = body
+  if (!EVENT_KINDS.includes(kind) || record === undefined || !Number.isSafeInteger(sent)) fail('malformed')
   if (kind === 'milestone' && (typeof ref !== 'string' || !MS_REF.test(ref) || record === null)) fail('malformed')
   if (kind === 'item' && (typeof ref !== 'string' || !IT_REF.test(ref))) fail('malformed')
   if (kind === 'mission' && record === null) fail('malformed')
   const r = kind === 'mission' ? readMission(record) : record === null ? null : (kind === 'milestone' ? readMilestone(record) : readItem(record))
   if (r && kind !== 'mission' && r.ref !== ref) fail('malformed')
+  // An event from an earlier offer of this grant (one that ended and was
+  // offered again) belongs to a copy that is gone.
+  if (sent !== incoming.offer_sent) return null
   const rep = d.prepare('SELECT * FROM fed_replica_missions WHERE fg_id=?').get(incoming.id)
   if (!rep?.complete) return null
   if (kind === 'mission') {
