@@ -720,11 +720,11 @@ export function listSharedItems(db, viewerUserId, { kind = null, state = null, a
 // journal (src/federation-replica.js), where there is no grantee user to
 // check: the caller has checked the grant. The same sieve as GRANTED_ITEM,
 // and the same strip as a grantee's read.
-export function grantedItemsExport(db, missionId, { limit = 5000 } = {}) {
+export function grantedItemsExport(db, missionId, { limit = 5000, only = null } = {}) {
   const rows = db.prepare(`SELECT i.*, ${DECORATE}, ${OWNER_DECORATE}, 0 AS org_shared ${SHARED_OR_GRANTED_FROM}
-    WHERE i.mission_id = @m AND i.consent IS NULL AND i.private = 0
+    WHERE i.mission_id = @m AND i.consent IS NULL AND i.private = 0 AND (@only IS NULL OR i.id = @only)
       AND NOT EXISTS (SELECT 1 FROM conversations pc JOIN private_devices pd ON pd.id = pc.agent_device_id WHERE pc.id = i.origin_convo_id)
-    ORDER BY i.updated_at DESC, i.id DESC LIMIT @lim`).all({ m: missionId, lim: limit })
+    ORDER BY i.updated_at DESC, i.id DESC LIMIT @lim`).all({ m: missionId, lim: limit, only })
   return rows.map((r) => ({ item: rowToSharedItem(r), comments: listGrantedComments(db, r.id) }))
 }
 

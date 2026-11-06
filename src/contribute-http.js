@@ -102,7 +102,7 @@ function toOwner(ctx, { contributor, item, action, comment = null }) {
     try { requestTurn(db, item.id) } catch (err) { console.error('contribute: turn request stamp failed', err) }
     wakeConvoAgent(ctx, owner, convoId)
   }
-  notifyGrantees(ctx, full.mission_id, 'item')
+  notifyGrantees(ctx, full.mission_id, 'item', full.id)
 }
 
 // The owner (or one of the owner's agents) wrote on an item a contributor
@@ -159,7 +159,7 @@ export function handleContributedMilestone(ctx, res, who, body, { writableConvo 
     if (out.peopleCreated) appendAndBroadcast(db, hub, { userId: mission.user_id, convoId: out.convoId, sender: 'journal', type: 'convo_meta', payload: { title: PEOPLE_TITLE, parent_convo_id: null, system: PEOPLE_SYSTEM } })
     broadcastAppended(db, hub, { userId: mission.user_id, convoId: out.convoId, seq: out.seq, ts: out.ts, sender, type: MILESTONE_EVENT_TYPE, payload: markerOf(out.milestone) })
   } catch (err) { console.error('contribute: milestone broadcast failed (row and marker already committed)', err) }
-  notifyGrantees(ctx, mission.id, 'milestone')
+  notifyGrantees(ctx, mission.id, 'milestone', out.milestone.id)
   const { convo_id: _c, seq: _s, device_id: _d, ...text } = milestoneRow(out.milestone)
   json(res, 201, { milestone: text, mission: getGrantedMission(db, who.userId, mission.id) })
   return true

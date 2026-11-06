@@ -150,7 +150,7 @@ function replyReachesAsker(db, item) {
 // mirrors something the conversation already shows as its own message (a
 // consent card, src/consent-items.js): the text would overwrite the card's
 // snippet and count a second unread for one ask.
-export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action, comment = null, by = null, extra = null, fallback = true }) {
+export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action, comment = null, by = null, extra = null, fallback = true, from = null }) {
   // A typo'd action would ship a marker no client knows how to render;
   // that's a programmer error, not a request error, so it throws.
   if (!ITEM_ACTIONS.includes(action)) throw new Error(`unknown item action: ${action}`)
@@ -236,7 +236,9 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
   // for a consent mirror — the grantee's reads do not show one.
   // Nor for an owner-only item (`private`): no grantee can read it, so
   // there is nothing to follow and nobody to forward to.
-  if (item.mission_id && item.consent == null && !item.private) notifyGrantees({ db, hub }, item.mission_id, 'item')
+  if (item.mission_id && item.consent == null && !item.private) notifyGrantees({ db, hub }, item.mission_id, 'item', item.id)
+  // Moved off a mission: that mission's grantees no longer see it.
+  if (from && from !== item.mission_id && item.consent == null && !item.private) notifyGrantees({ db, hub }, from, 'item', item.id)
   // An item a contributor filed: the owner's reply reaches the conversation
   // that filed it, as another person's turn (src/contribute-http.js).
   if (item.mission_id && item.consent == null && !item.private) forwardToContributor({ db, hub, pushPipeline, waker }, who, item, { action, comment })
@@ -463,7 +465,7 @@ async function handlePatch(ctx, req, res, who, item) {
   // hand-moved `awaiting` is a change connected clients must see without
   // re-polling. It is a quiet action though — no wake, no push (see
   // ITEM_ACTIONS in items-marker.js).
-  emitMarker(ctx, who, { item: result, action: 'updated' })
+  emitMarker(ctx, who, { item: result, action: 'updated', from: item.mission_id })
   replyItems(who, res, 200, { item: result })
   return true
 }

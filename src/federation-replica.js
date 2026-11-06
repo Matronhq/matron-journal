@@ -3,6 +3,7 @@
 // this is what the grant lets the grantee read.
 //
 //   mission.snapshot  owner → grantee  {grant, snap, page, pages, mission?, milestones, items}
+//   mission.event     owner → grantee  {grant, kind, ref?, record}
 //
 // The owner's journal builds what crosses from the grantee view a contact
 // on the same journal reads (missions.js grantedMissionExport, items.js
@@ -12,7 +13,11 @@
 //
 // A snapshot is sent in pages, in order, on the grant's own subject in the
 // outbox, so a revoke jumps the queue and cancels what waits. The grantee's
-// journal keeps a read-only replica: each record it holds gets an id of its
+// journal keeps a read-only replica: after the snapshot, each write on the
+// mission sends a mission.event with that one record's whole state as the
+// grantee view now has it (null: an item no longer on the mission). It goes
+// on the same subject, after any snapshot pages, so the grantee applies
+// every event to the snapshot it follows. The each record it holds gets an id of its
 // own (the owner's is `ref`), and the last page drops whatever the snapshot
 // no longer had. The replica is served only while the grant is active; a
 // trigger (db.js) deletes it the moment the grant ends there.
@@ -23,6 +28,8 @@ import { grantedItemsExport } from './items.js'
 import { sanitizePeerText } from './peer-text.js'
 
 export const SNAPSHOT_OP = 'mission.snapshot'
+export const EVENT_OP = 'mission.event'
+export const EVENT_KINDS = ['mission', 'milestone', 'item']
 
 // Under the envelope's 1 MiB with room for the envelope itself.
 export const PAGE_BYTES = 512 * 1024
@@ -139,6 +146,38 @@ export function sendSnapshot(db, g, { from, to, now }) {
   return pages.length
 }
 
+// The body of one mission.event for grant `g`: the record `ref` of `kind`
+// as its grantee view has it now. null when there is nothing to send: the
+// mission is no longer one the grant can show, or the record is one the
+// view never shows (a private item, a milestone from a private box), so
+// not even its id crosses. An item the view shows nowhere else, because it
+// has left the mission, crosses as `record: null`.
+export function eventBody(db, g, kind, ref = null) {
+  const view = grantedMissionExport(db, g.subject_id)
+  if (!view) return null
+  if (kind === 'mission') return { grant: g.id, kind, record: wireMission(view.mission) }
+  if (typeof ref !== 'string') return null
+  if (kind === 'milestone') {
+    const l = view.milestones.find((x) => x.id === ref)
+    return l ? { grant: g.id, kind, ref, record: wireMilestone(l) } : null
+  }
+  if (kind !== 'item') return null
+  const [x] = grantedItemsExport(db, g.subject_id, { limit: 1, only: ref })
+  if (x) return { grant: g.id, kind, ref, record: wireItem(x) }
+  const hidden = db.prepare(`SELECT 1 FROM items i WHERE i.id = ? AND (i.consent IS NOT NULL OR i.private = 1
+    OR EXISTS (SELECT 1 FROM conversations pc JOIN private_devices pd ON pd.id = pc.agent_device_id WHERE pc.id = i.origin_convo_id))`).get(ref)
+  return hidden ? null : { grant: g.id, kind, ref, record: null }
+}
+
+// Queues one mission.event for grant `g`. Returns whether it queued one.
+// Throws outbox_full like enqueue.
+export function sendEvent(db, g, { kind, ref = null, from, to, now }) {
+  const body = eventBody(db, g, kind, ref)
+  if (!body) return false
+  enqueue(db, { userId: g.owner_user_id, from, to, op: EVENT_OP, body, subject: `grant:${g.id}`, urgent: false, now })
+  return true
+}
+
 // --- Arrival: the grantee's journal ---------------------------------------
 
 // Peer text kept as the owner wrote it, lines and all (it is shown as
@@ -224,6 +263,27 @@ function readItem(i) {
   }
 }
 
+// One record into the replica, by the owner's ref: its id here is kept.
+function putMilestone(d, incoming, l, snap) {
+  d.prepare(`INSERT INTO fed_replica_milestones(id, fg_id, ref, num, kind, title, body, created_by, created_at, contributor_name, contributor_via, seen_snap)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fg_id, ref) DO UPDATE SET num=excluded.num, kind=excluded.kind, title=excluded.title, body=excluded.body,
+    created_by=excluded.created_by, created_at=excluded.created_at, contributor_name=excluded.contributor_name, contributor_via=excluded.contributor_via, seen_snap=excluded.seen_snap`)
+    .run(newId('ml'), incoming.id, l.ref, l.num, l.kind, l.title, l.body, l.created_by, l.created_at, l.contributor_name, l.contributor_via, snap)
+}
+
+function putItem(d, incoming, i, snap) {
+  d.prepare(`INSERT INTO fed_replica_items(id, fg_id, user_id, ref, num, kind, state, resolution, awaiting, title, body, created_by, created_at, updated_at, closed_at,
+    labels, links, comment_count, last_comment_at, contributor_name, contributor_via, comments, comments_truncated, seen_snap)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fg_id, ref) DO UPDATE SET num=excluded.num, kind=excluded.kind, state=excluded.state,
+    resolution=excluded.resolution, awaiting=excluded.awaiting, title=excluded.title, body=excluded.body, created_by=excluded.created_by,
+    created_at=excluded.created_at, updated_at=excluded.updated_at, closed_at=excluded.closed_at, labels=excluded.labels, links=excluded.links,
+    comment_count=excluded.comment_count, last_comment_at=excluded.last_comment_at, contributor_name=excluded.contributor_name,
+    contributor_via=excluded.contributor_via, comments=excluded.comments, comments_truncated=excluded.comments_truncated, seen_snap=excluded.seen_snap`)
+    .run(newId('it'), incoming.id, incoming.user_id, i.ref, i.num, i.kind, i.state, i.resolution, i.awaiting, i.title, i.body, i.created_by, i.created_at,
+      i.updated_at, i.closed_at, JSON.stringify(i.labels), JSON.stringify(i.links), i.comment_count, i.last_comment_at, i.contributor_name, i.contributor_via,
+      JSON.stringify(i.comments), i.comments_truncated ? 1 : 0, snap)
+}
+
 const SNAP = /^sn_[A-Za-z0-9_-]{1,64}$/
 
 // One page, inside the inbound transaction. `incoming` the grantee's live
@@ -278,28 +338,43 @@ export function applySnapshotPage(d, incoming, body, now) {
       created_by, created_at, updated_at, closed_at, applied_snap, complete, received_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)`)
       .run(id, incoming.id, incoming.user_id, ...cols, snap, now)
   }
-  const insMilestone = d.prepare(`INSERT INTO fed_replica_milestones(id, fg_id, ref, num, kind, title, body, created_by, created_at, contributor_name, contributor_via, seen_snap)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fg_id, ref) DO UPDATE SET num=excluded.num, kind=excluded.kind, title=excluded.title, body=excluded.body,
-    created_by=excluded.created_by, created_at=excluded.created_at, contributor_name=excluded.contributor_name, contributor_via=excluded.contributor_via, seen_snap=excluded.seen_snap`)
-  const insItem = d.prepare(`INSERT INTO fed_replica_items(id, fg_id, user_id, ref, num, kind, state, resolution, awaiting, title, body, created_by, created_at, updated_at, closed_at,
-    labels, links, comment_count, last_comment_at, contributor_name, contributor_via, comments, comments_truncated, seen_snap)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fg_id, ref) DO UPDATE SET num=excluded.num, kind=excluded.kind, state=excluded.state,
-    resolution=excluded.resolution, awaiting=excluded.awaiting, title=excluded.title, body=excluded.body, created_by=excluded.created_by,
-    created_at=excluded.created_at, updated_at=excluded.updated_at, closed_at=excluded.closed_at, labels=excluded.labels, links=excluded.links,
-    comment_count=excluded.comment_count, last_comment_at=excluded.last_comment_at, contributor_name=excluded.contributor_name,
-    contributor_via=excluded.contributor_via, comments=excluded.comments, comments_truncated=excluded.comments_truncated, seen_snap=excluded.seen_snap`)
-  for (const l of all.flatMap((p) => p.milestones).slice(0, MAX_RECORDS)) {
-    insMilestone.run(newId('ml'), incoming.id, l.ref, l.num, l.kind, l.title, l.body, l.created_by, l.created_at, l.contributor_name, l.contributor_via, snap)
-  }
-  for (const i of all.flatMap((p) => p.items).slice(0, MAX_RECORDS)) {
-    insItem.run(newId('it'), incoming.id, incoming.user_id, i.ref, i.num, i.kind, i.state, i.resolution, i.awaiting, i.title, i.body, i.created_by, i.created_at,
-      i.updated_at, i.closed_at, JSON.stringify(i.labels), JSON.stringify(i.links), i.comment_count, i.last_comment_at, i.contributor_name, i.contributor_via,
-      JSON.stringify(i.comments), i.comments_truncated ? 1 : 0, snap)
-  }
+  for (const l of all.flatMap((p) => p.milestones).slice(0, MAX_RECORDS)) putMilestone(d, incoming, l, snap)
+  for (const i of all.flatMap((p) => p.items).slice(0, MAX_RECORDS)) putItem(d, incoming, i, snap)
   // Whatever this snapshot did not carry is gone.
   d.prepare('DELETE FROM fed_replica_milestones WHERE fg_id=? AND seen_snap IS NOT ?').run(incoming.id, snap)
   d.prepare('DELETE FROM fed_replica_items WHERE fg_id=? AND seen_snap IS NOT ?').run(incoming.id, snap)
   return { done: rep?.complete ? 'changed' : 'added', missionId: id }
+}
+
+// One mission.event, inside the inbound transaction. Applied only to a
+// whole copy: an event that arrives before the first snapshot is whole
+// (or after one was given up on) is dropped, and the next snapshot carries
+// its record anyway. → {kind, missionId} when it changed the copy, else null.
+export function applyEvent(d, incoming, body) {
+  const { kind, ref = null, record } = body
+  if (!EVENT_KINDS.includes(kind) || record === undefined) fail('malformed')
+  if (kind === 'milestone' && (typeof ref !== 'string' || !MS_REF.test(ref) || record === null)) fail('malformed')
+  if (kind === 'item' && (typeof ref !== 'string' || !IT_REF.test(ref))) fail('malformed')
+  if (kind === 'mission' && record === null) fail('malformed')
+  const r = kind === 'mission' ? readMission(record) : record === null ? null : (kind === 'milestone' ? readMilestone(record) : readItem(record))
+  if (r && kind !== 'mission' && r.ref !== ref) fail('malformed')
+  const rep = d.prepare('SELECT * FROM fed_replica_missions WHERE fg_id=?').get(incoming.id)
+  if (!rep?.complete) return null
+  if (kind === 'mission') {
+    d.prepare(`UPDATE fed_replica_missions SET num=?, title=?, name=?, body=?, state=?, status=?, status_by=?, status_updated_at=?, close_summary=?, closed_by=?,
+      created_by=?, created_at=?, updated_at=?, closed_at=? WHERE fg_id=?`)
+      .run(r.num, r.title, r.name, r.body, r.state, r.status, r.status_by, r.status_updated_at, r.close_summary, r.closed_by, r.created_by, r.created_at, r.updated_at, r.closed_at, incoming.id)
+  } else if (kind === 'milestone') {
+    putMilestone(d, incoming, r, rep.applied_snap)
+    // Over the cap, the oldest goes, as a snapshot keeps the newest.
+    d.prepare(`DELETE FROM fed_replica_milestones WHERE id IN (SELECT id FROM fed_replica_milestones WHERE fg_id=? ORDER BY created_at DESC, num DESC LIMIT -1 OFFSET ?)`).run(incoming.id, MAX_RECORDS)
+  } else if (r) {
+    putItem(d, incoming, r, rep.applied_snap)
+    d.prepare(`DELETE FROM fed_replica_items WHERE id IN (SELECT id FROM fed_replica_items WHERE fg_id=? ORDER BY updated_at DESC, ref DESC LIMIT -1 OFFSET ?)`).run(incoming.id, MAX_RECORDS)
+  } else {
+    d.prepare('DELETE FROM fed_replica_items WHERE fg_id=? AND ref=?').run(incoming.id, ref)
+  }
+  return { kind, missionId: rep.id }
 }
 
 // --- Reads: the grantee's journal -----------------------------------------

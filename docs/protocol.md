@@ -5467,8 +5467,8 @@ tracker mirror (Accept / Decline), so today's apps answer it unchanged. An
 incoming grant's `subject_id` and `mission.id` are `null`: the mission
 lives on the owner's journal.
 
-Three ops carry a grant, and `mission.snapshot` (below) what it shares,
-all on the subject `grant:<owner's gr_ id>`:
+Three ops carry a grant, and `mission.snapshot` and `mission.event`
+(below) what it shares, all on the subject `grant:<owner's gr_ id>`:
 
 - `grant.offer`, owner to grantee, body `{grant, level: 'read', sent,
   mission: {num, title}, preview: {milestones, items, comments,
@@ -5567,15 +5567,42 @@ Each row reads as a grantee's would (`shared_via: 'grant'`,
 {user_id: 0, name: <address>, address}` and `grant {id: <fg_ id>, level}`.
 Every other method on them is `403`. The apps get `shared` frames as for a
 share on one journal: `mission_added` when the first snapshot is whole,
-`mission_changed` (`what: 'snapshot'`) for a later one, and
+`mission_changed` for a later one (`what: 'snapshot'`) or a
+`mission.event` (`what` its `kind`), and
 `mission_removed` when the share ends. The copy is deleted the moment the
 grant stops being active on the grantee's journal, whichever way it ended.
 
 A snapshot the grantee's journal refuses or never takes leaves the share
 standing; the owner gets one notice for it ("Couldn't send mission #N to
 bob@b.example"), except when the refusal is `not_active` (the share has
-ended there, and its revoke is on the way). So far a snapshot is sent on
-accept only: the changes after it follow in a later stage.
+ended there, and its revoke is on the way).
+
+**Live changes.** After the snapshot, each write on the mission sends a
+`mission.event` to every contact on another journal it is shared with,
+on the same subject, so it applies after the snapshot it follows:
+
+```
+{grant, kind: 'mission'|'milestone'|'item', ref?, record}
+```
+
+`record` is the one record the write changed, its whole state as the
+snapshot would carry it (the same fields): the mission's own fields for
+`mission`, the milestone or item named by `ref` (its `ml_…` or `it_…` id
+on the owner's journal) otherwise. An item that left the mission, or
+moved to another one, crosses as `record: null`, and the grantee drops
+it. A record the grantee view never shows (an owner-only item, an item or
+milestone from a private box) sends nothing, so not even its id crosses.
+Items a conversation brings along when it joins the mission each send
+one. The grantee's journal applies an event only to a whole copy: one
+that arrives before the first snapshot is whole, or after a snapshot was
+given up on, is dropped, and the next snapshot carries its record. Over
+5,000 of a kind, the oldest goes, as a snapshot keeps the newest.
+
+A `mission.event` is checked on arrival like a snapshot page (`400
+malformed`, `409 not_active`). One that dies leaves the share standing;
+the owner gets a notice ("Couldn't update mission #N for bob@b.example"),
+at most one a day per share, and the same when the outbox is too full to
+queue one.
 
 ## Device privacy
 

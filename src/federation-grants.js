@@ -12,7 +12,8 @@
 //   grant.answer  grantee → owner  {grant, decision: approve|decline}
 //   grant.revoke  either way       {grant}            urgent: cancels the grant's queue
 //   mission.snapshot owner → grantee, on accept: the mission's contents
-//                 (src/federation-replica.js)
+//   mission.event    owner → grantee, on each write since: one record's
+//                 state (both in src/federation-replica.js)
 //
 // Every op of one grant shares the subject `grant:<owner's gr_ id>`, so an
 // answer never overtakes its offer and a revoke cancels whatever waits.
@@ -20,10 +21,10 @@ import { newId } from './items.js'
 import { enqueue } from './federation-outbox.js'
 import { remoteContactRaw } from './contacts.js'
 import { answerRemoteGrant, leaveRemoteGrant, getGrantRaw, sharePreview } from './grants.js'
-import { card, fileMirror, closeMirror, audit, changed, fileNotice, peopleConvo, onGrantOutcome, onGrantRevoked, PEER_ACTIONS, SHARE_CARD_KIND } from './sharing-events.js'
+import { onRemoteMissionWrite, card, fileMirror, closeMirror, audit, changed, fileNotice, peopleConvo, onGrantOutcome, onGrantRevoked, PEER_ACTIONS, SHARE_CARD_KIND } from './sharing-events.js'
 import { consentLink } from './consent-items.js'
 import { sanitizePeerText, plainText as plain } from './peer-text.js'
-import { SNAPSHOT_OP, sendSnapshot, applySnapshotPage } from './federation-replica.js'
+import { SNAPSHOT_OP, EVENT_OP, sendSnapshot, sendEvent, applySnapshotPage, applyEvent } from './federation-replica.js'
 
 export const OFFER_OP = 'grant.offer'
 export const ANSWER_OP = 'grant.answer'
@@ -130,6 +131,33 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
       enqueue(db, { userId: g.owner_user_id, from, to, op: REVOKE_OP, body: { grant: g.id }, subject: subjectOf(g.id), urgent: true, cancelSubject: true, now: clock() })
     }
   }
+
+  // A write on a mission (sharing-events.js notifyGrantees, after it has
+  // committed): every contact on another journal it is shared with gets the
+  // record's new state. A full outbox loses the event; the owner is told,
+  // once a day per share, that the copy over there may be behind.
+  function onMissionWrite(missionId, kind, ref) {
+    const ids = db.prepare(`SELECT g.id FROM grants g JOIN contacts oc ON oc.id = g.contact_id AND oc.state = 'active' AND oc.peer_journal IS NOT NULL
+      WHERE g.subject_kind = 'mission' AND g.subject_id = ? AND g.state = 'active' AND g.level <> 'owner'`).all(missionId)
+    if (!ids.length) return
+    let queued = false
+    for (const { id } of ids) {
+      const g = getGrantRaw(db, id)
+      const to = `${g.grantee_name}@${g.grantee_journal}`
+      try {
+        queued = sendEvent(db, g, { kind, ref, from: `${g.owner_name}@${federation.host}`, to, now: clock() }) || queued
+      } catch (err) {
+        if (err.message !== 'outbox_full' && err.message !== 'too_large') throw err
+        fileNotice(ctx, {
+          userId: g.owner_user_id, title: `Couldn't update mission #${g.mission_num} for ${plain(to)}`,
+          body: `Too much is waiting to go to ${g.grantee_journal}, so a change to mission **#${g.mission_num} ${titleOf(g.mission_title)}** was not sent. The copy they read may be behind. The share itself stands.`,
+          idemKey: `fed-event-full:${g.id}:${new Date(clock()).toISOString().slice(0, 10)}`,
+        })
+      }
+    }
+    if (queued) kick()
+  }
+  onRemoteMissionWrite(db, onMissionWrite)
 
   // --- The grantee's journal: the card, the answer, leaving -----------------
 
@@ -329,6 +357,24 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
       },
       errors: { malformed: 400, not_contact: 403, not_active: 409 },
     },
+    // The grantee's journal: one record changed over there.
+    [EVENT_OP]: {
+      apply({ db: d, envelope, peer }) {
+        const ref = grantRef(envelope.body)
+        const { user } = party(d, envelope, peer)
+        const r = d.prepare(`${IN} WHERE user_id=? AND peer_host=? AND peer_grant_ref=? AND owner_name=?`).get(user.id, hostOf(envelope.from), ref, nameOf(envelope.from))
+        if (!r || r.state !== 'active') fail('not_active')
+        const out = applyEvent(d, r, envelope.body)
+        if (out) pending.set(envelope, { ...out, row: r })
+        return {}
+      },
+      after({ envelope }) {
+        const p = pending.get(envelope)
+        if (!p) return
+        sharedFrame(ctx, p.row.user_id, { event: 'mission_changed', mission_id: p.missionId, grant_id: p.row.id, what: p.kind, owner: { user_id: 0, name: p.row.owner_address } })
+      },
+      errors: { malformed: 400, not_contact: 403, not_active: 409 },
+    },
     // Either side: the other one ended it.
     [REVOKE_OP]: {
       apply({ db: d, envelope, peer, now }) {
@@ -431,6 +477,26 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
             userId: g.owner_user_id, title: `Couldn't send mission #${g.mission_num} to ${to}`,
             body: `Their journal at ${g.grantee_journal} ${why(error)}, so the copy of mission **#${g.mission_num} ${titleOf(g.mission_title)}** they read may be out of date or missing. The share itself stands.`,
             idemKey: `fed-snapshot-dead:${g.id}:${body.snap}`,
+          })
+        }
+        return 'discard'
+      },
+    },
+    [EVENT_OP]: {
+      stillAllowed(d, entry) {
+        const g = getGrantRaw(d, bodyOf(entry).grant)
+        return !!g && g.state === 'active'
+      },
+      // As for a snapshot: the share stands, their copy may be behind. Once
+      // a day per share, however many events died.
+      onDead(d, entry, { error }) {
+        const g = getGrantRaw(d, bodyOf(entry).grant)
+        if (g && g.state === 'active' && error !== 'not_active') {
+          const to = plain(`${g.grantee_name}@${g.grantee_journal}`)
+          fileNotice(ctx, {
+            userId: g.owner_user_id, title: `Couldn't update mission #${g.mission_num} for ${to}`,
+            body: `Their journal at ${g.grantee_journal} ${why(error)}, so the copy of mission **#${g.mission_num} ${titleOf(g.mission_title)}** they read may be behind. The share itself stands.`,
+            idemKey: `fed-event-dead:${g.id}:${new Date(clock()).toISOString().slice(0, 10)}`,
           })
         }
         return 'discard'
