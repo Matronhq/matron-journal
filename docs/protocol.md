@@ -5480,7 +5480,10 @@ Three ops carry a grant, all on the subject `grant:<owner's gr_ id>`:
   grantee's row moves at the tap; the owner's grant moves when the answer
   applies, and only while it is still `pending` (`409 not_pending`
   otherwise). An accept that is refused or undelivered ends the
-  grantee's row and gives them a notice.
+  grantee's row and gives them a notice. The owner's journal hears
+  nothing then, so while its grant is `pending` the owner (a client, not
+  an agent) may offer it again rather than get `409 pending`: the same
+  grant is sent again, and a grantee holding it live just keeps it.
 - `grant.revoke`, either way, body `{grant}`: urgent, and it cancels
   whatever is still queued for the grant. The owner's withdrawal ends the
   grantee's row (its card closes if still open); the grantee's ends the

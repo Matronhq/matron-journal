@@ -309,7 +309,7 @@ export function onContactEnded(ctx, who, out, verb) {
     changed(ctx, out.peer.user_id, { contact_id: out.peer.id })
   }
   for (const g of out.revokedGrants) onGrantRevoked(ctx, g, 'contact_removed')
-  for (const r of out.endedIncoming ?? []) onIncomingEnded(ctx, r, 'contact_removed')
+  for (const r of out.endedIncoming ?? []) onIncomingEnded(ctx, r, 'contact_ended')
   changed(ctx, own.user_id, { contact_id: own.id })
 }
 
@@ -345,7 +345,7 @@ function shareCardPayload(db, g, direction) {
 
 const shareOwnerAsk = asking('share approval card', (ctx, who, g) => {
   const { db } = ctx
-  const to = plain(g.grantee_name)
+  const to = plain(g.grantee_journal ? `${g.grantee_name}@${g.grantee_journal}` : g.grantee_name)
   const p = sharePreview(db, g.subject_id)
   card(ctx, {
     userId: g.owner_user_id, convoId: g.origin_convo_id, sender: `agent:${who.name}`,

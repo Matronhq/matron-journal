@@ -69,21 +69,25 @@ export const getIncoming = (db, userId, id) =>
 const auditGrant = (r) => ({ id: r.id, level: r.level, subject_kind: 'mission', subject_id: null, mission_num: null, owner_user_id: null, owner_name: r.owner_address })
 const contactOf = (db, r) => db.prepare('SELECT * FROM contacts WHERE id=?').get(r.contact_id)
 
-// An incoming grant ended (`by` 'owner' | 'grantee' | 'contact_removed'):
+// An incoming grant ended (`by` 'owner' | 'grantee', or 'contact_removed'
+// when the owner ended the contact, 'contact_ended' when the grantee did):
 // its open card closes, and the grantee's log says so.
 export function onIncomingEnded(ctx, before, by) {
   const { db } = ctx
   const from = plain(before.owner_address)
   const words = `mission "${titleOf(before.mission_title)}"`
+  const mine = by === 'grantee' || by === 'contact_ended'
   if (before.state === 'pending') {
     closeMirror(ctx, {
       userId: before.user_id, itemId: before.item_id, consent: 'share', resolution: 'cancelled',
-      author: by === 'grantee' ? 'user' : 'agent', comment: by === 'grantee' ? 'Declined.' : by === 'owner' ? `${from} withdrew the offer.` : 'The contact ended, so this share ended with it.',
+      author: mine ? 'user' : 'agent', comment: by === 'grantee' ? 'Declined.' : by === 'owner' ? `${from} withdrew the offer.` : 'The contact ended, so this share ended with it.',
     })
   }
   audit(ctx, before.user_id, {
-    event: 'grant.revoked', contact: contactOf(db, before), grant: auditGrant(before), by: by === 'grantee' ? 'you' : 'peer',
-    summary: by === 'grantee' ? `You ended the share of ${words} from ${from}` : `${from} ended the share of ${words}`,
+    event: 'grant.revoked', contact: contactOf(db, before), grant: auditGrant(before), by: mine ? 'you' : 'peer',
+    summary: by === 'grantee' ? `You ended the share of ${words} from ${from}`
+      : by === 'owner' ? `${from} ended the share of ${words}`
+        : `The share of ${words} from ${from} ended with the contact`,
   })
   changed(ctx, before.user_id, { grant_id: before.id })
 }
@@ -344,7 +348,7 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
           d.prepare("UPDATE fed_grants_in SET state='revoked', revoked_by='owner', revoked_at=?, updated_at=? WHERE id=?").run(at, at, r.id)
           fileNotice(ctx, {
             userId: r.user_id, title: `Couldn't accept mission "${titleOf(r.mission_title)}"`,
-            body: `The journal at ${r.peer_host} ${why(error)}, so the share from \`${plain(r.owner_address)}\` did not start. They can offer it again.`,
+            body: `The journal at ${r.peer_host} ${why(error)}, so the share from \`${plain(r.owner_address)}\` did not start. Ask them to offer it again.`,
             idemKey: `fed-answer-dead:${entry.id}`,
           })
           changed(ctx, r.user_id, { grant_id: r.id })

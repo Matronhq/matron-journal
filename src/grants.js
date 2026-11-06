@@ -110,7 +110,11 @@ export function sharePreview(db, missionId) {
 // active one. Returns {grant, existing}.
 function upsertAsk(db, { ownerUserId, kind, subjectId, own, level, brief, excludeMedia, keepLevel, by, convoId, deviceId, now }) {
   const cur = db.prepare('SELECT * FROM grants WHERE subject_kind=? AND subject_id=? AND contact_id=?').get(kind, subjectId, own.id)
-  if (cur && (cur.state === 'awaiting_owner' || cur.state === 'pending' || cur.pending_state)) fail('pending')
+  // The owner's own offer to a contact on another journal may be offered
+  // again while it waits: their answer may never have got back (their
+  // journal gives up on it after 7 days), and nothing else would end it.
+  const resend = cur?.state === 'pending' && !cur.pending_state && own.peer_journal && by !== 'agent'
+  if (cur && !resend && (cur.state === 'awaiting_owner' || cur.state === 'pending' || cur.pending_state)) fail('pending')
   // Asking for what the contact already has, or less, changes nothing.
   if (cur?.state === 'active' && RANK[level] <= RANK[cur.level]) return { grant: getGrantRaw(db, cur.id), existing: true }
   if (by === 'agent' && parkedAsks(db, deviceId) >= MAX_PARKED_PER_DEVICE) fail('too_many_asks')

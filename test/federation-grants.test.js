@@ -169,7 +169,7 @@ test('a contact that ends ends its shares on both journals', async (t) => {
   await w.settle()
   const [fg] = incoming(w.b)
   assert.deepEqual([fg.state, fg.revoked_by], ['revoked', 'contact_removed'])
-  assert.equal(audits(w.b, w.users.bob.id).at(-1).summary, 'alice@a.example ended the share of mission "Garden Club"')
+  assert.equal(audits(w.b, w.users.bob.id).at(-1).summary, 'The share of mission "Garden Club" from alice@a.example ended with the contact')
   // No longer a contact: nothing can be offered.
   const r = await w.phones.alice(`/missions/${w.mission.id}/shares`, post({ contact: 'bob@b.example', level: 'read' }))
   assert.deepEqual([r.status, r.json.blocked_by], [409, 'not_contact'])
@@ -200,4 +200,39 @@ test('an answer that arrives after the owner withdrew does not start the share',
   const [after] = incoming(w.b)
   assert.equal(after.state, 'revoked')
   assert.equal(grantOf(w.a, g.id).state, 'revoked')
+})
+
+test('an accept that never gets back leaves the owner free to offer again', async (t) => {
+  const w = await world(t)
+  const g = await offer(w)
+  // alice's journal refuses bob's answer, so it dies in bob's outbox.
+  const row = w.a.db.prepare("SELECT id FROM contacts WHERE user_id=? AND peer_journal='b.example'").get(w.users.alice.id)
+  w.a.db.prepare("UPDATE contacts SET state='removed' WHERE id=?").run(row.id)
+  const [fg] = incoming(w.b)
+  await w.phones.bob(`/grants/${fg.id}/answer`, post({ decision: 'approve' }))
+  await w.settle()
+  assert.deepEqual([incoming(w.b)[0].state, grantOf(w.a, g.id).state], ['revoked', 'pending'])
+  const [n] = notices(w.b, w.users.bob.id).filter((x) => x.title.startsWith("Couldn't accept"))
+  assert.match(n.body, /Ask them to offer it again/)
+
+  w.a.db.prepare("UPDATE contacts SET state='active' WHERE id=?").run(row.id)
+  // Still pending here, but the owner may send it again; an agent may not.
+  const byAgent = await w.aliceBox(`/missions/${w.mission.id}/shares`, post({ contact: 'bob@b.example', level: 'read', convo_id: 'work' }))
+  assert.deepEqual([byAgent.status, byAgent.json.blocked_by], [409, 'pending'])
+  const g2 = await offer(w)
+  assert.equal(g2.id, g.id)
+  assert.equal(incoming(w.b)[0].state, 'pending')
+  await w.phones.bob(`/grants/${incoming(w.b)[0].id}/answer`, post({ decision: 'approve' }))
+  await w.settle()
+  assert.equal(grantOf(w.a, g.id).state, 'active')
+})
+
+test('the grantee ending the contact is logged as theirs', async (t) => {
+  const w = await world(t)
+  await offer(w)
+  await w.phones.bob(`/grants/${incoming(w.b)[0].id}/answer`, post({ decision: 'approve' }))
+  await w.settle()
+  const aliceOnB = (await w.phones.bob('/contacts')).json.contacts.find((c) => c.address === 'alice@a.example')
+  assert.equal((await w.phones.bob(`/contacts/${aliceOnB.id}`, { method: 'DELETE' })).status, 200)
+  assert.equal(audits(w.b, w.users.bob.id).at(-1).summary, 'The share of mission "Garden Club" from alice@a.example ended with the contact')
 })
