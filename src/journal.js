@@ -534,19 +534,31 @@ export function eventsAfter(db, userId, cursor, limit = 500) {
 // The replay half of sync-scope.js's scopeCarries for a for_you hello: what
 // that socket would have carried since `cursor`, minus the viewed
 // conversations (a reconnecting app has no viewing set yet; it fetches an
-// open chat's gap over HTTP).
+// open chat's gap over HTTP). Two indexed reads merged by seq rather than one
+// OR, so each side keeps its index: the marker types through
+// idx_events_for_you, the Coordinator conversation through idx_events_convo.
+// The Coordinator id is the user's own (coordinatorFor), so no user_id term:
+// with one, SQLite picks the (user_id, seq) key and walks every row.
 export function scopedEventsAfter(db, userId, cursor, coordinatorConvoId, limit = 500) {
-  return db.prepare(
-    `SELECT * FROM events WHERE user_id=? AND seq>? AND (type IN (${FOR_YOU_TYPES_SQL}) OR convo_id IS ?) ORDER BY seq LIMIT ?`
-  ).all(userId, cursor, coordinatorConvoId ?? null, limit).map(parseRow)
+  const markers = db.prepare(
+    `SELECT * FROM events WHERE user_id=? AND seq>? AND type IN (${FOR_YOU_TYPES_SQL}) ORDER BY seq LIMIT ?`
+  ).all(userId, cursor, limit)
+  const coordinator = coordinatorConvoId == null ? [] : db.prepare(
+    `SELECT * FROM events INDEXED BY idx_events_convo WHERE convo_id=? AND seq>? AND type NOT IN (${FOR_YOU_TYPES_SQL}) ORDER BY seq LIMIT ?`
+  ).all(coordinatorConvoId, cursor, limit)
+  return [...markers, ...coordinator].sort((a, b) => a.seq - b.seq).slice(0, limit).map(parseRow)
 }
 
 // How many events a for_you replay from `cursor` would send, counted up to
 // `cap` + 1 so the snapshot_required valve stops scanning early.
 export function scopedReplayCount(db, userId, cursor, coordinatorConvoId, cap) {
-  return db.prepare(
-    `SELECT COUNT(*) AS n FROM (SELECT 1 FROM events WHERE user_id=? AND seq>? AND (type IN (${FOR_YOU_TYPES_SQL}) OR convo_id IS ?) LIMIT ?)`
-  ).get(userId, cursor, coordinatorConvoId ?? null, cap + 1).n
+  const markers = db.prepare(
+    `SELECT COUNT(*) AS n FROM (SELECT 1 FROM events WHERE user_id=? AND seq>? AND type IN (${FOR_YOU_TYPES_SQL}) LIMIT ?)`
+  ).get(userId, cursor, cap + 1).n
+  if (coordinatorConvoId == null || markers > cap) return markers
+  return markers + db.prepare(
+    `SELECT COUNT(*) AS n FROM (SELECT 1 FROM events INDEXED BY idx_events_convo WHERE convo_id=? AND seq>? AND type NOT IN (${FOR_YOU_TYPES_SQL}) LIMIT ?)`
+  ).get(coordinatorConvoId, cursor, cap + 1 - markers).n
 }
 
 export function messagesBefore(db, userId, convoId, { beforeSeq = null, limit = 50 } = {}) {

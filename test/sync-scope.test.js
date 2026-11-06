@@ -113,15 +113,16 @@ test('replay: a for_you socket gets only what its scope carries, then the head a
   add('work', 'tool_output')
   const meta = add('next', 'convo_meta', { title: 'Next' })
   const coordText = add('coord', 'text')
+  const coordItem = add('coord', 'item', { item_id: 'it_2', action: 'created' })
   const head = add('work', 'text')
   const phone = await login('phone')
   const p = await makeWsClient(s.base, { token: phone.token, cursor: 0, hello: { sync: 'for_you' } })
   const cursor = await p.waitFor((f) => f.kind === 'control' && f.op === 'cursor')
   const journal = p.journal().map((f) => f.seq)
   // setCoordinatorConvoId in the fixture wrote no event (no appendEvent).
-  assert.deepEqual(journal, [item, meta, coordText])
+  assert.deepEqual(journal, [item, meta, coordText, coordItem], 'a marker in the Coordinator conversation comes once')
   assert.equal(cursor.seq, head)
-  assert.ok(p.frames.indexOf(cursor) > p.frames.findIndex((f) => f.seq === coordText), 'cursor comes after the replay')
+  assert.ok(p.frames.indexOf(cursor) > p.frames.findIndex((f) => f.seq === coordItem), 'cursor comes after the replay')
   p.close()
 })
 
@@ -198,4 +199,20 @@ test('live: a for_you socket follows the Coordinator role when it moves', async 
   assert.ok(p.journal().some((f) => f.payload?.body === 'new coordinator'))
   assert.equal(p.journal().some((f) => f.payload?.body === 'old coordinator'), false)
   p.close(); m.close()
+})
+
+test('replay: a for_you backlog longer than one batch arrives whole and in order', async (t) => {
+  const { s, login, add } = await fixture(t)
+  const want = []
+  for (let i = 0; i < 700; i++) {
+    add('work', 'text')
+    want.push(add('work', 'item', { item_id: `it_${i}`, action: 'created' }))
+    if (i % 3 === 0) want.push(add('coord', 'text'))
+  }
+  want.sort((a, b) => a - b)
+  const phone = await login('phone')
+  const p = await makeWsClient(s.base, { token: phone.token, cursor: 0, hello: { sync: 'for_you' } })
+  await p.waitFor((f) => f.op === 'cursor', 10000)
+  assert.deepEqual(p.journal().map((f) => f.seq), want)
+  p.close()
 })
