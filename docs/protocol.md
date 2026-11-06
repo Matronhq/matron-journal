@@ -940,6 +940,28 @@ Rows from before the stamp carry neither, and don't count.
   wipes its local store, calls `GET /snapshot`, and reconnects with the
   fresh cursor (spec §6). Journal rows are never deleted, so this is an
   efficiency valve, not a data-loss boundary.
+- **Sync scope (`hello.sync`, clients only).** `'everything'` (the default,
+  and what a client that sends nothing gets) carries every event of every
+  conversation. `'for_you'` is for a phone that follows only the tracker:
+  its socket carries `item`, `mission`, `milestone`, `coordinator`,
+  `memory`, `routine`, `convo_meta` and `session_status` events from every
+  conversation, every event of the Coordinator conversation (following the
+  role when it moves), and every event of the conversations in its
+  `viewing` set. Everything else stays on the server; the app fetches a
+  conversation over `GET /convo/:id/messages` when it opens one. A client
+  that sends `sync` gets `hello_ok.sync` back, the scope it got, so it can
+  tell a journal that predates the field. Any other value is
+  `bad_request` (ref `hello`). Agents ignore the field.
+  - A `for_you` replay sends only what that scope carries (the viewed set
+    is empty during a replay), and the `snapshot_required` valve counts
+    those events rather than the whole gap. After the replay, and before
+    any live frame, the server sends `{kind:'control', op:'cursor', seq}`:
+    the head the replay reached. The client moves its cursor there, since
+    the last frame it was sent is usually well below the head.
+  - The scope is kept on the device row. A `for_you` phone with no socket
+    is woken only by `item`, `mission` and `milestone` events and the
+    Coordinator conversation's messages, and its wakes for a read on
+    another device share the same pacing.
   Client ops: send (type text, or file/image with a top-level blob_ref from a
   prior POST /media — payload mirrors the agent-publish media shape),
   prompt_reply, read_marker, ack, viewing.

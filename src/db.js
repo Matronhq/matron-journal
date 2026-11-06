@@ -5,6 +5,7 @@ import { imageSizeFromFile } from './image-size.js'
 import { backfillMissionLinks, healMissionLinks } from './mission-links.js'
 import { backfillDefaultProjects } from './default-project.js'
 import { installSearchDocs } from './search-docs.js'
+import { FOR_YOU_TYPES_SQL } from './sync-scope.js'
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users(
@@ -1618,6 +1619,14 @@ export function openDb(path) {
   if (!db.prepare('PRAGMA table_info(devices)').all().some((c) => c.name === 'push_level')) {
     db.exec('ALTER TABLE devices ADD COLUMN push_level TEXT')
   }
+  // A client's sync scope as its last hello named it (src/sync-scope.js):
+  // NULL = everything, 'for_you' = the tracker and the chats it opens.
+  if (!db.prepare('PRAGMA table_info(devices)').all().some((c) => c.name === 'sync_scope')) {
+    db.exec('ALTER TABLE devices ADD COLUMN sync_scope TEXT')
+  }
+  // A for_you replay (src/sync-scope.js) reads only these rows, a small share
+  // of the table, so it never walks the conversation content in between.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_events_for_you ON events(user_id, seq) WHERE type IN (${FOR_YOU_TYPES_SQL})`)
   // Per-box defaults for new sessions (matron-bridge docs/specs/box-defaults.md,
   // src/box-defaults.js): the agent, model and effort a session started on
   // this box gets when nobody names one. Agent devices only; NULL = the
@@ -2094,8 +2103,14 @@ export function pruneApnsToken(db, deviceId) {
 // registered token, for the push pipeline to fan a journal event out to.
 export function clientDevicesForPush(db, userId) {
   return db.prepare(
-    "SELECT id, apns_token, apns_env, cursor, push_level FROM devices WHERE user_id=? AND kind='client' AND apns_token IS NOT NULL"
+    "SELECT id, apns_token, apns_env, cursor, push_level, sync_scope FROM devices WHERE user_id=? AND kind='client' AND apns_token IS NOT NULL"
   ).all(userId)
+}
+
+// Records the sync scope a client's hello named. Written only when it
+// changes, since every reconnect sends it.
+export function setDeviceSyncScope(db, deviceId, scope) {
+  db.prepare('UPDATE devices SET sync_scope=? WHERE id=? AND sync_scope IS NOT ?').run(scope, deviceId, scope)
 }
 
 // The unread badge = SUM(unread_count) over the owner's conversations.
