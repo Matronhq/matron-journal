@@ -5467,7 +5467,8 @@ tracker mirror (Accept / Decline), so today's apps answer it unchanged. An
 incoming grant's `subject_id` and `mission.id` are `null`: the mission
 lives on the owner's journal.
 
-Three ops carry a grant, all on the subject `grant:<owner's gr_ id>`:
+Three ops carry a grant, and `mission.snapshot` (below) what it shares,
+all on the subject `grant:<owner's gr_ id>`:
 
 - `grant.offer`, owner to grantee, body `{grant, level: 'read', sent,
   mission: {num, title}, preview: {milestones, items, comments,
@@ -5501,8 +5502,80 @@ Ending the contact ends every grant between the two on both journals, by
 `contact.remove`. Each side writes its own People log lines, naming the
 other person by address.
 
-So far only the grant crosses: the mission's contents follow in a later
-stage.
+**What the share lets the grantee read.** When the owner's journal applies
+an accept, it sends the mission in the same transaction as
+`mission.snapshot` pages, on the grant's subject (so a later
+`grant.revoke` cancels any still waiting):
+
+```
+{grant, snap, page, pages, mission?, milestones: [...], items: [...]}
+```
+
+`snap` (`sn_…`) names one snapshot, `pages` its page count (at most 1000),
+and `mission` is on page 0 only. Each page is at most 512 KiB. Every record
+is its whole current state, built from the grantee view a contact on the
+owner's journal reads (the private-box and owner-only sieves, no consent
+mirrors, no conversation, device, box, seq or project), and only these
+fields cross:
+
+- mission: `num, title, name, body, state, status, status_by,
+  status_updated_at, close_summary, closed_by, created_by, created_at,
+  updated_at, closed_at`
+- milestone: `ref, num, kind, title, body, created_by, created_at,
+  contributor?`
+- item: `ref, num, kind, state, resolution, awaiting, title, body,
+  created_by, created_at, updated_at, closed_at, labels, links: [{url,
+  title?}], comment_count, last_comment_at, contributor?, comments,
+  comments_truncated?`, with at most 5,000 milestones and 5,000 items, the
+  newest
+- comment: `ref, author, kind, body, created_at, withdrawn?, from?, to?,
+  contributor?` (`from`/`to` `{state, resolution, awaiting}` on a status
+  comment), at most 192 KiB of thread per item, the newest
+
+Attachments do not cross yet. `ref` is the owner journal's id.
+
+The grantee's journal refuses a page for a grant that is not active there
+(`409 not_active`) and otherwise keeps a copy. Page 0 starts loading
+`snap` and a page of any other snapshot is ignored. Pages are held, not
+applied, until the last one arrives; the whole snapshot is then applied
+at once, and every record it did not carry is dropped. Pages must arrive
+in order: one that arrives with a page missing before it (refused, and
+dropped from the owner's outbox) gives that snapshot up, the held pages
+are discarded, and the copy stays as the last whole snapshot left it.
+Peer text is checked on arrival:
+one-line fields are flattened, bodies keep their lines without other
+control characters, unknown enum values fall back (`kind` to `task` or
+`progress`, `state` to `open`, `author` to `agent`), only http(s) links are
+kept, and anything over the caps above is cut. A page that is not
+well-formed is `400 malformed`.
+
+The copy gets ids of its own on the grantee's journal (`ms_…`, `it_…`,
+`ml_…`, `ic_…`), and the mission keeps its id across snapshots and across
+the share ending and being accepted again. It is served, once its first
+snapshot is whole, from the routes a same-journal grantee reads:
+
+```
+GET /missions?scope=shared        listed after the shares from this journal
+GET /missions/:id                 {mission, milestones, items, conversations: []}
+GET /items?scope=shared           merged into the same list, filters and cursor
+GET /items/:id                    {item, comments}
+GET /lookup?user=alice@a.example&num=N   the mission or one of its items
+```
+
+Each row reads as a grantee's would (`shared_via: 'grant'`,
+`origin_convo_id: ''`, `origin_device_id: 0`, no actions), with `owner
+{user_id: 0, name: <address>, address}` and `grant {id: <fg_ id>, level}`.
+Every other method on them is `403`. The apps get `shared` frames as for a
+share on one journal: `mission_added` when the first snapshot is whole,
+`mission_changed` (`what: 'snapshot'`) for a later one, and
+`mission_removed` when the share ends. The copy is deleted the moment the
+grant stops being active on the grantee's journal, whichever way it ended.
+
+A snapshot the grantee's journal refuses or never takes leaves the share
+standing; the owner gets one notice for it ("Couldn't send mission #N to
+bob@b.example"), except when the refusal is `not_active` (the share has
+ended there, and its revoke is on the way). So far a snapshot is sent on
+accept only: the changes after it follow in a later stage.
 
 ## Device privacy
 

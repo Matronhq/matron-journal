@@ -731,6 +731,95 @@ CREATE TABLE IF NOT EXISTS fed_grants_in(
 CREATE INDEX IF NOT EXISTS idx_fed_grants_in_user ON fed_grants_in(user_id, state);
 CREATE INDEX IF NOT EXISTS idx_fed_grants_in_contact ON fed_grants_in(contact_id);
 CREATE INDEX IF NOT EXISTS idx_fed_grants_in_item ON fed_grants_in(item_id);
+-- The grantee's read-only copy of a mission shared from another journal
+-- (src/federation-replica.js), one per fed_grants_in row: the mission, its
+-- milestones and its items (each with its thread, as JSON). Every row has
+-- an id of its own here; ref is the owner journal's. seen_snap is the
+-- snapshot that last carried the row: the last page of a snapshot drops
+-- the rows it did not carry. Pages wait in fed_replica_pages until the
+-- last is in, and must arrive in order; a gap gives that snapshot up and
+-- the copy stays as it was. Served only while the grant is active, and
+-- deleted the moment it is not (the trigger below).
+CREATE TABLE IF NOT EXISTS fed_replica_missions(
+  id                 TEXT PRIMARY KEY,
+  fg_id              TEXT NOT NULL UNIQUE,
+  user_id            INTEGER NOT NULL REFERENCES users(id),
+  num                INTEGER NOT NULL,
+  title              TEXT NOT NULL,
+  name               TEXT,
+  body               TEXT,
+  state              TEXT NOT NULL,
+  status             TEXT,
+  status_by          TEXT,
+  status_updated_at  INTEGER,
+  close_summary      TEXT,
+  closed_by          TEXT,
+  created_by         TEXT,
+  created_at         INTEGER NOT NULL,
+  updated_at         INTEGER NOT NULL,
+  closed_at          INTEGER,
+  applied_snap       TEXT,
+  complete           INTEGER NOT NULL DEFAULT 0,
+  received_at        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fed_replica_missions_user ON fed_replica_missions(user_id);
+CREATE TABLE IF NOT EXISTS fed_replica_milestones(
+  id                TEXT PRIMARY KEY,
+  fg_id             TEXT NOT NULL,
+  ref               TEXT NOT NULL,
+  num               INTEGER NOT NULL,
+  kind              TEXT NOT NULL,
+  title             TEXT NOT NULL,
+  body              TEXT,
+  created_by        TEXT,
+  created_at        INTEGER NOT NULL,
+  contributor_name  TEXT,
+  contributor_via   TEXT,
+  seen_snap         TEXT,
+  UNIQUE(fg_id, ref)
+);
+CREATE TABLE IF NOT EXISTS fed_replica_items(
+  id                  TEXT PRIMARY KEY,
+  fg_id               TEXT NOT NULL,
+  user_id             INTEGER NOT NULL REFERENCES users(id),
+  ref                 TEXT NOT NULL,
+  num                 INTEGER NOT NULL,
+  kind                TEXT NOT NULL,
+  state               TEXT NOT NULL,
+  resolution          TEXT,
+  awaiting            TEXT,
+  title               TEXT NOT NULL,
+  body                TEXT NOT NULL,
+  created_by          TEXT,
+  created_at          INTEGER NOT NULL,
+  updated_at          INTEGER NOT NULL,
+  closed_at           INTEGER,
+  labels              TEXT NOT NULL,
+  links               TEXT NOT NULL,
+  comment_count       INTEGER NOT NULL,
+  last_comment_at     INTEGER,
+  contributor_name    TEXT,
+  contributor_via     TEXT,
+  comments            TEXT NOT NULL,
+  comments_truncated  INTEGER NOT NULL DEFAULT 0,
+  seen_snap           TEXT,
+  UNIQUE(fg_id, ref)
+);
+CREATE INDEX IF NOT EXISTS idx_fed_replica_items_user ON fed_replica_items(user_id, updated_at);
+CREATE TABLE IF NOT EXISTS fed_replica_pages(
+  fg_id        TEXT NOT NULL,
+  snap         TEXT NOT NULL,
+  page         INTEGER NOT NULL,
+  body         TEXT NOT NULL,
+  received_at  INTEGER NOT NULL,
+  PRIMARY KEY(fg_id, page)
+);
+CREATE TRIGGER IF NOT EXISTS fed_replica_drop AFTER UPDATE OF state ON fed_grants_in WHEN NEW.state <> 'active' BEGIN
+  DELETE FROM fed_replica_pages WHERE fg_id = NEW.id;
+  DELETE FROM fed_replica_items WHERE fg_id = NEW.id;
+  DELETE FROM fed_replica_milestones WHERE fg_id = NEW.id;
+  DELETE FROM fed_replica_missions WHERE fg_id = NEW.id;
+END;
 -- An agent's ask for an invite link (src/federation-invite-asks.js): parked
 -- for the user's tap, which alone mints the invite (invite_id once approved).
 CREATE TABLE IF NOT EXISTS fed_invite_asks(
@@ -1894,6 +1983,9 @@ export function openDb(path) {
   // Federation outbox: the op's local-only context for its hooks (never
   // sent), e.g. the key the user consented to for an invite answer.
   addCols('fed_outbox', [['meta', 'TEXT']])
+  // A grant's replica keeps one local mission id across snapshots, and
+  // across an end and a fresh accept (src/federation-replica.js).
+  addCols('fed_grants_in', [['replica_mission_id', 'TEXT']])
   // Unified search's tracker mirror (spec 2026-10-12 unified search §1).
   // Must stay LAST: it reads columns added by every migration above (e.g.
   // missions.name), and its triggers must be reinstalled after any table
