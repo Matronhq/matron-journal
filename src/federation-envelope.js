@@ -173,3 +173,25 @@ export function verifyEnvelope(envelope, publicKey, { now = Date.now(), windowMs
 export function opHash({ op, body }) {
   return createHash('sha256').update(canonicalize({ op, body }), 'utf8').digest('hex')
 }
+
+// --- Responses --------------------------------------------------------------
+
+// A receiver signs what it answers, so the sender can trust a stored
+// response replayed for a repeat as much as a fresh one. The signature goes
+// in the `matron-federation-sig` header, over RESPONSE_PREFIX followed by
+// the JCS form of {id, status, body}: `id` is the op's id, so an answer to
+// one op is never valid as the answer to another.
+export const RESPONSE_PREFIX = 'matron-federation-v1-response\n'
+export const RESPONSE_SIG_HEADER = 'matron-federation-sig'
+
+const responseBytes = ({ id, status, body }) =>
+  Buffer.concat([Buffer.from(RESPONSE_PREFIX, 'ascii'), Buffer.from(canonicalize({ id, status, body }), 'utf8')])
+
+export function signResponse({ id, status, body }, privateKey) {
+  return sign(null, responseBytes({ id, status, body }), privateKey).toString('base64url')
+}
+
+export function verifyResponse({ id, status, body, sig }, publicKey) {
+  if (typeof sig !== 'string' || !SIG.test(sig)) return false
+  try { return verify(null, responseBytes({ id, status, body }), publicKey, Buffer.from(sig, 'base64url')) } catch { return false }
+}

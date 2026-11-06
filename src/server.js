@@ -26,6 +26,7 @@ import { makeRpcBroker } from './rpc-broker.js'
 import { resolveWebDir, makeStaticHandler } from './static-http.js'
 import { makeWellKnown, parseList } from './well-known.js'
 import { loadFederation, makeFederationWellKnown } from './federation-identity.js'
+import { makeFederationHandler, pruneReceipts } from './federation-inbound.js'
 import { makeWaker, markWakeRefused, clearWakeRefused } from './wake.js'
 import { makeConfiguredTranscriber } from './cloud-transcribe.js'
 import { makeConfiguredMailer } from './mailer.js'
@@ -448,7 +449,7 @@ export function startServer({
   // Federation between journals (src/federation-identity.js): the test
   // seam, {federation, publicUrl}; env (MATRON_FEDERATION,
   // MATRON_PUBLIC_URL) otherwise. Off unless turned on.
-  federationEnv,
+  federationEnv, federationOps,
   // Alertmanager webhook (src/alerts-http.js): {token, username}. The
   // option is the test seam; env otherwise. Off unless both are usable.
   alertWebhook,
@@ -614,6 +615,9 @@ export function startServer({
   })
   const handleFederationWellKnown = makeFederationWellKnown(federation)
   const handleWellKnown = (req, res, url) => handleFederationWellKnown(req, res, url) || handleAppWellKnown(req, res, url)
+  // POST /federation/v1 (src/federation-inbound.js): 404 while off.
+  // `federationOps` is the test seam for the op table.
+  const handleFederation = makeFederationHandler({ db, federation, ...(federationOps ? { ops: federationOps } : {}) })
   const resolvedAlertWebhook = alertWebhook !== undefined ? alertWebhook : {
     token: process.env.MATRON_ALERT_WEBHOOK_TOKEN || null,
     username: process.env.MATRON_ALERT_WEBHOOK_USER || null,
@@ -640,7 +644,7 @@ export function startServer({
     transferMaxBytes: resolvedTransferMaxBytes, transferUserQuotaBytes: resolvedTransferUserQuotaBytes, transferMaxAwaitingPerSender: resolvedTransferMaxAwaiting, transferChunkBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentTransferDailyCap, consentRoutineCap, verifier,
-    github: resolvedGithub, handleWellKnown, handleStatic, tokenBox,
+    github: resolvedGithub, handleWellKnown, handleFederation, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
   }))
   const wss = attachWs({
@@ -657,6 +661,7 @@ export function startServer({
   })
   let retentionInterval = null
   let walCheckpointInterval = null
+  let receiptPruneInterval = null
   let githubRefreshInterval = null
   let ttsSweepInterval = null
   let closing = false
@@ -668,6 +673,13 @@ export function startServer({
         mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes, deviceRetention,
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
+      // Federation receipts are the replay memory for 30 days, then go.
+      if (federation.enabled) {
+        receiptPruneInterval = setInterval(() => {
+          try { pruneReceipts(db) } catch (err) { console.error('federation: receipt prune failed', err) }
+        }, 3600_000)
+        receiptPruneInterval.unref()
+      }
       githubRefreshInterval = scheduleGithubRefresh(db, resolvedGithub, { intervalMs: githubRefreshIntervalMs, box: tokenBox })
       ttsSweepInterval = scheduleTtsSweep(resolvedTts, ttsSweepIntervalMs)
       // Whatever a previous process left mid-transcription: a bridge is
@@ -783,6 +795,7 @@ export function startServer({
           startDelay.cancel()
           if (retentionInterval) clearInterval(retentionInterval)
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
+          if (receiptPruneInterval) clearInterval(receiptPruneInterval)
           if (githubRefreshInterval) clearInterval(githubRefreshInterval)
           // No new reindex pass can start after this: the only other
           // starter is embedderReady's own `.then`, which re-checks

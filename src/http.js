@@ -115,7 +115,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, blobTranscripts = null, github = null, handleWellKnown = () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, blobTranscripts = null, github = null, handleWellKnown = () => false, handleFederation = async () => false, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null }) {
   // Two-factor sign-in (src/two-factor-http.js). The server passes its own;
   // the defaults keep a bare handler (tests) working the same way.
   const twoFactorBox = tokenBox || PLAIN_BOX
@@ -134,6 +134,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
     try {
       const url = new URL(req.url, 'http://x')
       if (handleWellKnown(req, res, url)) return
+      if (await handleFederation(req, res, url)) return
       if (await handleStatic(req, res, url)) return
       if (req.method === 'POST' && url.pathname === '/login') {
         // Behind the cloudflared tunnel, req.socket.remoteAddress is always 127.0.0.1
