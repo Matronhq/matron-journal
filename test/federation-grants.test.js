@@ -1,0 +1,203 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { createUser, createAgent } from '../src/auth.js'
+import { makeFederationClient } from '../src/federation-client.js'
+import { startTestServer } from './helpers.js'
+import { upsertConversation } from '../src/journal.js'
+
+// Read shares across journals (phase 5 stage 7a), end to end between two
+// journals on loopback: alice on a.example shares her mission with bob on
+// b.example. Only the grant travels in this stage; the mission's contents
+// follow in the next.
+const KEY = 'd'.repeat(64)
+const post = (body) => ({ method: 'POST', body })
+
+async function world(t) {
+  const bases = {}
+  const client = makeFederationClient({
+    allowHttp: true, allowHosts: ['127.0.0.1'],
+    rewriteUrl: (u) => { const x = new URL(u); return bases[x.host] ? bases[x.host] + x.pathname + x.search : u },
+  })
+  const start = async (host) => {
+    const s = await startTestServer({ tokenKey: KEY, federationEnv: { federation: 'on', publicUrl: `https://${host}` }, federationClient: client })
+    t.after(() => s.close())
+    bases[host] = s.base
+    return s
+  }
+  const a = await start('a.example')
+  const b = await start('b.example')
+  const users = {}
+  const phones = {}
+  for (const [s, name] of [[a, 'alice'], [b, 'bob']]) {
+    users[name] = await createUser(s.db, name, 'pw')
+    const token = (await s.http('/login', post({ username: name, password: 'pw', device_name: `${name}-phone` }))).json.token
+    phones[name] = (path, opts = {}) => s.http(path, { token, ...opts })
+  }
+  const box = createAgent(a.db, users.alice.id, 'alice-box')
+  upsertConversation(a.db, { id: 'work', ownerUserId: users.alice.id, title: 'Work', agentDeviceId: box.deviceId })
+  const aliceBox = (path, opts = {}) => a.http(path, { token: box.token, ...opts })
+  const settle = async () => {
+    for (let i = 0; i < 10; i++) {
+      await a.federationOutbox.tick()
+      await b.federationOutbox.tick()
+      const live = (s) => s.db.prepare("SELECT COUNT(*) AS n FROM fed_outbox WHERE state='queued' AND next_at<=?").get(Date.now()).n
+      if (!live(a) && !live(b)) return
+    }
+  }
+  // Contacts, by invite link.
+  const { link } = (await phones.alice('/contacts/invites', post({}))).json
+  assert.equal((await phones.bob('/contacts/invites/accept', post({ link }))).status, 202)
+  await settle()
+  const m = await aliceBox('/missions', post({ convo_id: 'work', title: 'Garden Club', body: 'Spring planting.' }))
+  assert.equal(m.status, 201)
+  return { a, b, users, phones, aliceBox, settle, mission: m.json.mission }
+}
+
+const grantOf = (s, id) => s.db.prepare('SELECT * FROM grants WHERE id=?').get(id)
+const incoming = (s) => s.db.prepare('SELECT * FROM fed_grants_in').all()
+const mirrorOf = (s, userId) => s.db.prepare("SELECT * FROM items WHERE user_id=? AND consent='share' ORDER BY rowid DESC").get(userId)
+const audits = (s, userId) => s.db.prepare("SELECT json_extract(payload, '$.event') AS e, json_extract(payload, '$.summary') AS summary FROM events WHERE user_id=? AND type='people' ORDER BY seq").all(userId)
+  .filter((r) => r.e.startsWith('grant.'))
+const notices = (s, userId) => s.db.prepare("SELECT title, body FROM items WHERE user_id=? AND kind='notice' ORDER BY rowid").all(userId)
+
+async function offer(w) {
+  const r = await w.phones.alice(`/missions/${w.mission.id}/shares`, post({ contact: 'bob@b.example', level: 'read' }))
+  assert.equal(r.status, 201, JSON.stringify(r.json))
+  await w.settle()
+  return r.json.grant
+}
+
+test('a read share crosses: the offer, the card on the other journal, the accept', async (t) => {
+  const w = await world(t)
+  const g = await offer(w)
+  assert.deepEqual([g.state, g.grantee.address], ['pending', 'bob@b.example'])
+
+  const [fg] = incoming(w.b)
+  assert.deepEqual([fg.state, fg.owner_name, fg.peer_host, fg.peer_grant_ref, fg.mission_title, fg.level], ['pending', 'alice', 'a.example', g.id, 'Garden Club', 'read'])
+  const card = w.b.db.prepare("SELECT payload FROM events WHERE user_id=? AND type='permission_request'").get(w.users.bob.id)
+  assert.equal(JSON.parse(card.payload).grant_id, fg.id)
+  const mirror = mirrorOf(w.b, w.users.bob.id)
+  assert.equal(mirror.title, 'alice@a.example wants to share a mission with you — Garden Club')
+  assert.match(mirror.body, /on another Matron journal/)
+
+  const listed = (await w.phones.bob('/grants')).json.grants
+  assert.deepEqual(listed.map((x) => [x.id, x.direction, x.state, x.owner.address, x.mission.title]), [[fg.id, 'in', 'pending', 'alice@a.example', 'Garden Club']])
+  assert.equal((await w.phones.bob(`/grants/${fg.id}`)).json.grant.state, 'pending')
+  assert.equal((await w.phones.alice(`/grants/${fg.id}`)).status, 404, 'an fg_ id is the grantee journal\'s own')
+
+  // The tap, through the mirror, as today's apps answer a share card.
+  const tap = await w.phones.bob(`/items/${mirror.id}/comments`, post({ action: 'Accept' }))
+  assert.equal(tap.status, 200)
+  assert.equal(tap.json.grant.state, 'active')
+  assert.equal(w.b.db.prepare('SELECT state FROM items WHERE id=?').get(mirror.id).state, 'closed')
+  await w.settle()
+  assert.equal(grantOf(w.a, g.id).state, 'active')
+  assert.deepEqual(audits(w.a, w.users.alice.id).map((r) => r.summary), [
+    `You offered bob@b.example mission #${w.mission.num} Garden Club to read`,
+    `bob@b.example accepted mission #${w.mission.num} Garden Club — shared read-only`,
+  ])
+  assert.deepEqual(audits(w.b, w.users.bob.id).map((r) => r.summary), [
+    'alice@a.example offered you mission "Garden Club" to read',
+    'You accepted mission "Garden Club" from alice@a.example',
+  ])
+  // Sharing again is the same grant.
+  const again = await w.phones.alice(`/missions/${w.mission.id}/shares`, post({ contact: 'bob@b.example', level: 'read' }))
+  assert.deepEqual([again.status, again.json.existing], [200, true])
+})
+
+test('declining, and either side ending it', async (t) => {
+  const w = await world(t)
+  const g = await offer(w)
+  const [fg] = incoming(w.b)
+  const no = await w.phones.bob(`/grants/${fg.id}/answer`, post({ decision: 'decline' }))
+  assert.equal(no.json.grant.state, 'declined')
+  await w.settle()
+  assert.equal(grantOf(w.a, g.id).state, 'declined')
+
+  // Offered again: the same row on b, pending once more.
+  const g2 = await offer(w)
+  assert.equal(g2.id, g.id)
+  assert.equal(incoming(w.b)[0].state, 'pending')
+  // The owner withdraws: b's card closes.
+  assert.equal((await w.phones.alice(`/grants/${g.id}`, { method: 'DELETE' })).status, 200)
+  await w.settle()
+  const [ended] = incoming(w.b)
+  assert.deepEqual([ended.state, ended.revoked_by], ['revoked', 'owner'])
+  assert.equal(w.b.db.prepare('SELECT resolution FROM items WHERE id=?').get(ended.item_id).resolution, 'cancelled')
+
+  // Accepted, then the grantee leaves.
+  await offer(w)
+  const fg3 = incoming(w.b)[0]
+  await w.phones.bob(`/grants/${fg3.id}/answer`, post({ decision: 'approve' }))
+  await w.settle()
+  assert.equal(grantOf(w.a, g.id).state, 'active')
+  const left = await w.phones.bob(`/grants/${fg3.id}`, { method: 'DELETE' })
+  assert.equal(left.json.grant.state, 'revoked')
+  await w.settle()
+  assert.deepEqual([grantOf(w.a, g.id).state, grantOf(w.a, g.id).revoked_by], ['revoked', 'grantee'])
+  assert.equal(audits(w.a, w.users.alice.id).at(-1).summary, `bob@b.example ended the share of mission #${w.mission.num} Garden Club`)
+  assert.equal((await w.phones.bob(`/grants/${fg3.id}`, { method: 'DELETE' })).json.blocked_by, 'not_active')
+})
+
+test('only read crosses; an agent asks and the owner approves; the grantee answers only from a client', async (t) => {
+  const w = await world(t)
+  for (const level of ['contribute', 'owner']) {
+    const r = await w.phones.alice(`/missions/${w.mission.id}/shares`, post({ contact: 'bob@b.example', level, ...(level === 'owner' ? { brief: 'All yours.' } : {}) }))
+    assert.deepEqual([r.status, r.json.blocked_by], [409, 'level_unavailable'], level)
+  }
+  const asked = await w.aliceBox(`/missions/${w.mission.id}/shares`, post({ contact: 'bob@b.example', level: 'read', convo_id: 'work' }))
+  assert.equal(asked.status, 202)
+  assert.equal(w.a.db.prepare("SELECT COUNT(*) AS n FROM fed_outbox WHERE op='grant.offer'").get().n, 0, 'nothing leaves before the owner approves')
+  const ownerMirror = mirrorOf(w.a, w.users.alice.id)
+  assert.equal((await w.phones.alice(`/items/${ownerMirror.id}/comments`, post({ action: 'Approve' }))).status, 200)
+  await w.settle()
+  const [fg] = incoming(w.b)
+  assert.equal(fg.state, 'pending')
+  const bobBox = createAgent(w.b.db, w.users.bob.id, 'bob-box')
+  assert.equal((await w.b.http(`/grants/${fg.id}/answer`, { token: bobBox.token, ...post({ decision: 'approve' }) })).status, 403)
+})
+
+test('a contact that ends ends its shares on both journals', async (t) => {
+  const w = await world(t)
+  const g = await offer(w)
+  await w.phones.bob(`/grants/${incoming(w.b)[0].id}/answer`, post({ decision: 'approve' }))
+  await w.settle()
+  assert.equal(grantOf(w.a, g.id).state, 'active')
+  const bobOnA = (await w.phones.alice('/contacts')).json.contacts.find((c) => c.address === 'bob@b.example')
+  assert.equal((await w.phones.alice(`/contacts/${bobOnA.id}`, { method: 'DELETE' })).status, 200)
+  assert.deepEqual([grantOf(w.a, g.id).state, grantOf(w.a, g.id).revoked_by], ['revoked', 'contact_removed'])
+  await w.settle()
+  const [fg] = incoming(w.b)
+  assert.deepEqual([fg.state, fg.revoked_by], ['revoked', 'contact_removed'])
+  assert.equal(audits(w.b, w.users.bob.id).at(-1).summary, 'alice@a.example ended the share of mission "Garden Club"')
+  // No longer a contact: nothing can be offered.
+  const r = await w.phones.alice(`/missions/${w.mission.id}/shares`, post({ contact: 'bob@b.example', level: 'read' }))
+  assert.deepEqual([r.status, r.json.blocked_by], [409, 'not_contact'])
+})
+
+test('an offer the other journal refuses ends here with a notice', async (t) => {
+  const w = await world(t)
+  // bob's journal no longer has alice as a contact, and was never told.
+  w.b.db.prepare("UPDATE contacts SET state='removed' WHERE user_id=?").run(w.users.bob.id)
+  const g = await offer(w)
+  assert.equal(grantOf(w.a, g.id).state, 'expired')
+  assert.equal(incoming(w.b).length, 0)
+  const [n] = notices(w.a, w.users.alice.id).filter((x) => x.title.startsWith("Couldn't offer"))
+  assert.equal(n.title, `Couldn't offer mission #${w.mission.num} to bob@b.example`)
+  assert.match(n.body, /no longer has you as a contact/)
+})
+
+test('an answer that arrives after the owner withdrew does not start the share', async (t) => {
+  const w = await world(t)
+  const g = await offer(w)
+  // The withdrawal is still in alice's outbox when bob taps Accept.
+  await w.phones.alice(`/grants/${g.id}`, { method: 'DELETE' })
+  const [fg] = incoming(w.b)
+  await w.phones.bob(`/grants/${fg.id}/answer`, post({ decision: 'approve' }))
+  await w.b.federationOutbox.tick()
+  assert.equal(grantOf(w.a, g.id).state, 'revoked')
+  await w.settle()
+  const [after] = incoming(w.b)
+  assert.equal(after.state, 'revoked')
+  assert.equal(grantOf(w.a, g.id).state, 'revoked')
+})

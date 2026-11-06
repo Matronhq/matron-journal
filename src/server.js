@@ -28,6 +28,7 @@ import { makeWellKnown, parseList } from './well-known.js'
 import { loadFederation, makeFederationWellKnown } from './federation-identity.js'
 import { makeFederationHandler, pruneReceipts, DEFAULT_OPS } from './federation-inbound.js'
 import { makeContactFederation } from './federation-contacts.js'
+import { makeGrantFederation } from './federation-grants.js'
 import { makeOutbox } from './federation-outbox.js'
 import { makeConfiguredFederationClient } from './federation-client.js'
 import { makeWaker, markWakeRefused, clearWakeRefused } from './wake.js'
@@ -626,17 +627,20 @@ export function startServer({
   const federationContacts = federation.enabled
     ? makeContactFederation({ db, hub, pushPipeline, federation, client: federationClientInUse })
     : null
+  // Mission shares with contacts on other journals (src/federation-grants.js).
+  const federationGrants = federation.enabled ? makeGrantFederation({ db, hub, pushPipeline, federation }) : null
   // POST /federation/v1 (src/federation-inbound.js): 404 while off.
   // `federationOps` is the test seam: extra ops, over the journal's own.
   const handleFederation = makeFederationHandler({
     db, federation, client: federationClientInUse,
-    ops: { ...DEFAULT_OPS, ...(federationContacts?.inbound ?? {}), ...(federationOps ?? {}) },
+    ops: { ...DEFAULT_OPS, ...(federationContacts?.inbound ?? {}), ...(federationGrants?.inbound ?? {}), ...(federationOps ?? {}) },
   })
   // The outbox (src/federation-outbox.js): built only when federation is on.
   const federationOutbox = federation.enabled
-    ? makeOutbox({ db, hub, federation, client: federationClientInUse, ops: federationContacts.outbound })
+    ? makeOutbox({ db, hub, federation, client: federationClientInUse, ops: { ...federationContacts.outbound, ...federationGrants.outbound } })
     : null
   federationContacts?.setOutbox(federationOutbox)
+  federationGrants?.setOutbox(federationOutbox)
   const resolvedAlertWebhook = alertWebhook !== undefined ? alertWebhook : {
     token: process.env.MATRON_ALERT_WEBHOOK_TOKEN || null,
     username: process.env.MATRON_ALERT_WEBHOOK_USER || null,
@@ -663,7 +667,7 @@ export function startServer({
     transferMaxBytes: resolvedTransferMaxBytes, transferUserQuotaBytes: resolvedTransferUserQuotaBytes, transferMaxAwaitingPerSender: resolvedTransferMaxAwaiting, transferChunkBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentTransferDailyCap, consentRoutineCap, verifier,
-    github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, handleStatic, tokenBox,
+    github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, federationGrants, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
   }))
   const wss = attachWs({
@@ -812,6 +816,7 @@ export function startServer({
         github: resolvedGithub,
         federationOutbox,
         federationContacts,
+        federationGrants,
         close: () => new Promise((r) => {
           closing = true
           startDelay.cancel()

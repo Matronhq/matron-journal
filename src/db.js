@@ -704,6 +704,32 @@ CREATE TABLE IF NOT EXISTS fed_invites(
   revoked_at      INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_fed_invites_user ON fed_invites(user_id, created_at);
+-- A mission share offered to a user here by a contact on another journal
+-- (src/federation-grants.js): the grantee's side of a grant whose owner,
+-- and whose grants row, live on that journal (peer_grant_ref is its id).
+CREATE TABLE IF NOT EXISTS fed_grants_in(
+  id              TEXT PRIMARY KEY,
+  user_id         INTEGER NOT NULL REFERENCES users(id),
+  contact_id      TEXT NOT NULL,
+  peer_host       TEXT NOT NULL,
+  peer_grant_ref  TEXT NOT NULL,
+  owner_name      TEXT NOT NULL,
+  level           TEXT NOT NULL,
+  state           TEXT NOT NULL CHECK(state IN ('pending','active','declined','revoked')),
+  mission_title   TEXT NOT NULL,
+  mission_num     INTEGER NOT NULL,
+  preview         TEXT,
+  item_id         TEXT,
+  revoked_by      TEXT,
+  created_at      INTEGER NOT NULL,
+  updated_at      INTEGER NOT NULL,
+  answered_at     INTEGER,
+  revoked_at      INTEGER,
+  UNIQUE(peer_host, peer_grant_ref)
+);
+CREATE INDEX IF NOT EXISTS idx_fed_grants_in_user ON fed_grants_in(user_id, state);
+CREATE INDEX IF NOT EXISTS idx_fed_grants_in_contact ON fed_grants_in(contact_id);
+CREATE INDEX IF NOT EXISTS idx_fed_grants_in_item ON fed_grants_in(item_id);
 -- An agent's ask for an invite link (src/federation-invite-asks.js): parked
 -- for the user's tap, which alone mints the invite (invite_id once approved).
 CREATE TABLE IF NOT EXISTS fed_invite_asks(

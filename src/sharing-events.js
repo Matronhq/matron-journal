@@ -30,6 +30,7 @@ import { MISSION_EVENT_TYPE, missionMarkerPayload } from './missions-marker.js'
 import { getItem, insertComment } from './items.js'
 import { withdrawOnClose } from './item-handover-http.js'
 import { CONSENT_LABEL, consentLink } from './consent-items.js'
+import { onIncomingEnded } from './federation-grants.js'
 
 export const CONTACT_CARD_KIND = 'contact_request'
 export const SHARE_CARD_KIND = 'mission_share'
@@ -308,6 +309,7 @@ export function onContactEnded(ctx, who, out, verb) {
     changed(ctx, out.peer.user_id, { contact_id: out.peer.id })
   }
   for (const g of out.revokedGrants) onGrantRevoked(ctx, g, 'contact_removed')
+  for (const r of out.endedIncoming ?? []) onIncomingEnded(ctx, r, 'contact_removed')
   changed(ctx, own.user_id, { contact_id: own.id })
 }
 
@@ -412,10 +414,14 @@ export function onGrantOutcome(ctx, who, out) {
   const { db, hub } = ctx
   const g = out.grant
   const before = out.before ?? null
-  const to = plain(g.grantee_name)
+  // A grantee on another journal: their journal raises their card and
+  // writes their log (src/federation-grants.js). Only the owner's side is
+  // written here.
+  const remote = !!g.grantee_journal
+  const to = plain(remote ? `${g.grantee_name}@${g.grantee_journal}` : g.grantee_name)
   const from = plain(g.owner_name)
   const oc = ownerContact(db, g)
-  const gc = granteeContact(db, g)
+  const gc = remote ? null : granteeContact(db, g)
   const ownerTap = (comment) => closeMirror(ctx, { userId: g.owner_user_id, itemId: before?.owner_item_id, consent: 'share', resolution: 'decided', author: 'user', deviceId: who.deviceId, comment })
   const granteeTap = (comment) => closeMirror(ctx, { userId: g.grantee_user_id, itemId: before?.grantee_item_id, consent: 'share', resolution: 'decided', author: 'user', deviceId: who.deviceId, comment })
   let closed = null
@@ -426,6 +432,7 @@ export function onGrantOutcome(ctx, who, out) {
     case 'sent':
       closed = ownerTap(`Approved — ${to} has been asked to accept.`)
       audit(ctx, g.owner_user_id, { event: 'grant.offered', summary: `You offered ${to} ${missionWords(g)} to ${verb(g)}`, contact: oc, grant: g, by: g.pending_by ?? g.requested_by })
+      if (remote) break
       shareGranteeAsk(ctx, g)
       audit(ctx, g.grantee_user_id, { event: 'grant.received', summary: `${from} offered you ${missionWordsFor(g)} to ${verb(g)}`, contact: gc, grant: g })
       changed(ctx, g.grantee_user_id, { grant_id: g.id })
@@ -440,6 +447,10 @@ export function onGrantOutcome(ctx, who, out) {
       closeMirror(ctx, { userId: g.owner_user_id, itemId: before?.owner_item_id, consent: 'share', resolution: 'cancelled', author: 'agent', deviceId: before?.origin_device_id, comment: 'Expired — no answer within 24 h. Nothing was shared.' })
       break
     case 'accepted':
+      if (remote) {
+        audit(ctx, g.owner_user_id, { event: 'grant.accepted', summary: `${to} accepted ${missionWords(g)} — shared read-only`, contact: oc, grant: g, by: 'peer' })
+        break
+      }
       closed = granteeTap(`Accepted — the mission is now in your shared list, shared by ${from}.`)
       audit(ctx, g.grantee_user_id, { event: 'grant.accepted', summary: `You accepted ${missionWordsFor(g)} from ${from}`, contact: gc, grant: g })
       audit(ctx, g.owner_user_id, { event: 'grant.accepted', summary: `${to} accepted ${missionWords(g)} — shared ${g.level === 'contribute' ? 'to contribute to' : 'read-only'}`, contact: oc, grant: g })
@@ -451,6 +462,10 @@ export function onGrantOutcome(ctx, who, out) {
       changed(ctx, g.owner_user_id, { grant_id: g.id })
       break
     case 'declined':
+      if (remote) {
+        audit(ctx, g.owner_user_id, { event: 'grant.declined', summary: `${to} declined ${missionWords(g)}`, contact: oc, grant: g, by: 'peer' })
+        break
+      }
       closed = granteeTap('Declined.')
       audit(ctx, g.grantee_user_id, { event: 'grant.declined', summary: `You declined ${missionWordsFor(g)} from ${from}`, contact: gc, grant: g })
       audit(ctx, g.owner_user_id, { event: 'grant.declined', summary: `${to} declined ${missionWords(g)}`, contact: oc, grant: g })
@@ -458,7 +473,7 @@ export function onGrantOutcome(ctx, who, out) {
       break
     default: break
   }
-  changed(ctx, out.outcome === 'accepted' || out.outcome === 'declined' ? g.grantee_user_id : g.owner_user_id, { grant_id: g.id })
+  changed(ctx, !remote && (out.outcome === 'accepted' || out.outcome === 'declined') ? g.grantee_user_id : g.owner_user_id, { grant_id: g.id })
   return closed
 }
 
@@ -472,10 +487,12 @@ export function onGrantRevoked(ctx, before, by, who = null) {
   // the same join every other path uses.
   const g = before.owner_name ? before : { ...(getGrantRaw(db, before.id) ?? {}), ...before, ...namesOf(db, before.id) }
   const state = before.state
-  const to = plain(g.grantee_name)
+  // A grantee on another journal hears of it from their own journal.
+  const remote = !!g.grantee_journal
+  const to = plain(remote ? `${g.grantee_name}@${g.grantee_journal}` : g.grantee_name)
   const from = plain(g.owner_name)
   const oc = ownerContact(db, g)
-  const gc = oc ? granteeContact(db, g) : null
+  const gc = oc && !remote ? granteeContact(db, g) : null
   const why = by === 'contact_removed' ? 'The contact ended, so this share ended with it.' : (by === 'owner' ? 'Withdrawn.' : 'Ended.')
   const actor = (side) => (by === side && who?.kind !== 'agent' ? { author: 'user', deviceId: who?.deviceId } : { author: 'agent' })
   // An ask still open (a share, a hand-over, or the raise of an active
@@ -485,11 +502,11 @@ export function onGrantRevoked(ctx, before, by, who = null) {
   if (ask.state === 'awaiting_owner') {
     closeMirror(ctx, { userId: g.owner_user_id, itemId: before.owner_item_id, consent, resolution: 'cancelled', comment: `${why} Nothing was shared.`, ...actor('owner') })
   }
-  if (ask.state === 'pending') {
+  if (ask.state === 'pending' && !remote) {
     closeMirror(ctx, { userId: g.grantee_user_id, itemId: before.grantee_item_id, consent, resolution: 'cancelled', comment: by === 'grantee' ? 'Declined.' : `${from} withdrew the offer.`, ...actor('grantee') })
   }
   // The grantee was never told of a row that was never sent to them.
-  if (before.sent_at != null) {
+  if (before.sent_at != null && !remote) {
     audit(ctx, g.grantee_user_id, {
       event: 'grant.revoked', contact: gc, grant: g, by: by === 'grantee' ? 'you' : 'peer',
       summary: by === 'grantee' ? `You ended the share of ${subjectWordsFor(g)} from ${from}` : `${from} ended the share of ${subjectWordsFor(g)}`,

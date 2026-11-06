@@ -4409,8 +4409,9 @@ A contact is one row per side; anything is shared only while both rows are
 `active`. `address` is `user` on this journal and `user@journal` across
 journals. A contact on another journal is made only by an invite link
 (see "Contacts across journals"); its other row lives on that journal.
-Mission shares and rooms are same-journal only for now: offering one to a
-contact on another journal is `409 not_contact`.
+A contact on another journal can be offered a mission to read (see
+"Shares across journals"); contribute and hand-over shares, and rooms, are
+same-journal only for now (`409 level_unavailable` for a share).
 
 | State | Meaning |
 |---|---|
@@ -5438,6 +5439,60 @@ accepted from it, every contact pinned to its old key reads
 `key_changed: true`, and each user with such a contact gets one notice.
 There is no rotation. Accepting a fresh invite from that journal pins its
 new key for that contact.
+
+### Shares across journals
+
+A mission can be shared **read-only** with a contact on another journal.
+The owner asks exactly as for any contact (`POST /missions/:id/shares
+{contact: 'bob@b.example', level: 'read'}`), and an agent's ask parks for
+the owner's tap as before. `level` `contribute` or `owner`, and any
+project share, are `409 level_unavailable`; a contact whose journal changed
+its key is `409 not_contact`; with federation off, `409 federation_off`.
+
+The owner's journal keeps the grant in its own list (`direction: 'out'`,
+`grantee.address` the address). The grantee's journal keeps the grant it
+was offered under its own id, `fg_…`, and lists it with the user's other
+incoming grants:
+
+```
+GET    /grants                       incoming ones carry owner.address, mission {num, title}; ids fg_…
+GET    /grants/:fg                   {grant}
+POST   /grants/:fg/answer {decision} (client) {grant} — approve | decline
+DELETE /grants/:fg                   {grant} — leave the share
+```
+
+The grantee answers on the same card as for any share (`permission_request`
+kind `mission_share`, `grant_id` the `fg_` id, `owner.address`) and its
+tracker mirror (Accept / Decline), so today's apps answer it unchanged. An
+incoming grant's `subject_id` and `mission.id` are `null`: the mission
+lives on the owner's journal.
+
+Three ops carry a grant, all on the subject `grant:<owner's gr_ id>`:
+
+- `grant.offer`, owner to grantee, body `{grant, level: 'read', mission:
+  {num, title}, preview: {milestones, items, comments, attachments}}`, sent
+  when the ask is sent (a client's ask at once, an agent's on the owner's
+  approval). The receiver needs a live contact for the sender under the key
+  that signed (`403 not_contact`). A grant it already holds live is the
+  same answer; one that ended is offered again. Refused or undelivered for
+  7 days, the owner's grant goes `expired` and the owner gets a notice.
+- `grant.answer`, grantee to owner, body `{grant, decision}`. The
+  grantee's row moves at the tap; the owner's grant moves when the answer
+  applies, and only while it is still `pending` (`409 not_pending`
+  otherwise). An accept that is refused or undelivered ends the
+  grantee's row and gives them a notice.
+- `grant.revoke`, either way, body `{grant}`: urgent, and it cancels
+  whatever is still queued for the grant. The owner's withdrawal ends the
+  grantee's row (its card closes if still open); the grantee's ends the
+  owner's grant (`revoked_by: 'grantee'`). Ending what is already over is
+  the same answer.
+
+Ending the contact ends every grant between the two on both journals, by
+`contact.remove`. Each side writes its own People log lines, naming the
+other person by address.
+
+So far only the grant crosses: the mission's contents follow in a later
+stage.
 
 ## Device privacy
 
