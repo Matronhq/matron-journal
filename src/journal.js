@@ -9,6 +9,7 @@ import { joinedAgentIds, participantConvosByRoom } from './participants.js'
 import { parseRepo } from './repo-identity.js'
 import { autoTitleColumns, convoMetaPayload, recomputeConvoTitle } from './convo-title.js'
 import { MESSAGE_TYPES, MESSAGE_TYPES_SQL } from './message-types.js'
+import { FOR_YOU_TYPES_SQL } from './sync-scope.js'
 import { pinHintBeforeAppend, sendPinsFrame } from './pins.js'
 import { unarchiveOnMessage, sendArchiveFrame } from './archive.js'
 export { MESSAGE_TYPES, MESSAGE_TYPES_SQL }
@@ -528,6 +529,24 @@ export function eventsAfter(db, userId, cursor, limit = 500) {
   return db.prepare(
     'SELECT * FROM events WHERE user_id=? AND seq>? ORDER BY seq LIMIT ?'
   ).all(userId, cursor, limit).map(parseRow)
+}
+
+// The replay half of sync-scope.js's scopeCarries for a for_you hello: what
+// that socket would have carried since `cursor`, minus the viewed
+// conversations (a reconnecting app has no viewing set yet; it fetches an
+// open chat's gap over HTTP).
+export function scopedEventsAfter(db, userId, cursor, coordinatorConvoId, limit = 500) {
+  return db.prepare(
+    `SELECT * FROM events WHERE user_id=? AND seq>? AND (type IN (${FOR_YOU_TYPES_SQL}) OR convo_id IS ?) ORDER BY seq LIMIT ?`
+  ).all(userId, cursor, coordinatorConvoId ?? null, limit).map(parseRow)
+}
+
+// How many events a for_you replay from `cursor` would send, counted up to
+// `cap` + 1 so the snapshot_required valve stops scanning early.
+export function scopedReplayCount(db, userId, cursor, coordinatorConvoId, cap) {
+  return db.prepare(
+    `SELECT COUNT(*) AS n FROM (SELECT 1 FROM events WHERE user_id=? AND seq>? AND (type IN (${FOR_YOU_TYPES_SQL}) OR convo_id IS ?) LIMIT ?)`
+  ).get(userId, cursor, coordinatorConvoId ?? null, cap + 1).n
 }
 
 export function messagesBefore(db, userId, convoId, { beforeSeq = null, limit = 50 } = {}) {

@@ -2,9 +2,10 @@ import { randomUUID } from 'node:crypto'
 import { WebSocketServer } from 'ws'
 import { authToken, authorizeAgentWrite } from './auth.js'
 import { getBoxDefaults, boxDefaultsByDevice, effectiveBoxDefaults, normaliseAgent } from './box-defaults.js'
-import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses } from './db.js'
+import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses, setDeviceSyncScope } from './db.js'
+import { parseSyncScope } from './sync-scope.js'
 import { settingsView } from './settings.js'
-import { eventsAfter, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, agentTargetsFor, CONVO_ID_MAX_CHARS } from './journal.js'
+import { eventsAfter, scopedEventsAfter, scopedReplayCount, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, agentTargetsFor, CONVO_ID_MAX_CHARS } from './journal.js'
 import { parseRepo, REPO_MAX } from './repo-identity.js'
 import { participantIds, participantConvoIds, joinedAgentIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
@@ -495,13 +496,25 @@ export function attachWs({
           // Absent field = asserts visible: an unpinned flag follows the env
           // var exactly, including its removal (admin pin is the override).
           if (who.kind === 'agent') applyBridgePrivate(db, who.deviceId, msg.private === true)
+          // Optional client sync scope (src/sync-scope.js). Same reject shape
+          // as a bad cursor. Agents' delivery is already scoped by
+          // membership, so they ignore it.
+          const syncScope = parseSyncScope(msg.sync)
+          if (syncScope === undefined) {
+            ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'bad_request', ref: 'hello' }))
+            ws.close()
+            return
+          }
           // conn is assigned here, before replay/registration complete below. If another
           // message arrives while the replay loop is yielded (see setImmediate below),
           // it will be dispatched to handleOp before hub.register(conn) runs. That's safe
           // for every op handled today: any journal append it triggers gets a seq greater
           // than the in-flight cursor, so it's picked up by a later replay batch rather
           // than lost. Revisit this assumption if a future op has other side effects.
-          conn = { ws, ...who, viewingConvoIds: new Set() }
+          conn = { ws, ...who, viewingConvoIds: new Set(), syncScope: who.kind === 'client' ? syncScope : null }
+          // Kept on the device row for the push pipeline's wakes, which
+          // decide for devices that have no socket.
+          if (who.kind === 'client') setDeviceSyncScope(db, who.deviceId, conn.syncScope)
           conn.username = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId).name
           // Set when the replay below yields: a pin change made meanwhile sent
           // its `pins` frame to registered sockets only, and pins are not
@@ -520,6 +533,9 @@ export function attachWs({
           // ordinary agent never learns a private-owned conversation's id.
           // applyBridgePrivate ran above, so the flag is already current.
           const coordinator = coordinatorFor(db, who.userId, { excludePrivateOwned: who.kind === 'agent' && !isPrivateDevice(db, who.deviceId) })
+          // A for_you socket carries every event of the Coordinator
+          // conversation; hub.broadcastJournal keeps this current after.
+          conn.coordinatorConvoId = coordinator
           // pins (src/pins.js): a client's sidebar entries, so a reconnecting
           // app catches up on changes made elsewhere while it was offline.
           // box_defaults (src/box-defaults.js): an agent's own defaults for
@@ -536,6 +552,10 @@ export function attachWs({
             kind: 'control', op: 'hello_ok', seq: headSeq, device_id: who.deviceId, name: who.name, coordinator_convo_id: coordinator,
             settings: settingsView(db, who.userId),
             ...(who.kind === 'client' ? { pins: listPins(db, who.userId) } : {}),
+            // sync: the scope this socket got, for a client that named one, so
+            // an app can tell a journal that honours `hello.sync` from one
+            // that predates it.
+            ...(who.kind === 'client' && msg.sync != null ? { sync: conn.syncScope ?? 'everything' } : {}),
             ...(archive ? { archive } : {}),
             ...(who.kind === 'agent' ? { box_defaults: getBoxDefaults(db, who.userId, who.deviceId) } : {}),
           }))
@@ -544,7 +564,13 @@ export function attachWs({
             // replaying — tell the client to wipe, GET /snapshot, and reconnect
             // with the fresh cursor instead. Close 4009 right after; the socket
             // is never registered (no live traffic for this abandoned attempt).
-            if (headSeq - msg.cursor > maxReplay) {
+            // A for_you replay is measured by what it would send, not by the
+            // whole journal's gap: most of that gap is never sent to it.
+            const scoped = conn.syncScope === 'for_you'
+            const gap = scoped
+              ? scopedReplayCount(db, who.userId, msg.cursor, conn.coordinatorConvoId, maxReplay)
+              : headSeq - msg.cursor
+            if (gap > maxReplay) {
               ws.send(JSON.stringify({ kind: 'control', op: 'snapshot_required' }))
               ws.close(4009)
               return
@@ -567,7 +593,9 @@ export function attachWs({
               return d
             }
             for (;;) {
-              const batch = eventsAfter(db, who.userId, cursor, 500)
+              const batch = scoped
+                ? scopedEventsAfter(db, who.userId, cursor, conn.coordinatorConvoId, 500)
+                : eventsAfter(db, who.userId, cursor, 500)
               for (const e of batch) {
                 if (decisionCache && !replaysTo(e.convo_id)) continue
                 // Client-only events (the agent-chat approval card) never
@@ -622,6 +650,14 @@ export function attachWs({
           // the loop above) closes that window. Both checks are synchronous with
           // register, so 'close' cannot interleave between check and register.
           if (conn.closed) return
+          // A for_you replay skips most seqs, so its last frame is not the
+          // head. This frame moves the app's cursor to the head the replay
+          // reached. Sent in the same synchronous tail as register, so no
+          // event can land between the two.
+          if (conn.syncScope && msg.cursor != null) {
+            const reached = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(who.userId)
+            ws.send(JSON.stringify({ kind: 'control', op: 'cursor', seq: reached ? reached.seq : 0 }))
+          }
           hub.register(conn)
           conn.registered = true
           if (yielded && who.kind === 'client') ws.send(JSON.stringify({ kind: 'pins', pins: listPins(db, who.userId) }))

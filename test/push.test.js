@@ -910,3 +910,40 @@ test('background wake: off unless the pipeline is given an interval', async (t) 
   pipeline.onAppend(alice.id, textEvent(1), null)
   assert.equal(stub.calls.length, 0)
 })
+
+// ---- For-you-only phones (src/sync-scope.js) ------------------------------
+
+test('background wake: a for_you phone is woken by tracker and Coordinator changes only', async (t) => {
+  // Each read of the clock is a fresh interval, so pacing never hides a wake.
+  let clock = 0
+  const { db, alice, phone, pipeline, wakes } = await setupWakes(t, { wakeIntervalMs: 1000, now: () => (clock += 1000) })
+  upsertConversation(db, { id: 'coord', ownerUserId: alice.id, title: 'Coordinator' })
+  db.prepare("UPDATE devices SET sync_scope='for_you' WHERE id=?").run(phone)
+  pipeline.onAppend(alice.id, textEvent(1), null)
+  pipeline.onAppend(alice.id, { ...textEvent(2), type: 'convo_meta', payload: { title: 't' } }, null)
+  assert.equal(wakes().length, 0, 'conversation content and metadata wake nothing')
+  pipeline.onAppend(alice.id, { ...textEvent(3), type: 'item', payload: { item_id: 'it_1', action: 'created' } }, null)
+  assert.equal(wakes().length, 1)
+  db.prepare("INSERT INTO user_settings(user_id, coordinator_convo_id, updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET coordinator_convo_id=excluded.coordinator_convo_id").run(alice.id, 'coord', 1)
+  pipeline.onAppend(alice.id, { ...textEvent(4), convo_id: 'coord' }, null)
+  assert.equal(wakes().length, 2)
+})
+
+test('background wake: an everything phone is still woken by any event', async (t) => {
+  const { alice, pipeline, wakes } = await setupWakes(t)
+  pipeline.onAppend(alice.id, textEvent(1), null)
+  assert.equal(wakes().length, 1)
+})
+
+test('background wake: a for_you phone\'s read-elsewhere wakes are paced like the others', async (t) => {
+  let clock = 1000000
+  const { db, alice, phone, pipeline, wakes } = await setupWakes(t, { wakeIntervalMs: 1000, now: () => clock })
+  db.prepare("UPDATE devices SET sync_scope='for_you' WHERE id=?").run(phone)
+  const read = (seq) => ({ seq, convo_id: 'c1', ts: seq, sender: 'user:alice', type: 'read_marker', payload: {} })
+  pipeline.onAppend(alice.id, read(1), null)
+  pipeline.onAppend(alice.id, read(2), null)
+  assert.equal(wakes().length, 1)
+  clock += 1000
+  pipeline.onAppend(alice.id, read(3), null)
+  assert.equal(wakes().length, 2)
+})

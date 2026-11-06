@@ -1,6 +1,7 @@
 import { snippetOf } from './journal.js'
 import { clientDevicesForPush, pruneApnsToken, unreadBadge } from './db.js'
 import { getCoordinatorConvoId } from './coordinator.js'
+import { wakesForYou } from './sync-scope.js'
 import {
   effectiveEvents, eventKey, allowedForUser, allowedForDevice, getConvoNotify,
   holdsConsent, consentStillPending, notifyBadge,
@@ -223,10 +224,17 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
       if (now() - at >= backgroundWakeMs) lastWakeAt.delete(token)
     }
     let connected = null
+    // A for_you phone (src/sync-scope.js) is woken only by what its For you
+    // and mission screens show; the rest it fetches when a chat is opened.
+    let forYouWake
     for (const device of devices) {
       if (device.id === originDeviceId || !device.apns_env) continue
       if (device.cursor >= event.seq) continue
       if (lastWakeAt.has(device.apns_token)) continue
+      if (device.sync_scope === 'for_you') {
+        forYouWake ??= wakesForYou(event, getCoordinatorConvoId(db, userId))
+        if (!forYouWake) continue
+      }
       connected ??= new Set(hub.connsOf(userId).map((c) => c.deviceId))
       if (connected.has(device.id)) continue
       sendWake(device, userId)
@@ -268,6 +276,9 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
       for (const device of devices) {
         if (device.id === originDeviceId) continue // never push a device its own read_marker
         if (!device.apns_env) continue
+        // A for_you phone has nothing to fetch for a read elsewhere, only a
+        // badge to update, so its read wakes share the paced wakes' budget.
+        if (device.sync_scope === 'for_you' && backgroundWakeMs && now() - (lastWakeAt.get(device.apns_token) ?? -Infinity) < backgroundWakeMs) continue
         sendWake(device, userId)
       }
       return
