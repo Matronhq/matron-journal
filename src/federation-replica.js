@@ -26,6 +26,7 @@ import { enqueue } from './federation-outbox.js'
 import { grantedMissionExport, activityOf } from './missions.js'
 import { grantedItemsExport } from './items.js'
 import { sanitizePeerText } from './peer-text.js'
+import { localMedia, isMediaRef } from './federation-media.js'
 
 export const SNAPSHOT_OP = 'mission.snapshot'
 export const EVENT_OP = 'mission.event'
@@ -49,6 +50,8 @@ const LABELS_MAX = 50
 const LINKS_MAX = 50
 const URL_CAP = 2048
 const PERSON_CAP = 324
+const ATTACHMENTS_MAX = 20
+const NAME_MAX = 255
 
 const fail = (code) => { throw new Error(code) }
 const bytes = (v) => Buffer.byteLength(JSON.stringify(v))
@@ -74,19 +77,36 @@ export function wireMilestone(l) {
   }
 }
 
-function wireComment(c) {
+// The blobs a thread names, as the owner's journal holds them: an
+// attachment crosses with its sha256 (the grantee's journal checks the bytes
+// it pulls against it) and only when its blob is here.
+export const blobsOf = (db) => (id) => db.prepare('SELECT sha256, width, height FROM blobs WHERE id=?').get(id) ?? null
+
+function wireAttachment(a, blobOf) {
+  const b = typeof a?.blob_ref === 'string' ? blobOf(a.blob_ref) : null
+  if (!b) return null
+  return {
+    media: a.blob_ref, name: typeof a.name === 'string' ? a.name : '', mime: a.mime, size: a.size, sha256: b.sha256,
+    ...(b.width > 0 && b.height > 0 ? { width: b.width, height: b.height } : {}),
+    ...(typeof a.transcript === 'string' ? { transcript: a.transcript } : {}),
+  }
+}
+
+function wireComment(c, blobOf) {
   const meta = c.meta && typeof c.meta === 'object' ? c.meta : {}
+  const attachments = c.withdrawn ? [] : (Array.isArray(c.attachments) ? c.attachments : []).map((a) => wireAttachment(a, blobOf)).filter(Boolean)
   return {
     ref: c.id, author: c.author, kind: c.kind, body: c.body ?? '', created_at: c.created_at,
+    ...(attachments.length ? { attachments } : {}),
     ...(c.withdrawn ? { withdrawn: true } : {}),
     ...(c.kind === 'status' && meta.from ? { from: statusOf(meta.from), to: statusOf(meta.to) } : {}),
     ...(meta.contributor ? { contributor: contributorOf(meta.contributor) } : {}),
   }
 }
 
-// Attachments cross in a later stage (media.fetch): until then an item and
-// its comments cross without them.
-export function wireItem({ item, comments }) {
+// An attachment crosses as a record of it (wireAttachment); its bytes are
+// pulled with media.fetch (src/federation-media.js).
+export function wireItem({ item, comments }, blobOf) {
   const out = {
     ref: item.id, num: item.num, kind: item.kind, state: item.state, resolution: item.resolution ?? null, awaiting: item.awaiting ?? null,
     title: item.title, body: item.body ?? '', created_by: item.created_by ?? null,
@@ -97,11 +117,15 @@ export function wireItem({ item, comments }) {
     ...(item.contributor ? { contributor: contributorOf(item.contributor) } : {}),
     comments: [],
   }
+  // The description's own attachments (they ride on the item's body
+  // comment, which the thread does not list).
+  const attachments = (Array.isArray(item.attachments) ? item.attachments : []).map((a) => wireAttachment(a, blobOf)).filter(Boolean)
+  if (attachments.length) out.attachments = attachments
   // The newest comments that fit, oldest first as a thread reads.
   let room = ITEM_BYTES - bytes(out)
   const kept = []
   for (const c of comments.slice(-MAX_COMMENTS).reverse()) {
-    const w = wireComment(c)
+    const w = wireComment(c, blobOf)
     const n = bytes(w) + 1
     if (n > room) break
     room -= n
@@ -119,7 +143,7 @@ export function snapshotPages(db, g, snap) {
   if (!view) return null
   const records = [
     ...view.milestones.slice(0, MAX_RECORDS).map((l) => ['milestones', wireMilestone(l)]),
-    ...grantedItemsExport(db, g.subject_id, { limit: MAX_RECORDS }).map((x) => ['items', wireItem(x)]),
+    ...grantedItemsExport(db, g.subject_id, { limit: MAX_RECORDS }).map((x) => ['items', wireItem(x, blobsOf(db))]),
   ]
   const fresh = () => ({ milestones: [], items: [] })
   const pages = [{ mission: wireMission(view.mission), ...fresh() }]
@@ -164,7 +188,7 @@ export function eventBody(db, g, kind, ref = null) {
   }
   if (kind !== 'item') return null
   const [x] = grantedItemsExport(db, g.subject_id, { limit: 1, only: ref })
-  if (x) return { ...at, ref, record: wireItem(x) }
+  if (x) return { ...at, ref, record: wireItem(x, blobsOf(db)) }
   const hidden = db.prepare(`SELECT 1 FROM items i WHERE i.id = ? AND (i.consent IS NOT NULL OR i.private = 1
     OR EXISTS (SELECT 1 FROM conversations pc JOIN private_devices pd ON pd.id = pc.agent_device_id WHERE pc.id = i.origin_convo_id))`).get(ref)
   return hidden ? null : { ...at, ref, record: null }
@@ -230,7 +254,26 @@ function readComment(c) {
   return {
     id: newId('ic'), ref: c.ref, author: oneOf(c.author, BY, 'agent'), kind, body: c.withdrawn ? '' : peerBody(c.body), created_at: time(c.created_at) ?? 0,
     meta: Object.keys(meta).length ? meta : null, ...(c.withdrawn ? { withdrawn: true } : {}),
+    attachments: c.withdrawn ? [] : readAttachments(c.attachments),
   }
+}
+
+// What an attachment record may carry. One that is not whole is dropped,
+// not refused: the rest of the thread still reads.
+const SHA = /^[0-9a-f]{64}$/
+function readAttachments(v) {
+  if (!Array.isArray(v)) return []
+  const out = []
+  for (const a of v.slice(0, ATTACHMENTS_MAX)) {
+    if (!a || typeof a !== 'object' || !isMediaRef(a.media) || typeof a.mime !== 'string' || a.mime.length > 128
+      || !Number.isSafeInteger(a.size) || a.size < 0 || typeof a.sha256 !== 'string' || !SHA.test(a.sha256)) continue
+    const dims = Number.isSafeInteger(a.width) && Number.isSafeInteger(a.height) && a.width > 0 && a.height > 0 ? { width: a.width, height: a.height } : {}
+    out.push({
+      media: a.media, name: line(typeof a.name === 'string' ? a.name : '', NAME_MAX), mime: a.mime, size: a.size, sha256: a.sha256, ...dims,
+      ...(typeof a.transcript === 'string' ? { transcript: peerBody(a.transcript) } : {}),
+    })
+  }
+  return out
 }
 
 function readLinks(v) {
@@ -251,6 +294,7 @@ function readItem(i) {
   const comments = Array.isArray(i.comments) ? i.comments.slice(-MAX_COMMENTS).map(readComment) : []
   const c = contributor(i.contributor)
   return {
+    attachments: readAttachments(i.attachments),
     ref: i.ref, num: num(i.num), kind: oneOf(i.kind, ['task', 'question', 'decision', 'notice'], 'task'),
     state: oneOf(i.state, STATES, 'open'), resolution: oneOf(i.resolution, RESOLUTIONS), awaiting: oneOf(i.awaiting, BY),
     title: line(i.title, TITLE_CAP) || 'Untitled', body: peerBody(i.body), created_by: oneOf(i.created_by, BY),
@@ -279,16 +323,23 @@ function putItem(d, incoming, i, snap) {
     const ids = new Map(parse(was.comments, []).map((c) => [c.ref, c.id]))
     i = { ...i, comments: i.comments.map((c) => (ids.has(c.ref) ? { ...c, id: ids.get(c.ref) } : c)) }
   }
+  // Each attachment as the apps read one here: a local media id (GET
+  // /media/:id pulls its bytes the first time).
+  const local = (list) => (list ?? []).map((a) => {
+    const { media: _m, sha256: _s, ...rest } = a
+    return { blob_ref: localMedia(d, incoming, a), ...rest }
+  })
+  i = { ...i, attachments: local(i.attachments), comments: i.comments.map((c) => ({ ...c, attachments: local(c.attachments) })) }
   d.prepare(`INSERT INTO fed_replica_items(id, fg_id, user_id, ref, num, kind, state, resolution, awaiting, title, body, created_by, created_at, updated_at, closed_at,
-    labels, links, comment_count, last_comment_at, contributor_name, contributor_via, comments, comments_truncated, seen_snap)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fg_id, ref) DO UPDATE SET num=excluded.num, kind=excluded.kind, state=excluded.state,
+    labels, links, comment_count, last_comment_at, contributor_name, contributor_via, comments, comments_truncated, seen_snap, attachments)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fg_id, ref) DO UPDATE SET attachments=excluded.attachments, num=excluded.num, kind=excluded.kind, state=excluded.state,
     resolution=excluded.resolution, awaiting=excluded.awaiting, title=excluded.title, body=excluded.body, created_by=excluded.created_by,
     created_at=excluded.created_at, updated_at=excluded.updated_at, closed_at=excluded.closed_at, labels=excluded.labels, links=excluded.links,
     comment_count=excluded.comment_count, last_comment_at=excluded.last_comment_at, contributor_name=excluded.contributor_name,
     contributor_via=excluded.contributor_via, comments=excluded.comments, comments_truncated=excluded.comments_truncated, seen_snap=excluded.seen_snap`)
     .run(newId('it'), incoming.id, incoming.user_id, i.ref, i.num, i.kind, i.state, i.resolution, i.awaiting, i.title, i.body, i.created_by, i.created_at,
       i.updated_at, i.closed_at, JSON.stringify(i.labels), JSON.stringify(i.links), i.comment_count, i.last_comment_at, i.contributor_name, i.contributor_via,
-      JSON.stringify(i.comments), i.comments_truncated ? 1 : 0, snap)
+      JSON.stringify(i.comments), i.comments_truncated ? 1 : 0, snap, JSON.stringify(i.attachments))
 }
 
 const SNAP = /^sn_[A-Za-z0-9_-]{1,64}$/
@@ -452,7 +503,7 @@ function itemOut(r) {
     created_at: r.created_at, updated_at: r.updated_at, closed_at: r.closed_at, mission_id: r.mission_id, consent: null, chosen_action: null,
     private: false, filed_convo_id: null, device_name: null, comment_count: r.comment_count, last_comment_at: r.last_comment_at,
     last_user_input_at: null, has_image: false, mission_num: r.mission_num, origin_convo_title: null, handover: null, repo: null,
-    labels: parse(r.labels, []), links: parse(r.links, []), attachments: [], actions: [],
+    labels: parse(r.labels, []), links: parse(r.links, []), attachments: parse(r.attachments, []), actions: [],
     ...(r.contributor_name ? { contributor: { name: r.contributor_name, via: r.contributor_via ?? 'agent' } } : {}),
     owner: ownerOf(r.owner_address), shared_via: 'grant',
   }
@@ -461,7 +512,7 @@ function itemOut(r) {
 function commentsOut(r) {
   return parse(r.comments, []).map((c) => ({
     id: c.id, item_id: r.id, author: c.author, device_id: 0, kind: c.kind, body: c.body, created_at: c.created_at,
-    chosen_action: null, convo_id: null, device_name: null, convo_title: null, attachments: [], meta: c.meta ?? null,
+    chosen_action: null, convo_id: null, device_name: null, convo_title: null, attachments: c.attachments ?? [], meta: c.meta ?? null,
     action: null, reply_to: null, actions: [], ...(c.withdrawn ? { withdrawn: true } : {}),
   }))
 }

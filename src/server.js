@@ -27,6 +27,7 @@ import { resolveWebDir, makeStaticHandler } from './static-http.js'
 import { makeWellKnown, parseList } from './well-known.js'
 import { loadFederation, makeFederationWellKnown } from './federation-identity.js'
 import { makeFederationHandler, pruneReceipts, DEFAULT_OPS } from './federation-inbound.js'
+import { makeMediaHandler, makeReplicaMedia, purgeReplicaMedia } from './federation-media.js'
 import { makeContactFederation } from './federation-contacts.js'
 import { makeGrantFederation } from './federation-grants.js'
 import { makeOutbox } from './federation-outbox.js'
@@ -631,10 +632,17 @@ export function startServer({
   const federationGrants = federation.enabled ? makeGrantFederation({ db, hub, pushPipeline, federation }) : null
   // POST /federation/v1 (src/federation-inbound.js): 404 while off.
   // `federationOps` is the test seam: extra ops, over the journal's own.
-  const handleFederation = makeFederationHandler({
+  const handleFederationOps = makeFederationHandler({
     db, federation, client: federationClientInUse,
     ops: { ...DEFAULT_OPS, ...(federationContacts?.inbound ?? {}), ...(federationGrants?.inbound ?? {}), ...(federationOps ?? {}) },
   })
+  // Attachments of read shares (src/federation-media.js): the owner's
+  // signed pull, and the grantee's pull-through copy behind GET /media/:id.
+  const handleFederationMedia = makeMediaHandler({ db, federation })
+  const handleFederation = async (req, res, url) => (await handleFederationMedia(req, res, url)) || handleFederationOps(req, res, url)
+  const federationMedia = federation.enabled
+    ? makeReplicaMedia({ db, federation, client: federationClientInUse, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes, quotaBytes: resolvedMediaUserQuotaBytes })
+    : null
   // The outbox (src/federation-outbox.js): built only when federation is on.
   const federationOutbox = federation.enabled
     ? makeOutbox({ db, hub, federation, client: federationClientInUse, ops: { ...federationContacts.outbound, ...federationGrants.outbound } })
@@ -667,7 +675,7 @@ export function startServer({
     transferMaxBytes: resolvedTransferMaxBytes, transferUserQuotaBytes: resolvedTransferUserQuotaBytes, transferMaxAwaitingPerSender: resolvedTransferMaxAwaiting, transferChunkBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentTransferDailyCap, consentRoutineCap, verifier,
-    github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, federationGrants, handleStatic, tokenBox,
+    github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, federationGrants, federationMedia, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
   }))
   const wss = attachWs({
@@ -700,6 +708,7 @@ export function startServer({
       if (federation.enabled) {
         receiptPruneInterval = setInterval(() => {
           try { pruneReceipts(db) } catch (err) { console.error('federation: receipt prune failed', err) }
+          try { purgeReplicaMedia(db) } catch (err) { console.error('federation: media purge failed', err) }
         }, 3600_000)
         receiptPruneInterval.unref()
         federationOutbox.start()
@@ -817,6 +826,8 @@ export function startServer({
         federationOutbox,
         federationContacts,
         federationGrants,
+        federationMedia,
+        federation,
         close: () => new Promise((r) => {
           closing = true
           startDelay.cancel()

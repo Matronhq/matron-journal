@@ -5547,14 +5547,19 @@ fields cross:
   contributor?`
 - item: `ref, num, kind, state, resolution, awaiting, title, body,
   created_by, created_at, updated_at, closed_at, labels, links: [{url,
-  title?}], comment_count, last_comment_at, contributor?, comments,
-  comments_truncated?`, with at most 5,000 milestones and 5,000 items, the
+  title?}], comment_count, last_comment_at, contributor?, attachments?
+  (the description's own), comments, comments_truncated?`, with at most
+  5,000 milestones and 5,000 items, the
   newest
-- comment: `ref, author, kind, body, created_at, withdrawn?, from?, to?,
-  contributor?` (`from`/`to` `{state, resolution, awaiting}` on a status
-  comment), at most 192 KiB of thread per item, the newest
+- comment: `ref, author, kind, body, created_at, attachments?, withdrawn?,
+  from?, to?, contributor?` (`from`/`to` `{state, resolution, awaiting}`
+  on a status comment), at most 192 KiB of thread per item, the newest
+- attachment: `media, name, mime, size, sha256, width?, height?,
+  transcript?`, at most 20 per comment; `media` is the owner journal's
+  blob id. A withdrawn reply carries none.
 
-Attachments do not cross yet. `ref` is the owner journal's id.
+`ref` is the owner journal's id. An attachment crosses as this record
+only; its bytes are pulled (below).
 
 The grantee's journal refuses a page for a grant that is not active there
 (`409 not_active`) and otherwise keeps a copy. Page 0 starts loading
@@ -5632,6 +5637,38 @@ malformed`, `409 not_active`). One that dies leaves the share standing;
 the owner gets a notice ("Couldn't update mission #N for bob@b.example"),
 at most one a day per share, and the same when the outbox is too full to
 queue one.
+
+**Attachments.** The grantee's journal gives each attachment of its copy
+an id of its own, in the shape of a blob id, so the apps read it as any
+attachment: `GET /media/:id` (same headers as a blob). The first read
+pulls the bytes from the owner's journal with a signed `media.fetch`:
+
+```
+GET /federation/v1/media
+Matron-Federation: <base64url of the envelope's JSON>
+  {v: 1, from: <grantee>, to: <owner>, op: 'media.fetch', id, ts,
+   body: {grant: <owner's gr_ id>, media: <owner's blob id>}, sig}
+```
+
+The owner's journal checks the envelope as for an op (`400 malformed`,
+`401 stale`, `403` for an unknown or refused journal or a bad
+signature). It then checks that the grant is active, is given to `from`
+under the key that signed, and is from `to` (`403 not_shared`
+otherwise). Last, it checks that the blob is attached to a comment the
+grant's grantee view shows (`404 not_found` otherwise): never a consent
+mirror, an owner-only item, an item from a private box, or a withdrawn
+reply. It answers with the bytes and `Matron-Media-SHA256`. There is no
+receipt: the pull changes nothing.
+
+The grantee's journal keeps the bytes only if their SHA-256 and size match
+the attachment record. They count in the grantee's media quota (`413
+quota_exceeded` when it is full, `413 too_large` past
+`MATRON_MEDIA_MAX_BYTES`), and later reads are served from the kept copy.
+An attachment reads only while the share and its contact are active and
+the copy still shows it; otherwise it is `404`. A pull that fails is
+`502 peer_unreachable`, and the next read tries again. Kept bytes of a
+share that has ended there, or of an attachment the copy no longer shows,
+are deleted by an hourly sweep.
 
 ## Device privacy
 

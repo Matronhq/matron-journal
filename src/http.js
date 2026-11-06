@@ -116,7 +116,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, blobTranscripts = null, github = null, handleWellKnown = () => false, handleFederation = async () => false, federationOutbox = null, federationContacts = null, federationGrants = null, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, blobTranscripts = null, github = null, handleWellKnown = () => false, handleFederation = async () => false, federationOutbox = null, federationContacts = null, federationGrants = null, federationMedia = null, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null }) {
   // Two-factor sign-in (src/two-factor-http.js). The server passes its own;
   // the defaults keep a bare handler (tests) working the same way.
   const twoFactorBox = tokenBox || PLAIN_BOX
@@ -1083,6 +1083,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // owner learns from a 403 that a 404 doesn't already hide just as well,
         // and callers can't probe for the existence of someone else's blob.
         const blob = getBlob(db, mm[1])
+        // An attachment of a mission shared from another journal: its bytes
+        // come from there on first read (src/federation-media.js).
+        if (!blob && federationMedia && await federationMedia.serve(req, res, who, mm[1])) return
         if (!blob) return json(res, 404, { error: 'not_found' })
         if (blob.owner_user_id !== who.userId) {
           // Shared visibility (spec 2026-09-23 tracker web/teams): a
