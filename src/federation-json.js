@@ -13,6 +13,8 @@
 //     leading zeros, single quotes, bare words, trailing data);
 //   - a duplicate key in any object, at any depth;
 //   - a lone surrogate, written raw or as a \u escape;
+//   - a Unicode noncharacter (U+FDD0..U+FDEF, U+xFFFE, U+xFFFF), which
+//     I-JSON forbids in keys and strings alike;
 //   - a number that is not finite, or whose value is an integer outside
 //     ±(2^53 - 1): such integers travel as strings;
 //   - nesting deeper than MAX_DEPTH.
@@ -20,6 +22,10 @@
 export const MAX_DEPTH = 64
 
 const fail = () => { throw new Error('malformed') }
+
+// A string I-JSON allows: no lone surrogates and no noncharacters.
+const NONCHARACTER = /[\uFDD0-\uFDEF\uFFFE\uFFFF]|[\uD83F\uD87F\uD8BF\uD8FF\uD93F\uD97F\uD9BF\uD9FF\uDA3F\uDA7F\uDABF\uDAFF\uDB3F\uDB7F\uDBBF\uDBFF][\uDFFE\uDFFF]/
+export const isIJsonString = (s) => s.isWellFormed() && !NONCHARACTER.test(s)
 
 const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
 
@@ -133,7 +139,7 @@ function parseString(p) {
   }
   // Surrogates are checked on the decoded string, so a pair split across a
   // raw half and an escaped half is judged the same as either alone.
-  if (!out.isWellFormed()) fail()
+  if (!isIJsonString(out)) fail()
   return out
 }
 

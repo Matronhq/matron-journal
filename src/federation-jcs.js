@@ -8,8 +8,10 @@
 // what Array.prototype.sort does for keys. What JSON.stringify would quietly
 // do differently is refused instead: undefined, functions, symbols, bigints
 // and non-finite numbers are Error('not_canonical'), and so is a string
-// holding a lone surrogate (I-JSON has none; federation-json.js never
-// produces one). Only plain data goes in: no toJSON, no class instances.
+// holding a lone surrogate or a noncharacter (I-JSON has neither;
+// federation-json.js never produces one). Only plain data goes in: no toJSON, no class instances.
+
+import { isIJsonString } from './federation-json.js'
 
 const fail = () => { throw new Error('not_canonical') }
 
@@ -26,15 +28,20 @@ function ser(v, depth) {
       if (!Number.isFinite(v)) fail()
       return JSON.stringify(v)
     case 'string':
-      if (!v.isWellFormed()) fail()
+      if (!isIJsonString(v)) fail()
       return JSON.stringify(v)
     case 'object': {
-      if (Array.isArray(v)) return '[' + Array.from(v, (x) => ser(x, depth + 1)).join(',') + ']'
+      if (Array.isArray(v)) {
+        // By index, never the iterator: what goes on the wire is the indices.
+        const parts = []
+        for (let i = 0; i < v.length; i++) parts.push(ser(v[i], depth + 1))
+        return '[' + parts.join(',') + ']'
+      }
       const proto = Object.getPrototypeOf(v)
       if (proto !== Object.prototype && proto !== null) fail()
       const keys = Object.keys(v).sort()
       return '{' + keys.map((k) => {
-        if (!k.isWellFormed()) fail()
+        if (!isIJsonString(k)) fail()
         return JSON.stringify(k) + ':' + ser(v[k], depth + 1)
       }).join(',') + '}'
     }

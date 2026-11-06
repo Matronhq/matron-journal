@@ -5101,7 +5101,7 @@ format, which `src/federation-envelope.js` implements.
 | Field | |
 |---|---|
 | `v` | `1`. Any other value is `unsupported_version` |
-| `from`, `to` | addresses, `name@host`: a name of up to 64 characters `[A-Za-z0-9._-]`, then a lower-case DNS host with an optional port |
+| `from`, `to` | addresses, `name@host`: a name of up to 64 characters `[A-Za-z0-9._-]` starting with a letter or digit, then a lower-case DNS host with an optional port |
 | `op` | the operation, lower-case dotted (`mission.event`) |
 | `id` | a ULID, given to the op once when it is queued and kept on every retry |
 | `ts` | milliseconds since the epoch, set afresh on every attempt |
@@ -5124,7 +5124,7 @@ order on the wire do not matter.
 - bytes that are not valid UTF-8, or a byte-order mark;
 - anything outside the JSON grammar;
 - a duplicate key at any depth;
-- a lone surrogate, raw or escaped;
+- a lone surrogate, raw or escaped, or a Unicode noncharacter;
 - a number that is not finite;
 - an integer outside ±(2^53 − 1). Larger integers travel as strings;
 - nesting deeper than 64.

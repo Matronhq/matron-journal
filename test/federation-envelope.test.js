@@ -243,3 +243,45 @@ test('opHash: same op and body hash alike whatever the key order; another body d
   assert.notEqual(opHash({ op: 'a.b', body: { x: 1 } }), opHash({ op: 'a.c', body: { x: 1 } }))
 })
 
+
+test('strict parser and jcs: refuse Unicode noncharacters (I-JSON)', () => {
+  for (const s of ['"\\uffff"', '"\\ufffe"', '"\\ufdd0"', '"\\ufdef"', '"\\ud83f\\udfff"', '"\\udbff\\udffe"', '{"\\uffff":1}', '"￿"']) {
+    assert.throws(() => parseStrict(s), malformed, s)
+  }
+  for (const ok of ['"\\ufdcf"', '"\\ufdf0"', '"\\ufffd"', '"\\ud83f\\udffd"']) assert.doesNotThrow(() => parseStrict(ok), ok)
+  for (const bad of ['￿', '﷐', '\u{1fffe}', '\u{10ffff}', { '￿': 1 }]) {
+    assert.throws(() => canonicalize(bad), { message: 'not_canonical' })
+  }
+})
+
+test('jcs: arrays are serialised by index, never through an overridden iterator', () => {
+  const a = [1, 2]
+  a[Symbol.iterator] = function* () { yield 9 }
+  assert.equal(canonicalize(a), '[1,2]')
+})
+
+test('envelope: signing refuses what every receiver would refuse to parse', () => {
+  assert.throws(() => signEnvelope(op({ body: { n: 2 ** 53 } }), alice.privateKey), malformed)
+  let deep = {}
+  for (let i = 0; i < MAX_DEPTH; i++) deep = { d: deep }
+  assert.throws(() => signEnvelope(op({ body: deep }), alice.privateKey), malformed)
+  assert.throws(() => signEnvelope(op({ body: { pad: 'x'.repeat(MAX_ENVELOPE_BYTES) } }), alice.privateKey), { message: 'too_large' })
+})
+
+test('envelope: the size cap is measured in bytes, whatever the input type', () => {
+  const text = '{"pad":"' + 'é'.repeat(MAX_ENVELOPE_BYTES / 2) + '"}'
+  assert.ok(text.length <= MAX_ENVELOPE_BYTES && Buffer.byteLength(text) > MAX_ENVELOPE_BYTES)
+  assert.throws(() => parseEnvelope(text), { message: 'too_large' })
+  assert.throws(() => parseEnvelope(new Uint8Array(Buffer.from(text))), { message: 'too_large' })
+})
+
+test('envelope: verify checks the shape of an object it is handed directly', () => {
+  const e = signEnvelope(op(), alice.privateKey)
+  const { ts, ...noTs } = e
+  assert.throws(() => verifyEnvelope(noTs, alice.publicKey, { now: T }), malformed)
+  assert.throws(() => verifyEnvelope({ ...e, extra: 1 }, alice.publicKey, { now: T }), malformed)
+})
+
+test('addresses: the name starts with a letter or digit', () => {
+  for (const bad of ['_alice@example.com', '.alice@example.com', '-alice@example.com']) assert.equal(isAddress(bad), false, bad)
+})

@@ -114,18 +114,25 @@ export function signingBytes(envelope) {
 }
 
 // Signs one attempt of an op. Pass the op's id and body unchanged on every
-// retry; ts defaults to now.
+// retry; ts defaults to now. Throws what parseEnvelope would answer, or
+// 'not_canonical', rather than return an envelope a receiver must refuse.
 export function signEnvelope({ from, to, op, id, body, ts = Date.now() }, privateKey) {
   const envelope = { v: 1, from, to, op, id, ts, body }
   checkShape({ ...envelope, sig: 'A'.repeat(86) })
-  return { ...envelope, sig: sign(null, signingBytes(envelope), privateKey).toString('base64url') }
+  const signed = { ...envelope, sig: sign(null, signingBytes(envelope), privateKey).toString('base64url') }
+  // Never sign what a receiver would refuse to parse (an unsafe integer, deep
+  // nesting, over 1 MiB): that op could only ever go dead.
+  parseEnvelope(Buffer.from(JSON.stringify(signed), 'utf8'))
+  return signed
 }
 
-// Bytes off the wire → a shape-checked envelope. Error codes, each one a
+// Bytes off the wire (a Buffer or Uint8Array; a string is measured in UTF-8)
+// → a shape-checked envelope. Error codes, each one a
 // permanent 4xx to the sender: 'too_large', 'malformed',
 // 'unsupported_version'.
 export function parseEnvelope(bytes) {
-  if (bytes.length > MAX_ENVELOPE_BYTES) fail('too_large')
+  const size = typeof bytes === 'string' ? Buffer.byteLength(bytes, 'utf8') : bytes.byteLength
+  if (size > MAX_ENVELOPE_BYTES) fail('too_large')
   const envelope = parseStrict(bytes)
   if (envelope === null || typeof envelope !== 'object' || Array.isArray(envelope)) fail('malformed')
   if (envelope.v !== 1) fail(Object.hasOwn(envelope, 'v') ? 'unsupported_version' : 'malformed')
@@ -148,9 +155,11 @@ function checkShape(e) {
 // Checks the signature against the key pinned for the sender, then the
 // attempt's freshness. 'bad_signature' is permanent; 'stale' carries the
 // receiver's clock so the sender can log the skew and retry with a fresh ts.
-// The signature is checked first so an unsigned caller learns nothing about
+// The shape is checked again (a caller may hand over an object it built
+// itself), then the signature, so an unsigned caller learns nothing about
 // the receiver's clock.
 export function verifyEnvelope(envelope, publicKey, { now = Date.now(), windowMs = FRESHNESS_MS } = {}) {
+  checkShape(envelope)
   const sig = Buffer.from(envelope.sig, 'base64url')
   let ok = false
   try { ok = sig.length === 64 && verify(null, signingBytes(envelope), publicKey, sig) } catch { ok = false }
