@@ -25,6 +25,7 @@ import { scheduleGithubRefresh } from './github-refresh.js'
 import { makeRpcBroker } from './rpc-broker.js'
 import { resolveWebDir, makeStaticHandler } from './static-http.js'
 import { makeWellKnown, parseList } from './well-known.js'
+import { loadFederation, makeFederationWellKnown } from './federation-identity.js'
 import { makeWaker, markWakeRefused, clearWakeRefused } from './wake.js'
 import { makeConfiguredTranscriber } from './cloud-transcribe.js'
 import { makeConfiguredMailer } from './mailer.js'
@@ -444,6 +445,10 @@ export function startServer({
   // it off. `ttsCacheDir` overrides where the clips are kept.
   tts, ttsCacheDir, ttsSweepIntervalMs,
   appleAppIds, androidPackage, androidCertSha256, tokenKey,
+  // Federation between journals (src/federation-identity.js): the test
+  // seam, {federation, publicUrl}; env (MATRON_FEDERATION,
+  // MATRON_PUBLIC_URL) otherwise. Off unless turned on.
+  federationEnv,
   // Alertmanager webhook (src/alerts-http.js): {token, username}. The
   // option is the test seam; env otherwise. Off unless both are usable.
   alertWebhook,
@@ -599,11 +604,16 @@ export function startServer({
   const handleStatic = makeStaticHandler({ webDir: resolvedWebDir })
   // App-link well-known files (spec 2026-09-23 tracker web/teams). The
   // options are the test seam; env otherwise; unset claims nothing (404).
-  const handleWellKnown = makeWellKnown({
+  const handleAppWellKnown = makeWellKnown({
     appleAppIds: appleAppIds !== undefined ? appleAppIds : parseList(process.env.MATRON_APPLE_APP_IDS),
     androidPackage: androidPackage !== undefined ? androidPackage : (process.env.MATRON_ANDROID_PACKAGE || null),
     androidCertSha256: androidCertSha256 !== undefined ? androidCertSha256 : parseList(process.env.MATRON_ANDROID_CERT_SHA256),
   })
+  const federation = loadFederation(db, tokenBox, federationEnv ?? {
+    federation: process.env.MATRON_FEDERATION, publicUrl: process.env.MATRON_PUBLIC_URL,
+  })
+  const handleFederationWellKnown = makeFederationWellKnown(federation)
+  const handleWellKnown = (req, res, url) => handleFederationWellKnown(req, res, url) || handleAppWellKnown(req, res, url)
   const resolvedAlertWebhook = alertWebhook !== undefined ? alertWebhook : {
     token: process.env.MATRON_ALERT_WEBHOOK_TOKEN || null,
     username: process.env.MATRON_ALERT_WEBHOOK_USER || null,

@@ -13,6 +13,9 @@ import { listAwaiting, answerParkedInvite } from '../src/participants.js'
 import { closeChatConsentItem } from '../src/consent-items.js'
 import { normaliseEmail, setUserEmail } from '../src/password-reset.js'
 import { setTransferConsentEnabled } from '../src/consent.js'
+import { resolveFederationConfig, storedFederationKeyInfo } from '../src/federation-identity.js'
+import { formatFingerprint } from '../src/federation-envelope.js'
+import { makeTokenBox } from '../src/token-box.js'
 import {
   disableTwoFactor, twoFactorState, isTwoFactorRequired, setTwoFactorRequired, isTwoFactorExempt, setTwoFactorExempt,
 } from '../src/two-factor.js'
@@ -27,6 +30,7 @@ const USAGE = `usage:
   matron-admin user 2fa-exempt <name> on|off
   matron-admin two-factor status
   matron-admin two-factor require on|off
+  matron-admin federation status
   matron-admin agent add <username> <agent-name>
   matron-admin device list <username>
   matron-admin device revoke <device_id>
@@ -229,6 +233,19 @@ export async function runAdmin(db, argv, deps = {}) {
       `exempt: ${exempt.length ? exempt.join(', ') : 'none'}`,
       ...lines,
     ].join('\n')
+  }
+  if (a === 'federation' && b === 'status') {
+    const env = deps.env ?? process.env
+    const config = resolveFederationConfig({ federation: env.MATRON_FEDERATION, publicUrl: env.MATRON_PUBLIC_URL })
+    const box = makeTokenBox(env.MATRON_TOKEN_KEY || null)
+    const key = storedFederationKeyInfo(db, box)
+    const switchLine = config.enabled
+      ? `on in this shell, as ${config.host} (${config.baseUrl})`
+      : ({ off: 'off in this shell (MATRON_FEDERATION is not on)', bad_switch: 'off in this shell: MATRON_FEDERATION must be on or off', no_public_url: 'off in this shell: MATRON_FEDERATION is on but MATRON_PUBLIC_URL is not an https URL' })[config.reason]
+    const keyLine = !key ? 'key: none yet (made the first time the server starts with federation on)'
+      : !key.readable ? `key: stored, but it does not open under ${env.MATRON_TOKEN_KEY ? 'this' : 'a missing'} MATRON_TOKEN_KEY`
+      : `key: ${key.pub}\nfingerprint: ${formatFingerprint(key.fingerprint)}${key.createdAt ? `\nmade: ${new Date(key.createdAt).toISOString()}` : ''}`
+    return [`federation: ${switchLine}`, keyLine].join('\n')
   }
   if (a === 'two-factor' && b === 'require') {
     const value = argv[2]
