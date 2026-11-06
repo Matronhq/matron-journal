@@ -5090,8 +5090,10 @@ contacts and share missions and rooms as users on one journal do. A user's
 address across journals is `name@host`, where `host` names their journal.
 Journals talk directly over HTTPS, and every request is a signed envelope.
 This section grows as each part ships. So far it covers the journal's
-identity (`src/federation-identity.js`) and the envelope format
-(`src/federation-envelope.js`).
+identity (`src/federation-identity.js`), the envelope format
+(`src/federation-envelope.js`), the endpoint that receives envelopes
+(`src/federation-inbound.js`) and the rules for calling another journal
+(`src/federation-client.js`). Only `ping` exists so far.
 
 ### Journal identity
 
@@ -5175,6 +5177,71 @@ a repeat of an op from a reused `id` by SHA-256 of the JCS form of
 base64url (43 characters). Its fingerprint is the first 128 bits of SHA-256
 of those raw bytes in lower-case base32 (26 characters). People compare it
 in groups of four.
+
+### Receiving an op
+
+```
+POST /federation/v1      body: one envelope
+```
+
+The body is read as bytes (at most 1 MiB) and parsed strictly. Then:
+
+1. `to` must name a user of this journal, on this journal's host.
+2. `from`'s host must be a journal this one knows (`fed_peers`, `active`),
+   and the key pinned for that journal must verify `sig`.
+3. The attempt must be fresh.
+4. **Receipts.** In one transaction, the journal looks up a receipt for
+   (the peer's key, `id`). If one exists with the same SHA-256 of
+   `{op, body}`, the stored answer is returned and nothing is applied
+   again. If the hash differs, the answer is `409 id_reused`. With no
+   receipt, the op applies and its receipt is written in the same
+   transaction. Receipts are kept for 30 days, the receiver's whole replay
+   memory.
+
+A refusal writes no receipt, so a resend of the same op is judged again
+against the state at that time.
+
+| Status | `error` | Retry? |
+|---|---|---|
+| 200 | — `{ok: true, result}` | done |
+| 400 | `malformed`, `unsupported_version`, `unknown_op` | no |
+| 401 | `stale`, with `clock` (the receiver's ms) | yes, with a fresh `ts` |
+| 403 | `not_here`, `unknown_journal`, `peer_refused`, `bad_signature`, or the op's own refusal | no |
+| 404 | `not_found`: federation is off here | no |
+| 405 | only `POST` | no |
+| 409 | `id_reused` | no |
+| 413 | `too_large` | no |
+
+**Signed answers.** Every answer from step 1 on carries
+`matron-federation-sig`: Ed25519 by the receiving journal over the ASCII
+bytes `matron-federation-v1-response\n`, followed by the JCS form of
+`{id, status, body}`, where `id` is the op's id. A sender counts only a
+signed answer as an acknowledgement. An unsigned one (a proxy's error page,
+say) is judged by its status alone.
+
+`ping` (`body: {}`) answers `{pong: true, clock}`.
+
+### Calling another journal
+
+Every request a journal makes to another journal follows these rules:
+
+- `https` only, and no credentials in the URL.
+- The host is resolved once per request, and every address it resolves to
+  must be public. Refused: loopback, private (10/8, 172.16/12,
+  192.168/16), link-local and metadata (169.254/16, fe80::/10), CGNAT
+  (100.64/10), ULA (fc00::/7), multicast, documentation, benchmarking and
+  reserved ranges, and IPv4 written inside IPv6 (mapped, NAT64, 6to4).
+  `MATRON_FEDERATION_ALLOW_HOSTS` (comma-separated host names or
+  addresses) lets the operator allow a peer on a LAN or tailnet.
+- The connection goes to the checked address, while TLS still verifies
+  the certificate against the host name. A DNS answer that changes between
+  the check and the connect cannot redirect it.
+- Redirects are not followed.
+- 10 s to connect, 30 s in all. Response bodies are capped at 1 MiB.
+
+**A peer's well-known document** is accepted only if `journal` is the host
+it was fetched from, `base_url` is that host's origin, `key.alg` is
+`ed25519`, and `key.id` is the fingerprint of `key.pub`.
 
 ## Device privacy
 

@@ -676,6 +676,32 @@ CREATE TABLE IF NOT EXISTS journal_settings(
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+-- Federation (src/federation-inbound.js): the other journals this one
+-- knows, by host, with the key pinned for each. state 'active' accepts
+-- envelopes; 'blocked' (the operator's) and 'key_changed' (its well-known
+-- began serving another key) refuse them.
+CREATE TABLE IF NOT EXISTS fed_peers(
+  host        TEXT PRIMARY KEY,
+  base_url    TEXT NOT NULL,
+  key_pub     TEXT NOT NULL,
+  state       TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','blocked','key_changed')),
+  first_seen  INTEGER NOT NULL,
+  last_ok_at  INTEGER,
+  last_error  TEXT
+);
+-- One row per op a peer's envelope applied here: the receiver's whole replay
+-- memory (30 days). hash is SHA-256 of the JCS form of {op, body}; status
+-- and response are what was answered, returned again for a repeat.
+CREATE TABLE IF NOT EXISTS fed_receipts(
+  peer_key    TEXT NOT NULL,
+  id          TEXT NOT NULL,
+  hash        TEXT NOT NULL,
+  status      INTEGER NOT NULL,
+  response    TEXT NOT NULL,
+  created_at  INTEGER NOT NULL,
+  PRIMARY KEY(peer_key, id)
+);
+CREATE INDEX IF NOT EXISTS idx_fed_receipts_created ON fed_receipts(created_at);
 -- Agent-to-agent file transfers (src/transfers.js): one row per file a
 -- session sends into a room. Three axes: consent (the user's card), upload
 -- (the sender's chunks) and phase (where the file is in its life; every
