@@ -70,11 +70,49 @@ const readBytes = (req, maxBytes) => new Promise((resolve, reject) => {
 const hostOf = (address) => address.slice(address.indexOf('@') + 1)
 const nameOf = (address) => address.slice(0, address.indexOf('@'))
 
+// Abuse limits (docs/protocol.md "Federation": limits). Every request to
+// the federation routes takes a token from two buckets before any work that
+// costs more than parsing it: one for the journal its `from` names, and one
+// for all of federation together. `from` is not authenticated yet at that
+// point, so a caller can spread its requests over made-up hosts; the
+// shared bucket is what bounds those. 429 is retried by a well-behaved
+// sender's outbox, so a burst of real traffic is only slowed down.
+export const PEER_BURST = 60
+export const PEER_PER_SEC = 1
+export const GLOBAL_BURST = 600
+export const GLOBAL_PER_SEC = 20
+
+export function makeFederationLimiter({ peerBurst = PEER_BURST, peerPerSec = PEER_PER_SEC, globalBurst = GLOBAL_BURST, globalPerSec = GLOBAL_PER_SEC, now = Date.now } = {}) {
+  const buckets = new Map()
+  const fill = (b, burst, perSec, at) => {
+    b.tokens = Math.min(burst, b.tokens + ((at - b.at) / 1000) * perSec)
+    b.at = at
+  }
+  const global = { tokens: globalBurst, at: now() }
+  return {
+    // → true when the request may go ahead (a token was taken from both).
+    take(host) {
+      const at = now()
+      fill(global, globalBurst, globalPerSec, at)
+      if (buckets.size > 10_000) {
+        for (const [k, b] of buckets) { fill(b, peerBurst, peerPerSec, at); if (b.tokens >= peerBurst) buckets.delete(k) }
+      }
+      const b = buckets.get(host) ?? { tokens: peerBurst, at }
+      fill(b, peerBurst, peerPerSec, at)
+      if (b.tokens < 1 || global.tokens < 1) { buckets.set(host, b); return false }
+      b.tokens -= 1
+      global.tokens -= 1
+      buckets.set(host, b)
+      return true
+    },
+  }
+}
+
 export function pruneReceipts(db, now = Date.now()) {
   return db.prepare('DELETE FROM fed_receipts WHERE created_at < ?').run(now - RECEIPT_TTL_MS).changes
 }
 
-export function makeFederationHandler({ db, federation, ops = DEFAULT_OPS, client = null, now = Date.now, log = console }) {
+export function makeFederationHandler({ db, federation, ops = DEFAULT_OPS, client = null, limiter = makeFederationLimiter(), now = Date.now, log = console }) {
   const findPeer = db.prepare('SELECT host, key_pub, state FROM fed_peers WHERE host=?')
   const findUser = db.prepare('SELECT id FROM users WHERE name=?')
   const findReceipt = db.prepare('SELECT hash, status, response FROM fed_receipts WHERE peer_key=? AND id=?')
@@ -116,6 +154,8 @@ export function makeFederationHandler({ db, federation, ops = DEFAULT_OPS, clien
       return true
     }
     const { id } = envelope
+    // Unsigned: a refusal before any check is not this journal's word.
+    if (!limiter.take(hostOf(envelope.from))) { res.setHeader('retry-after', '1'); send(res, 429, { error: 'rate_limited' }); return true }
 
     if (hostOf(envelope.to) !== federation.host || !findUser.get(nameOf(envelope.to))) {
       send(res, 403, { error: 'not_here' }, id)

@@ -25,6 +25,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { parseEnvelope, signEnvelope, verifyEnvelope, importPublicKey, newOpId } from './federation-envelope.js'
+import { makeFederationLimiter } from './federation-inbound.js'
 import { journalAllowed } from './federation-identity.js'
 import { getGrantRaw } from './grants.js'
 import { userBlobBytes } from './db.js'
@@ -65,7 +66,7 @@ export function grantedBlob(db, g, blobId) {
 }
 
 // GET /federation/v1/media. → true when the path was ours.
-export function makeMediaHandler({ db, federation, now = Date.now, log = console }) {
+export function makeMediaHandler({ db, federation, limiter = makeFederationLimiter(), now = Date.now, log = console }) {
   const findPeer = db.prepare('SELECT host, key_pub, state FROM fed_peers WHERE host=?')
   const send = (res, status, body) => {
     const text = JSON.stringify(body)
@@ -82,6 +83,7 @@ export function makeMediaHandler({ db, federation, now = Date.now, log = console
       if (typeof raw !== 'string' || raw.length > HEADER_MAX) fail('malformed')
       envelope = parseEnvelope(Buffer.from(raw, 'base64url'))
     } catch { send(res, 400, { error: 'malformed' }); return true }
+    if (!limiter.take(hostOf(envelope.from))) { res.setHeader('retry-after', '1'); send(res, 429, { error: 'rate_limited' }); return true }
     if (envelope.op !== MEDIA_OP) { send(res, 400, { error: 'unknown_op' }); return true }
     const { grant, media } = envelope.body ?? {}
     if (typeof grant !== 'string' || !isMediaRef(media)) { send(res, 400, { error: 'malformed' }); return true }

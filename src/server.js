@@ -26,7 +26,7 @@ import { makeRpcBroker } from './rpc-broker.js'
 import { resolveWebDir, makeStaticHandler } from './static-http.js'
 import { makeWellKnown, parseList } from './well-known.js'
 import { loadFederation, makeFederationWellKnown } from './federation-identity.js'
-import { makeFederationHandler, pruneReceipts, DEFAULT_OPS } from './federation-inbound.js'
+import { makeFederationHandler, makeFederationLimiter, pruneReceipts, DEFAULT_OPS } from './federation-inbound.js'
 import { makeMediaHandler, makeReplicaMedia, purgeReplicaMedia } from './federation-media.js'
 import { makeContactFederation } from './federation-contacts.js'
 import { makeGrantFederation } from './federation-grants.js'
@@ -454,7 +454,7 @@ export function startServer({
   // Federation between journals (src/federation-identity.js): the test
   // seam, {federation, publicUrl}; env (MATRON_FEDERATION,
   // MATRON_PUBLIC_URL) otherwise. Off unless turned on.
-  federationEnv, federationOps, federationClient,
+  federationEnv, federationOps, federationClient, federationLimits,
   // Alertmanager webhook (src/alerts-http.js): {token, username}. The
   // option is the test seam; env otherwise. Off unless both are usable.
   alertWebhook,
@@ -632,13 +632,16 @@ export function startServer({
   const federationGrants = federation.enabled ? makeGrantFederation({ db, hub, pushPipeline, federation }) : null
   // POST /federation/v1 (src/federation-inbound.js): 404 while off.
   // `federationOps` is the test seam: extra ops, over the journal's own.
+  // One set of abuse limits for both federation routes (federationLimits
+  // is the test seam).
+  const federationLimiter = makeFederationLimiter(federationLimits ?? {})
   const handleFederationOps = makeFederationHandler({
-    db, federation, client: federationClientInUse,
+    db, federation, client: federationClientInUse, limiter: federationLimiter,
     ops: { ...DEFAULT_OPS, ...(federationContacts?.inbound ?? {}), ...(federationGrants?.inbound ?? {}), ...(federationOps ?? {}) },
   })
   // Attachments of read shares (src/federation-media.js): the owner's
   // signed pull, and the grantee's pull-through copy behind GET /media/:id.
-  const handleFederationMedia = makeMediaHandler({ db, federation })
+  const handleFederationMedia = makeMediaHandler({ db, federation, limiter: federationLimiter })
   const handleFederation = async (req, res, url) => (await handleFederationMedia(req, res, url)) || handleFederationOps(req, res, url)
   const federationMedia = federation.enabled
     ? makeReplicaMedia({ db, federation, client: federationClientInUse, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes, quotaBytes: resolvedMediaUserQuotaBytes })

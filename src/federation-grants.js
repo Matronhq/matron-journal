@@ -30,6 +30,10 @@ export const OFFER_OP = 'grant.offer'
 export const ANSWER_OP = 'grant.answer'
 export const REVOKE_OP = 'grant.revoke'
 export const INCOMING_STATES = ['pending', 'active', 'declined', 'revoked']
+// Offers from one contact waiting on the grantee's tap, at most: each one is
+// a card and a tracker item, so a journal past this is refused rather than
+// let fill the grantee's For you list.
+export const MAX_PENDING_OFFERS = 10
 
 const TITLE_CAP = 200
 const GRANT_REF = /^gr_[A-Za-z0-9_-]{1,64}$/
@@ -281,6 +285,8 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
           d.prepare('UPDATE fed_grants_in SET offer_sent=? WHERE id=?').run(sent, cur.id)
           return { state: cur.state }
         }
+        const waiting = d.prepare("SELECT COUNT(*) AS n FROM fed_grants_in WHERE user_id=? AND contact_id=? AND state='pending'").get(user.id, contact.id).n
+        if (waiting >= MAX_PENDING_OFFERS) fail('too_many_offers')
         const fields = [level, sanitizePeerText(mission.title, TITLE_CAP) || 'Untitled', mission.num,
           JSON.stringify({ milestones: count(preview?.milestones), items: count(preview?.items), comments: count(preview?.comments), attachments: count(preview?.attachments) }), sent]
         let id = cur?.id
@@ -302,7 +308,7 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
         audit(ctx, r.user_id, { event: 'grant.received', summary: `${plain(r.owner_address)} offered you mission "${titleOf(r.mission_title)}" to read`, contact: contactOf(db, r), grant: auditGrant(r), by: 'peer' })
         changed(ctx, r.user_id, { grant_id: r.id })
       },
-      errors: { malformed: 400, not_contact: 403, level_unavailable: 409 },
+      errors: { malformed: 400, not_contact: 403, level_unavailable: 409, too_many_offers: 409 },
     },
     // The owner's journal: the grantee's answer.
     [ANSWER_OP]: {
@@ -416,6 +422,7 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
     expired: 'could not be reached for 7 days', journal_not_allowed: 'is not one this journal federates with any more',
     peer_key_changed: 'changed its key', not_contact: 'no longer has you as a contact', not_pending: 'no longer has that offer open',
     level_unavailable: 'does not take that kind of share', peer_refused: 'does not accept messages from this journal',
+    too_many_offers: 'has too many of your offers waiting for an answer',
   }
   const why = (error) => REASONS[error] ?? 'refused it'
 
