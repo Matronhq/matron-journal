@@ -5599,6 +5599,18 @@ control characters, unknown enum values fall back (`kind` to `task` or
 kept, and anything over the caps above is cut. A page that is not
 well-formed is `400 malformed`.
 
+**Room.** The owner's journal decides what crosses, so the grantee's
+journal bounds what it keeps. An item record over twice the 192 KiB an
+owner's journal fits each item to is refused `413 too_large`. One share's
+copy, with the pages of a snapshot still loading, holds at most 64 MiB of
+text; an event that would take it past that is refused `413 replica_full`
+and changes nothing. A snapshot page with no room (either reason) gives
+that whole snapshot up: its staged pages are dropped, the copy stays as
+the last whole snapshot left it, and the page is answered `200 {ok,
+result: {refused: 'replica_full' | 'too_large'}}`, so the owner's journal
+sends no more of it. The owner is told either way that the copy over there
+may be behind.
+
 The copy gets ids of its own on the grantee's journal (`ms_…`, `it_…`,
 `ml_…`, `ic_…`), and the mission keeps its id across snapshots and across
 the share ending and being accepted again. It is served, once its first
@@ -5656,7 +5668,8 @@ updates of its item. Over 5,000 of a kind, the oldest goes, as a snapshot
 keeps the newest.
 
 A `mission.event` is checked on arrival like a snapshot page (`400
-malformed`, `409 not_active`). One that dies leaves the share standing;
+malformed`, `409 not_active`), and refused `413 too_large` or `413
+replica_full` when there is no room for it. One that dies leaves the share standing;
 the owner gets a notice ("Couldn't update mission #N for bob@b.example"),
 at most one a day per share, and the same when the outbox is too full to
 queue one.

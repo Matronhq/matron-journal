@@ -353,7 +353,9 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
         if (!r || r.state !== 'active') fail('not_active')
         const out = applySnapshotPage(d, r, envelope.body, now)
         if (out.done) pending.set(envelope, { ...out, row: r })
-        return {}
+        // Given up for want of room: acknowledged, so the owner's journal
+        // sends no more of it, and told so (outbound onAcked).
+        return out.refused ? { refused: out.refused } : {}
       },
       after({ envelope }) {
         const p = pending.get(envelope)
@@ -363,7 +365,7 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
           ...(p.done === 'changed' ? { what: 'snapshot' } : {}), owner: { user_id: 0, name: p.row.owner_address },
         })
       },
-      errors: { malformed: 400, not_contact: 403, not_active: 409 },
+      errors: { malformed: 400, not_contact: 403, not_active: 409, too_large: 413, replica_full: 413 },
     },
     // The grantee's journal: one record changed over there.
     [EVENT_OP]: {
@@ -381,7 +383,7 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
         if (!p) return
         sharedFrame(ctx, p.row.user_id, { event: 'mission_changed', mission_id: p.missionId, grant_id: p.row.id, what: p.kind, owner: { user_id: 0, name: p.row.owner_address } })
       },
-      errors: { malformed: 400, not_contact: 403, not_active: 409 },
+      errors: { malformed: 400, not_contact: 403, not_active: 409, too_large: 413, replica_full: 413 },
     },
     // Either side: the other one ended it.
     [REVOKE_OP]: {
@@ -423,6 +425,7 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
     peer_key_changed: 'changed its key', not_contact: 'no longer has you as a contact', not_pending: 'no longer has that offer open',
     level_unavailable: 'does not take that kind of share', peer_refused: 'does not accept messages from this journal',
     too_many_offers: 'has too many of your offers waiting for an answer',
+    replica_full: 'has no more room for its copy of this mission', too_large: 'refused a record too large to keep',
   }
   const why = (error) => REASONS[error] ?? 'refused it'
 
@@ -477,6 +480,22 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
       // The share stands, but their copy is not whole: the owner is told
       // once per snapshot. A share that ended over there meanwhile is not
       // news (its revoke is on the way).
+      // Taken but given up over there (no room for the copy): as a page
+      // that died, once per snapshot.
+      onAcked(d, entry, result) {
+        if (typeof result?.refused !== 'string') return undefined
+        const body = bodyOf(entry)
+        const g = getGrantRaw(d, body.grant)
+        if (!g || g.state !== 'active') return undefined
+        return () => {
+          const to = plain(`${g.grantee_name}@${g.grantee_journal}`)
+          fileNotice(ctx, {
+            userId: g.owner_user_id, title: `Couldn't send mission #${g.mission_num} to ${to}`,
+            body: `Their journal at ${g.grantee_journal} ${why(result.refused)}, so the copy of mission **#${g.mission_num} ${titleOf(g.mission_title)}** they read may be out of date or missing. The share itself stands.`,
+            idemKey: `fed-snapshot-dead:${g.id}:${body.snap}`,
+          })
+        }
+      },
       onDead(d, entry, { error }) {
         const body = bodyOf(entry)
         const g = getGrantRaw(d, body.grant)
