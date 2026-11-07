@@ -165,14 +165,20 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
   // each queued share gets a fresh snapshot of what its grantee view shows
   // now, which drops from the copy over there whatever it no longer shows.
   // Run at the start of every outbox pass. A full outbox keeps the row for
-  // the next pass.
+  // the next pass. A snapshot still queued for the share was read before the
+  // flag changed, so it is cancelled first: it would otherwise go out ahead
+  // of the fresh one (SNAPSHOT_OP's stillAllowed holds it back meanwhile).
   function resnapshot() {
     const rows = db.prepare('SELECT grant_id FROM fed_resnapshot ORDER BY queued_at LIMIT 50').all()
     for (const { grant_id: id } of rows) {
       const g = getGrantRaw(db, id)
       try {
         db.transaction(() => {
-          if (g && g.state === 'active') sendSnapshot(db, g, { from: `${g.owner_name}@${federation.host}`, to: `${g.grantee_name}@${g.grantee_journal}`, now: clock() })
+          if (g && g.state === 'active') {
+            db.prepare("UPDATE fed_outbox SET state='cancelled', ended_at=?, last_error='superseded' WHERE peer_host=? AND subject=? AND op=? AND state='queued'")
+              .run(clock(), g.grantee_journal, subjectOf(g.id), SNAPSHOT_OP)
+            sendSnapshot(db, g, { from: `${g.owner_name}@${federation.host}`, to: `${g.grantee_name}@${g.grantee_journal}`, now: clock() })
+          }
           db.prepare('DELETE FROM fed_resnapshot WHERE grant_id=?').run(id)
         })()
       } catch (err) {
@@ -488,9 +494,12 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
       },
     },
     [SNAPSHOT_OP]: {
+      // Nor while a private flag change waits to resnapshot the share: the
+      // page was read before it, and resnapshot() replaces it.
       stillAllowed(d, entry) {
         const g = getGrantRaw(d, bodyOf(entry).grant)
-        return !!g && g.state === 'active'
+        if (!g || g.state !== 'active') return false
+        return !d.prepare('SELECT 1 FROM fed_resnapshot WHERE grant_id=?').get(g.id)
       },
       // The share stands, but their copy is not whole: the owner is told
       // once per snapshot. A share that ended over there meanwhile is not

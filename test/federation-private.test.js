@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import { createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import { pinDevicePrivate, applyBridgePrivate } from '../src/db.js'
+import { getGrantRaw } from '../src/grants.js'
+import { sendSnapshot } from '../src/federation-replica.js'
 import { world, post, grantOf, incoming, offer } from './federation-world.js'
 
 // A box that turns private takes back what already crossed: each share to
@@ -80,4 +82,34 @@ test('when the mission\'s own box turns private the whole copy goes, and the sha
   pinDevicePrivate(w.a.db, origin, false)
   await w.settle()
   assert.equal((await bobMissions(w))[0].title, 'Garden Club')
+})
+
+test('a snapshot queued before the box turned private never goes out', async (t) => {
+  const { w, g, box } = await shared(t)
+  // A full snapshot read while the box was ordinary, still in the queue.
+  const raw = getGrantRaw(w.a.db, g.id)
+  sendSnapshot(w.a.db, raw, { from: `alice@a.example`, to: `${raw.grantee_name}@${raw.grantee_journal}`, now: Date.now() })
+  const stale = w.a.db.prepare("SELECT id FROM fed_outbox WHERE op='mission.snapshot' AND state='queued'").all().map((r) => r.id)
+  assert.ok(stale.length >= 1)
+  w.b.db.prepare('DELETE FROM fed_replica_items').run()
+  w.b.db.prepare('DELETE FROM fed_replica_milestones').run()
+  pinDevicePrivate(w.a.db, box.deviceId, true)
+  await w.settle()
+  for (const id of stale) assert.equal(w.a.db.prepare('SELECT state FROM fed_outbox WHERE id=?').get(id).state, 'cancelled')
+  assert.deepEqual(await bobItems(w), ['Tomatoes or beans?'])
+  assert.deepEqual(await bobMilestones(w), [])
+  assert.ok(!JSON.stringify(w.b.db.prepare('SELECT * FROM fed_replica_pages').all()).includes('From the shed'))
+})
+
+test('a snapshot page held back while a resnapshot waits', async (t) => {
+  const { w, g } = await shared(t)
+  const raw = getGrantRaw(w.a.db, g.id)
+  sendSnapshot(w.a.db, raw, { from: `alice@a.example`, to: `${raw.grantee_name}@${raw.grantee_journal}`, now: Date.now() })
+  // The flag changes mid-pass: the row is there, nothing has resnapshotted yet.
+  w.a.db.prepare('INSERT INTO fed_resnapshot(grant_id, queued_at) VALUES(?, ?)').run(g.id, Date.now())
+  const { stillAllowed } = w.a.federationGrants.outbound['mission.snapshot']
+  const entry = w.a.db.prepare("SELECT * FROM fed_outbox WHERE op='mission.snapshot' AND state='queued'").get()
+  assert.equal(stillAllowed(w.a.db, entry), false)
+  w.a.db.prepare('DELETE FROM fed_resnapshot').run()
+  assert.equal(stillAllowed(w.a.db, entry), true)
 })
