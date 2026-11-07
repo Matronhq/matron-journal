@@ -72,3 +72,39 @@ test('a contact journal cannot keep raising share cards: at most MAX_PENDING_OFF
   const cards = w.b.db.prepare("SELECT COUNT(*) AS n FROM items WHERE user_id=? AND consent='share' AND state='open'").get(w.users.bob.id).n
   assert.equal(cards, MAX_PENDING_OFFERS)
 })
+
+test('a peer\'s bucket is not drained by its envelopes replayed stale or sent to another journal', async (t) => {
+  const w = await world(t, { federationLimits: { peerBurst: 3 } })
+  const key = w.a.federation.key.privateKey
+  const env = (over = {}) => signEnvelope({ from: 'alice@a.example', to: 'bob@b.example', op: 'ping', id: newOpId(), body: {}, ...over }, key)
+  for (let i = 0; i < 10; i++) {
+    assert.equal((await raw(w.b, env({ ts: Date.now() - 3600_000 }))).status, 401, 'stale')
+    assert.equal((await raw(w.b, env({ to: 'carol@c.example' }))).status, 403, 'meant for another journal')
+  }
+  assert.equal((await raw(w.b, env())).status, 200, 'alice@a.example still has her bucket')
+})
+
+test('an attachment pull that meets the peer\'s limit waits once, then answers 503 peer_busy', async () => {
+  const { makeReplicaMedia } = await import('../src/federation-media.js')
+  const s = await startTestServer({ tokenKey: KEY, federationEnv: { federation: 'on', publicUrl: 'https://b.example' } })
+  try {
+    const u = await createUser(s.db, 'bob', 'pw')
+    const d = s.db
+    d.prepare("INSERT INTO fed_peers(host, base_url, key_pub, state, first_seen) VALUES('a.example','https://a.example',?,'active',0)").run(s.federation.key.pub)
+    d.prepare(`INSERT INTO contacts(id,user_id,peer_user,peer_journal,peer_journal_key,peer_user_id,display_name,state,requested_by,created_at,updated_at)
+      VALUES('ct_1',?,'alice','a.example',?,NULL,'alice','active',NULL,0,0)`).run(u.id, s.federation.key.pub)
+    d.prepare(`INSERT INTO fed_grants_in(id,user_id,contact_id,peer_host,peer_grant_ref,owner_name,level,mission_title,mission_num,state,created_at,updated_at)
+      VALUES('fg_1',?,'ct_1','a.example','gr_1','alice','read','M',1,'active',0,0)`).run(u.id)
+    const id = 'ab'.repeat(16)
+    d.prepare("INSERT INTO fed_media(id, fg_id, user_id, ref, mime, size, sha256, created_at) VALUES(?, 'fg_1', ?, 'blob1', 'image/png', 3, ?, 0)").run(id, u.id, 'c'.repeat(64))
+    d.prepare(`INSERT INTO fed_replica_items(id, fg_id, user_id, ref, num, kind, state, title, body, created_at, updated_at, labels, links, comment_count, comments, attachments)
+      VALUES('it_1','fg_1',?,'it_r',1,'task','open','t','',0,0,'[]','[]',0,'[]',?)`).run(u.id, JSON.stringify([{ blob_ref: id }]))
+    let calls = 0
+    const client = { request: async () => { calls++; return { status: 429, headers: { 'retry-after': '0' }, body: Buffer.alloc(0) } } }
+    const media = makeReplicaMedia({ db: d, federation: s.federation, client, mediaDir: '/nonexistent', mediaMaxBytes: 1e6 })
+    let status = null
+    const res = { writeHead(st) { status = st }, end() {} }
+    assert.equal(await media.serve({}, res, { userId: u.id }, id), true)
+    assert.deepEqual([status, calls], [503, 2])
+  } finally { await s.close() }
+})

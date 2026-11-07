@@ -94,15 +94,21 @@ export function makeFederationLimiter({ peerBurst = PEER_BURST, peerPerSec = PEE
     return true
   }
   const strangers = { tokens: strangerBurst, at: now() }
+  let swept = 0
   return {
-    // A peer that proved its key. → true when the request may go ahead.
-    take(host) {
+    // A peer that proved its key (`key` its host, or a route's own bucket
+    // for it). → true when the request may go ahead.
+    take(key) {
       const at = now()
-      if (buckets.size > 10_000) {
+      // Full buckets are the same as no bucket: dropped, at most once a
+      // second, so a map of many part-drained ones is not walked on every
+      // request.
+      if (buckets.size > 10_000 && at - swept >= 1000) {
+        swept = at
         for (const [k, b] of buckets) if (b.tokens + ((at - b.at) / 1000) * peerPerSec >= peerBurst) buckets.delete(k)
       }
-      const b = buckets.get(host) ?? { tokens: peerBurst, at }
-      buckets.set(host, b)
+      const b = buckets.get(key) ?? { tokens: peerBurst, at }
+      buckets.set(key, b)
       return draw(b, peerBurst, peerPerSec, at)
     },
     // Anyone else.
@@ -175,17 +181,20 @@ export function makeFederationHandler({ db, federation, ops = DEFAULT_OPS, clien
         // answer from a journal whose key changed: discovery decides.
       }
     }
-    // Limits. A journal that proved its key draws on its own bucket; every
-    // other caller shares one, so naming a peer's host drains nothing of
-    // that peer's. Unsigned: refused before any of this journal's checks.
-    if (!(peer || stale ? limiter.take(host) : limiter.takeStranger())) {
+    // Limits. A journal that proved its key, with a fresh envelope meant
+    // for this journal, draws on its own bucket; every other caller shares
+    // one. So neither naming a peer's host nor replaying an envelope the
+    // peer sent elsewhere (stale, or to another journal) drains anything
+    // of that peer's. Unsigned: refused before any of this journal's checks.
+    const ours = hostOf(envelope.to) === federation.host
+    if (!(peer && ours ? limiter.take(host) : limiter.takeStranger())) {
       res.setHeader('retry-after', '1')
       send(res, 429, { error: 'rate_limited' })
       return true
     }
     if (stale) { send(res, 401, { error: 'stale', clock: stale.clock }, id); return true }
 
-    if (hostOf(envelope.to) !== federation.host) { send(res, 403, { error: 'not_here' }, id); return true }
+    if (!ours) { send(res, 403, { error: 'not_here' }, id); return true }
     if (!listed) { send(res, 403, { error: 'peer_refused' }, id); return true }
     const handler = Object.hasOwn(ops, envelope.op) ? ops[envelope.op] : null
     if (known?.state === 'blocked') { send(res, 403, { error: 'peer_refused' }, id); return true }
