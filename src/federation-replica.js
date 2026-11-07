@@ -40,6 +40,15 @@ export const ITEM_BYTES = 192 * 1024
 export const MAX_RECORDS = 5000
 const MAX_PAGES = 1000
 const MAX_COMMENTS = 1000
+// What one share's copy may hold here, its staged snapshot pages included,
+// in bytes of stored text: the owner's journal decides what crosses, so
+// without this one accepted share could fill this journal's disk. Past it
+// a page or event is refused `replica_full` and the owner is told the copy
+// may be behind.
+export const REPLICA_BYTES_MAX = 64 * 1024 * 1024
+// One item record as it arrives: the owner's journal fits each to
+// ITEM_BYTES; twice that leaves room for its other fields.
+export const ITEM_RECORD_MAX = 2 * ITEM_BYTES
 
 const TITLE_CAP = 200
 const NAME_CAP = 40
@@ -292,6 +301,7 @@ function readLinks(v) {
 
 function readItem(i) {
   if (!i || typeof i !== 'object' || typeof i.ref !== 'string' || !IT_REF.test(i.ref)) fail('malformed')
+  if (bytes(i) > ITEM_RECORD_MAX) fail('too_large')
   const comments = Array.isArray(i.comments) ? i.comments.slice(-MAX_COMMENTS).map(readComment) : []
   const c = contributor(i.contributor)
   return {
@@ -345,9 +355,20 @@ function putItem(d, incoming, i, snap) {
 
 const SNAP = /^sn_[A-Za-z0-9_-]{1,64}$/
 
+// The bytes of text a share's copy holds here: its records, and the pages of
+// a snapshot still loading.
+export function replicaBytes(d, fgId) {
+  return d.prepare(`SELECT
+      COALESCE((SELECT SUM(LENGTH(CAST(title AS BLOB)) + COALESCE(LENGTH(CAST(body AS BLOB)), 0)) FROM fed_replica_milestones WHERE fg_id = @fg), 0)
+    + COALESCE((SELECT SUM(LENGTH(CAST(title AS BLOB)) + LENGTH(CAST(body AS BLOB)) + LENGTH(CAST(labels AS BLOB)) + LENGTH(CAST(links AS BLOB))
+        + LENGTH(CAST(comments AS BLOB)) + LENGTH(CAST(attachments AS BLOB))) FROM fed_replica_items WHERE fg_id = @fg), 0)
+    + COALESCE((SELECT SUM(LENGTH(CAST(body AS BLOB))) FROM fed_replica_pages WHERE fg_id = @fg), 0) AS n`).get({ fg: fgId }).n
+}
+const withinBudget = (d, fgId, max) => { if (replicaBytes(d, fgId) > max) fail('replica_full') }
+
 // One page, inside the inbound transaction. `incoming` the grantee's live
 // fed_grants_in row. → {done: 'added'|'changed'|null, missionId}
-export function applySnapshotPage(d, incoming, body, now) {
+export function applySnapshotPage(d, incoming, body, now, { maxBytes = REPLICA_BYTES_MAX } = {}) {
   const { snap, page, pages } = body
   if (typeof snap !== 'string' || !SNAP.test(snap) || !Number.isSafeInteger(pages) || pages < 1 || pages > MAX_PAGES
     || !Number.isSafeInteger(page) || page < 0 || page >= pages) fail('malformed')
@@ -376,6 +397,7 @@ export function applySnapshotPage(d, incoming, body, now) {
   if (page < pages - 1) {
     d.prepare('INSERT INTO fed_replica_pages(fg_id, snap, page, body, received_at) VALUES(?,?,?,?,?)')
       .run(incoming.id, snap, page, JSON.stringify({ mission, milestones, items }), now)
+    withinBudget(d, incoming.id, maxBytes)
     return { done: null, missionId: repId() }
   }
   // The last page: apply the whole snapshot.
@@ -402,6 +424,7 @@ export function applySnapshotPage(d, incoming, body, now) {
   // Whatever this snapshot did not carry is gone.
   d.prepare('DELETE FROM fed_replica_milestones WHERE fg_id=? AND seen_snap IS NOT ?').run(incoming.id, snap)
   d.prepare('DELETE FROM fed_replica_items WHERE fg_id=? AND seen_snap IS NOT ?').run(incoming.id, snap)
+  withinBudget(d, incoming.id, maxBytes)
   return { done: rep?.complete ? 'changed' : 'added', missionId: id }
 }
 
@@ -410,7 +433,7 @@ export function applySnapshotPage(d, incoming, body, now) {
 // dropped, and the next snapshot carries its record anyway. After a later
 // snapshot was given up on, events apply to the last whole one: each is a
 // record's whole state, so the copy only moves forward. → {kind, missionId} when it changed the copy, else null.
-export function applyEvent(d, incoming, body) {
+export function applyEvent(d, incoming, body, { maxBytes = REPLICA_BYTES_MAX } = {}) {
   const { kind, ref = null, record, sent } = body
   if (!EVENT_KINDS.includes(kind) || record === undefined || !Number.isSafeInteger(sent)) fail('malformed')
   if (kind === 'milestone' && (typeof ref !== 'string' || !MS_REF.test(ref) || record === null)) fail('malformed')
@@ -437,6 +460,7 @@ export function applyEvent(d, incoming, body) {
   } else {
     d.prepare('DELETE FROM fed_replica_items WHERE fg_id=? AND ref=?').run(incoming.id, ref)
   }
+  if (r) withinBudget(d, incoming.id, maxBytes)
   return { kind, missionId: rep.id }
 }
 
