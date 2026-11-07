@@ -120,7 +120,8 @@ export function parseInviteLink(link) {
   const token = String(p.get('t') ?? '')
   const fingerprint = String(p.get('fp') ?? '').toLowerCase()
   if (!isAddress(`${user}@${host}`) || !TOKEN_RE.test(token) || !FP_RE.test(fingerprint)) return null
-  if (u.protocol === 'https:' && u.host !== host) return null
+  // As a URL writes it: an explicit default port (`:443`) is dropped.
+  if (u.protocol === 'https:' && u.host !== new URL(`https://${host}`).host) return null
   return { host, user, token, fingerprint }
 }
 

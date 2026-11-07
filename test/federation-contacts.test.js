@@ -96,6 +96,8 @@ test('links: the https form carries the same fields in its fragment, on the jour
   assert.deepEqual(parseInviteLink(link), good)
   assert.deepEqual(parseInviteLink(inviteWebLink({ ...good, host: 'a.example' })), { ...good, host: 'a.example' })
   assert.deepEqual(parseInviteLink(link.replace('https://a.example', 'https://A.EXAMPLE')), good, 'the host is case-blind')
+  const p443 = { ...good, host: 'a.example:443' }
+  assert.deepEqual(parseInviteLink(inviteWebLink(p443)), p443, 'a default port in j is the URL\'s own host')
   for (const bad of [
     link.replace('https:', 'http:'), link.replace('https://a.example:8443', 'https://b.example:8443'), link.replace(':8443/', '/'),
     link.replace('/contact#', '/contact/#'), link.replace('/contact#', '/other#'), link.replace('/contact#', '/contact?x=1#'),

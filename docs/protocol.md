@@ -5396,17 +5396,20 @@ journal key fingerprint (26 characters, base32). A link with any other
 field, or one twice, is refused. So is an https link anywhere but
 `/contact`, with a query, user info, or a host that is not `j`.
 
-**`GET /contact`** on the inviter's journal is the page an https link opens
+**`GET /contact`** on the inviter's journal is the page that an https link opens
 where no Matron app claims it. It is the same static page for every invite,
 served only while federation is on (`404` otherwise), `cache-control:
 no-store`, `referrer-policy: no-referrer`, not frameable, under a CSP that
 allows only its own inline script and style. Its script reads the fragment
 in the browser and, if the link is well-formed and names this journal,
-shows who is asking and the fingerprint, with **Open in Matron** (the
+it shows who is asking and the fingerprint, with **Open in Matron** (the
 `matron://` form, built from the checked fields, only on a tap), **Copy
 link**, and how to paste it in. It makes no request and links nowhere
 else. The app-link files claim `/contact` too, so an installed app opens
-the https link directly.
+the https link directly, where the journal serves them
+(`MATRON_APPLE_APP_IDS`, `MATRON_ANDROID_PACKAGE` and
+`MATRON_ANDROID_CERT_SHA256`, below) and the app declares that host.
+Without them the link opens this page, and **Open in Matron** hands it on.
 
 ```
 POST   /contacts/invites                 201 {invite, link, web_link} — the link is returned this once, in both forms

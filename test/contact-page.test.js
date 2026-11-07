@@ -10,6 +10,8 @@ import { startTestServer } from './helpers.js'
 const KEY = 'd'.repeat(64)
 const on = () => startTestServer({ tokenKey: KEY, federationEnv: { federation: 'on', publicUrl: 'https://a.example' } })
 const sha = (s) => `'sha256-${createHash('sha256').update(s).digest('base64')}'`
+// The text between the page's own (one, lower-case) tags.
+const between = (html, tag) => html.slice(html.indexOf(`<${tag}>`) + tag.length + 2, html.indexOf(`</${tag}>`))
 
 test('the contact page is static, cache-free, referrer-free and runs only its own script', async (t) => {
   const s = await on()
@@ -24,8 +26,8 @@ test('the contact page is static, cache-free, referrer-free and runs only its ow
   assert.match(csp, /^default-src 'none'; /)
   assert.match(csp, /frame-ancestors 'none'/)
   const html = await r.text()
-  const script = html.match(/<script>([\s\S]*?)<\/script>/)[1]
-  const style = html.match(/<style>([\s\S]*?)<\/style>/)[1]
+  const script = between(html, 'script')
+  const style = between(html, 'style')
   assert.ok(csp.includes(`script-src ${sha(script)};`), 'the inline script is allowed by its hash')
   assert.ok(csp.includes(`style-src ${sha(style)};`))
   assert.equal((html.match(/<script/g) ?? []).length, 1)
@@ -51,14 +53,16 @@ test('the contact page is not there while federation is off', async (t) => {
 // fields; anything else shows only "incomplete".
 async function run(s, href) {
   const html = await (await fetch(`${s.base}/contact`)).text()
-  const script = html.match(/<script>([\s\S]*?)<\/script>/)[1]
+  const script = between(html, 'script')
   const els = {}
   const el = (id) => (els[id] ??= { id, hidden: id === 'bad' || id === 'copied', textContent: '', handlers: {}, addEventListener(e, f) { this.handlers[e] = f } })
   const u = new URL(href)
   const location = { href, host: u.host, hash: u.hash }
+  const copied = []
+  const navigator = { clipboard: { writeText: (x) => { copied.push(x); return Promise.resolve() } } }
   const { runInNewContext } = await import('node:vm')
-  runInNewContext(script, { document: { getElementById: el }, location, URLSearchParams, navigator: {} })
-  return { els, location }
+  runInNewContext(script, { document: { getElementById: el }, location, URLSearchParams, navigator })
+  return { els, location, copied }
 }
 
 test('the page reads the fragment and builds the app link only from checked fields', async (t) => {
@@ -66,7 +70,9 @@ test('the page reads the fragment and builds the app link only from checked fiel
   t.after(() => s.close())
   const TOKEN = 'A'.repeat(43), FP = 'a'.repeat(26)
   const good = `https://a.example/contact#v=1&j=a.example&u=alice&t=${TOKEN}&fp=${FP}`
-  const { els, location } = await run(s, good)
+  const { els, location, copied } = await run(s, good.replace('https://a.example/contact#', 'https://eve@a.example/contact?x=1#'))
+  els.copy.handlers.click()
+  assert.deepEqual(copied, [good], 'Copy gives the clean link, not the address bar')
   assert.equal(els.bad, undefined, 'the incomplete notice is never touched')
   assert.equal(els.who.textContent, 'alice@a.example')
   assert.equal(els.fp.textContent, 'aaaa aaaa aaaa aaaa aaaa aaaa aa')

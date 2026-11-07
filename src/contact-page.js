@@ -49,11 +49,15 @@ const SCRIPT = `
   el('who').textContent = u + '@' + j;
   el('journal').textContent = j;
   el('fp').textContent = fp.match(/.{1,4}/g).join(' ');
-  var app = 'matron://contact?' + new URLSearchParams({ v: '1', j: j, u: u, t: t, fp: fp }).toString();
+  var fields = new URLSearchParams({ v: '1', j: j, u: u, t: t, fp: fp }).toString();
+  var app = 'matron://contact?' + fields;
+  // What Copy hands over is the link rebuilt from the checked fields, not the
+  // address bar, which may carry a query or user info the apps refuse.
+  var link = 'https://' + j + '/contact#' + fields;
   el('open').addEventListener('click', function () { location.href = app; });
   el('copy').addEventListener('click', function () {
     var done = function () { el('copied').hidden = false; };
-    if (navigator.clipboard) navigator.clipboard.writeText(location.href).then(done, function () {});
+    if (navigator.clipboard) navigator.clipboard.writeText(link).then(done, function () {});
   });
 })();
 `
