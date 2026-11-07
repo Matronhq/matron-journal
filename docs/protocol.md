@@ -4410,7 +4410,7 @@ The app-link files are served unauthenticated from env and are
 
 | Route | Env | Body |
 |---|---|---|
-| `GET /.well-known/apple-app-site-association` | `MATRON_APPLE_APP_IDS` (comma-separated `TEAMID.bundle.id`) | `{applinks:{details:[{appIDs, components:[{"/":"/u/*", comment:"Matron tracker links"}]}]}}` |
+| `GET /.well-known/apple-app-site-association` | `MATRON_APPLE_APP_IDS` (comma-separated `TEAMID.bundle.id`) | `{applinks:{details:[{appIDs, components:[{"/":"/u/*", comment:"Matron tracker links"}, {"/":"/contact", comment:"Matron contact invites"}]}]}}` |
 | `GET /.well-known/assetlinks.json` | `MATRON_ANDROID_PACKAGE` and `MATRON_ANDROID_CERT_SHA256` (comma-separated colon-hex fingerprints; both required together) | `[{relation:["delegate_permission/common.handle_all_urls"], target:{namespace:"android_app", package_name, sha256_cert_fingerprints}}]` |
 
 Malformed values refuse to start the journal, naming the variable.
@@ -5381,15 +5381,38 @@ Only an invite link makes a contact on another journal. Nobody can ask an
 address they typed: an invite is a capability its owner chose to hand out.
 
 ```
+https://<journal host>/contact#v=1&j=<journal host>&u=<inviter's name>&t=<token>&fp=<journal fingerprint>
 matron://contact?v=1&j=<journal host>&u=<inviter's name>&t=<token>&fp=<journal fingerprint>
 ```
 
+Both forms carry the same fields and open the same invite. The https form
+(`web_link`) is the one to share: chat apps and mail make it tappable. Its
+fields are all in the fragment, so the token never reaches a server or its
+logs, and its host must be `j`. The `matron://` form (`link`) is what apps
+from before the https form share; every journal and app accepts both.
+
 `t` is 256 random bits (base64url, 43 characters). `fp` is the inviter's
 journal key fingerprint (26 characters, base32). A link with any other
-field, or one twice, is refused.
+field, or one twice, is refused. So is an https link anywhere but
+`/contact`, with a query, user info, or a host that is not `j`.
+
+**`GET /contact`** on the inviter's journal is the page that an https link opens
+where no Matron app claims it. It is the same static page for every invite,
+served only while federation is on (`404` otherwise), `cache-control:
+no-store`, `referrer-policy: no-referrer`, not frameable, under a CSP that
+allows only its own inline script and style. Its script reads the fragment
+in the browser and, if the link is well-formed and names this journal,
+it shows who is asking and the fingerprint, with **Open in Matron** (the
+`matron://` form, built from the checked fields, only on a tap), **Copy
+link**, and how to paste it in. It makes no request and links nowhere
+else. The app-link files claim `/contact` too, so an installed app opens
+the https link directly, where the journal serves them
+(`MATRON_APPLE_APP_IDS`, `MATRON_ANDROID_PACKAGE` and
+`MATRON_ANDROID_CERT_SHA256`, below) and the app declares that host.
+Without them the link opens this page, and **Open in Matron** hands it on.
 
 ```
-POST   /contacts/invites                 201 {invite, link} — the link is returned this once
+POST   /contacts/invites                 201 {invite, link, web_link} — the link is returned this once, in both forms
 GET    /contacts/invites                 {invites:[invite]} — the last 30 days, newest first
 DELETE /contacts/invites/:id             {invite} — withdraw an open invite
 POST   /contacts/invites/open {link}     {inviter:{address, name, journal, fingerprint}, key_changed, contact}
@@ -5405,7 +5428,7 @@ While federation is off they answer `409 blocked_by: federation_off`.
 
 ```
 POST   /contacts/invites {convo_id}                 (agent) 202 {ask, pending:'user'}
-POST   /contacts/invites/asks/:id/answer {decision}  (client) {ask, invite?, link?}
+POST   /contacts/invites/asks/:id/answer {decision}  (client) {ask, invite?, link?, web_link?}
 ```
 
 `ask`: `{id, state: awaiting_user|approved|declined|expired, invite_id,
@@ -5413,7 +5436,7 @@ origin_convo_id, created_at, updated_at}`. Nothing is minted by asking.
 The user gets a card (`permission_request`, kind `contact_invite`,
 client-only) in the asking conversation and its tracker mirror (consent
 `invite`, Approve / Decline). The answer route and a tap on the mirror do
-the same: `approve` mints the invite and returns `{invite, link}` in that
+the same: `approve` mints the invite and returns `{invite, link, web_link}` in that
 answer, to the device that tapped, this once; the link is written to no
 event, item or comment, so no agent can read it. `decline` mints nothing.
 An ask unanswered for 24 h expires and its mirror closes as cancelled.

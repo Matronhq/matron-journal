@@ -26,6 +26,7 @@ import { makeRpcBroker } from './rpc-broker.js'
 import { resolveWebDir, makeStaticHandler } from './static-http.js'
 import { makeWellKnown, parseList } from './well-known.js'
 import { loadFederation, makeFederationWellKnown } from './federation-identity.js'
+import { makeContactPage } from './contact-page.js'
 import { makeFederationHandler, makeFederationLimiter, pruneReceipts, DEFAULT_OPS } from './federation-inbound.js'
 import { makeMediaHandler, makeReplicaMedia, purgeReplicaMedia } from './federation-media.js'
 import { makeContactFederation } from './federation-contacts.js'
@@ -620,7 +621,8 @@ export function startServer({
     allowJournals: process.env.MATRON_FEDERATION_ALLOW_JOURNALS, denyJournals: process.env.MATRON_FEDERATION_DENY_JOURNALS,
   })
   const handleFederationWellKnown = makeFederationWellKnown(federation)
-  const handleWellKnown = (req, res, url) => handleFederationWellKnown(req, res, url) || handleAppWellKnown(req, res, url)
+  const handleContactPage = makeContactPage(federation)
+  const handleWellKnown = (req, res, url) => handleFederationWellKnown(req, res, url) || handleContactPage(req, res, url) || handleAppWellKnown(req, res, url)
   // The outbound client (src/federation-client.js): `federationClient` is
   // its test seam. Contacts across journals (src/federation-contacts.js)
   // register their ops with both ends.
