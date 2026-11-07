@@ -104,6 +104,7 @@ test('links: the https form carries the same fields in its fragment, on the jour
     link.replace('/contact#', `/contact?${new URL(link).hash.slice(1)}#`), link.split('#')[0], `${link}&x=1`,
     link.replace('https://', 'https://eve@'), link.replace('v=1', 'v=2'), link.replace(`t=${TOKEN}`, 't=short'),
     `matron://contact#${new URL(link).hash.slice(1)}`, `${inviteLink(good)}#v=1`,
+    link.replace('j=a.example%3A8443', 'j=a.example%3A99999'),
   ]) assert.equal(parseInviteLink(bad), null, String(bad))
 })
 
