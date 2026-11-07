@@ -353,7 +353,9 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
         if (!r || r.state !== 'active') fail('not_active')
         const out = applySnapshotPage(d, r, envelope.body, now)
         if (out.done) pending.set(envelope, { ...out, row: r })
-        return {}
+        // Given up for want of room: acknowledged, so the owner's journal
+        // sends no more of it, and told so (outbound onAcked).
+        return out.refused ? { refused: out.refused } : {}
       },
       after({ envelope }) {
         const p = pending.get(envelope)
@@ -478,6 +480,22 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
       // The share stands, but their copy is not whole: the owner is told
       // once per snapshot. A share that ended over there meanwhile is not
       // news (its revoke is on the way).
+      // Taken but given up over there (no room for the copy): as a page
+      // that died, once per snapshot.
+      onAcked(d, entry, result) {
+        if (typeof result?.refused !== 'string') return undefined
+        const body = bodyOf(entry)
+        const g = getGrantRaw(d, body.grant)
+        if (!g || g.state !== 'active') return undefined
+        return () => {
+          const to = plain(`${g.grantee_name}@${g.grantee_journal}`)
+          fileNotice(ctx, {
+            userId: g.owner_user_id, title: `Couldn't send mission #${g.mission_num} to ${to}`,
+            body: `Their journal at ${g.grantee_journal} ${why(result.refused)}, so the copy of mission **#${g.mission_num} ${titleOf(g.mission_title)}** they read may be out of date or missing. The share itself stands.`,
+            idemKey: `fed-snapshot-dead:${g.id}:${body.snap}`,
+          })
+        }
+      },
       onDead(d, entry, { error }) {
         const body = bodyOf(entry)
         const g = getGrantRaw(d, body.grant)

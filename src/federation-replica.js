@@ -367,8 +367,25 @@ export function replicaBytes(d, fgId) {
 const withinBudget = (d, fgId, max) => { if (replicaBytes(d, fgId) > max) fail('replica_full') }
 
 // One page, inside the inbound transaction. `incoming` the grantee's live
-// fed_grants_in row. → {done: 'added'|'changed'|null, missionId}
-export function applySnapshotPage(d, incoming, body, now, { maxBytes = REPLICA_BYTES_MAX } = {}) {
+// fed_grants_in row. → {done: 'added'|'changed'|null, missionId, refused?}
+//
+// A page this journal has no room for (`replica_full`, `too_large`) gives
+// the whole snapshot up: its staged pages go, the copy stays as the last
+// whole snapshot left it, and the answer says `refused` rather than
+// failing, so that giving up commits (a refusal would roll it back and
+// leave the earlier pages waiting on a last page that never comes).
+export function applySnapshotPage(d, incoming, body, now, opts = {}) {
+  try {
+    // Nested: a savepoint inside the inbound transaction.
+    return d.transaction(() => applyPage(d, incoming, body, now, opts))()
+  } catch (err) {
+    if (err.message !== 'replica_full' && err.message !== 'too_large') throw err
+    d.prepare('DELETE FROM fed_replica_pages WHERE fg_id=?').run(incoming.id)
+    return { done: null, missionId: d.prepare('SELECT id FROM fed_replica_missions WHERE fg_id=?').get(incoming.id)?.id ?? null, refused: err.message }
+  }
+}
+
+function applyPage(d, incoming, body, now, { maxBytes = REPLICA_BYTES_MAX } = {}) {
   const { snap, page, pages } = body
   if (typeof snap !== 'string' || !SNAP.test(snap) || !Number.isSafeInteger(pages) || pages < 1 || pages > MAX_PAGES
     || !Number.isSafeInteger(page) || page < 0 || page >= pages) fail('malformed')
