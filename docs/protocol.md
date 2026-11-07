@@ -5562,7 +5562,7 @@ an accept, it sends the mission in the same transaction as
 ```
 
 `snap` (`sn_…`) names one snapshot, `pages` its page count (at most 1000),
-and `mission` is on page 0 only. Each page is at most 512 KiB. Every record
+and `mission` is on page 0 only (`null` there for a withheld snapshot, below). Each page is at most 512 KiB. Every record
 is its whole current state, built from the grantee view a contact on the
 owner's journal reads (the private-box and owner-only sieves, no consent
 mirrors, no conversation, device, box, seq or project), and only these
@@ -5671,6 +5671,28 @@ events apply to the last whole copy; each carries a record's whole state,
 so the copy only moves forward. A comment keeps its local id across
 updates of its item. Over 5,000 of a kind, the oldest goes, as a snapshot
 keeps the newest.
+
+**A box turns private.** When any device's private flag changes, either
+way (the bridge's hello, or `matron-admin device private` from another
+process), the owner's journal queues a fresh snapshot of every mission it
+shares with a contact on another journal. The outbox sends it at the
+start of its next pass (every few seconds). Records the grantee view no
+longer shows, such as items and milestones from a box that is now
+private, are then dropped from the copy over there. They come back with
+the next snapshot after the box is ordinary again.
+
+A mission the grant can no longer show at all, because its own origin
+box is now private, goes as a **withheld** snapshot: one page with
+`mission: null` and no records.
+
+```
+{grant, snap, page: 0, pages: 1, mission: null, milestones: [], items: []}
+```
+
+The grantee's journal drops the whole copy, records and all, and its
+apps get `mission_removed`. The share stays active, and the next whole
+snapshot brings the copy back under the same id. A withheld page with
+more than one page or with any record is `400 malformed`.
 
 A `mission.event` is checked on arrival like a snapshot page (`400
 malformed`, `409 not_active`), and refused `413 too_large` or `413

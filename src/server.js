@@ -648,7 +648,7 @@ export function startServer({
     : null
   // The outbox (src/federation-outbox.js): built only when federation is on.
   const federationOutbox = federation.enabled
-    ? makeOutbox({ db, hub, federation, client: federationClientInUse, ops: { ...federationContacts.outbound, ...federationGrants.outbound } })
+    ? makeOutbox({ db, hub, federation, client: federationClientInUse, ops: { ...federationContacts.outbound, ...federationGrants.outbound }, beforePass: () => federationGrants.resnapshot() })
     : null
   federationContacts?.setOutbox(federationOutbox)
   federationGrants?.setOutbox(federationOutbox)

@@ -170,10 +170,12 @@ export function snapshotPages(db, g, snap) {
 // Queues a snapshot of grant `g` to its grantee, inside the caller's
 // transaction, all its pages or none. Returns the number of pages, 0 when
 // there was nothing to send. Throws outbox_full like enqueue.
+// A mission the grant can no longer show (its origin box turned private)
+// goes as one page with `mission: null`: the copy over there is dropped,
+// and the share stands for when it can show it again.
 export function sendSnapshot(db, g, { from, to, now }) {
   const snap = newId('sn')
-  const pages = snapshotPages(db, g, snap)
-  if (!pages) return 0
+  const pages = snapshotPages(db, g, snap) ?? [{ grant: g.id, snap, page: 0, pages: 1, mission: null, milestones: [], items: [] }]
   db.transaction(() => {
     for (const body of pages) enqueue(db, { userId: g.owner_user_id, from, to, op: SNAPSHOT_OP, body, subject: `grant:${g.id}`, urgent: false, now })
   })()
@@ -393,10 +395,18 @@ function applyPage(d, incoming, body, now, { maxBytes = REPLICA_BYTES_MAX } = {}
   if (typeof snap !== 'string' || !SNAP.test(snap) || !Number.isSafeInteger(pages) || pages < 1 || pages > MAX_PAGES
     || !Number.isSafeInteger(page) || page < 0 || page >= pages) fail('malformed')
   if (!Array.isArray(body.milestones ?? []) || !Array.isArray(body.items ?? [])) fail('malformed')
+  const repId = () => d.prepare('SELECT id FROM fed_replica_missions WHERE fg_id=?').get(incoming.id)?.id ?? null
+  // Withheld: the owner's journal can no longer show this mission. The copy
+  // goes, records and all; the share stands.
+  if (page === 0 && body.mission === null) {
+    if (pages !== 1 || (body.milestones ?? []).length || (body.items ?? []).length) fail('malformed')
+    const rep = d.prepare('SELECT id, complete FROM fed_replica_missions WHERE fg_id=?').get(incoming.id)
+    for (const t of ['fed_replica_pages', 'fed_replica_items', 'fed_replica_milestones', 'fed_replica_missions']) d.prepare(`DELETE FROM ${t} WHERE fg_id=?`).run(incoming.id)
+    return { done: rep?.complete ? 'withheld' : null, missionId: rep?.id ?? null }
+  }
   const milestones = (body.milestones ?? []).map(readMilestone)
   const items = (body.items ?? []).map(readItem)
   const mission = page === 0 ? readMission(body.mission) : null
-  const repId = () => d.prepare('SELECT id FROM fed_replica_missions WHERE fg_id=?').get(incoming.id)?.id ?? null
   // Pages wait in fed_replica_pages, already read, until the last one is
   // in: only a whole snapshot touches the copy.
   if (page === 0) {

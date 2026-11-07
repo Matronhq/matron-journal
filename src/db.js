@@ -1069,6 +1069,24 @@ export function openDb(path) {
     BEGIN
       SELECT RAISE(ABORT, 'device id belongs to a revoked private device');
     END`)
+  // A device's private flag changed (the bridge's hello, or matron-admin
+  // from another process): what crossed to other journals may no longer be
+  // what their copies should show, either way. Every mission shared with a
+  // contact on another journal is queued for a fresh snapshot here, and the
+  // outbox's next pass sends it (federation-grants.js resnapshot), so a
+  // record from a box that turned private leaves the copy over there.
+  db.exec(`CREATE TABLE IF NOT EXISTS fed_resnapshot(
+    grant_id   TEXT PRIMARY KEY,
+    queued_at  INTEGER NOT NULL
+  )`)
+  db.exec(`CREATE TRIGGER IF NOT EXISTS devices_private_resnapshot AFTER UPDATE OF private ON devices
+    WHEN COALESCE(OLD.private, 0) <> COALESCE(NEW.private, 0)
+    BEGIN
+      INSERT OR IGNORE INTO fed_resnapshot(grant_id, queued_at)
+        SELECT g.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        FROM grants g JOIN contacts oc ON oc.id = g.contact_id AND oc.state = 'active' AND oc.peer_journal IS NOT NULL
+        WHERE g.subject_kind = 'mission' AND g.state = 'active' AND g.level <> 'owner';
+    END`)
   db.exec(`CREATE VIEW IF NOT EXISTS private_devices AS
     SELECT id FROM devices WHERE private = 1
     UNION ALL SELECT id FROM revoked_private_devices`)
