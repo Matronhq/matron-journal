@@ -25,6 +25,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { parseEnvelope, signEnvelope, verifyEnvelope, importPublicKey, newOpId } from './federation-envelope.js'
+import { makeFederationLimiter } from './federation-inbound.js'
 import { journalAllowed } from './federation-identity.js'
 import { getGrantRaw } from './grants.js'
 import { userBlobBytes } from './db.js'
@@ -65,7 +66,7 @@ export function grantedBlob(db, g, blobId) {
 }
 
 // GET /federation/v1/media. → true when the path was ours.
-export function makeMediaHandler({ db, federation, now = Date.now, log = console }) {
+export function makeMediaHandler({ db, federation, limiter = makeFederationLimiter(), now = Date.now, log = console }) {
   const findPeer = db.prepare('SELECT host, key_pub, state FROM fed_peers WHERE host=?')
   const send = (res, status, body) => {
     const text = JSON.stringify(body)
@@ -88,11 +89,19 @@ export function makeMediaHandler({ db, federation, now = Date.now, log = console
     if (hostOf(envelope.to) !== federation.host) { send(res, 403, { error: 'not_here' }); return true }
     const host = hostOf(envelope.from)
     const peer = journalAllowed(federation, host) ? findPeer.get(host) : null
-    if (!peer || peer.state !== 'active') { send(res, 403, { error: peer ? 'peer_refused' : 'unknown_journal' }); return true }
-    try {
-      verifyEnvelope(envelope, importPublicKey(peer.key_pub), { now: now() })
-    } catch (err) {
-      if (err.message === 'stale') send(res, 401, { error: 'stale', clock: err.clock })
+    let error = null
+    if (!peer || peer.state !== 'active') error = peer ? 'peer_refused' : 'unknown_journal'
+    else {
+      try { verifyEnvelope(envelope, importPublicKey(peer.key_pub), { now: now() }) } catch (err) { error = err }
+    }
+    // The limits of POST /federation/v1: a journal that proved its key from
+    // its own bucket, anyone else from the strangers' one.
+    // Attachments have a bucket of their own per peer, so opening a thread
+    // full of pictures does not hold up that journal's ops, or the reverse.
+    if (!(!error ? limiter.take(`media:${host}`) : limiter.takeStranger())) { res.setHeader('retry-after', '1'); send(res, 429, { error: 'rate_limited' }); return true }
+    if (typeof error === 'string') { send(res, 403, { error }); return true }
+    if (error) {
+      if (error.message === 'stale') send(res, 401, { error: 'stale', clock: error.clock })
       else send(res, 403, { error: 'bad_signature' })
       return true
     }
@@ -169,11 +178,22 @@ export function makeReplicaMedia({ db, federation, client, mediaDir, mediaMaxByt
       body: { grant: row.peer_grant_ref, media: row.ref }, ts: now(),
     }, federation.key.privateKey)
     const header = Buffer.from(JSON.stringify(envelope), 'utf8').toString('base64url')
-    let r
-    try {
-      r = await client.request(new URL(MEDIA_PATH, peer.base_url).href, { headers: { [MEDIA_HEADER]: header }, maxBytes: mediaMaxBytes })
-    } catch (err) {
-      fail(err.message === 'too_large' ? 'too_large' : 'unreachable')
+    const pull = async () => {
+      try {
+        return await client.request(new URL(MEDIA_PATH, peer.base_url).href, { headers: { [MEDIA_HEADER]: header }, maxBytes: mediaMaxBytes })
+      } catch (err) {
+        return fail(err.message === 'too_large' ? 'too_large' : 'unreachable')
+      }
+    }
+    let r = await pull()
+    // Their journal's limits: wait as it asks (a second or two at most,
+    // someone is waiting on this read) and try once more; still limited is
+    // `busy`, which the reader can retry.
+    if (r.status === 429) {
+      const wait = Math.min(2, Math.max(0, Number(r.headers?.['retry-after']) || 1))
+      await new Promise((resolve) => setTimeout(resolve, wait * 1000))
+      r = await pull()
+      if (r.status === 429) fail('busy')
     }
     if (r.status === 404 || r.status === 403) fail('gone')
     if (r.status !== 200) fail('unreachable')
@@ -221,10 +241,10 @@ export function makeReplicaMedia({ db, federation, client, mediaDir, mediaMaxByt
     let file = row.disk_path
     if (!file) {
       try { file = await cache(row) } catch (err) {
-        const [status, error] = { quota_exceeded: [413, 'quota_exceeded'], too_large: [413, 'too_large'], gone: [404, 'not_found'] }[err.message] ?? [502, 'peer_unreachable']
+        const [status, error] = { quota_exceeded: [413, 'quota_exceeded'], too_large: [413, 'too_large'], gone: [404, 'not_found'], busy: [503, 'peer_busy'] }[err.message] ?? [502, 'peer_unreachable']
         if (status === 502) log.error?.(`federation: media ${row.id} from ${row.peer_host}: ${err.message}`)
         const text = JSON.stringify({ error: error })
-        res.writeHead(status, { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(text)) })
+        res.writeHead(status, { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(text)), ...(status === 503 ? { 'retry-after': '5' } : {}) })
         res.end(text)
         return true
       }

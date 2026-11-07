@@ -5227,7 +5227,26 @@ POST /federation/v1      body: one envelope
 
 The body is read as bytes (at most 1 MiB) and parsed strictly. Then:
 
-1. `to` must name a user of this journal, on this journal's host.
+0. **Limits.** Before anything but the parse and, for a journal this one
+   knows, the signature check, each request takes a token. A journal whose
+   pinned key verified a fresh envelope addressed to this journal draws on
+   a bucket of its own (burst 60, then one a second). Every other caller
+   draws on one bucket they all share (burst 60, then five a second): an
+   unknown journal, a bad signature, an invite answer before discovery, a
+   stale envelope, or one addressed to another journal. So neither naming
+   another journal's host nor replaying an envelope it sent elsewhere
+   drains anything of that journal's. With the bucket empty the answer is
+   an unsigned `429 rate_limited` with `Retry-After`, which the sender's
+   outbox retries. `GET /federation/v1/media` draws on the same shared
+   bucket for strangers, and on a separate bucket per peer for its
+   attachments. A journal pulling an attachment that meets `429` waits as
+   asked (at most 2 s) and tries once more. If it is still limited, the
+   reader gets `503 peer_busy` with `Retry-After`.
+1. `to` must be on this journal's host (`403 not_here`). Whether it names
+   a user here is asked only once the sender is known (after step 2, or
+   after discovery). A refusal before that never depends on the name in
+   `to`, so a stranger cannot probe for user names, unlisted ones
+   included.
 2. `from`'s host must be allowed by the operator's lists, and a journal
    this one knows (`fed_peers`, `active`), and the key pinned for that
    journal must verify `sig`.
@@ -5263,6 +5282,7 @@ against the state at that time.
 | 405 | only `POST` | no |
 | 409 | `id_reused` | no |
 | 413 | `too_large` | no |
+| 429 | `rate_limited` (unsigned) | yes |
 | 503 | `peer_unreachable`: discovery could not fetch the sender's well-known | yes |
 
 **Signed answers.** Every answer from step 1 on carries
@@ -5498,7 +5518,10 @@ Three ops carry a grant, and `mission.snapshot` and `mission.event`
   when the ask is sent (a client's ask at once, an agent's on the owner's
   approval). The receiver needs a live contact for the sender under the key
   that signed (`403 not_contact`). A grant it already holds live is the
-  same answer; one that ended is offered again. Refused or undelivered for
+  same answer; one that ended is offered again. A grantee with
+  `MAX_PENDING_OFFERS` (10) offers from that contact already waiting on
+  their tap refuses another, `409 too_many_offers`: each offer is a card.
+  Refused or undelivered for
   7 days, the owner's grant goes `expired` and the owner gets a notice.
 - `grant.answer`, grantee to owner, body `{grant, decision}`. The
   grantee's row moves at the tap; the owner's grant moves when the answer
