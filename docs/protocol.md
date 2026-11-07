@@ -5112,18 +5112,23 @@ Audit events (`people`, client-only): `room.offered`, `room.received`,
 
 ## Federation (between journals)
 
-Not enabled yet. Users on different journals will add each other as
-contacts and share missions and rooms as users on one journal do. A user's
-address across journals is `name@host`, where `host` names their journal.
-Journals talk directly over HTTPS, and every request is a signed envelope.
-This section grows as each part ships. So far it covers the journal's
-identity (`src/federation-identity.js`), the envelope format
+Off unless the operator turns it on. Users on different journals add each
+other as contacts by invite link, and share missions to read, as users on
+one journal do. Contributing, hand-overs and rooms across journals are not
+built yet. A user's address across journals is `name@host`, where `host`
+names their journal. Journals talk directly over HTTPS, and every request
+is a signed envelope. The parts: the journal's identity
+(`src/federation-identity.js`), the envelope format
 (`src/federation-envelope.js`), the endpoint that receives envelopes
 (`src/federation-inbound.js`), the rules for calling another journal
 (`src/federation-client.js`), the outbox that delivers ops
-(`src/federation-outbox.js`) and contacts across journals
-(`src/federation-contacts.js`). The ops so far are `ping`,
-`contact.accept_invite` and `contact.remove`.
+(`src/federation-outbox.js`), contacts across journals
+(`src/federation-contacts.js`), shares across journals
+(`src/federation-grants.js`, `src/federation-replica.js`) and their
+attachments (`src/federation-media.js`).
+
+Running it (turning it on, the allow list, checking a fingerprint, the
+kill switch, dead deliveries) is in `docs/federation-runbook.md`.
 
 ### Journal identity
 
