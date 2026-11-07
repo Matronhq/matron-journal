@@ -626,8 +626,14 @@ export function listItems(db, userId, {
 // the viewer's own. Ordered newest-updated first; the cursor is
 // [updated_at, id] — item ids are random, so unlike `num` they are unique
 // across users.
+// The thread counts another person sees: without what an agent on a private
+// box wrote, which listSharedComments drops from the thread itself.
+const SHARED_COMMENT = `FROM item_comments c WHERE c.item_id = i.id AND c.kind='comment'
+    AND NOT (c.author = 'agent' AND EXISTS (SELECT 1 FROM private_devices pd WHERE pd.id = c.device_id))`
 const OWNER_DECORATE = `
   cv.repo AS repo,
+  (SELECT COUNT(*) ${SHARED_COMMENT}) AS shared_comment_count,
+  (SELECT MAX(c.created_at) ${SHARED_COMMENT}) AS shared_last_comment_at,
   json_object('user_id', u.id, 'name', u.name, 'github_login', ga.login) AS owner_json`
 
 // The grant rule for an item (spec 2026-10-02 matron-to-matron sharing): it
@@ -656,8 +662,8 @@ const ORG_SHARED = `(cv.id IS NOT NULL AND ${sharedConvoSql('cv')})`
 // two origin fields the apps' item model requires.
 function rowToSharedItem(row) {
   if (!row) return null
-  const { owner_json: ownerJson, org_shared: orgShared, ...rest } = row
-  const item = rowToItem(rest)
+  const { owner_json: ownerJson, org_shared: orgShared, shared_comment_count: count, shared_last_comment_at: lastAt, ...rest } = row
+  const item = rowToItem({ ...rest, comment_count: count, last_comment_at: lastAt })
   item.owner = parseJson(ownerJson, null)
   // Item handover (src/item-handover.js) names conversations that need not
   // pass the sharing rule themselves, and the filing box is the user's own:

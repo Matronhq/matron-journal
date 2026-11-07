@@ -125,4 +125,8 @@ test('what a private box\'s agent said on a shared item leaves the copy too', as
   await w.settle()
   assert.ok(!copy().includes('Beans, from the shed'))
   assert.deepEqual(await bobItems(w), ['Tomatoes or beans?'])
+  // Nor does the count say a hidden comment is there.
+  const row = w.b.db.prepare("SELECT comment_count, last_comment_at FROM fed_replica_items WHERE title='Tomatoes or beans?'").get()
+  assert.equal(row.comment_count, 0)
+  assert.equal(row.last_comment_at, null)
 })
