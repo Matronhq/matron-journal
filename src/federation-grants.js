@@ -104,7 +104,7 @@ function sharedFrame({ hub }, userId, frame) {
 }
 
 // `ctx` {db, hub, pushPipeline}; `federation` the loaded identity.
-// → {federate, answer, leave, kick, inbound, outbound, setOutbox}
+// → {federate, answer, leave, kick, resnapshot, inbound, outbound, setOutbox}
 export function makeGrantFederation({ db, hub = null, pushPipeline = null, federation, now: clock = Date.now, log = console }) {
   const ctx = { db, hub, pushPipeline }
   let outbox = null
@@ -160,6 +160,27 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
     if (queued) kick()
   }
   onRemoteMissionWrite(db, onMissionWrite)
+
+  // A device's private flag changed (db.js devices_private_resnapshot):
+  // each queued share gets a fresh snapshot of what its grantee view shows
+  // now, which drops from the copy over there whatever it no longer shows.
+  // Run at the start of every outbox pass. A full outbox keeps the row for
+  // the next pass.
+  function resnapshot() {
+    const rows = db.prepare('SELECT grant_id FROM fed_resnapshot ORDER BY queued_at LIMIT 50').all()
+    for (const { grant_id: id } of rows) {
+      const g = getGrantRaw(db, id)
+      try {
+        db.transaction(() => {
+          if (g && g.state === 'active') sendSnapshot(db, g, { from: `${g.owner_name}@${federation.host}`, to: `${g.grantee_name}@${g.grantee_journal}`, now: clock() })
+          db.prepare('DELETE FROM fed_resnapshot WHERE grant_id=?').run(id)
+        })()
+      } catch (err) {
+        if (err.message !== 'outbox_full' && err.message !== 'too_large') throw err
+        if (err.message === 'too_large') db.prepare('DELETE FROM fed_resnapshot WHERE grant_id=?').run(id)
+      }
+    }
+  }
 
   // --- The grantee's journal: the card, the answer, leaving -----------------
 
@@ -352,6 +373,10 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
       after({ envelope }) {
         const p = pending.get(envelope)
         if (!p) return
+        if (p.done === 'withheld') {
+          sharedFrame(ctx, p.row.user_id, { event: 'mission_removed', mission_id: p.missionId, grant_id: p.row.id })
+          return
+        }
         sharedFrame(ctx, p.row.user_id, {
           event: p.done === 'added' ? 'mission_added' : 'mission_changed', mission_id: p.missionId, grant_id: p.row.id,
           ...(p.done === 'changed' ? { what: 'snapshot' } : {}), owner: { user_id: 0, name: p.row.owner_address },
@@ -520,5 +545,5 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
       },
     },
   }
-  return { federate, answer, leave, kick, inbound, outbound, setOutbox: (o) => { outbox = o } }
+  return { federate, answer, leave, kick, resnapshot, inbound, outbound, setOutbox: (o) => { outbox = o } }
 }
