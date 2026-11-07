@@ -12,7 +12,7 @@ const raw = (s, envelope, path = '/federation/v1') => fetch(s.base + path, { met
 
 test('limiter: a journal gets its burst, then one request a second', () => {
   let t = 0
-  const l = makeFederationLimiter({ peerBurst: 3, peerPerSec: 1, globalBurst: 100, globalPerSec: 100, now: () => t })
+  const l = makeFederationLimiter({ peerBurst: 3, peerPerSec: 1, now: () => t })
   assert.deepEqual([1, 2, 3, 4].map(() => l.take('a.example')), [true, true, true, false])
   assert.equal(l.take('b.example'), true, 'another journal has its own bucket')
   t += 1000
@@ -20,14 +20,14 @@ test('limiter: a journal gets its burst, then one request a second', () => {
   assert.equal(l.take('a.example'), false)
 })
 
-test('limiter: made-up hosts share one global bucket', () => {
-  const l = makeFederationLimiter({ peerBurst: 10, peerPerSec: 1, globalBurst: 5, globalPerSec: 1, now: () => 0 })
-  const got = Array.from({ length: 8 }, (_, i) => l.take(`h${i}.example`))
-  assert.equal(got.filter(Boolean).length, 5)
+test('limiter: strangers share one bucket, and it is not any peer\'s', () => {
+  const l = makeFederationLimiter({ peerBurst: 2, strangerBurst: 5, strangerPerSec: 1, now: () => 0 })
+  assert.equal(Array.from({ length: 8 }, () => l.takeStranger()).filter(Boolean).length, 5)
+  assert.equal(l.take('a.example'), true, 'a peer is not slowed by strangers')
 })
 
-test('POST /federation/v1 answers 429 past the burst, before any other check', async (t) => {
-  const s = await startTestServer({ tokenKey: KEY, federationEnv: { federation: 'on', publicUrl: 'https://b.example' }, federationLimits: { peerBurst: 2 } })
+test('POST /federation/v1: strangers get 429 past their shared burst', async (t) => {
+  const s = await startTestServer({ tokenKey: KEY, federationEnv: { federation: 'on', publicUrl: 'https://b.example' }, federationLimits: { strangerBurst: 2 } })
   t.after(() => s.close())
   await createUser(s.db, 'bob', 'pw')
   const k = generateFederationKey()
@@ -35,6 +35,26 @@ test('POST /federation/v1 answers 429 past the burst, before any other check', a
   const statuses = []
   for (let i = 0; i < 3; i++) statuses.push((await send()).status)
   assert.deepEqual(statuses, [403, 403, 429])
+})
+
+test('POST /federation/v1: a stranger cannot tell a user here from a name that does not exist', async (t) => {
+  const s = await startTestServer({ tokenKey: KEY, federationEnv: { federation: 'on', publicUrl: 'https://b.example' } })
+  t.after(() => s.close())
+  const u = await createUser(s.db, 'reviewer', 'pw')
+  s.db.prepare('UPDATE users SET unlisted=1 WHERE id=?').run(u.id)
+  await createUser(s.db, 'bob', 'pw')
+  const k = generateFederationKey()
+  const probe = (name) => raw(s, signEnvelope({ from: 'x@m.example', to: `${name}@b.example`, op: 'ping', id: newOpId(), body: {} }, k.privateKey))
+  const answers = [await probe('bob'), await probe('reviewer'), await probe('nobody')]
+  assert.deepEqual(answers.map((a) => [a.status, a.json.error]), Array(3).fill([403, 'unknown_journal']))
+})
+
+test('POST /federation/v1: a known journal draws on its own bucket, and asks about users only once proved', async (t) => {
+  const w = await world(t)
+  const key = w.a.federation.key.privateKey
+  const ping = (to) => raw(w.b, signEnvelope({ from: 'alice@a.example', to, op: 'ping', id: newOpId(), body: {} }, key))
+  assert.equal((await ping('bob@b.example')).status, 200)
+  assert.deepEqual((await ping('nobody@b.example')).json, { error: 'not_here' })
 })
 
 test('a contact journal cannot keep raising share cards: at most MAX_PENDING_OFFERS wait', async (t) => {

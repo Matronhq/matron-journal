@@ -71,40 +71,42 @@ const hostOf = (address) => address.slice(address.indexOf('@') + 1)
 const nameOf = (address) => address.slice(0, address.indexOf('@'))
 
 // Abuse limits (docs/protocol.md "Federation": limits). Every request to
-// the federation routes takes a token from two buckets before any work that
-// costs more than parsing it: one for the journal its `from` names, and one
-// for all of federation together. `from` is not authenticated yet at that
-// point, so a caller can spread its requests over made-up hosts; the
-// shared bucket is what bounds those. 429 is retried by a well-behaved
-// sender's outbox, so a burst of real traffic is only slowed down.
+// the federation routes takes a token before any work that costs more than
+// parsing and checking its signature. A journal that signed with its pinned
+// key draws on a bucket of its own; every other caller (an unknown journal,
+// a bad signature, an invite answer before discovery) on one bucket shared
+// by all of them, because a stranger's `from` proves nothing and could
+// otherwise be spread over made-up hosts or aimed at a peer's bucket. 429
+// is retried by a well-behaved sender's outbox, so a burst of real traffic
+// is only slowed down.
 export const PEER_BURST = 60
 export const PEER_PER_SEC = 1
-export const GLOBAL_BURST = 600
-export const GLOBAL_PER_SEC = 20
+export const STRANGER_BURST = 60
+export const STRANGER_PER_SEC = 5
 
-export function makeFederationLimiter({ peerBurst = PEER_BURST, peerPerSec = PEER_PER_SEC, globalBurst = GLOBAL_BURST, globalPerSec = GLOBAL_PER_SEC, now = Date.now } = {}) {
+export function makeFederationLimiter({ peerBurst = PEER_BURST, peerPerSec = PEER_PER_SEC, strangerBurst = STRANGER_BURST, strangerPerSec = STRANGER_PER_SEC, now = Date.now } = {}) {
   const buckets = new Map()
-  const fill = (b, burst, perSec, at) => {
+  const draw = (b, burst, perSec, at) => {
     b.tokens = Math.min(burst, b.tokens + ((at - b.at) / 1000) * perSec)
     b.at = at
+    if (b.tokens < 1) return false
+    b.tokens -= 1
+    return true
   }
-  const global = { tokens: globalBurst, at: now() }
+  const strangers = { tokens: strangerBurst, at: now() }
   return {
-    // → true when the request may go ahead (a token was taken from both).
+    // A peer that proved its key. → true when the request may go ahead.
     take(host) {
       const at = now()
-      fill(global, globalBurst, globalPerSec, at)
       if (buckets.size > 10_000) {
-        for (const [k, b] of buckets) { fill(b, peerBurst, peerPerSec, at); if (b.tokens >= peerBurst) buckets.delete(k) }
+        for (const [k, b] of buckets) if (b.tokens + ((at - b.at) / 1000) * peerPerSec >= peerBurst) buckets.delete(k)
       }
       const b = buckets.get(host) ?? { tokens: peerBurst, at }
-      fill(b, peerBurst, peerPerSec, at)
-      if (b.tokens < 1 || global.tokens < 1) { buckets.set(host, b); return false }
-      b.tokens -= 1
-      global.tokens -= 1
       buckets.set(host, b)
-      return true
+      return draw(b, peerBurst, peerPerSec, at)
     },
+    // Anyone else.
+    takeStranger() { return draw(strangers, strangerBurst, strangerPerSec, now()) },
   }
 }
 
@@ -154,31 +156,40 @@ export function makeFederationHandler({ db, federation, ops = DEFAULT_OPS, clien
       return true
     }
     const { id } = envelope
-    // Unsigned: a refusal before any check is not this journal's word.
-    if (!limiter.take(hostOf(envelope.from))) { res.setHeader('retry-after', '1'); send(res, 429, { error: 'rate_limited' }); return true }
-
-    if (hostOf(envelope.to) !== federation.host || !findUser.get(nameOf(envelope.to))) {
-      send(res, 403, { error: 'not_here' }, id)
-      return true
-    }
     const host = hostOf(envelope.from)
-    if (!journalAllowed(federation, host)) { send(res, 403, { error: 'peer_refused' }, id); return true }
-    const handler = Object.hasOwn(ops, envelope.op) ? ops[envelope.op] : null
+    const listed = journalAllowed(federation, host)
     const known = findPeer.get(host)
-    if (known?.state === 'blocked') { send(res, 403, { error: 'peer_refused' }, id); return true }
-
     const at = now()
+
+    // Who is asking, before anything that would tell a stranger about this
+    // journal's users: only a known journal's own key makes it that journal.
     let peer = null
-    if (known?.state === 'active') {
+    let stale = null
+    if (listed && known?.state === 'active') {
       try {
         verifyEnvelope(envelope, keyFor(known.key_pub), { now: at })
         peer = known
       } catch (err) {
-        if (err.message === 'stale') { send(res, 401, { error: 'stale', clock: err.clock }, id); return true }
+        if (err.message === 'stale') stale = err
         // A bad signature from a known journal may still be an invite's
         // answer from a journal whose key changed: discovery decides.
       }
     }
+    // Limits. A journal that proved its key draws on its own bucket; every
+    // other caller shares one, so naming a peer's host drains nothing of
+    // that peer's. Unsigned: refused before any of this journal's checks.
+    if (!(peer || stale ? limiter.take(host) : limiter.takeStranger())) {
+      res.setHeader('retry-after', '1')
+      send(res, 429, { error: 'rate_limited' })
+      return true
+    }
+    if (stale) { send(res, 401, { error: 'stale', clock: stale.clock }, id); return true }
+
+    if (hostOf(envelope.to) !== federation.host) { send(res, 403, { error: 'not_here' }, id); return true }
+    if (!listed) { send(res, 403, { error: 'peer_refused' }, id); return true }
+    const handler = Object.hasOwn(ops, envelope.op) ? ops[envelope.op] : null
+    if (known?.state === 'blocked') { send(res, 403, { error: 'peer_refused' }, id); return true }
+
     if (!peer) {
       let admitted = false
       if (handler?.admits && client) {
@@ -210,6 +221,9 @@ export function makeFederationHandler({ db, federation, ops = DEFAULT_OPS, clien
     // The fetch took time: what the op checks (an invite's expiry) is judged
     // now, not when the envelope arrived.
     const applyAt = peer.discovered ? now() : at
+    // Asked only of a journal that proved its key: a stranger cannot tell
+    // a user here from a name that does not exist (an unlisted one either).
+    if (!findUser.get(nameOf(envelope.to))) { send(res, 403, { error: 'not_here' }, id); return true }
 
     if (!handler) { send(res, 400, { error: 'unknown_op' }, id); return true }
 

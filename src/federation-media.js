@@ -83,18 +83,24 @@ export function makeMediaHandler({ db, federation, limiter = makeFederationLimit
       if (typeof raw !== 'string' || raw.length > HEADER_MAX) fail('malformed')
       envelope = parseEnvelope(Buffer.from(raw, 'base64url'))
     } catch { send(res, 400, { error: 'malformed' }); return true }
-    if (!limiter.take(hostOf(envelope.from))) { res.setHeader('retry-after', '1'); send(res, 429, { error: 'rate_limited' }); return true }
     if (envelope.op !== MEDIA_OP) { send(res, 400, { error: 'unknown_op' }); return true }
     const { grant, media } = envelope.body ?? {}
     if (typeof grant !== 'string' || !isMediaRef(media)) { send(res, 400, { error: 'malformed' }); return true }
     if (hostOf(envelope.to) !== federation.host) { send(res, 403, { error: 'not_here' }); return true }
     const host = hostOf(envelope.from)
     const peer = journalAllowed(federation, host) ? findPeer.get(host) : null
-    if (!peer || peer.state !== 'active') { send(res, 403, { error: peer ? 'peer_refused' : 'unknown_journal' }); return true }
-    try {
-      verifyEnvelope(envelope, importPublicKey(peer.key_pub), { now: now() })
-    } catch (err) {
-      if (err.message === 'stale') send(res, 401, { error: 'stale', clock: err.clock })
+    let error = null
+    if (!peer || peer.state !== 'active') error = peer ? 'peer_refused' : 'unknown_journal'
+    else {
+      try { verifyEnvelope(envelope, importPublicKey(peer.key_pub), { now: now() }) } catch (err) { error = err }
+    }
+    // The limits of POST /federation/v1: a journal that proved its key from
+    // its own bucket, anyone else from the strangers' one.
+    const proved = !error || error.message === 'stale'
+    if (!(proved ? limiter.take(host) : limiter.takeStranger())) { res.setHeader('retry-after', '1'); send(res, 429, { error: 'rate_limited' }); return true }
+    if (typeof error === 'string') { send(res, 403, { error }); return true }
+    if (error) {
+      if (error.message === 'stale') send(res, 401, { error: 'stale', clock: error.clock })
       else send(res, 403, { error: 'bad_signature' })
       return true
     }

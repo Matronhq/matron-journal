@@ -5227,13 +5227,19 @@ POST /federation/v1      body: one envelope
 
 The body is read as bytes (at most 1 MiB) and parsed strictly. Then:
 
-0. **Limits.** Each request takes a token from a bucket for the journal
-   `from` names (burst 60, then one a second) and from one bucket shared by
-   all of federation (burst 600, then 20 a second). With either empty the
-   answer is an unsigned `429 rate_limited` with `Retry-After`, which the
-   sender's outbox retries. `GET /federation/v1/media` draws on the same
-   buckets.
-1. `to` must name a user of this journal, on this journal's host.
+0. **Limits.** Before anything but the parse and, for a journal this one
+   knows, the signature check, each request takes a token. A journal whose
+   pinned key verified the envelope draws on a bucket of its own (burst 60,
+   then one a second); every other caller (an unknown journal, a bad
+   signature, an invite answer before discovery) draws on one bucket they
+   all share (burst 60, then five a second), so naming another journal's
+   host drains nothing of that journal's. With the bucket empty the answer
+   is an unsigned `429 rate_limited` with `Retry-After`, which the sender's
+   outbox retries. `GET /federation/v1/media` draws on the same buckets.
+1. `to` must be on this journal's host (`403 not_here`). Whether it names
+   a user here is asked only once the sender is known (after step 2, or
+   after discovery), so a stranger cannot probe for user names: every
+   refusal before that is the same `403 unknown_journal`.
 2. `from`'s host must be allowed by the operator's lists, and a journal
    this one knows (`fed_peers`, `active`), and the key pinned for that
    journal must verify `sig`.
