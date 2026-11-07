@@ -22,7 +22,7 @@ h1{font-size:1.3rem;margin:0 0 12px}
 dl{margin:16px 0;display:grid;grid-template-columns:auto 1fr;gap:6px 12px}
 dt{color:#6e6e73}
 dd{margin:0;overflow-wrap:anywhere}
-code{font:15px ui-monospace,Menlo,monospace}
+code{font:15px ui-monospace,Menlo,monospace;overflow-wrap:anywhere;user-select:all}
 .note{color:#6e6e73;font-size:.92rem}
 .actions{display:flex;flex-wrap:wrap;gap:10px;margin:18px 0}
 button{font:inherit;border:0;border-radius:10px;padding:10px 16px;cursor:pointer}
@@ -45,7 +45,10 @@ const SCRIPT = `
   p.forEach(function (_, k) { keys.push(k); });
   var ok = keys.length === 5 && ['v', 'j', 'u', 't', 'fp'].every(function (k) { return keys.indexOf(k) >= 0; });
   var j = (p.get('j') || '').toLowerCase(), u = p.get('u') || '', t = p.get('t') || '', fp = (p.get('fp') || '').toLowerCase();
-  if (!ok || p.get('v') !== '1' || !HOST.test(j) || j !== location.host || !NAME.test(u) || !TOKEN.test(t) || !FP.test(fp)) return bad();
+  // j as a URL writes it (an explicit :443 dropped), as the journal reads it.
+  var named = '';
+  try { named = new URL('https://' + j).host; } catch (e) { return bad(); }
+  if (!ok || p.get('v') !== '1' || !HOST.test(j) || named !== location.host || !NAME.test(u) || !TOKEN.test(t) || !FP.test(fp)) return bad();
   el('who').textContent = u + '@' + j;
   el('journal').textContent = j;
   el('fp').textContent = fp.match(/.{1,4}/g).join(' ');
@@ -55,9 +58,13 @@ const SCRIPT = `
   // address bar, which may carry a query or user info the apps refuse.
   var link = 'https://' + j + '/contact#' + fields;
   el('open').addEventListener('click', function () { location.href = app; });
+  // Where the clipboard is unavailable or refused, the link is shown to
+  // select and copy by hand.
+  var manual = function () { el('plain').textContent = link; el('manual').hidden = false; };
   el('copy').addEventListener('click', function () {
     var done = function () { el('copied').hidden = false; };
-    if (navigator.clipboard) navigator.clipboard.writeText(link).then(done, function () {});
+    if (navigator.clipboard) navigator.clipboard.writeText(link).then(done, manual);
+    else manual();
   });
 })();
 `
@@ -89,6 +96,7 @@ const HTML = `<!doctype html>
 <button id="copy" type="button">Copy link</button>
 </div>
 <p class="note" id="copied" hidden>Copied.</p>
+<p class="note" id="manual" hidden>Copy this link: <code id="plain"></code></p>
 <p class="note">If Matron didn't open, open it yourself, go to People, choose <strong>Open an invite link</strong> and paste this link. The link works once and lasts 7 days.</p>
 </section>
 <section id="bad" hidden>

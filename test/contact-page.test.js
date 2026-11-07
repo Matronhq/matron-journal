@@ -33,7 +33,7 @@ test('the contact page is static, cache-free, referrer-free and runs only its ow
   assert.equal((html.match(/<script/g) ?? []).length, 1)
   assert.doesNotMatch(html, /\b(src|href|action)=/, 'it loads and links nothing')
   assert.match(script, /'matron:\/\/contact\?'/)
-  assert.match(script, /j !== location\.host/, 'only a link to this journal')
+  assert.match(script, /named !== location\.host/, 'only a link to this journal')
   const again = await (await fetch(`${s.base}/contact?t=x`)).text()
   assert.equal(again, html, 'nothing in the request changes the page')
   const head = await fetch(`${s.base}/contact`, { method: 'HEAD' })
@@ -51,17 +51,17 @@ test('the contact page is not there while federation is off', async (t) => {
 // The page's script, run against a stand-in for the browser: a good link
 // fills in who is asking and builds the matron:// link from the checked
 // fields; anything else shows only "incomplete".
-async function run(s, href) {
+async function run(s, href, { clipboard = true } = {}) {
   const html = await (await fetch(`${s.base}/contact`)).text()
   const script = between(html, 'script')
   const els = {}
-  const el = (id) => (els[id] ??= { id, hidden: id === 'bad' || id === 'copied', textContent: '', handlers: {}, addEventListener(e, f) { this.handlers[e] = f } })
+  const el = (id) => (els[id] ??= { id, hidden: ['bad', 'copied', 'manual'].includes(id), textContent: '', handlers: {}, addEventListener(e, f) { this.handlers[e] = f } })
   const u = new URL(href)
   const location = { href, host: u.host, hash: u.hash }
   const copied = []
-  const navigator = { clipboard: { writeText: (x) => { copied.push(x); return Promise.resolve() } } }
+  const navigator = clipboard ? { clipboard: { writeText: (x) => { copied.push(x); return Promise.resolve() } } } : {}
   const { runInNewContext } = await import('node:vm')
-  runInNewContext(script, { document: { getElementById: el }, location, URLSearchParams, navigator })
+  runInNewContext(script, { document: { getElementById: el }, location, URL, URLSearchParams, navigator })
   return { els, location, copied }
 }
 
@@ -78,6 +78,11 @@ test('the page reads the fragment and builds the app link only from checked fiel
   assert.equal(els.fp.textContent, 'aaaa aaaa aaaa aaaa aaaa aaaa aa')
   els.open.handlers.click()
   assert.equal(location.href, `matron://contact?v=1&j=a.example&u=alice&t=${TOKEN}&fp=${FP}`)
+  const bare = await run(s, good, { clipboard: false })
+  bare.els.copy.handlers.click()
+  assert.deepEqual([bare.els.manual.hidden, bare.els.plain.textContent], [false, good], 'no clipboard: the link to copy by hand')
+  const p443 = await run(s, good.replace('j=a.example', 'j=a.example%3A443'))
+  assert.equal(p443.els.who.textContent, 'alice@a.example:443', 'an explicit :443 is this journal too')
   for (const bad of [
     good.replace('j=a.example', 'j=b.example'), good.replace('v=1', 'v=2'), good.replace(`t=${TOKEN}`, 't=x'),
     `${good}&x=1`, good.replace('u=alice', 'u=<b>'), 'https://a.example/contact', good.replace(`fp=${FP}`, 'fp=1'),
