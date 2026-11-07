@@ -815,6 +815,26 @@ CREATE TABLE IF NOT EXISTS fed_replica_pages(
   received_at  INTEGER NOT NULL,
   PRIMARY KEY(fg_id, page)
 );
+-- An attachment of a copy (src/federation-media.js): one row per attachment
+-- the copy's threads name, with an id of its own in the shape of a blob id
+-- (GET /media/:id reads it). ref is the owner journal's blob id. The bytes
+-- are pulled on first read into disk_path, and count in the user's media
+-- quota (userBlobBytes). Rows of a share no longer active here, and their
+-- files, go in purgeReplicaMedia's sweep.
+CREATE TABLE IF NOT EXISTS fed_media(
+  id          TEXT PRIMARY KEY,
+  fg_id       TEXT NOT NULL,
+  user_id     INTEGER NOT NULL REFERENCES users(id),
+  ref         TEXT NOT NULL,
+  mime        TEXT NOT NULL,
+  size        INTEGER NOT NULL,
+  sha256      TEXT NOT NULL,
+  disk_path   TEXT,
+  fetched_at  INTEGER,
+  created_at  INTEGER NOT NULL,
+  UNIQUE(fg_id, ref)
+);
+CREATE INDEX IF NOT EXISTS idx_fed_media_user ON fed_media(user_id);
 CREATE TRIGGER IF NOT EXISTS fed_replica_drop AFTER UPDATE OF state ON fed_grants_in WHEN NEW.state <> 'active' BEGIN
   DELETE FROM fed_replica_pages WHERE fg_id = NEW.id;
   DELETE FROM fed_replica_items WHERE fg_id = NEW.id;
@@ -1995,6 +2015,7 @@ export function openDb(path) {
   // A grant's replica keeps one local mission id across snapshots, and
   // across an end and a fresh accept (src/federation-replica.js).
   addCols('fed_grants_in', [['replica_mission_id', 'TEXT']])
+  addCols('fed_replica_items', [['attachments', "TEXT NOT NULL DEFAULT '[]'"]])
   // Unified search's tracker mirror (spec 2026-10-12 unified search §1).
   // Must stay LAST: it reads columns added by every migration above (e.g.
   // missions.name), and its triggers must be reinstalled after any table
@@ -2069,8 +2090,11 @@ export function getBlob(db, id) {
 // the user owns, including retention-offloaded tool_output payloads, since
 // they consume the same disk. COALESCE so a user with no blobs reads 0, not
 // NULL.
+// Attachments pulled for the user's copies of missions shared from other
+// journals (fed_media) count too: they are on this disk.
 export function userBlobBytes(db, userId) {
-  return db.prepare('SELECT COALESCE(SUM(size),0) AS bytes FROM blobs WHERE owner_user_id=?').get(userId).bytes
+  return db.prepare(`SELECT (SELECT COALESCE(SUM(size),0) FROM blobs WHERE owner_user_id=@u)
+    + (SELECT COALESCE(SUM(size),0) FROM fed_media WHERE user_id=@u AND disk_path IS NOT NULL) AS bytes`).get({ u: userId }).bytes
 }
 
 // `apnsToken: null` unregisters (both columns cleared together — a token
