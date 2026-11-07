@@ -684,9 +684,14 @@ export function listGrantedComments(db, itemId) {
 // Another person's view of a thread: the handover lines (src/item-handover.js)
 // are dropped — they name the user's conversations and boxes — and so are
 // the author's box and conversation on every comment. A reply the user
-// withdrew (src/withdrawn-comments.js) shows without its words.
+// withdrew (src/withdrawn-comments.js) shows without its words. What an
+// agent on a private box wrote stays at home, as its items and milestones
+// do: a copy on another journal (src/federation-replica.js) drops it at the
+// next snapshot when the box turns private.
 export function listSharedComments(db, itemId) {
-  return listComments(db, itemId).filter((c) => !c.meta?.handover)
+  const hidden = new Set(db.prepare(`SELECT DISTINCT c.device_id AS id FROM item_comments c JOIN private_devices pd ON pd.id = c.device_id
+    WHERE c.item_id = ? AND c.author = 'agent'`).all(itemId).map((r) => r.id))
+  return listComments(db, itemId).filter((c) => !c.meta?.handover && !(c.author === 'agent' && hidden.has(c.device_id)))
     .map((c) => presentWithdrawn({ ...c, device_name: null, convo_id: null, convo_title: null }))
 }
 

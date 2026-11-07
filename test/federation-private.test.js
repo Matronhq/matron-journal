@@ -113,3 +113,16 @@ test('a snapshot page held back while a resnapshot waits', async (t) => {
   w.a.db.prepare('DELETE FROM fed_resnapshot').run()
   assert.equal(stillAllowed(w.a.db, entry), true)
 })
+
+test('what a private box\'s agent said on a shared item leaves the copy too', async (t) => {
+  const { w, box } = await shared(t)
+  const item = w.a.db.prepare("SELECT id FROM items WHERE title='Tomatoes or beans?'").get()
+  await w.a.http(`/items/${item.id}/comments`, { token: box.token, ...post({ body: 'Beans, from the shed' }) })
+  await w.settle()
+  const copy = () => JSON.stringify(w.b.db.prepare('SELECT * FROM fed_replica_items').all())
+  assert.ok(copy().includes('Beans, from the shed'))
+  pinDevicePrivate(w.a.db, box.deviceId, true)
+  await w.settle()
+  assert.ok(!copy().includes('Beans, from the shed'))
+  assert.deepEqual(await bobItems(w), ['Tomatoes or beans?'])
+})
