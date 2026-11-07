@@ -78,10 +78,15 @@ remove it, once you're happy with how it runs.
    another Matron". An agent can ask for one (`contact_add` with
    `remote: true`), but only alice's tap makes the link, and it shows on her
    device only. The link is
-   `matron://contact?v=1&j=a.example&u=alice&t=<token>&fp=<fingerprint>`.
+   `https://a.example/contact#v=1&j=a.example&u=alice&t=<token>&fp=<fingerprint>`,
+   which chat apps and mail make tappable (older apps show the same invite
+   as `matron://contact?v=1&j=…`; both work).
    It can be used once, lasts 7 days, and her journal keeps only its hash.
 3. alice sends bob the link over any channel.
-4. **bob opens it** in his app. His journal fetches
+4. **bob opens it** in his app: tapping the https link opens the app where
+   it's installed, or alice's journal's `/contact` page, which hands it to
+   the app or says how to paste it in.
+   His journal fetches
    `https://a.example/.well-known/matron-journal` and refuses the link if the
    key there doesn't match its `fp`. The accept card shows alice's address,
    her journal and the fingerprint, grouped in fours.
