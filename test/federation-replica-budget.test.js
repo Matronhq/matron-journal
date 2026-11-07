@@ -75,3 +75,17 @@ test('the owner is told when its snapshot was given up for want of room', async 
   assert.equal(n.length, 1)
   assert.match(n[0].body, /no more room/)
 })
+
+test('an oversized page of a snapshot no longer loading gives up nothing that is', async (t) => {
+  const { w, grant } = await sharedWorld(t)
+  const key = w.a.federation.key.privateKey
+  const send = (snap, page, pages, items) => raw(w.b, signEnvelope({
+    from: 'alice@a.example', to: 'bob@b.example', op: 'mission.snapshot', id: newOpId(),
+    body: { grant: grant.id, snap, page, pages, ...(page === 0 ? { mission: { num: 1, title: 'Garden Club', state: 'open', created_at: 1, updated_at: 1 } } : {}), milestones: [], items },
+  }, key))
+  assert.equal((await send('sn_now', 0, 3, [item(1, 'fine')])).status, 200)
+  const comments = Array.from({ length: 20 }, (_, j) => ({ ref: `ic_c${j}`, author: 'user', kind: 'comment', body: 'x'.repeat(30000), created_at: 1 }))
+  const r = await send('sn_old', 1, 3, [item(2, 'x', comments)])
+  assert.deepEqual(r.json.result, { refused: 'too_large' })
+  assert.equal(w.b.db.prepare("SELECT COUNT(*) AS n FROM fed_replica_pages WHERE snap='sn_now'").get().n, 1, 'the loading snapshot is untouched')
+})

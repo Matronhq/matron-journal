@@ -380,7 +380,10 @@ export function applySnapshotPage(d, incoming, body, now, opts = {}) {
     return d.transaction(() => applyPage(d, incoming, body, now, opts))()
   } catch (err) {
     if (err.message !== 'replica_full' && err.message !== 'too_large') throw err
-    d.prepare('DELETE FROM fed_replica_pages WHERE fg_id=?').run(incoming.id)
+    // Only the snapshot this page belongs to (a page 0 starts its own): a
+    // page of one already replaced gives up nothing that is loading now.
+    const loading = d.prepare('SELECT snap FROM fed_replica_pages WHERE fg_id=? LIMIT 1').get(incoming.id)?.snap ?? null
+    if (body?.page === 0 || (loading !== null && loading === body?.snap)) d.prepare('DELETE FROM fed_replica_pages WHERE fg_id=?').run(incoming.id)
     return { done: null, missionId: d.prepare('SELECT id FROM fed_replica_missions WHERE fg_id=?').get(incoming.id)?.id ?? null, refused: err.message }
   }
 }
