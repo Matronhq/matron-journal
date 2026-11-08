@@ -27,7 +27,9 @@ import { notifyGrantees } from './sharing-events.js'
 import { inlineRefsToText, knowsInlineRefs, strayInlineRef } from './inline-refs.js'
 import { presentWithdrawn } from './withdrawn-comments.js'
 import { handleHandoverRoute, approvalQuestionOf, handleApprovalTap, withdrawOnClose } from './item-handover-http.js'
-import { getReplicaItem } from './federation-replica.js'
+import { getReplicaItem, getReplicaMission } from './federation-replica.js'
+
+const forbiddenReply = (res) => { json(res, 403, { error: 'forbidden' }); return true }
 
 const SORTS = ['rank', 'updated', 'acted']
 const SCOPES = ['mine', 'shared']
@@ -339,6 +341,10 @@ async function handleCreate(ctx, req, res, who) {
   if (body.private !== undefined && typeof body.private !== 'boolean') return badRequest(res)
   if (body.mission !== undefined) {
     if (body.private !== undefined) return badRequest(res)
+    // A mission shared from another journal (its copy here): the write goes
+    // to that journal (src/federation-contribute.js).
+    const copy = getReplicaMission(db, who.userId, body.mission)
+    if (copy) return ctx.federationContribute ? ctx.federationContribute.routes.handleItem(res, who, body, copy, { writableConvo }) : forbiddenReply(res)
     return handleContributedItem(ctx, res, who, body, { writableConvo })
   }
   if (!ITEM_KINDS.includes(body.kind)) return badRequest(res)
@@ -511,6 +517,10 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
       const replica = getReplicaItem(db, who.userId, idOrNum)
       if (!replica) return notFound(res)
       if (!sub && req.method === 'GET') { replyItems(who, res, 200, replica); return true }
+      // A contributor writes on it through the owner's journal.
+      if (sub && req.method === 'POST' && ctx.federationContribute) {
+        return ctx.federationContribute.routes.handleItemSub(req, res, who, replica.item, sub, subId, await readBody(req))
+      }
       json(res, 403, { error: 'forbidden' })
       return true
     }

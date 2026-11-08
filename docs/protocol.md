@@ -5521,8 +5521,8 @@ contact whose journal changed its key is `409 not_contact`; with federation
 off, `409 federation_off`. An active read share asked for at `contribute`
 is a **raise**, as on one journal: the share stays read-only while the
 raise waits on the same two yeses, and only the grantee's accept raises
-it. (What a contributor on another journal writes is not carried yet: a
-contribute share across journals reads like a read share until then.)
+it. What a contributor on another journal writes is carried by
+`mission.write` (see "Contributors across journals").
 
 The owner's journal keeps the grant in its own list (`direction: 'out'`,
 `grantee.address` the address). The grantee's journal keeps the grant it
@@ -5780,6 +5780,67 @@ the copy still shows it; otherwise it is `404`. A pull that fails is
 `502 peer_unreachable`, and the next read tries again. Kept bytes of a
 share that has ended there, or of an attachment the copy no longer shows,
 are deleted by an hourly sweep.
+
+### Contributors across journals
+
+A contact on another journal holding a share at `contribute` writes into
+the owner's mission from their own journal, through the copy they read
+(the replica's ids), with the same routes and the same limits as a
+contributor on one journal (see *Contributors*):
+
+```
+POST  /milestones {mission: <copy's ms_ id>, kind, title, body?}
+POST  /items {mission: <copy's ms_ id>, kind: task|question|decision, title, body?, labels?, links?, convo_id?}
+POST  /items/:copy's it_ id/comments {body}
+POST  /items/:copy's it_ id/close {resolution, comment?}
+POST  /items/:copy's it_ id/reopen {comment?}
+PATCH /missions/:copy's ms_ id {status}
+```
+
+Each is checked on the contributor's journal (the share active there at
+`contribute`, else `403`; a closed mission `409 blocked_by: 'closed'`;
+the fields as on one journal, `400`; no buttons, files or other fields,
+`403`/`400`), then queued and answered `202 {queued: true, write: {id,
+kind}, mission, note}`: the write is not in the copy yet. It appears there
+once the owner's journal has written it and its `mission.event` comes
+back. An agent filing an item names its conversation (`convo_id`), as on
+one journal: that is where the owner's replies go. With too much already
+waiting for that journal, `503 outbox_full` (nothing was queued).
+
+Two ops carry it, on the grant's subject (`grant:<owner's gr_ id>`), so
+they keep their order with the grant's other ops and a revoke cancels
+what waits:
+
+- `mission.write`, contributor to owner, body `{grant, kind: milestone |
+  item | comment | close | reopen | status, via: user | agent, item?,
+  fields}` (`item` the owner's `it_` id, for the three item writes;
+  `fields` the route's, as above). Before each attempt the contributor's
+  journal checks the share still lets them contribute (otherwise the write
+  is dropped quietly). The owner's journal checks the fields again and,
+  when it applies, that the grant is still active at `contribute` for that
+  address and key, the mission open and still shareable, and the item one
+  the grantee view shows. It then writes exactly what a contributor on one
+  journal would: in the owner's numbering, attributed `contributor {name:
+  <address>, via}`, with the same markers (sender `person:<address>`) and
+  turns for the owner's agents, and the grant's own `mission.event`s back
+  to every grantee. It answers `{kind, ref, num}`, the owner-side record.
+  Refusals: `400 malformed`, `403 not_contact | read_only`, `404 no_item`,
+  `409 not_active | closed | conflict` (an item already closed, or open).
+  A write refused or undelivered gives the contributor a notice ("Couldn't
+  add your milestone to mission …").
+- `item.reply_notice`, owner to contributor, body `{grant, item, action:
+  commented | closed | reopened, via, comment?}`, after the owner (or an
+  owner's agent) writes on an item the contributor filed. The owner-side
+  item keeps only the grant it came through (`contributor_grant_id`); the
+  filing conversation stays on the contributor's journal
+  (`fed_contrib_items`, keyed by the owner's item id, recorded when the
+  write's answer names it) and is never sent. That journal hands the reply
+  to the filing conversation as on one journal: an `item` marker with
+  sender `person:<owner address>`, `person {name, via}`, `shared_by
+  {user_id: 0, name: <owner address>}` and `mission_id`, from its own copy
+  of the item (the reply's `mission.event` goes first on the same
+  subject), and wakes its box. An item filed from a phone has nowhere to
+  go, and nothing is told.
 
 ## Device privacy
 
