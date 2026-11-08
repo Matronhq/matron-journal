@@ -1471,7 +1471,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // target_person and target_device_id. Every refusal that would say
         // something about the person (unknown, self, a block) is not_found.
         if (msg.target_person != null) {
-          if (msg.target_device_id != null || msg.target_convo_id != null) return fail('bad_request', 'target_person or target_device_id, not both')
+          // A session a contact on another journal shares (an fs_ id from the
+          // roster) rides with their address; nothing else names a session.
+          const remoteSession = typeof msg.target_person === 'string' && msg.target_person.includes('@') && typeof msg.target_convo_id === 'string' && msg.target_convo_id.startsWith('fs_')
+          if (msg.target_device_id != null || (msg.target_convo_id != null && !remoteSession)) return fail('bad_request', 'target_person or target_device_id, not both')
           if (typeof msg.target_person !== 'string' || !msg.target_person || msg.target_person.length > 324) return fail('bad_request', 'bad target_person')
           if (msg.topic != null && (typeof msg.topic !== 'string' || msg.topic.length > INVITE_TOPIC_MAX_CHARS)) return fail('bad_request', 'bad topic')
           if (typeof msg.justification !== 'string' || !msg.justification || msg.justification.length > INVITE_TEXT_MAX_CHARS) return fail('bad_request', 'bad justification')
@@ -1490,10 +1493,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             try {
               half = fr.parkTalk({
                 ownerUserId: conn.userId, roomId: msg.room_id, ownerDeviceId: conn.deviceId, ownerSender: `agent:${conn.name}`, ownerConvoId: msg.from_convo_id ?? null,
-                person: msg.target_person, missionRef: msg.mission ?? null,
+                person: msg.target_person, session: remoteSession ? msg.target_convo_id : null, missionRef: msg.mission ?? null,
                 topic: sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS), justification: pJustification,
               })
             } catch (err) {
+              if (err.message === 'not_found' && remoteSession) return fail('not_found', 'that session is not shared with you by this contact any more: check agent_roster')
               if (err.message === 'not_found') return fail('not_found', 'not a contact on another journal: a talk across journals needs an existing contact')
               if (err.message === 'pending') return fail('conflict', 'pending: a talk request to this person is already waiting')
               if (err.message === 'room_busy') return fail('conflict', 'room_busy: a room with another person holds just the two agents: start a new room')
