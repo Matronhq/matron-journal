@@ -23,6 +23,7 @@ import { handleConsentTap, isSharingMirror } from './sharing-http.js'
 import { transferTapAnswer } from './transfer-consent.js'
 import { consentItemTapAnswer } from './consent-answer.js'
 import { handlePeopleRoomTap, isPeopleRoomMirror } from './person-rooms-http.js'
+import { forwardMirrorReply, isPeopleConvo } from './people-replies.js'
 import { notifyGrantees } from './sharing-events.js'
 import { inlineRefsToText, knowsInlineRefs, strayInlineRef } from './inline-refs.js'
 import { presentWithdrawn } from './withdrawn-comments.js'
@@ -140,6 +141,16 @@ function replyReachesAsker(db, item) {
   return !!db.prepare(`
     SELECT 1 FROM convo_agents ca JOIN conversations c ON c.id = ca.convo_id
     WHERE ca.item_id = ? AND ca.convo_id = ? AND ca.initiator_device_id = c.agent_device_id`).get(item.id, item.origin_convo_id)
+}
+
+// A consent mirror whose replies were never meant for any agent: a contact
+// or share card's (answered on the item alone), or any card in the People
+// conversation, which has no agent at all. A user's typed reply on one goes
+// to their Coordinator (src/people-replies.js). Not a chat join's: parking
+// keeps that one with the user on purpose (replyReachesAsker).
+function readByNoOne(db, userId, item) {
+  if (item.consent == null || replyReachesAsker(db, item)) return false
+  return item.consent === 'contact' || item.consent === 'share' || isPeopleConvo(db, userId, item.origin_convo_id)
 }
 
 // The one place an 'item' marker is written. Called AFTER the item's own
@@ -687,6 +698,14 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
         // One job per blob: the same audio attached twice is one whisper run.
         for (const blobRef of audioBlobs) ctx.itemTranscription.enqueue({ commentId: out.comment.id, userId: who.userId, blobRef })
       }
+    }
+    // A typed reply on a card no agent reads (a contact or share card's
+    // item, say) goes to the user's Coordinator, and the card says so
+    // (src/people-replies.js) — kept but unheard, it looked lost. A replay
+    // runs it again: its writes are keyed to the comment, so a forward a
+    // crash cut short is finished and a finished one does nothing.
+    if (!out.seen && who.kind !== 'agent' && action == null && readByNoOne(db, who.userId, item)) {
+      forwardMirrorReply(ctx, emitMarker, who, item, out.comment)
     }
     replyItems(who, res, out.duplicate ? 200 : 201, { item: out.item, comment: seenBy(out.comment) })
     return true
