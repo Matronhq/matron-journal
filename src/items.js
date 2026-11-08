@@ -158,7 +158,7 @@ export function rowToItem(row) {
     owner_turn_started_at: turnStartedAt, owner_turn_ended_at: turnEndedAt,
     // Internal: where a contributor's replies go (src/contribute.js), never
     // on the wire — least of all to the owner.
-    contributor_user_id: _contributorUserId, contributor_convo_id: _contributorConvoId,
+    contributor_user_id: _contributorUserId, contributor_convo_id: _contributorConvoId, contributor_grant_id: _contributorGrantId,
     contributor_name: contributorName, contributor_via: contributorVia,
     ...rest
   } = row

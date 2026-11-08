@@ -841,6 +841,20 @@ CREATE TRIGGER IF NOT EXISTS fed_replica_drop AFTER UPDATE OF state ON fed_grant
   DELETE FROM fed_replica_milestones WHERE fg_id = NEW.id;
   DELETE FROM fed_replica_missions WHERE fg_id = NEW.id;
 END;
+-- Items this user filed into a mission shared from another journal
+-- (src/federation-contribute.js): the owner's item id (ref) and the
+-- conversation that filed it, where the owner's replies go. Kept here only,
+-- never sent; gone with the share.
+CREATE TABLE IF NOT EXISTS fed_contrib_items(
+  fg_id       TEXT NOT NULL,
+  ref         TEXT NOT NULL,
+  convo_id    TEXT NOT NULL,
+  created_at  INTEGER NOT NULL,
+  PRIMARY KEY(fg_id, ref)
+);
+CREATE TRIGGER IF NOT EXISTS fed_contrib_items_drop AFTER UPDATE OF state ON fed_grants_in WHEN NEW.state <> 'active' BEGIN
+  DELETE FROM fed_contrib_items WHERE fg_id = NEW.id;
+END;
 -- An agent's ask for an invite link (src/federation-invite-asks.js): parked
 -- for the user's tap, which alone mints the invite (invite_id once approved).
 CREATE TABLE IF NOT EXISTS fed_invite_asks(
@@ -2037,6 +2051,9 @@ export function openDb(path) {
   // on the grantee's tap: the level asked for, and the owner's pending_at
   // that names this sending of it (src/federation-grants.js).
   addCols('fed_grants_in', [['pending_level', 'TEXT'], ['raise_sent', 'INTEGER']])
+  // An item a contributor on another journal filed: the owner's grant it
+  // came through, so the owner's replies reach them (src/federation-contribute.js).
+  addCols('items', [['contributor_grant_id', 'TEXT']])
   addCols('fed_replica_items', [['attachments', "TEXT NOT NULL DEFAULT '[]'"]])
   // Unified search's tracker mirror (spec 2026-10-12 unified search §1).
   // Must stay LAST: it reads columns added by every migration above (e.g.

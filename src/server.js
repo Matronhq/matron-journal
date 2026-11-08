@@ -31,6 +31,7 @@ import { makeFederationHandler, makeFederationLimiter, pruneReceipts, DEFAULT_OP
 import { makeMediaHandler, makeReplicaMedia, purgeReplicaMedia } from './federation-media.js'
 import { makeContactFederation } from './federation-contacts.js'
 import { makeGrantFederation } from './federation-grants.js'
+import { makeContributeFederation } from './federation-contribute.js'
 import { makeOutbox } from './federation-outbox.js'
 import { makeConfiguredFederationClient } from './federation-client.js'
 import { makeWaker, markWakeRefused, clearWakeRefused } from './wake.js'
@@ -632,6 +633,9 @@ export function startServer({
     : null
   // Mission shares with contacts on other journals (src/federation-grants.js).
   const federationGrants = federation.enabled ? makeGrantFederation({ db, hub, pushPipeline, federation }) : null
+  // What a contributor on another journal writes, and the owner's replies
+  // (src/federation-contribute.js).
+  const federationContribute = federation.enabled ? makeContributeFederation({ db, hub, pushPipeline, waker: resolvedWaker, federation }) : null
   // POST /federation/v1 (src/federation-inbound.js): 404 while off.
   // `federationOps` is the test seam: extra ops, over the journal's own.
   // One set of abuse limits for both federation routes (federationLimits
@@ -639,7 +643,7 @@ export function startServer({
   const federationLimiter = makeFederationLimiter(federationLimits ?? {})
   const handleFederationOps = makeFederationHandler({
     db, federation, client: federationClientInUse, limiter: federationLimiter,
-    ops: { ...DEFAULT_OPS, ...(federationContacts?.inbound ?? {}), ...(federationGrants?.inbound ?? {}), ...(federationOps ?? {}) },
+    ops: { ...DEFAULT_OPS, ...(federationContacts?.inbound ?? {}), ...(federationGrants?.inbound ?? {}), ...(federationContribute?.inbound ?? {}), ...(federationOps ?? {}) },
   })
   // Attachments of read shares (src/federation-media.js): the owner's
   // signed pull, and the grantee's pull-through copy behind GET /media/:id.
@@ -650,10 +654,11 @@ export function startServer({
     : null
   // The outbox (src/federation-outbox.js): built only when federation is on.
   const federationOutbox = federation.enabled
-    ? makeOutbox({ db, hub, federation, client: federationClientInUse, ops: { ...federationContacts.outbound, ...federationGrants.outbound }, beforePass: () => federationGrants.resnapshot() })
+    ? makeOutbox({ db, hub, federation, client: federationClientInUse, ops: { ...federationContacts.outbound, ...federationGrants.outbound, ...federationContribute.outbound }, beforePass: () => federationGrants.resnapshot() })
     : null
   federationContacts?.setOutbox(federationOutbox)
   federationGrants?.setOutbox(federationOutbox)
+  federationContribute?.setOutbox(federationOutbox)
   const resolvedAlertWebhook = alertWebhook !== undefined ? alertWebhook : {
     token: process.env.MATRON_ALERT_WEBHOOK_TOKEN || null,
     username: process.env.MATRON_ALERT_WEBHOOK_USER || null,
@@ -680,7 +685,7 @@ export function startServer({
     transferMaxBytes: resolvedTransferMaxBytes, transferUserQuotaBytes: resolvedTransferUserQuotaBytes, transferMaxAwaitingPerSender: resolvedTransferMaxAwaiting, transferChunkBytes,
     hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentTransferDailyCap, consentRoutineCap, verifier,
-    github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, federationGrants, federationMedia, handleStatic, tokenBox,
+    github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, federationGrants, federationContribute, federationMedia, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
   }))
   const wss = attachWs({
