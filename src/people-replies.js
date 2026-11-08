@@ -44,13 +44,9 @@ export function isPeopleConvo(db, userId, convoId) {
   return !!db.prepare('SELECT 1 FROM conversations WHERE id=? AND owner_user_id=? AND system=?').get(convoId, userId, PEOPLE_SYSTEM)
 }
 
-// How the place it was typed links to the task: a tracker link the apps
-// open (the same /u/<name>/<num> form handover.js writes).
-const linkTo = (db, userId, item) => {
-  const name = userName(db, userId)
-  const label = `#${item.num} ${item.title}`
-  return name ? `[${label}](/u/${encodeURIComponent(name)}/${item.num})` : label
-}
+// How the place it was typed links to the task: the in-app tracker link
+// every app opens (`matron://item/<num>`, the form briefings use).
+const linkTo = (item) => `[#${item.num} ${item.title.replace(/[[\]]/g, '')}](matron://item/${item.num})`
 
 // File the task. `emitMarker` is items-http.js's (passed in: that module
 // imports this one). Returns the new item, or null with no Coordinator.
@@ -103,7 +99,7 @@ export function forwardMirrorReply(ctx, emitMarker, who, mirror, comment) {
       idemKey: `people-reply:${comment.id}`,
     })
     const note = task
-      ? `Sent to your Coordinator: ${linkTo(db, who.userId, task)}. Replies on this card reach no other agent.`
+      ? `Sent to your Coordinator: ${linkTo(task)}. Replies on this card reach no other agent.`
       : 'Nobody reads replies on this card, and you have no Coordinator set, so this was not passed on. Ask in an agent\'s conversation instead, or set a Coordinator.'
     noteOnMirror(ctx, who.userId, fresh, note, `people-reply-note:${comment.id}`)
     return task
@@ -127,7 +123,7 @@ export function forwardPeopleMessage(ctx, emitMarker, who, { convoId, seq, text 
       idemKey: `people-send:${convoId}:${seq}`,
     })
     const body = task
-      ? `Sent to your Coordinator: ${linkTo(db, who.userId, task)}. No agent reads this conversation.`
+      ? `Sent to your Coordinator: ${linkTo(task)}. No agent reads this conversation.`
       : 'No agent reads this conversation, and you have no Coordinator set, so this was not passed on. Ask in an agent\'s conversation instead, or set a Coordinator.'
     appendAndBroadcast(db, hub, { userId: who.userId, convoId, sender: JOURNAL, type: 'text', payload: { body } })
     return task

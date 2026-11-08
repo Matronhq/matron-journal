@@ -94,7 +94,7 @@ test('a typed reply on a share card goes to the Coordinator as the user\'s task,
   assert.equal(thread.item.state, 'open')
   assert.equal(thread.item.awaiting, 'user')
   const note = thread.comments.at(-1)
-  assert.match(note.body, /^Sent to your Coordinator: \[#\d+ Reply on a card: .*\]\(\/u\/bob\/\d+\)/)
+  assert.match(note.body, /^Sent to your Coordinator: \[#\d+ Reply on a card: .*\]\(matron:\/\/item\/\d+\)/)
   assert.equal(note.author, 'agent')
   // The line's marker stays client-only, like every write to a mirror.
   const noteMarker = w.ws.bobPhone.journal().find((f) => f.type === 'item' && f.payload.item_id === mirror.id && f.payload.comment?.id === note.id)
@@ -132,7 +132,7 @@ test('a message in People goes to the Coordinator, with a line in People; a file
 
   w.ws.bobPhone.send({ op: 'send', convo_id: people, type: 'text', payload: { body: 'Who is alice?' }, local_id: 'l1' })
   const line = await w.ws.bobPhone.waitFor((f) => f.kind === 'journal' && f.convo_id === people && f.sender === 'journal' && f.type === 'text')
-  assert.match(line.payload.body, /^Sent to your Coordinator: \[#\d+ Message in People: Who is alice\?\]\(\/u\/bob\/\d+\)/)
+  assert.match(line.payload.body, /^Sent to your Coordinator: \[#\d+ Message in People: Who is alice\?\]\(matron:\/\/item\/\d+\)/)
   const [task] = await coordTasks(w)
   assert.equal(task.title, 'Message in People: Who is alice?')
   assert.match(task.body, /in their People conversation/)

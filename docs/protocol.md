@@ -4631,7 +4631,7 @@ user's Coordinator (`src/people-replies.js`):
   (idempotency keys `people-reply:<comment id>`, `people-send:<convo>:<seq>`).
 - **A line where it was typed**: a journal comment on the mirror (author
   `agent`, device 0, client-only marker, status unchanged) or a journal
-  `text` in People, reading `Sent to your Coordinator: [#N <title>](/u/<name>/N)`.
+  `text` in People, reading `Sent to your Coordinator: [#N <title>](matron://item/N)`.
   With no Coordinator set, the line says nobody reads it and nothing is
   filed.
 
