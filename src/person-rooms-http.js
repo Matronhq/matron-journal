@@ -317,7 +317,9 @@ async function handleFedRoom(ctx, req, res, who, id, sub) {
         throw err
       }
     } else {
-      const choice = body.decision === 'decline' ? 'decline' : talkTargetOf(body)
+      // A room aimed at a session this user shares has one target: that
+      // session, while the share stands (answerGuest checks it).
+      const choice = body.decision === 'decline' ? 'decline' : (r.session_ref ? 'shared' : talkTargetOf(body))
       if (!choice) return badRequest(res)
       out = fr.answerGuest(ctx, who, r, choice)
     }
