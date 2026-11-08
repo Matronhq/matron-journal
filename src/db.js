@@ -885,6 +885,7 @@ CREATE TABLE IF NOT EXISTS fed_rooms(
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL,
   answered_at   INTEGER,
+  sent_at       INTEGER,
   UNIQUE(role, peer_host, ref)
 );
 CREATE INDEX IF NOT EXISTS idx_fed_rooms_room ON fed_rooms(room_id);

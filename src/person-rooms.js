@@ -291,6 +291,10 @@ export function checkRoomFree(db, { ownerUserId, roomId, ownerDeviceId, ownerSen
   // stay a twin (isGuestRoom), and a fresh room is one agent_chat_start
   // away.
   if (db.prepare('SELECT 1 FROM person_rooms WHERE owner_room_id=? AND guest_room_id IS NOT NULL').get(roomId)) fail('room_busy')
+  // A room with a contact on another journal (src/federation-rooms.js)
+  // holds the room the same way: while it lives, once its ask left this
+  // journal, and always on the side that was asked.
+  if (db.prepare(`SELECT 1 FROM fed_rooms WHERE room_id=? AND (state IN ${LIVE_SQL} OR sent_at IS NOT NULL OR role='guest')`).get(roomId)) fail('room_busy')
   if (!isFreshRoom(db, { userId: ownerUserId, roomId, ownerSender })) fail('not_fresh')
   // Exactly two agents: the guest consented to talking with this one
   // session, not to whoever else the owner later adds.

@@ -199,8 +199,11 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
       if (db.prepare(`SELECT 1 FROM fed_rooms WHERE role='owner' AND device_id=? AND contact_id=? AND state IN ${LIVE_SQL}`).get(ownerDeviceId, own.id)) fail('pending')
       if (isGuestRoom(db, roomId) || fedLinked(db, roomId)) fail('room_busy')
       if (db.prepare(`SELECT 1 FROM person_rooms WHERE owner_room_id=? AND state IN ${LIVE_SQL}`).get(roomId)) fail('room_busy')
-      if (db.prepare('SELECT 1 FROM fed_rooms WHERE room_id=?').get(roomId)) fail('room_busy')
+      // An earlier ask from this room that never left this journal (Cancel,
+      // or no answer) is what a new ask replaces, as on one journal; one
+      // that was sent keeps the room (checkRoomFree).
       checkRoomFree(db, { ownerUserId, roomId, ownerDeviceId, ownerSender })
+      db.prepare(`DELETE FROM fed_rooms WHERE room_id=? AND role='owner' AND sent_at IS NULL AND state NOT IN ${LIVE_SQL}`).run(roomId)
       let missionId = null
       if (missionRef != null) {
         const m = getMission(db, ownerUserId, missionRef, { excludePrivateOwned: true })
@@ -263,7 +266,7 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
       if (at - cur.updated_at > OWN_ASK_TTL_MS) { setState(db, cur.id, 'expired', at); return 'expired' }
       if (decision === 'decline') { setState(db, cur.id, 'declined', at, `, answered_at=${Number(at)}, ended_by='owner'`); return 'withdrawn' }
       if (!contactLive(db, cur)) { setState(db, cur.id, 'withdrawn', at, ", ended_by='contact_removed'"); return 'unavailable' }
-      setState(db, cur.id, 'awaiting_guest', at, `, answered_at=${Number(at)}`)
+      setState(db, cur.id, 'awaiting_guest', at, `, answered_at=${Number(at)}, sent_at=${Number(at)}`)
       const m = cur.mission_id ? db.prepare("SELECT id FROM grants WHERE subject_kind='mission' AND subject_id=? AND contact_id=? AND state='active' AND level <> 'owner'").get(cur.mission_id, cur.contact_id) : null
       enqueue(db, {
         userId: cur.user_id, from: myAddress(cur), to: addressOf(cur), op: INVITE_OP, subject: subjectOf(cur.ref), now: at,

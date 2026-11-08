@@ -236,3 +236,22 @@ test('the owner ending the room from their phone ends it on both journals', asyn
   assert.deepEqual(left.person, { name: 'alice@a.example' })
   assert.equal(w.b.db.prepare("SELECT state FROM convo_agents WHERE convo_id=?").get(half(w.b).room_id).state, 'left')
 })
+
+test('a room holding a talk across journals takes no other person; a cancelled ask leaves the room free', async (t) => {
+  const w = await rooms(t)
+  const { createUser } = await import('../src/auth.js')
+  await createUser(w.a.db, 'carol', 'pw')
+  // Cancel: nothing left this journal, so the same room can ask again.
+  w.ws.alice.send({ op: 'agent_invite', room_id: 'room', target_person: 'bob@b.example', justification: 'x', from_convo_id: 'room' })
+  await w.ws.alice.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  await tick()
+  const own = await roomItem(w.phones.alice)
+  assert.equal((await w.phones.alice(`/items/${own.id}/comments`, post({ action: 'Cancel' }))).status, 200)
+  await askAndSend(w)
+  assert.equal(w.a.db.prepare("SELECT COUNT(*) AS n FROM fed_rooms WHERE room_id='room'").get().n, 1)
+  // Sent: a same-journal talk from this room is refused.
+  w.ws.alice.send({ op: 'agent_invite', room_id: 'room', target_person: 'carol', justification: 'y', from_convo_id: 'room' })
+  const err = await w.ws.alice.waitFor((f) => f.op === 'error' && f.ref === 'agent_invite')
+  assert.equal(err.code, 'conflict')
+  assert.match(err.message ?? err.detail ?? '', /room_busy/)
+})
