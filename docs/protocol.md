@@ -4431,9 +4431,9 @@ A contact is one row per side; anything is shared only while both rows are
 `active`. `address` is `user` on this journal and `user@journal` across
 journals. A contact on another journal is made only by an invite link
 (see "Contacts across journals"); its other row lives on that journal.
-A contact on another journal can be offered a mission to read (see
-"Shares across journals"); contribute and hand-over shares, and rooms, are
-same-journal only for now (`409 level_unavailable` for a share).
+A contact on another journal can be offered a mission to read or to
+contribute to (see "Shares across journals"); hand-over shares and rooms
+are same-journal only for now (`409 level_unavailable` for a hand-over).
 
 | State | Meaning |
 |---|---|
@@ -5512,12 +5512,17 @@ new key for that contact.
 
 ### Shares across journals
 
-A mission can be shared **read-only** with a contact on another journal.
-The owner asks exactly as for any contact (`POST /missions/:id/shares
-{contact: 'bob@b.example', level: 'read'}`), and an agent's ask parks for
-the owner's tap as before. `level` `contribute` or `owner`, and any
-project share, are `409 level_unavailable`; a contact whose journal changed
-its key is `409 not_contact`; with federation off, `409 federation_off`.
+A mission can be shared **read-only** or **to contribute to** with a
+contact on another journal. The owner asks exactly as for any contact
+(`POST /missions/:id/shares {contact: 'bob@b.example', level: 'read' |
+'contribute'}`), and an agent's ask parks for the owner's tap as before.
+`level` `owner`, and any project share, are `409 level_unavailable`; a
+contact whose journal changed its key is `409 not_contact`; with federation
+off, `409 federation_off`. An active read share asked for at `contribute`
+is a **raise**, as on one journal: the share stays read-only while the
+raise waits on the same two yeses, and only the grantee's accept raises
+it. (What a contributor on another journal writes is not carried yet: a
+contribute share across journals reads like a read share until then.)
 
 The owner's journal keeps the grant in its own list (`direction: 'out'`,
 `grantee.address` the address). The grantee's journal keeps the grant it
@@ -5540,9 +5545,9 @@ lives on the owner's journal.
 Three ops carry a grant, and `mission.snapshot` and `mission.event`
 (below) what it shares, all on the subject `grant:<owner's gr_ id>`:
 
-- `grant.offer`, owner to grantee, body `{grant, level: 'read', sent,
-  mission: {num, title}, preview: {milestones, items, comments,
-  attachments}}`, sent
+- `grant.offer`, owner to grantee, body `{grant, level: 'read' |
+  'contribute', sent, mission: {num, title}, preview: {milestones, items,
+  comments, attachments}, raise?: {sent}}`, sent
   when the ask is sent (a client's ask at once, an agent's on the owner's
   approval). The receiver needs a live contact for the sender under the key
   that signed (`403 not_contact`). A grant it already holds live is the
@@ -5551,6 +5556,19 @@ Three ops carry a grant, and `mission.snapshot` and `mission.event`
   their tap refuses another, `409 too_many_offers`: each offer is a card.
   Refused or undelivered for
   7 days, the owner's grant goes `expired` and the owner gets a notice.
+- **A raise** is a `grant.offer` with `raise: {sent}` (the owner's
+  `pending_at`) for a share the grantee holds active. It raises one card
+  and tracker mirror ("invites you to contribute to a mission you read",
+  card payload `raise: true, from_level`), and the grantee's incoming grant
+  shows `pending_level` / `pending_state: 'pending'` meanwhile. One no newer
+  than the last heard, or for the level the share already has, changes
+  nothing; a share not active there is not raised. The answer is
+  `grant.answer {grant, decision, raise: <level>}`: an accept raises both
+  sides, a decline leaves the share as it was. An accept the owner's
+  journal refuses (`409 not_pending`, the share ended or the raise was
+  answered meanwhile) or that never gets there puts the grantee's share
+  back at its old level, with a notice; a raise the grantee's journal
+  refuses or never gets drops on the owner's side, with a notice.
 - `grant.answer`, grantee to owner, body `{grant, decision}`. The
   grantee's row moves at the tap; the owner's grant moves when the answer
   applies, and only while it is still `pending` (`409 not_pending`
