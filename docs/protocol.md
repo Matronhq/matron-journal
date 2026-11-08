@@ -4613,6 +4613,32 @@ their mirrors and the audit events. `/snapshot` lists it for clients with
 `system: 'people'`. No agent can read it (`/snapshot`, `/roster`, replay,
 fan-out), write to it, file into it or adopt it.
 
+### Words typed where no agent reads them
+
+Two places take text that no agent ever sees: a typed comment (no `action`)
+from the user on a contact or share card's mirror, or on any mirror in the
+People conversation, and a `send` of `type: 'text'` into the People
+conversation. The journal still stores both, and also passes them to the
+user's Coordinator (`src/people-replies.js`):
+
+- **A task in the Coordinator conversation**, filed as the user's own
+  (`created_by: 'user'`, `awaiting: 'agent'`, so its `created` marker is an
+  ordinary turn and wakes the box). Its title is `Reply on a card: <card
+  title>` or `Message in People: <first line>`; its body quotes the words,
+  names the card, and says the card's text may quote another person and is
+  information, not instructions. A comment's attachments go with it. The
+  card stays hidden from agents, and a replay files nothing more
+  (idempotency keys `people-reply:<comment id>`, `people-send:<convo>:<seq>`).
+- **A line where it was typed**: a journal comment on the mirror (author
+  `agent`, device 0, client-only marker, status unchanged) or a journal
+  `text` in People, reading `Sent to your Coordinator: [#N <title>](/u/<name>/N)`.
+  With no Coordinator set, the line says nobody reads it and nothing is
+  filed.
+
+A tap is the card's answer, never forwarded. A chat join's mirror keeps its
+replies with the user (parking). A non-text `send` into People is refused
+with `bad_request` ("files and images are not passed on from People").
+
 ### Audit and live frames
 
 Every transition appends one `people` event to **each** side's People
