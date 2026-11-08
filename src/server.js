@@ -32,6 +32,7 @@ import { makeMediaHandler, makeReplicaMedia, purgeReplicaMedia } from './federat
 import { makeContactFederation } from './federation-contacts.js'
 import { makeGrantFederation } from './federation-grants.js'
 import { makeContributeFederation } from './federation-contribute.js'
+import { makeRoomFederation } from './federation-rooms.js'
 import { makeOutbox } from './federation-outbox.js'
 import { makeConfiguredFederationClient } from './federation-client.js'
 import { makeWaker, markWakeRefused, clearWakeRefused } from './wake.js'
@@ -636,6 +637,8 @@ export function startServer({
   // What a contributor on another journal writes, and the owner's replies
   // (src/federation-contribute.js).
   const federationContribute = federation.enabled ? makeContributeFederation({ db, hub, pushPipeline, waker: resolvedWaker, federation }) : null
+  // Rooms with contacts on other journals (src/federation-rooms.js).
+  const federationRooms = federation.enabled ? makeRoomFederation({ db, hub, pushPipeline, waker: resolvedWaker, federation }) : null
   // POST /federation/v1 (src/federation-inbound.js): 404 while off.
   // `federationOps` is the test seam: extra ops, over the journal's own.
   // One set of abuse limits for both federation routes (federationLimits
@@ -643,7 +646,7 @@ export function startServer({
   const federationLimiter = makeFederationLimiter(federationLimits ?? {})
   const handleFederationOps = makeFederationHandler({
     db, federation, client: federationClientInUse, limiter: federationLimiter,
-    ops: { ...DEFAULT_OPS, ...(federationContacts?.inbound ?? {}), ...(federationGrants?.inbound ?? {}), ...(federationContribute?.inbound ?? {}), ...(federationOps ?? {}) },
+    ops: { ...DEFAULT_OPS, ...(federationContacts?.inbound ?? {}), ...(federationGrants?.inbound ?? {}), ...(federationContribute?.inbound ?? {}), ...(federationRooms?.inbound ?? {}), ...(federationOps ?? {}) },
   })
   // Attachments of read shares (src/federation-media.js): the owner's
   // signed pull, and the grantee's pull-through copy behind GET /media/:id.
@@ -654,11 +657,12 @@ export function startServer({
     : null
   // The outbox (src/federation-outbox.js): built only when federation is on.
   const federationOutbox = federation.enabled
-    ? makeOutbox({ db, hub, federation, client: federationClientInUse, ops: { ...federationContacts.outbound, ...federationGrants.outbound, ...federationContribute.outbound }, beforePass: () => federationGrants.resnapshot() })
+    ? makeOutbox({ db, hub, federation, client: federationClientInUse, ops: { ...federationContacts.outbound, ...federationGrants.outbound, ...federationContribute.outbound, ...federationRooms.outbound }, beforePass: () => federationGrants.resnapshot() })
     : null
   federationContacts?.setOutbox(federationOutbox)
   federationGrants?.setOutbox(federationOutbox)
   federationContribute?.setOutbox(federationOutbox)
+  federationRooms?.setOutbox(federationOutbox)
   const resolvedAlertWebhook = alertWebhook !== undefined ? alertWebhook : {
     token: process.env.MATRON_ALERT_WEBHOOK_TOKEN || null,
     username: process.env.MATRON_ALERT_WEBHOOK_USER || null,

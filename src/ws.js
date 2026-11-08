@@ -20,6 +20,7 @@ import { onContactAskExpired, onGrantAskExpired, notifyGrantees } from './sharin
 import { sweepExpiredHandovers } from './item-handover-http.js'
 import { parkPersonRoom, linkOfRoom, isGuestRoom, onGuestAgentAnswer, onGuestInviteExpired, expireSessionShareAsks, LIVE_ROOM_STATES } from './person-rooms.js'
 import { parkTalk } from './talk-requests.js'
+import { fedRoomsOf, fedLinked, isFedGuestRoom } from './federation-rooms.js'
 import { ownerTalkAsk, sweepTalkAsks } from './talk-requests-events.js'
 import { onPersonRoomOutcome, onGuestAck, onGuestAnswered, onGuestExpired, endAndNotify, copyRoomMessage, onShareAnswered } from './person-rooms-events.js'
 import { predictSpawnRun } from './spawn-model.js'
@@ -332,6 +333,10 @@ export function attachWs({
           try { onGuestExpired({ db, hub }, onGuestInviteExpired(db, { guestRoomId: row.convo_id })) } catch (err) { console.error('person room: invite expiry failed', err) }
           continue
         }
+        if (isFedGuestRoom(db, row.convo_id)) {
+          try { fedRoomsOf(db)?.onGuestInviteExpired(row.convo_id) } catch (err) { console.error('federation room: invite expiry failed', err) }
+          continue
+        }
         hub.sendToDevice(convo.owner_user_id, row.initiator_device_id, {
           kind: 'invite', event: 'answer', room_id: row.convo_id,
           peer_device_id: row.agent_device_id, accept: false, reason: 'expired',
@@ -379,6 +384,7 @@ export function attachWs({
         for (const row of expireInviteAsks(db)) onInviteAskExpired({ db, hub }, row)
         // Room asks, session or talk (the owner's 24 h, a talk guest's week).
         sweepTalkAsks({ db, hub, broker, spawnStartTimeoutMs, spawnWakeWaitMs, waker })
+        fedRoomsOf(db)?.sweep({ db, hub, pushPipeline, broker, spawnStartTimeoutMs, spawnWakeWaitMs, waker })
         for (const row of expireSessionShareAsks(db)) onShareAnswered({ db, hub }, null, { outcome: 'expired', share: { ...row, state: 'expired' }, before: row })
       } catch (err) {
         console.error('sharing: ask expiry sweep failed', err)
@@ -866,7 +872,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
   // A room taking part in a room with another person (either side) holds
   // exactly two agents: no other invite or join, either way.
   const personLinked = (roomId) => {
-    if (isGuestRoom(db, roomId)) return true
+    if (isGuestRoom(db, roomId) || fedLinked(db, roomId)) return true
     const hit = linkOfRoom(db, roomId)
     return !!hit && LIVE_ROOM_STATES.includes(hit.link.state)
   }
@@ -874,6 +880,8 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
   const copyOut = (args, r) => {
     if (!r || r.duplicate) return
     copyRoomMessage(personCtx, { userId: args.userId, convoId: args.convoId, sender: args.sender, type: args.type, payload: args.payload, seq: r.seq })
+    // A room with a contact on another journal: their journal's copy.
+    fedRoomsOf(db)?.copyOut({ userId: args.userId, convoId: args.convoId, sender: args.sender, type: args.type, payload: args.payload, seq: r.seq })
   }
   // Membership convo_meta fan (spec: multi-agent room tags): live clients
   // re-chip a room the moment its membership changes. Best-effort like every
@@ -1464,7 +1472,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // something about the person (unknown, self, a block) is not_found.
         if (msg.target_person != null) {
           if (msg.target_device_id != null || msg.target_convo_id != null) return fail('bad_request', 'target_person or target_device_id, not both')
-          if (typeof msg.target_person !== 'string' || !msg.target_person || msg.target_person.length > 64) return fail('bad_request', 'bad target_person')
+          if (typeof msg.target_person !== 'string' || !msg.target_person || msg.target_person.length > 324) return fail('bad_request', 'bad target_person')
           if (msg.topic != null && (typeof msg.topic !== 'string' || msg.topic.length > INVITE_TOPIC_MAX_CHARS)) return fail('bad_request', 'bad topic')
           if (typeof msg.justification !== 'string' || !msg.justification || msg.justification.length > INVITE_TEXT_MAX_CHARS) return fail('bad_request', 'bad justification')
           if (msg.mission != null && !((Number.isInteger(msg.mission) && msg.mission > 0) || (typeof msg.mission === 'string' && msg.mission.length > 0 && msg.mission.length <= 64))) {
@@ -1474,6 +1482,32 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           if (from.err) return fail(...from.err)
           const pJustification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
           if (!pJustification) return fail('bad_request', 'bad justification')
+          // An address: a contact on another journal (src/federation-rooms.js).
+          if (msg.target_person.includes('@')) {
+            const fr = fedRoomsOf(db)
+            if (!fr) return fail('conflict', 'federation_off: this journal does not federate with other journals, so it cannot reach someone on another one')
+            let half
+            try {
+              half = fr.parkTalk({
+                ownerUserId: conn.userId, roomId: msg.room_id, ownerDeviceId: conn.deviceId, ownerSender: `agent:${conn.name}`, ownerConvoId: msg.from_convo_id ?? null,
+                person: msg.target_person, missionRef: msg.mission ?? null,
+                topic: sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS), justification: pJustification,
+              })
+            } catch (err) {
+              if (err.message === 'not_found') return fail('not_found', 'not a contact on another journal: a talk across journals needs an existing contact')
+              if (err.message === 'pending') return fail('conflict', 'pending: a talk request to this person is already waiting')
+              if (err.message === 'room_busy') return fail('conflict', 'room_busy: a room with another person holds just the two agents: start a new room')
+              if (err.message === 'too_many_asks') return fail('conflict', 'too_many_asks: too many requests awaiting user approval')
+              if (err.message === 'no_mission') return fail('not_found', 'no such mission')
+              if (err.message === 'mission_not_shared') return fail('conflict', 'mission_not_shared: that mission is not shared with this person: share it first')
+              if (err.message === 'private_box') return fail('forbidden', 'private_box: a private box cannot open a room with another person')
+              if (err.message === 'not_fresh') return fail('conflict', 'not_fresh: a room with another person must be a new room: everything said in it crosses to them (use agent_chat_start)')
+              throw err
+            }
+            fr.ownerAsk(personCtx, half)
+            conn.ws.send(JSON.stringify({ kind: 'invite', event: 'delivered', room_id: msg.room_id, target_person: msg.target_person, room_link_id: half.id }))
+            break
+          }
           let link
           try {
             link = parkTalk(db, {
@@ -1760,6 +1794,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           // an ordinary turn, and the guest agent's words belong in the room.
           onGuestAnswered(personCtx, onGuestAgentAnswer(db, { guestRoomId: msg.room_id, accept: msg.accept }), msg.accept, msg.accept ? null : 'refused')
         }
+        if (isFedGuestRoom(db, msg.room_id)) fedRoomsOf(db)?.onGuestAgentAnswer(msg.room_id, msg.accept)
         break
       }
       case 'agent_leave': {
@@ -1783,6 +1818,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         }
         // The owner of a room with another person leaving ends that room on
         // both sides (and withdraws an ask still waiting on either person).
+        // A room with a contact on another journal: its owner leaving ends
+        // it on both journals. Nobody else is in it here.
+        if (room.agent_device_id === conn.deviceId && !hasParticipants(db, msg.room_id) && fedRoomsOf(db)?.onAgentLeft(msg.room_id, conn.deviceId)) break
         if (room.agent_device_id === conn.deviceId) {
           const hit = linkOfRoom(db, msg.room_id)
           if (hit?.side === 'owner' && LIVE_ROOM_STATES.includes(hit.link.state)) {
@@ -1852,6 +1890,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (isGuestRoom(db, msg.room_id)) {
           const hit = linkOfRoom(db, msg.room_id)
           if (hit && LIVE_ROOM_STATES.includes(hit.link.state)) endAndNotify(personCtx, hit.link.id, 'guest_agent')
+          break
+        }
+        if (isFedGuestRoom(db, msg.room_id)) {
+          fedRoomsOf(db)?.onAgentLeft(msg.room_id, conn.deviceId)
           break
         }
         // A participant left. While other members are still joined the room

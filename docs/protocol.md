@@ -5875,6 +5875,78 @@ what waits:
   subject), and wakes its box. An item filed from a phone has nowhere to
   go, and nothing is told.
 
+### Rooms across journals
+
+A talk request (see *Rooms between people*) can go to a contact on another
+journal: the agent's `agent_invite` names them by address,
+`target_person: "bob@b.example"` (an address up to 324 characters). Only
+an existing contact on another journal can be asked (a live contact,
+pinned to the key their journal serves): there is no contact-by-talk
+across journals, and anyone else is `not_found`. With federation off the
+ask is `conflict federation_off`. The room checks are the same as on one
+journal (a fresh room, just the two agents, the parked-asks cap, an
+attached mission already shared with them at `read` or `contribute`), and
+so are the two taps: the owner's **Send** or **Cancel** on their agent's
+ask, then the guest's choice of where their side talks (**New session**,
+**My Coordinator**, **Pick a session**, or **Decline**), each on a
+client-only card and mirror (`consent: 'room'`, `remote: true` on the
+card). Neither person's Coordinator can tap either.
+
+Each journal keeps its own half of the room (`fed_rooms`): the owner's
+journal the asking room, the guest's journal the room it creates when the
+guest chooses. That room has no agent of its own: the guest's agent is
+invited into it by the journal (`from_device_id: 0`), and the invite frame
+names the other side as `person {name: <address>}`. Neither journal learns
+the other side's rooms, devices or sessions. Four ops carry it, all on the
+subject `room:<owner journal's fr_ id>`, so each side's ops arrive in
+order:
+
+- `room.invite`, owner to guest, body `{room, topic, justification,
+  mission?: {grant}}` (`grant` the owner's `gr_` id, which the guest's
+  journal maps to its copy of the mission). Refusals: `400 malformed`,
+  `403 not_contact`, `429 too_many_asks` (five of that contact's talk
+  requests already waiting on this user).
+- `room.answer`, guest to owner, body `{room, outcome}`: `accepted`,
+  `declined` or `expired` (the guest person, after their week), then
+  `joined`, `agent_declined` or `agent_expired` (their agent's answer to
+  its invite). The owner's agent hears `accepted`, then `joined`, as a
+  same-journal owner hears the guest accept and then the guest's agent
+  join (`invite answer accept: true`); any refusal as `invite answer
+  accept: false` with `reason: refused` or `expired`. A late or repeated
+  answer to a room that moved on changes nothing. On `accepted` the
+  owner's journal sends what its room said so far (at most 50 messages,
+  the room being fresh), so the guest's agent finds it on joining.
+- `room.message`, either way, body `{room, n, body, via}`: a text
+  message, `n` the sender's own event seq (the receiver's idempotency
+  key), cut at 16,000 characters. It lands in the other side's room with
+  sender `person:<address>` and payload `{body, person: {name: <address>},
+  via}`, exactly a copy on one journal, so the bridge starts the same
+  restricted turn. Files and images do not cross (`publish` refuses them
+  in either room).
+- `room.end`, either way, body `{room, by}`: `owner_agent` or
+  `owner_user` from the owner's side, `guest_agent` or `guest_user` from
+  the guest's. Either agent leaving (`agent_leave`) or either person
+  ending it (`DELETE /person-rooms/:id`) ends both halves.
+
+Removing or blocking the contact ends every room with them on both
+journals: each journal ends its own half when its contact ends. An op that
+cannot be delivered (the other journal refused it, or could not be reached
+for 7 days) ends the room on the sending side with a notice, "Room with
+`<address>` ended"; a journal that does not know these ops yet answers
+`400 unknown_op`, and the notice says it "does not take rooms with other
+journals yet".
+
+`GET /person-rooms?room_id=` answers for either half as for a room on one
+journal, with `person` the other side's address, `kind: 'talk'`, `remote:
+true` and `mission` the attached mission as this side reads it: the
+owner's own (while it is still shared with them), or on the guest's side
+their copy (`owner` the owner's address, `level` the share's). `GET
+/person-rooms` lists both kinds. `POST /person-rooms/:id/answer` takes the
+same bodies as a talk request's.
+
+Sessions shared with a contact on another journal (their roster, and asks
+for a room with a session they share) are not available yet.
+
 ## Device privacy
 
 A per-device flag that makes an agent device — and what it manages — invisible

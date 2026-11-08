@@ -87,7 +87,8 @@ export function parkedPeopleAsks(db, deviceId) {
       (SELECT COUNT(*) FROM contacts WHERE origin_device_id=@d AND state='awaiting_user')
     + (SELECT COUNT(*) FROM grants WHERE origin_device_id=@d AND (state='awaiting_owner' OR pending_state='awaiting_owner'))
     + (SELECT COUNT(*) FROM session_shares WHERE origin_device_id=@d AND state='awaiting_user')
-    + (SELECT COUNT(*) FROM person_rooms WHERE owner_device_id=@d AND state='awaiting_owner') AS n`).get({ d: deviceId }).n
+    + (SELECT COUNT(*) FROM person_rooms WHERE owner_device_id=@d AND state='awaiting_owner')
+    + (SELECT COUNT(*) FROM fed_rooms WHERE role='owner' AND device_id=@d AND state='awaiting_owner') AS n`).get({ d: deviceId }).n
 }
 
 // `by` 'agent' parks for the user's approval; 'user' (a client) is the tap.

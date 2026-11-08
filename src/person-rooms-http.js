@@ -32,6 +32,7 @@ import {
 import { shareAsk, onShareAnswered, onShareEnded, onPersonRoomOutcome, endAndNotify } from './person-rooms-events.js'
 import { answerTalkOwner, answerTalkGuest, pickedConvo, CHOICE } from './talk-requests.js'
 import { onTalkOwnerOutcome, onTalkGuestOutcome, talkQuestionActions, recordFollowUpTap } from './talk-requests-events.js'
+import { fedRoomsOf, getFedRoom, fedRoomOfRoom, fedRoomRow, listFedRooms } from './federation-rooms.js'
 
 const forbidden = (res) => { json(res, 403, { error: 'forbidden' }); return true }
 const SHARE_CONFLICTS = new Set(['private_session', 'not_contact', 'pending', 'too_many_asks', 'not_pending', 'not_active'])
@@ -135,6 +136,16 @@ function handleTalkTap(ctx, res, who, item, action, replyTo, link) {
 // a talk request's follow-up question (the comment-actions contract).
 export function handlePeopleRoomTap(ctx, res, who, item, action, replyTo = null) {
   const { db } = ctx
+  // A room with a contact on another journal (src/federation-rooms.js).
+  if (item.consent === 'room') {
+    const fr = fedRoomsOf(db)
+    const r = fr?.handleTap(ctx, res, who, item, action, replyTo)
+    if (r) {
+      if (r.status !== 200) { json(res, r.status, r.body); return true }
+      json(res, 200, { item: getItem(db, who.userId, item.id) ?? item, comment: r.comment ?? r.closed?.comment ?? null, ...r.body })
+      return true
+    }
+  }
   if (item.consent === 'room') {
     const row = db.prepare('SELECT id, kind FROM person_rooms WHERE (owner_user_id=@u AND owner_item_id=@i) OR (guest_user_id=@u AND guest_item_id=@i)').get({ u: who.userId, i: item.id })
     if (row?.kind === 'talk') return handleTalkTap(ctx, res, who, item, action, replyTo, getPersonRoom(db, row.id))
@@ -223,7 +234,7 @@ async function handleRooms(ctx, req, res, url, who) {
     // about a room it is in, by that room's id.
     if (roomId == null) {
       if (who.kind !== 'client') return forbidden(res)
-      json(res, 200, { person_rooms: listPersonRooms(db, who.userId) })
+      json(res, 200, { person_rooms: [...listPersonRooms(db, who.userId), ...listFedRooms(db, who.userId)] })
       return true
     }
     // The bridge's question at the start of a turn the other person
@@ -231,6 +242,12 @@ async function handleRooms(ctx, req, res, url, who) {
     // turn may use. An agent asks only about a room it may write into; an
     // ordinary room, or one it is not in, is the same 404.
     if (who.kind === 'agent' && !authorizeAgentWrite(db, who.userId, who.deviceId, roomId)) return notFound(res)
+    const fed = fedRoomOfRoom(db, roomId)
+    if (fed) {
+      if (fed.user_id !== who.userId) return notFound(res)
+      json(res, 200, { person_room: fedRoomRow(db, fed) })
+      return true
+    }
     const hit = linkOfRoom(db, roomId)
     if (!hit) return notFound(res)
     const mine = hit.side === 'owner' ? hit.link.owner_user_id === who.userId : hit.link.guest_user_id === who.userId
@@ -244,6 +261,7 @@ async function handleRooms(ctx, req, res, url, who) {
   if (who.kind !== 'client') return forbidden(res)
   let id
   try { id = decodeURIComponent(m[1]) } catch { return badRequest(res) }
+  if (id.startsWith('fr_')) return handleFedRoom(ctx, req, res, who, id, m[2])
   const link = getPersonRoom(db, id)
   const side = link?.owner_user_id === who.userId ? 'owner' : (link?.guest_user_id === who.userId && guestSees(db, link) ? 'guest' : null)
   if (!link || !side) return notFound(res)
@@ -274,6 +292,38 @@ async function handleRooms(ctx, req, res, url, who) {
   const before = endAndNotify(ctx, id, side === 'owner' ? 'owner_user' : 'guest_user', ['awaiting_owner', 'awaiting_guest', 'starting'].includes(link.state) ? 'withdrawn' : 'left')
   if (!before) return conflict(res, { blocked_by: 'not_active' })
   json(res, 200, { person_room: personRoomRow(getPersonRoom(db, id), side) })
+  return true
+}
+
+// GET or DELETE one room with a contact on another journal, or its answer
+// (POST /person-rooms/:id/answer, the same body as a talk request's).
+async function handleFedRoom(ctx, req, res, who, id, sub) {
+  const { db } = ctx
+  const fr = fedRoomsOf(db)
+  const r = getFedRoom(db, id)
+  if (!fr || !r || r.user_id !== who.userId) return notFound(res)
+  if (sub === 'answer') {
+    if (req.method !== 'POST') return false
+    const body = await readBody(req)
+    if (!DECISIONS.has(body.decision)) return badRequest(res)
+    let out
+    if (r.role === 'owner') {
+      try { out = fr.answerOwner(ctx, who, r, body.decision === 'decline' ? 'decline' : 'approve') } catch (err) {
+        if (err.message === 'not_pending') return conflict(res, { blocked_by: 'not_pending' })
+        throw err
+      }
+    } else {
+      const choice = body.decision === 'decline' ? 'decline' : talkTargetOf(body)
+      if (!choice) return badRequest(res)
+      out = fr.answerGuest(ctx, who, r, choice)
+    }
+    json(res, out.status, out.body)
+    return true
+  }
+  if (req.method === 'GET') { json(res, 200, { person_room: fedRoomRow(db, r) }); return true }
+  if (req.method !== 'DELETE') return false
+  if (!fr.endByUser(r)) return conflict(res, { blocked_by: 'not_active' })
+  json(res, 200, { person_room: fedRoomRow(db, getFedRoom(db, id)) })
   return true
 }
 
