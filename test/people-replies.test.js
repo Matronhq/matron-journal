@@ -155,3 +155,35 @@ test('an ordinary conversation\'s messages are not forwarded', async (t) => {
   await settle()
   assert.deepEqual(await coordTasks(w), [])
 })
+
+test('a replay finishes a forward a crash cut short, and repeats nothing once it is done', async (t) => {
+  const w = await world(t)
+  const mirror = await shareOffered(w)
+  const send = () => w.bobPhone(`/items/${mirror.id}/comments`, { method: 'POST', body: { body: 'Why read only?' }, headers: { 'idempotency-key': 'k1' } })
+  assert.equal((await send()).status, 201)
+  // The crash: the reply committed, the forward never ran.
+  const [task] = await coordTasks(w)
+  w.s.db.prepare('DELETE FROM item_comments WHERE item_id=?').run(task.id)
+  w.s.db.prepare('DELETE FROM items WHERE id=?').run(task.id)
+  w.s.db.prepare("DELETE FROM item_comments WHERE item_id=? AND body LIKE 'Sent to your Coordinator%'").run(mirror.id)
+  assert.equal((await send()).status, 200)
+  assert.equal((await coordTasks(w)).length, 1)
+  assert.equal((await send()).status, 200)
+  assert.equal((await coordTasks(w)).length, 1)
+  const notes = (await w.bobPhone(`/items/${mirror.id}`)).json.comments.filter((c) => /^Sent to your Coordinator/.test(c.body))
+  assert.equal(notes.length, 1)
+})
+
+test('a voice reply goes with the task as audio with no transcript pending on it', async (t) => {
+  const w = await world(t)
+  const mirror = await shareOffered(w)
+  w.s.db.prepare('INSERT INTO blobs(id,owner_user_id,content_type,size,sha256,disk_path,created_at) VALUES(?,?,?,?,?,?,?)').run('b1', w.bob.id, 'audio/mp4', 3, 'x', '/dev/null', Date.now())
+  const voice = { blob_ref: 'b1', mime: 'audio/mp4', name: 'b1.m4a', size: 3, transcript_status: 'pending' }
+  assert.equal((await w.bobPhone(`/items/${mirror.id}/comments`, post({ attachments: [voice] }))).status, 201)
+  const [task] = await coordTasks(w)
+  assert.match(task.body, /no text: see the attachments/)
+  const full = (await w.bobCoord(`/items/${task.id}`)).json
+  const audio = [...(full.item.attachments ?? []), ...full.comments.flatMap((c) => c.attachments ?? [])].find((a) => a.blob_ref === 'b1')
+  assert.ok(audio, 'the audio is on the task')
+  assert.equal(audio.transcript_status, undefined)
+})

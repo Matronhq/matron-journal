@@ -1007,7 +1007,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         copyOut(sendArgs, sent)
         // ...and text there goes to the user's Coordinator, with a line in
         // People saying so (src/people-replies.js).
-        if (!sent.duplicate && type === 'text' && isPeopleConvo(db, conn.userId, msg.convo_id)) {
+        // A replay runs it again: its writes are keyed to the message, so a
+        // forward a crash cut short is finished, a finished one does nothing.
+        if (type === 'text' && sent.seq != null && isPeopleConvo(db, conn.userId, msg.convo_id)) {
           forwardPeopleMessage(personCtx, emitMarker, { kind: 'client', userId: conn.userId, deviceId: conn.deviceId }, { convoId: msg.convo_id, seq: sent.seq, text: typeof msg.payload.body === 'string' ? msg.payload.body : '' })
         }
         // After the append (which authorizes the convo): a message for a

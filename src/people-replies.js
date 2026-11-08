@@ -17,8 +17,8 @@
 // own text, but it can carry another person's words (a mission title, a
 // name), so the task says they are information, not instructions. The card
 // itself stays hidden from agents, and its buttons stay the user's.
-import { createItem, addComment, getItem, TITLE_MAX, BODY_MAX } from './items.js'
-import { appendAndBroadcast } from './journal.js'
+import { createItem, addComment, getItem, isAudioAttachment, markTranscriptsPending, TITLE_MAX, BODY_MAX } from './items.js'
+import { append, appendAndBroadcast, broadcastAppended } from './journal.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE } from './items-marker.js'
 import { getCoordinatorConvoId } from './coordinator.js'
 import { PEOPLE_SYSTEM } from './people-convo.js'
@@ -63,12 +63,26 @@ function fileForCoordinator(ctx, emitMarker, who, { title, where, text, context,
   ]
   if (context) parts.push('', `**The card:** ${context}`, '', CONTEXT_NOTE)
   const body = cut(parts.join('\n'), BODY_MAX)
-  const { item, duplicate } = createItem(db, {
-    userId: who.userId, kind: 'task', title: cut(title, TITLE_MAX), body, attachments, awaiting: 'agent', position: 'top',
-    originConvoId: convoId, originDeviceId: who.deviceId ?? 0, createdBy: 'user', idemKey,
+  // Voice notes go with the words, as copies with no transcript yet: the
+  // reply's own transcript lands on the reply, not here. Like a body the user
+  // files (items-http.js handleCreate), this journal transcribes them when it
+  // can, and the `created` turn waits for the words; otherwise they go as
+  // plain audio and the Coordinator's bridge transcribes them itself.
+  const copies = attachments.map(({ transcript_status: _s, transcript: _t, ...a }) => a)
+  const audio = [...new Set(copies.filter(isAudioAttachment).map((a) => a.blob_ref))]
+  const createdOnce = !db.prepare('SELECT 1 FROM items WHERE user_id=? AND idem_key=?').get(who.userId, idemKey)
+  const transcribeHere = createdOnce && audio.length > 0 && !!ctx.itemTranscription?.enabled && ctx.itemTranscription.admit(who.userId, audio.length)
+  const out = createItem(db, {
+    userId: who.userId, kind: 'task', title: cut(title, TITLE_MAX), body, attachments: transcribeHere ? markTranscriptsPending(copies) : copies,
+    awaiting: 'agent', position: 'top', originConvoId: convoId, originDeviceId: who.deviceId ?? 0, createdBy: 'user', idemKey,
   })
-  if (!duplicate) emitMarker(ctx, { kind: 'client', userId: who.userId, deviceId: who.deviceId }, { item, action: 'created', by: 'user' })
-  return item
+  if (!out.duplicate) {
+    emitMarker(ctx, { kind: 'client', userId: who.userId, deviceId: who.deviceId }, { item: out.item, action: 'created', by: 'user', comment: transcribeHere ? out.bodyComment : null })
+    if (transcribeHere && out.bodyComment) {
+      for (const blobRef of audio) ctx.itemTranscription.enqueue({ commentId: out.bodyComment.id, userId: who.userId, blobRef })
+    }
+  }
+  return out.item
 }
 
 // The journal's own line on the mirror, saying where the reply went. Kept
@@ -125,7 +139,11 @@ export function forwardPeopleMessage(ctx, emitMarker, who, { convoId, seq, text 
     const body = task
       ? `Sent to your Coordinator: ${linkTo(task)}. No agent reads this conversation.`
       : 'No agent reads this conversation, and you have no Coordinator set, so this was not passed on. Ask in an agent\'s conversation instead, or set a Coordinator.'
-    appendAndBroadcast(db, hub, { userId: who.userId, convoId, sender: JOURNAL, type: 'text', payload: { body } })
+    // Keyed like the task, so a replayed send that finishes the forward
+    // writes the line once.
+    const payload = { body }
+    const r = append(db, { userId: who.userId, convoId, sender: JOURNAL, type: 'text', payload, idemKey: `people-send-note:${convoId}:${seq}` })
+    if (!r.duplicate) broadcastAppended(db, hub, { userId: who.userId, convoId, seq: r.seq, ts: r.ts, sender: JOURNAL, type: 'text', payload })
     return task
   } catch (err) {
     console.error('people-replies: forwarding a People message failed (the message stands)', err)

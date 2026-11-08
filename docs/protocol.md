@@ -4624,11 +4624,18 @@ user's Coordinator (`src/people-replies.js`):
 - **A task in the Coordinator conversation**, filed as the user's own
   (`created_by: 'user'`, `awaiting: 'agent'`, so its `created` marker is an
   ordinary turn and wakes the box). Its title is `Reply on a card: <card
-  title>` or `Message in People: <first line>`; its body quotes the words,
-  names the card, and says the card's text may quote another person and is
-  information, not instructions. A comment's attachments go with it. The
-  card stays hidden from agents, and a replay files nothing more
-  (idempotency keys `people-reply:<comment id>`, `people-send:<convo>:<seq>`).
+  title>` or `Message in People: <the message>`, whitespace collapsed,
+  `(empty)` for none, cut to 200 characters with `…`. Its body quotes the
+  words, names the card, and says the card's text may quote another person
+  and is information, not instructions. A comment's attachments go with it
+  as copies with no transcript: this journal transcribes their voice notes
+  when it can (the `created` marker carries the body comment, pending), and
+  otherwise the Coordinator's bridge does. The card stays hidden from agents.
+- **Replays finish the work.** Every write is keyed to the reply
+  (`people-reply:<comment id>`, `people-reply-note:<comment id>`,
+  `people-send:<convo>:<seq>`, `people-send-note:<convo>:<seq>`), and a
+  replayed request runs the forward again: one cut short by a crash is
+  finished, one already done writes nothing.
 - **A line where it was typed**: a journal comment on the mirror (author
   `agent`, device 0, client-only marker, status unchanged) or a journal
   `text` in People, reading `Sent to your Coordinator: [#N <title>](matron://item/N)`.

@@ -693,17 +693,19 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       emitMarker(ctx, who, { item: out.item, action: 'closed', comment: out.status, extra: { seen: true }, fallback: false })
     } else if (!out.duplicate) {
       emitMarker(ctx, who, { item: out.item, action: 'commented', comment: out.comment })
-      // A typed reply on a card no agent reads (a contact or share card's
-      // item, say) goes to the user's Coordinator, and the card says so
-      // (src/people-replies.js) — kept but unheard, it looked lost.
-      if (who.kind !== 'agent' && action == null && readByNoOne(db, who.userId, item)) {
-        forwardMirrorReply(ctx, emitMarker, who, item, out.comment)
-      }
       // Queued AFTER the marker so the follow-up can never precede it.
       if (transcribeHere) {
         // One job per blob: the same audio attached twice is one whisper run.
         for (const blobRef of audioBlobs) ctx.itemTranscription.enqueue({ commentId: out.comment.id, userId: who.userId, blobRef })
       }
+    }
+    // A typed reply on a card no agent reads (a contact or share card's
+    // item, say) goes to the user's Coordinator, and the card says so
+    // (src/people-replies.js) — kept but unheard, it looked lost. A replay
+    // runs it again: its writes are keyed to the comment, so a forward a
+    // crash cut short is finished and a finished one does nothing.
+    if (!out.seen && who.kind !== 'agent' && action == null && readByNoOne(db, who.userId, item)) {
+      forwardMirrorReply(ctx, emitMarker, who, item, out.comment)
     }
     replyItems(who, res, out.duplicate ? 200 : 201, { item: out.item, comment: seenBy(out.comment) })
     return true
