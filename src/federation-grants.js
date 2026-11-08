@@ -89,7 +89,9 @@ export function onIncomingEnded(ctx, before, by) {
   const from = plain(before.owner_address)
   const words = `mission "${titleOf(before.mission_title)}"`
   const mine = by === 'grantee' || by === 'contact_ended'
-  if (before.state === 'pending') {
+  // An offer's card, or a raise's card on a share that was active: either
+  // has nothing left to answer.
+  if (before.state === 'pending' || (before.state === 'active' && before.pending_level)) {
     closeMirror(ctx, {
       userId: before.user_id, itemId: before.item_id, consent: 'share', resolution: 'cancelled',
       author: mine ? 'user' : 'agent', comment: by === 'grantee' ? 'Declined.' : by === 'owner' ? `${from} withdrew the offer.` : 'The contact ended, so this share ended with it.',
@@ -565,7 +567,11 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
         if (body.raise) {
           if (r && r.state === 'active' && body.decision !== 'decline') {
             const was = entry.meta?.from_level ?? null
-            if (REMOTE_LEVELS.includes(was)) d.prepare('UPDATE fed_grants_in SET level=?, updated_at=? WHERE id=?').run(was, clock(), r.id)
+            if (REMOTE_LEVELS.includes(was)) {
+              d.prepare('UPDATE fed_grants_in SET level=?, updated_at=? WHERE id=?').run(was, clock(), r.id)
+              // The apps reread the copy, as they did when the accept raised it.
+              if (r.replica_mission_id) sharedFrame(ctx, r.user_id, { event: 'mission_changed', mission_id: r.replica_mission_id, grant_id: r.id, what: 'grant', owner: { user_id: 0, name: r.owner_address } })
+            }
             fileNotice(ctx, {
               userId: r.user_id, title: `Couldn't accept contributing to mission "${titleOf(r.mission_title)}"`,
               body: `The journal at ${r.peer_host} ${why(error)}, so the share from \`${plain(r.owner_address)}\` stays ${was === 'read' ? 'read-only' : 'as it was'}. Ask them to offer it again.`,

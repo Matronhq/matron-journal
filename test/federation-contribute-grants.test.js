@@ -94,3 +94,16 @@ test('a raise accepted after the owner ended the share goes back to read, and bo
   assert.equal(incoming(w.b)[0].level, 'read')
   assert.match(notices(w.b, w.users.bob.id).at(-1).title, /Couldn't accept contributing/)
 })
+
+test('a share that ends while a raise waits closes the raise card', async (t) => {
+  const w = await world(t)
+  const r = await share(w, 'read')
+  await accept(w)
+  await share(w, 'contribute')
+  const raise = mirrorOf(w.b, w.users.bob.id)
+  assert.equal(raise.state, 'open')
+  assert.equal((await w.phones.alice(`/grants/${r.json.grant.id}`, { method: 'DELETE' })).status, 200)
+  await w.settle()
+  const after = w.b.db.prepare('SELECT state, resolution FROM items WHERE id=?').get(raise.id)
+  assert.deepEqual([after.state, after.resolution], ['closed', 'cancelled'])
+})
