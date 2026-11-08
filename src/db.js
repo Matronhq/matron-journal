@@ -855,6 +855,42 @@ CREATE TABLE IF NOT EXISTS fed_contrib_items(
 CREATE TRIGGER IF NOT EXISTS fed_contrib_items_drop AFTER UPDATE OF state ON fed_grants_in WHEN NEW.state <> 'active' BEGIN
   DELETE FROM fed_contrib_items WHERE fg_id = NEW.id;
 END;
+-- One journal's half of a room between this user's agent and the agent of a
+-- contact on another journal (src/federation-rooms.js). role 'owner': the
+-- asking side, ref = id, room_id the asker's room. role 'guest': the side
+-- that was asked, ref = the owner journal's id, room_id the room created
+-- here when the guest chose where to talk. The other side's room, devices
+-- and sessions are never known here.
+CREATE TABLE IF NOT EXISTS fed_rooms(
+  id            TEXT PRIMARY KEY,
+  user_id       INTEGER NOT NULL REFERENCES users(id),
+  role          TEXT NOT NULL CHECK(role IN ('owner','guest')),
+  contact_id    TEXT NOT NULL,
+  peer_host     TEXT NOT NULL,
+  peer_name     TEXT NOT NULL,
+  ref           TEXT NOT NULL,
+  room_id       TEXT,
+  device_id     INTEGER,
+  convo_id      TEXT,
+  mission_id    TEXT,
+  grant_ref     TEXT,
+  state         TEXT NOT NULL CHECK(state IN
+                  ('awaiting_owner','awaiting_guest','starting','invited','joined','declined','refused','withdrawn','left','expired')),
+  topic         TEXT NOT NULL DEFAULT '',
+  justification TEXT NOT NULL DEFAULT '',
+  item_id       TEXT,
+  ended_by      TEXT,
+  pick_options  TEXT,
+  spawn_id      TEXT,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL,
+  answered_at   INTEGER,
+  sent_at       INTEGER,
+  UNIQUE(role, peer_host, ref)
+);
+CREATE INDEX IF NOT EXISTS idx_fed_rooms_room ON fed_rooms(room_id);
+CREATE INDEX IF NOT EXISTS idx_fed_rooms_contact ON fed_rooms(contact_id, state);
+CREATE INDEX IF NOT EXISTS idx_fed_rooms_item ON fed_rooms(item_id);
 -- An agent's ask for an invite link (src/federation-invite-asks.js): parked
 -- for the user's tap, which alone mints the invite (invite_id once approved).
 CREATE TABLE IF NOT EXISTS fed_invite_asks(
