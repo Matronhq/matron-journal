@@ -448,7 +448,7 @@ export function onGrantOutcome(ctx, who, out) {
       break
     case 'accepted':
       if (remote) {
-        audit(ctx, g.owner_user_id, { event: 'grant.accepted', summary: `${to} accepted ${missionWords(g)} — shared read-only`, contact: oc, grant: g, by: 'peer' })
+        audit(ctx, g.owner_user_id, { event: 'grant.accepted', summary: `${to} accepted ${missionWords(g)} — shared ${g.level === 'contribute' ? 'to contribute to' : 'read-only'}`, contact: oc, grant: g, by: 'peer' })
         break
       }
       closed = granteeTap(`Accepted — the mission is now in your shared list, shared by ${from}.`)

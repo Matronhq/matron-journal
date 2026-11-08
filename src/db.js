@@ -2033,6 +2033,10 @@ export function openDb(path) {
   // A grant's replica keeps one local mission id across snapshots, and
   // across an end and a fresh accept (src/federation-replica.js).
   addCols('fed_grants_in', [['replica_mission_id', 'TEXT']])
+  // A raise of an active share across journals (read → contribute) waiting
+  // on the grantee's tap: the level asked for, and the owner's pending_at
+  // that names this sending of it (src/federation-grants.js).
+  addCols('fed_grants_in', [['pending_level', 'TEXT'], ['raise_sent', 'INTEGER']])
   addCols('fed_replica_items', [['attachments', "TEXT NOT NULL DEFAULT '[]'"]])
   // Unified search's tracker mirror (spec 2026-10-12 unified search §1).
   // Must stay LAST: it reads columns added by every migration above (e.g.
