@@ -5944,8 +5944,56 @@ their copy (`owner` the owner's address, `level` the share's). `GET
 /person-rooms` lists both kinds. `POST /person-rooms/:id/answer` takes the
 same bodies as a talk request's.
 
-Sessions shared with a contact on another journal (their roster, and asks
-for a room with a session they share) are not available yet.
+#### Session shares across journals
+
+A session can be shared with a contact on another journal exactly as with
+one on the same journal: `POST /session-shares {convo_id, contact}` with
+`contact` their address (`bob@b.example`), the same rules, the same card
+for an agent's ask (it says the title goes to their journal), the same
+`DELETE`. The contact must be live (`409 not_contact` otherwise). While the
+share is active, the sharer's journal tells theirs, on the subject
+`share:<ss_ id>`:
+
+- `session.share`, sharer to contact, body `{share, title}`: `share` the
+  sharer's `ss_` id, `title` the session's title (at most 200 characters).
+  Sent when the share becomes active and again whenever the session's title
+  changes (the sweep compares it with the last title sent). A session that
+  can no longer be shared (its box made private) is withdrawn the same way,
+  and offered again if it can be shared again.
+- `session.unshare`, sharer to contact, body `{share}`: the share was
+  revoked. Rooms already open with the session stand, as on one journal.
+
+Removing or blocking the contact drops every share between the two on
+both journals, with nothing sent. A journal that does not know these ops
+answers `400 unknown_op`, and the sharer gets one notice saying the contact
+cannot see the shared session yet.
+
+The contact's journal lists what it was sent (`fed_sessions_in`) on `GET
+/roster`, under `people` with the sharer's address:
+
+```
+{person: "alice@a.example", sessions: [{convo_id: "fs_…", title, agent_device_id: null, session_state: null, created_at, remote: true}]}
+```
+
+`convo_id` is that journal's own id for the share. Nothing else of the
+sharer's crosses: no conversation id, device, box or state.
+
+To ask for a room with it, an agent sends a talk request naming both:
+
+```
+agent_invite {room_id, target_person: "alice@a.example", target_convo_id: "fs_…", from_convo_id?, topic?, justification, mission?}
+```
+
+An `fs_` id that is not an active share from that contact is `not_found`.
+Everything else is a talk request across journals (above): the owner's
+**Send** or **Cancel**, then `room.invite` carries `session: <ss_ id>`. The
+sharer's journal refuses it with `409 not_shared` when that share is no
+longer active to this contact (the asking side's room ends with a notice).
+Otherwise the sharer gets the card for that session, **Accept** or
+**Decline**, instead of the choice of where to talk. **Accept** invites the
+session's own agent (`target_convo_id` its conversation); if the share has
+ended since the ask arrived, **Accept** declines it instead. The rest — the
+answers, the messages, the end — is the same as any room across journals.
 
 ## Device privacy
 

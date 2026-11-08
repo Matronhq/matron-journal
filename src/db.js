@@ -596,6 +596,7 @@ CREATE TABLE IF NOT EXISTS session_shares(
   created_at       INTEGER NOT NULL,
   updated_at       INTEGER NOT NULL,
   revoked_at       INTEGER,
+  fed_title        TEXT,
   UNIQUE(convo_id, contact_id)
 );
 CREATE INDEX IF NOT EXISTS idx_session_shares_contact ON session_shares(contact_id, state);
@@ -874,6 +875,7 @@ CREATE TABLE IF NOT EXISTS fed_rooms(
   convo_id      TEXT,
   mission_id    TEXT,
   grant_ref     TEXT,
+  session_ref   TEXT,
   state         TEXT NOT NULL CHECK(state IN
                   ('awaiting_owner','awaiting_guest','starting','invited','joined','declined','refused','withdrawn','left','expired')),
   topic         TEXT NOT NULL DEFAULT '',
@@ -891,6 +893,23 @@ CREATE TABLE IF NOT EXISTS fed_rooms(
 CREATE INDEX IF NOT EXISTS idx_fed_rooms_room ON fed_rooms(room_id);
 CREATE INDEX IF NOT EXISTS idx_fed_rooms_contact ON fed_rooms(contact_id, state);
 CREATE INDEX IF NOT EXISTS idx_fed_rooms_item ON fed_rooms(item_id);
+-- Sessions a contact on another journal shares with this user
+-- (src/federation-rooms.js, session.share): the title they chose to show and
+-- their share's id, which a talk request names. Never a box or device.
+CREATE TABLE IF NOT EXISTS fed_sessions_in(
+  id          TEXT PRIMARY KEY,
+  user_id     INTEGER NOT NULL REFERENCES users(id),
+  contact_id  TEXT NOT NULL,
+  peer_host   TEXT NOT NULL,
+  peer_name   TEXT NOT NULL,
+  ref         TEXT NOT NULL,
+  title       TEXT NOT NULL DEFAULT '',
+  state       TEXT NOT NULL CHECK(state IN ('active','ended')),
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL,
+  UNIQUE(user_id, peer_host, ref)
+);
+CREATE INDEX IF NOT EXISTS idx_fed_sessions_in_contact ON fed_sessions_in(contact_id, state);
 -- An agent's ask for an invite link (src/federation-invite-asks.js): parked
 -- for the user's tap, which alone mints the invite (invite_id once approved).
 CREATE TABLE IF NOT EXISTS fed_invite_asks(
@@ -1573,6 +1592,11 @@ export function openDb(path) {
   rebuildItemsForNotice(db)
   // Talk requests: person_rooms rows aimed at a person, not a session.
   migratePersonRoomsForTalk(db)
+  // Session shares across journals (src/federation-rooms.js): a room's
+  // shared session (fed_rooms.session_ref), and the title last sent for a
+  // share with a contact on another journal (session_shares.fed_title).
+  if (!db.prepare('PRAGMA table_info(fed_rooms)').all().some((c) => c.name === 'session_ref')) db.exec('ALTER TABLE fed_rooms ADD COLUMN session_ref TEXT')
+  if (!db.prepare('PRAGMA table_info(session_shares)').all().some((c) => c.name === 'fed_title')) db.exec('ALTER TABLE session_shares ADD COLUMN fed_title TEXT')
   // Item handover (mission: hand a tracker item from one session to another).
   // An item's origin_convo_id / origin_device_id is its OWNER: every reply,
   // tap, wake and transcript follows it, and a handover moves it. The

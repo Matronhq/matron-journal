@@ -26,7 +26,7 @@
 // owner's device through the twin.
 import { randomBytes } from 'node:crypto'
 import { newId } from './items.js'
-import { getContactRaw, isMutual, peerRowOf, OWN_ASK_TTL_MS, MAX_PARKED_PER_DEVICE } from './contacts.js'
+import { getContactRaw, isMutual, isLiveRemote, peerRowOf, OWN_ASK_TTL_MS, MAX_PARKED_PER_DEVICE } from './contacts.js'
 import { getMission } from './missions.js'
 import { isPrivateDevice } from './db.js'
 import { recordJoined } from './participants.js'
@@ -99,7 +99,9 @@ export function shareSession(db, { userId, convoId, contact, by, deviceId = null
     const session = shareableSession(db, userId, convoId)
     if (!session) fail('no_session')
     const own = getContactRaw(db, userId, contact)
-    if (!own || !isMutual(db, own)) fail('not_contact')
+    // A contact on another journal has no row here to check: theirs answers
+    // for them (federation-rooms.js sends them the share).
+    if (!own || !(own.peer_journal ? isLiveRemote(db, own) : isMutual(db, own))) fail('not_contact')
     const cur = db.prepare('SELECT * FROM session_shares WHERE convo_id=? AND contact_id=?').get(session.id, own.id)
     if (cur?.state === 'active') return { outcome: 'existing', share: cur }
     if (cur?.state === 'awaiting_user') fail('pending')
@@ -132,7 +134,7 @@ export function answerSessionShare(db, { userId, shareId, decision, now = Date.n
     if (now - row.updated_at > OWN_ASK_TTL_MS) return done('expired', 'expired')
     if (decision === 'decline') return done('withdrawn', 'declined')
     const contact = db.prepare('SELECT * FROM contacts WHERE id=?').get(row.contact_id)
-    if (!isMutual(db, contact)) return done('unavailable', 'revoked', `, revoked_at=${Number(now)}`)
+    if (!(contact?.peer_journal ? isLiveRemote(db, contact) : isMutual(db, contact))) return done('unavailable', 'revoked', `, revoked_at=${Number(now)}`)
     return done('shared', 'active')
   })()
 }

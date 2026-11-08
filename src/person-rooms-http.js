@@ -54,6 +54,8 @@ export function applyShareAnswer(ctx, who, shareId, decision) {
   }
   if (!out) return { status: 404, body: { error: 'not_found' } }
   const closed = onShareAnswered(ctx, who, out)
+  // A contact on another journal hears of it from here.
+  if (out.outcome === 'shared') fedRoomsOf(ctx.db)?.offerShare(out.share.id)
   if (out.outcome === 'expired') return { status: 409, body: { error: 'conflict', blocked_by: 'expired' }, closed }
   return { status: 200, body: { session_share: sessionShareRow(ctx.db, out.share) }, closed }
 }
@@ -193,6 +195,7 @@ async function handleShares(ctx, req, res, url, who) {
       throw err
     }
     if (out.outcome === 'parked') shareAsk(ctx, out.share, who)
+    if (out.outcome === 'shared') fedRoomsOf(db)?.offerShare(out.share.id)
     json(res, out.outcome === 'parked' ? 202 : (out.outcome === 'existing' ? 200 : 201), {
       session_share: sessionShareRow(db, out.share), ...(out.outcome === 'parked' ? { pending: 'owner' } : {}),
     })
@@ -219,6 +222,7 @@ async function handleShares(ctx, req, res, url, who) {
   }
   if (!out) return notFound(res)
   onShareEnded(ctx, out.before, who)
+  fedRoomsOf(db)?.withdrawShare(out.before)
   json(res, 200, { session_share: sessionShareRow(db, out.share) })
   return true
 }

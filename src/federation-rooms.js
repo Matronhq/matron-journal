@@ -12,6 +12,16 @@
 //   room.message   either way      {room, n, body, via}
 //   room.end       either way      {room, by}
 //
+// and two more let a person share ONE session with a contact on another
+// journal (a session share, as on one journal), so that contact's agents
+// can ask for a room with that session:
+//
+//   session.share    sharer → contact  {share, title}   (again when the title changes)
+//   session.unshare  sharer → contact  {share}
+//
+// A talk request aimed at a shared session carries `session: <share id>` on
+// its room.invite; the sharer answers Accept or Decline for that session.
+//
 // `room` is always the owner journal's id for the room, and every op of one
 // room rides one outbox subject (`room:<that id>`), so each side's messages
 // arrive in order. The consent is the same two taps as on one journal: the
@@ -36,7 +46,9 @@ import { wakeIfOffline, wakeConvoAgent } from './wake.js'
 import { sanitizePeerText, plainText as plain } from './peer-text.js'
 import { card, fileMirror, closeMirror, audit, changed, peopleConvo, fileNotice } from './sharing-events.js'
 import { ROOM_CARD_KIND, COPY_BODY_MAX, BACKFILL_MAX, roomLink, deviceName } from './person-rooms-events.js'
-import { checkRoomFree, isGuestRoom, LIVE_ROOM_STATES, PERSON_SENDER_PREFIX } from './person-rooms.js'
+import { checkRoomFree, isGuestRoom, isShareableSession, LIVE_ROOM_STATES, PERSON_SENDER_PREFIX } from './person-rooms.js'
+import { onShareEnded } from './person-rooms-events.js'
+import { PEER_ACTIONS } from './sharing-events.js'
 import {
   OWNER_TALK_ACTIONS, CHOICE, TALK_GUEST_TTL_MS, TALK_START_STUCK_MS, guestChoices, coordinatorTarget, pickableSessions, sessionLabels, isTalkTarget,
 } from './talk-requests.js'
@@ -46,7 +58,9 @@ export const INVITE_OP = 'room.invite'
 export const ANSWER_OP = 'room.answer'
 export const MESSAGE_OP = 'room.message'
 export const END_OP = 'room.end'
-export const ROOM_OPS = [INVITE_OP, ANSWER_OP, MESSAGE_OP, END_OP]
+export const SHARE_OP = 'session.share'
+export const UNSHARE_OP = 'session.unshare'
+export const ROOM_OPS = [INVITE_OP, ANSWER_OP, MESSAGE_OP, END_OP, SHARE_OP, UNSHARE_OP]
 const GUEST_OUTCOMES = ['accepted', 'declined', 'expired', 'joined', 'agent_declined', 'agent_expired']
 const END_BY = ['owner_agent', 'guest_agent', 'owner_user', 'guest_user']
 // Talk requests one contact may have waiting on this user's choice at once.
@@ -55,10 +69,12 @@ export const MAX_WAITING_PER_CONTACT = 5
 // guest's own week (their journal should have said 'expired' by then).
 export const OWNER_WAIT_MS = TALK_GUEST_TTL_MS + 24 * 60 * 60 * 1000
 const TOPIC_MAX = 200
+const TITLE_MAX = 200
 const WHY_MAX = 1000
 
 const ROOM_REF = /^fr_[A-Za-z0-9_-]{1,64}$/
 const GRANT_REF = /^gr_[A-Za-z0-9_-]{1,64}$/
+const SHARE_REF = /^ss_[A-Za-z0-9_-]{1,64}$/
 const JOURNAL = 'journal'
 const LIVE_SQL = `('${LIVE_ROOM_STATES.join("','")}')`
 const PENDING = ['awaiting_owner', 'awaiting_guest', 'starting']
@@ -66,6 +82,7 @@ const fail = (code) => { throw new Error(code) }
 const hostOf = (address) => address.slice(address.indexOf('@') + 1)
 const nameOf = (address) => address.slice(0, address.indexOf('@'))
 const subjectOf = (ref) => `room:${ref}`
+const shareSubjectOf = (id) => `share:${id}`
 const t = (s, n = 120) => plain(sanitizePeerText(s ?? '', n))
 const bodyOf = (entry) => (typeof entry.body === 'string' ? JSON.parse(entry.body) : entry.body ?? {})
 // A message body keeps its lines; only control characters other than tab
@@ -122,6 +139,19 @@ export function fedRoomRow(db, r) {
     id: r.id, role: r.role, room_id: r.room_id, person: addressOf(r), state: r.state, kind: 'talk', topic: r.topic,
     mission: missionOf(db, r), remote: true, created_at: r.created_at, updated_at: r.updated_at,
   }
+}
+
+// The sessions contacts on other journals share with `userId`, for the
+// roster: active, the contact live and pinned to the key their journal
+// serves. `convo_id` is this journal's id for the share (fs_), which a talk
+// request names; never the other side's conversation, device or box.
+export function remoteSessionsFor(db, userId) {
+  return db.prepare(`SELECT fs.id AS convo_id, fs.title, fs.created_at, fs.peer_name || '@' || fs.peer_host AS person
+    FROM fed_sessions_in fs
+    JOIN contacts c ON c.id = fs.contact_id AND c.user_id = fs.user_id AND c.state='active'
+    JOIN fed_peers p ON p.host = c.peer_journal AND p.state='active' AND p.key_pub = c.peer_journal_key
+    WHERE fs.user_id=? AND fs.state='active'
+    ORDER BY person COLLATE NOCASE, fs.created_at DESC`).all(userId)
 }
 
 export function listFedRooms(db, userId) {
@@ -184,6 +214,22 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
       : `In a turn started by ${t(addressOf(r))}'s side, your agent may only reply in the room. Anything more needs your tap.`
   }
   const topicSuffix = (r) => (r.topic ? ` — ${t(r.topic, 80)}` : '')
+  // The shared session a room is aimed at, by its title as this side knows
+  // it: the title the sharer sent (owner side), or the session's own (the
+  // sharer's side). null for a talk request to the person.
+  function sessionTitleOf(r) {
+    if (!r.session_ref) return null
+    if (r.role === 'owner') return db.prepare('SELECT title FROM fed_sessions_in WHERE user_id=? AND peer_host=? AND ref=?').get(r.user_id, r.peer_host, r.session_ref)?.title ?? ''
+    return db.prepare('SELECT c.title FROM session_shares ss JOIN conversations c ON c.id = ss.convo_id WHERE ss.id=?').get(r.session_ref)?.title ?? ''
+  }
+  // The shared session's conversation, while the share stands: this side's
+  // row, to this contact, and still a session that can be shared.
+  function sharedTarget(d, r) {
+    const ss = d.prepare("SELECT * FROM session_shares WHERE id=? AND user_id=? AND contact_id=? AND state='active'").get(r.session_ref, r.user_id, r.contact_id)
+    if (!ss || !isShareableSession(d, r.user_id, ss.convo_id)) return null
+    const c = d.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(ss.convo_id)
+    return c ? { deviceId: c.agent_device_id, convoId: ss.convo_id } : null
+  }
 
   // --- The owner's side: the ask ---------------------------------------------
 
@@ -191,11 +237,19 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
   // Throws as parkTalk on one journal: not_found (not a live contact on that
   // journal), pending, room_busy, not_fresh, too_many_asks, no_mission,
   // mission_not_shared, private_box. Returns the parked row.
-  function parkTalk({ ownerUserId, roomId, ownerDeviceId, ownerSender, ownerConvoId = null, person, missionRef = null, topic = '', justification = '', now = clock() }) {
+  // `session` (an fs_ id from the roster) aims it at a session the person
+  // shares with this user; their answer is then Accept or Decline.
+  function parkTalk({ ownerUserId, roomId, ownerDeviceId, ownerSender, ownerConvoId = null, person, session = null, missionRef = null, topic = '', justification = '', now = clock() }) {
     return db.transaction(() => {
       if (isPrivateDevice(db, ownerDeviceId)) fail('private_box')
       const own = getContactRaw(db, ownerUserId, person)
       if (!own?.peer_journal || !isLiveRemote(db, own)) fail('not_found')
+      let sessionRef = null
+      if (session != null) {
+        const fs = db.prepare("SELECT * FROM fed_sessions_in WHERE id=? AND user_id=? AND state='active'").get(session, ownerUserId)
+        if (!fs || fs.contact_id !== own.id) fail('not_found')
+        sessionRef = fs.ref
+      }
       if (db.prepare(`SELECT 1 FROM fed_rooms WHERE role='owner' AND device_id=? AND contact_id=? AND state IN ${LIVE_SQL}`).get(ownerDeviceId, own.id)) fail('pending')
       if (isGuestRoom(db, roomId) || fedLinked(db, roomId)) fail('room_busy')
       if (db.prepare(`SELECT 1 FROM person_rooms WHERE owner_room_id=? AND state IN ${LIVE_SQL}`).get(roomId)) fail('room_busy')
@@ -213,9 +267,9 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
         missionId = m.id
       }
       const id = newId('fr')
-      db.prepare(`INSERT INTO fed_rooms(id, user_id, role, contact_id, peer_host, peer_name, ref, room_id, device_id, convo_id, mission_id, state, topic, justification, created_at, updated_at)
-        VALUES(?,?,'owner',?,?,?,?,?,?,?,?,'awaiting_owner',?,?,?,?)`)
-        .run(id, ownerUserId, own.id, own.peer_journal, own.peer_user, id, roomId, ownerDeviceId, ownerConvoId, missionId, topic ?? '', justification ?? '', now, now)
+      db.prepare(`INSERT INTO fed_rooms(id, user_id, role, contact_id, peer_host, peer_name, ref, room_id, device_id, convo_id, mission_id, session_ref, state, topic, justification, created_at, updated_at)
+        VALUES(?,?,'owner',?,?,?,?,?,?,?,?,?,'awaiting_owner',?,?,?,?)`)
+        .run(id, ownerUserId, own.id, own.peer_journal, own.peer_user, id, roomId, ownerDeviceId, ownerConvoId, missionId, sessionRef, topic ?? '', justification ?? '', now, now)
       return reread(db, id)
     })()
   }
@@ -225,14 +279,16 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
     const box = deviceName(db, r.device_id)
     const to = t(addressOf(r))
     const m = missionOf(db, r)
+    const session = sessionTitleOf(r)
     safely('owner card', () => {
       card(ctx, {
         userId: r.user_id, convoId: r.room_id, sender: `agent:${box}`,
         payload: {
-          kind: ROOM_CARD_KIND, direction: 'out', room_link_id: r.id, person: { name: addressOf(r) }, session_title: null,
+          kind: ROOM_CARD_KIND, direction: 'out', room_link_id: r.id, person: { name: addressOf(r) },
+          session_title: session == null ? null : sanitizePeerText(session, TITLE_MAX),
           topic: sanitizePeerText(r.topic, TOPIC_MAX), justification: sanitizePeerText(r.justification, WHY_MAX),
           mission: m ? { num: m.num, title: sanitizePeerText(m.title, 120) } : null,
-          talk: true, contact_pending: false, choices: OWNER_TALK_ACTIONS, remote: true,
+          talk: session == null, contact_pending: false, choices: OWNER_TALK_ACTIONS, remote: true,
           from_device_id: r.device_id, from_name: sanitizePeerText(box, 80),
         },
       })
@@ -240,12 +296,16 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
         userId: r.user_id, convoId: r.room_id, deviceId: r.device_id, sender: `agent:${box}`, consent: 'room',
         title: `Ask ${to} to talk${topicSuffix(r)}`,
         body: [
-          `**${t(box, 80)}** asks to talk with **${to}**'s agent in this room. ${to} is on another Matron journal.`,
+          session == null
+            ? `**${t(box, 80)}** asks to talk with **${to}**'s agent in this room. ${to} is on another Matron journal.`
+            : `**${t(box, 80)}** asks to talk, in this room, with **${to}**'s session "${t(session, 80)}", which ${to} shares with you. ${to} is on another Matron journal.`,
           '',
           ...(r.topic ? [`- **Topic:** ${t(r.topic, TOPIC_MAX)}`] : []),
           `- **Why:** ${t(r.justification, WHY_MAX)}`,
           ...(m ? [`- **Attached to:** mission #${m.num} ${t(m.title)}, which ${to} can already read.`] : []),
-          `- **What happens:** ${to} gets one card on their journal and chooses where their side talks: a new session, their Coordinator, or one of their sessions.`,
+          session == null
+            ? `- **What happens:** ${to} gets one card on their journal and chooses where their side talks: a new session, their Coordinator, or one of their sessions.`
+            : `- **What happens:** ${to} gets one card on their journal to accept or decline a room with that session.`,
           `- **What crosses:** the room's messages, both ways, to ${t(r.peer_host)}. Files do not.`,
           `- ${scope(r)}`,
           '',
@@ -270,7 +330,7 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
       const m = cur.mission_id ? db.prepare("SELECT id FROM grants WHERE subject_kind='mission' AND subject_id=? AND contact_id=? AND state='active' AND level <> 'owner'").get(cur.mission_id, cur.contact_id) : null
       enqueue(db, {
         userId: cur.user_id, from: myAddress(cur), to: addressOf(cur), op: INVITE_OP, subject: subjectOf(cur.ref), now: at,
-        body: { room: cur.ref, topic: cur.topic, justification: cur.justification, ...(m ? { mission: { grant: m.id } } : {}) },
+        body: { room: cur.ref, topic: cur.topic, justification: cur.justification, ...(m ? { mission: { grant: m.id } } : {}), ...(cur.session_ref ? { session: cur.session_ref } : {}) },
       })
       return 'sent'
     })()
@@ -299,28 +359,34 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
 
   // --- The guest's side: the card and the choice ------------------------------
 
-  const choicesFor = (r, opts) => guestChoices(db, { guest_user_id: r.user_id }, opts)
+  // A room aimed at a session this user shares is Accept or Decline; a talk
+  // request to the person, the choice of where to talk.
+  const choicesFor = (r, opts) => (r.session_ref ? PEER_ACTIONS : guestChoices(db, { guest_user_id: r.user_id }, opts))
 
   function guestAsk(ctx, r) {
     const from = t(addressOf(r))
     const choices = choicesFor(r)
     const m = missionOf(db, r)
+    const session = sessionTitleOf(r)
     safely('guest card', () => {
       const convoId = peopleConvo(ctx, r.user_id)
       card(ctx, {
         userId: r.user_id, convoId, sender: JOURNAL,
         payload: {
-          kind: ROOM_CARD_KIND, direction: 'in', room_link_id: r.id, person: { name: addressOf(r) }, session_title: null,
+          kind: ROOM_CARD_KIND, direction: 'in', room_link_id: r.id, person: { name: addressOf(r) },
+          session_title: session == null ? null : sanitizePeerText(session, TITLE_MAX),
           topic: sanitizePeerText(r.topic, TOPIC_MAX), justification: sanitizePeerText(r.justification, WHY_MAX),
           mission: m ? { num: null, title: sanitizePeerText(m.title, 120) } : null,
-          talk: true, contact_pending: false, choices, remote: true,
+          talk: session == null, contact_pending: false, choices, remote: true,
         },
       })
       const item = fileMirror(ctx, {
         userId: r.user_id, convoId, deviceId: 0, sender: JOURNAL, consent: 'room',
         title: `${from}'s agent wants to talk${topicSuffix(r)}`,
         body: [
-          `**${from}**, on another Matron journal, asks for their agent to talk with one of your agents.`,
+          session == null
+            ? `**${from}**, on another Matron journal, asks for their agent to talk with one of your agents.`
+            : `**${from}**, on another Matron journal, asks for their agent to talk with your session "${t(session, 80)}", which you share with them.`,
           '',
           ...(r.topic ? [`- **Topic:** ${t(r.topic, TOPIC_MAX)}`] : []),
           `- **Why, in their agent's words:** ${t(r.justification, WHY_MAX)}`,
@@ -329,7 +395,9 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
           `- ${scope(r)}`,
           '- Either of you can end it at any time, and removing the contact ends it too.',
           '',
-          `**To answer:** choose where your side talks${choices.includes(CHOICE.new) ? ' (**New session** starts a fresh session just for this talk)' : ''}, or tap **Decline**. Unanswered, it expires after ${Math.round(TALK_GUEST_TTL_MS / 86400000)} days.`,
+          session == null
+            ? `**To answer:** choose where your side talks${choices.includes(CHOICE.new) ? ' (**New session** starts a fresh session just for this talk)' : ''}, or tap **Decline**. Unanswered, it expires after ${Math.round(TALK_GUEST_TTL_MS / 86400000)} days.`
+            : `**To answer:** tap **Accept** to ask that session's agent to join, or **Decline**. Unanswered, it expires after ${Math.round(TALK_GUEST_TTL_MS / 86400000)} days.`,
         ].join('\n'),
         link: roomLink(r.id), actions: choices, idemKey: `consent:fedroom:${r.id}:guest:${r.created_at}`,
       })
@@ -437,7 +505,17 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
       return ok({ comment: q?.comment ?? null })
     }
     let target
-    if (choice === 'coordinator') target = coordinatorTarget(db, r.user_id)
+    if (choice === 'shared') {
+      target = sharedTarget(db, r)
+      // The share ended since they asked: nothing to accept onto.
+      if (!target) {
+        setState(db, r.id, 'refused', at, `, answered_at=${Number(at)}, ended_by='guest'`)
+        send(r, ANSWER_OP, { outcome: 'declined' })
+        const closed = closeMirror(ctx, { userId: r.user_id, itemId: r.item_id, consent: 'room', resolution: 'cancelled', author: 'user', deviceId: who.deviceId, comment: 'You no longer share that session, so this was declined.' })
+        changed(ctx, r.user_id, { room_link_id: r.id })
+        return ok({ closed, comment: closed?.comment ?? null })
+      }
+    } else if (choice === 'coordinator') target = coordinatorTarget(db, r.user_id)
     else if (choice?.convoId) {
       const c = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(choice.convoId)
       target = c ? { deviceId: c.agent_device_id, convoId: choice.convoId } : null
@@ -474,6 +552,10 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
         throw err
       }
       return out
+    }
+    if (r.session_ref) {
+      if (replyTo != null || !PEER_ACTIONS.includes(action) || !item.actions.includes(action)) return { status: 400, body: { error: 'unknown_action' } }
+      return answerGuest(ctx, who, r, action === 'Accept' ? 'shared' : 'decline')
     }
     if (replyTo != null) {
       const offered = talkQuestionActions(db, item.id, replyTo)
@@ -580,6 +662,15 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
   // The contact ended: every room with them ends here. Their journal ends
   // its half when it hears the contact ended, so nothing is sent.
   function onContactEnded(contactId) {
+    // The sessions either side shared end with it: theirs leave this roster,
+    // and this user's stop being offered (their journal drops its copy).
+    safely('end shared sessions', () => db.prepare("UPDATE fed_sessions_in SET state='ended', updated_at=? WHERE contact_id=? AND state='active'").run(clock(), contactId))
+    safely('revoke shares', () => {
+      const at = clock()
+      const rows = db.prepare("SELECT * FROM session_shares WHERE contact_id=? AND state IN ('awaiting_user','active')").all(contactId)
+      if (rows.length) db.prepare("UPDATE session_shares SET state='revoked', updated_at=?, revoked_at=? WHERE contact_id=? AND state IN ('awaiting_user','active')").run(at, at, contactId)
+      for (const row of rows) safely('share card', () => onShareEnded(base, row))
+    })
     for (const r of db.prepare(`SELECT * FROM fed_rooms WHERE contact_id=? AND state IN ${LIVE_SQL}`).all(contactId)) {
       safely('end on contact', () => endLocal(r, 'contact_removed'))
       safely('cancel queued', () => db.prepare("UPDATE fed_outbox SET state='cancelled', ended_at=?, last_error='contact_ended' WHERE user_id=? AND peer_host=? AND subject=? AND state='queued'")
@@ -627,9 +718,76 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
     if (waker) safely('wake', () => wakeConvoAgent(base, r.user_id, r.room_id))
   }
 
+  // --- Session shares ---------------------------------------------------------
+
+  const shareContact = (d, share) => {
+    const c = d.prepare('SELECT * FROM contacts WHERE id=?').get(share.contact_id)
+    return c?.peer_journal ? c : null
+  }
+  function sendShare(share, contact, op, body) {
+    try {
+      enqueue(db, {
+        userId: share.user_id, from: `${userName(share.user_id)}@${federation.host}`, to: `${contact.peer_user}@${contact.peer_journal}`,
+        op, subject: shareSubjectOf(share.id), body: { share: share.id, ...body }, now: clock(),
+      })
+      kick()
+      return true
+    } catch (err) {
+      if (err.message === 'outbox_full' || err.message === 'too_large') { log.error?.(`federation rooms: ${op} not queued (${err.message})`); return false }
+      throw err
+    }
+  }
+
+  // A share with a contact on another journal became active, or its
+  // session's title changed: their journal lists it under this user's
+  // address with that title. Anything else is not theirs to hear.
+  // → true when it was sent.
+  function offerShare(shareId) {
+    return !!safely('session share', () => {
+      const s = db.prepare('SELECT * FROM session_shares WHERE id=?').get(shareId)
+      if (!s || s.state !== 'active') return false
+      const c = shareContact(db, s)
+      if (!c || !isLiveRemote(db, c) || !isShareableSession(db, s.user_id, s.convo_id)) return false
+      const title = sanitizePeerText(db.prepare('SELECT title FROM conversations WHERE id=?').get(s.convo_id)?.title ?? '', TITLE_MAX)
+      if (!sendShare(s, c, SHARE_OP, { title })) return false
+      db.prepare('UPDATE session_shares SET fed_title=? WHERE id=?').run(title, s.id)
+      return true
+    })
+  }
+
+  // A share that was active ended (revoked by its sharer, or its session
+  // can no longer be shared): their journal drops it. A share with a
+  // contact that ended needs nothing: each journal drops its own.
+  function withdrawShare(before) {
+    safely('session unshare', () => {
+      if (!before || before.state !== 'active') return
+      const c = shareContact(db, before)
+      if (!c || !isLiveRemote(db, c)) return
+      sendShare(before, c, UNSHARE_OP, {})
+      db.prepare('UPDATE session_shares SET fed_title=NULL WHERE id=?').run(before.id)
+    })
+  }
+
+  // Keep the other journal's copy current: a title that changed is sent
+  // again, a session that can no longer be shared (its box made private) is
+  // withdrawn, and one that can be again is offered again.
+  function syncShares() {
+    const rows = db.prepare(`SELECT ss.*, c.title AS convo_title FROM session_shares ss
+      JOIN contacts ct ON ct.id = ss.contact_id AND ct.peer_journal IS NOT NULL AND ct.state='active'
+      JOIN conversations c ON c.id = ss.convo_id
+      WHERE ss.state='active'`).all()
+    for (const s of rows) {
+      let shareable = false
+      try { shareable = isShareableSession(db, s.user_id, s.convo_id) } catch { shareable = false }
+      if (!shareable) { if (s.fed_title != null) withdrawShare(s); continue }
+      if (sanitizePeerText(s.convo_title ?? '', TITLE_MAX) !== s.fed_title) offerShare(s.id)
+    }
+  }
+
   // --- Sweep ------------------------------------------------------------------
 
   function sweep(ctx, at = clock()) {
+    safely('share sync', () => syncShares())
     for (const r of db.prepare("SELECT * FROM fed_rooms WHERE role='owner' AND state='awaiting_owner' AND updated_at < ?").all(at - OWN_ASK_TTL_MS)) {
       setState(db, r.id, 'expired', at)
       closeMirror(ctx, { userId: r.user_id, itemId: r.item_id, consent: 'room', resolution: 'cancelled', author: 'agent', deviceId: r.device_id, comment: 'Expired — no answer within 24 h. Nothing was sent.' })
@@ -669,7 +827,49 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
     return r
   }
 
+  const shareRef = (v) => { if (typeof v !== 'string' || !SHARE_REF.test(v)) fail('malformed'); return v }
+
   const inbound = {
+    // The contact's journal: a session they share with this user, or its
+    // new title.
+    [SHARE_OP]: {
+      apply({ db: d, envelope, peer, now }) {
+        const b = envelope.body ?? {}
+        const ref = shareRef(b.share)
+        if (typeof b.title !== 'string' || b.title.length > TITLE_MAX * 4) fail('malformed')
+        const { user, contact } = party(d, envelope, peer)
+        const title = sanitizePeerText(b.title, TITLE_MAX)
+        const cur = d.prepare('SELECT * FROM fed_sessions_in WHERE user_id=? AND peer_host=? AND ref=?').get(user.id, hostOf(envelope.from), ref)
+        if (cur && cur.peer_name !== nameOf(envelope.from)) fail('malformed')
+        if (cur) {
+          d.prepare("UPDATE fed_sessions_in SET title=?, state='active', contact_id=?, updated_at=? WHERE id=?").run(title, contact.id, now, cur.id)
+        } else {
+          d.prepare(`INSERT INTO fed_sessions_in(id, user_id, contact_id, peer_host, peer_name, ref, title, state, created_at, updated_at)
+            VALUES(?,?,?,?,?,?,?,'active',?,?)`).run(newId('fs'), user.id, contact.id, hostOf(envelope.from), nameOf(envelope.from), ref, title, now, now)
+        }
+        if (!cur || cur.state !== 'active') pending.set(envelope, { userId: user.id, title })
+        return {}
+      },
+      after({ envelope }) {
+        const p = pending.get(envelope)
+        if (!p) return
+        audit(base, p.userId, { event: 'session_share.received', summary: `${t(envelope.from)} shared a session with you: "${t(p.title, 80)}"`, extra: { person: { name: envelope.from } } })
+      },
+      errors: { malformed: 400, not_contact: 403 },
+    },
+    // The contact's journal: they stopped sharing it. Rooms already open
+    // with it stand, as on one journal.
+    [UNSHARE_OP]: {
+      apply({ db: d, envelope, peer, now }) {
+        const b = envelope.body ?? {}
+        const ref = shareRef(b.share)
+        const { user } = party(d, envelope, peer)
+        d.prepare("UPDATE fed_sessions_in SET state='ended', updated_at=? WHERE user_id=? AND peer_host=? AND ref=? AND peer_name=? AND state='active'")
+          .run(now, user.id, hostOf(envelope.from), ref, nameOf(envelope.from))
+        return {}
+      },
+      errors: { malformed: 400, not_contact: 403 },
+    },
     // The guest's journal: the owner sent their talk request.
     [INVITE_OP]: {
       apply({ db: d, envelope, peer, now }) {
@@ -690,10 +890,18 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
             WHERE fg.user_id=? AND fg.peer_host=? AND fg.peer_grant_ref=? AND fg.owner_name=? AND fg.state='active'`).get(user.id, hostOf(envelope.from), grantRef, nameOf(envelope.from))
           missionId = rm?.id ?? null
         }
+        // Aimed at a session this user shares with them: the share must
+        // stand now.
+        let sessionRef = null
+        if (b.session != null) {
+          if (typeof b.session !== 'string' || !SHARE_REF.test(b.session)) fail('malformed')
+          if (!sharedTarget(d, { session_ref: b.session, user_id: user.id, contact_id: contact.id })) fail('not_shared')
+          sessionRef = b.session
+        }
         const id = newId('fr')
-        d.prepare(`INSERT INTO fed_rooms(id, user_id, role, contact_id, peer_host, peer_name, ref, mission_id, grant_ref, state, topic, justification, created_at, updated_at)
-          VALUES(?,?,'guest',?,?,?,?,?,?,'awaiting_guest',?,?,?,?)`)
-          .run(id, user.id, contact.id, hostOf(envelope.from), nameOf(envelope.from), ref, missionId, grantRef,
+        d.prepare(`INSERT INTO fed_rooms(id, user_id, role, contact_id, peer_host, peer_name, ref, mission_id, grant_ref, session_ref, state, topic, justification, created_at, updated_at)
+          VALUES(?,?,'guest',?,?,?,?,?,?,?,'awaiting_guest',?,?,?,?)`)
+          .run(id, user.id, contact.id, hostOf(envelope.from), nameOf(envelope.from), ref, missionId, grantRef, sessionRef,
             sanitizePeerText(b.topic ?? '', TOPIC_MAX), sanitizePeerText(b.justification, WHY_MAX), now, now)
         pending.set(envelope, { id })
         return {}
@@ -706,7 +914,7 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
         roomAudit(base, r, 'room.received', `${t(addressOf(r))} asked for their agent to talk with yours`)
         changed(base, r.user_id, { room_link_id: r.id })
       },
-      errors: { malformed: 400, not_contact: 403, too_many_asks: 429 },
+      errors: { malformed: 400, not_contact: 403, not_shared: 409, too_many_asks: 429 },
     },
     // The owner's journal: the guest person, or their agent, answered.
     [ANSWER_OP]: {
@@ -802,6 +1010,7 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
     unknown_op: 'does not take rooms with other journals yet', expired: 'could not be reached for 7 days',
     journal_not_allowed: 'is not one this journal federates with any more', peer_key_changed: 'changed its key',
     not_contact: 'no longer has you as a contact', too_many_asks: 'has too many talk requests from you waiting',
+    not_shared: 'says that session is no longer shared with you',
   }
   const live = (d, entry) => {
     const r = halfOfEntry(d, entry)
@@ -824,7 +1033,31 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
     }
     return 'discard'
   }
+  const shareOfEntry = (d, entry) => {
+    const id = bodyOf(entry).share
+    return typeof id === 'string' ? d.prepare('SELECT * FROM session_shares WHERE id=? AND user_id=?').get(id, entry.user_id) ?? null : null
+  }
+  const shareContactLive = (d, entry) => { const s = shareOfEntry(d, entry); return !!s && isLiveRemote(d, shareContact(d, s)) }
+  // A share their journal cannot take (one from before this) is said once,
+  // to the sharer; anything else undeliverable is simply dropped (the
+  // contact ending, or their journal going, ends it anyway).
+  function onShareDead(d, entry, { error }) {
+    const s = shareOfEntry(d, entry)
+    if (s && error === 'unknown_op') {
+      const c = shareContact(d, s)
+      const to = c ? `${c.peer_user}@${c.peer_journal}` : 'them'
+      const title = d.prepare('SELECT title FROM conversations WHERE id=?').get(s.convo_id)?.title ?? ''
+      fileNotice(base, {
+        userId: s.user_id, title: `${t(to)} can't see your shared session yet`,
+        body: `The journal at ${t(c?.peer_journal ?? '')} does not take shared sessions yet, so "${t(title, 80)}" is not on ${t(to)}'s roster. Their agents can still ask to talk with you, and you choose where your side talks. The share stays on and is sent again when the session's title changes.`,
+        idemKey: `fed-share-dead:${s.id}`,
+      })
+    }
+    return 'discard'
+  }
   const outbound = {
+    [SHARE_OP]: { stillAllowed: (d, entry) => shareOfEntry(d, entry)?.state === 'active' && shareContactLive(d, entry), onDead: onShareDead },
+    [UNSHARE_OP]: { stillAllowed: shareContactLive, onDead: () => 'discard' },
     [INVITE_OP]: { stillAllowed: live, onDead },
     // An answer often ends the guest's half (a decline, an expiry): it goes
     // while the contact lasts.
@@ -838,6 +1071,7 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
     inbound, outbound, setOutbox: (o) => { outbox = o },
     parkTalk, ownerAsk, handleTap, answerOwner, answerGuest, onGuestAgentAnswer, onGuestInviteExpired,
     onAgentLeft, endByUser, onContactEnded, copyOut, sweep, endLocal,
+    offerShare, withdrawShare, syncShares,
   }
   registry.set(db, api)
   return api

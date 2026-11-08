@@ -23,6 +23,7 @@ import { handleSharingRoute } from './sharing-http.js'
 import { handleFederationRoute } from './federation-http.js'
 import { handlePersonRoomRoute } from './person-rooms-http.js'
 import { sessionsSharedWith } from './person-rooms.js'
+import { remoteSessionsFor } from './federation-rooms.js'
 import { handleProjectsRoute } from './projects-http.js'
 import { handleGithubRoute, handleGithubCallback } from './github-http.js'
 import { handleLookupRoute } from './lookup-http.js'
@@ -561,6 +562,15 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           let p = people.find((x) => x.person === s.person)
           if (!p) { p = { person: s.person, sessions: [] }; people.push(p) }
           p.sessions.push({ convo_id: s.convo_id, title: s.title, agent_device_id: s.agent_device_id, session_state: s.session_state, created_at: s.created_at })
+        }
+        // Sessions contacts on other journals share (src/federation-rooms.js):
+        // the person is their address, and the id is this journal's for the
+        // share. No device, no state: a talk request names the person and the
+        // session, and their journal finds the agent.
+        for (const s of remoteSessionsFor(db, who.userId)) {
+          let p = people.find((x) => x.person === s.person)
+          if (!p) { p = { person: s.person, sessions: [] }; people.push(p) }
+          p.sessions.push({ convo_id: s.convo_id, title: s.title, agent_device_id: null, session_state: null, created_at: s.created_at, remote: true })
         }
         return json(res, 200, { agents, conversations, people })
       }
