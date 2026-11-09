@@ -265,8 +265,8 @@ export async function runAdmin(db, argv, deps = {}) {
   }
   // A blocked journal is refused both ways at once, with no restart: its
   // envelopes get 403 peer_refused, its invite links are refused, and what
-  // is queued for it goes dead (its users are told, and can resend after an
-  // unblock). A host never seen is blocked ahead of time; it has no key yet.
+  // is queued for it goes dead at the outbox's next pass, a few seconds
+  // later (its users are told, and can resend after an unblock). A host never seen is blocked ahead of time; it has no key yet.
   if (a === 'federation' && (b === 'block' || b === 'unblock')) {
     const host = String(argv[2] ?? '').trim().toLowerCase()
     if (!/^[a-z0-9.-]+(:[0-9]{1,5})?$/.test(host) || !host.includes('.')) throw new Error(USAGE)
@@ -276,7 +276,7 @@ export async function runAdmin(db, argv, deps = {}) {
       if (row) db.prepare("UPDATE fed_peers SET state='blocked', last_error='blocked' WHERE host=?").run(host)
       else db.prepare("INSERT INTO fed_peers(host, base_url, key_pub, state, first_seen, last_error) VALUES(?,?,'','blocked',?,'blocked')").run(host, `https://${host}`, Date.now())
       const queued = db.prepare("SELECT COUNT(*) AS n FROM fed_outbox WHERE peer_host=? AND state='queued'").get(host).n
-      return `${host} is blocked: nothing goes to it or comes from it${queued ? `; its ${queued} queued ${queued === 1 ? 'op goes' : 'ops go'} dead and their users are told` : ''}`
+      return `${host} is blocked: nothing goes to it or comes from it${queued ? `; ${queued} queued ${queued === 1 ? 'op goes' : 'ops go'} dead at the next outbox pass, and their users are told` : ''}`
     }
     if (row?.state !== 'blocked') return `${host} is not blocked`
     if (!row.key_pub) {

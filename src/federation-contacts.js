@@ -216,9 +216,12 @@ function observeKey(db, host, pub, now) {
 }
 
 // A user's consent pins `pub` for `host`. → the contacts this cut off (pinned
-// to an earlier key), for their notices. Never unblocks: caller checks.
+// to an earlier key), for their notices. Never unblocks: a block that landed
+// while the caller was fetching the journal's key (the operator's
+// `matron-admin federation block`) refuses the pin.
 function pinPeer(db, { host, baseUrl, pub, now }) {
   const row = db.prepare('SELECT * FROM fed_peers WHERE host=?').get(host)
+  if (row?.state === 'blocked') fail('journal_blocked')
   if (!row) {
     db.prepare("INSERT INTO fed_peers(host, base_url, key_pub, state, first_seen) VALUES(?,?,?,'active',?)").run(host, baseUrl, pub, now)
     return []

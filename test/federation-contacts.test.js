@@ -27,7 +27,10 @@ async function world(t, { a: aEnv = {}, b: bEnv = {} } = {}) {
     allowHttp: true, allowHosts: ['127.0.0.1'],
     rewriteUrl: (u) => { const x = new URL(u); return bases[x.host] ? bases[x.host] + x.pathname + x.search : u },
   })
-  const client = { ...real, fetchWellKnown: (host) => { fetched.push(host); return real.fetchWellKnown(host) } }
+  // hooks.afterFetch runs once a journal's key is fetched, before the
+  // caller goes on: what changed meanwhile.
+  const hooks = {}
+  const client = { ...real, fetchWellKnown: async (host) => { fetched.push(host); const wk = await real.fetchWellKnown(host); hooks.afterFetch?.(host); return wk } }
   const start = async (host, env) => {
     const s = await startTestServer({ tokenKey: KEY, federationEnv: { federation: 'on', publicUrl: `https://${host}`, ...env }, federationClient: client })
     t.after(() => s.close())
@@ -53,7 +56,7 @@ async function world(t, { a: aEnv = {}, b: bEnv = {} } = {}) {
       if (!live(a) && !live(b)) return
     }
   }
-  return { a, b, users, phones, fetched, settle, client: real, aliceBoxId: aliceBox.deviceId, aliceBox: (path, opts = {}) => a.http(path, { token: aliceBox.token, ...opts }) }
+  return { hooks, a, b, users, phones, fetched, settle, client: real, aliceBoxId: aliceBox.deviceId, aliceBox: (path, opts = {}) => a.http(path, { token: aliceBox.token, ...opts }) }
 }
 
 const contactsOf = async (phone) => (await phone('/contacts')).json.contacts
@@ -589,4 +592,19 @@ test('invite asks: with federation off an agent is told so and nothing parks', a
   const r = await s.http('/contacts/invites', { token: box.token, ...post({ convo_id: 'work' }) })
   assert.deepEqual([r.status, r.json.blocked_by], [409, 'federation_off'])
   assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM fed_invite_asks').get().n, 0)
+})
+
+test('block: an operator block that lands while the inviter\'s journal fetches the answering journal\'s key refuses the pin', async (t) => {
+  const w = await world(t)
+  const { link } = await invite(w)
+  // alice's journal first hears of b.example from bob's answer, and blocks
+  // it while it is fetching b.example's key.
+  w.hooks.afterFetch = (host) => {
+    if (host !== 'b.example') return
+    w.a.db.prepare("INSERT INTO fed_peers(host, base_url, key_pub, state, first_seen) VALUES('b.example','https://b.example','','blocked',1)").run()
+  }
+  assert.equal((await w.phones.bob('/contacts/invites/accept', post({ link }))).status, 202)
+  await w.settle()
+  assert.deepEqual(w.a.db.prepare('SELECT host, state, key_pub FROM fed_peers').all(), [{ host: 'b.example', state: 'blocked', key_pub: '' }])
+  assert.deepEqual(await contactsOf(w.phones.alice), [])
 })
