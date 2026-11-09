@@ -19,6 +19,7 @@
 //
 // Every op of one grant shares the subject `grant:<owner's gr_ id>`, so an
 // answer never overtakes its offer and a revoke cancels whatever waits.
+import { createHash } from 'node:crypto'
 import { newId } from './items.js'
 import { enqueue } from './federation-outbox.js'
 import { remoteContactRaw } from './contacts.js'
@@ -26,7 +27,8 @@ import { answerRemoteGrant, leaveRemoteGrant, getGrantRaw, sharePreview, askOf }
 import { onRemoteMissionWrite, card, fileMirror, closeMirror, audit, changed, fileNotice, peopleConvo, onGrantOutcome, onGrantRevoked, PEER_ACTIONS, SHARE_CARD_KIND } from './sharing-events.js'
 import { consentLink } from './consent-items.js'
 import { sanitizePeerText, plainText as plain } from './peer-text.js'
-import { SNAPSHOT_OP, EVENT_OP, sendSnapshot, sendEvent, eventBody, applySnapshotPage, applyEvent } from './federation-replica.js'
+import { SNAPSHOT_OP, EVENT_OP, sendSnapshot, sendEvent, eventBody, snapshotPages, applySnapshotPage, applyEvent } from './federation-replica.js'
+import { canonicalize } from './federation-jcs.js'
 
 export const OFFER_OP = 'grant.offer'
 export const ANSWER_OP = 'grant.answer'
@@ -115,6 +117,9 @@ function sharedFrame({ hub }, userId, frame) {
 
 // `ctx` {db, hub, pushPipeline}; `federation` the loaded identity.
 // → {federate, answer, leave, kick, resnapshot, inbound, outbound, setOutbox}
+// How long a snapshot's page hashes are trusted between its pages.
+const SNAPSHOT_CHECK_MS = 60_000
+
 export function makeGrantFederation({ db, hub = null, pushPipeline = null, federation, now: clock = Date.now, log = console }) {
   const ctx = { db, hub, pushPipeline }
   let outbox = null
@@ -123,6 +128,23 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
   // One notice a day per share, whichever way its events failed.
   const eventNoticeKey = (g) => `fed-event:${g.id}:${new Date(clock()).toISOString().slice(0, 10)}`
   const kick = () => { try { outbox?.kick() } catch (err) { log.error?.('federation: outbox kick failed', err) } }
+
+  // A snapshot on its way, as it would be built now: the hash of each page,
+  // kept between its pages (each would otherwise build the whole mission
+  // again). A write to the mission drops it, and none is kept longer than
+  // SNAPSHOT_CHECK_MS. null pages: the grant can no longer show the mission.
+  const builds = new Map()
+  const pageHash = (text) => createHash('sha256').update(text).digest('base64')
+  function currentPages(d, g, snap) {
+    const at = clock()
+    for (const [k, b] of builds) if (at - b.at >= SNAPSHOT_CHECK_MS) builds.delete(k)
+    const key = `${g.id}:${snap}`
+    if (!builds.has(key)) {
+      const pages = snapshotPages(d, g, snap)
+      builds.set(key, { mission: g.subject_id, at, pages: pages && pages.map((p) => pageHash(canonicalize(p))) })
+    }
+    return builds.get(key).pages
+  }
 
   // --- The owner's journal: grants.js calls this inside its transaction ------
 
@@ -152,6 +174,7 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
   // record's new state. A full outbox loses the event; the owner is told,
   // once a day per share, that the copy over there may be behind.
   function onMissionWrite(missionId, kind, ref) {
+    for (const [k, b] of builds) if (b.mission === missionId) builds.delete(k)
     const ids = db.prepare(`SELECT g.id FROM grants g JOIN contacts oc ON oc.id = g.contact_id AND oc.state = 'active' AND oc.peer_journal IS NOT NULL
       WHERE g.subject_kind = 'mission' AND g.subject_id = ? AND g.state = 'active' AND g.level <> 'owner'`).all(missionId)
     if (!ids.length) return
@@ -597,10 +620,20 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
     [SNAPSHOT_OP]: {
       // Nor while a private flag change waits to resnapshot the share: the
       // page was read before it, and resnapshot() replaces it.
+      // Nor a page that is no longer what the mission shows (a comment
+      // withdrawn, an item hidden since it was queued): the share is queued
+      // for a fresh snapshot, and this one, page by page, is cancelled.
       stillAllowed(d, entry) {
-        const g = getGrantRaw(d, bodyOf(entry).grant)
+        const body = bodyOf(entry)
+        const g = getGrantRaw(d, body.grant)
         if (!g || g.state !== 'active') return false
-        return !d.prepare('SELECT 1 FROM fed_resnapshot WHERE grant_id=?').get(g.id)
+        if (d.prepare('SELECT 1 FROM fed_resnapshot WHERE grant_id=?').get(g.id)) return false
+        const pages = currentPages(d, g, body.snap)
+        const text = typeof entry.body === 'string' ? entry.body : canonicalize(body)
+        const same = pages ? pages.length === body.pages && pages[body.page] === pageHash(text) : body.mission === null
+        if (same) return true
+        d.prepare('INSERT OR IGNORE INTO fed_resnapshot(grant_id, queued_at) VALUES(?,?)').run(g.id, clock())
+        return false
       },
       // The share stands, but their copy is not whole: the owner is told
       // once per snapshot. A share that ended over there meanwhile is not
@@ -643,6 +676,13 @@ export function makeGrantFederation({ db, hub = null, pushPipeline = null, feder
         const g = getGrantRaw(d, body.grant)
         if (!g || g.state !== 'active') return false
         return body.record === null || !!eventBody(d, g, body.kind, body.ref ?? null)
+      },
+      // The record as the grantee view has it at the attempt, not as it was
+      // queued: a comment withdrawn meanwhile crosses withdrawn.
+      refresh(d, entry) {
+        const body = bodyOf(entry)
+        const g = getGrantRaw(d, body.grant)
+        return (g && eventBody(d, g, body.kind, body.ref ?? null)) ?? undefined
       },
       // As for a snapshot: the share stands, their copy may be behind. Once
       // a day per share, however many events died.

@@ -476,3 +476,107 @@ test('hooks: a string from stillAllowed ends the entry dead with that error; a d
   await denied.tick()
   assert.deepEqual([r.row(d).state, r.row(d).last_error], ['dead', 'journal_not_allowed'])
 })
+
+test('peers are served side by side: a slow peer holds up only its own entries', async () => {
+  const r = await rig()
+  const cKey = generateFederationKey()
+  r.db.prepare('INSERT INTO fed_peers(host, base_url, key_pub, state, first_seen) VALUES(?,?,?,?,?)')
+    .run('c.example', 'https://c.example', exportPublicKey(cKey.publicKey), 'active', 1)
+  const slow = r.q({ subject: 's1' })
+  const slowNext = r.q({ subject: 's2' })
+  const fast = r.q({ to: 'carol@c.example', subject: 's1' })
+  const fastNext = r.q({ to: 'carol@c.example', subject: 's2' })
+  let release
+  const gate = new Promise((res) => { release = res })
+  const order = []
+  const client = {
+    async postEnvelope(baseUrl, e) {
+      order.push(e.id)
+      if (baseUrl === 'https://b.example') await gate
+      return { status: 200, body: { ok: true, result: {} }, signed: true }
+    },
+  }
+  const box = makeOutbox({ db: r.db, federation: { key: { privateKey: r.self.privateKey } }, client, now: r.now, log: quietLog })
+  const pass = box.tick()
+  for (let i = 0; i < 50 && r.row(fastNext).state !== 'sent'; i++) await new Promise((res) => setImmediate(res))
+  assert.deepEqual([r.row(fast).state, r.row(fastNext).state], ['sent', 'sent'], 'c is served while b has not answered')
+  assert.deepEqual([r.row(slow).state, r.row(slowNext).state], ['queued', 'queued'])
+  assert.equal(order.includes(slowNext), false, 'within a peer, one at a time and in order')
+  // A second pass while b's chain runs starts no second chain for b.
+  await Promise.race([box.tick(), new Promise((res) => setImmediate(res))])
+  assert.equal(order.filter((id) => id === slow).length, 1)
+  release()
+  await pass
+  assert.deepEqual([r.row(slow).state, r.row(slowNext).state], ['sent', 'sent'])
+  assert.ok(order.indexOf(slow) < order.indexOf(slowNext))
+})
+
+test('a pass runs at most `peers` chains at once; the rest wait for the next pass', async () => {
+  const r = await rig()
+  const cKey = generateFederationKey()
+  r.db.prepare('INSERT INTO fed_peers(host, base_url, key_pub, state, first_seen) VALUES(?,?,?,?,?)')
+    .run('c.example', 'https://c.example', exportPublicKey(cKey.publicKey), 'active', 1)
+  const b = r.q()
+  const c = r.q({ to: 'carol@c.example' })
+  const client = { postEnvelope: async () => ({ status: 200, body: { ok: true, result: {} }, signed: true }) }
+  const box = makeOutbox({ db: r.db, federation: { key: { privateKey: r.self.privateKey } }, client, now: r.now, log: quietLog, peers: 1 })
+  await box.tick()
+  assert.deepEqual([r.row(b).state, r.row(c).state], ['sent', 'queued'], 'the peer whose oldest entry is oldest goes first')
+  await box.tick()
+  assert.equal(r.row(c).state, 'sent')
+})
+
+test('refresh: a body that changed since it was queued goes as it is now, under a new id, in its place', async () => {
+  const r = await rig()
+  let current = { n: 1 }
+  r.ops['test.op'] = { refresh: (db, e) => (JSON.parse(e.body).n === 1 ? current : undefined) }
+  const first = r.q({ body: { n: 1 } })
+  const second = r.q({ body: { n: 9 } })
+  r.answers.push({ status: 503, body: null, signed: false })
+  await r.outbox.tick()
+  assert.equal(r.sent[0].envelope.id, first, 'unchanged: the queued id and body')
+  const seq = r.row(first).seq
+  current = { n: 2, withdrawn: true }
+  r.advance(BACKOFF_BASE_MS)
+  await r.outbox.tick()
+  assert.equal(r.row(first), undefined, 'the old id is gone')
+  const replaced = r.db.prepare('SELECT * FROM fed_outbox WHERE seq=?').get(seq)
+  assert.notEqual(replaced.id, first)
+  assert.equal(replaced.state, 'sent')
+  assert.deepEqual(JSON.parse(replaced.body), current)
+  assert.deepEqual(r.sent[1].envelope.body, current)
+  assert.equal(r.sent[1].envelope.id, replaced.id)
+  await r.outbox.tick()
+  assert.equal(r.row(second).state, 'sent', 'the op behind it on its subject still waited for it')
+  assert.deepEqual(r.sent.map((x) => x.envelope.body.n), [1, 2, 9])
+})
+
+test('refresh: a throw holds the op back for a retry; an unsendable body ends it dead', async () => {
+  const r = await rig()
+  r.ops['test.op'] = { refresh: () => { throw new Error('boom') } }
+  const a = r.q()
+  await r.outbox.tick()
+  assert.deepEqual([r.row(a).state, r.row(a).last_error, r.sent.length], ['queued', 'check_failed', 0])
+  r.ops['test.op'] = { refresh: () => ({ n: 1n }) }
+  r.advance(BACKOFF_BASE_MS)
+  await r.outbox.tick()
+  assert.deepEqual([r.row(a).state, r.sent.length], ['dead', 0])
+  assert.match(r.row(a).last_error, /^unsendable: /)
+})
+
+test('prune: sent and cancelled entries go a week after they ended; dead ones stay', async () => {
+  const { pruneOutbox, PRUNE_AFTER_MS } = await import('../src/federation-outbox.js')
+  const r = await rig()
+  const sent = r.q({ subject: 's1' })
+  const cancelled = r.q({ subject: 's2' })
+  const dead = r.q({ subject: 's3' })
+  const queued = r.q({ subject: 's4', body: { n: 4 } })
+  r.db.prepare("UPDATE fed_outbox SET next_at=? WHERE id=?").run(r.now() + 10 * PRUNE_AFTER_MS, queued)
+  cancelSubject(r.db, { peerHost: 'b.example', subject: 's2', now: r.now() })
+  r.answers.push({ status: 200, body: { ok: true, result: {} }, signed: true }, { status: 403, body: { error: 'nope' }, signed: true })
+  await r.outbox.tick()
+  assert.deepEqual([sent, cancelled, dead, queued].map((id) => r.row(id).state), ['sent', 'cancelled', 'dead', 'queued'])
+  assert.equal(pruneOutbox(r.db, r.now() + PRUNE_AFTER_MS - 1), 0, 'not before a week')
+  assert.equal(pruneOutbox(r.db, r.now() + PRUNE_AFTER_MS + 1), 2)
+  assert.deepEqual([sent, cancelled, dead, queued].map((id) => r.row(id)?.state), [undefined, undefined, 'dead', 'queued'])
+})

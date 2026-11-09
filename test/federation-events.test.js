@@ -162,3 +162,21 @@ test('an event whose box turned private while it waited is not sent', async (t) 
   assert.equal((await bobMission(w)).status, 'Held')
   assert.deepEqual((await bobItems(w)).map((i) => i.title), ['Tomatoes or beans?'])
 })
+
+test('an event goes as its record is when it is sent: a comment withdrawn while it waited crosses withdrawn', async (t) => {
+  const { w, q } = await shared(t)
+  // Hold the share's queue: an earlier event at its head, not yet due.
+  await w.aliceBox(`/missions/${w.mission.id}`, { method: 'PATCH', body: { status: 'Held', convo_id: 'work' } })
+  w.a.db.prepare("UPDATE fed_outbox SET next_at=? WHERE rowid=(SELECT MAX(rowid) FROM fed_outbox WHERE op='mission.event')").run(Date.now() + 3600_000)
+  const c = (await w.aliceBox(`/items/${q.id}/comments`, post({ body: 'Words to take back', convo_id: 'work' }))).json.comment
+  const queued = w.a.db.prepare("SELECT id, body FROM fed_outbox WHERE op='mission.event' AND state='queued' ORDER BY seq DESC LIMIT 1").get()
+  assert.ok(queued.body.includes('Words to take back'), 'queued with its words')
+  w.a.db.prepare('UPDATE item_comments SET withdrawn_at=? WHERE id=?').run(Date.now(), c.id)
+  w.a.db.prepare("UPDATE fed_outbox SET next_at=0 WHERE state='queued'").run()
+  await w.settle()
+  assert.equal(w.a.db.prepare('SELECT 1 FROM fed_outbox WHERE id=?').get(queued.id), undefined, 'replaced under a new id')
+  const sent = w.a.db.prepare("SELECT body FROM fed_outbox WHERE op='mission.event' AND state='sent'").all().map((r) => r.body)
+  assert.ok(!sent.some((b) => b.includes('Words to take back')), 'the words never crossed')
+  const bq = (await bobItems(w)).find((i) => i.title === 'Tomatoes or beans?')
+  assert.ok(!JSON.stringify((await w.phones.bob(`/items/${bq.id}`)).json).includes('Words to take back'))
+})

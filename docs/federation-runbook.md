@@ -110,7 +110,8 @@ approves it on his side.
   `GET /federation/outbox?state=dead|queued|sent|cancelled` (client devices
   only, and never the bodies). For the whole journal, look at the
   `fed_outbox` table: `state`, `attempts`, `last_status` and `last_error`
-  per entry.
+  per entry. Sent and cancelled entries are deleted a week after they
+  ended.
 - **Dead deliveries.** An op the other journal hasn't acknowledged within 7
   days, or that it refused for good, goes dead. Its user gets one notice per
   peer in their People conversation. Dead ops hold up later ops on the same

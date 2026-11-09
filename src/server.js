@@ -33,7 +33,7 @@ import { makeContactFederation } from './federation-contacts.js'
 import { makeGrantFederation } from './federation-grants.js'
 import { makeContributeFederation } from './federation-contribute.js'
 import { makeRoomFederation } from './federation-rooms.js'
-import { makeOutbox } from './federation-outbox.js'
+import { makeOutbox, pruneOutbox } from './federation-outbox.js'
 import { makeConfiguredFederationClient } from './federation-client.js'
 import { makeWaker, markWakeRefused, clearWakeRefused } from './wake.js'
 import { makeConfiguredTranscriber } from './cloud-transcribe.js'
@@ -718,10 +718,12 @@ export function startServer({
         mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes, deviceRetention,
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
-      // Federation receipts are the replay memory for 30 days, then go.
+      // Federation receipts are the replay memory for 30 days, then go;
+      // what the outbox sent or cancelled goes a week after it ended.
       if (federation.enabled) {
         receiptPruneInterval = setInterval(() => {
           try { pruneReceipts(db) } catch (err) { console.error('federation: receipt prune failed', err) }
+          try { pruneOutbox(db) } catch (err) { console.error('federation: outbox prune failed', err) }
           try { purgeReplicaMedia(db) } catch (err) { console.error('federation: media purge failed', err) }
         }, 3600_000)
         receiptPruneInterval.unref()
