@@ -11,7 +11,7 @@ import { createItem, addComment, closeItem } from '../src/items.js'
 import { createMission, closeMission, createMilestone } from '../src/missions.js'
 import { createProject, mergeProject, updateProject, closeProject } from '../src/projects.js'
 import {
-  projectMoves, projectWeeklyMoves, weeksList, weekDetail, wentQuiet, openLong, finished,
+  projectMoves, projectWeeklyMoves, weeksList, weekDetail, wentQuiet, openLong, finished, cronRunsForTest,
 } from '../src/timeline.js'
 
 const LON = 'Europe/London'
@@ -533,4 +533,41 @@ test('wentQuiet includes a project whose last move is exactly 14 days ago', () =
   postAt(db, short.convo, 'last', NOW - 14 * DAY + 1)
   const out = wentQuiet(db, 1, at)
   assert.deepEqual(out.rows.map((r) => [r.project.title, r.last_moved_at]), [['Edge', NOW - 14 * DAY]])
+})
+
+test('the 22 Mar 2027 week spans the March clock change as 167 hours', () => {
+  const start = weekStartOf(Date.UTC(2027, 2, 24, 12), LON)
+  assert.equal(start, Date.UTC(2027, 2, 22, 0, 0)) // Mon 22 Mar 00:00 GMT
+  const end = weekEndOf(start, LON)
+  assert.equal(end, Date.UTC(2027, 2, 28, 23, 0)) // Mon 29 Mar 00:00 BST
+  assert.equal(end - start, 167 * 3600e3)
+  assert.equal(formatWeekKey(end, LON), '2027-03-29')
+  assert.equal(previousWeekStart(end, LON), start)
+  assert.equal(weekStartOf(end - 1, LON), start)
+})
+
+test("weekDetail's needs_you is bounded to the week: an item created the week after is not on the earlier card", () => {
+  const db = seeded()
+  const { convo, p } = proj(db, 'Billing')
+  postAt(db, convo, 'moved', mid(-1))
+  postAt(db, convo, 'moved again', mid(0))
+  const then = item(db, convo, 'question', 'Which plan?', { now: mid(-1) })
+  const later = item(db, convo, 'question', 'Ship it?', { now: mid(0) })
+  const card = (n) => weekDetail(db, 1, keyOf(n), at).stories.find((s) => s.project.id === p.id)
+  assert.deepEqual(card(-1).needs_you.map((r) => r.id), [then.id])
+  assert.deepEqual(card(0).needs_you.map((r) => r.id), [later.id, then.id])
+})
+
+test('wentQuiet over 200 candidates reuses week boundaries: about one croner run per candidate, not sixteen', () => {
+  const db = seeded()
+  const N = 200
+  for (let i = 0; i < N; i++) {
+    const { convo } = proj(db, `Q${i}`, { createdAt: mid(-5 - (i % 7) - (i % 3)) })
+    postAt(db, convo, 'last', mid(-3 - (i % 7)))
+  }
+  const before = cronRunsForTest()
+  const out = wentQuiet(db, 1, at)
+  const runs = cronRunsForTest() - before
+  assert.equal(out.total, N)
+  assert.ok(runs <= N + 40, `${runs} croner runs for ${N} candidates`)
 })

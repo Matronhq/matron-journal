@@ -13,27 +13,54 @@ import { PROJECT_ORIGIN_SIEVE } from './projects.js'
 const MONDAY_MIDNIGHT = '0 0 * * 1'
 const KEY_RE = /^(\d{4})-(\d{2})-(\d{2})$/
 
-const zoneOf = (tz) => (validTz(tz) ? tz : DEFAULT_TZ)
-const mondays = (tz) => new Cron(MONDAY_MIDNIGHT, { timezone: zoneOf(tz) })
+// Week maths runs on the request path of a synchronous server, and a list
+// read asks for the same few boundaries hundreds of times, so the zone check,
+// the per-zone Cron and every computed boundary are memoised (each map is
+// cleared when it grows past its cap; a boundary never changes for a zone).
+const CACHE_MAX = 50_000
+const remember = (map, key, compute) => {
+  if (map.has(key)) return map.get(key)
+  if (map.size >= CACHE_MAX) map.clear()
+  const value = compute()
+  map.set(key, value)
+  return value
+}
+const zoneChecks = new Map()
+const crons = new Map()
+const boundaries = new Map()
+let cronRuns = 0
+// Test seam: how many croner run computations have happened so far.
+export const cronRunsForTest = () => cronRuns
+
+const zoneOf = (tz) => (remember(zoneChecks, tz, () => validTz(tz)) ? tz : DEFAULT_TZ)
+const mondays = (zone) => remember(crons, zone, () => new Cron(MONDAY_MIDNIGHT, { timezone: zone }))
 
 export function userTimeZone(db, userId) {
   const row = db.prepare('SELECT time_zone FROM users WHERE id = ?').get(userId)
-  return row && validTz(row.time_zone) ? row.time_zone : DEFAULT_TZ
+  return row ? zoneOf(row.time_zone) : DEFAULT_TZ
 }
 
 // The local Monday 00:00 at or before `ms`. croner counts in whole seconds and
 // returns runs strictly before its reference, so the reference is a second on.
+// Not memoised by `ms` (any instant); week starts themselves go through the
+// cached boundaries below.
 export function weekStartOf(ms, tz) {
-  return mondays(tz).previousRuns(1, new Date(ms + 1000))[0].getTime()
+  cronRuns += 1
+  return mondays(zoneOf(tz)).previousRuns(1, new Date(ms + 1000))[0].getTime()
 }
 
 // The next local Monday 00:00 after `weekStart`.
 export function weekEndOf(weekStart, tz) {
-  return mondays(tz).nextRun(new Date(weekStart)).getTime()
+  const zone = zoneOf(tz)
+  return remember(boundaries, `${zone}|end|${weekStart}`, () => {
+    cronRuns += 1
+    return mondays(zone).nextRun(new Date(weekStart)).getTime()
+  })
 }
 
 export function previousWeekStart(weekStart, tz) {
-  return weekStartOf(weekStart - 1, tz)
+  const zone = zoneOf(tz)
+  return remember(boundaries, `${zone}|prev|${weekStart}`, () => weekStartOf(weekStart - 1, zone))
 }
 
 // The local calendar date of the instant, 'YYYY-MM-DD'.
@@ -252,10 +279,11 @@ export function weekDetail(db, userId, weekKey, { excludePrivateOwned = false, n
       JOIN conversations c ON c.id = l.convo_id
     WHERE ${ofProject} AND l.created_at >= @start AND l.created_at < @end ${convoSieve}
     ORDER BY l.created_at DESC, l.seq DESC LIMIT 1`)
-  // Unlike projectDetail's needs-you: consent cards are left out, newest created first.
+  // Unlike projectDetail's needs-you: consent cards are left out, newest created first,
+  // and only items created before the week ended.
   const needsYou = db.prepare(`SELECT i.id, i.num, i.title FROM items i JOIN missions m ON m.id = i.mission_id
       JOIN conversations c ON c.id = i.origin_convo_id
-    WHERE ${ofProject} AND i.state = 'open' AND i.awaiting = 'user' AND i.consent IS NULL ${convoSieve}
+    WHERE ${ofProject} AND i.state = 'open' AND i.awaiting = 'user' AND i.consent IS NULL AND i.created_at < @end ${convoSieve}
     ORDER BY i.created_at DESC, i.num DESC`)
   // The project feed's files roll-up, narrowed to the week's pictures and videos.
   const media = db.prepare(`SELECT f.blob_id, f.content_type, f.name FROM (${filesSql(excludePrivateOwned)}) f
