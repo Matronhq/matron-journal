@@ -391,7 +391,15 @@ export function makeContactFederation({ db, hub = null, pushPipeline = null, fed
         if (cur?.state === 'blocked') fail('invite_invalid')
         const wasActive = cur?.state === 'active' && cur.peer_journal_key === peer.key_pub
         if (!wasActive && !(cur && ['active', 'pending_out'].includes(cur.state)) && liveRemoteCount(d, user.id) >= MAX_REMOTE_CONTACTS) fail('too_many_contacts')
-        const cut = peer.discovered ? pinPeer(d, { host, baseUrl: peer.base_url, pub: peer.key_pub, now }) : []
+        // Blocked while its key was being fetched: answered as any blocked
+        // journal is.
+        let cut = []
+        if (peer.discovered) {
+          try { cut = pinPeer(d, { host, baseUrl: peer.base_url, pub: peer.key_pub, now }) } catch (err) {
+            if (err.message === 'journal_blocked') fail('peer_refused')
+            throw err
+          }
+        }
         const displayName = sanitizePeerText(body.display_name, NAME_CAP) || name
         const row = wasActive ? cur : putRemoteRow(d, { userId: user.id, name, host, pub: peer.key_pub, state: 'active', displayName, requestedBy: null, now })
         if (!invite.used_at) d.prepare('UPDATE fed_invites SET used_at=?, used_by_address=? WHERE id=?').run(now, envelope.from, invite.id)
@@ -412,7 +420,7 @@ export function makeContactFederation({ db, hub = null, pushPipeline = null, fed
         })
         changed(ctx, p.row.user_id, { contact_id: p.row.id })
       },
-      errors: { malformed: 400, invite_invalid: 403, too_many_contacts: 403 },
+      errors: { malformed: 400, invite_invalid: 403, too_many_contacts: 403, peer_refused: 403 },
     },
     [REMOVE_OP]: {
       apply({ db: d, envelope, peer, now }) {

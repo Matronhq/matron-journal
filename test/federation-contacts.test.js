@@ -605,6 +605,10 @@ test('block: an operator block that lands while the inviter\'s journal fetches t
   }
   assert.equal((await w.phones.bob('/contacts/invites/accept', post({ link }))).status, 202)
   await w.settle()
+  // Refused in a's signed word, as any blocked journal is: bob's answer
+  // ends (bob is told) rather than being retried.
+  const answer = w.b.db.prepare("SELECT state, last_status, last_error FROM fed_outbox WHERE op='contact.accept_invite'").get()
+  assert.deepEqual(answer, { state: 'cancelled', last_status: 403, last_error: 'peer_refused' })
   assert.deepEqual(w.a.db.prepare('SELECT host, state, key_pub FROM fed_peers').all(), [{ host: 'b.example', state: 'blocked', key_pub: '' }])
   assert.deepEqual(await contactsOf(w.phones.alice), [])
 })
