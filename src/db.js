@@ -1999,6 +1999,12 @@ export function openDb(path) {
   if (!userCols.some((c) => c.name === 'two_factor_exempt')) {
     db.exec('ALTER TABLE users ADD COLUMN two_factor_exempt INTEGER NOT NULL DEFAULT 0')
   }
+  // The user's IANA time zone, which fixes where a Monday-to-Monday week
+  // starts for the Projects timeline (src/timeline.js). Validated where it is
+  // written; an unknown stored value reads back as the default.
+  if (!userCols.some((c) => c.name === 'time_zone')) {
+    db.exec("ALTER TABLE users ADD COLUMN time_zone TEXT NOT NULL DEFAULT 'Europe/London'")
+  }
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower ON users(lower(email)) WHERE email IS NOT NULL;
     CREATE TABLE IF NOT EXISTS password_resets(

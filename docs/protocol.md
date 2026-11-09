@@ -4097,6 +4097,28 @@ plus the rollup fields on every route that returns one. `idem_key` and
 There is no project marker: the apps refresh `GET /projects` on any
 `mission` marker and while the Projects tab is open.
 
+**Timeline (read-only).** `src/timeline-http.js`. Five `GET` routes that
+turn the projects into a weekly timeline; nothing is written. Weeks are the
+user's own local Monday 00:00 to the next, in their stored time zone
+(`Europe/London` by default); a *week key* is the Monday's local date,
+`YYYY-MM-DD`. A "move" is a milestone, an item created or closed, a
+user-visible item comment, or a mission created or closed; chat traffic and a
+project status edit are not. A project merged into another counts under the
+survivor and is never a row. Every route goes through the caller's sieve like
+`GET /projects` (an ordinary agent loses private-origin projects and
+private-owned moves). Bad parameters are 400 `{error:'bad_request'}`.
+
+| Route | Query | Response |
+|---|---|---|
+| `GET /timeline/weeks` | `before?` a Monday week key; `limit?` integer 1..52, default 12 | `{weeks:[{week, start, end, sentence, moved}], next_before}` — newest first from the current week (or the week before `before`) back to the week of the user's earliest mission, quiet weeks included. `moved` is how many projects moved; `sentence` summarises them. `next_before` is the week key to pass for the next page, `null` at the end. |
+| `GET /timeline/weeks/:week` | | `{week, start, end, final, lede, stories:[{project, sentence, next, needs_you, media}], also:[{…project ref, moved}]}` — one week: a story per project that moved, most moves first, at most 8; the rest under `also`. `final` is false for the current week. `sentence` is the newest milestone title that week; `needs_you` the project's open items awaiting the user (consent cards left out); `media` its newest image or video that week, or `null`. A `:week` that is not a real Monday key is 400. |
+| `GET /timeline/quiet` | | `{total, rows:[{project, last_moved_at, weekly, note}]}` — *went quiet*: open projects that moved in at least two of the eight weeks up to their last move and have not moved for 14 days. Top 10 by moves; `total` counts them all. `weekly` is eight per-week move counts, oldest first, ending with the current week. |
+| `GET /timeline/long` | | `{total, rows:[{project, created_at, last_moved_at, weekly, note}]}` — *open a long time*: open projects with an open mission, created at least 21 days ago, oldest first. Top 10; `total` counts them all. |
+| `GET /timeline/finished` | `before?` a `"<finished_at>:<project id>"` cursor; `limit?` integer 1..100, default 30 | `{rows:[{project, finished_at}], next_before}` — projects that are closed or have no open mission (and had at least one), newest finish first. `next_before` is the cursor for the next page, `null` at the end. |
+
+`project` in these bodies is the compact project reference `{id, num, title}` the timeline reads
+share, never the full row.
+
 **Visibility.** Same rules as missions. An ordinary agent never sees a
 project whose origin conversation is private-owned or that a private device
 created (404, absent from lists, not resolvable by `/lookup`); a status
