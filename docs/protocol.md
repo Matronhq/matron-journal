@@ -5338,7 +5338,9 @@ Every op a journal sends is queued first, and a worker delivers it every
 few seconds. The rules:
 
 - **One id per op.** The id is set when the op is queued. Every attempt
-  keeps that id and body, takes a fresh `ts`, and is signed again.
+  keeps that id and body, takes a fresh `ts`, and is signed again. The
+  one exception is a `mission.event` whose record changed while it
+  waited (below): it takes a new id with its new body.
 - **Order.** Ops are delivered first in, first out per (peer, subject),
   where the subject is a mission, room, contact or grant. An op waits
   while an earlier one on its subject is queued or dead. Ops on other
@@ -5363,10 +5365,23 @@ few seconds. The rules:
   resend is refused (counted in `too_old`) for an op queued more than 23
   days earlier: its last attempt could otherwise fall after the peer has
   pruned the op's 30-day receipt, and the peer would apply it twice.
+- **Peers side by side.** Each peer with something due gets its own chain
+  of attempts, in order, and up to 8 peers are served at once. A peer that
+  answers slowly holds up only what is queued for it.
 - **Checks before sending.** Before each attempt the sender checks its own
   records again. An op whose grant or contact has ended here is cancelled
   rather than sent, and an op for a journal the operator's lists now
   refuse goes dead (`journal_not_allowed`).
+- **Sent as it is now.** A `mission.event` is sent with its record as the
+  grantee view has it at the attempt, not as it was when queued: a comment
+  withdrawn meanwhile crosses withdrawn. When the body changed, the op takes
+  a new id in its place in the queue (the old id with a new body would be
+  `409 id_reused`); a resend puts back the id the op had when it went
+  dead. A `mission.snapshot` page with a record that is now hidden or has
+  changed is cancelled with the rest of its snapshot, and a fresh snapshot
+  is queued instead.
+- **Pruning.** Sent and cancelled ops are deleted a week after they ended,
+  bodies and all. Dead ops stay until the user resends or discards them.
 - **Acknowledgement.** An entry is marked sent, and its op's own records
   updated, in one transaction, and only if the entry was still queued: an
   answer to an entry cancelled while its request was out changes nothing.
