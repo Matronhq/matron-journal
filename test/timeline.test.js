@@ -571,3 +571,15 @@ test('wentQuiet over 200 candidates reuses week boundaries: about one croner run
   assert.equal(out.total, N)
   assert.ok(runs <= N + 40, `${runs} croner runs for ${N} candidates`)
 })
+
+test("week media follows missions still filed under a merged project onto the survivor's card", () => {
+  const db = seeded()
+  const survivor = proj(db, 'Survivor'); const gone = proj(db, 'Gone')
+  mergeProject(db, { userId: 1, projectId: gone.p.id, intoId: survivor.p.id, by: 'user' })
+  db.prepare('UPDATE missions SET project_id=? WHERE id=?').run(gone.p.id, gone.m.id) // a late write
+  const it = item(db, gone.convo, 'task', 'Screens', { now: mid(-1) })
+  addComment(db, { userId: 1, itemId: it.id, author: 'agent', deviceId: 7, attachments: [{ blob_ref: 'b-shot.png', mime: 'image/png', name: 'shot.png', size: 4 }], now: mid(-1, 1) })
+  const [story] = weekDetail(db, 1, keyOf(-1), at).stories
+  assert.equal(story.project.id, survivor.p.id)
+  assert.deepEqual(story.media, { blob_id: 'b-shot.png', content_type: 'image/png', name: 'shot.png' })
+})

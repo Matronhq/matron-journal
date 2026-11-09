@@ -274,7 +274,9 @@ export function weekDetail(db, userId, weekKey, { excludePrivateOwned = false, n
   const moved = ranked(projectMoves(db, userId, { from: start, to: end, excludePrivateOwned }), byId)
   const shown = moved.slice(0, TIMELINE.storiesMax)
   const convoSieve = excludePrivateOwned ? `AND NOT ${privateConvo('c')} AND ${ORIGIN_SIEVE}` : ''
-  const ofProject = 'm.user_id = @userId AND m.project_id IN (SELECT q.id FROM projects q WHERE q.id = @projectId OR q.merged_into = @projectId)'
+  // The project's missions and those still filed under a project merged into it.
+  const inProject = 'm.project_id IN (SELECT q.id FROM projects q WHERE q.id = @projectId OR q.merged_into = @projectId)'
+  const ofProject = `m.user_id = @userId AND ${inProject}`
   const sentence = db.prepare(`SELECT l.title FROM milestones l JOIN missions m ON m.id = l.mission_id
       JOIN conversations c ON c.id = l.convo_id
     WHERE ${ofProject} AND l.created_at >= @start AND l.created_at < @end ${convoSieve}
@@ -286,7 +288,7 @@ export function weekDetail(db, userId, weekKey, { excludePrivateOwned = false, n
     WHERE ${ofProject} AND i.state = 'open' AND i.awaiting = 'user' AND i.consent IS NULL AND i.created_at < @end ${convoSieve}
     ORDER BY i.created_at DESC, i.num DESC`)
   // The project feed's files roll-up, narrowed to the week's pictures and videos.
-  const media = db.prepare(`SELECT f.blob_id, f.content_type, f.name FROM (${filesSql(excludePrivateOwned)}) f
+  const media = db.prepare(`SELECT f.blob_id, f.content_type, f.name FROM (${filesSql(excludePrivateOwned, inProject)}) f
     WHERE f.at >= @start AND f.at < @end AND (f.content_type LIKE 'image/%' OR f.content_type LIKE 'video/%')
     ORDER BY f.at DESC, f.sort_key DESC LIMIT 1`)
   const stories = shown.map(({ project }) => {
