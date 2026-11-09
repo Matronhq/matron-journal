@@ -14,8 +14,8 @@ export const FEED_LIMIT_MAX = 100
 export const DETAIL_PAGE = 6
 const ANSWER_MAX = 240
 
-const privateDevice = (col) => `EXISTS (SELECT 1 FROM private_devices pd WHERE pd.id = ${col})`
-const privateConvo = (alias) => privateDevice(`${alias}.agent_device_id`)
+export const privateDevice = (col) => `EXISTS (SELECT 1 FROM private_devices pd WHERE pd.id = ${col})`
+export const privateConvo = (alias) => privateDevice(`${alias}.agent_device_id`)
 
 // A page cursor is "<at>:<key>": rows sort by at DESC, then key DESC (a
 // fixed-width string, so equal timestamps never skip or repeat a row).
