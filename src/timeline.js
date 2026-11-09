@@ -81,18 +81,18 @@ function movesSql(excludePrivateOwned) {
     SELECT ${of}, i.created_at
       FROM items i JOIN missions m ON m.id = i.mission_id ${joinProject}
       JOIN conversations c ON c.id = i.origin_convo_id
-      WHERE m.user_id = @userId ${convoSieve}
+      WHERE m.user_id = @userId AND i.consent IS NULL ${convoSieve}
     UNION ALL
     SELECT ${of}, i.closed_at
       FROM items i JOIN missions m ON m.id = i.mission_id ${joinProject}
       JOIN conversations c ON c.id = i.origin_convo_id
-      WHERE m.user_id = @userId AND i.closed_at IS NOT NULL ${convoSieve}
+      WHERE m.user_id = @userId AND i.consent IS NULL AND i.closed_at IS NOT NULL ${convoSieve}
     UNION ALL
     SELECT ${of}, ic.created_at
       FROM item_comments ic JOIN items i ON i.id = ic.item_id
       JOIN missions m ON m.id = i.mission_id ${joinProject}
       JOIN conversations c ON c.id = i.origin_convo_id
-      WHERE m.user_id = @userId AND ic.kind = 'comment' AND ic.withdrawn_at IS NULL
+      WHERE m.user_id = @userId AND i.consent IS NULL AND ic.kind = 'comment' AND ic.withdrawn_at IS NULL
         ${convoSieve} ${commentSieve}
     UNION ALL
     SELECT ${of}, m.created_at
@@ -104,6 +104,11 @@ function movesSql(excludePrivateOwned) {
       WHERE m.user_id = @userId AND m.closed_at IS NOT NULL ${originSieve}`
 }
 
+// Every move in [from, to) as {project_id, at}.
+const moveRows = (db, userId, { from, to, excludePrivateOwned }) =>
+  db.prepare(`SELECT project_id, at FROM (${movesSql(excludePrivateOwned)}) WHERE at >= @from AND at < @to`)
+    .all({ userId, from, to })
+
 // Moves per project with at least one in [from, to).
 export function projectMoves(db, userId, { from, to, excludePrivateOwned = false }) {
   const rows = db.prepare(`SELECT project_id, COUNT(*) AS n FROM (${movesSql(excludePrivateOwned)})
@@ -112,12 +117,20 @@ export function projectMoves(db, userId, { from, to, excludePrivateOwned = false
 }
 
 // One count per requested project and week start, oldest first (the order of
-// `weekStarts`); a quiet week, or a project with no moves, is 0.
+// `weekStarts`); a quiet week, or a project with no moves, is 0. One pass over
+// the whole span: each move is placed in the week whose [start, end) holds it,
+// with the ends from the zone's own calendar so a 167 or 169 hour week fits.
 export function projectWeeklyMoves(db, userId, projectIds, weekStarts, tz, { excludePrivateOwned = false } = {}) {
   const out = new Map(projectIds.map((id) => [id, new Array(weekStarts.length).fill(0)]))
-  weekStarts.forEach((start, i) => {
-    const moves = projectMoves(db, userId, { from: start, to: weekEndOf(start, tz), excludePrivateOwned })
-    for (const [id, n] of moves) if (out.has(id)) out.get(id)[i] = n
-  })
+  if (!weekStarts.length) return out
+  const weeks = weekStarts.map((start) => ({ start, end: weekEndOf(start, tz) }))
+  const from = Math.min(...weeks.map((w) => w.start))
+  const to = Math.max(...weeks.map((w) => w.end))
+  for (const { project_id: id, at } of moveRows(db, userId, { from, to, excludePrivateOwned })) {
+    const counts = out.get(id)
+    if (!counts) continue
+    const i = weeks.findIndex((w) => at >= w.start && at < w.end)
+    if (i >= 0) counts[i] += 1
+  }
   return out
 }

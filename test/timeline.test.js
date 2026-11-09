@@ -159,12 +159,21 @@ test('chat events and a project status edit are not moves', () => {
 test('a withdrawn comment and an agent status line are not moves', () => {
   const { db, p } = lone((d) => {
     const it = item(d, 'c1', 'task', 'Do it')
-    const c = addComment(d, { userId: 1, itemId: it.id, author: 'user', deviceId: 8, body: 'oops' })
+    addComment(d, { userId: 1, itemId: it.id, author: 'user', deviceId: 8, body: 'oops' })
     d.prepare('UPDATE item_comments SET withdrawn_at=1 WHERE item_id=?').run(it.id)
     d.prepare("INSERT INTO item_comments(id,item_id,user_id,author,device_id,kind,body,created_at) VALUES('s1',?,1,'agent',7,'status','moved on',0)").run(it.id)
-    return c
   })
   assert.equal(count(db, p), 2) // mission creation + item creation
+})
+
+test('a consent card created, commented on and closed counts 0', () => {
+  const { db, p } = lone((d) => {
+    const card = item(d, 'c1', 'decision', 'Approve the spawn', { consent: 'spawn:x' })
+    addComment(d, { userId: 1, itemId: card.id, author: 'user', deviceId: 8, body: 'ok' })
+    addComment(d, { userId: 1, itemId: card.id, author: 'agent', deviceId: 7, body: 'thanks' })
+    closeItem(d, { userId: 1, itemId: card.id, resolution: 'decided', author: 'user', deviceId: 8 })
+  })
+  assert.equal(count(db, p), 1) // only the mission's own creation
 })
 
 test('the window is [from, to): activity outside it counts 0', () => {
@@ -224,4 +233,20 @@ test('projectWeeklyMoves gives one count per week, oldest first, zero for quiet 
   assert.deepEqual(out.get(busy.id), [1, 0, 2])
   assert.deepEqual(out.get(quiet.id), [0, 0, 0])
   assert.equal(out.size, 2)
+})
+
+test('projectWeeklyMoves buckets the tail hour of the 169 hour week into that week, and the boundary into the next', () => {
+  const db = seeded()
+  const p = project(db)
+  const m = mission(db, 'c1', 'one'); file(db, m.id, p.id)
+  const w19 = weekStartOf(Date.UTC(2026, 9, 21), LON) // Mon 19 Oct 00:00 BST
+  const w26 = weekEndOf(w19, LON) // Mon 26 Oct 00:00 GMT
+  assert.equal(w26 - w19, 169 * 3600e3)
+  const sunTail = Date.UTC(2026, 9, 25, 23, 30) // Sun 25 Oct 23:30 GMT, last hour of the week
+  pinAll(db, w19 + 60e3)
+  post(db, 'c1', 'tail'); post(db, 'c1', 'edge'); post(db, 'c1', 'start')
+  const set = db.prepare('UPDATE milestones SET created_at=? WHERE title=?')
+  set.run(sunTail, 'tail'); set.run(w26 - 1, 'edge'); set.run(w26, 'start')
+  const out = projectWeeklyMoves(db, 1, [p.id], [w19, w26], LON)
+  assert.deepEqual(out.get(p.id), [3, 1]) // mission + tail + edge | start
 })
