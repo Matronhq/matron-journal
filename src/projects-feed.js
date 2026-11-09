@@ -72,7 +72,7 @@ function decisionsSql(excludePrivateOwned) {
 // keeps no history of gaps. An event in a conversation
 // linked to two of the project's missions is listed once, under the
 // lower-numbered mission.
-function filesSql(excludePrivateOwned) {
+export function filesSql(excludePrivateOwned) {
   const itemSieve = excludePrivateOwned
     ? `AND NOT ${privateConvo('c')} AND NOT ${privateDevice('ic.device_id')} AND ${ORIGIN_SIEVE}` : ''
   const eventSieve = excludePrivateOwned ? `AND NOT ${privateConvo('c')} AND ${ORIGIN_SIEVE}` : ''
@@ -108,7 +108,8 @@ function milestonesSql(excludePrivateOwned) {
 }
 
 const SQL = { decisions: decisionsSql, files: filesSql, milestones: milestonesSql }
-// Test seam: the query-plan test reads the files SQL directly.
+// Test seam: the query-plan test reads the files SQL directly (the
+// timeline's week media reuses it as filesSql).
 export const filesSqlForTest = filesSql
 
 const strip = ({ at: _at, sort_key: _key, ...rest }) => rest

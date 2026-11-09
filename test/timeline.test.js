@@ -9,8 +9,10 @@ import {
 import { upsertConversation, append } from '../src/journal.js'
 import { createItem, addComment, closeItem } from '../src/items.js'
 import { createMission, closeMission, createMilestone } from '../src/missions.js'
-import { createProject, mergeProject, updateProject } from '../src/projects.js'
-import { projectMoves, projectWeeklyMoves } from '../src/timeline.js'
+import { createProject, mergeProject, updateProject, closeProject } from '../src/projects.js'
+import {
+  projectMoves, projectWeeklyMoves, weeksList, weekDetail, wentQuiet, openLong, finished,
+} from '../src/timeline.js'
 
 const LON = 'Europe/London'
 
@@ -249,4 +251,251 @@ test('projectWeeklyMoves buckets the tail hour of the 169 hour week into that we
   set.run(sunTail, 'tail'); set.run(w26 - 1, 'edge'); set.run(w26, 'start')
   const out = projectWeeklyMoves(db, 1, [p.id], [w19, w26], LON)
   assert.deepEqual(out.get(p.id), [3, 1]) // mission + tail + edge | start
+})
+
+// ---- the five reads ----
+
+const DAY = 86400e3
+const NOW = Date.UTC(2026, 10, 11, 12) // Wed 11 Nov 2026, week of Mon 9 Nov
+const W0 = weekStartOf(NOW, LON)
+// Week n relative to the current one (0 = this week, -1 = last week): its
+// start, a Wednesday-noon instant inside it, and its key.
+const weekOf = (n) => weekStartOf(W0 + n * 7 * DAY + 2 * DAY, LON)
+const mid = (n, hours = 0) => weekOf(n) + 2 * DAY + 12 * 3600e3 + hours * 3600e3
+const keyOf = (n) => formatWeekKey(weekOf(n), LON)
+const at = { now: NOW }
+
+// A project with one mission in its own conversation, both created at
+// `createdAt` (the mission's creation is itself a move).
+function proj(db, title, { createdAt = mid(-20) } = {}) {
+  const convo = `k${db.prepare('SELECT COUNT(*) AS n FROM missions').get().n + 1}`
+  upsertConversation(db, { id: convo, ownerUserId: 1, title: convo, agentDeviceId: 7 })
+  const p = project(db, title)
+  const { mission: m } = createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: convo, title, projectId: p.id })
+  db.prepare('UPDATE missions SET created_at=?, updated_at=? WHERE id=?').run(createdAt, createdAt, m.id)
+  db.prepare('UPDATE projects SET created_at=?, updated_at=? WHERE id=?').run(createdAt, createdAt, p.id)
+  return { p, m, convo }
+}
+const postAt = (db, convo, title, ts) => {
+  const { milestone } = post(db, convo, title)
+  db.prepare('UPDATE milestones SET created_at=? WHERE id=?').run(ts, milestone.id)
+  return milestone
+}
+const closeAt = (db, m, ts) => {
+  closeMission(db, { userId: 1, missionId: m.id, by: 'user', summary: 'done' })
+  db.prepare('UPDATE missions SET closed_at=?, updated_at=? WHERE id=?').run(ts, ts, m.id)
+}
+const ref = (p) => ({ id: p.id, num: p.num, title: p.title })
+
+test('weekDetail ranks stories by moves, caps them at 8 and lists the rest under also', () => {
+  const db = seeded()
+  const ps = []
+  for (let i = 1; i <= 10; i++) {
+    const { p, convo } = proj(db, `P${i}`)
+    for (let j = 0; j < i; j++) postAt(db, convo, `P${i} step ${j}`, mid(-1, j))
+    ps.push(p)
+  }
+  const out = weekDetail(db, 1, keyOf(-1), at)
+  assert.equal(out.week, keyOf(-1)); assert.equal(out.start, weekOf(-1)); assert.equal(out.end, weekOf(0))
+  assert.equal(out.final, true); assert.equal(out.lede, null)
+  assert.deepEqual(out.stories.map((s) => s.project.title), ['P10', 'P9', 'P8', 'P7', 'P6', 'P5', 'P4', 'P3'])
+  assert.deepEqual(out.stories[0].project, ref(ps[9]))
+  assert.equal(out.stories[0].next, null)
+  assert.deepEqual(out.also, [{ ...ref(ps[1]), moved: 2 }, { ...ref(ps[0]), moved: 1 }])
+})
+
+test("a story's sentence is the newest milestone of that week, not a newer one the week after", () => {
+  const db = seeded()
+  const { convo } = proj(db, 'Search')
+  postAt(db, convo, 'Index built', mid(-1, -24))
+  postAt(db, convo, 'Search page live', mid(-1, 24))
+  postAt(db, convo, 'Search tuned', mid(0))
+  const [story] = weekDetail(db, 1, keyOf(-1), at).stories
+  assert.equal(story.sentence, 'Search page live')
+  assert.equal(weekDetail(db, 1, keyOf(0), at).stories[0].sentence, 'Search tuned')
+})
+
+test("media is the newest image or video of that week on the project's missions, null when there is none", () => {
+  const db = seeded()
+  const { convo } = proj(db, 'Site')
+  const plain = proj(db, 'Docs')
+  const it = item(db, convo, 'task', 'Screens')
+  const attach = (name, mime, ts) => addComment(db, {
+    userId: 1, itemId: it.id, author: 'agent', deviceId: 7, attachments: [{ blob_ref: `b-${name}`, mime, name, size: 4 }], now: ts,
+  })
+  attach('old.png', 'image/png', mid(-1, -24))
+  attach('demo.mp4', 'video/mp4', mid(-1, 0))
+  attach('spec.pdf', 'application/pdf', mid(-1, 12))
+  attach('next.png', 'image/png', mid(0))
+  const docsItem = item(db, plain.convo, 'task', 'Docs')
+  addComment(db, { userId: 1, itemId: docsItem.id, author: 'agent', deviceId: 7, attachments: [{ blob_ref: 'b-d.pdf', mime: 'application/pdf', name: 'd.pdf', size: 4 }], now: mid(-1) })
+  db.prepare('UPDATE items SET created_at=?, updated_at=?').run(mid(-1), mid(-1))
+  const stories = weekDetail(db, 1, keyOf(-1), at).stories
+  const site = stories.find((s) => s.project.title === 'Site')
+  assert.deepEqual(site.media, { blob_id: 'b-demo.mp4', content_type: 'video/mp4', name: 'demo.mp4' })
+  assert.equal(stories.find((s) => s.project.title === 'Docs').media, null)
+})
+
+test("needs_you lists the open items awaiting the user on the project's missions, newest first, consent cards left out", () => {
+  const db = seeded()
+  const { convo, p } = proj(db, 'Billing')
+  const other = proj(db, 'Other')
+  postAt(db, convo, 'moved', mid(-1))
+  const older = item(db, convo, 'question', 'Which plan?', { now: mid(-1) })
+  const newer = item(db, convo, 'question', 'Ship it?', { now: mid(-1, 1) })
+  item(db, convo, 'task', 'Agent work', { now: mid(-1) }) // awaits the agent
+  const answered = item(db, convo, 'question', 'Old ask', { now: mid(-1) })
+  closeItem(db, { userId: 1, itemId: answered.id, resolution: 'answered', author: 'agent', deviceId: 7 })
+  item(db, convo, 'decision', 'Approve the spawn', { consent: 'spawn:x', awaiting: 'user', now: mid(-1) })
+  item(db, other.convo, 'question', 'Elsewhere?', { now: mid(-1) })
+  const story = weekDetail(db, 1, keyOf(-1), at).stories.find((s) => s.project.id === p.id)
+  assert.deepEqual(story.needs_you, [
+    { id: newer.id, num: newer.num, title: 'Ship it?' },
+    { id: older.id, num: older.num, title: 'Which plan?' },
+  ])
+})
+
+test('weekDetail empty: a week with no movement has no stories and nothing in also; a current week is not final; a bad key is null', () => {
+  const db = seeded()
+  proj(db, 'Old', { createdAt: mid(-9) })
+  const empty = weekDetail(db, 1, keyOf(-3), at)
+  assert.deepEqual(empty.stories, []); assert.deepEqual(empty.also, [])
+  assert.equal(empty.final, true)
+  assert.equal(weekDetail(db, 1, keyOf(0), at).final, false)
+  assert.equal(weekDetail(db, 1, '2026-11-10', at), null)
+  assert.equal(weekDetail(db, 1, 'nope', at), null)
+})
+
+test('weekDetail leaves out merged projects and, for a filtered caller, private-origin projects', () => {
+  const db = seeded()
+  const a = proj(db, 'Survivor'); const b = proj(db, 'Gone')
+  postAt(db, a.convo, 'a', mid(-1)); postAt(db, b.convo, 'b', mid(-1, 1))
+  mergeProject(db, { userId: 1, projectId: b.p.id, intoId: a.p.id, by: 'user' })
+  const hidden = createProject(db, { userId: 1, deviceId: 9, createdBy: 'agent', title: 'Hidden', convoId: 'secret' }).project
+  const hm = mission(db, 'c1', 'visible mission'); file(db, hm.id, hidden.id)
+  db.prepare('UPDATE missions SET created_at=? WHERE id=?').run(mid(-1), hm.id)
+  const all = weekDetail(db, 1, keyOf(-1), at)
+  assert.deepEqual(all.stories.map((s) => s.project.title).sort(), ['Hidden', 'Survivor'])
+  assert.equal(all.stories.find((s) => s.project.title === 'Survivor').sentence, 'b')
+  const filtered = weekDetail(db, 1, keyOf(-1), { ...at, excludePrivateOwned: true })
+  assert.deepEqual(filtered.stories.map((s) => s.project.title), ['Survivor'])
+})
+
+test('weeksList: one sentence per week for 0, 1, 2, 3 and 5 moving projects, newest first, back to the earliest mission', () => {
+  const db = seeded()
+  const names = ['Alpha', 'Bravo', 'Charlie', 'Delta', 'Echo']
+  const ps = names.map((n) => proj(db, n, { createdAt: mid(-5) }))
+  // week -3: Alpha; -2: Alpha, Bravo; -1: Alpha, Bravo, Charlie; 0: all five,
+  // Echo the busiest. Week -4 is quiet.
+  const moves = { [-3]: [1], [-2]: [1, 2], [-1]: [1, 2, 3], 0: [1, 2, 3, 4, 5] }
+  for (const [w, counts] of Object.entries(moves)) {
+    counts.forEach((n, i) => { for (let j = 0; j < n; j++) postAt(db, ps[i].convo, `${names[i]} ${w}.${j}`, mid(Number(w), j)) })
+  }
+  const out = weeksList(db, 1, at)
+  assert.deepEqual(out.weeks.map((w) => w.week), [0, -1, -2, -3, -4, -5].map(keyOf))
+  assert.deepEqual(out.weeks.map((w) => w.sentence), [
+    'Echo, Delta, Charlie and 2 more moved.',
+    'Charlie, Bravo and Alpha moved.',
+    'Bravo and Alpha moved.',
+    'Alpha moved.',
+    'A quiet week.',
+    'Alpha, Bravo, Charlie and 2 more moved.', // each mission's creation, tied, by number
+  ])
+  assert.deepEqual(out.weeks.map((w) => w.moved), [5, 3, 2, 1, 0, 5])
+  assert.equal(out.weeks[1].start, weekOf(-1)); assert.equal(out.weeks[1].end, weekOf(0))
+  assert.equal(out.next_before, null)
+})
+
+test('weeksList pages backwards by week key and stops at the week of the earliest mission', () => {
+  const db = seeded()
+  proj(db, 'Alpha', { createdAt: mid(-5) })
+  const first = weeksList(db, 1, { ...at, limit: 4 })
+  assert.deepEqual(first.weeks.map((w) => w.week), [0, -1, -2, -3].map(keyOf))
+  assert.equal(first.next_before, keyOf(-3))
+  const second = weeksList(db, 1, { ...at, before: first.next_before, limit: 4 })
+  assert.deepEqual(second.weeks.map((w) => w.week), [-4, -5].map(keyOf))
+  assert.equal(second.next_before, null)
+  const exact = weeksList(db, 1, { ...at, limit: 6 })
+  assert.equal(exact.weeks.length, 6); assert.equal(exact.next_before, null)
+  assert.equal(weeksList(db, 1, { ...at, before: '2026-11-10' }), null)
+  // No missions at all: just this week.
+  const fresh = weeksList(seeded(), 1, at)
+  assert.deepEqual(fresh.weeks.map((w) => w.week), [keyOf(0)]); assert.equal(fresh.next_before, null)
+})
+
+test('wentQuiet: moved in two of the eight weeks before it stopped and not for 14 days; one-week, recent and finished projects left out', () => {
+  const db = seeded()
+  const quiet = proj(db, 'Quiet', { createdAt: mid(-6) })
+  postAt(db, quiet.convo, 'paused', mid(-4))
+  proj(db, 'Once', { createdAt: mid(-5) })
+  const recent = proj(db, 'Recent', { createdAt: mid(-6) })
+  postAt(db, recent.convo, 'still going', NOW - 10 * DAY)
+  const done = proj(db, 'Done', { createdAt: mid(-6) })
+  postAt(db, done.convo, 'wrapping up', mid(-5))
+  closeAt(db, done.m, mid(-4))
+  const out = wentQuiet(db, 1, at)
+  assert.equal(out.total, 1)
+  assert.deepEqual(out.rows, [{
+    project: ref(quiet.p), last_moved_at: mid(-4), weekly: [0, 1, 0, 1, 0, 0, 0, 0], note: null,
+  }])
+})
+
+test('wentQuiet ranks by moves in the eight weeks before it stopped, shows the top 10 and counts them all', () => {
+  const db = seeded()
+  for (let i = 1; i <= 12; i++) {
+    const { convo } = proj(db, `Q${i}`, { createdAt: mid(-8) })
+    for (let j = 0; j < i; j++) postAt(db, convo, `Q${i}.${j}`, mid(-4, j))
+  }
+  const out = wentQuiet(db, 1, at)
+  assert.equal(out.total, 12)
+  assert.deepEqual(out.rows.map((r) => r.project.title), ['Q12', 'Q11', 'Q10', 'Q9', 'Q8', 'Q7', 'Q6', 'Q5', 'Q4', 'Q3'])
+  assert.equal(out.rows[0].weekly.length, 8)
+})
+
+test('openLong: a live project created 22 days ago is in, oldest first; 20 days ago and finished ones are out', () => {
+  const db = seeded()
+  const old = proj(db, 'Old', { createdAt: NOW - 40 * DAY })
+  const mid22 = proj(db, 'Middle', { createdAt: NOW - 22 * DAY })
+  postAt(db, mid22.convo, 'step', mid(0))
+  proj(db, 'Young', { createdAt: NOW - 20 * DAY })
+  const fin = proj(db, 'Finished', { createdAt: NOW - 30 * DAY })
+  closeAt(db, fin.m, NOW - 25 * DAY)
+  const closed = proj(db, 'Closed', { createdAt: NOW - 30 * DAY })
+  closeProject(db, { userId: 1, projectId: closed.p.id, by: 'user', summary: 'stop' })
+  const out = openLong(db, 1, at)
+  assert.equal(out.total, 2)
+  assert.deepEqual(out.rows.map((r) => r.project), [ref(old.p), ref(mid22.p)])
+  assert.equal(out.rows[0].created_at, NOW - 40 * DAY)
+  assert.equal(out.rows[0].last_moved_at, NOW - 40 * DAY)
+  assert.equal(out.rows[1].last_moved_at, mid(0))
+  assert.deepEqual(out.rows[1].weekly, [0, 0, 0, 0, 1, 0, 0, 1]) // created in week -3, a milestone this week
+  assert.equal(out.rows[0].note, null)
+})
+
+test('finished: projects whose missions are all closed and closed projects, newest first, paged; live and merged ones left out', () => {
+  const db = seeded()
+  const allClosed = proj(db, 'All closed')
+  closeAt(db, allClosed.m, NOW - 5 * DAY)
+  const closed = proj(db, 'Closed')
+  const gone = proj(db, 'Gone')
+  mergeProject(db, { userId: 1, projectId: gone.p.id, intoId: closed.p.id, by: 'user' })
+  closeProject(db, { userId: 1, projectId: closed.p.id, by: 'user', summary: 'stop' })
+  db.prepare('UPDATE projects SET closed_at=? WHERE id=?').run(NOW - 2 * DAY, closed.p.id)
+  const older = proj(db, 'Older')
+  closeAt(db, older.m, NOW - 9 * DAY)
+  proj(db, 'Live')
+  const out = finished(db, 1, at)
+  assert.deepEqual(out.rows, [
+    { project: ref(closed.p), finished_at: NOW - 2 * DAY },
+    { project: ref(allClosed.p), finished_at: NOW - 5 * DAY },
+    { project: ref(older.p), finished_at: NOW - 9 * DAY },
+  ])
+  assert.equal(out.next_before, null)
+  const p1 = finished(db, 1, { ...at, limit: 2 })
+  assert.deepEqual(p1.rows.map((r) => r.project.title), ['Closed', 'All closed'])
+  assert.equal(p1.next_before, `${NOW - 5 * DAY}:${allClosed.p.id}`)
+  const p2 = finished(db, 1, { ...at, limit: 2, before: p1.next_before })
+  assert.deepEqual(p2.rows.map((r) => r.project.title), ['Older'])
+  assert.equal(p2.next_before, null)
+  assert.equal(finished(db, 1, { ...at, before: 'bad cursor' }), null)
 })
