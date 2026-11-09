@@ -161,18 +161,20 @@ const openMissionSql = (excludePrivateOwned) => `EXISTS (SELECT 1 FROM missions 
   WHERE m.project_id = p.id AND m.user_id = p.user_id AND m.state = 'open' ${excludePrivateOwned ? `AND ${ORIGIN_SIEVE}` : ''})`
 
 // Every project the caller may see as a row, with whether it is live (open,
-// with at least one open mission) and, when it is not, when it finished: its
-// close, else its newest mission close, else (no mission ever) its creation.
+// with at least one open mission), whether it has any mission at all, and,
+// when it is not live, when it finished: its close, else its newest mission
+// close, else (no mission ever) its creation.
 function rowProjects(db, userId, excludePrivateOwned) {
   const originSieve = excludePrivateOwned ? `AND ${ORIGIN_SIEVE}` : ''
-  return db.prepare(`SELECT p.id, p.num, p.title, p.created_at,
+  return db.prepare(`SELECT p.id, p.num, p.title, p.state, p.created_at,
       (p.state = 'open' AND ${openMissionSql(excludePrivateOwned)}) AS live,
+      EXISTS (SELECT 1 FROM missions m WHERE m.project_id = p.id AND m.user_id = p.user_id ${originSieve}) AS has_mission,
       COALESCE(p.closed_at,
         (SELECT MAX(m.closed_at) FROM missions m WHERE m.project_id = p.id AND m.user_id = p.user_id ${originSieve}),
         p.created_at) AS finished_at
     FROM projects p
     WHERE p.user_id = ? AND p.merged_into IS NULL ${excludePrivateOwned ? `AND ${PROJECT_ORIGIN_SIEVE}` : ''}`)
-    .all(userId).map((r) => ({ ...r, live: Boolean(r.live) }))
+    .all(userId).map((r) => ({ ...r, live: Boolean(r.live), has_mission: Boolean(r.has_mission) }))
 }
 const refOf = (p) => ({ id: p.id, num: p.num, title: p.title })
 
@@ -250,6 +252,7 @@ export function weekDetail(db, userId, weekKey, { excludePrivateOwned = false, n
       JOIN conversations c ON c.id = l.convo_id
     WHERE ${ofProject} AND l.created_at >= @start AND l.created_at < @end ${convoSieve}
     ORDER BY l.created_at DESC, l.seq DESC LIMIT 1`)
+  // Unlike projectDetail's needs-you: consent cards are left out, newest created first.
   const needsYou = db.prepare(`SELECT i.id, i.num, i.title FROM items i JOIN missions m ON m.id = i.mission_id
       JOIN conversations c ON c.id = i.origin_convo_id
     WHERE ${ofProject} AND i.state = 'open' AND i.awaiting = 'user' AND i.consent IS NULL ${convoSieve}
@@ -331,12 +334,14 @@ export function openLong(db, userId, { excludePrivateOwned = false, now = Date.n
 }
 
 // Projects with no open mission, or closed, newest finish first, paged by
-// a "<finished_at>:<project id>" cursor. null when `before` is not a cursor.
+// a "<finished_at>:<project id>" cursor. An open project that never had a
+// mission (a filing leftover, e.g. emptied by a move) is not finished work
+// and is left out. null when `before` is not a cursor.
 export function finished(db, userId, { before = null, limit = TIMELINE.finishedPage, excludePrivateOwned = false } = {}) {
   const cursor = parseCursor(before)
   if (cursor === undefined) return null
   const rows = rowProjects(db, userId, excludePrivateOwned)
-    .filter((p) => !p.live)
+    .filter((p) => !p.live && (p.state === 'closed' || p.has_mission))
     .filter((p) => !cursor || p.finished_at < cursor.at || (p.finished_at === cursor.at && p.id < cursor.key))
     .sort((a, b) => (b.finished_at - a.finished_at) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0))
   const shown = rows.slice(0, limit)

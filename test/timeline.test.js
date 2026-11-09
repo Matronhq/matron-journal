@@ -499,3 +499,38 @@ test('finished: projects whose missions are all closed and closed projects, newe
   assert.equal(p2.next_before, null)
   assert.equal(finished(db, 1, { ...at, before: 'bad cursor' }), null)
 })
+
+test('finished leaves out an open project that never had a mission, keeps a closed one, and keeps a closed project with open missions', () => {
+  const db = seeded()
+  const leftover = proj(db, 'Leftover')
+  const target = proj(db, 'Target')
+  file(db, leftover.m.id, target.p.id) // the move empties Leftover
+  const emptyClosed = project(db, 'Empty closed')
+  closeProject(db, { userId: 1, projectId: emptyClosed.id, by: 'user', summary: 'never started' })
+  const stillOpen = proj(db, 'Closed over open missions')
+  closeProject(db, { userId: 1, projectId: stillOpen.p.id, by: 'user', summary: 'stop' })
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM missions WHERE project_id=? AND state='open'").get(stillOpen.p.id).n, 1)
+  const titles = finished(db, 1, at).rows.map((r) => r.project.title)
+  assert.ok(!titles.includes('Leftover'))
+  assert.ok(!titles.includes('Target'))
+  assert.ok(titles.includes('Empty closed'))
+  assert.ok(titles.includes('Closed over open missions'))
+})
+
+test('openLong includes a project created exactly 21 days ago', () => {
+  const db = seeded()
+  const edge = proj(db, 'Edge', { createdAt: NOW - 21 * DAY })
+  proj(db, 'Just short', { createdAt: NOW - 21 * DAY + 1 })
+  const out = openLong(db, 1, at)
+  assert.deepEqual(out.rows.map((r) => r.project), [ref(edge.p)])
+})
+
+test('wentQuiet includes a project whose last move is exactly 14 days ago', () => {
+  const db = seeded()
+  const edge = proj(db, 'Edge', { createdAt: NOW - 20 * DAY })
+  postAt(db, edge.convo, 'last', NOW - 14 * DAY)
+  const short = proj(db, 'Just short', { createdAt: NOW - 20 * DAY })
+  postAt(db, short.convo, 'last', NOW - 14 * DAY + 1)
+  const out = wentQuiet(db, 1, at)
+  assert.deepEqual(out.rows.map((r) => [r.project.title, r.last_moved_at]), [['Edge', NOW - 14 * DAY]])
+})
