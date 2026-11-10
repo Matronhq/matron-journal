@@ -3365,9 +3365,20 @@ itself; a peer agent joined to the conversation cannot.
   marker about the comment (a transcript landing after the cancel) carries
   no comment at all.
 
-A release with any other action (`send`, `send_one`, `expired`) withdraws
-nothing: a reply whose session ended before it was delivered was not
-cancelled by the user.
+A release with any other action (`send`, `send_one`, `edited`, `expired`)
+withdraws nothing: a reply whose session ended before it was delivered was
+not cancelled by the user.
+
+**Editing a queued reply.** A card may offer an edit (`edit: {mode,
+hold_seconds}` on its payload). The app answers it with a `prompt_reply`
+whose choice is `edit` (the bridge holds the message while it is edited),
+then `edit_cancel` (released as it was) or, for `mode: 'replace'`,
+`edit_save` with the edited text in `text` (the bridge replaces the message
+in place and retires the card with an `edited` release). A reply on an item
+is `mode: 'resend'`: its comment is never rewritten. The app cancels the
+held card, which withdraws the original as above, and posts the edited
+reply as a new comment. The journal passes these replies through like any
+other; the bridge's router checks them.
 
 ### Item handover
 
