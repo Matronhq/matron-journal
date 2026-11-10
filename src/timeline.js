@@ -293,17 +293,23 @@ function survivingProjects(db, userId, ids, byId) {
 
 // The stored items that still exist and that the caller may see (consent cards
 // are never items to show), with whether each still waits on the user:
-// Map(id → { id, num, title, done }).
-function liveItems(db, userId, ids, excludePrivateOwned) {
+// Map(id → { id, num, title, done }). Under the sieve the item's mission must
+// also sit in a project the caller can see (`byId`, the surviving project
+// after a merge); a mission filed under no project has nothing to hide behind.
+function liveItems(db, userId, ids, byId, excludePrivateOwned) {
   const out = new Map()
   if (!ids.length) return out
   const sieve = excludePrivateOwned ? `AND NOT ${privateConvo('c')} AND ${ORIGIN_SIEVE}` : ''
-  const rows = db.prepare(`SELECT i.id, i.num, i.title, (i.state = 'open' AND i.awaiting = 'user') AS pending
+  const rows = db.prepare(`SELECT i.id, i.num, i.title, (i.state = 'open' AND i.awaiting = 'user') AS pending,
+        (SELECT COALESCE(p.merged_into, p.id) FROM projects p WHERE p.id = m.project_id AND p.user_id = m.user_id) AS project_id
       FROM items i JOIN missions m ON m.id = i.mission_id AND m.user_id = i.user_id
       JOIN conversations c ON c.id = i.origin_convo_id
     WHERE i.user_id = ? AND i.consent IS NULL AND i.id IN (SELECT value FROM json_each(?)) ${sieve}`)
     .all(userId, JSON.stringify(ids))
-  for (const r of rows) out.set(r.id, { id: r.id, num: r.num, title: r.title, done: !r.pending })
+  for (const r of rows) {
+    if (excludePrivateOwned && r.project_id != null && !byId.has(r.project_id)) continue
+    out.set(r.id, { id: r.id, num: r.num, title: r.title, done: !r.pending })
+  }
   return out
 }
 
@@ -334,7 +340,7 @@ function liveMedia(db, userId, blobIds, excludePrivateOwned) {
 function resolveStored(db, userId, stored, byId, excludePrivateOwned) {
   const all = (f) => [...new Set(stored.stories.flatMap(f))]
   const projects = survivingProjects(db, userId, all((s) => s.project_ids), byId)
-  const items = liveItems(db, userId, all((s) => s.item_ids), excludePrivateOwned)
+  const items = liveItems(db, userId, all((s) => s.item_ids), byId, excludePrivateOwned)
   const media = liveMedia(db, userId, all((s) => (s.media_blob_id ? [s.media_blob_id] : [])), excludePrivateOwned)
   const out = []
   for (const s of stored.stories) {
@@ -438,24 +444,39 @@ export function weekRaw(db, userId, weekKey, { excludePrivateOwned = true, now =
       JOIN conversations c ON c.id = l.convo_id
     WHERE ${ofProject} AND l.created_at >= @start AND l.created_at < @end ${convoSieve}
     ORDER BY l.created_at DESC, l.seq DESC LIMIT ${RAW.milestones}`)
-  // An item's activity in the week: created, closed or commented (as a move counts them).
-  const items = db.prepare(`SELECT i.id, i.num, i.title, i.kind, i.state, i.awaiting, MAX(ev.at) AS at
-    FROM (SELECT i.id AS item_id, i.created_at AS at FROM items i WHERE i.user_id = @userId
-        UNION ALL SELECT i.id, i.closed_at FROM items i WHERE i.user_id = @userId AND i.closed_at IS NOT NULL
-        UNION ALL SELECT ic.item_id, ic.created_at FROM item_comments ic
-          WHERE ic.kind = 'comment' AND ic.withdrawn_at IS NULL ${commentSieve}) ev
-      JOIN items i ON i.id = ev.item_id JOIN missions m ON m.id = i.mission_id AND m.user_id = i.user_id
-      JOIN conversations c ON c.id = i.origin_convo_id
-    WHERE ${ofProject} AND i.consent IS NULL AND ev.at >= @start AND ev.at < @end ${convoSieve}
-    GROUP BY i.id ORDER BY at DESC, i.num DESC LIMIT ${RAW.items}`)
+  // Every item with activity in the week (created, closed or commented, as a
+  // move counts them), for all the shown projects in one pass. The week range
+  // sits inside each arm so only the week's rows are read; the newest
+  // RAW.items per project are kept.
+  const shown = moved.slice(0, RAW.projects)
+  const itemRows = shown.length ? db.prepare(`SELECT project_id, id, num, title, kind, state, awaiting, at FROM (
+      SELECT project_id, id, num, title, kind, state, awaiting, at,
+        ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY at DESC, num DESC) AS rn
+      FROM (SELECT COALESCE(p.merged_into, p.id) AS project_id, i.id, i.num, i.title, i.kind, i.state, i.awaiting, MAX(ev.at) AS at
+        FROM (SELECT i.id AS item_id, i.created_at AS at FROM items i
+            WHERE i.user_id = @userId AND i.created_at >= @start AND i.created_at < @end
+          UNION ALL SELECT i.id, i.closed_at FROM items i
+            WHERE i.user_id = @userId AND i.closed_at >= @start AND i.closed_at < @end
+          UNION ALL SELECT ic.item_id, ic.created_at FROM item_comments ic
+            WHERE ic.created_at >= @start AND ic.created_at < @end AND ic.kind = 'comment' AND ic.withdrawn_at IS NULL ${commentSieve}) ev
+          JOIN items i ON i.id = ev.item_id AND i.user_id = @userId
+          JOIN missions m ON m.id = i.mission_id AND m.user_id = i.user_id
+          JOIN projects p ON p.id = m.project_id AND p.user_id = m.user_id
+          JOIN conversations c ON c.id = i.origin_convo_id
+        WHERE i.consent IS NULL ${convoSieve}
+        GROUP BY i.id))
+    WHERE rn <= ${RAW.items} AND project_id IN (SELECT value FROM json_each(@projectIds))
+    ORDER BY at DESC, num DESC`).all({ userId, start, end, projectIds: JSON.stringify(shown.map((r) => r.project.id)) }) : []
+  const itemsOf = new Map()
+  for (const { project_id: pid, ...row } of itemRows) itemsOf.set(pid, [...(itemsOf.get(pid) ?? []), row])
   const media = db.prepare(`SELECT f.blob_id, f.content_type, f.name, f.at FROM (${filesSql(excludePrivateOwned, inProject)}) f
     WHERE f.at >= @start AND f.at < @end AND (f.content_type LIKE 'image/%' OR f.content_type LIKE 'video/%')
     ORDER BY f.at DESC, f.sort_key DESC LIMIT ${RAW.media}`)
-  const projects = moved.slice(0, RAW.projects).map(({ project, moved: n }) => {
+  const projects = shown.map(({ project, moved: n }) => {
     const args = { userId, projectId: project.id, start, end }
     return {
       project: refOf(project), moved: n, status: project.status ?? null,
-      milestones: milestones.all(args), items: items.all(args), media: media.all(args),
+      milestones: milestones.all(args), items: itemsOf.get(project.id) ?? [], media: media.all(args),
     }
   })
   const stored = writtenWeek(db, userId, start)
@@ -464,6 +485,9 @@ export function weekRaw(db, userId, weekKey, { excludePrivateOwned = true, now =
     final: Boolean(stored?.final) || end <= now,
     written_at: stored?.written_at ?? null,
     current: start === weekStartOf(now, tz),
+    // A story whose projects are all hidden from the caller is withheld here, as
+    // the apps' read withholds it, so a Coordinator that rewrites the week from
+    // this drops that story (accepted: a story never names private work).
     stored: stored && {
       lede: stored.lede, final: stored.final,
       stories: resolveStored(db, userId, stored, byId, excludePrivateOwned).map((s) => ({

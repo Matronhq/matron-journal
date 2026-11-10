@@ -167,11 +167,26 @@ test('writeWeek refuses an unknown item, a private item, another user\'s item', 
   // Another user's item, by id and by number (bob's number also exists for alice).
   assert.deepEqual(write(db, keyOf(0), { stories: [story([theirs.id])] }), { error: 'bad_request', detail: 'unknown_item', ref: theirs.id })
   assert.equal(write(db, keyOf(0), { stories: [story([theirs.id])] }, { excludePrivateOwned: false }).detail, 'unknown_item')
-  const beyond = Math.max(mine.num, hidden.num) + 5
-  db.prepare('UPDATE items SET num = ? WHERE id = ?').run(beyond, theirs.id)
-  assert.deepEqual(write(db, keyOf(0), { stories: [story([beyond])] }), { error: 'bad_request', detail: 'unknown_item', ref: beyond })
   assert.equal(write(db, keyOf(0), { stories: [story([mine.num])] }).ok, true)
   assert.equal(write(db, keyOf(0), { stories: [story([hidden.id])] }, { excludePrivateOwned: false }).ok, true)
+})
+
+test("writeWeek's item numbers are per user: bob's same number is alice's own item, bob's number alice lacks is unknown", () => {
+  const db = seeded()
+  const a = project(db, 'Alpha'); mission(db, 'c1', a.id)
+  const mine = item(db, 'c1')
+  const bobs = []
+  while (bobs.length < mine.num + 2) {
+    bobs.push(createItem(db, { userId: 2, originDeviceId: 10, createdBy: 'agent', kind: 'task', title: 'Bob item', originConvoId: 'b1' }).item)
+  }
+  const sameNum = bobs.find((x) => x.num === mine.num)
+  const onlyBobs = bobs.find((x) => x.num === mine.num + 2)
+  assert.ok(sameNum && onlyBobs)
+  const story = (item_ids) => ({ title: 'T', sentence: 'S.', project_ids: [a.id], item_ids })
+  assert.equal(write(db, keyOf(0), { stories: [story([mine.num])] }).ok, true)
+  assert.deepEqual(storedWeek(db, 1, weekN(0)).stories[0].item_ids, [mine.id]) // not bob's item with the same number
+  assert.deepEqual(write(db, keyOf(0), { stories: [story([onlyBobs.num])] }), { error: 'bad_request', detail: 'unknown_item', ref: onlyBobs.num })
+  assert.equal(write(db, keyOf(0), { stories: [story([sameNum.id])] }).detail, 'unknown_item')
 })
 
 test('writeWeek refuses an unknown blob, another user\'s, one only a private conversation holds, one in no roll-up', () => {

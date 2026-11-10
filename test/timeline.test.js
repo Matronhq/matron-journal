@@ -857,3 +857,68 @@ test('weekRaw caps the moving projects at 40 and counts the rest; applies the ag
   assert.equal(out.projects.some((p) => p.project.id === ps[1].p.id), false)
   assert.equal(out.projects.length, 40); assert.equal(out.more_projects, 2)
 })
+
+test('weekRaw runs one items query for all the shown projects, reading only the week', () => {
+  const db = seeded()
+  const ps = [proj(db, 'Alpha'), proj(db, 'Bravo'), proj(db, 'Charlie')]
+  const old = []
+  for (const { p, convo } of ps) {
+    postAt(db, convo, 'm', mid(-1))
+    old.push(item(db, convo, 'task', `${p.title} old`, { now: mid(-5) }))
+    item(db, convo, 'task', `${p.title} new`, { now: mid(-1) })
+  }
+  for (const it of old) addComment(db, { userId: 1, itemId: it.id, author: 'agent', deviceId: 7, body: 'x', now: mid(-4) })
+  db.prepare('UPDATE items SET updated_at = created_at').run()
+  let runs = 0; let sql = ''
+  const prepare = db.prepare.bind(db)
+  db.prepare = (q) => {
+    const st = prepare(q)
+    if (!/ROW_NUMBER/.test(q)) return st
+    sql = q
+    return { all: (a) => { runs += 1; return st.all(a) } }
+  }
+  const raw = weekRaw(db, 1, keyOf(-1), at)
+  assert.equal(runs, 1)
+  assert.deepEqual(raw.projects.map((x) => x.items.map((i) => i.title)).sort(), [['Alpha new'], ['Bravo new'], ['Charlie new']])
+  // The week's range is inside every arm of the activity union, so nothing outside it is read.
+  const arms = sql.slice(sql.indexOf('FROM (SELECT i.id AS item_id'), sql.indexOf(') ev'))
+  assert.equal((arms.match(/>= @start AND [a-z.]+_at < @end/g) ?? []).length, 3)
+})
+
+test("weekRaw applies the agent sieve to milestones, items and pictures, and leaves consent cards out of items", () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha')
+  db.prepare("UPDATE conversations SET mission_id = ? WHERE id = 'secret'").run(a.m.id)
+  postAt(db, a.convo, 'public milestone', mid(-1))
+  post(db, 'secret', 'private milestone', 9)
+  db.prepare("UPDATE milestones SET created_at = ? WHERE title = 'private milestone'").run(mid(-1, 1))
+  const pub = item(db, a.convo, 'task', 'Public task', { now: mid(-1) })
+  const priv = item(db, 'secret', 'task', 'Private task', { now: mid(-1, 1) })
+  item(db, a.convo, 'decision', 'Approve the spawn', { consent: 'spawn:x', awaiting: 'user', now: mid(-1, 2) })
+  const quiet = item(db, a.convo, 'task', 'Old public task', { now: mid(-5) })
+  addComment(db, { userId: 1, itemId: quiet.id, author: 'user', deviceId: 9, body: 'from the private box', now: mid(-1, 3) })
+  db.prepare('UPDATE items SET updated_at = created_at').run()
+  blobRow(db, 'b-pub'); attachAt(db, pub, 'b-pub', mid(-1))
+  blobRow(db, 'b-sec'); attachAt(db, priv, 'b-sec', mid(-1, 1))
+  const view = (o) => { const [x] = weekRaw(db, 1, keyOf(-1), { ...at, ...o }).projects; return x }
+  const agent = view({ excludePrivateOwned: true })
+  assert.deepEqual(agent.milestones.map((m) => m.title), ['public milestone'])
+  assert.deepEqual(agent.items.map((i) => i.title), ['Public task'])
+  assert.deepEqual(agent.media.map((m) => m.blob_id), ['b-pub'])
+  const all = view({ excludePrivateOwned: false })
+  assert.deepEqual(all.milestones.map((m) => m.title), ['private milestone', 'public milestone'])
+  assert.deepEqual(all.items.map((i) => i.title), ['Old public task', 'Private task', 'Public task'])
+  assert.deepEqual(all.media.map((m) => m.blob_id), ['b-sec', 'b-pub'])
+})
+
+test('a stored item whose mission sits in a project the agent cannot see is dropped from an agent read', () => {
+  const db = seeded()
+  const a = proj(db, 'Open'); const b = proj(db, 'Turned private')
+  postAt(db, a.convo, 'a', mid(-1))
+  const it = item(db, b.convo, 'question', 'Hidden by project')
+  put(db, -1, { lede: 'x', stories: [tale({ project_ids: [a.p.id], item_ids: [it.id] })] })
+  db.prepare('UPDATE projects SET origin_convo_id = ? WHERE id = ?').run('secret', b.p.id)
+  assert.deepEqual(weekDetail(db, 1, keyOf(-1), { ...at, excludePrivateOwned: true }).stories[0].needs_you, [])
+  assert.equal(weekDetail(db, 1, keyOf(-1), at).stories[0].needs_you.length, 1)
+  assert.deepEqual(weekRaw(db, 1, keyOf(-1), at).stored.stories[0].items, [])
+})
