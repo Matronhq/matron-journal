@@ -201,7 +201,7 @@ test('projectDetail carries the first page of each kind with totals', () => {
   assert.equal(out.recent_milestones.length, 5, 'kept for older apps')
 })
 
-test('files query reads a linked conversation through idx_events_media, never every event of the user', () => {
+test('files query reads a linked conversation through idx_events_media, never every event of the user, and items through their mission', () => {
   const db = seeded()
   const p = project(db)
   const m1 = mission(db, 'c1', 'one'); file(db, m1.id, p.id)
@@ -209,6 +209,12 @@ test('files query reads a linked conversation through idx_events_media, never ev
   const text = plan.map((r) => r.detail).join('\n')
   assert.match(text, /idx_events_media/)
   assert.doesNotMatch(text, /SEARCH e USING INDEX sqlite_autoindex_events_1/)
+  // The item arm reaches a file from the project's missions, through their
+  // items to the items' comments; never through the consent index.
+  assert.doesNotMatch(text, /idx_items_consent/)
+  assert.match(text, /SEARCH i USING INDEX idx_items_mission \(mission_id=\?/)
+  assert.match(text, /SEARCH ic USING INDEX idx_item_comments_item \(item_id=\?/)
+  assert.equal((text.match(/SEARCH m USING INDEX idx_missions_project \(project_id=\?/g) ?? []).length, 2)
 })
 
 test('waiting_on counts a consent card like the needs_you number does', () => {

@@ -6,8 +6,8 @@ import { createItem, addComment, closeItem } from '../src/items.js'
 import { createMission, closeMission, createMilestone } from '../src/missions.js'
 import { createProject, mergeProject, updateProject, resolveProject } from '../src/projects.js'
 import { writeWeek } from '../src/week-stories.js'
-import { weekStartOf, formatWeekKey, projectMoveTimes, movesSqlForTest } from '../src/timeline.js'
-import { projectFeed } from '../src/projects-feed.js'
+import { weekStartOf, formatWeekKey, projectMoveTimes, movesSqlForTest, liveMedia, IN_PROJECT } from '../src/timeline.js'
+import { projectFeed, filesSqlForTest } from '../src/projects-feed.js'
 import { projectPage, projectHistory, PROJECT_PAGE, PROJECT_HISTORY } from '../src/timeline-project.js'
 
 // ---- fixtures: alice (user 1) with an ordinary box (7), a client (8) and a
@@ -87,6 +87,35 @@ const put = (db, n, stories, o = {}) => {
 }
 const pic = (id) => ({ blob_id: id, content_type: 'image/png', name: `${id}.png` })
 const page = (db, p, o = at) => projectPage(db, 1, resolveProject(db, 1, p.id, o).project, o)
+// How many statements `fn` runs: every get, all, run or iterate of a prepared
+// statement, so one prepared once and run per row counts per row.
+function statementsRun(db, fn) {
+  let n = 0
+  const prepare = db.prepare.bind(db)
+  const counted = (stmt) => new Proxy(stmt, {
+    get(target, key) {
+      const value = target[key]
+      if (typeof value !== 'function') return value
+      return (...a) => {
+        if (['get', 'all', 'run', 'iterate'].includes(key)) n += 1
+        const out = value.apply(target, a)
+        return out === target ? counted(target) : out
+      }
+    },
+  })
+  db.prepare = (sql) => counted(prepare(sql))
+  try { fn() } finally { db.prepare = prepare }
+  return n
+}
+// The SQL of every statement `fn` prepares.
+function prepared(db, fn) {
+  const out = []
+  const prepare = db.prepare.bind(db)
+  db.prepare = (sql) => { out.push(sql); return prepare(sql) }
+  try { fn() } finally { db.prepare = prepare }
+  return out
+}
+const planOf = (db, sql, args) => db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(args).map((r) => r.detail).join('\n')
 
 // ---- the project's moves ----
 
@@ -338,20 +367,85 @@ test('projectPage under the agent sieve: a private-origin project is not found, 
   assert.notEqual(resolveProject(db, 1, hidden.p.id), null)
 })
 
-test('projectPage: the number of statements does not grow with the stored weeks', () => {
+test('projectPage: eight statements with a status and no stored pick, however many weeks are stored; the files roll-up is read once', () => {
   const db = seeded()
-  const a = proj(db, 'Alpha')
-  const count = () => {
-    let n = 0
-    const prepare = db.prepare.bind(db)
-    db.prepare = (sql) => { n += 1; return prepare(sql) }
-    try { page(db, a.p) } finally { db.prepare = prepare }
-    return n
+  const a = proj(db, 'Alpha'); const b = proj(db, 'Bravo')
+  updateProject(db, { userId: 1, projectId: a.p.id, fields: { status: 'Going well.' }, statusWriter: { by: 'agent', deviceId: 7, convoId: null } })
+  const it = item(db, a.convo, 'task', 'Shots', { now: mid(-3) })
+  attachAt(db, it, 'b-one', mid(-3, 1))
+  // The route resolves the project first; the page itself is counted.
+  const count = () => { const { project } = resolveProject(db, 1, a.p.id); return statementsRun(db, () => projectPage(db, 1, project, at)) }
+  put(db, -1, [tale({ project_ids: [a.p.id, b.p.id] })])
+  // The zone, the mission counts, the stored weeks, the projects their
+  // stories name, the files, the waiting items and their count, the moves.
+  assert.equal(count(), 8)
+  for (let n = 2; n <= 9; n++) put(db, -n, [tale({ project_ids: [a.p.id, b.p.id] })])
+  assert.equal(count(), 8)
+  // Without a status, one more for the newest milestone; with a stored pick,
+  // two more to resolve it.
+  updateProject(db, { userId: 1, projectId: a.p.id, fields: { status: '' }, statusWriter: { by: 'agent', deviceId: 7, convoId: null } })
+  assert.equal(count(), 9)
+  put(db, -1, [tale({ project_ids: [a.p.id], media_blob_id: 'b-one' })])
+  assert.equal(count(), 11)
+  const files = prepared(db, () => page(db, a.p)).filter((sql) => /json_each\(ic\.attachments\)/.test(sql) && /@projectId/.test(sql))
+  assert.equal(files.length, 1, 'the newest picture and the files count come from one statement')
+})
+
+test('projectPage files: the count and the newest picture come from one read; files that are not pictures count but are never the picture', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha'); const other = proj(db, 'Other')
+  const it = item(db, a.convo, 'task', 'Papers', { now: mid(-5) })
+  attachAt(db, it, 'b-doc', mid(-2), 'application/pdf')
+  attachAt(db, item(db, other.convo, 'task', 'Elsewhere', { now: mid(-5) }), 'b-other', mid(-1))
+  let out = page(db, a.p)
+  assert.equal(out.media, null); assert.equal(out.counts.files, 1)
+  attachAt(db, it, 'b-old', mid(-4)); attachAt(db, it, 'b-new', mid(-3), 'video/mp4')
+  out = page(db, a.p)
+  assert.deepEqual(out.media, { blob_id: 'b-new', content_type: 'video/mp4', name: 'b-new.png' })
+  assert.equal(out.counts.files, 3)
+})
+
+test('a story naming a private-origin project: the project stays invisible to a sieved caller and visible to a client', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha', { createdAt: mid(-6) }); const hidden = proj(db, 'Hidden', { createdAt: mid(-6) })
+  const gone = proj(db, 'Gone', { createdAt: mid(-6) })
+  db.prepare('UPDATE projects SET origin_convo_id = ? WHERE id = ?').run('secret', hidden.p.id)
+  // The story's first project is the private-origin one: a client reads the
+  // story as being about it, a sieved caller as being about the next it names.
+  put(db, -1, [tale({ project_ids: [hidden.p.id, a.p.id], sentence: 'Both moved.', next: 'Ship it' })])
+  postAt(db, a.convo, 'A step', mid(-1)); postAt(db, hidden.convo, 'A hidden step', mid(-1))
+  assert.equal(page(db, a.p).next, null)
+  assert.equal(page(db, hidden.p).next, 'Ship it')
+  assert.equal(page(db, a.p, sieved).next, 'Ship it')
+  assert.equal(history(db, a.p).weeks[0].card, null)
+  assert.deepEqual(history(db, hidden.p).weeks[0].card, { sentence: 'Both moved.', media: null })
+  assert.deepEqual(history(db, a.p, sieved).weeks[0].card, { sentence: 'Both moved.', media: null })
+  // The same through a merge: a project merged into the private-origin one.
+  put(db, -2, [tale({ project_ids: [gone.p.id, a.p.id], next: 'After the merge' })])
+  mergeProject(db, { userId: 1, projectId: gone.p.id, intoId: hidden.p.id, by: 'user' })
+  put(db, -1, [])
+  assert.equal(page(db, a.p).next, null)
+  assert.equal(page(db, hidden.p).next, 'After the merge')
+  assert.equal(page(db, a.p, sieved).next, 'After the merge')
+})
+
+test("the files roll-up of a project starts from its missions, and a picture lookup from the user's, never from the consent index", () => {
+  const db = seeded()
+  const a = proj(db, 'Billing')
+  for (const sieve of [false, true]) {
+    const text = planOf(db, `SELECT * FROM (${filesSqlForTest(sieve, IN_PROJECT)})`, { userId: 1, projectId: a.p.id })
+    assert.doesNotMatch(text, /idx_items_consent|idx_missions_user_state|SCAN (m|i|ic|e|l)\b/, `sieved ${sieve}`)
+    assert.equal((text.match(/SEARCH m USING INDEX idx_missions_project \(project_id=\?/g) ?? []).length, 2, `sieved ${sieve}`)
+    assert.match(text, /SEARCH i USING INDEX idx_items_mission \(mission_id=\?/, `sieved ${sieve}`)
+    assert.match(text, /SEARCH ic USING INDEX idx_item_comments_item \(item_id=\?/, `sieved ${sieve}`)
+    assert.match(text, /SEARCH e USING INDEX idx_events_media \(convo_id=\?/, `sieved ${sieve}`)
+    blobRow(db, `b-${sieve}`)
+    const [lookup] = prepared(db, () => liveMedia(db, 1, [`b-${sieve}`], sieve)).filter((sql) => /json_each\(ic\.attachments\)/.test(sql))
+    const found = planOf(db, lookup, { userId: 1, ids: '[]' })
+    assert.doesNotMatch(found, /idx_items_consent|SCAN (m|i|ic|e|l)\b/, `lookup, sieved ${sieve}`)
+    assert.equal((found.match(/SEARCH m USING INDEX idx_missions_user_state \(user_id=\?/g) ?? []).length, 2, `lookup, sieved ${sieve}`)
+    assert.match(found, /SEARCH i USING INDEX idx_items_mission \(mission_id=\?/, `lookup, sieved ${sieve}`)
   }
-  put(db, -1, [tale({ project_ids: [a.p.id] })])
-  const one = count()
-  for (let n = 2; n <= 9; n++) put(db, -n, [tale({ project_ids: [a.p.id] })])
-  assert.equal(count(), one)
 })
 
 // ---- projectHistory ----
@@ -471,18 +565,51 @@ test('projectHistory under the agent sieve: no week, milestone or picture from t
   assert.deepEqual(agent.weeks[0].card, { sentence: 'A step.', media: null })
 })
 
-test('projectHistory: the statements a page takes do not grow with the weeks behind it', () => {
+test('projectHistory: five statements and one per returned week, whatever lies behind the page and however many cards need a picture', () => {
   const db = seeded()
   const a = proj(db, 'Alpha', { createdAt: mid(-9) })
-  const count = () => {
-    let n = 0
-    const prepare = db.prepare.bind(db)
-    db.prepare = (sql) => { n += 1; return prepare(sql) }
-    try { history(db, a.p, { ...at, limit: 2 }) } finally { db.prepare = prepare }
-    return n
-  }
-  for (const n of [-1, -2]) { postAt(db, a.convo, `Week ${n}`, mid(n)); put(db, n, [tale({ project_ids: [a.p.id] })]) }
-  const two = count()
-  for (const n of [-3, -4, -5, -6, -7, -8]) { postAt(db, a.convo, `Week ${n}`, mid(n)); put(db, n, [tale({ project_ids: [a.p.id] })]) }
-  assert.equal(count(), two)
+  const it = item(db, a.convo, 'task', 'Shots', { now: mid(-9, 1) })
+  const { project } = resolveProject(db, 1, a.p.id)
+  const count = (limit) => statementsRun(db, () => projectHistory(db, 1, project, { ...at, limit }))
+  const week = (n) => { postAt(db, a.convo, `Week ${n}`, mid(n)); attachAt(db, it, `b${n}`, mid(n, 1)); put(db, n, [tale({ project_ids: [a.p.id] })]) }
+  for (const n of [-1, -2]) week(n)
+  // The zone, the moves, the stored weeks, the projects their stories name
+  // and the pictures of the weeks shown; then each week's milestones.
+  assert.equal(count(2), 5 + 2)
+  for (const n of [-3, -4, -5, -6, -7, -8]) week(n)
+  assert.equal(count(2), 5 + 2)
+  assert.equal(count(8), 5 + 8)
+  const out = history(db, a.p, { ...at, limit: 8 })
+  assert.deepEqual(out.weeks.map((w) => w.card?.media?.blob_id), [-1, -2, -3, -4, -5, -6, -7, -8].map((n) => `b${n}`))
+  // No card at all: neither the named projects nor the pictures are read. A pick that
+  // resolves costs two statements, whatever the number of cards.
+  for (const n of [-1, -2]) put(db, n, [])
+  assert.equal(count(2), 3 + 2)
+  for (const n of [-1, -2]) put(db, n, [tale({ project_ids: [a.p.id], media_blob_id: 'b-8' })])
+  assert.equal(count(2), 6 + 2)
+})
+
+test("projectHistory card media: each week's own newest picture in one read, a week with none null, a pick kept, the sieve applied", () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha', { createdAt: mid(-9) }); const other = proj(db, 'Other', { createdAt: mid(-9) })
+  privateMission(db, a.p, mid(-9, 1))
+  const it = item(db, a.convo, 'task', 'Shots', { now: mid(-9, 2) })
+  const hid = item(db, 'secret', 'task', 'Private shots', { now: mid(-9, 3) })
+  const far = item(db, other.convo, 'task', 'Elsewhere', { now: mid(-9, 4) })
+  attachAt(db, it, 'b1-old', mid(-1)); attachAt(db, it, 'b1-new', mid(-1, 2)); attachAt(db, it, 'b1-doc', mid(-1, 3), 'application/pdf')
+  attachAt(db, far, 'b1-other', mid(-1, 4))
+  attachAt(db, it, 'b2-first', weekOf(-2)) // the first instant of its week
+  attachAt(db, it, 'b3-public', mid(-3)); attachAt(db, hid, 'b3-secret', mid(-3, 1))
+  postAt(db, a.convo, 'Quiet on pictures', mid(-4))
+  attachAt(db, it, 'b5-own', mid(-5)); attachAt(db, it, 'b5-pick', mid(-5, -1))
+  for (const n of [-1, -2, -3, -4]) put(db, n, [tale({ project_ids: [a.p.id] })])
+  put(db, -5, [tale({ project_ids: [a.p.id], media_blob_id: 'b5-pick' })])
+  const media = (o) => Object.fromEntries(history(db, a.p, o).weeks.filter((w) => w.card).map((w) => [w.week, w.card.media?.blob_id ?? null]))
+  assert.deepEqual(media(at), {
+    [keyOf(-1)]: 'b1-new', [keyOf(-2)]: 'b2-first', [keyOf(-3)]: 'b3-secret', [keyOf(-4)]: null, [keyOf(-5)]: 'b5-pick',
+  })
+  assert.deepEqual(media(sieved), {
+    [keyOf(-1)]: 'b1-new', [keyOf(-2)]: 'b2-first', [keyOf(-3)]: 'b3-public', [keyOf(-4)]: null, [keyOf(-5)]: 'b5-pick',
+  })
+  assert.deepEqual(history(db, a.p).weeks[0].card.media, pic('b1-new'))
 })

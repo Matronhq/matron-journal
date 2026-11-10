@@ -235,6 +235,10 @@ const DAY_MS = 86400e3
 const openMissionSql = (excludePrivateOwned) => `EXISTS (SELECT 1 FROM missions m
   WHERE m.project_id = p.id AND m.user_id = p.user_id AND m.state = 'open' ${excludePrivateOwned ? `AND ${ORIGIN_SIEVE}` : ''})`
 
+// Which projects `p` the caller may see as a row: one not merged into
+// another and, for a filtered caller, not born on a private device.
+const rowProjectSql = (excludePrivateOwned) => `p.merged_into IS NULL ${excludePrivateOwned ? `AND ${PROJECT_ORIGIN_SIEVE}` : ''}`
+
 // Every project the caller may see as a row, with whether it is live (open,
 // with at least one open mission), whether it has any mission at all, and,
 // when it is not live, when it finished: its close, else its newest mission
@@ -251,7 +255,7 @@ export function rowProjects(db, userId, excludePrivateOwned) {
         (SELECT MAX(m.closed_at) FROM missions m WHERE m.project_id = p.id AND m.user_id = p.user_id ${originSieve}),
         p.created_at) AS finished_at
     FROM projects p
-    WHERE p.user_id = ? AND p.merged_into IS NULL ${excludePrivateOwned ? `AND ${PROJECT_ORIGIN_SIEVE}` : ''}`)
+    WHERE p.user_id = ? AND ${rowProjectSql(excludePrivateOwned)}`)
     .all(userId).map((r) => ({ ...r, live: Boolean(r.live), has_mission: Boolean(r.has_mission) }))
 }
 export const refOf = (p) => ({ id: p.id, num: p.num, title: p.title })
@@ -342,6 +346,22 @@ export function survivingProjects(db, userId, ids, byId) {
   return out
 }
 
+// survivingProjects for a reader that needs only which project each stored
+// id is now: Map(stored id -> { id }), in one statement and without listing
+// every project. A stored id goes through a merge to the project that
+// survived it, which is kept only when rowProjects would return it
+// (rowProjectSql, the same rule).
+// `+s.user_id` has SQLite find the named rows by their id rather than read
+// every project of the user.
+export function namedProjects(db, userId, ids, excludePrivateOwned) {
+  if (!ids.length) return new Map()
+  const rows = db.prepare(`SELECT s.id AS stored, p.id FROM projects s
+      JOIN projects p ON p.id = COALESCE(s.merged_into, s.id) AND p.user_id = s.user_id
+    WHERE +s.user_id = ? AND s.id IN (SELECT value FROM json_each(?)) AND ${rowProjectSql(excludePrivateOwned)}`)
+    .all(userId, JSON.stringify(ids))
+  return new Map(rows.map((r) => [r.stored, { id: r.id }]))
+}
+
 // The stored items that still exist and that the caller may see (consent cards
 // are never items to show), with whether each still waits on the user:
 // Map(id → { id, num, title, done }). Under the sieve the item's mission must
@@ -369,7 +389,8 @@ export const isPicture = (type) => /^(image|video)\//.test(type ?? '')
 
 // The stored pictures that still exist and that the caller may see (under the
 // sieve, one the files roll-up still shows): Map(blob id → { blob_id,
-// content_type, name }). One pass over the roll-up for all of them.
+// content_type, name }). One pass over the roll-up for all of them, over
+// every mission of the user (found through idx_missions_user_state).
 export function liveMedia(db, userId, blobIds, excludePrivateOwned) {
   const out = new Map()
   if (!blobIds.length) return out
@@ -377,7 +398,7 @@ export function liveMedia(db, userId, blobIds, excludePrivateOwned) {
   const owned = db.prepare('SELECT id, content_type FROM blobs WHERE owner_user_id = ? AND id IN (SELECT value FROM json_each(?))')
     .all(userId, ids)
   if (!owned.length) return out
-  const rolled = new Map(db.prepare(`SELECT f.blob_id, f.content_type, f.name FROM (${filesSql(excludePrivateOwned, '1 = 1')}) f
+  const rolled = new Map(db.prepare(`SELECT f.blob_id, f.content_type, f.name FROM (${filesSql(excludePrivateOwned, 'm.user_id = @userId')}) f
     WHERE f.blob_id IN (SELECT value FROM json_each(@ids))`).all({ userId, ids }).map((r) => [r.blob_id, r]))
   for (const b of owned) {
     const r = rolled.get(b.id)

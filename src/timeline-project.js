@@ -8,7 +8,7 @@ import { ORIGIN_SIEVE } from './missions.js'
 import { filesSql, milestonesSql, feedMilestone } from './projects-feed.js'
 import { allWrittenWeeks, writtenWeeks } from './week-stories.js'
 import {
-  userTimeZone, parseWeekKey, formatWeekKey, weekEndOf, projectMoveTimes, weekStartsOf, rowProjects, survivingProjects, storyProjects,
+  userTimeZone, parseWeekKey, formatWeekKey, weekEndOf, projectMoveTimes, weekStartsOf, namedProjects, storyProjects,
   liveMedia, convoSieveOf, IN_PROJECT, OF_PROJECT, needsYouSql, forYouSql,
 } from './timeline.js'
 
@@ -29,13 +29,12 @@ const ALWAYS = Number.MAX_SAFE_INTEGER
 // What the stored `weeks` say about the project: for each week with a story
 // whose main project is this one (the first project the story names that the
 // caller may see, through merges; the first such story wins, as on the week
-// page), { week, story }, in the order of `weeks`. Two statements, however
-// many weeks.
+// page), { week, story }, in the order of `weeks`. One statement, however
+// many weeks: only the projects the stories name are looked up, and each is
+// kept under the rule that makes a project a row of the timeline.
 function storiesAbout(db, userId, project, weeks, excludePrivateOwned) {
-  if (!weeks.length) return []
-  const byId = new Map(rowProjects(db, userId, excludePrivateOwned).map((p) => [p.id, p]))
   const ids = [...new Set(weeks.flatMap((w) => w.stories.flatMap((s) => s.project_ids)))]
-  const projects = survivingProjects(db, userId, ids, byId)
+  const projects = namedProjects(db, userId, ids, excludePrivateOwned)
   const out = []
   for (const week of weeks) {
     const story = week.stories.find((s) => storyProjects(s, projects)[0]?.id === project.id)
@@ -92,9 +91,12 @@ export function projectPage(db, userId, project, { excludePrivateOwned = false }
 
   const about = storiesAbout(db, userId, project, allWrittenWeeks(db, userId), excludePrivateOwned)
 
-  const files = filesSql(excludePrivateOwned, IN_PROJECT)
-  const newest = db.prepare(`SELECT f.blob_id, f.content_type, f.name, f.at FROM (${files}) f
-    WHERE ${PICTURES} ORDER BY f.at DESC, f.sort_key DESC LIMIT 1`).get(args)
+  // The files roll-up, read once: its first row is the newest picture or
+  // video when there is one (`picture`), and every row carries the count.
+  const first = db.prepare(`SELECT f.blob_id, f.content_type, f.name, f.at, ${PICTURES} AS picture, COUNT(*) OVER () AS total
+    FROM (${filesSql(excludePrivateOwned, IN_PROJECT)}) f
+    ORDER BY picture DESC, f.at DESC, f.sort_key DESC LIMIT 1`).get(args)
+  const newest = first?.picture ? first : null
   const pick = storedPick(db, userId, about, tz, excludePrivateOwned)
   const fromFiles = newest ? { blob_id: newest.blob_id, content_type: newest.content_type, name: newest.name } : null
   const media = pick && (!newest || pick.at >= newest.at) ? pick.media : fromFiles
@@ -112,7 +114,7 @@ export function projectPage(db, userId, project, { excludePrivateOwned = false }
       weeks: weekStartsOf(projectMoveTimes(db, userId, project.id, { excludePrivateOwned }), tz).length,
       missions_open: open,
       missions_done: missions.get('closed') ?? 0,
-      files: db.prepare(`SELECT COUNT(*) AS n FROM (${files})`).get(args).n,
+      files: first?.total ?? 0,
     },
   }
 }
@@ -131,8 +133,7 @@ export function projectPage(db, userId, project, { excludePrivateOwned = false }
 //   milestone; `more_milestones` is how many more the week has.
 // `next_before` is the last week shown when older ones remain, else null.
 // null when `before` is not a week key. A fixed number of statements, plus
-// one for each returned week's milestones and one for each card that needs
-// the week's own picture.
+// one for each returned week's milestones.
 export function projectHistory(db, userId, project, { before = null, limit = PROJECT_HISTORY.page, excludePrivateOwned = false } = {}) {
   const tz = userTimeZone(db, userId)
   let starts = weekStartsOf(projectMoveTimes(db, userId, project.id, { excludePrivateOwned }), tz)
@@ -150,8 +151,18 @@ export function projectHistory(db, userId, project, { before = null, limit = PRO
   const live = liveMedia(db, userId, picks, excludePrivateOwned)
 
   const args = { userId, projectId: project.id }
-  const weekMedia = db.prepare(`SELECT f.blob_id, f.content_type, f.name FROM (${filesSql(excludePrivateOwned, IN_PROJECT)}) f
-    WHERE f.at >= @start AND f.at < @end AND ${PICTURES} ORDER BY f.at DESC, f.sort_key DESC LIMIT 1`)
+  // The newest picture or video of each week whose card has no pick that
+  // resolves: one statement over the files roll-up for all of them. The weeks
+  // do not overlap, so a file falls in at most one; the roll-up is the outer
+  // loop (CROSS JOIN fixes the order), read once.
+  const bare = shown.filter((w) => about.has(w.week) && !live.has(about.get(w.week).media_blob_id))
+  const weekMedia = new Map(bare.length ? db.prepare(`SELECT week, blob_id, content_type, name FROM (
+      SELECT w.value ->> 'week' AS week, f.blob_id, f.content_type, f.name,
+        ROW_NUMBER() OVER (PARTITION BY w.key ORDER BY f.at DESC, f.sort_key DESC) AS rn
+      FROM (${filesSql(excludePrivateOwned, IN_PROJECT)}) f CROSS JOIN json_each(@weeks) w
+      WHERE ${PICTURES} AND f.at >= @from AND f.at < @to AND f.at >= w.value ->> 'start' AND f.at < w.value ->> 'end')
+    WHERE rn = 1`).all({ ...args, weeks: JSON.stringify(bare), from: bare.at(-1).start, to: bare[0].end })
+    .map(({ week, ...m }) => [week, m]) : [])
   // `total` counts the week's milestones before the cap.
   const milestones = db.prepare(`SELECT f.*, COUNT(*) OVER () AS total FROM (${milestonesSql(excludePrivateOwned, IN_PROJECT)}) f
     WHERE f.at >= @start AND f.at < @end ORDER BY f.at DESC, f.sort_key DESC LIMIT ${PROJECT_HISTORY.milestones}`)
@@ -162,7 +173,7 @@ export function projectHistory(db, userId, project, { before = null, limit = PRO
     const rows = milestones.all(range)
     return {
       week, start, end,
-      card: story ? { sentence: story.sentence, media: live.get(story.media_blob_id) ?? weekMedia.get(range) ?? null } : null,
+      card: story ? { sentence: story.sentence, media: live.get(story.media_blob_id) ?? weekMedia.get(week) ?? null } : null,
       milestones: rows.map(({ total: _total, ...r }) => feedMilestone(r)),
       more_milestones: rows.length ? rows[0].total - rows.length : 0,
     }
