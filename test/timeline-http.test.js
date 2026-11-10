@@ -285,6 +285,28 @@ test('POST /timeline/weeks/:week/entries: 8 entries are stored, 9 are a bare 400
   assert.equal(storedWeek(s.db, alice.id, week).stories.length, 8)
 })
 
+test('POST /timeline/weeks/:week/entries: a body without entries is 400 and the stored week is left as it was', async (t) => {
+  const { s, alice, agent, p } = await coordinatorFleet(t)
+  const week = thisWeek(s, alice)
+  assert.equal((await putEntries(s, week, agent.token, entriesBody(p))).status, 201)
+  const before = storedWeek(s.db, alice.id, week)
+  assert.equal(before.stories.length, 1)
+  const bad = [
+    // The grouped write's shape, sent to this route.
+    { convo_id: 'coord', lede: 'A busy week.', stories: [{ title: 'Launch', sentence: 'It shipped.', project_ids: [p.num] }] },
+    { convo_id: 'coord', stories: [{ title: 'Launch', sentence: 'It shipped.', project_ids: [p.num] }] },
+    // Notes only.
+    { convo_id: 'coord', notes: [{ project_id: p.id, note: 'Slipping.' }] },
+    { convo_id: 'coord', entries: null, notes: [{ project_id: p.id, note: 'Slipping.' }] },
+    { convo_id: 'coord' },
+  ]
+  for (const body of bad) {
+    assert.deepEqual(await putEntries(s, week, agent.token, body), { status: 400, json: { error: 'bad_request' } }, JSON.stringify(body))
+    assert.deepEqual(storedWeek(s.db, alice.id, week), before, JSON.stringify(body))
+  }
+  assert.deepEqual(s.db.prepare('SELECT note FROM project_notes').all(), [{ note: 'On track.' }])
+})
+
 test('POST /timeline/weeks/:week/entries: a title, project_ids or lede in the body or an entry is ignored, never stored', async (t) => {
   const { s, alice, agent, p } = await coordinatorFleet(t)
   const week = thisWeek(s, alice)

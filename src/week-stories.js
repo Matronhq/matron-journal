@@ -4,11 +4,11 @@
 // (a lede and titled cards naming several projects) or as one entry per
 // project (no lede, no titles); both land in the same row. This module holds
 // the limits, the body validation, the checked writes and the reads; the HTTP
-// routes are in src/timeline-http.js. Nothing here trusts the Coordinator's references: a
-// project, item or picture it names must resolve to the user's own row, and
-// (the Coordinator always writes with the agent privacy sieve) to one an
-// ordinary agent may see, so a private device's work is never put into text
-// the apps show.
+// routes are in src/timeline-http.js. Nothing here trusts the Coordinator's
+// references: a project, item or picture it names must resolve to the user's
+// own row, and (the Coordinator always writes with the agent privacy sieve)
+// to one an ordinary agent may see, so a private device's work is never put
+// into text the apps show.
 import { parseWeekKey, userTimeZone, weekStartOf, weekEndOf, previousWeekStart } from './timeline.js'
 import { resolveProject } from './projects.js'
 import { ORIGIN_SIEVE } from './missions.js'
@@ -114,10 +114,13 @@ function validEntry(e) {
 // The body of a write of one entry per project, normalised: { entries, final,
 // notes } or null when malformed. An entry is { project, sentence, next,
 // media_blob_id }; any other key (a title, a lede, a list of projects or
-// items) is ignored, so it is never stored.
+// items) is ignored, so it is never stored. `entries` itself is required: a
+// write replaces the stored week, so a body without the list (the grouped
+// write's shape sent here, or notes alone) is malformed rather than a week
+// with no cards. An empty list is how a week with none is written.
 export function validWeekEntries(body) {
   if (!isObject(body)) return null
-  const rawEntries = body.entries ?? []
+  const rawEntries = body.entries
   if (!Array.isArray(rawEntries) || rawEntries.length > WEEK_LIMITS.storiesMax) return null
   const entries = rawEntries.map(validEntry)
   if (entries.includes(null)) return null

@@ -1019,7 +1019,7 @@ const putEntries = (db, n, { entries = [], final = false, notes = [] } = {}, o =
 
 test('validWeekEntries: 0..8 entries, each a project and a sentence of 1..300; next and the picture are optional', () => {
   const e = { project: 3, sentence: ' It shipped. ' }
-  assert.deepEqual(validWeekEntries({}), { entries: [], final: false, notes: [] })
+  assert.deepEqual(validWeekEntries({ entries: [] }), { entries: [], final: false, notes: [] })
   assert.deepEqual(validWeekEntries({ entries: [e], final: true, notes: [{ project_id: 'p1', note: 'Steady.' }] }), {
     entries: [{ project: 3, sentence: 'It shipped.', next: null, media_blob_id: null }], final: true, notes: [{ project: 'p1', note: 'Steady.' }],
   })
@@ -1033,7 +1033,18 @@ test('validWeekEntries: 0..8 entries, each a project and a sentence of 1..300; n
     { project: 3, sentence: 'x'.repeat(301) }, { project: 3, sentence: 's', next: 'x'.repeat(301) }, { project: 3, sentence: 's', next: 5 },
     { project: 3, sentence: 's', media_blob_id: 5 }, 'nope', null,
   ]) assert.equal(validWeekEntries({ entries: [bad] }), null, JSON.stringify(bad))
-  for (const bad of [null, [], { entries: 'x' }, { final: 'yes' }, { notes: [{ project_id: 3 }] }]) assert.equal(validWeekEntries(bad), null, JSON.stringify(bad))
+  for (const bad of [null, [], { entries: 'x' }, { entries: [], final: 'yes' }, { entries: [], notes: [{ project_id: 3 }] }]) {
+    assert.equal(validWeekEntries(bad), null, JSON.stringify(bad))
+  }
+})
+
+test('validWeekEntries needs its entries: a body without the list is malformed, an empty list is a week with no cards', () => {
+  const note = { project_id: 3, note: 'Steady.' }
+  for (const bad of [
+    {}, { entries: null }, { entries: {} }, { entries: 0 }, { notes: [note] }, { final: false },
+    { lede: 'A busy week.', stories: [{ title: 'Launch', sentence: 'It shipped.', project_ids: [3] }] },
+  ]) assert.equal(validWeekEntries(bad), null, JSON.stringify(bad))
+  assert.deepEqual(validWeekEntries({ entries: [], notes: [note] }), { entries: [], final: false, notes: [{ project: 3, note: 'Steady.' }] })
 })
 
 test('validWeekEntries drops a title, project_ids, item_ids or lede it is sent', () => {
