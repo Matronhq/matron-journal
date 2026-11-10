@@ -64,7 +64,7 @@ function handleFinished(db, res, url, who, opts) {
   return true
 }
 
-// GET /timeline/projects?before=<"<at>:<project id>">&limit=<1..100>
+// GET /timeline/projects?before=<"<at>:<project id>">&limit=<1..100>&raw=1?
 function handleProjects(db, res, url, who, opts) {
   const limit = limitOf(url, PROJECTS_LIMIT)
   if (limit == null) return badRequest(res)
@@ -133,21 +133,23 @@ export async function handleTimelineRoute(ctx, req, res, url, who) {
   }
   if (req.method !== 'GET') return false
   const opts = { excludePrivateOwned: filteredAgent(db, who) }
-  // The Coordinator reads the stalled lists to write notes and a lede that the
+  // The Coordinator reads the stalled lists, the list of live projects and a
+  // project's page and history to write notes, a lede and entries that the
   // filtered apps then show, so (like its raw week read and its write) its
   // `?raw=1` read of them is always under the agent privacy sieve, whatever
-  // device it runs on. A client sending raw=1 gets the ordinary read.
+  // device it runs on: a private-origin project is no row there, and 404 by
+  // id or number. A client sending raw=1 gets the ordinary read.
   const rawOpts = url.searchParams.get('raw') === '1' && who.kind === 'agent' ? { excludePrivateOwned: true } : opts
   if (path === '/timeline/weeks') return handleWeeks(db, res, url, who, opts)
   if (path === '/timeline/quiet') { json(res, 200, wentQuiet(db, who.userId, rawOpts)); return true }
   if (path === '/timeline/long') { json(res, 200, openLong(db, who.userId, rawOpts)); return true }
   if (path === '/timeline/finished') return handleFinished(db, res, url, who, opts)
-  if (path === '/timeline/projects') return handleProjects(db, res, url, who, opts)
+  if (path === '/timeline/projects') return handleProjects(db, res, url, who, rawOpts)
   const one = path.match(/^\/timeline\/projects\/([^/]+)(\/history)?$/)
   if (one) {
     let ref
     try { ref = decodeURIComponent(one[1]) } catch { return badRequest(res) }
-    return one[2] ? handleProjectHistory(db, res, url, who, ref, opts) : handleProject(db, res, who, ref, opts)
+    return one[2] ? handleProjectHistory(db, res, url, who, ref, rawOpts) : handleProject(db, res, who, ref, rawOpts)
   }
   const m = path.match(/^\/timeline\/weeks\/([^/]+)$/)
   if (!m) return false

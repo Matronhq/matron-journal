@@ -640,3 +640,46 @@ test('project history: limit must be an integer in 1..26 and before a Monday wee
   for (const bad of ['2026-11-10', '2026-02-30', 'nope', '']) assert.equal((await get(s, `${path}?before=${bad}`, client)).status, 400, `before=${bad}`)
   assert.equal((await get(s, `${path}?before=${thisWeek(s, alice)}`, client)).status, 200)
 })
+
+// ---- raw=1 on the project routes (the Coordinator's reads) ----
+
+test('raw=1 on the project routes is always sieved for an agent, even on a private device; a client and a plain read are unchanged', async (t) => {
+  const { s, alice, agent, priv, client } = await fleet(t)
+  const hidden = liveProject(s, alice, priv, 'Hidden', 2_000_000, { convoId: 'secret' })
+  const open = liveProject(s, alice, agent, 'Open', 1_000_000)
+  // The private box's mission on the visible project, a month after its own.
+  const quiet = createMission(s.db, { userId: alice.id, deviceId: priv.deviceId, createdBy: 'agent', convoId: 'secret', title: 'quiet work', projectId: open.p.id, attach: false }).mission
+  s.db.prepare('UPDATE missions SET created_at = ?, updated_at = ? WHERE id = ?').run(30 * 86400e3, 30 * 86400e3, quiet.id)
+  const titles = async (path, token) => (await get(s, path, token)).json.rows.map((r) => r.project.title).sort()
+  const status = async (path, token) => (await get(s, path, token)).status
+  const page = `/timeline/projects/${hidden.p.id}`
+
+  // Without raw=1 the private device's agent sees its own work, as before.
+  assert.deepEqual(await titles('/timeline/projects', priv.token), ['Hidden', 'Open'])
+  assert.equal(await status(page, priv.token), 200)
+  assert.equal(await status(`${page}/history`, priv.token), 200)
+  assert.equal((await get(s, `/timeline/projects/${open.p.id}`, priv.token)).json.counts.missions_open, 2)
+  assert.equal((await get(s, `/timeline/projects/${open.p.id}/history`, priv.token)).json.weeks.length, 2)
+
+  // With it, the private-origin project is no row and is not found, by id or
+  // number, and a visible project is read without the private box's work.
+  for (const token of [priv.token, agent.token]) {
+    assert.deepEqual(await titles('/timeline/projects?raw=1', token), ['Open'])
+    assert.deepEqual(await titles('/timeline/projects?raw=1&limit=5', token), ['Open'])
+    assert.equal((await get(s, '/timeline/projects?raw=1', token)).json.total, 1)
+    assert.equal(await status(`${page}?raw=1`, token), 404)
+    assert.equal(await status(`/timeline/projects/${hidden.p.num}?raw=1`, token), 404)
+    assert.equal(await status(`${page}/history?raw=1`, token), 404)
+    assert.equal(await status(`${page}/history?raw=1&limit=3`, token), 404)
+    assert.equal((await get(s, `/timeline/projects/${open.p.id}?raw=1`, token)).json.counts.missions_open, 1)
+    assert.equal((await get(s, `/timeline/projects/${open.p.id}/history?raw=1`, token)).json.weeks.length, 1)
+  }
+
+  // A client sending raw=1 gets the normal read.
+  assert.deepEqual(await titles('/timeline/projects?raw=1', client), ['Hidden', 'Open'])
+  assert.deepEqual(await get(s, `${page}?raw=1`, client), await get(s, page, client))
+  assert.equal(await status(`${page}?raw=1`, client), 200)
+  assert.deepEqual(await get(s, `${page}/history?raw=1`, client), await get(s, `${page}/history`, client))
+  assert.equal(await status(`${page}/history?raw=1`, client), 200)
+  assert.equal((await get(s, `/timeline/projects/${open.p.id}?raw=1`, client)).json.counts.missions_open, 2)
+})
