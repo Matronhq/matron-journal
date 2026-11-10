@@ -12,7 +12,7 @@ import { createMission, closeMission, createMilestone } from '../src/missions.js
 import { createProject, mergeProject, updateProject, closeProject } from '../src/projects.js'
 import { writeWeek, validWeekEntries, writeWeekEntries, storedWeek } from '../src/week-stories.js'
 import {
-  weekRaw, RAW, cardItemsSqlForTest, projectMoves, projectWeeklyMoves, weeksList, weekDetail, wentQuiet, openLong, finished, cronRunsForTest,
+  weekRaw, RAW, cardItemsSqlForTest, allProjects, projectMoves, projectWeeklyMoves, weeksList, weekDetail, wentQuiet, openLong, finished, cronRunsForTest,
 } from '../src/timeline.js'
 
 const LON = 'Europe/London'
@@ -1495,4 +1495,69 @@ test('an entry reads back as a card with no title of its own', () => {
     title: null, project: ref(a.p), projects: [ref(a.p)], sentence: 'It shipped.', next: 'Docs', needs_you: [], media: null,
     marks: { for_you: 0, done: 0, next: true },
   }])
+})
+
+// ---- Every live project, most recently moved first ----
+
+test('allProjects: live projects newest move first with their open missions; finished and merged ones left out, a merged one counted for its survivor', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha'); const b = proj(db, 'Bravo'); const c = proj(db, 'Charlie')
+  postAt(db, a.convo, 'a', mid(-3)); postAt(db, b.convo, 'b', mid(-1)); postAt(db, c.convo, 'c', mid(-2))
+  // Bravo: a second open mission and a closed one.
+  const more = (title) => createMission(db, { userId: 1, deviceId: 7, createdBy: 'agent', convoId: 'c1', title, projectId: b.p.id, attach: false }).mission
+  more('two')
+  const shut = more('shut')
+  db.prepare('UPDATE missions SET created_at=?, updated_at=? WHERE project_id=? AND id != ?').run(mid(-9), mid(-9), b.p.id, b.m.id)
+  closeAt(db, shut, mid(-8))
+  const done = proj(db, 'Done'); closeAt(db, done.m, mid(0))
+  // Merged into Alpha: not a row of its own, and its mission and move are now Alpha's.
+  const gone = proj(db, 'Gone'); postAt(db, gone.convo, 'g', mid(0, -1))
+  mergeProject(db, { userId: 1, projectId: gone.p.id, intoId: a.p.id, by: 'user' })
+  const closed = proj(db, 'Closed'); closeProject(db, { userId: 1, projectId: closed.p.id, by: 'user', summary: 'stop' })
+  const out = allProjects(db, 1, at)
+  assert.deepEqual(out, {
+    total: 3,
+    rows: [
+      { project: ref(a.p), last_moved_at: mid(0, -1), open_missions: 2 },
+      { project: ref(b.p), last_moved_at: mid(-1), open_missions: 2 },
+      { project: ref(c.p), last_moved_at: mid(-2), open_missions: 1 },
+    ],
+    next_before: null,
+  })
+})
+
+test('allProjects pages by a cursor of the last move and the project id; total counts every live project; ties go by id, descending', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha'); const b = proj(db, 'Bravo'); const c = proj(db, 'Charlie'); const d = proj(db, 'Delta')
+  postAt(db, a.convo, 'a', mid(-1))
+  for (const x of [b, c, d]) postAt(db, x.convo, 'same instant', mid(-2))
+  const tied = [b, c, d].map((x) => x.p).sort((x, y) => (x.id < y.id ? 1 : -1))
+  const one = allProjects(db, 1, { ...at, limit: 2 })
+  assert.equal(one.total, 4)
+  assert.deepEqual(one.rows.map((r) => r.project.id), [a.p.id, tied[0].id])
+  assert.equal(one.next_before, `${mid(-2)}:${tied[0].id}`)
+  const two = allProjects(db, 1, { ...at, limit: 2, before: one.next_before })
+  assert.equal(two.total, 4)
+  assert.deepEqual(two.rows.map((r) => r.project.id), [tied[1].id, tied[2].id])
+  assert.equal(two.next_before, null)
+  const three = allProjects(db, 1, { ...at, limit: 3 })
+  assert.deepEqual(allProjects(db, 1, { ...at, before: three.next_before }).rows.map((r) => r.project.id), [tied[2].id])
+  assert.equal(allProjects(db, 1, { ...at, before: 'bad cursor' }), null)
+  assert.deepEqual(allProjects(openDb(':memory:'), 1, at), { total: 0, rows: [], next_before: null })
+})
+
+test('allProjects under the agent sieve: no private-origin project, and a private mission neither counts nor moves a project', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha'); postAt(db, a.convo, 'a', mid(-2))
+  // A private mission on a visible project, with a newer milestone.
+  createMission(db, { userId: 1, deviceId: 9, createdBy: 'agent', convoId: 'secret', title: 'quiet work', projectId: a.p.id })
+  db.prepare("UPDATE missions SET created_at=?, updated_at=? WHERE title='quiet work'").run(mid(-5), mid(-5))
+  postAt(db, 'secret', 'hidden step', mid(-1))
+  const hidden = proj(db, 'Hidden')
+  db.prepare('UPDATE projects SET origin_convo_id = ? WHERE id = ?').run('secret', hidden.p.id)
+  const all = allProjects(db, 1, at)
+  assert.equal(all.total, 2)
+  assert.deepEqual(all.rows.find((r) => r.project.id === a.p.id), { project: ref(a.p), last_moved_at: mid(-1), open_missions: 2 })
+  const sieved = allProjects(db, 1, { ...at, excludePrivateOwned: true })
+  assert.deepEqual(sieved, { total: 1, rows: [{ project: ref(a.p), last_moved_at: mid(-2), open_missions: 1 }], next_before: null })
 })

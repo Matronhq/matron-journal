@@ -1,5 +1,5 @@
 // HTTP surface of the projects timeline (spec 2026-11-09 projects timeline).
-// Five reads over projects, missions, items and milestones; the Coordinator's
+// Six reads over projects, missions, items and milestones; the Coordinator's
 // paged raw read of one week (GET /timeline/weeks/:week?raw=1); and its two
 // writes of a week: a lede and story cards (POST /timeline/weeks/:week) or
 // one entry per project (POST /timeline/weeks/:week/entries), storage and
@@ -12,10 +12,13 @@ import { closingConvo, refusedCloser } from './missions-http.js'
 import { filteredAgent } from './privacy.js'
 import { parseCursor } from './projects-feed.js'
 import { validWeekWrite, writeWeek, validWeekEntries, writeWeekEntries } from './week-stories.js'
-import { weeksList, weekDetail, weekRaw, RAW, wentQuiet, openLong, finished, parseWeekKey, userTimeZone } from './timeline.js'
+import {
+  weeksList, weekDetail, weekRaw, RAW, TIMELINE, wentQuiet, openLong, finished, allProjects, parseWeekKey, userTimeZone,
+} from './timeline.js'
 
 const WEEKS_LIMIT = { default: 12, max: 52 }
 const FINISHED_LIMIT = { default: 30, max: 100 }
+const PROJECTS_LIMIT = { default: TIMELINE.allPage, max: 100 }
 const RAW_LIMIT = { default: RAW.page, max: RAW.pageMax }
 
 // The integer `limit` query parameter: its default when absent, null when not
@@ -53,6 +56,16 @@ function handleFinished(db, res, url, who, opts) {
   const before = url.searchParams.get('before')
   if (parseCursor(before) === undefined) return badRequest(res)
   json(res, 200, finished(db, who.userId, { before, limit, ...opts }))
+  return true
+}
+
+// GET /timeline/projects?before=<"<at>:<project id>">&limit=<1..100>
+function handleProjects(db, res, url, who, opts) {
+  const limit = limitOf(url, PROJECTS_LIMIT)
+  if (limit == null) return badRequest(res)
+  const before = url.searchParams.get('before')
+  if (parseCursor(before) === undefined) return badRequest(res)
+  json(res, 200, allProjects(db, who.userId, { before, limit, ...opts }))
   return true
 }
 
@@ -99,6 +112,7 @@ export async function handleTimelineRoute(ctx, req, res, url, who) {
   if (path === '/timeline/quiet') { json(res, 200, wentQuiet(db, who.userId, rawOpts)); return true }
   if (path === '/timeline/long') { json(res, 200, openLong(db, who.userId, rawOpts)); return true }
   if (path === '/timeline/finished') return handleFinished(db, res, url, who, opts)
+  if (path === '/timeline/projects') return handleProjects(db, res, url, who, opts)
   const m = path.match(/^\/timeline\/weeks\/([^/]+)$/)
   if (!m) return false
   let week

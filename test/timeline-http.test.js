@@ -38,7 +38,7 @@ const get = (s, path, token) => s.http(path, { token })
 
 test('every timeline route is 401 without a token', async (t) => {
   const { s } = await fleet(t)
-  for (const p of ['/timeline/weeks', '/timeline/weeks/2026-11-09', '/timeline/quiet', '/timeline/long', '/timeline/finished']) {
+  for (const p of ['/timeline/weeks', '/timeline/weeks/2026-11-09', '/timeline/quiet', '/timeline/long', '/timeline/finished', '/timeline/projects']) {
     assert.equal((await get(s, p, undefined)).status, 401, p)
   }
 })
@@ -133,6 +133,69 @@ test('an agent device does not see a private-origin project; the client does', a
   const titles = async (token) => (await get(s, '/timeline/finished', token)).json.rows.map((r) => r.project.title).sort()
   assert.deepEqual(await titles(client), ['Hidden', 'Visible'])
   assert.deepEqual(await titles(agent.token), ['Visible'])
+})
+
+// ---- GET /timeline/projects (every live project) ----
+
+const liveProject = (s, alice, agent, title, movedAt, { convoId = 'c1' } = {}) => {
+  const p = createProject(s.db, { userId: alice.id, deviceId: agent.deviceId, createdBy: 'agent', title, convoId }).project
+  const m = createMission(s.db, { userId: alice.id, deviceId: agent.deviceId, createdBy: 'agent', convoId, title, projectId: p.id, attach: false }).mission
+  s.db.prepare('UPDATE missions SET created_at = ?, updated_at = ? WHERE id = ?').run(movedAt, movedAt, m.id)
+  return { p, m }
+}
+
+test('projects: live projects most recently moved first, each with its last move and open missions; total counts them all; before pages', async (t) => {
+  const { s, alice, agent, client } = await fleet(t)
+  assert.deepEqual((await get(s, '/timeline/projects', client)).json, { total: 0, rows: [], next_before: null })
+  const a = liveProject(s, alice, agent, 'A', 1_000_000)
+  const b = liveProject(s, alice, agent, 'B', 3_000_000)
+  const c = liveProject(s, alice, agent, 'C', 2_000_000)
+  const done = liveProject(s, alice, agent, 'Done', 4_000_000)
+  closeMission(s.db, { userId: alice.id, missionId: done.m.id, by: 'user', summary: 'done' })
+  const all = await get(s, '/timeline/projects', client)
+  assert.equal(all.status, 200)
+  assert.deepEqual(all.json, {
+    total: 3,
+    rows: [
+      { project: { id: b.p.id, num: b.p.num, title: 'B' }, last_moved_at: 3_000_000, open_missions: 1 },
+      { project: { id: c.p.id, num: c.p.num, title: 'C' }, last_moved_at: 2_000_000, open_missions: 1 },
+      { project: { id: a.p.id, num: a.p.num, title: 'A' }, last_moved_at: 1_000_000, open_missions: 1 },
+    ],
+    next_before: null,
+  })
+  const page1 = await get(s, '/timeline/projects?limit=2', client)
+  assert.equal(page1.json.total, 3)
+  assert.deepEqual(page1.json.rows.map((r) => r.project.title), ['B', 'C'])
+  assert.equal(page1.json.next_before, `2000000:${c.p.id}`)
+  const page2 = await get(s, `/timeline/projects?limit=2&before=${encodeURIComponent(page1.json.next_before)}`, client)
+  assert.equal(page2.json.total, 3)
+  assert.deepEqual(page2.json.rows.map((r) => r.project.title), ['A'])
+  assert.equal(page2.json.next_before, null)
+  // An agent reads the same list.
+  assert.deepEqual((await get(s, '/timeline/projects', agent.token)).json, all.json)
+})
+
+test('projects: limit must be an integer in 1..100 and before a cursor, else 400', async (t) => {
+  const { s, client } = await fleet(t)
+  for (const bad of ['0', '101', '-1', '2.5', 'x', '']) {
+    assert.equal((await get(s, `/timeline/projects?limit=${bad}`, client)).status, 400, `limit=${bad}`)
+  }
+  for (const ok of ['1', '100']) assert.equal((await get(s, `/timeline/projects?limit=${ok}`, client)).status, 200, `limit=${ok}`)
+  for (const bad of ['junk', '12', ':abc', '']) {
+    assert.equal((await get(s, `/timeline/projects?before=${bad}`, client)).status, 400, `before=${bad}`)
+  }
+  assert.equal((await get(s, '/timeline/projects/', client)).status, 404)
+})
+
+test('projects: an agent device does not see a private-origin project; the client does', async (t) => {
+  const { s, alice, agent, priv, client } = await fleet(t)
+  liveProject(s, alice, priv, 'Hidden', 2_000_000, { convoId: 'secret' })
+  liveProject(s, alice, agent, 'Visible', 1_000_000)
+  const read = async (token) => (await get(s, '/timeline/projects', token)).json
+  assert.deepEqual((await read(client)).rows.map((r) => r.project.title), ['Hidden', 'Visible'])
+  assert.equal((await read(client)).total, 2)
+  assert.deepEqual((await read(agent.token)).rows.map((r) => r.project.title), ['Visible'])
+  assert.equal((await read(agent.token)).total, 1)
 })
 
 test('non-GET methods and unknown timeline paths are not handled (404)', async (t) => {

@@ -164,8 +164,8 @@ export function projectWeeklyMoves(db, userId, projectIds, weekStarts, tz, { exc
   return out
 }
 
-// ---- The five reads (weeks list, one week, went quiet, open a long time,
-// finished). Every read takes `{ excludePrivateOwned, now }` last; the zone is
+// ---- The reads (weeks list, one week, went quiet, open a long time,
+// finished, every live project). Every read takes `{ excludePrivateOwned, now }` last; the zone is
 // the user's own. A project merged into another never appears as a row (its
 // moves already count for the survivor); a filtered caller also loses
 // private-origin projects, and its missions and moves go through the same
@@ -182,6 +182,7 @@ export const TIMELINE = {
   quietMovedWeeks: 2, //   quietWeeks weeks ending with its last move's week
   openLongDays: 21, // open a long time: created at least this long ago
   finishedPage: 30,
+  allPage: 50, // rows per page of every live project
 }
 const DAY_MS = 86400e3
 
@@ -698,5 +699,32 @@ export function finished(db, userId, { before = null, limit = TIMELINE.finishedP
   return {
     rows: shown.map((p) => ({ project: refOf(p), finished_at: p.finished_at })),
     next_before: rows.length > limit ? `${lastRow.finished_at}:${lastRow.id}` : null,
+  }
+}
+
+// Every live project, most recently moved first, paged by an
+// "<at>:<project id>" cursor, where `at` is the project's last move or, for
+// one that never moved, its creation; ties go by id, descending. Each row has
+// `last_moved_at` (null when it never moved) and `open_missions`, how many of
+// its missions are open; `total` counts every live project, whatever the
+// page. null when `before` is not a cursor.
+export function allProjects(db, userId, { before = null, limit = TIMELINE.allPage, excludePrivateOwned = false } = {}) {
+  const cursor = parseCursor(before)
+  if (cursor === undefined) return null
+  const last = lastMoves(db, userId, excludePrivateOwned)
+  const open = new Map(db.prepare(`SELECT m.project_id, COUNT(*) AS n FROM missions m
+    WHERE m.user_id = ? AND m.state = 'open' ${excludePrivateOwned ? `AND ${ORIGIN_SIEVE}` : ''}
+    GROUP BY m.project_id`).all(userId).map((r) => [r.project_id, r.n]))
+  const live = rowProjects(db, userId, excludePrivateOwned).filter((p) => p.live)
+    .map((p) => ({ p, moved: last.get(p.id) ?? null, at: last.get(p.id) ?? p.created_at }))
+  const rows = live
+    .filter((r) => !cursor || r.at < cursor.at || (r.at === cursor.at && r.p.id < cursor.key))
+    .sort((a, b) => (b.at - a.at) || (a.p.id < b.p.id ? 1 : a.p.id > b.p.id ? -1 : 0))
+  const shown = rows.slice(0, limit)
+  const lastRow = shown.at(-1)
+  return {
+    total: live.length,
+    rows: shown.map((r) => ({ project: refOf(r.p), last_moved_at: r.moved, open_missions: open.get(r.p.id) ?? 0 })),
+    next_before: rows.length > limit ? `${lastRow.at}:${lastRow.p.id}` : null,
   }
 }
