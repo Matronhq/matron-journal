@@ -590,3 +590,53 @@ test('project page: an agent device gets 404 for a private-origin project; the c
   assert.equal((await get(s, `/timeline/projects/${open.p.id}`, client)).json.counts.missions_open, 2)
   assert.equal((await get(s, `/timeline/projects/${open.p.id}`, agent.token)).json.counts.missions_open, 1)
 })
+
+// ---- GET /timeline/projects/:id/history (the project's weeks) ----
+
+test('project history: 401 without a token; 404 for an unknown project and, for an agent device, a private-origin one', async (t) => {
+  const { s, alice, priv, agent, client } = await fleet(t)
+  assert.equal((await get(s, '/timeline/projects/1/history', undefined)).status, 401)
+  assert.equal((await get(s, '/timeline/projects/999/history', client)).status, 404)
+  const hidden = liveProject(s, alice, priv, 'Hidden', 2_000_000, { convoId: 'secret' })
+  assert.equal((await get(s, `/timeline/projects/${hidden.p.id}/history`, agent.token)).status, 404)
+  assert.equal((await get(s, `/timeline/projects/${hidden.p.id}/history`, client)).status, 200)
+  assert.equal((await get(s, `/timeline/projects/${hidden.p.id}/history/more`, client)).status, 404)
+})
+
+test('project history: the weeks the project moved, newest first, by id or number; limit and before page; a merged project reads as its survivor', async (t) => {
+  const { s, alice, agent, client } = await fleet(t)
+  const tz = userTimeZone(s.db, alice.id)
+  const w0 = weekStartOf(Date.now(), tz)
+  const w1 = previousWeekStart(w0, tz); const w2 = previousWeekStart(w1, tz); const w3 = previousWeekStart(w2, tz)
+  const key = (w) => formatWeekKey(w, tz)
+  const { p } = liveProject(s, alice, agent, 'Promo launch', w3 + 3600e3)
+  const gone = liveProject(s, alice, agent, 'Gone', w1 + 3600e3)
+  const all = await get(s, `/timeline/projects/${p.id}/history`, client)
+  assert.equal(all.status, 200)
+  assert.deepEqual(all.json, {
+    weeks: [{ week: key(w3), start: w3, end: w2, card: null, milestones: [], more_milestones: 0 }],
+    next_before: null,
+  })
+  mergeProject(s.db, { userId: alice.id, projectId: gone.p.id, intoId: p.id, by: 'user' })
+  for (const ref of [p.id, String(p.num), gone.p.id, String(gone.p.num)]) {
+    const r = await get(s, `/timeline/projects/${ref}/history`, client)
+    assert.deepEqual(r.json.weeks.map((w) => w.week), [key(w1), key(w3)], ref)
+    assert.equal(r.json.next_before, null)
+  }
+  const page1 = await get(s, `/timeline/projects/${p.id}/history?limit=1`, client)
+  assert.deepEqual(page1.json.weeks.map((w) => w.week), [key(w1)])
+  assert.equal(page1.json.next_before, key(w1))
+  const page2 = await get(s, `/timeline/projects/${p.id}/history?limit=1&before=${page1.json.next_before}`, agent.token)
+  assert.deepEqual(page2.json.weeks.map((w) => w.week), [key(w3)])
+  assert.equal(page2.json.next_before, null)
+})
+
+test('project history: limit must be an integer in 1..26 and before a Monday week key, else 400', async (t) => {
+  const { s, alice, agent, client } = await fleet(t)
+  const { p } = liveProject(s, alice, agent, 'Promo launch', 1_000_000)
+  const path = `/timeline/projects/${p.id}/history`
+  for (const bad of ['0', '27', '-1', '2.5', 'x', '']) assert.equal((await get(s, `${path}?limit=${bad}`, client)).status, 400, `limit=${bad}`)
+  for (const ok of ['1', '26']) assert.equal((await get(s, `${path}?limit=${ok}`, client)).status, 200, `limit=${ok}`)
+  for (const bad of ['2026-11-10', '2026-02-30', 'nope', '']) assert.equal((await get(s, `${path}?before=${bad}`, client)).status, 400, `before=${bad}`)
+  assert.equal((await get(s, `${path}?before=${thisWeek(s, alice)}`, client)).status, 200)
+})

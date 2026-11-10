@@ -1,6 +1,7 @@
 // HTTP surface of the projects timeline (spec 2026-11-09 projects timeline).
 // Six reads over projects, missions, items and milestones; one project's
-// page (GET /timeline/projects/:id); the Coordinator's
+// page (GET /timeline/projects/:id) and its history week by week
+// (GET /timeline/projects/:id/history); the Coordinator's
 // paged raw read of one week (GET /timeline/weeks/:week?raw=1); and its two
 // writes of a week: a lede and story cards (POST /timeline/weeks/:week) or
 // one entry per project (POST /timeline/weeks/:week/entries), storage and
@@ -13,7 +14,7 @@ import { closingConvo, refusedCloser } from './missions-http.js'
 import { filteredAgent } from './privacy.js'
 import { parseCursor } from './projects-feed.js'
 import { resolveProject } from './projects.js'
-import { projectPage } from './timeline-project.js'
+import { projectPage, projectHistory, PROJECT_HISTORY } from './timeline-project.js'
 import { validWeekWrite, writeWeek, validWeekEntries, writeWeekEntries } from './week-stories.js'
 import {
   weeksList, weekDetail, weekRaw, RAW, TIMELINE, wentQuiet, openLong, finished, allProjects, parseWeekKey, userTimeZone,
@@ -22,6 +23,7 @@ import {
 const WEEKS_LIMIT = { default: 12, max: 52 }
 const FINISHED_LIMIT = { default: 30, max: 100 }
 const PROJECTS_LIMIT = { default: TIMELINE.allPage, max: 100 }
+const HISTORY_LIMIT = { default: PROJECT_HISTORY.page, max: PROJECT_HISTORY.pageMax }
 const RAW_LIMIT = { default: RAW.page, max: RAW.pageMax }
 
 // The integer `limit` query parameter: its default when absent, null when not
@@ -83,6 +85,20 @@ function handleProject(db, res, who, ref, opts) {
   return true
 }
 
+// GET /timeline/projects/:id/history?before=<week key>&limit=<1..26> — the
+// weeks the project moved in, newest first. The project is found as the
+// page finds it (id or number, through a merge, 404 when hidden or unknown).
+function handleProjectHistory(db, res, url, who, ref, opts) {
+  const limit = limitOf(url, HISTORY_LIMIT)
+  if (limit == null) return badRequest(res)
+  const before = url.searchParams.get('before')
+  if (before != null && parseWeekKey(before, userTimeZone(db, who.userId)) == null) return badRequest(res)
+  const r = resolveProject(db, who.userId, ref, opts)
+  if (!r) return notFound(res)
+  json(res, 200, projectHistory(db, who.userId, r.project, { before, limit, ...opts }))
+  return true
+}
+
 // POST /timeline/weeks/:week — the Coordinator's lede and story cards for one
 // week, and its notes on projects. POST /timeline/weeks/:week/entries — the
 // same week as one entry per project (`entries` true): no lede, no titles,
@@ -127,11 +143,11 @@ export async function handleTimelineRoute(ctx, req, res, url, who) {
   if (path === '/timeline/long') { json(res, 200, openLong(db, who.userId, rawOpts)); return true }
   if (path === '/timeline/finished') return handleFinished(db, res, url, who, opts)
   if (path === '/timeline/projects') return handleProjects(db, res, url, who, opts)
-  const one = path.match(/^\/timeline\/projects\/([^/]+)$/)
+  const one = path.match(/^\/timeline\/projects\/([^/]+)(\/history)?$/)
   if (one) {
     let ref
     try { ref = decodeURIComponent(one[1]) } catch { return badRequest(res) }
-    return handleProject(db, res, who, ref, opts)
+    return one[2] ? handleProjectHistory(db, res, url, who, ref, opts) : handleProject(db, res, who, ref, opts)
   }
   const m = path.match(/^\/timeline\/weeks\/([^/]+)$/)
   if (!m) return false

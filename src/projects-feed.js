@@ -102,11 +102,14 @@ export function filesSql(excludePrivateOwned, projectMatch = 'm.project_id = @pr
   // read through idx_events_media (pinned by a test).
 }
 
-function milestonesSql(excludePrivateOwned) {
+// Every milestone of the project's missions. `projectMatch` picks the
+// missions, as in filesSql (the timeline's project history also takes those
+// of projects merged into it).
+export function milestonesSql(excludePrivateOwned, projectMatch = 'm.project_id = @projectId') {
   const sieve = excludePrivateOwned ? `AND NOT ${privateConvo('c')} AND ${ORIGIN_SIEVE}` : ''
   return `SELECT l.*, m.num AS mission_num, l.created_at AS at, ${pad('l.seq')} AS sort_key
     FROM milestones l JOIN missions m ON m.id = l.mission_id JOIN conversations c ON c.id = l.convo_id
-    WHERE m.project_id = @projectId AND m.user_id = @userId ${sieve}`
+    WHERE ${projectMatch} AND m.user_id = @userId ${sieve}`
 }
 
 const SQL = { decisions: decisionsSql, files: filesSql, milestones: milestonesSql }
@@ -115,6 +118,8 @@ const SQL = { decisions: decisionsSql, files: filesSql, milestones: milestonesSq
 export const filesSqlForTest = filesSql
 
 const strip = ({ at: _at, sort_key: _key, ...rest }) => rest
+// A milestonesSql row as the feed returns it (the project history returns the same).
+export const feedMilestone = (r) => milestoneRow(strip(r))
 const SHAPE = {
   decisions: (r) => strip(r),
   files: ({ source, item_num: itemNum, convo_id: convoId, seq, ...r }) => ({
@@ -122,7 +127,7 @@ const SHAPE = {
     posted_at: r.at,
     source: source === 'item' ? { item_num: itemNum } : { convo_id: convoId, seq },
   }),
-  milestones: (r) => milestoneRow(strip(r)),
+  milestones: feedMilestone,
 }
 
 // One page of one kind. `before` is a parsed cursor or null.

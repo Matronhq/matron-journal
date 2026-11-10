@@ -7,7 +7,8 @@ import { createMission, closeMission, createMilestone } from '../src/missions.js
 import { createProject, mergeProject, updateProject, resolveProject } from '../src/projects.js'
 import { writeWeek } from '../src/week-stories.js'
 import { weekStartOf, formatWeekKey } from '../src/timeline.js'
-import { projectPage, PROJECT_PAGE } from '../src/timeline-project.js'
+import { projectFeed } from '../src/projects-feed.js'
+import { projectPage, projectHistory, PROJECT_PAGE, PROJECT_HISTORY } from '../src/timeline-project.js'
 
 // ---- fixtures: alice (user 1) with an ordinary box (7), a client (8) and a
 // private box (9, the `secret` conversation) ----
@@ -289,4 +290,137 @@ test('projectPage: the number of statements does not grow with the stored weeks'
   const one = count()
   for (let n = 2; n <= 9; n++) put(db, -n, [tale({ project_ids: [a.p.id] })])
   assert.equal(count(), one)
+})
+
+// ---- projectHistory ----
+
+const history = (db, p, o = at) => projectHistory(db, 1, resolveProject(db, 1, p.id, o).project, o)
+const head = (n) => ({ week: keyOf(n), start: weekOf(n), end: weekOf(n + 1) })
+// The project feed's milestone rows with these titles, in the feed's order.
+const feedRows = (db, p, titles, o = {}) => projectFeed(db, 1, p, 'milestones', { limit: 100, ...o }).rows.filter((r) => titles.includes(r.title))
+
+test('projectHistory: every local week the project moved, newest first, quiet weeks left out; a card where a week was written about it', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha', { createdAt: mid(-6) }); const b = proj(db, 'Bravo', { createdAt: mid(-6) })
+  postAt(db, a.convo, 'Drafted', mid(-4)); postAt(db, a.convo, 'Reviewed', mid(-4, 1))
+  postAt(db, a.convo, 'Shipped', mid(-1))
+  postAt(db, b.convo, 'Elsewhere', mid(-2))
+  put(db, -4, [tale({ project_ids: [a.p.id], sentence: 'The draft went round.', next: 'Ship it' })])
+  // Written weeks that are not about it: one names it second, one not at all.
+  put(db, -1, [tale({ project_ids: [b.p.id, a.p.id], sentence: 'Mostly Bravo.' })])
+  put(db, -2, [tale({ project_ids: [b.p.id] })])
+  const out = history(db, a.p)
+  assert.deepEqual(out, {
+    weeks: [
+      { ...head(-1), card: null, milestones: feedRows(db, a.p, ['Shipped']), more_milestones: 0 },
+      { ...head(-4), card: { sentence: 'The draft went round.', media: null }, milestones: feedRows(db, a.p, ['Reviewed', 'Drafted']), more_milestones: 0 },
+      { ...head(-6), card: null, milestones: [], more_milestones: 0 },
+    ],
+    next_before: null,
+  })
+  assert.deepEqual(out.weeks[1].milestones.map((m) => m.title), ['Reviewed', 'Drafted'])
+})
+
+test('projectHistory milestones are in the project feed shape, so a reader can jump to one in its conversation', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha', { createdAt: mid(-1) })
+  const posted = postAt(db, a.convo, 'Shipped', mid(-1, 1))
+  const [row] = history(db, a.p).weeks[0].milestones
+  assert.deepEqual(row, projectFeed(db, 1, a.p, 'milestones').rows[0])
+  assert.equal(row.id, posted.id); assert.equal(row.convo_id, a.convo); assert.equal(row.mission_num, a.m.num)
+  assert.equal(row.kind, 'progress'); assert.equal(row.created_at, mid(-1, 1)); assert.equal(typeof row.seq, 'number')
+  for (const internal of ['at', 'sort_key', 'total', 'idem_key', 'user_id']) assert.equal(internal in row, false, internal)
+})
+
+test('projectHistory: at most 20 milestones a week, the newest, with how many more; a week with item activity only has none', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha', { createdAt: mid(-3) })
+  for (let i = 0; i < 23; i++) postAt(db, a.convo, `Step ${i}`, mid(-2) + i * 60e3)
+  item(db, a.convo, 'task', 'Tidy up', { now: mid(-1) })
+  const out = history(db, a.p)
+  assert.deepEqual(out.weeks.map((w) => w.week), [keyOf(-1), keyOf(-2), keyOf(-3)])
+  assert.deepEqual(out.weeks[0].milestones, []); assert.equal(out.weeks[0].more_milestones, 0)
+  assert.equal(PROJECT_HISTORY.milestones, 20)
+  assert.deepEqual(out.weeks[1].milestones.map((m) => m.title), Array.from({ length: 20 }, (_, i) => `Step ${22 - i}`))
+  assert.equal(out.weeks[1].more_milestones, 3)
+})
+
+test('projectHistory pages by week key: limit weeks a page, next_before the last week shown; a before that is not a week key is null', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha', { createdAt: mid(-9) })
+  for (const n of [-7, -5, -3, -1]) postAt(db, a.convo, `Week ${n}`, mid(n))
+  const keys = (o) => { const r = history(db, a.p, { ...at, ...o }); return [r.weeks.map((w) => w.week), r.next_before] }
+  assert.equal(PROJECT_HISTORY.page, 8)
+  assert.deepEqual(keys({}), [[keyOf(-1), keyOf(-3), keyOf(-5), keyOf(-7), keyOf(-9)], null])
+  assert.deepEqual(keys({ limit: 2 }), [[keyOf(-1), keyOf(-3)], keyOf(-3)])
+  assert.deepEqual(keys({ limit: 2, before: keyOf(-3) }), [[keyOf(-5), keyOf(-7)], keyOf(-7)])
+  assert.deepEqual(keys({ limit: 2, before: keyOf(-7) }), [[keyOf(-9)], null])
+  assert.deepEqual(keys({ limit: 5 }), [[keyOf(-1), keyOf(-3), keyOf(-5), keyOf(-7), keyOf(-9)], null])
+  // A quiet week is a fine place to page from; a week before the first is empty.
+  assert.deepEqual(keys({ before: keyOf(-4) }), [[keyOf(-5), keyOf(-7), keyOf(-9)], null])
+  assert.deepEqual(keys({ before: keyOf(-9) }), [[], null])
+  for (const bad of ['2026-11-10', 'nope', '']) assert.equal(history(db, a.p, { ...at, before: bad }), null, bad)
+})
+
+test('projectHistory card media: the stored pick when it resolves, else the newest picture of that week, else null', () => {
+  const db = seeded()
+  const a = proj(db, 'Site', { createdAt: mid(-6) })
+  const it = item(db, a.convo, 'task', 'Screens', { now: mid(-6) })
+  attachAt(db, it, 'b-pick', mid(-5))
+  attachAt(db, it, 'b-week', mid(-2)); attachAt(db, it, 'b-doc', mid(-2, 1), 'application/pdf')
+  postAt(db, a.convo, 'Plain week', mid(-1))
+  for (const n of [-1, -2]) put(db, n, [tale({ project_ids: [a.p.id], media_blob_id: n === -2 ? 'b-pick' : null })])
+  const media = () => Object.fromEntries(history(db, a.p).weeks.map((w) => [w.week, w.card && w.card.media]))
+  assert.deepEqual(media(), { [keyOf(-1)]: null, [keyOf(-2)]: pic('b-pick'), [keyOf(-5)]: null, [keyOf(-6)]: null })
+  db.prepare("DELETE FROM blobs WHERE id = 'b-pick'").run()
+  assert.deepEqual(media()[keyOf(-2)], pic('b-week'))
+})
+
+test("projectHistory: a merged project's history includes the moves made before the merge, and the weeks written about it", () => {
+  const db = seeded()
+  const a = proj(db, 'Survivor', { createdAt: mid(-2) }); const gone = proj(db, 'Gone', { createdAt: mid(-6) })
+  postAt(db, gone.convo, 'Before the merge', mid(-4))
+  put(db, -4, [tale({ project_ids: [gone.p.id], sentence: 'Gone got going.' })])
+  assert.deepEqual(history(db, a.p).weeks.map((w) => w.week), [keyOf(-2)])
+  mergeProject(db, { userId: 1, projectId: gone.p.id, intoId: a.p.id, by: 'user' })
+  const out = projectHistory(db, 1, resolveProject(db, 1, gone.p.id).project, at)
+  assert.deepEqual(out.weeks.map((w) => w.week), [keyOf(-2), keyOf(-4), keyOf(-6)])
+  assert.deepEqual(out.weeks[1].card, { sentence: 'Gone got going.', media: null })
+  assert.deepEqual(out.weeks[1].milestones.map((m) => m.title), ['Before the merge'])
+})
+
+test('projectHistory under the agent sieve: no week, milestone or picture from the secret conversation', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha', { createdAt: mid(-6) })
+  privateMission(db, a.p, mid(-5))
+  postAt(db, 'secret', 'Private step', mid(-3))
+  postAt(db, a.convo, 'Public step', mid(-3, 1))
+  const hid = item(db, 'secret', 'task', 'Private shot', { now: mid(-3, 2) })
+  attachAt(db, hid, 'b-secret', mid(-3, 3))
+  put(db, -3, [tale({ project_ids: [a.p.id], sentence: 'A step.', media_blob_id: 'b-secret' })])
+  const client = history(db, a.p)
+  assert.deepEqual(client.weeks.map((w) => w.week), [keyOf(-3), keyOf(-5), keyOf(-6)])
+  assert.deepEqual(client.weeks[0].milestones.map((m) => m.title), ['Public step', 'Private step'])
+  assert.deepEqual(client.weeks[0].card, { sentence: 'A step.', media: pic('b-secret') })
+  const agent = history(db, a.p, sieved)
+  assert.deepEqual(agent.weeks.map((w) => w.week), [keyOf(-3), keyOf(-6)])
+  assert.deepEqual(agent.weeks[0].milestones, feedRows(db, a.p, ['Public step'], { excludePrivateOwned: true }))
+  assert.deepEqual(agent.weeks[0].milestones.map((m) => m.title), ['Public step'])
+  assert.deepEqual(agent.weeks[0].card, { sentence: 'A step.', media: null })
+})
+
+test('projectHistory: the statements a page takes do not grow with the weeks behind it', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha', { createdAt: mid(-9) })
+  const count = () => {
+    let n = 0
+    const prepare = db.prepare.bind(db)
+    db.prepare = (sql) => { n += 1; return prepare(sql) }
+    try { history(db, a.p, { ...at, limit: 2 }) } finally { db.prepare = prepare }
+    return n
+  }
+  for (const n of [-1, -2]) { postAt(db, a.convo, `Week ${n}`, mid(n)); put(db, n, [tale({ project_ids: [a.p.id] })]) }
+  const two = count()
+  for (const n of [-3, -4, -5, -6, -7, -8]) { postAt(db, a.convo, `Week ${n}`, mid(n)); put(db, n, [tale({ project_ids: [a.p.id] })]) }
+  assert.equal(count(), two)
 })

@@ -1,18 +1,25 @@
-// One project on the timeline: the summary its page opens with. Pure DB
-// reads over what src/timeline.js already defines (moves, the stored weeks,
-// the sieves), for one project the caller has already resolved (through a
-// merge, under its own sieve). `excludePrivateOwned` hides what an ordinary
-// agent may not see, exactly as the week reads do.
+// One project on the timeline: the summary its page opens with, and its
+// history week by week. Pure DB reads over what src/timeline.js already
+// defines (moves, the stored weeks, the sieves), for one project the caller
+// has already resolved (through a merge, under its own sieve).
+// `excludePrivateOwned` hides what an ordinary agent may not see, exactly as
+// the week reads do.
 import { ORIGIN_SIEVE } from './missions.js'
-import { filesSql } from './projects-feed.js'
-import { allWrittenWeeks } from './week-stories.js'
+import { filesSql, milestonesSql, feedMilestone } from './projects-feed.js'
+import { allWrittenWeeks, writtenWeeks } from './week-stories.js'
 import {
-  userTimeZone, parseWeekKey, weekEndOf, projectMoveTimes, weekStartsOf, rowProjects, survivingProjects, storyProjects,
+  userTimeZone, parseWeekKey, formatWeekKey, weekEndOf, projectMoveTimes, weekStartsOf, rowProjects, survivingProjects, storyProjects,
   liveMedia, convoSieveOf, IN_PROJECT, OF_PROJECT, needsYouSql, forYouSql,
 } from './timeline.js'
 
 export const PROJECT_PAGE = {
   needsYou: 10, // waiting items listed on the page; needs_you_total counts them all
+}
+
+export const PROJECT_HISTORY = {
+  page: 8, // weeks per page by default
+  pageMax: 26,
+  milestones: 20, // milestones listed per week; more_milestones counts the rest
 }
 
 const PICTURES = "(f.content_type LIKE 'image/%' OR f.content_type LIKE 'video/%')"
@@ -108,4 +115,57 @@ export function projectPage(db, userId, project, { excludePrivateOwned = false }
       files: db.prepare(`SELECT COUNT(*) AS n FROM (${files})`).get(args).n,
     },
   }
+}
+
+// The project's history: every local week it moved in, newest first, from
+// the newest (or from the first before the week `before`, a week key),
+// `limit` weeks a page:
+// { weeks: [{ week, start, end, card, milestones, more_milestones }], next_before }.
+// - `card` is { sentence, media } when a stored week has a story about the
+//   project (see storiesAbout): the story's sentence, and its picture as the
+//   week page resolves it (the stored pick if it still resolves, else the
+//   newest picture or video among the project's files of that week, else
+//   null). null for a week nobody wrote about it.
+// - `milestones` are the week's, newest first, at most
+//   PROJECT_HISTORY.milestones, each exactly as the project feed returns a
+//   milestone; `more_milestones` is how many more the week has.
+// `next_before` is the last week shown when older ones remain, else null.
+// null when `before` is not a week key. A fixed number of statements, plus
+// one for each returned week's milestones and one for each card that needs
+// the week's own picture.
+export function projectHistory(db, userId, project, { before = null, limit = PROJECT_HISTORY.page, excludePrivateOwned = false } = {}) {
+  const tz = userTimeZone(db, userId)
+  let starts = weekStartsOf(projectMoveTimes(db, userId, project.id, { excludePrivateOwned }), tz)
+  if (before != null) {
+    const b = parseWeekKey(before, tz)
+    if (b == null) return null
+    starts = starts.filter((s) => s < b)
+  }
+  const shown = starts.slice(0, limit).map((start) => ({ week: formatWeekKey(start, tz), start, end: weekEndOf(start, tz) }))
+
+  const stored = writtenWeeks(db, userId, shown.map((w) => w.week))
+  const about = new Map(storiesAbout(db, userId, project, [...stored.values()], excludePrivateOwned)
+    .map(({ week, story }) => [week.week_key, story]))
+  const picks = [...new Set([...about.values()].map((s) => s.media_blob_id).filter(Boolean))]
+  const live = liveMedia(db, userId, picks, excludePrivateOwned)
+
+  const args = { userId, projectId: project.id }
+  const weekMedia = db.prepare(`SELECT f.blob_id, f.content_type, f.name FROM (${filesSql(excludePrivateOwned, IN_PROJECT)}) f
+    WHERE f.at >= @start AND f.at < @end AND ${PICTURES} ORDER BY f.at DESC, f.sort_key DESC LIMIT 1`)
+  // `total` counts the week's milestones before the cap.
+  const milestones = db.prepare(`SELECT f.*, COUNT(*) OVER () AS total FROM (${milestonesSql(excludePrivateOwned, IN_PROJECT)}) f
+    WHERE f.at >= @start AND f.at < @end ORDER BY f.at DESC, f.sort_key DESC LIMIT ${PROJECT_HISTORY.milestones}`)
+
+  const weeks = shown.map(({ week, start, end }) => {
+    const range = { ...args, start, end }
+    const story = about.get(week)
+    const rows = milestones.all(range)
+    return {
+      week, start, end,
+      card: story ? { sentence: story.sentence, media: live.get(story.media_blob_id) ?? weekMedia.get(range) ?? null } : null,
+      milestones: rows.map(({ total: _total, ...r }) => feedMilestone(r)),
+      more_milestones: rows.length ? rows[0].total - rows.length : 0,
+    }
+  })
+  return { weeks, next_before: starts.length > limit ? shown.at(-1).week : null }
 }
