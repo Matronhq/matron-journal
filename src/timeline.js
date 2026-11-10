@@ -368,17 +368,34 @@ function resolveStored(db, userId, stored, byId, excludePrivateOwned) {
 // unlike projectDetail's needs-you, consent cards are left out, newest created
 // first, and only items created before the week ended (`@end`). Shared by the
 // apps' fallback card and the Coordinator's raw read. `limit` caps the rows.
-function needsYouStatement(db, convoSieve, inProject, ofProject, limit = -1) {
-  return db.prepare(`SELECT i.id, i.num, i.title FROM items i JOIN missions m ON m.id = i.mission_id
+const needsYouFrom = (convoSieve, ofProject) => `FROM items i JOIN missions m ON m.id = i.mission_id
       JOIN conversations c ON c.id = i.origin_convo_id
-    WHERE ${ofProject} AND i.state = 'open' AND i.awaiting = 'user' AND i.consent IS NULL AND i.created_at < @end ${convoSieve}
+    WHERE ${ofProject} AND i.state = 'open' AND i.awaiting = 'user' AND i.consent IS NULL AND i.created_at < @end ${convoSieve}`
+function needsYouStatement(db, convoSieve, inProject, ofProject, limit = -1) {
+  return db.prepare(`SELECT i.id, i.num, i.title ${needsYouFrom(convoSieve, ofProject)}
     ORDER BY i.created_at DESC, i.num DESC LIMIT ${limit}`)
+}
+
+// The counts behind a week card's marks, for one project (@projectId) and one
+// week (@start, @end): `forYou`, how many items needsYouStatement would list,
+// and `done`, how many items on the project's missions were closed in the
+// week. Consent cards are in neither; both go through the caller's sieve.
+function marksStatements(db, convoSieve, ofProject) {
+  return {
+    forYou: db.prepare(`SELECT COUNT(*) AS n ${needsYouFrom(convoSieve, ofProject)}`),
+    done: db.prepare(`SELECT COUNT(*) AS n FROM items i JOIN missions m ON m.id = i.mission_id
+      JOIN conversations c ON c.id = i.origin_convo_id
+    WHERE ${ofProject} AND i.consent IS NULL AND i.closed_at >= @start AND i.closed_at < @end ${convoSieve}`),
+  }
 }
 
 // One week's page: a story per project that moved, most moves first, at most
 // TIMELINE.storiesMax, the rest under `also` -- or, when the Coordinator has
-// written the week, its lede and stories in its order, with `also` the moving
-// projects no story names. null when `weekKey` is not a week key.
+// written the week, its lede and stories in its order, one per main project
+// (the first wins: two can share one in a week written as grouped stories, or
+// after a merge), with `also` the moving projects no remaining story names.
+// Every story carries `marks`: { for_you, done, next }, counted now, as the
+// caller may see them. null when `weekKey` is not a week key.
 export function weekDetail(db, userId, weekKey, { excludePrivateOwned = false, now = Date.now() } = {}) {
   const tz = userTimeZone(db, userId)
   const start = parseWeekKey(weekKey, tz)
@@ -395,6 +412,11 @@ export function weekDetail(db, userId, weekKey, { excludePrivateOwned = false, n
     WHERE ${ofProject} AND l.created_at >= @start AND l.created_at < @end ${convoSieve}
     ORDER BY l.created_at DESC, l.seq DESC LIMIT 1`)
   const needsYou = needsYouStatement(db, convoSieve, inProject, ofProject)
+  const counts = marksStatements(db, convoSieve, ofProject)
+  const marks = (project, next) => {
+    const args = { userId, projectId: project.id, start, end }
+    return { for_you: counts.forYou.get(args).n, done: counts.done.get(args).n, next: !!next }
+  }
   // The project feed's files roll-up, narrowed to the week's pictures and videos.
   const media = db.prepare(`SELECT f.blob_id, f.content_type, f.name FROM (${filesSql(excludePrivateOwned, inProject)}) f
     WHERE f.at >= @start AND f.at < @end AND (f.content_type LIKE 'image/%' OR f.content_type LIKE 'video/%')
@@ -413,6 +435,7 @@ export function weekDetail(db, userId, weekKey, { excludePrivateOwned = false, n
         next: null,
         needs_you: needsYou.all(args).map((r) => ({ ...r, done: false })),
         media: weekMedia(project),
+        marks: marks(project, null),
       }
     })
     return {
@@ -420,7 +443,10 @@ export function weekDetail(db, userId, weekKey, { excludePrivateOwned = false, n
       also: moved.slice(TIMELINE.storiesMax).map(({ project, moved: n }) => ({ ...refOf(project), moved: n })),
     }
   }
-  const stories = resolveStored(db, userId, stored, byId, excludePrivateOwned).map((s) => ({
+  const mains = new Set()
+  const cards = resolveStored(db, userId, stored, byId, excludePrivateOwned)
+    .filter((s) => !mains.has(s.projects[0].id) && mains.add(s.projects[0].id))
+  const stories = cards.map((s) => ({
     title: s.title,
     project: refOf(s.projects[0]),
     projects: s.projects.map(refOf),
@@ -428,6 +454,7 @@ export function weekDetail(db, userId, weekKey, { excludePrivateOwned = false, n
     next: s.next,
     needs_you: s.items,
     media: s.media ?? weekMedia(s.projects[0]),
+    marks: marks(s.projects[0], s.next),
     _ids: s.projects.map((p) => p.id),
   }))
   const named = new Set(stories.flatMap((s) => s._ids))
