@@ -217,3 +217,44 @@ test('POST /timeline/weeks/:week: a private-device Coordinator still cannot name
   const r = await put(s, thisWeek(s, alice), priv.token, goodBody(hidden, { convo_id: 'secret', notes: [] }))
   assert.deepEqual(r, { status: 400, json: { error: 'bad_request', detail: 'unknown_project', ref: hidden.num } })
 })
+
+// ---- GET /timeline/weeks/:week?raw=1 (the Coordinator's raw read) and the reads over a written week ----
+
+test('raw read: 401 without a token, 403 for a client, 400 for a bad key, agents get the shape', async (t) => {
+  const { s, alice, agent, client, p } = await coordinatorFleet(t)
+  const week = thisWeek(s, alice)
+  assert.equal((await get(s, `/timeline/weeks/${week}?raw=1`, undefined)).status, 401)
+  assert.deepEqual(await get(s, `/timeline/weeks/${week}?raw=1`, client), { status: 403, json: { error: 'forbidden' } })
+  assert.equal((await get(s, '/timeline/weeks/2026-11-10?raw=1', agent.token)).status, 400)
+  createMission(s.db, { userId: alice.id, deviceId: agent.deviceId, createdBy: 'agent', convoId: 'c1', title: 'one', projectId: p.id })
+  const r = await get(s, `/timeline/weeks/${week}?raw=1`, agent.token)
+  assert.equal(r.status, 200)
+  assert.deepEqual(Object.keys(r.json), ['week', 'start', 'end', 'final', 'written_at', 'current', 'stored', 'projects', 'more_projects'])
+  assert.equal(r.json.current, true); assert.equal(r.json.stored, null); assert.equal(r.json.written_at, null)
+  assert.deepEqual(r.json.projects.map((x) => x.project.title), ['Promo launch'])
+  assert.deepEqual(Object.keys(r.json.projects[0]), ['project', 'moved', 'status', 'milestones', 'items', 'media'])
+  // raw=0 and other values are the ordinary read, open to the client.
+  assert.equal((await get(s, `/timeline/weeks/${week}?raw=0`, client)).status, 200)
+})
+
+test('raw read always applies the agent sieve, even on a private device; a written week shows in the plain reads', async (t) => {
+  const { s, alice, agent, priv, client, p } = await coordinatorFleet(t)
+  const week = thisWeek(s, alice)
+  const hidden = createProject(s.db, { userId: alice.id, deviceId: priv.deviceId, createdBy: 'agent', title: 'Hidden', convoId: 'secret' }).project
+  createMission(s.db, { userId: alice.id, deviceId: priv.deviceId, createdBy: 'agent', convoId: 'secret', title: 'priv', projectId: hidden.id })
+  createMission(s.db, { userId: alice.id, deviceId: agent.deviceId, createdBy: 'agent', convoId: 'c1', title: 'one', projectId: p.id })
+  for (const token of [agent.token, priv.token]) {
+    const r = await get(s, `/timeline/weeks/${week}?raw=1`, token)
+    assert.deepEqual(r.json.projects.map((x) => x.project.title), ['Promo launch'])
+  }
+  assert.equal((await put(s, week, agent.token, goodBody(p))).status, 201)
+  const raw = await get(s, `/timeline/weeks/${week}?raw=1`, agent.token)
+  assert.equal(raw.json.stored.lede, 'A busy week.')
+  assert.deepEqual(raw.json.stored.stories[0].projects.map((x) => x.id), [p.id])
+  const detail = await get(s, `/timeline/weeks/${week}`, client)
+  assert.equal(detail.json.lede, 'A busy week.'); assert.equal(detail.json.stories[0].title, 'Launch')
+  assert.deepEqual(detail.json.stories[0].projects, [{ id: p.id, num: p.num, title: p.title }])
+  assert.equal(typeof detail.json.written_at, 'number')
+  const list = await get(s, '/timeline/weeks', client)
+  assert.equal(list.json.weeks[0].sentence, 'A busy week.'); assert.equal(list.json.weeks[0].written, true)
+})

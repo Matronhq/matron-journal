@@ -17,6 +17,9 @@ export const WEEK_LIMITS = {
   notesMax: 50, projectsPerStory: 10, itemsPerStory: 10, reachWeeks: 10,
 }
 
+// The longest string reference or blob id accepted (ids are far shorter).
+const REF_MAX = 128
+
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
 
 // A required string, trimmed, 1..max long; null when it is not.
@@ -38,7 +41,10 @@ function optionalText(v, max) {
 // A reference to a project or item: a non-empty string id, or the positive
 // integer per-user number. Anything else is undefined.
 function ref(v) {
-  if (typeof v === 'string') return v.trim() || undefined
+  if (typeof v === 'string') {
+    const t = v.trim()
+    return t && t.length <= REF_MAX ? t : undefined
+  }
   return Number.isInteger(v) && v > 0 ? v : undefined
 }
 
@@ -58,7 +64,7 @@ function validStory(s) {
   const item_ids = refs(s.item_ids, 0, WEEK_LIMITS.itemsPerStory)
   const blob = s.media_blob_id
   if (title === null || sentence === null || next === undefined || !project_ids || !item_ids) return null
-  if (blob !== undefined && blob !== null && (typeof blob !== 'string' || !blob)) return null
+  if (blob !== undefined && blob !== null && (typeof blob !== 'string' || !blob || blob.length > REF_MAX)) return null
   return { title, sentence, next, project_ids, item_ids, media_blob_id: blob || null }
 }
 
@@ -171,11 +177,36 @@ export function writeWeek(db, userId, weekKey, input, { now = Date.now(), exclud
   return { ok: true, week: weekKey }
 }
 
+// Whether a stored week says anything: a lede, a story or the final flag. A
+// row from a notes-only write has none, and is read as if it did not exist.
+const written = (w) => Boolean(w.lede || w.stories.length || w.final)
+const parseRow = (row) => ({ week_key: row.week_key, lede: row.lede, stories: JSON.parse(row.stories), written_at: row.written_at, final: row.final === 1 })
+
 // The stored week starting at `weekStart`, or null.
 export function storedWeek(db, userId, weekStart) {
   const row = db.prepare('SELECT week_key, lede, stories, written_at, final FROM week_stories WHERE user_id = ? AND week_start = ?')
     .get(userId, weekStart)
-  return row ? { week_key: row.week_key, lede: row.lede, stories: JSON.parse(row.stories), written_at: row.written_at, final: row.final === 1 } : null
+  return row ? parseRow(row) : null
+}
+
+// The stored week the readers use: storedWeek, or null when the row holds only
+// notes.
+export function writtenWeek(db, userId, weekStart) {
+  const w = storedWeek(db, userId, weekStart)
+  return w && written(w) ? w : null
+}
+
+// The written weeks among `weekStarts` in one query: Map(week start → week).
+export function writtenWeeks(db, userId, weekStarts) {
+  const out = new Map()
+  if (!weekStarts.length) return out
+  const rows = db.prepare(`SELECT week_start, week_key, lede, stories, written_at, final FROM week_stories
+    WHERE user_id = ? AND week_start IN (SELECT value FROM json_each(?))`).all(userId, JSON.stringify(weekStarts))
+  for (const r of rows) {
+    const w = parseRow(r)
+    if (written(w)) out.set(r.week_start, w)
+  }
+  return out
 }
 
 // The notes on the given project ids: Map(project id → { note, written_at }).

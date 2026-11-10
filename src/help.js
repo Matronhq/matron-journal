@@ -264,6 +264,11 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   (\`unknown_project\` / \`unknown_item\` / \`unknown_blob\` with the \`ref\`,
   \`bad_week\`, \`week_out_of_range\`, \`week_not_ended\`); nothing is written
   on an error. Never names private work.
+- \`GET /timeline/weeks/:week?raw=1\` → \`{week, start, end, final, written_at,
+  current, stored, projects, more_projects}\` — what to write a week from
+  (agents only): the stored week with ids as refs, and the projects that moved
+  that week (most moves first, ≤ 40, the rest counted in \`more_projects\`),
+  each with its status, milestones, items and pictures of that week.
 - \`GET /unseen?convo_id=<coordinator convo>\` → \`{entries, truncated}\` —
   what the user hasn't seen (Coordinator only). Params: \`older_than_ms\`
   (default 30 min), \`since_ms\` (default 3 d), \`importance\`

@@ -63,6 +63,11 @@ test('validWeekWrite rejects malformed bodies', () => {
   bad({ stories: [story({ project_ids: undefined })] }, 'project_ids missing')
   bad({ stories: [story({ project_ids: Array.from({ length: 11 }, (_, i) => i + 1) })] }, '11 projects')
   bad({ stories: [story({ item_ids: Array.from({ length: 11 }, (_, i) => i + 1) })] }, '11 items')
+  bad({ stories: [story({ project_ids: ['p'.repeat(129)] })] }, 'project ref > 128')
+  bad({ stories: [story({ item_ids: [` ${'i'.repeat(129)} `] })] }, 'item ref > 128 after trim')
+  bad({ notes: [{ project_id: 'p'.repeat(129), note: 'x' }] }, 'note ref > 128')
+  bad({ stories: [story({ media_blob_id: 'b'.repeat(129) })] }, 'blob id > 128')
+  assert.ok(validWeekWrite({ stories: [story({ project_ids: ['p'.repeat(128)], media_blob_id: 'b'.repeat(128) })] }), '128 is allowed')
   for (const r of [0, -1, '', {}, 1.5, null, true]) {
     bad({ stories: [story({ project_ids: [r] })] }, `project ref ${JSON.stringify(r)}`)
     bad({ stories: [story({ item_ids: [r] })] }, `item ref ${JSON.stringify(r)}`)
@@ -153,11 +158,18 @@ test('writeWeek refuses an unknown item, a private item, another user\'s item', 
   const priv = project(db, 'P2'); mission(db, 'secret', priv.id, 9)
   const hidden = item(db, 'secret', 9)
   const mine = item(db, 'c1')
+  const theirs = createItem(db, { userId: 2, originDeviceId: 10, createdBy: 'agent', kind: 'task', title: 'Bob item', originConvoId: 'b1' }).item
   const story = (item_ids) => ({ title: 'T', sentence: 'S.', project_ids: [a.id], item_ids })
   assert.deepEqual(write(db, keyOf(0), { stories: [story([999])] }), { error: 'bad_request', detail: 'unknown_item', ref: 999 })
   assert.deepEqual(write(db, keyOf(0), { stories: [story(['it_nope'])] }), { error: 'bad_request', detail: 'unknown_item', ref: 'it_nope' })
   assert.equal(write(db, keyOf(0), { stories: [story([hidden.id])] }).detail, 'unknown_item')
   assert.equal(write(db, keyOf(0), { stories: [story([hidden.num])] }).detail, 'unknown_item')
+  // Another user's item, by id and by number (bob's number also exists for alice).
+  assert.deepEqual(write(db, keyOf(0), { stories: [story([theirs.id])] }), { error: 'bad_request', detail: 'unknown_item', ref: theirs.id })
+  assert.equal(write(db, keyOf(0), { stories: [story([theirs.id])] }, { excludePrivateOwned: false }).detail, 'unknown_item')
+  const beyond = Math.max(mine.num, hidden.num) + 5
+  db.prepare('UPDATE items SET num = ? WHERE id = ?').run(beyond, theirs.id)
+  assert.deepEqual(write(db, keyOf(0), { stories: [story([beyond])] }), { error: 'bad_request', detail: 'unknown_item', ref: beyond })
   assert.equal(write(db, keyOf(0), { stories: [story([mine.num])] }).ok, true)
   assert.equal(write(db, keyOf(0), { stories: [story([hidden.id])] }, { excludePrivateOwned: false }).ok, true)
 })

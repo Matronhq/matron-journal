@@ -1,15 +1,16 @@
 // HTTP surface of the projects timeline (spec 2026-11-09 projects timeline).
-// Five reads over projects, missions, items and milestones, and the
-// Coordinator's write of a week's lede and story cards (POST
-// /timeline/weeks/:week, storage and rules in src/week-stories.js). The read functions in src/timeline.js assume valid input, so every
-// parameter is validated here (400) before one is called.
+// Five reads over projects, missions, items and milestones; the Coordinator's
+// raw read of one week (GET /timeline/weeks/:week?raw=1); and its write of a
+// week's lede and story cards (POST /timeline/weeks/:week, storage and rules
+// in src/week-stories.js). The read functions in src/timeline.js assume valid
+// input, so every parameter is validated here (400) before one is called.
 import { json, readBody } from './http-body.js'
 import { badRequest } from './http-who.js'
 import { closingConvo, refusedCloser } from './missions-http.js'
 import { filteredAgent } from './privacy.js'
 import { parseCursor } from './projects-feed.js'
 import { validWeekWrite, writeWeek } from './week-stories.js'
-import { weeksList, weekDetail, wentQuiet, openLong, finished, parseWeekKey, userTimeZone } from './timeline.js'
+import { weeksList, weekDetail, weekRaw, wentQuiet, openLong, finished, parseWeekKey, userTimeZone } from './timeline.js'
 
 const WEEKS_LIMIT = { default: 12, max: 52 }
 const FINISHED_LIMIT = { default: 30, max: 100 }
@@ -81,6 +82,14 @@ export async function handleTimelineRoute(ctx, req, res, url, who) {
   if (!m) return false
   let week
   try { week = decodeURIComponent(m[1]) } catch { return badRequest(res) }
+  if (url.searchParams.get('raw') === '1') {
+    // The Coordinator's input: agents only, and always under the agent privacy sieve.
+    if (who.kind !== 'agent') { json(res, 403, { error: 'forbidden' }); return true }
+    const raw = weekRaw(db, who.userId, week, { excludePrivateOwned: true })
+    if (!raw) return badRequest(res)
+    json(res, 200, raw)
+    return true
+  }
   const detail = weekDetail(db, who.userId, week, opts)
   if (!detail) return badRequest(res)
   json(res, 200, detail)
