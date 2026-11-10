@@ -580,3 +580,66 @@ test('prune: sent and cancelled entries go a week after they ended; dead ones st
   assert.equal(pruneOutbox(r.db, r.now() + PRUNE_AFTER_MS + 1), 2)
   assert.deepEqual([sent, cancelled, dead, queued].map((id) => r.row(id)?.state), [undefined, undefined, 'dead', 'queued'])
 })
+
+// --- Unreachable since ---------------------------------------------------------
+
+const failingSince = (r) => r.db.prepare("SELECT failing_since FROM fed_peers WHERE host='b.example'").get().failing_since
+
+test('unreachable since: the first failed attempt after the peer last answered, until it answers again', async () => {
+  const r = await rig()
+  const id = r.q()
+  assert.equal(failingSince(r), null)
+  const t0 = r.now()
+  r.answers.push(Object.assign(new Error('network'), { why: 'ECONNREFUSED' }), { status: 503, body: null, signed: false }, { status: 502, body: { error: 'down' }, signed: true })
+  await r.outbox.tick()
+  assert.equal(failingSince(r), t0, 'a network error starts it')
+  r.advance(BACKOFF_BASE_MS)
+  await r.outbox.tick()
+  r.advance(2 * BACKOFF_BASE_MS)
+  await r.outbox.tick()
+  assert.equal(r.row(id).attempts, 3)
+  assert.equal(failingSince(r), t0, 'later failures keep the start of the run')
+  r.advance(4 * BACKOFF_BASE_MS)
+  await r.outbox.tick()
+  assert.equal(r.row(id).state, 'sent')
+  assert.equal(failingSince(r), null, 'an acknowledgement ends it')
+
+  // The peer refusing an op in its own signed word is reachable.
+  const x = r.q({ subject: 's-x' })
+  r.answers.push({ status: 503, body: null, signed: false }, { status: 403, body: { error: 'forbidden' }, signed: true })
+  await r.outbox.tick()
+  assert.ok(failingSince(r) != null)
+  r.advance(BACKOFF_BASE_MS)
+  await r.outbox.tick()
+  assert.equal(r.row(x).state, 'dead')
+  assert.equal(failingSince(r), null)
+})
+
+test('unreachable since: kept through expiry, and on the contact rows for that journal while something waits for it', async () => {
+  const { listContacts, contactRow } = await import('../src/contacts.js')
+  const r = await rig()
+  r.db.prepare(`INSERT INTO contacts(id, user_id, peer_user, peer_journal, peer_journal_key, display_name, state, created_at, updated_at)
+    VALUES('ct_bob', ?, 'bob', 'b.example', (SELECT key_pub FROM fed_peers WHERE host='b.example'), 'bob', 'active', 1, 1)`).run(r.alice.id)
+  r.db.prepare(`INSERT INTO contacts(id, user_id, peer_user, display_name, state, created_at, updated_at)
+    VALUES('ct_local', ?, 'dave', 'dave', 'active', 1, 1)`).run(r.alice.id)
+  const rows = () => Object.fromEntries(listContacts(r.db, r.alice.id).map((c) => [c.id, c.unreachable_since]))
+  assert.deepEqual(rows(), { ct_bob: null, ct_local: null })
+
+  const id = r.q()
+  const t0 = r.now()
+  r.answers.push(Object.assign(new Error('network'), { why: 'ECONNREFUSED' }))
+  await r.outbox.tick()
+  assert.deepEqual(rows(), { ct_bob: t0, ct_local: null })
+  assert.equal(contactRow({ id: 'x', peer_user: 'y', state: 'active', created_at: 1, updated_at: 1 }).unreachable_since, null)
+
+  // Seven days of failures: the entry is dead, the journal still unreached.
+  r.advance(OUTBOX_MAX_AGE_MS)
+  for (let i = 0; i < 3; i++) r.answers.push(Object.assign(new Error('network'), { why: 'ECONNREFUSED' }))
+  await r.outbox.tick()
+  assert.equal(r.row(id).state, 'dead')
+  assert.deepEqual(rows(), { ct_bob: t0, ct_local: null })
+
+  // With nothing left to deliver there is nothing failing to report.
+  discardDead(r.db, r.alice.id, 'b.example', r.now())
+  assert.deepEqual(rows(), { ct_bob: null, ct_local: null })
+})

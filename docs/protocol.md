@@ -4478,9 +4478,18 @@ GET    /contacts/:id/activity             {events:[…]} — the audit events na
 ```
 
 `contact`: `{id, address, peer_user, peer_journal, display_name, state,
-requested_by, origin_convo_id, key_changed, created_at, updated_at, accepted_at,
-revoked_at}`. `key_changed` is true for a contact on another journal whose
-journal now serves a different key than the one pinned for it.
+requested_by, origin_convo_id, key_changed, unreachable_since, created_at,
+updated_at, accepted_at, revoked_at}`. `key_changed` is true for a contact on
+another journal whose journal now serves a different key than the one pinned
+for it. `unreachable_since` (epoch ms, else `null`) is when deliveries to a
+contact's journal started failing: the federation outbox's first attempt to
+that journal that failed in a way it retries (a network error or timeout, an
+answer the journal did not sign, a 5xx, 408 or 429) since that journal last
+answered in its own signed word (an acknowledgement, a refusal, a stale
+clock), which clears it. It is kept through later failures and through
+entries going dead after 7 days, and is reported only while something to
+that journal is still queued or dead in the outbox: with nothing waiting
+there is no delivery failing. Always `null` for a same-journal contact.
 
 `POST /contacts` from a **client** is the user's own tap and goes straight
 to the other person. From an **agent** it needs `convo_id` (a conversation
@@ -5517,6 +5526,16 @@ write to (`404` for one it may not). `503 unavailable` if the card could not be
 filed: nothing is kept, and the agent may ask again. An approve refused for
 `too_many_invites` leaves the ask waiting; one already answered is `409
 not_pending`, one past its 24 h `409 expired`.
+
+A repeated `approve` (a client's outbox retrying a tap whose answer it
+never got) from the device that approved, within 10 minutes and while the
+invite is still open, is answered `200` with the same `{ask, invite, link,
+web_link}` as the first time; nothing new is minted. The journal keeps the
+link for those 10 minutes in memory only, so a restart forgets it. Any
+other `approve` of an approved ask (another device, later, after a
+restart, or once the invite was used or withdrawn) is `409 not_pending`
+with a `message` telling the user to withdraw the invite from Open invites
+and make a new one: the link itself cannot be shown again.
 
 **The inviter's journal** keeps only the SHA-256 of the token. An invite is
 single use and lasts 7 days; a user may have 20 open at once

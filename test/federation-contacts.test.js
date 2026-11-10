@@ -9,7 +9,7 @@ import { enqueue, makeOutbox } from '../src/federation-outbox.js'
 import { ensureFederationKey } from '../src/federation-identity.js'
 import { makeTokenBox } from '../src/token-box.js'
 import { upsertConversation } from '../src/journal.js'
-import { expireInviteAsks, onInviteAskExpired } from '../src/federation-invite-asks.js'
+import { expireInviteAsks, onInviteAskExpired, applyInviteAnswer, REPEAT_APPROVE_WINDOW_MS } from '../src/federation-invite-asks.js'
 import { MAX_PARKED_PER_DEVICE } from '../src/contacts.js'
 
 // Contacts across journals (phase 5 stage 5), end to end between two real
@@ -534,8 +534,67 @@ test('invite asks: an agent parks one, the tap mints it and only the tapping dev
   await w.settle()
   assert.equal((await contactsOf(w.phones.alice)).find((c) => c.address === 'bob@b.example').state, 'active')
 
+  // A repeat once the link it made has been used gets no link back.
   const twice = await w.phones.alice(`/contacts/invites/asks/${r.json.ask.id}/answer`, post({ decision: 'approve' }))
-  assert.deepEqual([twice.status, twice.json.blocked_by], [409, 'not_pending'])
+  assert.deepEqual([twice.status, twice.json.blocked_by, twice.json.link], [409, 'not_pending', undefined])
+})
+
+test('invite asks: a repeated Approve from the same device within the window answers the same link again', async (t) => {
+  const w = await world(t)
+  upsertConversation(w.a.db, { id: 'work', ownerUserId: w.users.alice.id, title: 'Work', agentDeviceId: w.aliceBoxId })
+  const ask = (await w.aliceBox('/contacts/invites', post({ convo_id: 'work' }))).json.ask
+  const mirror = mirrorOf(w.a, w.users.alice.id)
+  const answer = () => w.phones.alice(`/contacts/invites/asks/${ask.id}/answer`, post({ decision: 'approve' }))
+
+  const first = await answer()
+  assert.equal(first.status, 200)
+  // A client's outbox retrying the same Approve, by either route.
+  const again = await answer()
+  assert.equal(again.status, 200)
+  assert.deepEqual([again.json.link, again.json.web_link, again.json.invite.id, again.json.ask.state],
+    [first.json.link, first.json.web_link, first.json.invite.id, 'approved'])
+  const tapped = await w.phones.alice(`/items/${mirror.id}/comments`, post({ action: 'Approve' }))
+  assert.equal(tapped.status, 200)
+  assert.equal(tapped.json.link, first.json.link)
+  assert.equal(w.a.db.prepare('SELECT COUNT(*) AS n FROM fed_invites').get().n, 1, 'nothing new is minted')
+  assert.equal(w.a.db.prepare('SELECT COUNT(*) AS n FROM item_comments WHERE item_id=?').get(mirror.id).n, 1, 'the mirror is closed once')
+  // The link is still nowhere an agent could read it.
+  assert.equal(w.a.db.prepare("SELECT COUNT(*) AS n FROM item_comments WHERE body LIKE '%matron://contact%' OR body LIKE '%/contact#%'").get().n, 0)
+  assert.deepEqual(agentHeard(w.a, 'work'), [])
+
+  // Another device of the same user is not the one the link was shown on.
+  const login = (await w.a.http('/login', post({ username: 'alice', password: 'pw', device_name: 'alice-laptop' }))).json
+  const other = await w.a.http(`/contacts/invites/asks/${ask.id}/answer`, { token: login.token, ...post({ decision: 'approve' }) })
+  assert.deepEqual([other.status, other.json.blocked_by, other.json.link], [409, 'not_pending', undefined])
+  assert.match(other.json.message, /withdraw/i)
+  assert.match(other.json.message, /new/i)
+
+  // Once the invite is withdrawn, the same device gets no link back either.
+  assert.equal((await w.phones.alice(`/contacts/invites/${first.json.invite.id}`, { method: 'DELETE' })).status, 200)
+  const withdrawn = await answer()
+  assert.deepEqual([withdrawn.status, withdrawn.json.blocked_by, withdrawn.json.link], [409, 'not_pending', undefined])
+})
+
+test('invite asks: a repeated Approve after the window is refused, saying to withdraw and mint a new one', async (t) => {
+  const w = await world(t)
+  upsertConversation(w.a.db, { id: 'work', ownerUserId: w.users.alice.id, title: 'Work', agentDeviceId: w.aliceBoxId })
+  const ask = (await w.aliceBox('/contacts/invites', post({ convo_id: 'work' }))).json.ask
+  const phone = (await w.a.http('/login', post({ username: 'alice', password: 'pw', device_name: 'alice-tablet' }))).json
+  const ctx = { db: w.a.db, hub: w.a.hub, federationContacts: w.a.federationContacts }
+  const who = { kind: 'client', userId: w.users.alice.id, deviceId: phone.device_id }
+  const t0 = Date.now()
+  const first = applyInviteAnswer(ctx, who, ask.id, 'approve', { now: t0 })
+  assert.equal(first.status, 200)
+  const inside = applyInviteAnswer(ctx, who, ask.id, 'approve', { now: t0 + REPEAT_APPROVE_WINDOW_MS - 1000 })
+  assert.deepEqual([inside.status, inside.body.link], [200, first.body.link])
+  const late = applyInviteAnswer(ctx, who, ask.id, 'approve', { now: t0 + REPEAT_APPROVE_WINDOW_MS + 1000 })
+  assert.deepEqual([late.status, late.body.blocked_by, late.body.link], [409, 'not_pending', undefined])
+  assert.match(late.body.message, /withdraw/i)
+  // A declined ask answered again is still just not pending.
+  const ask2 = (await w.aliceBox('/contacts/invites', post({ convo_id: 'work' }))).json.ask
+  assert.equal(applyInviteAnswer(ctx, who, ask2.id, 'decline').status, 200)
+  const redo = applyInviteAnswer(ctx, who, ask2.id, 'approve')
+  assert.deepEqual([redo.status, redo.body.blocked_by, redo.body.link], [409, 'not_pending', undefined])
 })
 
 test('invite asks: declined, expired, capped, and waiting while the open invites are full', async (t) => {
