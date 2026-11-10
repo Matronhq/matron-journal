@@ -6,7 +6,7 @@
 
 import { Cron } from 'croner'
 import { DEFAULT_TZ, validTz } from './routines.js'
-import { ORIGIN_SIEVE } from './missions.js'
+import { ORIGIN_SIEVE, statusPrivateSql } from './missions.js'
 import { privateDevice, privateConvo, filesSql, parseCursor } from './projects-feed.js'
 import { PROJECT_ORIGIN_SIEVE } from './projects.js'
 import { writtenWeek, writtenWeeks, projectNotes } from './week-stories.js'
@@ -194,7 +194,10 @@ const openMissionSql = (excludePrivateOwned) => `EXISTS (SELECT 1 FROM missions 
 // close, else (no mission ever) its creation.
 function rowProjects(db, userId, excludePrivateOwned) {
   const originSieve = excludePrivateOwned ? `AND ${ORIGIN_SIEVE}` : ''
-  return db.prepare(`SELECT p.id, p.num, p.title, p.status, p.state, p.created_at,
+  // The status sieve, as GET /projects applies it: a status written from or
+  // by a private device reads as null.
+  const status = excludePrivateOwned ? `CASE WHEN ${statusPrivateSql('p')} THEN NULL ELSE p.status END` : 'p.status'
+  return db.prepare(`SELECT p.id, p.num, p.title, ${status} AS status, p.state, p.created_at,
       (p.state = 'open' AND ${openMissionSql(excludePrivateOwned)}) AS live,
       EXISTS (SELECT 1 FROM missions m WHERE m.project_id = p.id AND m.user_id = p.user_id ${originSieve}) AS has_mission,
       COALESCE(p.closed_at,

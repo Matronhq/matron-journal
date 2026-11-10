@@ -220,8 +220,12 @@ export function writtenWeeks(db, userId, weekKeys) {
 export function projectNotes(db, userId, projectIds) {
   const out = new Map()
   if (!projectIds.length) return out
-  const rows = db.prepare(`SELECT project_id, note, written_at FROM project_notes
-    WHERE user_id = ? AND project_id IN (SELECT value FROM json_each(?))`).all(userId, JSON.stringify(projectIds))
+  // A note written on a project later merged into one of these counts for
+  // the survivor (merges flatten, so one hop reaches it); the newest wins.
+  const rows = db.prepare(`SELECT COALESCE(p.merged_into, n.project_id) AS project_id, n.note, n.written_at
+    FROM project_notes n LEFT JOIN projects p ON p.id = n.project_id AND p.user_id = n.user_id
+    WHERE n.user_id = @userId AND COALESCE(p.merged_into, n.project_id) IN (SELECT value FROM json_each(@ids))
+    ORDER BY n.written_at`).all({ userId, ids: JSON.stringify(projectIds) })
   for (const r of rows) out.set(r.project_id, { note: r.note, written_at: r.written_at })
   return out
 }

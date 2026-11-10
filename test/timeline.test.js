@@ -992,3 +992,21 @@ test('a stored picture that is not an image or video reads as missing: the week\
   assert.equal(weekDetail(db, 1, keyOf(-1), at).stories[0].media.blob_id, 'b-pic')
   assert.equal(weekRaw(db, 1, keyOf(-1), at).stored.stories[0].media_blob_id, null)
 })
+
+test('weekRaw: a status written by a private device reads as null', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha')
+  updateProject(db, { userId: 1, projectId: a.p.id, fields: { status: 'Secret plans' }, statusWriter: { by: 'agent', deviceId: 9, convoId: null } })
+  postAt(db, a.convo, 'step', mid(-1))
+  assert.equal(weekRaw(db, 1, keyOf(-1), at).projects[0].status, null)
+})
+
+test('a note written before a merge follows the project into its survivor', () => {
+  const db = seeded()
+  const gone = proj(db, 'Gone', { createdAt: NOW - 40 * DAY })
+  const survivor = proj(db, 'Survivor', { createdAt: NOW - 40 * DAY })
+  db.prepare('INSERT INTO project_notes(user_id, project_id, note, written_at) VALUES(1,?,?,?)').run(gone.p.id, 'Left mid-way.', NOW - DAY)
+  mergeProject(db, { userId: 1, projectId: gone.p.id, intoId: survivor.p.id, by: 'user' })
+  const row = openLong(db, 1, at).rows.find((r) => r.project.id === survivor.p.id)
+  assert.equal(row.note, 'Left mid-way.')
+})
