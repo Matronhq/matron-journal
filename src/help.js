@@ -251,6 +251,19 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   conversation). The journal writes it into that conversation as your
   message, so do not repeat it in prose; the apps show the latest at the top
   of Projects. Honours \`Idempotency-Key\`.
+- \`POST /timeline/weeks/:week\` \`{convo_id, lede?, stories?, final?, notes?}\`
+  → 201 \`{week, written, final}\` — write the lede and story cards of one
+  week of the projects timeline (:week is its Monday as \`YYYY-MM-DD\` in the
+  user's zone; this week or up to 10 weeks back; Coordinator only, naming its
+  own conversation). \`lede\` ≤ 600 chars; \`stories\` ≤ 8 of \`{title ≤ 80,
+  sentence ≤ 300, next? ≤ 300, project_ids (1..10), item_ids? (≤ 10),
+  media_blob_id?}\`, ids or per-user numbers; \`notes\` ≤ 50 of
+  \`{project_id, note ≤ 300}\`, one sentence kept on a project. A write replaces
+  the week. \`final: true\` closes a week that has ended; after that only a
+  final write replaces it (409 \`week_final\`). 400 with \`detail\`
+  (\`unknown_project\` / \`unknown_item\` / \`unknown_blob\` with the \`ref\`,
+  \`bad_week\`, \`week_out_of_range\`, \`week_not_ended\`); nothing is written
+  on an error. Never names private work.
 - \`GET /unseen?convo_id=<coordinator convo>\` → \`{entries, truncated}\` —
   what the user hasn't seen (Coordinator only). Params: \`older_than_ms\`
   (default 30 min), \`since_ms\` (default 3 d), \`importance\`

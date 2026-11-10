@@ -3,10 +3,12 @@ import assert from 'node:assert/strict'
 import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
+import { setCoordinatorConvoId } from '../src/coordinator.js'
+import { storedWeek } from '../src/week-stories.js'
 import { pinDevicePrivate } from '../src/db.js'
 import { createProject, closeProject } from '../src/projects.js'
 import { createMission, closeMission } from '../src/missions.js'
-import { weekStartOf, formatWeekKey, previousWeekStart, parseWeekKey, userTimeZone } from '../src/timeline.js'
+import { weekStartOf, formatWeekKey, previousWeekStart, weekEndOf, parseWeekKey, userTimeZone } from '../src/timeline.js'
 
 async function fleet(t) {
   const s = await startTestServer({})
@@ -27,6 +29,10 @@ const thisWeek = (s, alice) => {
 const lastWeek = (s, alice) => {
   const tz = userTimeZone(s.db, alice.id)
   return formatWeekKey(previousWeekStart(weekStartOf(Date.now(), tz), tz), tz)
+}
+const nextWeek = (s, alice) => {
+  const tz = userTimeZone(s.db, alice.id)
+  return formatWeekKey(weekEndOf(weekStartOf(Date.now(), tz), tz), tz)
 }
 const get = (s, path, token) => s.http(path, { token })
 
@@ -134,4 +140,80 @@ test('non-GET methods and unknown timeline paths are not handled (404)', async (
   assert.equal((await s.http('/timeline/weeks', { method: 'POST', token: client, body: {} })).status, 404)
   assert.equal((await get(s, '/timeline/nope', client)).status, 404)
   assert.equal((await get(s, '/timeline/weeks/2026-11-09/extra', client)).status, 404)
+})
+
+// ---- POST /timeline/weeks/:week (the Coordinator's write) ----
+
+async function coordinatorFleet(t) {
+  const f = await fleet(t)
+  upsertConversation(f.s.db, { id: 'coord', ownerUserId: f.alice.id, title: 'Coordinator', agentDeviceId: f.agent.deviceId })
+  setCoordinatorConvoId(f.s.db, f.alice.id, 'coord')
+  const p = createProject(f.s.db, { userId: f.alice.id, deviceId: f.agent.deviceId, createdBy: 'agent', title: 'Promo launch' }).project
+  return { ...f, p }
+}
+const put = (s, week, token, body) => s.http(`/timeline/weeks/${week}`, { method: 'POST', token, body })
+const goodBody = (p, over = {}) => ({
+  convo_id: 'coord', lede: 'A busy week.', final: false,
+  stories: [{ title: 'Launch', sentence: 'It shipped.', project_ids: [p.num] }],
+  notes: [{ project_id: p.id, note: 'On track.' }], ...over,
+})
+
+test('POST /timeline/weeks/:week: 401 without a token, 403 for a client token', async (t) => {
+  const { s, alice, client, p } = await coordinatorFleet(t)
+  assert.equal((await put(s, thisWeek(s, alice), undefined, goodBody(p))).status, 401)
+  assert.deepEqual(await put(s, thisWeek(s, alice), client, goodBody(p)), { status: 403, json: { error: 'forbidden' } })
+  assert.equal(storedWeek(s.db, alice.id, weekStartOf(Date.now(), userTimeZone(s.db, alice.id))), null)
+})
+
+test('POST /timeline/weeks/:week: only the Coordinator naming its own conversation', async (t) => {
+  const { s, alice, agent, p } = await coordinatorFleet(t)
+  const week = thisWeek(s, alice)
+  assert.deepEqual(await put(s, week, agent.token, goodBody(p, { convo_id: 'c1' })), { status: 403, json: { error: 'forbidden', detail: 'not_coordinator' } })
+  assert.deepEqual(await put(s, week, agent.token, goodBody(p, { convo_id: undefined })), { status: 403, json: { error: 'forbidden', detail: 'not_coordinator' } })
+  assert.equal((await put(s, week, agent.token, goodBody(p, { convo_id: 'nope' }))).status, 404)
+  assert.equal((await put(s, week, agent.token, goodBody(p, { convo_id: 7 }))).status, 400)
+  assert.equal(storedWeek(s.db, alice.id, weekStartOf(Date.now(), userTimeZone(s.db, alice.id))), null)
+})
+
+test('POST /timeline/weeks/:week: the Coordinator writes a week, 201, and the row is stored with resolved ids', async (t) => {
+  const { s, alice, agent, p } = await coordinatorFleet(t)
+  const week = thisWeek(s, alice)
+  const r = await put(s, week, agent.token, goodBody(p))
+  assert.deepEqual(r, { status: 201, json: { week, written: true, final: false } })
+  const stored = storedWeek(s.db, alice.id, weekStartOf(Date.now(), userTimeZone(s.db, alice.id)))
+  assert.equal(stored.lede, 'A busy week.')
+  assert.deepEqual(stored.stories[0].project_ids, [p.id])
+  assert.equal(s.db.prepare('SELECT note FROM project_notes WHERE project_id = ?').get(p.id).note, 'On track.')
+})
+
+test('POST /timeline/weeks/:week: malformed bodies and bad weeks are 400, unknown refs name the ref', async (t) => {
+  const { s, alice, agent, p } = await coordinatorFleet(t)
+  const week = thisWeek(s, alice)
+  for (const bad of [{ stories: [{ title: 'x'.repeat(81), sentence: 's', project_ids: [p.id] }] }, { stories: [{ title: 'x', sentence: 's', project_ids: [] }] }, { final: 'yes' }, { lede: 5 }]) {
+    assert.deepEqual(await put(s, week, agent.token, goodBody(p, bad)), { status: 400, json: { error: 'bad_request' } })
+  }
+  assert.deepEqual(await put(s, '2026-11-10', agent.token, goodBody(p)), { status: 400, json: { error: 'bad_request', detail: 'bad_week' } })
+  assert.equal((await put(s, '%E0%A4%A', agent.token, goodBody(p))).status, 400)
+  assert.deepEqual(await put(s, nextWeek(s, alice), agent.token, goodBody(p)), { status: 400, json: { error: 'bad_request', detail: 'week_out_of_range' } })
+  assert.deepEqual(await put(s, week, agent.token, goodBody(p, { final: true })), { status: 400, json: { error: 'bad_request', detail: 'week_not_ended' } })
+  assert.deepEqual(
+    await put(s, week, agent.token, goodBody(p, { stories: [{ title: 'x', sentence: 's', project_ids: [9999] }] })),
+    { status: 400, json: { error: 'bad_request', detail: 'unknown_project', ref: 9999 } })
+})
+
+test('POST /timeline/weeks/:week: a non-final write over a final week is 409; a final rewrite is 201', async (t) => {
+  const { s, alice, agent, p } = await coordinatorFleet(t)
+  const week = lastWeek(s, alice)
+  assert.deepEqual(await put(s, week, agent.token, goodBody(p, { final: true })), { status: 201, json: { week, written: true, final: true } })
+  assert.deepEqual(await put(s, week, agent.token, goodBody(p)), { status: 409, json: { error: 'conflict', detail: 'week_final' } })
+  assert.equal((await put(s, week, agent.token, goodBody(p, { final: true, lede: 'Rewritten.' }))).status, 201)
+  assert.equal(storedWeek(s.db, alice.id, weekStartOf(Date.now() - 7 * 86400e3, userTimeZone(s.db, alice.id))).lede, 'Rewritten.')
+})
+
+test('POST /timeline/weeks/:week: a private-device Coordinator still cannot name private work', async (t) => {
+  const { s, alice, priv } = await coordinatorFleet(t)
+  setCoordinatorConvoId(s.db, alice.id, 'secret')
+  const hidden = createProject(s.db, { userId: alice.id, deviceId: priv.deviceId, createdBy: 'agent', title: 'Hidden' }).project
+  const r = await put(s, thisWeek(s, alice), priv.token, goodBody(hidden, { convo_id: 'secret', notes: [] }))
+  assert.deepEqual(r, { status: 400, json: { error: 'bad_request', detail: 'unknown_project', ref: hidden.num } })
 })
