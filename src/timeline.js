@@ -97,7 +97,7 @@ export function parseWeekKey(key, tz) {
 // as the project feed: a private device's conversation or comment, and a
 // mission born in a private device's conversation.
 function movesSql(excludePrivateOwned) {
-  const convoSieve = excludePrivateOwned ? `AND NOT ${privateConvo('c')} AND ${ORIGIN_SIEVE}` : ''
+  const convoSieve = convoSieveOf(excludePrivateOwned)
   const commentSieve = excludePrivateOwned ? `AND NOT ${privateDevice('ic.device_id')}` : ''
   const originSieve = excludePrivateOwned ? `AND ${ORIGIN_SIEVE}` : ''
   const of = 'COALESCE(p.merged_into, p.id)'
@@ -364,29 +364,38 @@ function resolveStored(db, userId, stored, byId, excludePrivateOwned) {
   return out
 }
 
+// A caller's sieve over an item's or milestone's conversation `c` and mission `m`.
+const convoSieveOf = (excludePrivateOwned) => (excludePrivateOwned ? `AND NOT ${privateConvo('c')} AND ${ORIGIN_SIEVE}` : '')
+// The project's missions (@projectId) and those still filed under a project merged into it.
+const IN_PROJECT = 'm.project_id IN (SELECT q.id FROM projects q WHERE q.id = @projectId OR q.merged_into = @projectId)'
+const OF_PROJECT = `m.user_id = @userId AND ${IN_PROJECT}`
+
 // The project's open items awaiting the user, as the timeline shows them:
 // unlike projectDetail's needs-you, consent cards are left out, newest created
 // first, and only items created before the week ended (`@end`). Shared by the
 // apps' fallback card and the Coordinator's raw read. `limit` caps the rows.
-const needsYouFrom = (convoSieve, ofProject) => `FROM items i JOIN missions m ON m.id = i.mission_id
+// `+i.consent`: the unary plus keeps SQLite off idx_items_consent, which it
+// otherwise prefers without ANALYZE statistics, reading nearly every item of
+// every user for each card. With it, the project's missions come first and
+// each one's items are read through idx_items_mission (pinned by a test).
+const needsYouFrom = (convoSieve) => `FROM items i JOIN missions m ON m.id = i.mission_id
       JOIN conversations c ON c.id = i.origin_convo_id
-    WHERE ${ofProject} AND i.state = 'open' AND i.awaiting = 'user' AND i.consent IS NULL AND i.created_at < @end ${convoSieve}`
-function needsYouStatement(db, convoSieve, inProject, ofProject, limit = -1) {
-  return db.prepare(`SELECT i.id, i.num, i.title ${needsYouFrom(convoSieve, ofProject)}
-    ORDER BY i.created_at DESC, i.num DESC LIMIT ${limit}`)
-}
+    WHERE ${OF_PROJECT} AND i.state = 'open' AND i.awaiting = 'user' AND +i.consent IS NULL AND i.created_at < @end ${convoSieve}`
+const needsYouSql = (convoSieve, limit = -1) => `SELECT i.id, i.num, i.title ${needsYouFrom(convoSieve)}
+    ORDER BY i.created_at DESC, i.num DESC LIMIT ${limit}`
 
 // The counts behind a week card's marks, for one project (@projectId) and one
-// week (@start, @end): `forYou`, how many items needsYouStatement would list,
+// week (@start, @end): `forYou`, how many items the needs-you list would hold,
 // and `done`, how many items on the project's missions were closed in the
 // week. Consent cards are in neither; both go through the caller's sieve.
-function marksStatements(db, convoSieve, ofProject) {
-  return {
-    forYou: db.prepare(`SELECT COUNT(*) AS n ${needsYouFrom(convoSieve, ofProject)}`),
-    done: db.prepare(`SELECT COUNT(*) AS n FROM items i JOIN missions m ON m.id = i.mission_id
+const forYouSql = (convoSieve) => `SELECT COUNT(*) AS n ${needsYouFrom(convoSieve)}`
+const doneSql = (convoSieve) => `SELECT COUNT(*) AS n FROM items i JOIN missions m ON m.id = i.mission_id
       JOIN conversations c ON c.id = i.origin_convo_id
-    WHERE ${ofProject} AND i.consent IS NULL AND i.closed_at >= @start AND i.closed_at < @end ${convoSieve}`),
-  }
+    WHERE ${OF_PROJECT} AND +i.consent IS NULL AND i.closed_at >= @start AND i.closed_at < @end ${convoSieve}`
+// Test seam: the three per-card item queries as SQL.
+export const cardItemsSqlForTest = (excludePrivateOwned) => {
+  const sieve = convoSieveOf(excludePrivateOwned)
+  return { forYou: forYouSql(sieve), needsYou: needsYouSql(sieve), done: doneSql(sieve) }
 }
 
 // One week's page: a story per project that moved, most moves first, at most
@@ -403,20 +412,16 @@ export function weekDetail(db, userId, weekKey, { excludePrivateOwned = false, n
   const end = weekEndOf(start, tz)
   const byId = new Map(rowProjects(db, userId, excludePrivateOwned).map((p) => [p.id, p]))
   const moved = ranked(projectMoves(db, userId, { from: start, to: end, excludePrivateOwned }), byId)
-  const convoSieve = excludePrivateOwned ? `AND NOT ${privateConvo('c')} AND ${ORIGIN_SIEVE}` : ''
-  // The project's missions and those still filed under a project merged into it.
-  const inProject = 'm.project_id IN (SELECT q.id FROM projects q WHERE q.id = @projectId OR q.merged_into = @projectId)'
-  const ofProject = `m.user_id = @userId AND ${inProject}`
+  const convoSieve = convoSieveOf(excludePrivateOwned)
+  const inProject = IN_PROJECT
+  const ofProject = OF_PROJECT
   const sentence = db.prepare(`SELECT l.title FROM milestones l JOIN missions m ON m.id = l.mission_id
       JOIN conversations c ON c.id = l.convo_id
     WHERE ${ofProject} AND l.created_at >= @start AND l.created_at < @end ${convoSieve}
     ORDER BY l.created_at DESC, l.seq DESC LIMIT 1`)
-  const needsYou = needsYouStatement(db, convoSieve, inProject, ofProject)
-  const counts = marksStatements(db, convoSieve, ofProject)
-  const marks = (project, next) => {
-    const args = { userId, projectId: project.id, start, end }
-    return { for_you: counts.forYou.get(args).n, done: counts.done.get(args).n, next: !!next }
-  }
+  const needsYou = db.prepare(needsYouSql(convoSieve))
+  const forYou = db.prepare(forYouSql(convoSieve))
+  const done = db.prepare(doneSql(convoSieve))
   // The project feed's files roll-up, narrowed to the week's pictures and videos.
   const media = db.prepare(`SELECT f.blob_id, f.content_type, f.name FROM (${filesSql(excludePrivateOwned, inProject)}) f
     WHERE f.at >= @start AND f.at < @end AND (f.content_type LIKE 'image/%' OR f.content_type LIKE 'video/%')
@@ -427,15 +432,17 @@ export function weekDetail(db, userId, weekKey, { excludePrivateOwned = false, n
   if (!stored) {
     const stories = moved.slice(0, TIMELINE.storiesMax).map(({ project }) => {
       const args = { userId, projectId: project.id, start, end }
+      const waiting = needsYou.all(args).map((r) => ({ ...r, done: false }))
       return {
         title: null,
         project: refOf(project),
         projects: [refOf(project)],
         sentence: sentence.get(args)?.title ?? null,
         next: null,
-        needs_you: needsYou.all(args).map((r) => ({ ...r, done: false })),
+        needs_you: waiting,
         media: weekMedia(project),
-        marks: marks(project, null),
+        // The list above is every item the for-you count would count.
+        marks: { for_you: waiting.length, done: done.get(args).n, next: false },
       }
     })
     return {
@@ -446,17 +453,20 @@ export function weekDetail(db, userId, weekKey, { excludePrivateOwned = false, n
   const mains = new Set()
   const cards = resolveStored(db, userId, stored, byId, excludePrivateOwned)
     .filter((s) => !mains.has(s.projects[0].id) && mains.add(s.projects[0].id))
-  const stories = cards.map((s) => ({
-    title: s.title,
-    project: refOf(s.projects[0]),
-    projects: s.projects.map(refOf),
-    sentence: s.sentence,
-    next: s.next,
-    needs_you: s.items,
-    media: s.media ?? weekMedia(s.projects[0]),
-    marks: marks(s.projects[0], s.next),
-    _ids: s.projects.map((p) => p.id),
-  }))
+  const stories = cards.map((s) => {
+    const args = { userId, projectId: s.projects[0].id, start, end }
+    return {
+      title: s.title,
+      project: refOf(s.projects[0]),
+      projects: s.projects.map(refOf),
+      sentence: s.sentence,
+      next: s.next,
+      needs_you: s.items,
+      media: s.media ?? weekMedia(s.projects[0]),
+      marks: { for_you: forYou.get(args).n, done: done.get(args).n, next: !!s.next },
+      _ids: s.projects.map((p) => p.id),
+    }
+  })
   const named = new Set(stories.flatMap((s) => s._ids))
   return {
     ...head, final: stored.final || end <= now, lede: stored.lede, written_at: stored.written_at,
@@ -506,10 +516,10 @@ export function weekRaw(db, userId, weekKey, { offset = 0, limit = RAW.page, exc
   const end = weekEndOf(start, tz)
   const byId = new Map(rowProjects(db, userId, excludePrivateOwned).map((p) => [p.id, p]))
   const moved = ranked(projectMoves(db, userId, { from: start, to: end, excludePrivateOwned }), byId)
-  const convoSieve = excludePrivateOwned ? `AND NOT ${privateConvo('c')} AND ${ORIGIN_SIEVE}` : ''
+  const convoSieve = convoSieveOf(excludePrivateOwned)
   const commentSieve = excludePrivateOwned ? `AND NOT ${privateDevice('ic.device_id')}` : ''
-  const inProject = 'm.project_id IN (SELECT q.id FROM projects q WHERE q.id = @projectId OR q.merged_into = @projectId)'
-  const ofProject = `m.user_id = @userId AND ${inProject}`
+  const inProject = IN_PROJECT
+  const ofProject = OF_PROJECT
   const milestones = db.prepare(`SELECT l.title, l.kind, l.created_at AS at FROM milestones l JOIN missions m ON m.id = l.mission_id
       JOIN conversations c ON c.id = l.convo_id
     WHERE ${ofProject} AND l.created_at >= @start AND l.created_at < @end ${convoSieve}
@@ -543,7 +553,7 @@ export function weekRaw(db, userId, weekKey, { offset = 0, limit = RAW.page, exc
     WHERE f.at >= @start AND f.at < @end AND (f.content_type LIKE 'image/%' OR f.content_type LIKE 'video/%')
     ORDER BY f.at DESC, f.sort_key DESC LIMIT ${RAW.media}`)
   // The newest of what still waits on the user, whatever the week's activity.
-  const needsYou = needsYouStatement(db, convoSieve, inProject, ofProject, RAW.needsYou)
+  const needsYou = db.prepare(needsYouSql(convoSieve, RAW.needsYou))
   const projects = shown.map(({ project, moved: n }) => {
     const args = { userId, projectId: project.id, start, end }
     return {

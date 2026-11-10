@@ -12,7 +12,7 @@ import { createMission, closeMission, createMilestone } from '../src/missions.js
 import { createProject, mergeProject, updateProject, closeProject } from '../src/projects.js'
 import { writeWeek, validWeekEntries, writeWeekEntries, storedWeek } from '../src/week-stories.js'
 import {
-  weekRaw, RAW, projectMoves, projectWeeklyMoves, weeksList, weekDetail, wentQuiet, openLong, finished, cronRunsForTest,
+  weekRaw, RAW, cardItemsSqlForTest, projectMoves, projectWeeklyMoves, weeksList, weekDetail, wentQuiet, openLong, finished, cronRunsForTest,
 } from '../src/timeline.js'
 
 const LON = 'Europe/London'
@@ -1341,6 +1341,19 @@ test('marks.done counts the items closed in the week, not the week before or aft
   assert.equal(cardOf(db, 0, a.p).marks.done, 1)
   assert.equal(putEntries(db, -1, { entries: [entry(a.p)], final: true }).ok, true)
   assert.equal(cardOf(db, -1, a.p).marks.done, 2)
+})
+
+test("a card's item counts reach items through their mission, never through the consent index", () => {
+  const db = seeded()
+  const a = proj(db, 'Billing')
+  for (const sieved of [false, true]) {
+    for (const [name, sql] of Object.entries(cardItemsSqlForTest(sieved))) {
+      const plan = db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all({ userId: 1, projectId: a.p.id, start: weekOf(-1), end: weekOf(0) })
+      const text = plan.map((r) => r.detail).join('\n')
+      assert.doesNotMatch(text, /idx_items_consent/, `${name}, sieved ${sieved}`)
+      assert.match(text, /SEARCH i USING INDEX idx_items_mission \(mission_id=\?/, `${name}, sieved ${sieved}`)
+    }
+  }
 })
 
 test('marks.next is true only with a next; the computed card carries marks too, next false', () => {
