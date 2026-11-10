@@ -6589,9 +6589,16 @@ considers each of that user's *client* devices with a registered token
 - alert title is the conversation title (falling back to its id), body is
   the event's snippet, badge is `SUM(unread_count)` over the owner's
   conversations.
-- a 410 response prunes that device's `apns_token`/`apns_env` (dead token,
-  logged once); a 400 keeps the token but logs loudly — almost always a
-  sandbox/prod `apns_env` mismatch (the sygnal lesson), not a dead token.
+- a 410 response, or a 400 `BadDeviceToken`, prunes that device's
+  `apns_token`/`apns_env` (dead token, logged once with its `apns_env`); the
+  device itself is kept and pushes resume when the app registers a token
+  again. Only the token and environment that failed are cleared, so a late
+  answer never drops a registration made since (a new token, or the same
+  token with a corrected environment). Every other failure (429, 5xx, other 400s
+  including `DeviceTokenNotForTopic`, the relay's own validation errors,
+  transport) keeps the token. A `BadDeviceToken` is often a sandbox/prod
+  `apns_env` mismatch, but since the environment is registered with the
+  token, retrying the same pair never succeeds either.
 
 Per-device `apns_env` (`'sandbox'|'prod'`) exists because Xcode dev builds
 register sandbox tokens, which prod APNs answers with 400 `BadDeviceToken` —

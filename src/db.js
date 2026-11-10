@@ -2223,10 +2223,17 @@ export function setApnsRegistration(db, deviceId, { apnsToken, apnsEnv }) {
   db.prepare('UPDATE devices SET apns_token=?, apns_env=? WHERE id=?').run(apnsToken, apnsEnv, deviceId)
 }
 
-// Called by the push pipeline on a 410 Unregistered response — the token is
-// dead, so stop trying it rather than retrying forever (sygnal lesson).
-export function pruneApnsToken(db, deviceId) {
-  db.prepare('UPDATE devices SET apns_token=NULL, apns_env=NULL WHERE id=?').run(deviceId)
+// Called by the push pipeline when APNs says a token is dead (410
+// Unregistered, 400 BadDeviceToken), so it stops being tried rather than
+// retried on every push. Only the token is cleared, never the device: the app
+// registers a fresh one through /push/register. Clears only while the device
+// still holds the token AND environment the failed push used, so a late
+// answer never drops a registration made since — a new token, or the same
+// token re-registered with a corrected environment. Returns whether anything
+// was cleared, so a burst of failures for one token is logged once.
+export function pruneApnsToken(db, deviceId, apnsToken, apnsEnv) {
+  return db.prepare('UPDATE devices SET apns_token=NULL, apns_env=NULL WHERE id=? AND apns_token=? AND apns_env=?')
+    .run(deviceId, apnsToken, apnsEnv).changes > 0
 }
 
 // Client devices (never agent — agents are never pushed to) with a
