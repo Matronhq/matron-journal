@@ -169,7 +169,9 @@ test("a project's moves are reached through its missions, never through the cons
     const count = (re) => (text.match(re) ?? []).length
     assert.doesNotMatch(text, /idx_items_consent/, `sieved ${sieve}`)
     assert.doesNotMatch(text, /idx_missions_user_state/, `sieved ${sieve}`)
-    assert.doesNotMatch(text, /SCAN (m|i|l|ic)\b/, `sieved ${sieve}`)
+    assert.doesNotMatch(text, /SCAN (m|i|l|ic|q)\b/, `sieved ${sieve}`)
+    // Each arm finds the projects merged into this one among the user's own.
+    assert.equal(count(/SEARCH q USING INDEX idx_projects_user_state \(user_id=\?/g), 6, `sieved ${sieve}`)
     // Six arms, each from the project's missions; three of them go on to the
     // missions' items, one to their milestones, one to the items' comments.
     assert.equal(count(/SEARCH m USING INDEX idx_missions_project \(project_id=\?/g), 6, `sieved ${sieve}`)
@@ -434,7 +436,8 @@ test("the files roll-up of a project starts from its missions, and a picture loo
   const a = proj(db, 'Billing')
   for (const sieve of [false, true]) {
     const text = planOf(db, `SELECT * FROM (${filesSqlForTest(sieve, IN_PROJECT)})`, { userId: 1, projectId: a.p.id })
-    assert.doesNotMatch(text, /idx_items_consent|idx_missions_user_state|SCAN (m|i|ic|e|l)\b/, `sieved ${sieve}`)
+    assert.doesNotMatch(text, /idx_items_consent|idx_missions_user_state|SCAN (m|i|ic|e|l|q)\b/, `sieved ${sieve}`)
+    assert.equal((text.match(/SEARCH q USING INDEX idx_projects_user_state \(user_id=\?/g) ?? []).length, 2, `sieved ${sieve}`)
     assert.equal((text.match(/SEARCH m USING INDEX idx_missions_project \(project_id=\?/g) ?? []).length, 2, `sieved ${sieve}`)
     assert.match(text, /SEARCH i USING INDEX idx_items_mission \(mission_id=\?/, `sieved ${sieve}`)
     assert.match(text, /SEARCH ic USING INDEX idx_item_comments_item \(item_id=\?/, `sieved ${sieve}`)
@@ -445,6 +448,27 @@ test("the files roll-up of a project starts from its missions, and a picture loo
     assert.doesNotMatch(found, /idx_items_consent|SCAN (m|i|ic|e|l)\b/, `lookup, sieved ${sieve}`)
     assert.equal((found.match(/SEARCH m USING INDEX idx_missions_user_state \(user_id=\?/g) ?? []).length, 2, `lookup, sieved ${sieve}`)
     assert.match(found, /SEARCH i USING INDEX idx_items_mission \(mission_id=\?/, `lookup, sieved ${sieve}`)
+  }
+})
+
+test("every read of one project finds the projects merged into it among the user's own, never by reading every user's projects", () => {
+  const db = seeded()
+  const a = proj(db, 'Billing')
+  postAt(db, a.convo, 'A step', mid(-1))
+  put(db, -1, [tale({ project_ids: [a.p.id] })])
+  const args = { userId: 1, projectId: a.p.id, start: 0, end: 1, weeks: '[]', from: 0, to: 1 }
+  for (const sieve of [false, true]) {
+    const o = { excludePrivateOwned: sieve }
+    const merged = prepared(db, () => { projectPage(db, 1, a.p, o); projectHistory(db, 1, a.p, o) })
+      .filter((sql) => /q\.merged_into/.test(sql))
+    // The page: missions, the newest milestone, files, needs-you and its
+    // count, moves. The history: moves, a week's picture, milestones.
+    assert.equal(merged.length, 9, `sieved ${sieve}`)
+    for (const sql of merged) {
+      const text = planOf(db, sql, Object.fromEntries(Object.entries(args).filter(([k]) => sql.includes(`@${k}`))))
+      assert.doesNotMatch(text, /SCAN q\b/, `sieved ${sieve}: ${sql}`)
+      assert.match(text, /SEARCH q USING INDEX idx_projects_user_state \(user_id=\?/, `sieved ${sieve}: ${sql}`)
+    }
   }
 })
 

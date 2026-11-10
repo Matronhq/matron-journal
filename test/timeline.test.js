@@ -1421,6 +1421,9 @@ test("a card's item counts reach items through their mission, never through the 
       const text = plan.map((r) => r.detail).join('\n')
       assert.doesNotMatch(text, /idx_items_consent/, `${name}, sieved ${sieved}`)
       assert.match(text, /SEARCH i USING INDEX idx_items_mission \(mission_id=\?/, `${name}, sieved ${sieved}`)
+      // The projects merged into this one are found among the user's own.
+      assert.doesNotMatch(text, /SCAN q\b/, `${name}, sieved ${sieved}`)
+      assert.match(text, /SEARCH q USING INDEX idx_projects_user_state \(user_id=\?/, `${name}, sieved ${sieved}`)
     }
   }
 })

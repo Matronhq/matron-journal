@@ -441,8 +441,11 @@ function resolveStored(db, userId, stored, byId, excludePrivateOwned) {
 
 // A caller's sieve over an item's or milestone's conversation `c` and mission `m`.
 export const convoSieveOf = (excludePrivateOwned) => (excludePrivateOwned ? `AND NOT ${privateConvo('c')} AND ${ORIGIN_SIEVE}` : '')
-// The project's missions (@projectId) and those still filed under a project merged into it.
-export const IN_PROJECT = 'm.project_id IN (SELECT q.id FROM projects q WHERE q.id = @projectId OR q.merged_into = @projectId)'
+// The project's missions (@projectId) and those still filed under a project
+// merged into it. The projects are looked for among the user's own (@userId),
+// through idx_projects_user_state: nothing indexes merged_into, so without
+// the user the subquery reads every user's projects (pinned by tests).
+export const IN_PROJECT = 'm.project_id IN (SELECT q.id FROM projects q WHERE q.user_id = @userId AND (q.id = @projectId OR q.merged_into = @projectId))'
 export const OF_PROJECT = `m.user_id = @userId AND ${IN_PROJECT}`
 
 // The project's open items awaiting the user, as the timeline shows them:
