@@ -117,7 +117,9 @@ function validEntry(e) {
 // items) is ignored, so it is never stored. `entries` itself is required: a
 // write replaces the stored week, so a body without the list (the grouped
 // write's shape sent here, or notes alone) is malformed rather than a week
-// with no cards. An empty list is how a week with none is written.
+// with no cards. An empty list clears what was
+// written: final, the week has no cards; not final, it reads as unwritten
+// (the computed cards), as an empty stories write always has.
 export function validWeekEntries(body) {
   if (!isObject(body)) return null
   const rawEntries = body.entries
