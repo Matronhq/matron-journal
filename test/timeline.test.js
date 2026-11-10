@@ -10,8 +10,9 @@ import { upsertConversation, append } from '../src/journal.js'
 import { createItem, addComment, closeItem } from '../src/items.js'
 import { createMission, closeMission, createMilestone } from '../src/missions.js'
 import { createProject, mergeProject, updateProject, closeProject } from '../src/projects.js'
+import { writeWeek } from '../src/week-stories.js'
 import {
-  projectMoves, projectWeeklyMoves, weeksList, weekDetail, wentQuiet, openLong, finished, cronRunsForTest,
+  weekRaw, projectMoves, projectWeeklyMoves, weeksList, weekDetail, wentQuiet, openLong, finished, cronRunsForTest,
 } from '../src/timeline.js'
 
 const LON = 'Europe/London'
@@ -301,6 +302,8 @@ test('weekDetail ranks stories by moves, caps them at 8 and lists the rest under
   assert.deepEqual(out.stories.map((s) => s.project.title), ['P10', 'P9', 'P8', 'P7', 'P6', 'P5', 'P4', 'P3'])
   assert.deepEqual(out.stories[0].project, ref(ps[9]))
   assert.equal(out.stories[0].next, null)
+  assert.equal(out.stories[0].title, null); assert.equal(out.written_at, null)
+  assert.deepEqual(out.stories[0].projects, [ref(ps[9])])
   assert.deepEqual(out.also, [{ ...ref(ps[1]), moved: 2 }, { ...ref(ps[0]), moved: 1 }])
 })
 
@@ -350,8 +353,8 @@ test("needs_you lists the open items awaiting the user on the project's missions
   item(db, other.convo, 'question', 'Elsewhere?', { now: mid(-1) })
   const story = weekDetail(db, 1, keyOf(-1), at).stories.find((s) => s.project.id === p.id)
   assert.deepEqual(story.needs_you, [
-    { id: newer.id, num: newer.num, title: 'Ship it?' },
-    { id: older.id, num: older.num, title: 'Which plan?' },
+    { id: newer.id, num: newer.num, title: 'Ship it?', done: false },
+    { id: older.id, num: older.num, title: 'Which plan?', done: false },
   ])
 })
 
@@ -582,4 +585,428 @@ test("week media follows missions still filed under a merged project onto the su
   const [story] = weekDetail(db, 1, keyOf(-1), at).stories
   assert.equal(story.project.id, survivor.p.id)
   assert.deepEqual(story.media, { blob_id: 'b-shot.png', content_type: 'image/png', name: 'shot.png' })
+})
+
+// ---- Coordinator-written weeks (phase 2) ----
+
+const blobRow = (db, id, mime = 'image/png') =>
+  db.prepare("INSERT INTO blobs(id, owner_user_id, content_type, size, sha256, disk_path, created_at) VALUES(?,1,?,4,'s','p',0)").run(id, mime)
+const attachAt = (db, it, blobId, ts, mime = 'image/png') => addComment(db, {
+  userId: 1, itemId: it.id, author: 'agent', deviceId: 7, attachments: [{ blob_ref: blobId, mime, name: `${blobId}.png`, size: 4 }], now: ts,
+})
+// A story as the Coordinator writes it (project_ids etc. are references).
+const tale = (over = {}) => ({ title: 'Launch', sentence: 'It shipped.', next: null, project_ids: [], item_ids: [], media_blob_id: null, ...over })
+const put = (db, n, { lede = null, stories = [], final = false, notes = [] } = {}, o = {}) => {
+  const r = writeWeek(db, 1, keyOf(n), { lede, stories, final, notes }, { now: NOW, excludePrivateOwned: false, ...o })
+  assert.equal(r.ok, true, JSON.stringify(r))
+}
+
+test('a stored week wins: lede, stories in the stored order, written_at, final from the store', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha'); const b = proj(db, 'Bravo')
+  postAt(db, a.convo, 'a1', mid(0)); postAt(db, b.convo, 'b1', mid(0)); postAt(db, b.convo, 'b2', mid(0, 1))
+  put(db, 0, {
+    lede: 'A big week. Two things shipped.', final: false,
+    stories: [tale({ title: 'First', project_ids: [a.p.id], next: 'Docs' }), tale({ title: 'Second', sentence: 'Done.', project_ids: [b.p.id, a.p.id] })],
+  })
+  const out = weekDetail(db, 1, keyOf(0), at)
+  assert.equal(out.lede, 'A big week. Two things shipped.'); assert.equal(out.written_at, NOW); assert.equal(out.final, false)
+  assert.deepEqual(out.stories.map((s) => s.title), ['First', 'Second'])
+  assert.deepEqual(out.stories[0], {
+    title: 'First', project: ref(a.p), projects: [ref(a.p)], sentence: 'It shipped.', next: 'Docs', needs_you: [], media: null,
+  })
+  assert.deepEqual(out.stories[1].projects, [ref(b.p), ref(a.p)])
+  assert.deepEqual(out.stories[1].project, ref(b.p))
+  assert.deepEqual(out.also, [])
+  // The end-of-week floor still applies to a stored week that is not marked final.
+  put(db, -1, { lede: 'Last week.', stories: [tale({ project_ids: [a.p.id] })] })
+  assert.equal(weekDetail(db, 1, keyOf(-1), at).final, true)
+})
+
+test('a stored week marked final is final: the store flag wins over a clock that says the week is open', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha')
+  postAt(db, a.convo, 'a1', mid(-2))
+  put(db, -2, { lede: 'Done.', final: true })
+  assert.equal(weekDetail(db, 1, keyOf(-2), at).final, true)
+  assert.equal(weekDetail(db, 1, keyOf(-2), { now: weekOf(-2) + DAY }).final, true)
+})
+
+test('a notes-only row counts as not written: the computed page, sentence and written false', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha')
+  postAt(db, a.convo, 'a1', mid(-1))
+  put(db, -1, { notes: [{ project: a.p.id, note: 'Steady.' }] })
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM week_stories').get().n, 1)
+  const d = weekDetail(db, 1, keyOf(-1), at)
+  assert.equal(d.lede, null); assert.equal(d.written_at, null); assert.equal(d.stories[0].title, null)
+  const w = weeksList(db, 1, at).weeks.find((x) => x.week === keyOf(-1))
+  assert.equal(w.written, false); assert.equal(w.sentence, 'Alpha moved.')
+  assert.equal(weekRaw(db, 1, keyOf(-1), at).stored, null)
+})
+
+test('a merged project in a story resolves to the survivor; duplicates collapse', () => {
+  const db = seeded()
+  const a = proj(db, 'Survivor'); const b = proj(db, 'Gone')
+  postAt(db, a.convo, 'a', mid(-1))
+  put(db, -1, { lede: 'x', stories: [tale({ project_ids: [b.p.id, a.p.id] })] })
+  mergeProject(db, { userId: 1, projectId: b.p.id, intoId: a.p.id, by: 'user' })
+  const [story] = weekDetail(db, 1, keyOf(-1), at).stories
+  assert.deepEqual(story.projects, [ref(a.p)]); assert.deepEqual(story.project, ref(a.p))
+})
+
+test('a project made private after the write vanishes from an agent read but shows on a client read; a story with no visible project is dropped', () => {
+  const db = seeded()
+  const a = proj(db, 'Open'); const b = proj(db, 'Turned private')
+  postAt(db, a.convo, 'a', mid(-1)); postAt(db, b.convo, 'b', mid(-1))
+  put(db, -1, {
+    lede: 'x',
+    stories: [tale({ title: 'Both', project_ids: [b.p.id, a.p.id] }), tale({ title: 'Only private', project_ids: [b.p.id] })],
+  })
+  db.prepare('UPDATE projects SET origin_convo_id = ? WHERE id = ?').run('secret', b.p.id)
+  const agent = weekDetail(db, 1, keyOf(-1), { ...at, excludePrivateOwned: true })
+  assert.deepEqual(agent.stories.map((s) => s.title), ['Both'])
+  assert.deepEqual(agent.stories[0].projects, [ref(a.p)])
+  const client = weekDetail(db, 1, keyOf(-1), at)
+  assert.deepEqual(client.stories.map((s) => s.title), ['Both', 'Only private'])
+  assert.deepEqual(client.stories[0].projects, [ref(b.p), ref(a.p)])
+})
+
+test('needs_you resolves stored items live: closed is done, still awaiting is not, deleted and hidden ones are dropped', () => {
+  const db = seeded()
+  const a = proj(db, 'Billing')
+  postAt(db, a.convo, 'a', mid(-1))
+  const open = item(db, a.convo, 'question', 'Which plan?')
+  const closed = item(db, a.convo, 'question', 'Ship it?')
+  const gone = item(db, a.convo, 'question', 'Deleted?')
+  const hid = item(db, a.convo, 'question', 'Hidden later?')
+  const agentTask = item(db, a.convo, 'task', 'Agent work')
+  put(db, -1, { lede: 'x', stories: [tale({ project_ids: [a.p.id], item_ids: [open.id, closed.id, gone.id, hid.id, agentTask.id] })] })
+  closeItem(db, { userId: 1, itemId: closed.id, resolution: 'answered', author: 'agent', deviceId: 7 })
+  db.prepare('DELETE FROM items WHERE id = ?').run(gone.id)
+  db.prepare('UPDATE items SET origin_convo_id = ? WHERE id = ?').run('secret', hid.id)
+  const needs = (o) => weekDetail(db, 1, keyOf(-1), { ...at, ...o }).stories[0].needs_you
+  assert.deepEqual(needs({ excludePrivateOwned: true }), [
+    { id: open.id, num: open.num, title: 'Which plan?', done: false },
+    { id: closed.id, num: closed.num, title: 'Ship it?', done: true },
+    { id: agentTask.id, num: agentTask.num, title: 'Agent work', done: true },
+  ])
+  assert.deepEqual(needs().map((n) => n.title), ['Which plan?', 'Ship it?', 'Hidden later?', 'Agent work'])
+})
+
+test('story media: the stored blob when it exists, else the main project week roll-up, else null', () => {
+  const db = seeded()
+  const a = proj(db, 'Site'); const bare = proj(db, 'Bare')
+  postAt(db, a.convo, 'a', mid(-1)); postAt(db, bare.convo, 'b', mid(-1))
+  const it = item(db, a.convo, 'task', 'Screens')
+  blobRow(db, 'b-stored'); attachAt(db, it, 'b-stored', mid(-3))
+  blobRow(db, 'b-week'); attachAt(db, it, 'b-week', mid(-1))
+  put(db, -1, {
+    lede: 'x', stories: [
+      tale({ title: 'Stored', project_ids: [a.p.id], media_blob_id: 'b-stored' }),
+      tale({ title: 'Deleted blob', project_ids: [a.p.id], media_blob_id: 'b-stored' }),
+      tale({ title: 'None', project_ids: [bare.p.id] }),
+    ],
+  })
+  const stories = () => weekDetail(db, 1, keyOf(-1), at).stories
+  assert.deepEqual(stories()[0].media, { blob_id: 'b-stored', content_type: 'image/png', name: 'b-stored.png' })
+  assert.equal(stories()[2].media, null)
+  db.prepare("DELETE FROM blobs WHERE id = 'b-stored'").run()
+  assert.deepEqual(stories()[0].media, { blob_id: 'b-week', content_type: 'image/png', name: 'b-week.png' })
+  assert.deepEqual(stories()[1].media, stories()[0].media)
+})
+
+test('story media hidden by the sieve falls back to null for an agent and still shows for a client', () => {
+  const db = seeded()
+  const a = proj(db, 'Site')
+  postAt(db, a.convo, 'a', mid(-1))
+  const hidden = item(db, 'secret', 'task', 'Private shot')
+  blobRow(db, 'b-secret'); attachAt(db, hidden, 'b-secret', mid(-1))
+  put(db, -1, { lede: 'x', stories: [tale({ project_ids: [a.p.id], media_blob_id: 'b-secret' })] })
+  assert.equal(weekDetail(db, 1, keyOf(-1), { ...at, excludePrivateOwned: true }).stories[0].media, null)
+  assert.equal(weekDetail(db, 1, keyOf(-1), at).stories[0].media.blob_id, 'b-secret')
+})
+
+test('also: the projects that moved and no remaining story names, with their counts', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha'); const b = proj(db, 'Bravo'); const c = proj(db, 'Charlie')
+  for (let i = 0; i < 3; i++) postAt(db, a.convo, `a${i}`, mid(-1, i))
+  for (let i = 0; i < 2; i++) postAt(db, b.convo, `b${i}`, mid(-1, i))
+  postAt(db, c.convo, 'c', mid(-1))
+  // Bravo is named as a second project of Alpha's story; Charlie is not named.
+  put(db, -1, { lede: 'x', stories: [tale({ project_ids: [a.p.id, b.p.id] })] })
+  assert.deepEqual(weekDetail(db, 1, keyOf(-1), at).also, [{ ...ref(c.p), moved: 1 }])
+  // A project hidden from the caller no longer counts as named or as moved: Bravo still anchors the story.
+  db.prepare('UPDATE projects SET origin_convo_id = ? WHERE id = ?').run('secret', a.p.id)
+  const out = weekDetail(db, 1, keyOf(-1), { ...at, excludePrivateOwned: true })
+  assert.deepEqual(out.stories.map((s) => s.projects), [[ref(b.p)]])
+  assert.deepEqual(out.also.map((x) => x.title), ['Charlie'])
+  // With every named project hidden the story is dropped and names nothing.
+  db.prepare('UPDATE projects SET origin_convo_id = ? WHERE id = ?').run('secret', b.p.id)
+  const bare = weekDetail(db, 1, keyOf(-1), { ...at, excludePrivateOwned: true })
+  assert.deepEqual(bare.stories, []); assert.deepEqual(bare.also.map((x) => x.title), ['Charlie'])
+})
+
+test("weeksList: the sentence is the lede's first sentence, written says so, and the computed sentence stays when there is none", () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha', { createdAt: mid(-5) })
+  for (const n of [-3, -2, -1, 0]) postAt(db, a.convo, `s${n}`, mid(n))
+  put(db, -1, { lede: 'A. B.' })
+  put(db, -2, { lede: 'No stop' })
+  put(db, -3, { lede: '  Wow! Really?  ' })
+  put(db, 0, { lede: 'Is it done? Not yet.' })
+  const w = (key) => weeksList(db, 1, at).weeks.find((x) => x.week === key)
+  assert.equal(w(keyOf(-1)).sentence, 'A.'); assert.equal(w(keyOf(-1)).written, true)
+  assert.equal(w(keyOf(-2)).sentence, 'No stop')
+  assert.equal(w(keyOf(-3)).sentence, 'Wow!')
+  assert.equal(w(keyOf(0)).sentence, 'Is it done?')
+  assert.equal(w(keyOf(-4)).written, false); assert.equal(w(keyOf(-4)).sentence, 'A quiet week.')
+  // A stored row with stories but no lede keeps the computed sentence and is written.
+  put(db, -2, { stories: [tale({ project_ids: [a.p.id] })] })
+  assert.equal(w(keyOf(-2)).sentence, 'Alpha moved.'); assert.equal(w(keyOf(-2)).written, true)
+})
+
+test('weeksList reads the stored weeks in one query for the page', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha', { createdAt: mid(-5) })
+  for (const n of [-3, -2, -1]) { postAt(db, a.convo, `s${n}`, mid(n)); put(db, n, { lede: 'Hi.' }) }
+  let reads = 0
+  const prepare = db.prepare.bind(db)
+  db.prepare = (sql) => { if (/FROM week_stories/.test(sql)) reads += 1; return prepare(sql) }
+  weeksList(db, 1, at)
+  assert.equal(reads, 1)
+})
+
+test('notes on went-quiet and open-long rows: shown when fresh, null when older than the last move', () => {
+  const db = seeded()
+  const quiet = proj(db, 'Quiet', { createdAt: mid(-6) })
+  postAt(db, quiet.convo, 'paused', mid(-4))
+  const stale = proj(db, 'Stale', { createdAt: mid(-6) })
+  postAt(db, stale.convo, 'paused', mid(-4))
+  const noNote = proj(db, 'NoNote', { createdAt: mid(-6) })
+  postAt(db, noNote.convo, 'paused', mid(-4))
+  const longOld = proj(db, 'Long', { createdAt: NOW - 40 * DAY })
+  const longStale = proj(db, 'LongStale', { createdAt: NOW - 39 * DAY })
+  postAt(db, longStale.convo, 'late step', NOW - 2 * DAY)
+  const setNote = (p, note, written) => db.prepare('INSERT INTO project_notes(user_id, project_id, note, written_at) VALUES(1,?,?,?)').run(p.id, note, written)
+  setNote(quiet.p, 'Waiting on legal.', mid(-4) + 1)
+  setNote(stale.p, 'Old note.', mid(-4) - 1)
+  setNote(longOld.p, 'Parked deliberately.', NOW - 30 * DAY) // after its only move (creation, 40 days ago)
+  setNote(longStale.p, 'Stale long.', NOW - 3 * DAY) // before its move 2 days ago
+  const notes = (rows) => Object.fromEntries(rows.map((r) => [r.project.title, r.note]))
+  assert.deepEqual(notes(wentQuiet(db, 1, at).rows), { Quiet: 'Waiting on legal.', Stale: null, NoNote: null })
+  const long = notes(openLong(db, 1, at).rows)
+  assert.equal(long.Long, 'Parked deliberately.'); assert.equal(long.LongStale, null)
+  assert.equal(long.Quiet, 'Waiting on legal.'); assert.equal(long.Stale, null)
+})
+
+test('weekRaw: the moving projects with status, milestones, items and media, capped; stored refs; bad key null', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha'); const b = proj(db, 'Bravo')
+  updateProject(db, { userId: 1, projectId: a.p.id, fields: { status: 'On track' }, statusWriter: { by: 'agent', deviceId: 7, convoId: 'c1' } })
+  for (let i = 0; i < 12; i++) postAt(db, a.convo, `step ${i}`, mid(-1, i))
+  postAt(db, b.convo, 'b', mid(-1))
+  const items = []
+  for (let i = 0; i < 12; i++) items.push(item(db, a.convo, 'task', `Item ${i}`))
+  db.prepare('UPDATE items SET created_at = ?, updated_at = ?').run(mid(-1), mid(-1))
+  for (let i = 0; i < 7; i++) { blobRow(db, `b${i}`); attachAt(db, items[0], `b${i}`, mid(-1, i)) }
+  attachAt(db, items[0], 'doc', mid(-1, 9), 'application/pdf')
+  put(db, -1, {
+    lede: 'Lede.', stories: [tale({ title: 'T', project_ids: [b.p.id, a.p.id], item_ids: [items[0].id], media_blob_id: 'b3' })],
+  })
+  const raw = weekRaw(db, 1, keyOf(-1), at)
+  assert.deepEqual(Object.keys(raw), ['week', 'start', 'end', 'final', 'written_at', 'current', 'stored', 'projects', 'more_projects'])
+  assert.equal(raw.week, keyOf(-1)); assert.equal(raw.final, true); assert.equal(raw.current, false)
+  assert.equal(raw.written_at, NOW); assert.equal(raw.more_projects, 0)
+  assert.equal(weekRaw(db, 1, keyOf(0), at).current, true)
+  assert.deepEqual(raw.projects.map((p) => p.project.title), ['Alpha', 'Bravo'])
+  const alpha = raw.projects[0]
+  assert.equal(alpha.status, 'On track'); assert.equal(raw.projects[1].status, null)
+  assert.ok(alpha.moved > 12)
+  assert.equal(alpha.milestones.length, 10)
+  assert.deepEqual(alpha.milestones[0], { title: 'step 11', kind: 'progress', at: mid(-1, 11) })
+  assert.ok(alpha.milestones.every((m, i, all) => i === 0 || all[i - 1].at >= m.at))
+  assert.equal(alpha.items.length, 10)
+  assert.deepEqual(Object.keys(alpha.items[0]), ['id', 'num', 'title', 'kind', 'state', 'awaiting', 'at'])
+  assert.equal(alpha.items[0].id, items[0].id) // newest activity: the attachment comments
+  assert.equal(alpha.media.length, 5)
+  assert.deepEqual(alpha.media[0], { blob_id: 'b6', content_type: 'image/png', name: 'b6.png', at: mid(-1, 6) })
+  assert.deepEqual(raw.stored, {
+    lede: 'Lede.', final: false,
+    stories: [{
+      title: 'T', sentence: 'It shipped.', next: null, projects: [ref(b.p), ref(a.p)],
+      items: [{ id: items[0].id, num: items[0].num, title: 'Item 0' }], media_blob_id: 'b3',
+    }],
+  })
+  assert.equal(weekRaw(db, 1, '2026-11-10', at), null)
+})
+
+test('weekRaw caps the moving projects at 40 and counts the rest; applies the agent sieve; drops refs that no longer resolve', () => {
+  const db = seeded()
+  const ps = []
+  for (let i = 1; i <= 43; i++) { const x = proj(db, `P${i}`); postAt(db, x.convo, 'm', mid(-1)); ps.push(x) }
+  const raw = weekRaw(db, 1, keyOf(-1), at)
+  assert.equal(raw.projects.length, 40); assert.equal(raw.more_projects, 3)
+  const a = ps[0]
+  const it = item(db, a.convo, 'task', 'Gone soon')
+  put(db, -1, { lede: 'x', stories: [tale({ project_ids: [a.p.id], item_ids: [it.id] })] })
+  db.prepare('DELETE FROM items WHERE id = ?').run(it.id)
+  db.prepare('UPDATE projects SET origin_convo_id = ? WHERE id = ?').run('secret', ps[1].p.id)
+  const out = weekRaw(db, 1, keyOf(-1), at)
+  assert.deepEqual(out.stored.stories[0].items, [])
+  assert.equal(out.projects.some((p) => p.project.id === ps[1].p.id), false)
+  assert.equal(out.projects.length, 40); assert.equal(out.more_projects, 2)
+})
+
+test('weekRaw runs one items query for all the shown projects, reading only the week', () => {
+  const db = seeded()
+  const ps = [proj(db, 'Alpha'), proj(db, 'Bravo'), proj(db, 'Charlie')]
+  const old = []
+  for (const { p, convo } of ps) {
+    postAt(db, convo, 'm', mid(-1))
+    old.push(item(db, convo, 'task', `${p.title} old`, { now: mid(-5) }))
+    item(db, convo, 'task', `${p.title} new`, { now: mid(-1) })
+  }
+  for (const it of old) addComment(db, { userId: 1, itemId: it.id, author: 'agent', deviceId: 7, body: 'x', now: mid(-4) })
+  db.prepare('UPDATE items SET updated_at = created_at').run()
+  let runs = 0; let sql = ''
+  const prepare = db.prepare.bind(db)
+  db.prepare = (q) => {
+    const st = prepare(q)
+    if (!/ROW_NUMBER/.test(q)) return st
+    sql = q
+    return { all: (a) => { runs += 1; return st.all(a) } }
+  }
+  const raw = weekRaw(db, 1, keyOf(-1), at)
+  assert.equal(runs, 1)
+  assert.deepEqual(raw.projects.map((x) => x.items.map((i) => i.title)).sort(), [['Alpha new'], ['Bravo new'], ['Charlie new']])
+  // The week's range is inside every arm of the activity union, so nothing outside it is read.
+  const arms = sql.slice(sql.indexOf('FROM (SELECT i.id AS item_id'), sql.indexOf(') ev'))
+  assert.equal((arms.match(/>= @start AND [a-z.]+_at < @end/g) ?? []).length, 3)
+})
+
+test("weekRaw applies the agent sieve to milestones, items and pictures, and leaves consent cards out of items", () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha')
+  db.prepare("UPDATE conversations SET mission_id = ? WHERE id = 'secret'").run(a.m.id)
+  postAt(db, a.convo, 'public milestone', mid(-1))
+  post(db, 'secret', 'private milestone', 9)
+  db.prepare("UPDATE milestones SET created_at = ? WHERE title = 'private milestone'").run(mid(-1, 1))
+  const pub = item(db, a.convo, 'task', 'Public task', { now: mid(-1) })
+  const priv = item(db, 'secret', 'task', 'Private task', { now: mid(-1, 1) })
+  item(db, a.convo, 'decision', 'Approve the spawn', { consent: 'spawn:x', awaiting: 'user', now: mid(-1, 2) })
+  const quiet = item(db, a.convo, 'task', 'Old public task', { now: mid(-5) })
+  addComment(db, { userId: 1, itemId: quiet.id, author: 'user', deviceId: 9, body: 'from the private box', now: mid(-1, 3) })
+  db.prepare('UPDATE items SET updated_at = created_at').run()
+  blobRow(db, 'b-pub'); attachAt(db, pub, 'b-pub', mid(-1))
+  blobRow(db, 'b-sec'); attachAt(db, priv, 'b-sec', mid(-1, 1))
+  const view = (o) => { const [x] = weekRaw(db, 1, keyOf(-1), { ...at, ...o }).projects; return x }
+  const agent = view({ excludePrivateOwned: true })
+  assert.deepEqual(agent.milestones.map((m) => m.title), ['public milestone'])
+  assert.deepEqual(agent.items.map((i) => i.title), ['Public task'])
+  assert.deepEqual(agent.media.map((m) => m.blob_id), ['b-pub'])
+  const all = view({ excludePrivateOwned: false })
+  assert.deepEqual(all.milestones.map((m) => m.title), ['private milestone', 'public milestone'])
+  assert.deepEqual(all.items.map((i) => i.title), ['Old public task', 'Private task', 'Public task'])
+  assert.deepEqual(all.media.map((m) => m.blob_id), ['b-sec', 'b-pub'])
+})
+
+test('a stored item whose mission sits in a project the agent cannot see is dropped from an agent read', () => {
+  const db = seeded()
+  const a = proj(db, 'Open'); const b = proj(db, 'Turned private')
+  postAt(db, a.convo, 'a', mid(-1))
+  const it = item(db, b.convo, 'question', 'Hidden by project')
+  put(db, -1, { lede: 'x', stories: [tale({ project_ids: [a.p.id], item_ids: [it.id] })] })
+  db.prepare('UPDATE projects SET origin_convo_id = ? WHERE id = ?').run('secret', b.p.id)
+  assert.deepEqual(weekDetail(db, 1, keyOf(-1), { ...at, excludePrivateOwned: true }).stories[0].needs_you, [])
+  assert.equal(weekDetail(db, 1, keyOf(-1), at).stories[0].needs_you.length, 1)
+  assert.deepEqual(weekRaw(db, 1, keyOf(-1), at).stored.stories[0].items, [])
+})
+
+// ---- Review fixes: waiting items in the raw read, zone changes, non-picture media ----
+
+test('weekRaw lists, per project, every item still waiting on the user, whatever the week\'s activity; newest first, capped at 10', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha'); const b = proj(db, 'Bravo')
+  postAt(db, a.convo, 'a1', mid(-1)); postAt(db, b.convo, 'b1', mid(-1))
+  // Waiting for weeks, no activity in the week asked about: not in `items`, but in `needs_you`.
+  const stale = item(db, a.convo, 'question', 'Old question', { awaiting: 'user', now: mid(-5) })
+  const answered = item(db, a.convo, 'question', 'Answered', { awaiting: 'agent', now: mid(-5) })
+  const closed = item(db, a.convo, 'question', 'Closed', { awaiting: 'user', now: mid(-5) })
+  closeItem(db, { userId: 1, itemId: closed.id, resolution: 'answered', author: 'user', deviceId: 8 })
+  item(db, a.convo, 'decision', 'Approve the spawn', { consent: 'spawn:x', awaiting: 'user', now: mid(-5) })
+  const later = item(db, a.convo, 'question', 'Created after the week', { awaiting: 'user', now: mid(0) })
+  const fresh = item(db, a.convo, 'question', 'Fresh question', { awaiting: 'user', now: mid(-1) })
+  const raw = weekRaw(db, 1, keyOf(-1), at)
+  const alpha = raw.projects.find((x) => x.project.id === a.p.id)
+  assert.deepEqual(alpha.needs_you, [stale, fresh].reverse().map((i) => ({ id: i.id, num: i.num, title: i.title })))
+  assert.ok(!alpha.items.some((i) => i.id === stale.id), 'the stale item has no activity in the week')
+  assert.ok(![answered, closed, later].some((i) => alpha.needs_you.some((n) => n.id === i.id)))
+  assert.deepEqual(raw.projects.find((x) => x.project.id === b.p.id).needs_you, [])
+  // The apps' fallback card for the same week shows the same set.
+  const card = weekDetail(db, 1, keyOf(-1), at).stories.find((s) => s.project.id === a.p.id)
+  assert.deepEqual(card.needs_you.map((n) => n.id), alpha.needs_you.map((n) => n.id))
+  // Capped at 10.
+  for (let i = 0; i < 12; i++) item(db, a.convo, 'question', `Q${i}`, { awaiting: 'user', now: mid(-3, i) })
+  assert.equal(weekRaw(db, 1, keyOf(-1), at).projects.find((x) => x.project.id === a.p.id).needs_you.length, 10)
+})
+
+test('weekRaw needs_you applies the agent sieve', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha')
+  db.prepare("UPDATE conversations SET mission_id = ? WHERE id = 'secret'").run(a.m.id)
+  postAt(db, a.convo, 'a1', mid(-1))
+  item(db, a.convo, 'question', 'Public', { awaiting: 'user', now: mid(-5) })
+  item(db, 'secret', 'question', 'Private', { awaiting: 'user', now: mid(-5) })
+  const titles = (o) => weekRaw(db, 1, keyOf(-1), { ...at, ...o }).projects[0].needs_you.map((n) => n.title).sort()
+  assert.deepEqual(titles({ excludePrivateOwned: true }), ['Public'])
+  assert.deepEqual(titles({ excludePrivateOwned: false }), ['Private', 'Public'])
+})
+
+test('a written week is still written after the user changes time zone', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha')
+  postAt(db, a.convo, 'a1', mid(-1))
+  put(db, -1, { lede: 'Last week. Went well.', stories: [tale({ title: 'T', project_ids: [a.p.id] })] })
+  db.prepare("UPDATE users SET time_zone = 'America/New_York' WHERE id = 1").run()
+  const detail = weekDetail(db, 1, keyOf(-1), at)
+  assert.equal(detail.lede, 'Last week. Went well.'); assert.equal(detail.stories[0].title, 'T')
+  const listed = weeksList(db, 1, at).weeks.find((w) => w.week === keyOf(-1))
+  assert.equal(listed.written, true); assert.equal(listed.sentence, 'Last week.')
+  assert.equal(weekRaw(db, 1, keyOf(-1), at).stored.lede, 'Last week. Went well.')
+  // A rewrite after the change replaces the row rather than adding a second.
+  put(db, -1, { lede: 'Rewritten.', stories: [tale({ title: 'U', project_ids: [a.p.id] })] })
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM week_stories').get().n, 1)
+  assert.equal(weekDetail(db, 1, keyOf(-1), at).lede, 'Rewritten.')
+})
+
+test('a stored picture that is not an image or video reads as missing: the week\'s roll-up picture shows instead', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha')
+  const it = item(db, a.convo, 'task', 'T', { now: mid(-1) })
+  blobRow(db, 'b-pic'); attachAt(db, it, 'b-pic', mid(-1))
+  blobRow(db, 'b-doc', 'application/pdf'); attachAt(db, it, 'b-doc', mid(-1, 1), 'application/pdf')
+  put(db, -1, { lede: 'x', stories: [tale({ project_ids: [a.p.id], media_blob_id: 'b-pic' })] })
+  // Only a write that skipped the check could store a document; forge one.
+  db.prepare("UPDATE week_stories SET stories = replace(stories, 'b-pic', 'b-doc')").run()
+  assert.equal(weekDetail(db, 1, keyOf(-1), at).stories[0].media.blob_id, 'b-pic')
+  assert.equal(weekRaw(db, 1, keyOf(-1), at).stored.stories[0].media_blob_id, null)
+})
+
+test('weekRaw: a status written by a private device reads as null', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha')
+  updateProject(db, { userId: 1, projectId: a.p.id, fields: { status: 'Secret plans' }, statusWriter: { by: 'agent', deviceId: 9, convoId: null } })
+  postAt(db, a.convo, 'step', mid(-1))
+  assert.equal(weekRaw(db, 1, keyOf(-1), at).projects[0].status, null)
+})
+
+test('a note written before a merge follows the project into its survivor', () => {
+  const db = seeded()
+  const gone = proj(db, 'Gone', { createdAt: NOW - 40 * DAY })
+  const survivor = proj(db, 'Survivor', { createdAt: NOW - 40 * DAY })
+  db.prepare('INSERT INTO project_notes(user_id, project_id, note, written_at) VALUES(1,?,?,?)').run(gone.p.id, 'Left mid-way.', NOW - DAY)
+  mergeProject(db, { userId: 1, projectId: gone.p.id, intoId: survivor.p.id, by: 'user' })
+  const row = openLong(db, 1, at).rows.find((r) => r.project.id === survivor.p.id)
+  assert.equal(row.note, 'Left mid-way.')
 })

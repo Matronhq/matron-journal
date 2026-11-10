@@ -516,6 +516,32 @@ CREATE TABLE IF NOT EXISTS briefing_refresh(
   requested_at INTEGER NOT NULL,
   outcome      TEXT
 );
+-- Weekly timeline stories (spec 2026-11-09 projects timeline, phase 2): the
+-- lede and story cards the user's Coordinator wrote for one local week
+-- (week_start is the Monday 00:00 instant in the user's zone, week_key its
+-- date), the stories as a JSON array with resolved project/item ids. A final
+-- row is a closed week: only a final write replaces it. project_notes is the
+-- one sentence the Coordinator keeps on a project, shown in the timeline's
+-- went-quiet and open-a-long-time lists.
+CREATE TABLE IF NOT EXISTS week_stories(
+  user_id    INTEGER NOT NULL REFERENCES users(id),
+  week_start INTEGER NOT NULL,
+  week_key   TEXT NOT NULL,
+  lede       TEXT,
+  stories    TEXT NOT NULL,
+  written_at INTEGER NOT NULL,
+  final      INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(user_id, week_start)
+);
+-- Rows are looked up by week_key: the date survives a change of time zone.
+CREATE INDEX IF NOT EXISTS week_stories_key ON week_stories(user_id, week_key);
+CREATE TABLE IF NOT EXISTS project_notes(
+  user_id    INTEGER NOT NULL REFERENCES users(id),
+  project_id TEXT NOT NULL,
+  note       TEXT NOT NULL,
+  written_at INTEGER NOT NULL,
+  PRIMARY KEY(user_id, project_id)
+);
 -- Contacts and grants (spec 2026-10-02 matron-to-matron sharing, phase 1).
 -- A contact is one row PER SIDE; nothing is shared except between two rows
 -- that are both 'active'. peer_user is the address's user part and
