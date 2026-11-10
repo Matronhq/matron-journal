@@ -507,6 +507,9 @@ const clipTitle = (row) => ({ ...row, title: clip(row.title, RAW.titleMax) })
 // page can hold fewer than `limit`; `next_offset` always follows what was
 // returned. The stored week is on the first page only (`stored` is null from
 // then on, as it is for an unwritten week; `written_at` tells them apart).
+// When a page down to one project is still too long, the stored stories come
+// back without their items (`stored.items_omitted: true`) and, if that is
+// not enough, with their first project only (`stored.projects_omitted: true`).
 // `offset` and `limit` are assumed valid. null when `weekKey` is not a week
 // key.
 export function weekRaw(db, userId, weekKey, { offset = 0, limit = RAW.page, excludePrivateOwned = true, now = Date.now() } = {}) {
@@ -597,7 +600,19 @@ export function weekRaw(db, userId, weekKey, { offset = 0, limit = RAW.page, exc
     result.next_offset = result.more_projects ? offset + projects.length : null
   }
   place()
-  while (projects.length > 1 && JSON.stringify(result).length > RAW.maxChars) { projects.pop(); place() }
+  const over = () => JSON.stringify(result).length > RAW.maxChars
+  while (projects.length > 1 && over()) { projects.pop(); place() }
+  // A week written as grouped stories can itself be most of a page. With
+  // one project left, the stored stories give up their items, then every
+  // project after their first; a flag says what was left out.
+  if (result.stored && over()) {
+    result.stored.stories = result.stored.stories.map((s) => ({ ...s, items: [] }))
+    result.stored.items_omitted = true
+    if (over()) {
+      result.stored.stories = result.stored.stories.map((s) => ({ ...s, projects: s.projects.slice(0, 1) }))
+      result.stored.projects_omitted = true
+    }
+  }
   return result
 }
 

@@ -1120,6 +1120,75 @@ test('weekRaw: a page never exceeds 36,000 characters', () => {
   }
 })
 
+// A stored week as large as the grouped-stories write allowed: 8 stories,
+// each naming 10 projects and 10 items, every text at its limit and every
+// title 200 characters. Twenty heavy projects moved; the rest are only named.
+function largeStoredWeek(db) {
+  const long = (what) => `${what} `.padEnd(200, 'x')
+  const ps = []
+  for (let n = 1; n <= 20; n++) ps.push(heavy(db, n))
+  const stories = []
+  for (let s = 0; s < 8; s++) {
+    const named = [ps[s].p.id]
+    while (named.length < 10) named.push(proj(db, long(`Named ${s}.${named.length}`)).p.id)
+    const items = []
+    for (let i = 0; i < 10; i++) items.push(item(db, ps[s].convo, 'task', long(`Stored ${s}.${i}`), { now: mid(-6) }).id)
+    stories.push(tale({ title: 't'.repeat(80), sentence: 's'.repeat(300), next: 'n'.repeat(300), project_ids: named, item_ids: items }))
+  }
+  put(db, -1, { lede: 'l'.repeat(600), stories })
+  return ps
+}
+
+test('weekRaw: a large stored week gives up its items to keep the first page within the bound', () => {
+  const db = seeded()
+  const ps = largeStoredWeek(db)
+  const first = weekRaw(db, 1, keyOf(-1), { ...at, limit: 20 })
+  const size = JSON.stringify(first).length
+  assert.ok(size <= RAW.maxChars, `${size} characters`)
+  assert.equal(first.stored.items_omitted, true)
+  assert.equal(first.stored.stories.length, 8)
+  for (const s of first.stored.stories) assert.deepEqual(s.items, [])
+  // The stories keep their text and, while the page fits, every project they name.
+  assert.equal(first.stored.projects_omitted, undefined)
+  assert.equal(first.stored.stories[0].projects.length, 10)
+  assert.equal(first.stored.stories[0].sentence, 's'.repeat(300)); assert.equal(first.stored.lede, 'l'.repeat(600))
+  assert.equal(first.stored.legacy, true)
+  // Still one moving project on the page, and paging reaches the rest.
+  assert.equal(first.projects.length, 1); assert.equal(first.projects[0].project.id, ps[0].p.id)
+  assert.equal(first.projects_total, 20); assert.equal(first.next_offset, 1); assert.equal(first.more_projects, 19)
+  const pages = rawPages(db, { limit: 20 })
+  for (const page of pages) assert.ok(JSON.stringify(page).length <= RAW.maxChars, `offset ${page.offset}`)
+  assert.deepEqual(pages.flatMap((page) => page.projects.map((x) => x.project.id)), ps.map((x) => x.p.id))
+  assert.equal(pages[1].stored, null)
+})
+
+test('weekRaw: a stored week still too large without its items keeps one project a story', () => {
+  const db = seeded()
+  const ps = largeStoredWeek(db)
+  // Titles longer than a project is given today.
+  db.prepare("UPDATE projects SET title = title || ?").run('y'.repeat(200))
+  const first = weekRaw(db, 1, keyOf(-1), { ...at, limit: 20 })
+  const size = JSON.stringify(first).length
+  assert.ok(size <= RAW.maxChars, `${size} characters`)
+  assert.equal(first.stored.items_omitted, true); assert.equal(first.stored.projects_omitted, true)
+  assert.equal(first.stored.stories.length, 8)
+  first.stored.stories.forEach((s, i) => {
+    assert.deepEqual(s.items, [])
+    assert.deepEqual(s.projects.map((p) => p.id), [ps[i].p.id], 'the main project stays')
+  })
+  assert.equal(first.projects.length, 1); assert.equal(first.next_offset, 1)
+})
+
+test('weekRaw: a stored week that fits is returned whole, with no omission flags', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha'); postAt(db, a.convo, 'a', mid(-1))
+  const it = item(db, a.convo, 'task', 'Invoices', { now: mid(-1) })
+  put(db, -1, { stories: [tale({ project_ids: [a.p.id], item_ids: [it.id] })] })
+  const { stored } = weekRaw(db, 1, keyOf(-1), at)
+  assert.deepEqual(Object.keys(stored), ['lede', 'final', 'legacy', 'stories'])
+  assert.equal(stored.stories[0].items.length, 1)
+})
+
 test('weekRaw: one project with every cap at its limit is far under the page bound', () => {
   const db = seeded()
   heavy(db, 1)
