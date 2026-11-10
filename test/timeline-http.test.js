@@ -6,7 +6,7 @@ import { upsertConversation, append } from '../src/journal.js'
 import { setCoordinatorConvoId } from '../src/coordinator.js'
 import { storedWeek } from '../src/week-stories.js'
 import { pinDevicePrivate } from '../src/db.js'
-import { createProject, closeProject } from '../src/projects.js'
+import { createProject, closeProject, mergeProject } from '../src/projects.js'
 import { createMission, closeMission, createMilestone } from '../src/missions.js'
 import { weekStartOf, formatWeekKey, previousWeekStart, weekEndOf, parseWeekKey, userTimeZone } from '../src/timeline.js'
 
@@ -529,4 +529,64 @@ test('raw read always applies the agent sieve, even on a private device; a writt
   assert.equal(typeof detail.json.written_at, 'number')
   const list = await get(s, '/timeline/weeks', client)
   assert.equal(list.json.weeks[0].sentence, 'A busy week.'); assert.equal(list.json.weeks[0].written, true)
+})
+
+// ---- GET /timeline/projects/:id (the project page's summary) ----
+
+test('project page: 401 without a token; 404 for an unknown project', async (t) => {
+  const { s, client } = await fleet(t)
+  assert.equal((await get(s, '/timeline/projects/1', undefined)).status, 401)
+  for (const unknown of ['999', 'pj_nope', 'nope', '0']) {
+    const r = await get(s, `/timeline/projects/${unknown}`, client)
+    assert.equal(r.status, 404, unknown)
+    assert.deepEqual(r.json, { error: 'not_found' }, unknown)
+  }
+  assert.equal((await get(s, '/timeline/projects/%E0%A4%A', client)).status, 400)
+  assert.equal((await get(s, '/timeline/projects/1/extra', client)).status, 404)
+})
+
+test('project page: by id or number, in the shape projectPage returns', async (t) => {
+  const { s, alice, agent, client } = await fleet(t)
+  const { p } = liveProject(s, alice, agent, 'Promo launch', 1_000_000)
+  const expected = {
+    project: { id: p.id, num: p.num, title: 'Promo launch', state: 'open', live: true },
+    sentence: null, sentence_source: null, next: null,
+    needs_you: [], needs_you_total: 0, media: null,
+    counts: { weeks: 1, missions_open: 1, missions_done: 0, files: 0 },
+  }
+  for (const ref of [p.id, String(p.num)]) {
+    const r = await get(s, `/timeline/projects/${ref}`, client)
+    assert.equal(r.status, 200)
+    assert.deepEqual(r.json, expected)
+  }
+  assert.deepEqual((await get(s, `/timeline/projects/${p.id}`, agent.token)).json, expected)
+})
+
+test('project page: a merged project answers as its survivor with merged_from', async (t) => {
+  const { s, alice, agent, client } = await fleet(t)
+  const a = liveProject(s, alice, agent, 'Survivor', 1_000_000)
+  const gone = liveProject(s, alice, agent, 'Gone', 2_000_000)
+  mergeProject(s.db, { userId: alice.id, projectId: gone.p.id, intoId: a.p.id, by: 'user' })
+  for (const ref of [gone.p.id, String(gone.p.num)]) {
+    const r = await get(s, `/timeline/projects/${ref}`, client)
+    assert.equal(r.status, 200)
+    assert.equal(r.json.project.id, a.p.id); assert.equal(r.json.project.title, 'Survivor')
+    assert.deepEqual(r.json.merged_from, { id: gone.p.id, num: gone.p.num })
+    assert.equal(r.json.counts.missions_open, 2)
+  }
+  assert.equal('merged_from' in (await get(s, `/timeline/projects/${a.p.id}`, client)).json, false)
+})
+
+test('project page: an agent device gets 404 for a private-origin project; the client reads it', async (t) => {
+  const { s, alice, agent, priv, client } = await fleet(t)
+  const hidden = liveProject(s, alice, priv, 'Hidden', 2_000_000, { convoId: 'secret' })
+  assert.equal((await get(s, `/timeline/projects/${hidden.p.id}`, agent.token)).status, 404)
+  assert.equal((await get(s, `/timeline/projects/${hidden.p.num}`, agent.token)).status, 404)
+  const mine = await get(s, `/timeline/projects/${hidden.p.id}`, client)
+  assert.equal(mine.status, 200); assert.equal(mine.json.project.title, 'Hidden')
+  // On a visible project, the private box's mission is not counted for the agent.
+  const open = liveProject(s, alice, agent, 'Visible', 1_000_000)
+  createMission(s.db, { userId: alice.id, deviceId: priv.deviceId, createdBy: 'agent', convoId: 'secret', title: 'quiet work', projectId: open.p.id, attach: false })
+  assert.equal((await get(s, `/timeline/projects/${open.p.id}`, client)).json.counts.missions_open, 2)
+  assert.equal((await get(s, `/timeline/projects/${open.p.id}`, agent.token)).json.counts.missions_open, 1)
 })

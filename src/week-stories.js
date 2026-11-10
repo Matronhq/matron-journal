@@ -307,6 +307,22 @@ export function writtenWeeks(db, userId, weekKeys) {
   return out
 }
 
+// Every written week of the user, newest first.
+export function allWrittenWeeks(db, userId) {
+  const rows = db.prepare(`SELECT week_key, lede, stories, written_at, final FROM week_stories
+    WHERE user_id = ? ORDER BY week_key DESC, week_start DESC`).all(userId)
+  const out = []
+  let last = null
+  for (const r of rows) {
+    // As storedWeek reads a key held by two rows: the later instant only.
+    if (r.week_key === last) continue
+    last = r.week_key
+    const w = parseRow(r)
+    if (written(w)) out.push(w)
+  }
+  return out
+}
+
 // The notes on the given project ids: Map(project id → { note, written_at }).
 export function projectNotes(db, userId, projectIds) {
   const out = new Map()

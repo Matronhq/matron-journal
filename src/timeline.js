@@ -138,6 +138,25 @@ const moveRows = (db, userId, { from, to, excludePrivateOwned }) =>
   db.prepare(`SELECT project_id, at FROM (${movesSql(excludePrivateOwned)}) WHERE at >= @from AND at < @to`)
     .all({ userId, from, to })
 
+// Every instant the project moved, newest first: its own moves and those
+// credited to it from projects merged into it.
+export const projectMoveTimes = (db, userId, projectId, { excludePrivateOwned = false } = {}) =>
+  db.prepare(`SELECT at FROM (${movesSql(excludePrivateOwned)}) WHERE project_id = @projectId ORDER BY at DESC`)
+    .pluck().all({ userId, projectId })
+
+// The start of every local week holding one of `times` (instants, newest
+// first), newest first. One calendar lookup per week, not per instant.
+export function weekStartsOf(times, tz) {
+  const out = []
+  let start = Infinity
+  for (const t of times) {
+    if (t >= start) continue
+    start = weekStartOf(t, tz)
+    out.push(start)
+  }
+  return out
+}
+
 // Moves per project with at least one in [from, to).
 export function projectMoves(db, userId, { from, to, excludePrivateOwned = false }) {
   const rows = db.prepare(`SELECT project_id, COUNT(*) AS n FROM (${movesSql(excludePrivateOwned)})
@@ -193,7 +212,7 @@ const openMissionSql = (excludePrivateOwned) => `EXISTS (SELECT 1 FROM missions 
 // with at least one open mission), whether it has any mission at all, and,
 // when it is not live, when it finished: its close, else its newest mission
 // close, else (no mission ever) its creation.
-function rowProjects(db, userId, excludePrivateOwned) {
+export function rowProjects(db, userId, excludePrivateOwned) {
   const originSieve = excludePrivateOwned ? `AND ${ORIGIN_SIEVE}` : ''
   // The status sieve, as GET /projects applies it: a status written from or
   // by a private device reads as null.
@@ -208,7 +227,7 @@ function rowProjects(db, userId, excludePrivateOwned) {
     WHERE p.user_id = ? AND p.merged_into IS NULL ${excludePrivateOwned ? `AND ${PROJECT_ORIGIN_SIEVE}` : ''}`)
     .all(userId).map((r) => ({ ...r, live: Boolean(r.live), has_mission: Boolean(r.has_mission) }))
 }
-const refOf = (p) => ({ id: p.id, num: p.num, title: p.title })
+export const refOf = (p) => ({ id: p.id, num: p.num, title: p.title })
 
 // The projects that moved, most moves first (ties by number), as
 // [{ project, moved }]; projects the caller cannot see as rows are dropped.
@@ -284,7 +303,7 @@ export function weeksList(db, userId, { before = null, limit = TIMELINE.weeksPag
 // The projects a stored week names, as the reader sees them now: each stored
 // id through a merge to the project that survived it, kept only when it is a
 // row the caller may see. Map(stored id → project).
-function survivingProjects(db, userId, ids, byId) {
+export function survivingProjects(db, userId, ids, byId) {
   const out = new Map()
   if (!ids.length) return out
   const rows = db.prepare(`SELECT id, merged_into FROM projects
@@ -319,12 +338,12 @@ function liveItems(db, userId, ids, byId, excludePrivateOwned) {
 }
 
 // Whether a content type is one a card can show: an image or a video.
-const isPicture = (type) => /^(image|video)\//.test(type ?? '')
+export const isPicture = (type) => /^(image|video)\//.test(type ?? '')
 
 // The stored pictures that still exist and that the caller may see (under the
 // sieve, one the files roll-up still shows): Map(blob id → { blob_id,
 // content_type, name }). One pass over the roll-up for all of them.
-function liveMedia(db, userId, blobIds, excludePrivateOwned) {
+export function liveMedia(db, userId, blobIds, excludePrivateOwned) {
   const out = new Map()
   if (!blobIds.length) return out
   const ids = JSON.stringify(blobIds)
@@ -342,6 +361,14 @@ function liveMedia(db, userId, blobIds, excludePrivateOwned) {
   return out
 }
 
+// The projects one stored story names, as the reader sees them now, in the
+// stored order and each once: `projects` is survivingProjects' map. The first
+// is the story's main project; a story left with none is not shown.
+export function storyProjects(story, projects) {
+  const seen = new Set()
+  return story.project_ids.map((id) => projects.get(id)).filter((p) => p && !seen.has(p.id) && seen.add(p.id))
+}
+
 // The stored stories as the caller sees them now, in stored order:
 // { title, sentence, next, projects: [project row], items: [{id,num,title,done}],
 // media: {blob_id,content_type,name}|null }. A story left with no visible
@@ -353,8 +380,7 @@ function resolveStored(db, userId, stored, byId, excludePrivateOwned) {
   const media = liveMedia(db, userId, all((s) => (s.media_blob_id ? [s.media_blob_id] : [])), excludePrivateOwned)
   const out = []
   for (const s of stored.stories) {
-    const seen = new Set()
-    const rows = s.project_ids.map((id) => projects.get(id)).filter((p) => p && !seen.has(p.id) && seen.add(p.id))
+    const rows = storyProjects(s, projects)
     if (!rows.length) continue
     out.push({
       title: s.title, sentence: s.sentence, next: s.next, projects: rows,
@@ -366,10 +392,10 @@ function resolveStored(db, userId, stored, byId, excludePrivateOwned) {
 }
 
 // A caller's sieve over an item's or milestone's conversation `c` and mission `m`.
-const convoSieveOf = (excludePrivateOwned) => (excludePrivateOwned ? `AND NOT ${privateConvo('c')} AND ${ORIGIN_SIEVE}` : '')
+export const convoSieveOf = (excludePrivateOwned) => (excludePrivateOwned ? `AND NOT ${privateConvo('c')} AND ${ORIGIN_SIEVE}` : '')
 // The project's missions (@projectId) and those still filed under a project merged into it.
-const IN_PROJECT = 'm.project_id IN (SELECT q.id FROM projects q WHERE q.id = @projectId OR q.merged_into = @projectId)'
-const OF_PROJECT = `m.user_id = @userId AND ${IN_PROJECT}`
+export const IN_PROJECT = 'm.project_id IN (SELECT q.id FROM projects q WHERE q.id = @projectId OR q.merged_into = @projectId)'
+export const OF_PROJECT = `m.user_id = @userId AND ${IN_PROJECT}`
 
 // The project's open items awaiting the user, as the timeline shows them:
 // unlike projectDetail's needs-you, consent cards are left out, newest created
@@ -382,14 +408,14 @@ const OF_PROJECT = `m.user_id = @userId AND ${IN_PROJECT}`
 const needsYouFrom = (convoSieve) => `FROM items i JOIN missions m ON m.id = i.mission_id
       JOIN conversations c ON c.id = i.origin_convo_id
     WHERE ${OF_PROJECT} AND i.state = 'open' AND i.awaiting = 'user' AND +i.consent IS NULL AND i.created_at < @end ${convoSieve}`
-const needsYouSql = (convoSieve, limit = -1) => `SELECT i.id, i.num, i.title ${needsYouFrom(convoSieve)}
+export const needsYouSql = (convoSieve, limit = -1) => `SELECT i.id, i.num, i.title ${needsYouFrom(convoSieve)}
     ORDER BY i.created_at DESC, i.num DESC LIMIT ${limit}`
 
 // The counts behind a week card's marks, for one project (@projectId) and one
 // week (@start, @end): `forYou`, how many items the needs-you list would hold,
 // and `done`, how many items on the project's missions were closed in the
 // week. Consent cards are in neither; both go through the caller's sieve.
-const forYouSql = (convoSieve) => `SELECT COUNT(*) AS n ${needsYouFrom(convoSieve)}`
+export const forYouSql = (convoSieve) => `SELECT COUNT(*) AS n ${needsYouFrom(convoSieve)}`
 const doneSql = (convoSieve) => `SELECT COUNT(*) AS n FROM items i JOIN missions m ON m.id = i.mission_id
       JOIN conversations c ON c.id = i.origin_convo_id
     WHERE ${OF_PROJECT} AND +i.consent IS NULL AND i.closed_at >= @start AND i.closed_at < @end ${convoSieve}`

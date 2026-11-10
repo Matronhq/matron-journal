@@ -1,5 +1,6 @@
 // HTTP surface of the projects timeline (spec 2026-11-09 projects timeline).
-// Six reads over projects, missions, items and milestones; the Coordinator's
+// Six reads over projects, missions, items and milestones; one project's
+// page (GET /timeline/projects/:id); the Coordinator's
 // paged raw read of one week (GET /timeline/weeks/:week?raw=1); and its two
 // writes of a week: a lede and story cards (POST /timeline/weeks/:week) or
 // one entry per project (POST /timeline/weeks/:week/entries), storage and
@@ -7,10 +8,12 @@
 // valid input, so every parameter is validated here (400) before one is
 // called.
 import { json, readBody } from './http-body.js'
-import { badRequest } from './http-who.js'
+import { badRequest, notFound } from './http-who.js'
 import { closingConvo, refusedCloser } from './missions-http.js'
 import { filteredAgent } from './privacy.js'
 import { parseCursor } from './projects-feed.js'
+import { resolveProject } from './projects.js'
+import { projectPage } from './timeline-project.js'
 import { validWeekWrite, writeWeek, validWeekEntries, writeWeekEntries } from './week-stories.js'
 import {
   weeksList, weekDetail, weekRaw, RAW, TIMELINE, wentQuiet, openLong, finished, allProjects, parseWeekKey, userTimeZone,
@@ -69,6 +72,17 @@ function handleProjects(db, res, url, who, opts) {
   return true
 }
 
+// GET /timeline/projects/:id — one project's page; `:id` is a project id or
+// its number. A read, so it follows a merge to the project that survived it,
+// as GET /projects/:id does: the survivor's page plus `merged_from`. A project
+// the caller cannot see is 404, like one that does not exist.
+function handleProject(db, res, who, ref, opts) {
+  const r = resolveProject(db, who.userId, ref, opts)
+  if (!r) return notFound(res)
+  json(res, 200, { ...projectPage(db, who.userId, r.project, opts), ...(r.mergedFrom ? { merged_from: r.mergedFrom } : {}) })
+  return true
+}
+
 // POST /timeline/weeks/:week — the Coordinator's lede and story cards for one
 // week, and its notes on projects. POST /timeline/weeks/:week/entries — the
 // same week as one entry per project (`entries` true): no lede, no titles,
@@ -113,6 +127,12 @@ export async function handleTimelineRoute(ctx, req, res, url, who) {
   if (path === '/timeline/long') { json(res, 200, openLong(db, who.userId, rawOpts)); return true }
   if (path === '/timeline/finished') return handleFinished(db, res, url, who, opts)
   if (path === '/timeline/projects') return handleProjects(db, res, url, who, opts)
+  const one = path.match(/^\/timeline\/projects\/([^/]+)$/)
+  if (one) {
+    let ref
+    try { ref = decodeURIComponent(one[1]) } catch { return badRequest(res) }
+    return handleProject(db, res, who, ref, opts)
+  }
   const m = path.match(/^\/timeline\/weeks\/([^/]+)$/)
   if (!m) return false
   let week
