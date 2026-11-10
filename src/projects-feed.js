@@ -115,13 +115,17 @@ export function milestonesSql(excludePrivateOwned, projectMatch = 'm.project_id 
   const sieve = excludePrivateOwned ? `AND NOT ${privateConvo('c')} AND ${ORIGIN_SIEVE}` : ''
   return `SELECT l.*, m.num AS mission_num, l.created_at AS at, ${pad('l.seq')} AS sort_key
     FROM milestones l JOIN missions m ON m.id = l.mission_id JOIN conversations c ON c.id = l.convo_id
-    WHERE ${projectMatch} AND m.user_id = @userId ${sieve}`
+    WHERE ${projectMatch} AND +m.user_id = @userId ${sieve}`
+  // `+m.user_id`, as in filesSql: `projectMatch` finds the missions (through
+  // idx_missions_project), not a read of every mission the user has, and each
+  // one's milestones follow through idx_milestones_mission (pinned by tests).
 }
 
 const SQL = { decisions: decisionsSql, files: filesSql, milestones: milestonesSql }
-// Test seam: the query-plan test reads the files SQL directly (the
-// timeline's week media reuses it as filesSql).
+// Test seam: the query-plan tests read the files and milestones SQL directly
+// (the timeline's week media reuses the first as filesSql).
 export const filesSqlForTest = filesSql
+export const milestonesSqlForTest = milestonesSql
 
 const strip = ({ at: _at, sort_key: _key, ...rest }) => rest
 // A milestonesSql row as the feed returns it (the project history returns the same).

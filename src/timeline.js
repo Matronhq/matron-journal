@@ -133,12 +133,17 @@ function moveArms(excludePrivateOwned, { cols = '', join = '', scope, consent })
       WHERE ${scope} AND m.closed_at IS NOT NULL ${originSieve}`
 }
 
-// Every move of the user (@userId) as (project_id, at).
+// Every move of the user (@userId) as (project_id, at). Each arm starts from
+// the user's missions (idx_missions_user_state) and reads each one's
+// milestones, items and comments through their own indexes (pinned by a
+// test). `+i.consent` holds that without ANALYZE statistics: it keeps SQLite
+// off idx_items_consent, which it otherwise prefers, reading nearly every
+// item of every user for the all-projects list and each week read.
 const movesSql = (excludePrivateOwned) => moveArms(excludePrivateOwned, {
   cols: 'COALESCE(p.merged_into, p.id) AS project_id, ',
   join: 'JOIN projects p ON p.id = m.project_id AND p.user_id = m.user_id',
   scope: 'm.user_id = @userId',
-  consent: 'i.consent IS NULL',
+  consent: '+i.consent IS NULL',
 })
 
 // Every move of one project (@projectId, a project that is not itself merged

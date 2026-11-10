@@ -7,7 +7,7 @@ import { createMission, closeMission, createMilestone } from '../src/missions.js
 import { createProject, mergeProject, updateProject, resolveProject } from '../src/projects.js'
 import { writeWeek } from '../src/week-stories.js'
 import { weekStartOf, formatWeekKey, projectMoveTimes, movesSqlForTest, liveMedia, IN_PROJECT } from '../src/timeline.js'
-import { projectFeed, filesSqlForTest } from '../src/projects-feed.js'
+import { projectFeed, filesSqlForTest, milestonesSqlForTest } from '../src/projects-feed.js'
 import { projectPage, projectHistory, PROJECT_PAGE, PROJECT_HISTORY } from '../src/timeline-project.js'
 
 // ---- fixtures: alice (user 1) with an ordinary box (7), a client (8) and a
@@ -178,6 +178,32 @@ test("a project's moves are reached through its missions, never through the cons
     assert.equal(count(/SEARCH i USING INDEX idx_items_mission \(mission_id=\?/g), 3, `sieved ${sieve}`)
     assert.equal(count(/SEARCH l USING INDEX idx_milestones_mission \(mission_id=\?/g), 1, `sieved ${sieve}`)
     assert.equal(count(/SEARCH ic USING INDEX idx_item_comments_item \(item_id=\?/g), 1, `sieved ${sieve}`)
+  }
+})
+
+test("the moves of every project are reached through the user's missions, never through the consent index", () => {
+  const db = seeded()
+  for (const sieve of [false, true]) {
+    const inner = movesSqlForTest.user(sieve)
+    // As written, and as the reads use it: the newest move per project, and
+    // the moves of a span of weeks.
+    for (const [name, sql, args] of [
+      ['plain', inner, {}],
+      ['newest', `SELECT project_id, MAX(at) AS at FROM (${inner}) GROUP BY project_id`, {}],
+      ['span', `SELECT project_id, COUNT(*) AS n FROM (${inner}) WHERE at >= @from AND at < @to GROUP BY project_id`, { from: 0, to: 1 }],
+    ]) {
+      const text = planOf(db, sql, { userId: 1, ...args })
+      const count = (re) => (text.match(re) ?? []).length
+      const what = `${name}, sieved ${sieve}`
+      assert.doesNotMatch(text, /idx_items_consent/, what)
+      assert.doesNotMatch(text, /SCAN (m|i|l|ic|p)\b/, what)
+      // Six arms, each from the user's missions; three of them go on to the
+      // missions' items, one to their milestones, one to the items' comments.
+      assert.equal(count(/SEARCH m USING INDEX idx_missions_user_state \(user_id=\?/g), 6, what)
+      assert.equal(count(/SEARCH i USING INDEX idx_items_mission \(mission_id=\?/g), 3, what)
+      assert.equal(count(/SEARCH l USING INDEX idx_milestones_mission \(mission_id=\?/g), 1, what)
+      assert.equal(count(/SEARCH ic USING INDEX idx_item_comments_item \(item_id=\?/g), 1, what)
+    }
   }
 })
 
@@ -431,7 +457,7 @@ test('a story naming a private-origin project: the project stays invisible to a 
   assert.equal(page(db, a.p, sieved).next, 'After the merge')
 })
 
-test("the files roll-up of a project starts from its missions, and a picture lookup from the user's, never from the consent index", () => {
+test("the files roll-up and the milestones of a project start from its missions, and a picture lookup from the user's, never from the consent index", () => {
   const db = seeded()
   const a = proj(db, 'Billing')
   for (const sieve of [false, true]) {
@@ -442,6 +468,11 @@ test("the files roll-up of a project starts from its missions, and a picture loo
     assert.match(text, /SEARCH i USING INDEX idx_items_mission \(mission_id=\?/, `sieved ${sieve}`)
     assert.match(text, /SEARCH ic USING INDEX idx_item_comments_item \(item_id=\?/, `sieved ${sieve}`)
     assert.match(text, /SEARCH e USING INDEX idx_events_media \(convo_id=\?/, `sieved ${sieve}`)
+    // The history's milestones start from the project's missions too.
+    const steps = planOf(db, `SELECT * FROM (${milestonesSqlForTest(sieve, IN_PROJECT)})`, { userId: 1, projectId: a.p.id })
+    assert.doesNotMatch(steps, /idx_missions_user_state|SCAN (m|l|q)\b/, `milestones, sieved ${sieve}`)
+    assert.match(steps, /SEARCH m USING INDEX idx_missions_project \(project_id=\?/, `milestones, sieved ${sieve}`)
+    assert.match(steps, /SEARCH l USING INDEX idx_milestones_mission \(mission_id=\?/, `milestones, sieved ${sieve}`)
     blobRow(db, `b-${sieve}`)
     const [lookup] = prepared(db, () => liveMedia(db, 1, [`b-${sieve}`], sieve)).filter((sql) => /json_each\(ic\.attachments\)/.test(sql))
     const found = planOf(db, lookup, { userId: 1, ids: '[]' })
