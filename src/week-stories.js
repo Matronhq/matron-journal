@@ -156,8 +156,15 @@ function blobAllowed(db, userId, blobId, excludePrivateOwned) {
   const blob = db.prepare('SELECT content_type FROM blobs WHERE id = ? AND owner_user_id = ?').get(blobId, userId)
   if (!blob || !/^(image|video)\//.test(blob.content_type ?? '')) return false
   if (!excludePrivateOwned) return true
-  return !!db.prepare(`SELECT 1 FROM (${filesSql(true, '1 = 1')}) f WHERE f.blob_id = @blobId LIMIT 1`).get({ userId, blobId })
+  return !!db.prepare(PICTURE_ROLLUP_SQL).get({ userId, blobId })
 }
+// The roll-up over every mission of the user, as liveMedia reads it: the
+// scope names the user, so the missions are found through
+// idx_missions_user_state and nothing of another user is read (pinned by a
+// test).
+const PICTURE_ROLLUP_SQL = `SELECT 1 FROM (${filesSql(true, 'm.user_id = @userId')}) f WHERE f.blob_id = @blobId LIMIT 1`
+// Test seam: the query-plan test reads the picture check's SQL directly.
+export const pictureRollupSqlForTest = PICTURE_ROLLUP_SQL
 
 // A 400 that names the reference it is about.
 const unknown = (error, ref) => ({ error: 'bad_request', detail: error, ref })
