@@ -96,42 +96,69 @@ export function parseWeekKey(key, tz) {
 // hop reaches the survivor). `excludePrivateOwned` applies the same two sieves
 // as the project feed: a private device's conversation or comment, and a
 // mission born in a private device's conversation.
-function movesSql(excludePrivateOwned) {
+//
+// The six kinds of move are written once, as `moveArms`, and read two ways:
+// for every project of the user at once (`movesSql`), and for one project
+// through its own missions (`projectMovesSql`). `cols` is what an arm selects
+// before its instant, `join` what it joins to the mission `m`, `scope` which
+// missions it takes and `consent` how it leaves consent cards out.
+function moveArms(excludePrivateOwned, { cols = '', join = '', scope, consent }) {
   const convoSieve = convoSieveOf(excludePrivateOwned)
   const commentSieve = excludePrivateOwned ? `AND NOT ${privateDevice('ic.device_id')}` : ''
   const originSieve = excludePrivateOwned ? `AND ${ORIGIN_SIEVE}` : ''
-  const of = 'COALESCE(p.merged_into, p.id)'
-  const joinProject = 'JOIN projects p ON p.id = m.project_id AND p.user_id = m.user_id'
-  return `SELECT ${of} AS project_id, l.created_at AS at
-      FROM milestones l JOIN missions m ON m.id = l.mission_id ${joinProject}
+  const ofItem = `JOIN missions m ON m.id = i.mission_id ${join}
+      JOIN conversations c ON c.id = i.origin_convo_id
+      WHERE ${scope} AND ${consent}`
+  return `SELECT ${cols}l.created_at AS at
+      FROM milestones l JOIN missions m ON m.id = l.mission_id ${join}
       JOIN conversations c ON c.id = l.convo_id
-      WHERE m.user_id = @userId ${convoSieve}
+      WHERE ${scope} ${convoSieve}
     UNION ALL
-    SELECT ${of}, i.created_at
-      FROM items i JOIN missions m ON m.id = i.mission_id ${joinProject}
-      JOIN conversations c ON c.id = i.origin_convo_id
-      WHERE m.user_id = @userId AND i.consent IS NULL ${convoSieve}
+    SELECT ${cols}i.created_at AS at
+      FROM items i ${ofItem} ${convoSieve}
     UNION ALL
-    SELECT ${of}, i.closed_at
-      FROM items i JOIN missions m ON m.id = i.mission_id ${joinProject}
-      JOIN conversations c ON c.id = i.origin_convo_id
-      WHERE m.user_id = @userId AND i.consent IS NULL AND i.closed_at IS NOT NULL ${convoSieve}
+    SELECT ${cols}i.closed_at AS at
+      FROM items i ${ofItem} AND i.closed_at IS NOT NULL ${convoSieve}
     UNION ALL
-    SELECT ${of}, ic.created_at
-      FROM item_comments ic JOIN items i ON i.id = ic.item_id
-      JOIN missions m ON m.id = i.mission_id ${joinProject}
-      JOIN conversations c ON c.id = i.origin_convo_id
-      WHERE m.user_id = @userId AND i.consent IS NULL AND ic.kind = 'comment' AND ic.withdrawn_at IS NULL
-        ${convoSieve} ${commentSieve}
+    SELECT ${cols}ic.created_at AS at
+      FROM item_comments ic JOIN items i ON i.id = ic.item_id ${ofItem}
+        AND ic.kind = 'comment' AND ic.withdrawn_at IS NULL ${convoSieve} ${commentSieve}
     UNION ALL
-    SELECT ${of}, m.created_at
-      FROM missions m ${joinProject}
-      WHERE m.user_id = @userId ${originSieve}
+    SELECT ${cols}m.created_at AS at
+      FROM missions m ${join}
+      WHERE ${scope} ${originSieve}
     UNION ALL
-    SELECT ${of}, m.closed_at
-      FROM missions m ${joinProject}
-      WHERE m.user_id = @userId AND m.closed_at IS NOT NULL ${originSieve}`
+    SELECT ${cols}m.closed_at AS at
+      FROM missions m ${join}
+      WHERE ${scope} AND m.closed_at IS NOT NULL ${originSieve}`
 }
+
+// Every move of the user (@userId) as (project_id, at).
+const movesSql = (excludePrivateOwned) => moveArms(excludePrivateOwned, {
+  cols: 'COALESCE(p.merged_into, p.id) AS project_id, ',
+  join: 'JOIN projects p ON p.id = m.project_id AND p.user_id = m.user_id',
+  scope: 'm.user_id = @userId',
+  consent: 'i.consent IS NULL',
+})
+
+// Every move of one project (@projectId, a project that is not itself merged
+// away) as (at): the same moves as movesSql credits to it, read from its own
+// missions outwards instead of from everything the user has. The project's
+// missions and those of projects merged into it come first (IN_PROJECT);
+// each one's milestones are read through idx_milestones_mission, its items
+// through idx_items_mission and their comments through idx_item_comments_item
+// (pinned by a test).
+// The two unary pluses hold that plan without ANALYZE statistics:
+// `+i.consent` keeps SQLite off idx_items_consent, which it otherwise prefers,
+// reading nearly every item of every user on each request; `+m.user_id` keeps
+// it off idx_missions_user_state, so the missions are found through
+// idx_missions_project rather than by reading every mission the user has.
+const projectMovesSql = (excludePrivateOwned) => moveArms(excludePrivateOwned, {
+  scope: `+m.user_id = @userId AND ${IN_PROJECT}`,
+  consent: '+i.consent IS NULL',
+})
+// Test seam: both readings of the moves as SQL.
+export const movesSqlForTest = { user: movesSql, project: projectMovesSql }
 
 // Every move in [from, to) as {project_id, at}.
 const moveRows = (db, userId, { from, to, excludePrivateOwned }) =>
@@ -141,7 +168,7 @@ const moveRows = (db, userId, { from, to, excludePrivateOwned }) =>
 // Every instant the project moved, newest first: its own moves and those
 // credited to it from projects merged into it.
 export const projectMoveTimes = (db, userId, projectId, { excludePrivateOwned = false } = {}) =>
-  db.prepare(`SELECT at FROM (${movesSql(excludePrivateOwned)}) WHERE project_id = @projectId ORDER BY at DESC`)
+  db.prepare(`SELECT at FROM (${projectMovesSql(excludePrivateOwned)}) ORDER BY at DESC`)
     .pluck().all({ userId, projectId })
 
 // The start of every local week holding one of `times` (instants, newest

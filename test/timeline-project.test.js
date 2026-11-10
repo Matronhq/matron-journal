@@ -2,11 +2,11 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { openDb } from '../src/db.js'
 import { upsertConversation, append } from '../src/journal.js'
-import { createItem, addComment } from '../src/items.js'
+import { createItem, addComment, closeItem } from '../src/items.js'
 import { createMission, closeMission, createMilestone } from '../src/missions.js'
 import { createProject, mergeProject, updateProject, resolveProject } from '../src/projects.js'
 import { writeWeek } from '../src/week-stories.js'
-import { weekStartOf, formatWeekKey } from '../src/timeline.js'
+import { weekStartOf, formatWeekKey, projectMoveTimes, movesSqlForTest } from '../src/timeline.js'
 import { projectFeed } from '../src/projects-feed.js'
 import { projectPage, projectHistory, PROJECT_PAGE, PROJECT_HISTORY } from '../src/timeline-project.js'
 
@@ -87,6 +87,68 @@ const put = (db, n, stories, o = {}) => {
 }
 const pic = (id) => ({ blob_id: id, content_type: 'image/png', name: `${id}.png` })
 const page = (db, p, o = at) => projectPage(db, 1, resolveProject(db, 1, p.id, o).project, o)
+
+// ---- the project's moves ----
+
+// The whole-user moves credited to the project, newest first.
+const userMoves = (db, p, sieve) => db.prepare(`SELECT at FROM (${movesSqlForTest.user(sieve)}) WHERE project_id = @projectId ORDER BY at DESC`)
+  .pluck().all({ userId: 1, projectId: p.id })
+
+test("projectMoveTimes: a project's moves read through its missions are the whole-user moves credited to it, sieved and not, through a merge", () => {
+  const db = seeded()
+  const a = proj(db, 'Survivor', { createdAt: mid(-9) }); const gone = proj(db, 'Gone', { createdAt: mid(-12) })
+  const other = proj(db, 'Other', { createdAt: mid(-11) })
+  // One of every kind of move on the survivor, on the project merged into it,
+  // on the private box, and on a project that must not be counted.
+  for (const [convo, base] of [[a.convo, -8], [gone.convo, -10], [other.convo, -7]]) {
+    postAt(db, convo, 'A step', mid(base))
+    const it = item(db, convo, 'task', 'A task', { now: mid(base, 1) })
+    addComment(db, { userId: 1, itemId: it.id, author: 'agent', deviceId: 7, body: 'Seen', now: mid(base, 2) })
+    addComment(db, { userId: 1, itemId: it.id, author: 'agent', deviceId: 9, body: 'From the private box', now: mid(base, 3) })
+    closeItem(db, { userId: 1, itemId: it.id, resolution: 'done', author: 'agent', deviceId: 7, now: mid(base, 4) })
+    item(db, convo, 'question', 'Approve the spawn', { now: mid(base, 5), consent: `spawn:${convo}`, awaiting: 'user' })
+  }
+  const closing = missionOn(db, a.p, 'Short work', mid(-6)); closeAt(db, closing.m, mid(-5))
+  const hidden = privateMission(db, a.p, mid(-4))
+  postAt(db, 'secret', 'Private step', mid(-3))
+  item(db, 'secret', 'task', 'Private task', { now: mid(-3, 1) })
+  closeAt(db, hidden, mid(-2))
+  mergeProject(db, { userId: 1, projectId: gone.p.id, intoId: a.p.id, by: 'user' })
+  for (const sieve of [false, true]) {
+    const mine = projectMoveTimes(db, 1, a.p.id, { excludePrivateOwned: sieve })
+    assert.deepEqual(mine, userMoves(db, a.p, sieve), `sieved ${sieve}`)
+    assert.deepEqual(projectMoveTimes(db, 1, other.p.id, { excludePrivateOwned: sieve }), userMoves(db, other.p, sieve), `other, sieved ${sieve}`)
+  }
+  const all = projectMoveTimes(db, 1, a.p.id); const seen = projectMoveTimes(db, 1, a.p.id, { excludePrivateOwned: true })
+  // Survivor and merged project: a mission created, a milestone, an item
+  // created and closed, two comments (the close writes none), the consent
+  // card left out; plus the short mission (2) and the private one (created,
+  // closed, a milestone, an item).
+  assert.equal(all.length, 2 * 6 + 2 + 4)
+  assert.ok(all.includes(mid(-10)), 'a move made on the project merged into it')
+  assert.ok(all.includes(mid(-3)) && !seen.includes(mid(-3)), 'the private milestone is sieved')
+  // The sieve drops the private mission's moves and each private-box comment.
+  assert.equal(seen.length, all.length - 4 - 2)
+})
+
+test("a project's moves are reached through its missions, never through the consent index or every mission of the user", () => {
+  const db = seeded()
+  const a = proj(db, 'Billing')
+  for (const sieve of [false, true]) {
+    const plan = db.prepare(`EXPLAIN QUERY PLAN ${movesSqlForTest.project(sieve)}`).all({ userId: 1, projectId: a.p.id })
+    const text = plan.map((r) => r.detail).join('\n')
+    const count = (re) => (text.match(re) ?? []).length
+    assert.doesNotMatch(text, /idx_items_consent/, `sieved ${sieve}`)
+    assert.doesNotMatch(text, /idx_missions_user_state/, `sieved ${sieve}`)
+    assert.doesNotMatch(text, /SCAN (m|i|l|ic)\b/, `sieved ${sieve}`)
+    // Six arms, each from the project's missions; three of them go on to the
+    // missions' items, one to their milestones, one to the items' comments.
+    assert.equal(count(/SEARCH m USING INDEX idx_missions_project \(project_id=\?/g), 6, `sieved ${sieve}`)
+    assert.equal(count(/SEARCH i USING INDEX idx_items_mission \(mission_id=\?/g), 3, `sieved ${sieve}`)
+    assert.equal(count(/SEARCH l USING INDEX idx_milestones_mission \(mission_id=\?/g), 1, `sieved ${sieve}`)
+    assert.equal(count(/SEARCH ic USING INDEX idx_item_comments_item \(item_id=\?/g), 1, `sieved ${sieve}`)
+  }
+})
 
 // ---- projectPage ----
 
