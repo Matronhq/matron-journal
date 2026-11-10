@@ -465,12 +465,41 @@ export function weekDetail(db, userId, weekKey, { excludePrivateOwned = false, n
   }
 }
 
-// The Coordinator's raw read of one week (it writes the week's stories from
-// this): the stored week with ids resolved to refs, and every moving project
-// (most moves first, at most RAW.projects) with its milestones, items and
-// pictures of that week. null when `weekKey` is not a week key.
-const RAW = { projects: 40, milestones: 10, items: 10, media: 5, needsYou: 10 }
-export function weekRaw(db, userId, weekKey, { excludePrivateOwned = true, now = Date.now() } = {}) {
+// The limits of the Coordinator's raw week read: the page of projects it
+// returns by default and at most; per project, how many milestones, items,
+// pictures and waiting items; how long a title and a status may be; and the
+// most characters one response may run to as JSON.
+export const RAW = {
+  page: 12, pageMax: 20, milestones: 6, items: 6, media: 3, needsYou: 5, titleMax: 140, statusMax: 300, maxChars: 36_000,
+}
+
+// `text` cut to at most `max` UTF-16 code units, the last an ellipsis when
+// anything was cut. A cut never leaves half a surrogate pair.
+function clip(text, max) {
+  if (typeof text !== 'string' || text.length <= max) return text
+  const end = max - 1
+  const half = text.charCodeAt(end - 1) >= 0xd800 && text.charCodeAt(end - 1) <= 0xdbff
+  return `${text.slice(0, half ? end - 1 : end)}…`
+}
+const clipTitle = (row) => ({ ...row, title: clip(row.title, RAW.titleMax) })
+
+// The Coordinator's raw read of one week (it writes the week from this), one
+// page at a time: the stored week with ids resolved to refs, and the moving
+// projects (most moves first) from `offset`, at most `limit` of them, each
+// with its milestones, items and pictures of that week and the items still
+// waiting on the user. `projects_total` counts every moving project;
+// `next_offset` is where the next page starts, or null on the last one, and
+// `more_projects` how many projects come after this page.
+//
+// The response is bounded so its reader can take it whole: every list is
+// capped, titles and statuses are clipped, and while the JSON is longer than
+// RAW.maxChars the page gives up its last project (never its only one), so a
+// page can hold fewer than `limit`; `next_offset` always follows what was
+// returned. The stored week is on the first page only (`stored` is null from
+// then on, as it is for an unwritten week; `written_at` tells them apart).
+// `offset` and `limit` are assumed valid. null when `weekKey` is not a week
+// key.
+export function weekRaw(db, userId, weekKey, { offset = 0, limit = RAW.page, excludePrivateOwned = true, now = Date.now() } = {}) {
   const tz = userTimeZone(db, userId)
   const start = parseWeekKey(weekKey, tz)
   if (start == null) return null
@@ -486,10 +515,10 @@ export function weekRaw(db, userId, weekKey, { excludePrivateOwned = true, now =
     WHERE ${ofProject} AND l.created_at >= @start AND l.created_at < @end ${convoSieve}
     ORDER BY l.created_at DESC, l.seq DESC LIMIT ${RAW.milestones}`)
   // Every item with activity in the week (created, closed or commented, as a
-  // move counts them), for all the shown projects in one pass. The week range
-  // sits inside each arm so only the week's rows are read; the newest
+  // move counts them), for all the page's projects in one pass. The week
+  // range sits inside each arm so only the week's rows are read; the newest
   // RAW.items per project are kept.
-  const shown = moved.slice(0, RAW.projects)
+  const shown = moved.slice(offset, offset + limit)
   const itemRows = shown.length ? db.prepare(`SELECT project_id, id, num, title, kind, state, awaiting, at FROM (
       SELECT project_id, id, num, title, kind, state, awaiting, at,
         ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY at DESC, num DESC) AS rn
@@ -509,23 +538,24 @@ export function weekRaw(db, userId, weekKey, { excludePrivateOwned = true, now =
     WHERE rn <= ${RAW.items} AND project_id IN (SELECT value FROM json_each(@projectIds))
     ORDER BY at DESC, num DESC`).all({ userId, start, end, projectIds: JSON.stringify(shown.map((r) => r.project.id)) }) : []
   const itemsOf = new Map()
-  for (const { project_id: pid, ...row } of itemRows) itemsOf.set(pid, [...(itemsOf.get(pid) ?? []), row])
+  for (const { project_id: pid, ...row } of itemRows) itemsOf.set(pid, [...(itemsOf.get(pid) ?? []), clipTitle(row)])
   const media = db.prepare(`SELECT f.blob_id, f.content_type, f.name, f.at FROM (${filesSql(excludePrivateOwned, inProject)}) f
     WHERE f.at >= @start AND f.at < @end AND (f.content_type LIKE 'image/%' OR f.content_type LIKE 'video/%')
     ORDER BY f.at DESC, f.sort_key DESC LIMIT ${RAW.media}`)
-  // Everything still waiting on the user, whatever the week's activity: the
-  // Coordinator names these in `item_ids` and counts them in the lede.
+  // The newest of what still waits on the user, whatever the week's activity.
   const needsYou = needsYouStatement(db, convoSieve, inProject, ofProject, RAW.needsYou)
   const projects = shown.map(({ project, moved: n }) => {
     const args = { userId, projectId: project.id, start, end }
     return {
-      project: refOf(project), moved: n, status: project.status ?? null,
-      milestones: milestones.all(args), items: itemsOf.get(project.id) ?? [], media: media.all(args),
-      needs_you: needsYou.all(args),
+      project: refOf(project), moved: n, status: clip(project.status ?? null, RAW.statusMax),
+      milestones: milestones.all(args).map(clipTitle), items: itemsOf.get(project.id) ?? [],
+      // A file name is as long as its sender made it; it is clipped like a title.
+      media: media.all(args).map((f) => ({ ...f, name: clip(f.name, RAW.titleMax) })),
+      needs_you: needsYou.all(args).map(clipTitle),
     }
   })
   const stored = writtenWeek(db, userId, weekKey)
-  return {
+  const result = {
     week: formatWeekKey(start, tz), start, end,
     final: Boolean(stored?.final) || end <= now,
     written_at: stored?.written_at ?? null,
@@ -533,18 +563,32 @@ export function weekRaw(db, userId, weekKey, { excludePrivateOwned = true, now =
     // A story whose projects are all hidden from the caller is withheld here, as
     // the apps' read withholds it, so a Coordinator that rewrites the week from
     // this drops that story (accepted: a story never names private work).
-    stored: stored && {
+    stored: stored && offset === 0 ? {
       lede: stored.lede, final: stored.final,
+      // Written as grouped stories (a card with its own title, or one naming
+      // several projects) rather than as one entry per project. Judged on
+      // the stories as stored, whatever the caller may see of them now.
+      legacy: stored.stories.some((s) => s.title != null || s.project_ids.length > 1),
       stories: resolveStored(db, userId, stored, byId, excludePrivateOwned).map((s) => ({
         title: s.title, sentence: s.sentence, next: s.next,
         projects: s.projects.map(refOf),
-        items: s.items.map(({ id, num, title }) => ({ id, num, title })),
+        items: s.items.map(({ id, num, title }) => ({ id, num, title: clip(title, RAW.titleMax) })),
         media_blob_id: s.media?.blob_id ?? null,
       })),
-    },
+    } : null,
     projects,
-    more_projects: Math.max(0, moved.length - RAW.projects),
+    projects_total: moved.length,
+    offset,
+    next_offset: null,
+    more_projects: 0,
   }
+  const place = () => {
+    result.more_projects = Math.max(0, moved.length - offset - projects.length)
+    result.next_offset = result.more_projects ? offset + projects.length : null
+  }
+  place()
+  while (projects.length > 1 && JSON.stringify(result).length > RAW.maxChars) { projects.pop(); place() }
+  return result
 }
 
 // The activity chart for each row: TIMELINE.sparkWeeks counts ending with

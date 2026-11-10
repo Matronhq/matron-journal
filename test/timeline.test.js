@@ -12,7 +12,7 @@ import { createMission, closeMission, createMilestone } from '../src/missions.js
 import { createProject, mergeProject, updateProject, closeProject } from '../src/projects.js'
 import { writeWeek, validWeekEntries, writeWeekEntries, storedWeek } from '../src/week-stories.js'
 import {
-  weekRaw, projectMoves, projectWeeklyMoves, weeksList, weekDetail, wentQuiet, openLong, finished, cronRunsForTest,
+  weekRaw, RAW, projectMoves, projectWeeklyMoves, weeksList, weekDetail, wentQuiet, openLong, finished, cronRunsForTest,
 } from '../src/timeline.js'
 
 const LON = 'Europe/London'
@@ -799,6 +799,10 @@ test('notes on went-quiet and open-long rows: shown when fresh, null when older 
   assert.equal(long.Quiet, 'Waiting on legal.'); assert.equal(long.Stale, null)
 })
 
+const RAW_KEYS = [
+  'week', 'start', 'end', 'final', 'written_at', 'current', 'stored', 'projects', 'projects_total', 'offset', 'next_offset', 'more_projects',
+]
+
 test('weekRaw: the moving projects with status, milestones, items and media, capped; stored refs; bad key null', () => {
   const db = seeded()
   const a = proj(db, 'Alpha'); const b = proj(db, 'Bravo')
@@ -814,24 +818,25 @@ test('weekRaw: the moving projects with status, milestones, items and media, cap
     lede: 'Lede.', stories: [tale({ title: 'T', project_ids: [b.p.id, a.p.id], item_ids: [items[0].id], media_blob_id: 'b3' })],
   })
   const raw = weekRaw(db, 1, keyOf(-1), at)
-  assert.deepEqual(Object.keys(raw), ['week', 'start', 'end', 'final', 'written_at', 'current', 'stored', 'projects', 'more_projects'])
+  assert.deepEqual(Object.keys(raw), RAW_KEYS)
   assert.equal(raw.week, keyOf(-1)); assert.equal(raw.final, true); assert.equal(raw.current, false)
-  assert.equal(raw.written_at, NOW); assert.equal(raw.more_projects, 0)
+  assert.equal(raw.written_at, NOW)
+  assert.equal(raw.projects_total, 2); assert.equal(raw.offset, 0); assert.equal(raw.next_offset, null); assert.equal(raw.more_projects, 0)
   assert.equal(weekRaw(db, 1, keyOf(0), at).current, true)
   assert.deepEqual(raw.projects.map((p) => p.project.title), ['Alpha', 'Bravo'])
   const alpha = raw.projects[0]
   assert.equal(alpha.status, 'On track'); assert.equal(raw.projects[1].status, null)
   assert.ok(alpha.moved > 12)
-  assert.equal(alpha.milestones.length, 10)
+  assert.equal(alpha.milestones.length, 6)
   assert.deepEqual(alpha.milestones[0], { title: 'step 11', kind: 'progress', at: mid(-1, 11) })
   assert.ok(alpha.milestones.every((m, i, all) => i === 0 || all[i - 1].at >= m.at))
-  assert.equal(alpha.items.length, 10)
+  assert.equal(alpha.items.length, 6)
   assert.deepEqual(Object.keys(alpha.items[0]), ['id', 'num', 'title', 'kind', 'state', 'awaiting', 'at'])
   assert.equal(alpha.items[0].id, items[0].id) // newest activity: the attachment comments
-  assert.equal(alpha.media.length, 5)
+  assert.equal(alpha.media.length, 3)
   assert.deepEqual(alpha.media[0], { blob_id: 'b6', content_type: 'image/png', name: 'b6.png', at: mid(-1, 6) })
   assert.deepEqual(raw.stored, {
-    lede: 'Lede.', final: false,
+    lede: 'Lede.', final: false, legacy: true,
     stories: [{
       title: 'T', sentence: 'It shipped.', next: null, projects: [ref(b.p), ref(a.p)],
       items: [{ id: items[0].id, num: items[0].num, title: 'Item 0' }], media_blob_id: 'b3',
@@ -840,12 +845,12 @@ test('weekRaw: the moving projects with status, milestones, items and media, cap
   assert.equal(weekRaw(db, 1, '2026-11-10', at), null)
 })
 
-test('weekRaw caps the moving projects at 40 and counts the rest; applies the agent sieve; drops refs that no longer resolve', () => {
+test('weekRaw returns one page of the moving projects and counts them all; applies the agent sieve; drops refs that no longer resolve', () => {
   const db = seeded()
   const ps = []
   for (let i = 1; i <= 43; i++) { const x = proj(db, `P${i}`); postAt(db, x.convo, 'm', mid(-1)); ps.push(x) }
   const raw = weekRaw(db, 1, keyOf(-1), at)
-  assert.equal(raw.projects.length, 40); assert.equal(raw.more_projects, 3)
+  assert.equal(raw.projects.length, 12); assert.equal(raw.projects_total, 43); assert.equal(raw.more_projects, 31)
   const a = ps[0]
   const it = item(db, a.convo, 'task', 'Gone soon')
   put(db, -1, { lede: 'x', stories: [tale({ project_ids: [a.p.id], item_ids: [it.id] })] })
@@ -854,7 +859,8 @@ test('weekRaw caps the moving projects at 40 and counts the rest; applies the ag
   const out = weekRaw(db, 1, keyOf(-1), at)
   assert.deepEqual(out.stored.stories[0].items, [])
   assert.equal(out.projects.some((p) => p.project.id === ps[1].p.id), false)
-  assert.equal(out.projects.length, 40); assert.equal(out.more_projects, 2)
+  assert.equal(out.projects.length, 12); assert.equal(out.projects_total, 42); assert.equal(out.more_projects, 30)
+  assert.equal(weekRaw(db, 1, keyOf(-1), { ...at, limit: 20, offset: 40 }).projects.some((p) => p.project.id === ps[1].p.id), false)
 })
 
 test('weekRaw runs one items query for all the shown projects, reading only the week', () => {
@@ -924,7 +930,7 @@ test('a stored item whose mission sits in a project the agent cannot see is drop
 
 // ---- Review fixes: waiting items in the raw read, zone changes, non-picture media ----
 
-test('weekRaw lists, per project, every item still waiting on the user, whatever the week\'s activity; newest first, capped at 10', () => {
+test('weekRaw lists, per project, every item still waiting on the user, whatever the week\'s activity; newest first, capped at 5', () => {
   const db = seeded()
   const a = proj(db, 'Alpha'); const b = proj(db, 'Bravo')
   postAt(db, a.convo, 'a1', mid(-1)); postAt(db, b.convo, 'b1', mid(-1))
@@ -945,9 +951,10 @@ test('weekRaw lists, per project, every item still waiting on the user, whatever
   // The apps' fallback card for the same week shows the same set.
   const card = weekDetail(db, 1, keyOf(-1), at).stories.find((s) => s.project.id === a.p.id)
   assert.deepEqual(card.needs_you.map((n) => n.id), alpha.needs_you.map((n) => n.id))
-  // Capped at 10.
+  // Capped at 5, the newest kept.
   for (let i = 0; i < 12; i++) item(db, a.convo, 'question', `Q${i}`, { awaiting: 'user', now: mid(-3, i) })
-  assert.equal(weekRaw(db, 1, keyOf(-1), at).projects.find((x) => x.project.id === a.p.id).needs_you.length, 10)
+  assert.deepEqual(weekRaw(db, 1, keyOf(-1), at).projects.find((x) => x.project.id === a.p.id).needs_you.map((n) => n.title),
+    ['Fresh question', 'Q11', 'Q10', 'Q9', 'Q8'])
 })
 
 test('weekRaw needs_you applies the agent sieve', () => {
@@ -1016,6 +1023,160 @@ test('a note written before a merge follows the project into its survivor', () =
 const entry = (p, over = {}) => ({ project: p.id, sentence: 'It shipped.', ...over })
 const putEntries = (db, n, { entries = [], final = false, notes = [] } = {}, o = {}) =>
   writeWeekEntries(db, 1, keyOf(n), validWeekEntries({ entries, final, notes }), { now: NOW, excludePrivateOwned: false, ...o })
+
+// ---- The raw week read in pages, bounded in size ----
+
+// Every page of last week's raw read, following next_offset from 0.
+function rawPages(db, opts = {}) {
+  const pages = []
+  for (let offset = 0; offset != null; offset = pages.at(-1).next_offset) {
+    pages.push(weekRaw(db, 1, keyOf(-1), { ...at, ...opts, offset }))
+    assert.ok(pages.length <= 100, 'paging ends')
+  }
+  return pages
+}
+// A project that moved last week carrying as much as one project can: a
+// title and a status at their limits and more milestones, items, waiting
+// items and pictures than the read keeps, every title 200 characters.
+function heavy(db, n) {
+  const long = (what) => `${what} `.padEnd(200, 'x')
+  const x = proj(db, long(`Project ${n}`))
+  updateProject(db, { userId: 1, projectId: x.p.id, fields: { status: 's'.repeat(600) }, statusWriter: { by: 'agent', deviceId: 7, convoId: 'c1' } })
+  for (let i = 0; i < 6; i++) postAt(db, x.convo, long(`Step ${i}`), mid(-1, i))
+  const items = []
+  for (let i = 0; i < 6; i++) items.push(item(db, x.convo, 'task', long(`Task ${i}`), { now: mid(-1, i) }))
+  for (let i = 0; i < 5; i++) item(db, x.convo, 'question', long(`Question ${i}`), { awaiting: 'user', now: mid(-5, i) })
+  for (let i = 0; i < 3; i++) {
+    const id = `b${n}-${i}`
+    blobRow(db, id)
+    addComment(db, { userId: 1, itemId: items[0].id, author: 'agent', deviceId: 7, attachments: [{ blob_ref: id, mime: 'image/png', name: `${long(id)}.png`, size: 4 }], now: mid(-1, 7 + i) })
+  }
+  return x
+}
+
+test('weekRaw pages the moving projects: 12 a page, the total, where the next page starts, the stored week on the first page only', () => {
+  const db = seeded()
+  const ps = []
+  for (let i = 1; i <= 30; i++) { const x = proj(db, `P${i}`); postAt(db, x.convo, 'm', mid(-1)); ps.push(x) }
+  put(db, -1, { lede: 'Lede.', stories: [tale({ project_ids: [ps[0].p.id] })] })
+  const one = weekRaw(db, 1, keyOf(-1), at)
+  assert.deepEqual(Object.keys(one), RAW_KEYS)
+  assert.equal(one.projects.length, 12); assert.equal(one.projects_total, 30)
+  assert.equal(one.offset, 0); assert.equal(one.next_offset, 12); assert.equal(one.more_projects, 18)
+  assert.equal(one.stored.lede, 'Lede.')
+  const two = weekRaw(db, 1, keyOf(-1), { ...at, offset: 12 })
+  assert.equal(two.projects.length, 12); assert.equal(two.projects_total, 30)
+  assert.equal(two.offset, 12); assert.equal(two.next_offset, 24); assert.equal(two.more_projects, 6)
+  // The stored week is on the first page only; what it says about the week is on every page.
+  assert.equal(two.stored, null); assert.equal(two.written_at, NOW); assert.equal(two.final, true)
+  const last = weekRaw(db, 1, keyOf(-1), { ...at, offset: 24 })
+  assert.equal(last.projects.length, 6); assert.equal(last.offset, 24); assert.equal(last.next_offset, null); assert.equal(last.more_projects, 0)
+  assert.deepEqual([one, two, last].flatMap((r) => r.projects.map((x) => x.project.id)), ps.map((x) => x.p.id))
+  // A chosen page size, and an offset at or past the end.
+  const wide = weekRaw(db, 1, keyOf(-1), { ...at, offset: 5, limit: 20 })
+  assert.deepEqual(wide.projects.map((x) => x.project.id), ps.slice(5, 25).map((x) => x.p.id))
+  assert.equal(wide.next_offset, 25); assert.equal(wide.more_projects, 5)
+  const exact = weekRaw(db, 1, keyOf(-1), { ...at, offset: 10, limit: 20 })
+  assert.equal(exact.projects.length, 20); assert.equal(exact.next_offset, null); assert.equal(exact.more_projects, 0)
+  for (const offset of [30, 99]) {
+    const past = weekRaw(db, 1, keyOf(-1), { ...at, offset })
+    assert.deepEqual(past.projects, []); assert.equal(past.projects_total, 30)
+    assert.equal(past.offset, offset); assert.equal(past.next_offset, null); assert.equal(past.more_projects, 0)
+  }
+  // A week nothing moved in.
+  const quiet = weekRaw(db, 1, keyOf(-3), at)
+  assert.deepEqual(quiet.projects, []); assert.equal(quiet.projects_total, 0); assert.equal(quiet.next_offset, null); assert.equal(quiet.more_projects, 0)
+})
+
+test('weekRaw: a page never exceeds 36,000 characters', () => {
+  const db = seeded()
+  const ps = []
+  for (let n = 1; n <= 20; n++) ps.push(heavy(db, n))
+  // A stored week at its own limits is part of the first page.
+  put(db, -1, {
+    lede: 'l'.repeat(600),
+    stories: ps.slice(0, 8).map((x, i) => tale({ title: `Story ${i}`, sentence: 's'.repeat(300), next: 'n'.repeat(300), project_ids: [x.p.id] })),
+  })
+  assert.equal(RAW.maxChars, 36_000)
+  const first = weekRaw(db, 1, keyOf(-1), { ...at, limit: 20 })
+  assert.equal(first.projects_total, 20)
+  // Twenty were asked for; the page shrank to fit and the next page starts where it stopped.
+  assert.ok(first.projects.length >= 1 && first.projects.length < 20, `${first.projects.length} projects`)
+  assert.equal(first.next_offset, first.projects.length)
+  assert.equal(first.more_projects, 20 - first.projects.length)
+  assert.equal(first.projects[0].milestones.length, 6); assert.equal(first.projects[0].items.length, 6)
+  assert.equal(first.projects[0].needs_you.length, 5); assert.equal(first.projects[0].media.length, 3)
+  for (const limit of [20, 12, 7]) {
+    const pages = rawPages(db, { limit })
+    for (const page of pages) {
+      const size = JSON.stringify(page).length
+      assert.ok(size <= 36_000, `limit ${limit}, offset ${page.offset}: ${size} characters`)
+      assert.ok(page.projects.length >= 1 && page.projects.length <= limit)
+      assert.equal(page.more_projects, 20 - page.offset - page.projects.length)
+      assert.equal(page.next_offset, page.more_projects ? page.offset + page.projects.length : null)
+    }
+    // Paging from next_offset reaches every project exactly once, in rank order.
+    assert.deepEqual(pages.flatMap((page) => page.projects.map((x) => x.project.id)), ps.map((x) => x.p.id), `limit ${limit}`)
+  }
+})
+
+test('weekRaw: one project with every cap at its limit is far under the page bound', () => {
+  const db = seeded()
+  heavy(db, 1)
+  const raw = weekRaw(db, 1, keyOf(-1), { ...at, limit: 1 })
+  const [x] = raw.projects
+  assert.equal(x.milestones.length, RAW.milestones); assert.equal(x.items.length, RAW.items)
+  assert.equal(x.needs_you.length, RAW.needsYou); assert.equal(x.media.length, RAW.media)
+  assert.equal(x.status.length, RAW.statusMax)
+  for (const row of [...x.milestones, ...x.items, ...x.needs_you]) assert.equal(row.title.length, RAW.titleMax)
+  const size = JSON.stringify(x).length
+  assert.ok(size < RAW.maxChars / 5, `${size} characters`)
+  assert.ok(JSON.stringify(raw).length < RAW.maxChars / 5)
+})
+
+test('weekRaw clips a milestone, item or waiting item title to 140 characters and a status to 300, ending with an ellipsis', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha')
+  const long = 'A long title. '.repeat(15).slice(0, 200)
+  postAt(db, a.convo, long, mid(-1, 3)); postAt(db, a.convo, 'm'.repeat(140), mid(-1, 2)); postAt(db, a.convo, 'm'.repeat(141), mid(-1, 1))
+  item(db, a.convo, 'question', long, { awaiting: 'user', now: mid(-1) })
+  updateProject(db, { userId: 1, projectId: a.p.id, fields: { status: 's'.repeat(301) }, statusWriter: { by: 'agent', deviceId: 7, convoId: 'c1' } })
+  const [x] = weekRaw(db, 1, keyOf(-1), at).projects
+  const clipped = `${long.slice(0, 139)}…`
+  assert.equal(clipped.length, 140)
+  assert.deepEqual(x.milestones.map((m) => m.title), [clipped, 'm'.repeat(140), `${'m'.repeat(139)}…`])
+  assert.equal(x.items[0].title, clipped); assert.equal(x.needs_you[0].title, clipped)
+  assert.equal(x.status, `${'s'.repeat(299)}…`); assert.equal(x.status.length, 300)
+  // At the limit a status is whole.
+  updateProject(db, { userId: 1, projectId: a.p.id, fields: { status: 's'.repeat(300) }, statusWriter: { by: 'agent', deviceId: 7, convoId: 'c1' } })
+  assert.equal(weekRaw(db, 1, keyOf(-1), at).projects[0].status, 's'.repeat(300))
+  // A clip never ends on half a character.
+  postAt(db, a.convo, `${'e'.repeat(138)}😀 and more`, mid(-1, 4))
+  assert.equal(weekRaw(db, 1, keyOf(-1), at).projects[0].milestones[0].title, `${'e'.repeat(138)}…`)
+})
+
+test('weekRaw: stored.legacy is true for a week of grouped stories and false for one entry per project', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha'); const b = proj(db, 'Bravo')
+  postAt(db, a.convo, 'a', mid(-1)); postAt(db, b.convo, 'b', mid(-1))
+  const legacy = () => weekRaw(db, 1, keyOf(-1), at).stored.legacy
+  putEntries(db, -1, { entries: [entry(a.p), entry(b.p)] })
+  assert.equal(legacy(), false)
+  // A titled card, even on one project.
+  put(db, -1, { stories: [tale({ title: 'Launch', project_ids: [a.p.id] })] })
+  assert.equal(legacy(), true)
+  // An untitled story naming two projects: judged as stored, before any project drops out of sight.
+  put(db, -1, { stories: [tale({ title: 'Launch', project_ids: [a.p.id, b.p.id] })] })
+  db.prepare("UPDATE week_stories SET stories = replace(stories, '\"title\":\"Launch\"', '\"title\":null')").run()
+  assert.equal(weekRaw(db, 1, keyOf(-1), at).stored.stories[0].title, null)
+  assert.equal(legacy(), true)
+  db.prepare('UPDATE projects SET origin_convo_id = ? WHERE id = ?').run('secret', b.p.id)
+  assert.equal(weekRaw(db, 1, keyOf(-1), at).stored.stories[0].projects.length, 1)
+  assert.equal(legacy(), true)
+  // A frozen week with no cards is not a grouped one.
+  putEntries(db, -2, { final: true })
+  assert.equal(weekRaw(db, 1, keyOf(-2), at).stored.legacy, false)
+})
 
 test('validWeekEntries: 0..8 entries, each a project and a sentence of 1..300; next and the picture are optional', () => {
   const e = { project: 3, sentence: ' It shipped. ' }

@@ -1,20 +1,22 @@
 // HTTP surface of the projects timeline (spec 2026-11-09 projects timeline).
 // Five reads over projects, missions, items and milestones; the Coordinator's
-// raw read of one week (GET /timeline/weeks/:week?raw=1); and its two writes
-// of a week: a lede and story cards (POST /timeline/weeks/:week) or one entry
-// per project (POST /timeline/weeks/:week/entries), storage and rules in
-// src/week-stories.js. The read functions in src/timeline.js assume valid
-// input, so every parameter is validated here (400) before one is called.
+// paged raw read of one week (GET /timeline/weeks/:week?raw=1); and its two
+// writes of a week: a lede and story cards (POST /timeline/weeks/:week) or
+// one entry per project (POST /timeline/weeks/:week/entries), storage and
+// rules in src/week-stories.js. The read functions in src/timeline.js assume
+// valid input, so every parameter is validated here (400) before one is
+// called.
 import { json, readBody } from './http-body.js'
 import { badRequest } from './http-who.js'
 import { closingConvo, refusedCloser } from './missions-http.js'
 import { filteredAgent } from './privacy.js'
 import { parseCursor } from './projects-feed.js'
 import { validWeekWrite, writeWeek, validWeekEntries, writeWeekEntries } from './week-stories.js'
-import { weeksList, weekDetail, weekRaw, wentQuiet, openLong, finished, parseWeekKey, userTimeZone } from './timeline.js'
+import { weeksList, weekDetail, weekRaw, RAW, wentQuiet, openLong, finished, parseWeekKey, userTimeZone } from './timeline.js'
 
 const WEEKS_LIMIT = { default: 12, max: 52 }
 const FINISHED_LIMIT = { default: 30, max: 100 }
+const RAW_LIMIT = { default: RAW.page, max: RAW.pageMax }
 
 // The integer `limit` query parameter: its default when absent, null when not
 // an integer in 1..max.
@@ -23,6 +25,15 @@ function limitOf(url, { default: dflt, max }) {
   if (raw == null) return dflt
   const n = Number(raw)
   return /^\d+$/.test(raw) && Number.isInteger(n) && n >= 1 && n <= max ? n : null
+}
+
+// The integer `offset` query parameter: 0 when absent, null when not an
+// integer from 0 up.
+function offsetOf(url) {
+  const raw = url.searchParams.get('offset')
+  if (raw == null) return 0
+  const n = Number(raw)
+  return /^\d+$/.test(raw) && Number.isSafeInteger(n) ? n : null
 }
 
 // GET /timeline/weeks?before=<week key>&limit=<1..52>
@@ -93,9 +104,14 @@ export async function handleTimelineRoute(ctx, req, res, url, who) {
   let week
   try { week = decodeURIComponent(m[1]) } catch { return badRequest(res) }
   if (url.searchParams.get('raw') === '1') {
-    // The Coordinator's input: agents only, and always under the agent privacy sieve.
+    // The Coordinator's input, a page of projects at a time
+    // (&offset=<int from 0>&limit=<1..20>): agents only, and always under
+    // the agent privacy sieve.
     if (who.kind !== 'agent') { json(res, 403, { error: 'forbidden' }); return true }
-    const raw = weekRaw(db, who.userId, week, { excludePrivateOwned: true })
+    const offset = offsetOf(url)
+    const limit = limitOf(url, RAW_LIMIT)
+    if (offset == null || limit == null) return badRequest(res)
+    const raw = weekRaw(db, who.userId, week, { offset, limit, excludePrivateOwned: true })
     if (!raw) return badRequest(res)
     json(res, 200, raw)
     return true

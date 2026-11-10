@@ -369,12 +369,52 @@ test('raw read: 401 without a token, 403 for a client, 400 for a bad key, agents
   createMission(s.db, { userId: alice.id, deviceId: agent.deviceId, createdBy: 'agent', convoId: 'c1', title: 'one', projectId: p.id })
   const r = await get(s, `/timeline/weeks/${week}?raw=1`, agent.token)
   assert.equal(r.status, 200)
-  assert.deepEqual(Object.keys(r.json), ['week', 'start', 'end', 'final', 'written_at', 'current', 'stored', 'projects', 'more_projects'])
+  assert.deepEqual(Object.keys(r.json), [
+    'week', 'start', 'end', 'final', 'written_at', 'current', 'stored', 'projects', 'projects_total', 'offset', 'next_offset', 'more_projects',
+  ])
   assert.equal(r.json.current, true); assert.equal(r.json.stored, null); assert.equal(r.json.written_at, null)
+  assert.equal(r.json.projects_total, 1); assert.equal(r.json.offset, 0); assert.equal(r.json.next_offset, null); assert.equal(r.json.more_projects, 0)
   assert.deepEqual(r.json.projects.map((x) => x.project.title), ['Promo launch'])
   assert.deepEqual(Object.keys(r.json.projects[0]), ['project', 'moved', 'status', 'milestones', 'items', 'media', 'needs_you'])
   // raw=0 and other values are the ordinary read, open to the client.
   assert.equal((await get(s, `/timeline/weeks/${week}?raw=0`, client)).status, 200)
+})
+
+test('raw read: offset and limit page the projects; offset must be an integer from 0 and limit one in 1..20, else 400; a client is still 403', async (t) => {
+  const { s, alice, agent, client, p } = await coordinatorFleet(t)
+  const week = thisWeek(s, alice)
+  const all = [p]
+  for (let i = 1; i <= 24; i++) all.push(another(s, alice, agent, `Project ${i}`))
+  for (const x of all) {
+    upsertConversation(s.db, { id: `k${x.num}`, ownerUserId: alice.id, title: x.title, agentDeviceId: agent.deviceId })
+    createMission(s.db, { userId: alice.id, deviceId: agent.deviceId, createdBy: 'agent', convoId: `k${x.num}`, title: 'one', projectId: x.id })
+  }
+  assert.equal((await put(s, week, agent.token, goodBody(p))).status, 201)
+  const raw = (query, token = agent.token) => get(s, `/timeline/weeks/${week}?raw=1${query}`, token)
+  for (const bad of ['&offset=-1', '&offset=x', '&offset=', '&offset=1.5', '&offset=1e2', '&limit=0', '&limit=21', '&limit=x', '&limit=', '&limit=-3', '&offset=0&limit=99']) {
+    assert.deepEqual(await raw(bad), { status: 400, json: { error: 'bad_request' } }, bad)
+  }
+  for (const query of ['', '&offset=0', '&offset=12&limit=20', '&offset=-1']) {
+    assert.deepEqual(await raw(query, client), { status: 403, json: { error: 'forbidden' } }, query)
+  }
+  const ids = (r) => r.json.projects.map((x) => x.project.id)
+  const one = await raw('')
+  assert.equal(one.status, 200)
+  assert.equal(one.json.projects.length, 12); assert.equal(one.json.projects_total, 25)
+  assert.equal(one.json.offset, 0); assert.equal(one.json.next_offset, 12); assert.equal(one.json.more_projects, 13)
+  assert.equal(one.json.stored.legacy, true)
+  const two = await raw('&offset=12')
+  assert.equal(two.json.projects.length, 12); assert.equal(two.json.offset, 12); assert.equal(two.json.next_offset, 24)
+  assert.equal(two.json.stored, null); assert.equal(typeof two.json.written_at, 'number')
+  const three = await raw('&offset=24')
+  assert.equal(three.json.projects.length, 1); assert.equal(three.json.next_offset, null); assert.equal(three.json.more_projects, 0)
+  assert.deepEqual([...ids(one), ...ids(two), ...ids(three)].sort(), all.map((x) => x.id).sort())
+  const wide = await raw('&offset=5&limit=20')
+  assert.equal(wide.json.projects.length, 20); assert.equal(wide.json.offset, 5); assert.equal(wide.json.next_offset, null)
+  assert.equal((await raw('&limit=1')).json.next_offset, 1)
+  assert.deepEqual((await raw('&offset=400')).json.projects, [])
+  // The ordinary read takes no paging: the parameters are not looked at.
+  assert.equal((await get(s, `/timeline/weeks/${week}?offset=x&limit=0`, client)).status, 200)
 })
 
 test('raw=1 on the quiet and long lists is always sieved for an agent, even on a private device; a client and a plain read are unchanged', async (t) => {
