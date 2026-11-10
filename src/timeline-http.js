@@ -2,7 +2,9 @@
 // Six reads over projects, missions, items and milestones; one project's
 // page (GET /timeline/projects/:id) and its history week by week
 // (GET /timeline/projects/:id/history); the Coordinator's
-// paged raw read of one week (GET /timeline/weeks/:week?raw=1); and its two
+// paged raw read of one week (GET /timeline/weeks/:week?raw=1), with its
+// index of the whole week (&index=1) and its read of named projects
+// (&projects=); and its two
 // writes of a week: a lede and story cards (POST /timeline/weeks/:week) or
 // one entry per project (POST /timeline/weeks/:week/entries), storage and
 // rules in src/week-stories.js. The read functions in src/timeline.js assume
@@ -17,7 +19,7 @@ import { resolveProject } from './projects.js'
 import { projectPage, projectHistory, PROJECT_HISTORY } from './timeline-project.js'
 import { validWeekWrite, writeWeek, validWeekEntries, writeWeekEntries } from './week-stories.js'
 import {
-  weeksList, weekDetail, weekRaw, RAW, TIMELINE, wentQuiet, openLong, finished, allProjects, parseWeekKey, userTimeZone,
+  weeksList, weekDetail, weekRaw, weekIndex, RAW, TIMELINE, wentQuiet, openLong, finished, allProjects, parseWeekKey, userTimeZone,
 } from './timeline.js'
 
 const WEEKS_LIMIT = { default: 12, max: 52 }
@@ -42,6 +44,17 @@ function offsetOf(url) {
   if (raw == null) return 0
   const n = Number(raw)
   return /^\d+$/.test(raw) && Number.isSafeInteger(n) ? n : null
+}
+
+// The `projects` query parameter of the raw week read: undefined when
+// absent, else its comma-separated references (each a project id or a
+// number), null unless there are 1..RAW.page of them, all well formed.
+const PROJECT_REF = /^(pj_[0-9A-Za-z]{1,60}|[1-9]\d{0,14})$/
+function pickedOf(url) {
+  const raw = url.searchParams.get('projects')
+  if (raw == null) return undefined
+  const refs = raw.split(',')
+  return refs.length <= RAW.page && refs.every((r) => PROJECT_REF.test(r)) ? refs : null
 }
 
 // GET /timeline/weeks?before=<week key>&limit=<1..52>
@@ -160,6 +173,22 @@ export async function handleTimelineRoute(ctx, req, res, url, who) {
     // (&offset=<int from 0>&limit=<1..20>): agents only, and always under
     // the agent privacy sieve.
     if (who.kind !== 'agent') { json(res, 403, { error: 'forbidden' }); return true }
+    // Two more reads of the same week, neither paged: &index=1, a compact
+    // row for every moving project, and &projects=<1..12 ids or numbers,
+    // comma-separated>, the page's detail for exactly those.
+    const q = url.searchParams
+    const index = q.get('index')
+    const picked = pickedOf(url)
+    if (index != null || picked !== undefined) {
+      const alone = (index == null) !== (picked === undefined) && !q.has('offset') && !q.has('limit')
+      if (!alone || picked === null || (index != null && index !== '1')) return badRequest(res)
+      const read = picked
+        ? weekRaw(db, who.userId, week, { picked, excludePrivateOwned: true })
+        : weekIndex(db, who.userId, week, { excludePrivateOwned: true })
+      if (!read) return badRequest(res)
+      json(res, 200, read)
+      return true
+    }
     const offset = offsetOf(url)
     const limit = limitOf(url, RAW_LIMIT)
     if (offset == null || limit == null) return badRequest(res)

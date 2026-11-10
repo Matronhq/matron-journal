@@ -8,7 +8,7 @@ import { Cron } from 'croner'
 import { DEFAULT_TZ, validTz } from './routines.js'
 import { ORIGIN_SIEVE, statusPrivateSql } from './missions.js'
 import { privateDevice, privateConvo, filesSql, parseCursor } from './projects-feed.js'
-import { PROJECT_ORIGIN_SIEVE } from './projects.js'
+import { PROJECT_ORIGIN_SIEVE, resolveProject } from './projects.js'
 import { writtenWeek, writtenWeeks, projectNotes } from './week-stories.js'
 
 const MONDAY_MIDNIGHT = '0 0 * * 1'
@@ -576,6 +576,33 @@ function clip(text, max) {
 }
 const clipTitle = (row) => ({ ...row, title: clip(row.title, RAW.titleMax) })
 
+// What every raw read says about the week itself, the stored row included.
+const rawHead = (stored, start, end, tz, now) => ({
+  week: formatWeekKey(start, tz), start, end,
+  final: Boolean(stored?.final) || end <= now,
+  written_at: stored?.written_at ?? null,
+  current: start === weekStartOf(now, tz),
+})
+// Whether a week was written as grouped stories (a card with its own title,
+// or one naming several projects) rather than as one entry per project.
+// Judged on the stories as stored, whatever the caller may see of them now.
+const legacyWeek = (stored) => stored.stories.some((s) => s.title != null || s.project_ids.length > 1)
+
+// The projects `refs` name (ids or numbers) as [{ project, moved }], in the
+// order given and each once: every reference goes through a merge to the
+// project that survived it, under the caller's sieve at each hop, and is
+// left out when nothing the caller may see answers to it. `moved` is the
+// project's place in the week's ranking, 0 when it did not move.
+function pickedProjects(db, userId, refs, byId, moved, excludePrivateOwned) {
+  const moves = new Map(moved.map((r) => [r.project.id, r.moved]))
+  const out = new Map()
+  for (const ref of refs) {
+    const project = byId.get(resolveProject(db, userId, ref, { excludePrivateOwned })?.project.id)
+    if (project && !out.has(project.id)) out.set(project.id, { project, moved: moves.get(project.id) ?? 0 })
+  }
+  return [...out.values()]
+}
+
 // The Coordinator's raw read of one week (it writes the week from this), one
 // page at a time: the stored week with ids resolved to refs, and the moving
 // projects (most moves first) from `offset`, at most `limit` of them, each
@@ -595,7 +622,15 @@ const clipTitle = (row) => ({ ...row, title: clip(row.title, RAW.titleMax) })
 // not enough, with their first project only (`stored.projects_omitted: true`).
 // `offset` and `limit` are assumed valid. null when `weekKey` is not a week
 // key.
-export function weekRaw(db, userId, weekKey, { offset = 0, limit = RAW.page, excludePrivateOwned = true, now = Date.now() } = {}) {
+//
+// With `picked` (project ids or numbers, at most a page of them) the projects
+// are instead exactly the named ones the caller may see, in the order given
+// and each once: a reference is followed through a merge, one that is
+// unknown or hidden is left out, and a project that did not move that week
+// comes with `moved: 0`. There is no next page then, `projects_total` is
+// still the week's moving total, and `omitted` lists the ids of the projects
+// the bound took off the end.
+export function weekRaw(db, userId, weekKey, { offset = 0, limit = RAW.page, picked = null, excludePrivateOwned = true, now = Date.now() } = {}) {
   const tz = userTimeZone(db, userId)
   const start = parseWeekKey(weekKey, tz)
   if (start == null) return null
@@ -614,7 +649,7 @@ export function weekRaw(db, userId, weekKey, { offset = 0, limit = RAW.page, exc
   // move counts them), for all the page's projects in one pass. The week
   // range sits inside each arm so only the week's rows are read; the newest
   // RAW.items per project are kept.
-  const shown = moved.slice(offset, offset + limit)
+  const shown = picked ? pickedProjects(db, userId, picked, byId, moved, excludePrivateOwned) : moved.slice(offset, offset + limit)
   const itemRows = shown.length ? db.prepare(`SELECT project_id, id, num, title, kind, state, awaiting, at FROM (
       SELECT project_id, id, num, title, kind, state, awaiting, at,
         ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY at DESC, num DESC) AS rn
@@ -652,19 +687,13 @@ export function weekRaw(db, userId, weekKey, { offset = 0, limit = RAW.page, exc
   })
   const stored = writtenWeek(db, userId, weekKey)
   const result = {
-    week: formatWeekKey(start, tz), start, end,
-    final: Boolean(stored?.final) || end <= now,
-    written_at: stored?.written_at ?? null,
-    current: start === weekStartOf(now, tz),
+    ...rawHead(stored, start, end, tz, now),
     // A story whose projects are all hidden from the caller is withheld here, as
     // the apps' read withholds it, so a Coordinator that rewrites the week from
     // this drops that story (accepted: a story never names private work).
     stored: stored && offset === 0 ? {
       lede: stored.lede, final: stored.final,
-      // Written as grouped stories (a card with its own title, or one naming
-      // several projects) rather than as one entry per project. Judged on
-      // the stories as stored, whatever the caller may see of them now.
-      legacy: stored.stories.some((s) => s.title != null || s.project_ids.length > 1),
+      legacy: legacyWeek(stored),
       stories: resolveStored(db, userId, stored, byId, excludePrivateOwned).map((s) => ({
         title: s.title, sentence: s.sentence, next: s.next,
         projects: s.projects.map(refOf),
@@ -677,14 +706,20 @@ export function weekRaw(db, userId, weekKey, { offset = 0, limit = RAW.page, exc
     offset,
     next_offset: null,
     more_projects: 0,
+    ...(picked && { omitted: [] }),
   }
   const place = () => {
+    if (picked) return
     result.more_projects = Math.max(0, moved.length - offset - projects.length)
     result.next_offset = result.more_projects ? offset + projects.length : null
   }
   place()
   const over = () => JSON.stringify(result).length > RAW.maxChars
-  while (projects.length > 1 && over()) { projects.pop(); place() }
+  while (projects.length > 1 && over()) {
+    const last = projects.pop()
+    if (picked) result.omitted.unshift(last.project.id)
+    place()
+  }
   // A week written as grouped stories can itself be most of a page. With
   // one project left, the stored stories give up their items, then every
   // project after their first; a flag says what was left out.
@@ -696,6 +731,128 @@ export function weekRaw(db, userId, weekKey, { offset = 0, limit = RAW.page, exc
       result.stored.projects_omitted = true
     }
   }
+  return result
+}
+
+// The limits of the week index: how long a project's title and its newest
+// milestone's title may be, and the shorter title a crowded week falls back to.
+export const INDEX = { titleMax: 80, titleMin: 40, newestMax: 100 }
+
+// The three grouped statements behind the week index: for every project of
+// the user (@userId) at once, in one week (@start, @end), each credited to
+// the surviving project as a move is. Each starts from the user's missions
+// (idx_missions_user_state) and reads each one's milestones, items and
+// comments through their own indexes (pinned by a test); `+i.consent` is as
+// in movesSql.
+//   milestones: (project_id, n, title) -- how many that week and the newest's title;
+//   items: (project_id, done, for_you) -- as doneSql and forYouSql count them
+//     for one project, consent cards in neither;
+//   media: (project_id, n) -- the week's pictures and videos in the files roll-up.
+const BY_PROJECT = {
+  cols: 'COALESCE(p.merged_into, p.id) AS project_id, ',
+  join: 'JOIN projects p ON p.id = m.project_id AND p.user_id = m.user_id',
+  group: ', COALESCE(p.merged_into, p.id)',
+}
+const indexSql = (excludePrivateOwned) => {
+  const convoSieve = convoSieveOf(excludePrivateOwned)
+  return {
+    milestones: `SELECT project_id, n, title FROM (
+        SELECT ${BY_PROJECT.cols}l.title,
+          COUNT(*) OVER (PARTITION BY COALESCE(p.merged_into, p.id)) AS n,
+          ROW_NUMBER() OVER (PARTITION BY COALESCE(p.merged_into, p.id) ORDER BY l.created_at DESC, l.seq DESC) AS rn
+        FROM milestones l JOIN missions m ON m.id = l.mission_id ${BY_PROJECT.join}
+        JOIN conversations c ON c.id = l.convo_id
+        WHERE m.user_id = @userId AND l.created_at >= @start AND l.created_at < @end ${convoSieve})
+      WHERE rn = 1`,
+    items: `SELECT ${BY_PROJECT.cols}
+        COALESCE(SUM(i.closed_at >= @start AND i.closed_at < @end), 0) AS done,
+        COALESCE(SUM(i.state = 'open' AND i.awaiting = 'user' AND i.created_at < @end), 0) AS for_you
+      FROM items i JOIN missions m ON m.id = i.mission_id ${BY_PROJECT.join}
+      JOIN conversations c ON c.id = i.origin_convo_id
+      WHERE m.user_id = @userId AND +i.consent IS NULL ${convoSieve}
+      GROUP BY 1`,
+    media: `SELECT f.project_id, COUNT(*) AS n FROM (${filesSql(excludePrivateOwned, 'm.user_id = @userId', BY_PROJECT)}) f
+      WHERE f.at >= @start AND f.at < @end AND (f.content_type LIKE 'image/%' OR f.content_type LIKE 'video/%')
+      GROUP BY f.project_id`,
+  }
+}
+// Test seam: the week index's three grouped statements as SQL.
+export const indexSqlForTest = indexSql
+
+// The Coordinator's index of one week: every project that moved, most moves
+// first as weekRaw ranks them, as one compact row each -- `moved`, how many
+// `milestones` it posted, how many items were `done` (closed that week), how
+// many are `for_you` (open, awaiting the user, created before the week
+// ended), how many pictures or videos (`media`) and the title of its
+// `newest` milestone of the week (null without one). Consent cards are in no
+// count. `stored` is the written week as { final, legacy, entries }, each
+// entry a stored story's main project and sentence (a story left with no
+// project the caller may see is dropped), or null for an unwritten week.
+// The Coordinator picks from this and reads its picks with weekRaw's `picked`.
+//
+// The whole week comes in one response of at most RAW.maxChars characters
+// of JSON. A week too crowded for that gives up, from the last-ranked
+// project upward and only as far as needed: first `newest` (null), then
+// the title beyond INDEX.titleMin characters, then the project itself,
+// counted in `more_projects`.
+//
+// The statements run do not grow with the projects: the counts are three
+// grouped statements for the whole week. null when `weekKey` is not a week
+// key.
+export function weekIndex(db, userId, weekKey, { excludePrivateOwned = true, now = Date.now() } = {}) {
+  const tz = userTimeZone(db, userId)
+  const start = parseWeekKey(weekKey, tz)
+  if (start == null) return null
+  const end = weekEndOf(start, tz)
+  const byId = new Map(rowProjects(db, userId, excludePrivateOwned).map((p) => [p.id, p]))
+  const moved = ranked(projectMoves(db, userId, { from: start, to: end, excludePrivateOwned }), byId)
+  const sql = indexSql(excludePrivateOwned)
+  const grouped = (text) => new Map(db.prepare(text).all({ userId, start, end }).map((r) => [r.project_id, r]))
+  const milestones = grouped(sql.milestones)
+  const items = grouped(sql.items)
+  const media = grouped(sql.media)
+  const short = (p) => ({ id: p.id, num: p.num, title: clip(p.title, INDEX.titleMax) })
+  const rows = moved.map(({ project, moved: n }) => ({
+    ...short(project), moved: n,
+    milestones: milestones.get(project.id)?.n ?? 0,
+    done: items.get(project.id)?.done ?? 0,
+    for_you: items.get(project.id)?.for_you ?? 0,
+    media: media.get(project.id)?.n ?? 0,
+    newest: clip(milestones.get(project.id)?.title ?? null, INDEX.newestMax),
+  }))
+  const stored = writtenWeek(db, userId, weekKey)
+  const named = stored ? survivingProjects(db, userId, [...new Set(stored.stories.flatMap((s) => s.project_ids))], byId) : null
+  const result = {
+    ...rawHead(stored, start, end, tz, now),
+    stored: stored ? {
+      final: stored.final, legacy: legacyWeek(stored),
+      entries: stored.stories.map((s) => ({ project: storyProjects(s, named)[0], sentence: s.sentence }))
+        .filter((e) => e.project).map((e) => ({ ...e, project: short(e.project) })),
+    } : null,
+    projects_total: rows.length,
+    projects: rows,
+    more_projects: 0,
+  }
+  // Each step changes the last `k` rows; the fewest that fit are found by
+  // halving (a larger `k` is never longer), all of them when none does.
+  const fits = () => JSON.stringify(result).length <= RAW.maxChars
+  const shrink = (change) => {
+    const from = result.projects
+    const set = (k) => { change(from, from.length - k, k); return fits() }
+    if (set(0)) return
+    let lo = 1
+    let hi = from.length
+    while (lo < hi) {
+      const k = (lo + hi) >> 1
+      if (set(k)) hi = k
+      else lo = k + 1
+    }
+    set(lo)
+  }
+  const last = (edit) => (from, keep) => { result.projects = from.map((r, i) => (i < keep ? r : edit(r))) }
+  shrink(last((r) => ({ ...r, newest: null })))
+  shrink(last((r) => ({ ...r, title: clip(r.title, INDEX.titleMin) })))
+  shrink((from, keep, k) => { result.projects = from.slice(0, keep); result.more_projects = k })
   return result
 }
 

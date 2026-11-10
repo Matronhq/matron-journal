@@ -73,29 +73,33 @@ function decisionsSql(excludePrivateOwned) {
 // linked to two of the project's missions is listed once, under the
 // lower-numbered mission. `projectMatch` picks the missions (the feed: the
 // project's own; the timeline's week media also takes those of projects
-// merged into it).
-export function filesSql(excludePrivateOwned, projectMatch = 'm.project_id = @projectId') {
+// merged into it). The third argument makes it a roll-up for several
+// projects at once: `cols` leads each arm's columns (ending in a comma),
+// `join` joins the mission `m` to what they name and `group` (starting with
+// a comma) is the same expression, so an event in conversations of two
+// projects is listed once under each.
+export function filesSql(excludePrivateOwned, projectMatch = 'm.project_id = @projectId', { cols = '', join = '', group = '' } = {}) {
   const itemSieve = excludePrivateOwned
     ? `AND NOT ${privateConvo('c')} AND NOT ${privateDevice('ic.device_id')} AND ${ORIGIN_SIEVE}` : ''
   const eventSieve = excludePrivateOwned ? `AND NOT ${privateConvo('c')} AND ${ORIGIN_SIEVE}` : ''
-  return `SELECT 'item' AS source, json_extract(je.value, '$.blob_ref') AS blob_id, json_extract(je.value, '$.name') AS name,
+  return `SELECT ${cols}'item' AS source, json_extract(je.value, '$.blob_ref') AS blob_id, json_extract(je.value, '$.name') AS name,
       json_extract(je.value, '$.mime') AS content_type, json_extract(je.value, '$.size') AS size,
       ic.created_at AS at, 'c:' || ic.id || ':' || printf('%03d', je.key) AS sort_key,
       i.num AS item_num, NULL AS convo_id, NULL AS seq, NULL AS caption, m.num AS mission_num
-    FROM item_comments ic JOIN items i ON i.id = ic.item_id JOIN missions m ON m.id = i.mission_id
+    FROM item_comments ic JOIN items i ON i.id = ic.item_id JOIN missions m ON m.id = i.mission_id ${join}
     JOIN conversations c ON c.id = i.origin_convo_id, json_each(ic.attachments) je
     WHERE ${projectMatch} AND +m.user_id = @userId AND +i.consent IS NULL AND ic.withdrawn_at IS NULL ${itemSieve}
   UNION ALL
-  SELECT 'chat', e.blob_ref, json_extract(e.payload, '$.name'), json_extract(e.payload, '$.content_type'),
+  SELECT ${cols}'chat', e.blob_ref, json_extract(e.payload, '$.name'), json_extract(e.payload, '$.content_type'),
       json_extract(e.payload, '$.size'), e.ts, 'e:' || ${pad('e.seq')}, NULL, e.convo_id, e.seq,
       json_extract(e.payload, '$.caption'), MIN(m.num)
-    FROM missions m
+    FROM missions m ${join}
     JOIN mission_conversations l ON l.mission_id = m.id
     JOIN conversations c ON c.id = l.convo_id
     JOIN events e ON e.convo_id = l.convo_id AND e.type IN ('image', 'file')
       AND e.ts >= COALESCE(l.first_joined_at, l.joined_at) AND (l.ended_at IS NULL OR e.ts <= l.ended_at)
     WHERE ${projectMatch} AND +m.user_id = @userId AND +e.user_id = @userId AND e.blob_ref IS NOT NULL ${eventSieve}
-    GROUP BY e.seq`
+    GROUP BY e.seq${group}`
   // `+e.user_id`: the unary plus keeps SQLite off the events primary key
   // (user_id, seq), which it otherwise prefers without ANALYZE statistics,
   // reading every event the user has. With it, each linked conversation is

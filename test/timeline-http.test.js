@@ -531,6 +531,116 @@ test('raw read always applies the agent sieve, even on a private device; a writt
   assert.equal(list.json.weeks[0].sentence, 'A busy week.'); assert.equal(list.json.weeks[0].written, true)
 })
 
+// ---- GET /timeline/weeks/:week?raw=1&index=1 and &projects= (the whole week in one read, then the picked projects) ----
+
+// `count` more projects, each with a mission of its own made now (a move this week).
+function moving(s, alice, agent, count, first = 1) {
+  const out = []
+  for (let i = first; i < first + count; i++) {
+    const x = another(s, alice, agent, `Project ${i}`)
+    upsertConversation(s.db, { id: `k${x.num}`, ownerUserId: alice.id, title: x.title, agentDeviceId: agent.deviceId })
+    createMission(s.db, { userId: alice.id, deviceId: agent.deviceId, createdBy: 'agent', convoId: `k${x.num}`, title: 'one', projectId: x.id })
+    out.push(x)
+  }
+  return out
+}
+
+test('week index: 401 without a token, 403 for a client, 400 for a bad key; an agent gets every moving project in one response', async (t) => {
+  const { s, alice, agent, client, p } = await coordinatorFleet(t)
+  const week = thisWeek(s, alice)
+  const path = `/timeline/weeks/${week}?raw=1&index=1`
+  assert.equal((await get(s, path, undefined)).status, 401)
+  assert.deepEqual(await get(s, path, client), { status: 403, json: { error: 'forbidden' } })
+  assert.deepEqual(await get(s, '/timeline/weeks/2026-11-10?raw=1&index=1', agent.token), { status: 400, json: { error: 'bad_request' } })
+  createMission(s.db, { userId: alice.id, deviceId: agent.deviceId, createdBy: 'agent', convoId: 'c1', title: 'one', projectId: p.id })
+  createMilestone(s.db, {
+    userId: alice.id, deviceId: agent.deviceId, createdBy: 'agent', convoId: 'c1', kind: 'progress', title: 'Shipped',
+    appendMarker: (payload) => append(s.db, { userId: alice.id, convoId: 'c1', sender: 'agent:x', type: 'milestone', payload }),
+  })
+  const all = [p, ...moving(s, alice, agent, 39)]
+  assert.equal((await put(s, week, agent.token, goodBody(p))).status, 201)
+  const r = await get(s, path, agent.token)
+  assert.equal(r.status, 200)
+  assert.deepEqual(Object.keys(r.json), ['week', 'start', 'end', 'final', 'written_at', 'current', 'stored', 'projects_total', 'projects', 'more_projects'])
+  assert.equal(r.json.week, week); assert.equal(r.json.current, true); assert.equal(r.json.final, false)
+  assert.equal(r.json.projects_total, 40); assert.equal(r.json.projects.length, 40); assert.equal(r.json.more_projects, 0)
+  assert.deepEqual(r.json.projects[0], { id: p.id, num: p.num, title: 'Promo launch', moved: 2, milestones: 1, done: 0, for_you: 0, media: 0, newest: 'Shipped' })
+  assert.deepEqual(r.json.projects.map((x) => x.id).sort(), all.map((x) => x.id).sort())
+  assert.deepEqual(r.json.stored, { final: false, legacy: true, entries: [{ project: { id: p.id, num: p.num, title: p.title }, sentence: 'It shipped.' }] })
+  // The same ranking as the pages.
+  const pages = []
+  for (let offset = 0; offset != null; offset = pages.at(-1).next_offset) pages.push((await get(s, `/timeline/weeks/${week}?raw=1&limit=20&offset=${offset}`, agent.token)).json)
+  assert.deepEqual(r.json.projects.map((x) => x.id), pages.flatMap((page) => page.projects.map((x) => x.project.id)))
+})
+
+test('picked projects: the named ones in the order given, by id and number, each once, through a merge; hidden and unknown ones left out; a client is 403', async (t) => {
+  const { s, alice, agent, priv, client, p } = await coordinatorFleet(t)
+  const week = thisWeek(s, alice)
+  const picked = (refs, token = agent.token) => get(s, `/timeline/weeks/${week}?raw=1&projects=${refs}`, token)
+  createMission(s.db, { userId: alice.id, deviceId: agent.deviceId, createdBy: 'agent', convoId: 'c1', title: 'one', projectId: p.id })
+  const [a, b, gone] = moving(s, alice, agent, 3)
+  const still = another(s, alice, agent, 'Still')
+  const hidden = createProject(s.db, { userId: alice.id, deviceId: priv.deviceId, createdBy: 'agent', title: 'Hidden', convoId: 'secret' }).project
+  createMission(s.db, { userId: alice.id, deviceId: priv.deviceId, createdBy: 'agent', convoId: 'secret', title: 'priv', projectId: hidden.id })
+  mergeProject(s.db, { userId: alice.id, projectId: gone.id, intoId: a.id, by: 'user' })
+  assert.equal((await put(s, week, agent.token, goodBody(p))).status, 201)
+  assert.equal((await get(s, `/timeline/weeks/${week}?raw=1&projects=${p.id}`, undefined)).status, 401)
+  assert.deepEqual(await picked(p.id, client), { status: 403, json: { error: 'forbidden' } })
+  for (const token of [agent.token, priv.token]) {
+    const r = await picked(`${b.id},${gone.num},${hidden.id},${hidden.num},pj_nope,999,${still.num},${b.num},${a.id},${p.num}`, token)
+    assert.equal(r.status, 200)
+    assert.deepEqual(Object.keys(r.json), [
+      'week', 'start', 'end', 'final', 'written_at', 'current', 'stored', 'projects', 'projects_total', 'offset', 'next_offset', 'more_projects', 'omitted',
+    ])
+    assert.deepEqual(r.json.projects.map((x) => [x.project.title, x.moved]), [['Project 2', 1], ['Project 1', 2], ['Still', 0], ['Promo launch', 1]])
+    assert.deepEqual(Object.keys(r.json.projects[0]), ['project', 'moved', 'status', 'milestones', 'items', 'media', 'needs_you'])
+    assert.equal(r.json.projects_total, 3); assert.equal(r.json.offset, 0); assert.equal(r.json.next_offset, null); assert.equal(r.json.more_projects, 0)
+    assert.deepEqual(r.json.omitted, [])
+    assert.equal(r.json.stored.lede, 'A busy week.')
+  }
+  // Only refs that name nothing the agent may see: still a read of the week.
+  const none = await picked(`${hidden.id},999`)
+  assert.equal(none.status, 200); assert.deepEqual(none.json.projects, []); assert.equal(none.json.projects_total, 3)
+  assert.equal((await picked(p.id)).json.projects.length, 1)
+  assert.equal((await get(s, `/timeline/weeks/2026-11-10?raw=1&projects=${p.id}`, agent.token)).status, 400)
+})
+
+test('week index and picked projects: 1..12 well-formed refs, not together, and neither with offset or limit, else 400', async (t) => {
+  const { s, alice, agent, client, p } = await coordinatorFleet(t)
+  const week = thisWeek(s, alice)
+  const raw = (query, token = agent.token) => get(s, `/timeline/weeks/${week}?raw=1${query}`, token)
+  const twelve = Array.from({ length: 12 }, (_, i) => i + 1).join(',')
+  assert.equal((await raw(`&projects=${twelve}`)).status, 200)
+  assert.equal((await raw('&index=1')).status, 200)
+  for (const bad of [
+    `&projects=${twelve},13`, '&projects=', '&projects=,', `&projects=${p.id},`, `&projects=,${p.id}`, '&projects=1,,2', '&projects=0', '&projects=-1',
+    '&projects=1.5', '&projects=%231', '&projects=x', '&projects=pj_', '&projects=pj_a-b', '&projects=1%202', `&projects=${p.id}%20`,
+    `&index=1&projects=${p.id}`, `&projects=${p.id}&index=1`, '&index=1&offset=0', '&index=1&limit=12', `&projects=${p.id}&offset=0`, `&projects=${p.id}&limit=5`,
+    `&projects=${p.id}&offset=x`, '&index=0', '&index=', '&index=true', `&index=0&projects=${p.id}`,
+  ]) {
+    assert.deepEqual(await raw(bad), { status: 400, json: { error: 'bad_request' } }, bad)
+    assert.deepEqual(await raw(bad, client), { status: 403, json: { error: 'forbidden' } }, `${bad}, client`)
+  }
+  // Without raw=1 neither parameter is looked at: the ordinary read, open to the client.
+  assert.equal((await get(s, `/timeline/weeks/${week}?index=1&projects=,`, client)).status, 200)
+  assert.ok('stories' in (await get(s, `/timeline/weeks/${week}?index=1`, client)).json)
+})
+
+test('week index and picked projects always apply the agent sieve, even on a private device', async (t) => {
+  const { s, alice, agent, priv, p } = await coordinatorFleet(t)
+  const week = thisWeek(s, alice)
+  const hidden = createProject(s.db, { userId: alice.id, deviceId: priv.deviceId, createdBy: 'agent', title: 'Hidden', convoId: 'secret' }).project
+  createMission(s.db, { userId: alice.id, deviceId: priv.deviceId, createdBy: 'agent', convoId: 'secret', title: 'priv', projectId: hidden.id })
+  createMission(s.db, { userId: alice.id, deviceId: agent.deviceId, createdBy: 'agent', convoId: 'c1', title: 'one', projectId: p.id })
+  for (const token of [agent.token, priv.token]) {
+    const index = await get(s, `/timeline/weeks/${week}?raw=1&index=1`, token)
+    assert.deepEqual(index.json.projects.map((x) => x.title), ['Promo launch'])
+    assert.equal(index.json.projects_total, 1)
+    const picked = await get(s, `/timeline/weeks/${week}?raw=1&projects=${hidden.id},${p.id}`, token)
+    assert.deepEqual(picked.json.projects.map((x) => x.project.title), ['Promo launch'])
+  }
+})
+
 // ---- GET /timeline/projects/:id (the project page's summary) ----
 
 test('project page: 401 without a token; 404 for an unknown project', async (t) => {
