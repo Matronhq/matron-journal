@@ -1,15 +1,16 @@
 // HTTP surface of the projects timeline (spec 2026-11-09 projects timeline).
 // Five reads over projects, missions, items and milestones; the Coordinator's
-// raw read of one week (GET /timeline/weeks/:week?raw=1); and its write of a
-// week's lede and story cards (POST /timeline/weeks/:week, storage and rules
-// in src/week-stories.js). The read functions in src/timeline.js assume valid
+// raw read of one week (GET /timeline/weeks/:week?raw=1); and its two writes
+// of a week: a lede and story cards (POST /timeline/weeks/:week) or one entry
+// per project (POST /timeline/weeks/:week/entries), storage and rules in
+// src/week-stories.js. The read functions in src/timeline.js assume valid
 // input, so every parameter is validated here (400) before one is called.
 import { json, readBody } from './http-body.js'
 import { badRequest } from './http-who.js'
 import { closingConvo, refusedCloser } from './missions-http.js'
 import { filteredAgent } from './privacy.js'
 import { parseCursor } from './projects-feed.js'
-import { validWeekWrite, writeWeek } from './week-stories.js'
+import { validWeekWrite, writeWeek, validWeekEntries, writeWeekEntries } from './week-stories.js'
 import { weeksList, weekDetail, weekRaw, wentQuiet, openLong, finished, parseWeekKey, userTimeZone } from './timeline.js'
 
 const WEEKS_LIMIT = { default: 12, max: 52 }
@@ -45,19 +46,22 @@ function handleFinished(db, res, url, who, opts) {
 }
 
 // POST /timeline/weeks/:week — the Coordinator's lede and story cards for one
-// week, and its notes on projects. Agents only, gated exactly like POST
-// /briefings (the Coordinator naming its own conversation). The Coordinator
-// always writes under the agent privacy sieve, whatever device it runs on.
-async function handleWeekWrite(db, req, res, who, week) {
+// week, and its notes on projects. POST /timeline/weeks/:week/entries — the
+// same week as one entry per project (`entries` true): no lede, no titles,
+// and the reply counts the entries stored. Agents only, gated exactly like
+// POST /briefings (the Coordinator naming its own conversation). The
+// Coordinator always writes under the agent privacy sieve, whatever device it
+// runs on.
+async function handleWeekWrite(db, req, res, who, week, { entries = false } = {}) {
   if (who.kind !== 'agent') { json(res, 403, { error: 'forbidden' }); return true }
   const body = await readBody(req)
   if (refusedCloser(res, closingConvo(db, who, body.convo_id, { required: true }))) return true
-  const input = validWeekWrite(body)
+  const input = entries ? validWeekEntries(body) : validWeekWrite(body)
   if (!input) return badRequest(res)
-  const r = writeWeek(db, who.userId, week, input, { excludePrivateOwned: true })
+  const r = (entries ? writeWeekEntries : writeWeek)(db, who.userId, week, input, { excludePrivateOwned: true })
   if (r.error === 'conflict') { json(res, 409, { error: 'conflict', detail: r.detail }); return true }
   if (r.error) { json(res, 400, { error: r.error, detail: r.detail, ...(r.ref !== undefined && { ref: r.ref }) }); return true }
-  json(res, 201, { week: r.week, written: true, final: input.final })
+  json(res, 201, { week: r.week, written: true, final: input.final, ...(entries && { entries: r.entries }) })
   return true
 }
 
@@ -66,11 +70,12 @@ export async function handleTimelineRoute(ctx, req, res, url, who) {
   const path = url.pathname
   if (!path.startsWith('/timeline/')) return false
   if (req.method === 'POST') {
-    const w = path.match(/^\/timeline\/weeks\/([^/]+)$/)
+    const e = path.match(/^\/timeline\/weeks\/([^/]+)\/entries$/)
+    const w = e ?? path.match(/^\/timeline\/weeks\/([^/]+)$/)
     if (!w) return false
     let week
     try { week = decodeURIComponent(w[1]) } catch { return badRequest(res) }
-    return handleWeekWrite(db, req, res, who, week)
+    return handleWeekWrite(db, req, res, who, week, { entries: Boolean(e) })
   }
   if (req.method !== 'GET') return false
   const opts = { excludePrivateOwned: filteredAgent(db, who) }

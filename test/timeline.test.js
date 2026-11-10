@@ -10,7 +10,7 @@ import { upsertConversation, append } from '../src/journal.js'
 import { createItem, addComment, closeItem } from '../src/items.js'
 import { createMission, closeMission, createMilestone } from '../src/missions.js'
 import { createProject, mergeProject, updateProject, closeProject } from '../src/projects.js'
-import { writeWeek } from '../src/week-stories.js'
+import { writeWeek, validWeekEntries, writeWeekEntries, storedWeek } from '../src/week-stories.js'
 import {
   weekRaw, projectMoves, projectWeeklyMoves, weeksList, weekDetail, wentQuiet, openLong, finished, cronRunsForTest,
 } from '../src/timeline.js'
@@ -1009,4 +1009,118 @@ test('a note written before a merge follows the project into its survivor', () =
   mergeProject(db, { userId: 1, projectId: gone.p.id, intoId: survivor.p.id, by: 'user' })
   const row = openLong(db, 1, at).rows.find((r) => r.project.id === survivor.p.id)
   assert.equal(row.note, 'Left mid-way.')
+})
+
+// ---- A week written as one entry per project ----
+
+// An entry as the Coordinator writes it (project is a reference).
+const entry = (p, over = {}) => ({ project: p.id, sentence: 'It shipped.', ...over })
+const putEntries = (db, n, { entries = [], final = false, notes = [] } = {}, o = {}) =>
+  writeWeekEntries(db, 1, keyOf(n), validWeekEntries({ entries, final, notes }), { now: NOW, excludePrivateOwned: false, ...o })
+
+test('validWeekEntries: 0..8 entries, each a project and a sentence of 1..300; next and the picture are optional', () => {
+  const e = { project: 3, sentence: ' It shipped. ' }
+  assert.deepEqual(validWeekEntries({}), { entries: [], final: false, notes: [] })
+  assert.deepEqual(validWeekEntries({ entries: [e], final: true, notes: [{ project_id: 'p1', note: 'Steady.' }] }), {
+    entries: [{ project: 3, sentence: 'It shipped.', next: null, media_blob_id: null }], final: true, notes: [{ project: 'p1', note: 'Steady.' }],
+  })
+  assert.deepEqual(validWeekEntries({ entries: [{ project: 'p1', sentence: 's', next: 'Docs', media_blob_id: 'b1' }] }).entries,
+    [{ project: 'p1', sentence: 's', next: 'Docs', media_blob_id: 'b1' }])
+  assert.equal(validWeekEntries({ entries: Array(8).fill(e) }).entries.length, 8)
+  assert.equal(validWeekEntries({ entries: Array(9).fill(e) }), null)
+  assert.equal(validWeekEntries({ entries: [{ ...e, sentence: 'x'.repeat(300) }] }).entries[0].sentence.length, 300)
+  for (const bad of [
+    { sentence: 's' }, { project: 0, sentence: 's' }, { project: '', sentence: 's' }, { project: 3 }, { project: 3, sentence: ' ' },
+    { project: 3, sentence: 'x'.repeat(301) }, { project: 3, sentence: 's', next: 'x'.repeat(301) }, { project: 3, sentence: 's', next: 5 },
+    { project: 3, sentence: 's', media_blob_id: 5 }, 'nope', null,
+  ]) assert.equal(validWeekEntries({ entries: [bad] }), null, JSON.stringify(bad))
+  for (const bad of [null, [], { entries: 'x' }, { final: 'yes' }, { notes: [{ project_id: 3 }] }]) assert.equal(validWeekEntries(bad), null, JSON.stringify(bad))
+})
+
+test('validWeekEntries drops a title, project_ids, item_ids or lede it is sent', () => {
+  const out = validWeekEntries({ lede: 'A big week.', title: 'x', entries: [{ project: 3, sentence: 's', title: 'Launch', project_ids: [4], item_ids: [5], lede: 'y' }] })
+  assert.deepEqual(out, { entries: [{ project: 3, sentence: 's', next: null, media_blob_id: null }], final: false, notes: [] })
+})
+
+test('writeWeekEntries stores one story per entry: no title, no lede, one resolved project, no items', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha'); const b = proj(db, 'Bravo')
+  blobRow(db, 'b-shot')
+  const r = putEntries(db, 0, {
+    entries: [entry(b.p, { project: b.p.num, next: 'Docs', media_blob_id: 'b-shot' }), entry(a.p, { sentence: 'Done.' })],
+    notes: [{ project_id: a.p.id, note: 'Steady.' }],
+  })
+  assert.deepEqual(r, { ok: true, week: keyOf(0), entries: 2 })
+  assert.deepEqual(storedWeek(db, 1, keyOf(0)), {
+    week_key: keyOf(0), lede: null, written_at: NOW, final: false,
+    stories: [
+      { title: null, sentence: 'It shipped.', next: 'Docs', project_ids: [b.p.id], item_ids: [], media_blob_id: 'b-shot' },
+      { title: null, sentence: 'Done.', next: null, project_ids: [a.p.id], item_ids: [], media_blob_id: null },
+    ],
+  })
+  assert.equal(db.prepare('SELECT note FROM project_notes WHERE project_id = ?').get(a.p.id).note, 'Steady.')
+  // A second write replaces the week's entries and the note.
+  assert.deepEqual(putEntries(db, 0, { entries: [entry(a.p)], notes: [{ project_id: a.p.num, note: 'Faster.' }] }), { ok: true, week: keyOf(0), entries: 1 })
+  assert.deepEqual(storedWeek(db, 1, keyOf(0)).stories.map((s) => s.project_ids), [[a.p.id]])
+  assert.deepEqual(db.prepare('SELECT note FROM project_notes').all(), [{ note: 'Faster.' }])
+})
+
+test('writeWeekEntries replaces a week written as grouped stories, lede and all', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha')
+  put(db, 0, { lede: 'A big week.', stories: [tale({ project_ids: [a.p.id] })] })
+  assert.equal(putEntries(db, 0, { entries: [entry(a.p)] }).ok, true)
+  const w = storedWeek(db, 1, keyOf(0))
+  assert.equal(w.lede, null); assert.deepEqual(w.stories.map((s) => s.title), [null])
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM week_stories').get().n, 1)
+})
+
+test('writeWeekEntries refuses two entries on one project, by id and number or through a merge, and stores nothing', () => {
+  const db = seeded()
+  const a = proj(db, 'Survivor'); const b = proj(db, 'Gone')
+  assert.deepEqual(putEntries(db, 0, { entries: [entry(a.p), entry(b.p), entry(a.p, { project: a.p.num })] }),
+    { error: 'bad_request', detail: 'duplicate_project', ref: a.p.num })
+  mergeProject(db, { userId: 1, projectId: b.p.id, intoId: a.p.id, by: 'user' })
+  assert.deepEqual(putEntries(db, 0, { entries: [entry(a.p), entry(b.p)] }), { error: 'bad_request', detail: 'duplicate_project', ref: b.p.id })
+  assert.equal(storedWeek(db, 1, keyOf(0)), null)
+  // One entry on the merged project is stored under the survivor.
+  assert.equal(putEntries(db, 0, { entries: [entry(b.p)] }).ok, true)
+  assert.deepEqual(storedWeek(db, 1, keyOf(0)).stories[0].project_ids, [a.p.id])
+})
+
+test('writeWeekEntries: an unknown or private project and an unknown picture name the reference and store nothing', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha')
+  const hidden = createProject(db, { userId: 1, deviceId: 9, createdBy: 'agent', title: 'Hidden', convoId: 'secret' }).project
+  db.prepare('UPDATE projects SET origin_convo_id = ? WHERE id = ?').run('secret', hidden.id)
+  blobRow(db, 'b-doc', 'application/pdf')
+  const sieved = { excludePrivateOwned: true }
+  assert.deepEqual(putEntries(db, 0, { entries: [entry(a.p), entry(a.p, { project: 9999 })] }), { error: 'bad_request', detail: 'unknown_project', ref: 9999 })
+  assert.deepEqual(putEntries(db, 0, { entries: [entry(hidden)] }, sieved), { error: 'bad_request', detail: 'unknown_project', ref: hidden.id })
+  assert.deepEqual(putEntries(db, 0, { notes: [{ project_id: hidden.num, note: 'x' }] }, sieved), { error: 'bad_request', detail: 'unknown_project', ref: hidden.num })
+  for (const blob of ['b-nope', 'b-doc']) {
+    assert.deepEqual(putEntries(db, 0, { entries: [entry(a.p, { media_blob_id: blob })] }), { error: 'bad_request', detail: 'unknown_blob', ref: blob })
+  }
+  assert.equal(storedWeek(db, 1, keyOf(0)), null)
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM project_notes').get().n, 0)
+  // Unsieved, the private project is the user's own and can be written.
+  assert.equal(putEntries(db, 0, { entries: [entry(hidden)] }).ok, true)
+})
+
+test('writeWeekEntries keeps the week rules: a real week in reach, final only once it has ended, a final week replaced only by a final write', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha')
+  const write = (key, final = false) => writeWeekEntries(db, 1, key, validWeekEntries({ entries: [entry(a.p)], final }), { now: NOW })
+  assert.deepEqual(write('2026-11-10'), { error: 'bad_request', detail: 'bad_week' })
+  assert.deepEqual(write(keyOf(1)), { error: 'bad_request', detail: 'week_out_of_range' })
+  assert.deepEqual(write(keyOf(-11)), { error: 'bad_request', detail: 'week_out_of_range' })
+  assert.equal(write(keyOf(-10)).ok, true)
+  assert.deepEqual(write(keyOf(0), true), { error: 'bad_request', detail: 'week_not_ended' })
+  assert.equal(write(keyOf(-1), true).ok, true)
+  assert.deepEqual(write(keyOf(-1)), { error: 'conflict', detail: 'week_final' })
+  assert.equal(write(keyOf(-1), true).ok, true)
+  assert.equal(storedWeek(db, 1, keyOf(-1)).final, true)
+  // A week grouped stories made final is as frozen as one written by entries.
+  put(db, -2, { lede: 'Done.', final: true })
+  assert.deepEqual(write(keyOf(-2)), { error: 'conflict', detail: 'week_final' })
 })

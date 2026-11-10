@@ -218,6 +218,124 @@ test('POST /timeline/weeks/:week: a private-device Coordinator still cannot name
   assert.deepEqual(r, { status: 400, json: { error: 'bad_request', detail: 'unknown_project', ref: hidden.num } })
 })
 
+// ---- POST /timeline/weeks/:week/entries (the Coordinator's write, one entry per project) ----
+
+const putEntries = (s, week, token, body) => s.http(`/timeline/weeks/${week}/entries`, { method: 'POST', token, body })
+const entriesBody = (p, over = {}) => ({
+  convo_id: 'coord', final: false,
+  entries: [{ project: p.num, sentence: 'It shipped.' }],
+  notes: [{ project_id: p.id, note: 'On track.' }], ...over,
+})
+const another = (s, alice, agent, title) => createProject(s.db, { userId: alice.id, deviceId: agent.deviceId, createdBy: 'agent', title }).project
+
+test('POST /timeline/weeks/:week/entries: 401 without a token, 403 for a client, only the Coordinator naming its own conversation', async (t) => {
+  const { s, alice, agent, client, p } = await coordinatorFleet(t)
+  const week = thisWeek(s, alice)
+  assert.equal((await putEntries(s, week, undefined, entriesBody(p))).status, 401)
+  assert.deepEqual(await putEntries(s, week, client, entriesBody(p)), { status: 403, json: { error: 'forbidden' } })
+  assert.deepEqual(await putEntries(s, week, agent.token, entriesBody(p, { convo_id: 'c1' })), { status: 403, json: { error: 'forbidden', detail: 'not_coordinator' } })
+  assert.deepEqual(await putEntries(s, week, agent.token, entriesBody(p, { convo_id: undefined })), { status: 403, json: { error: 'forbidden', detail: 'not_coordinator' } })
+  assert.equal((await putEntries(s, week, agent.token, entriesBody(p, { convo_id: 'nope' }))).status, 404)
+  assert.equal((await putEntries(s, week, agent.token, entriesBody(p, { convo_id: 7 }))).status, 400)
+  assert.equal(storedWeek(s.db, alice.id, week), null)
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM project_notes').get().n, 0)
+})
+
+test('POST /timeline/weeks/:week/entries: the Coordinator writes a week, 201, stored as one untitled story per project with no lede', async (t) => {
+  const { s, alice, agent, p } = await coordinatorFleet(t)
+  const week = thisWeek(s, alice)
+  const q = another(s, alice, agent, 'Site refresh')
+  const r = await putEntries(s, week, agent.token, entriesBody(p, {
+    entries: [{ project: p.num, sentence: 'It shipped.', next: 'Docs' }, { project: q.id, sentence: 'Half way.' }],
+  }))
+  assert.deepEqual(r, { status: 201, json: { week, written: true, final: false, entries: 2 } })
+  const stored = storedWeek(s.db, alice.id, week)
+  assert.equal(stored.lede, null); assert.equal(stored.final, false)
+  assert.deepEqual(stored.stories, [
+    { title: null, sentence: 'It shipped.', next: 'Docs', project_ids: [p.id], item_ids: [], media_blob_id: null },
+    { title: null, sentence: 'Half way.', next: null, project_ids: [q.id], item_ids: [], media_blob_id: null },
+  ])
+  assert.equal(s.db.prepare('SELECT note FROM project_notes WHERE project_id = ?').get(p.id).note, 'On track.')
+  // Notes upsert: a later write replaces the note, and no entries is a valid week.
+  assert.deepEqual(await putEntries(s, week, agent.token, { convo_id: 'coord', entries: [], notes: [{ project_id: p.num, note: 'Slipping.' }] }),
+    { status: 201, json: { week, written: true, final: false, entries: 0 } })
+  assert.deepEqual(s.db.prepare('SELECT note FROM project_notes').all(), [{ note: 'Slipping.' }])
+  assert.deepEqual(storedWeek(s.db, alice.id, week).stories, [])
+})
+
+test('POST /timeline/weeks/:week/entries: 8 entries are stored, 9 are a bare 400; malformed entries and bad weeks are 400', async (t) => {
+  const { s, alice, agent, p } = await coordinatorFleet(t)
+  const week = thisWeek(s, alice)
+  const nine = [p, ...Array.from({ length: 8 }, (_, i) => another(s, alice, agent, `Project ${i}`))].map((x) => ({ project: x.id, sentence: 'Moved.' }))
+  assert.deepEqual(await putEntries(s, week, agent.token, entriesBody(p, { entries: nine })), { status: 400, json: { error: 'bad_request' } })
+  const bad = [
+    { entries: [{ sentence: 's' }] }, { entries: [{ project: p.id }] }, { entries: [{ project: p.id, sentence: '' }] },
+    { entries: [{ project: p.id, sentence: 'x'.repeat(301) }] }, { entries: [{ project: p.id, sentence: 's', next: 'x'.repeat(301) }] },
+    { entries: [{ project: p.id, sentence: 's', media_blob_id: 5 }] }, { entries: 'x' }, { final: 'yes' },
+  ]
+  for (const over of bad) {
+    assert.deepEqual(await putEntries(s, week, agent.token, entriesBody(p, over)), { status: 400, json: { error: 'bad_request' } }, JSON.stringify(over))
+  }
+  assert.equal(storedWeek(s.db, alice.id, week), null)
+  assert.deepEqual(await putEntries(s, '2026-11-10', agent.token, entriesBody(p)), { status: 400, json: { error: 'bad_request', detail: 'bad_week' } })
+  assert.equal((await putEntries(s, '%E0%A4%A', agent.token, entriesBody(p))).status, 400)
+  assert.deepEqual(await putEntries(s, nextWeek(s, alice), agent.token, entriesBody(p)), { status: 400, json: { error: 'bad_request', detail: 'week_out_of_range' } })
+  assert.deepEqual(await putEntries(s, week, agent.token, entriesBody(p, { entries: nine.slice(0, 8) })),
+    { status: 201, json: { week, written: true, final: false, entries: 8 } })
+  assert.equal(storedWeek(s.db, alice.id, week).stories.length, 8)
+})
+
+test('POST /timeline/weeks/:week/entries: a title, project_ids or lede in the body or an entry is ignored, never stored', async (t) => {
+  const { s, alice, agent, p } = await coordinatorFleet(t)
+  const week = thisWeek(s, alice)
+  const q = another(s, alice, agent, 'Site refresh')
+  const r = await putEntries(s, week, agent.token, entriesBody(p, {
+    lede: 'A busy week.', title: 'Week', project_ids: [q.id], stories: [{ title: 'Launch', sentence: 'x', project_ids: [q.id] }],
+    entries: [{ project: p.id, sentence: 'It shipped.', title: 'Launch', project_ids: [q.id], item_ids: [1], lede: 'A busy week.' }],
+  }))
+  assert.equal(r.status, 201)
+  const stored = storedWeek(s.db, alice.id, week)
+  assert.equal(stored.lede, null)
+  assert.deepEqual(stored.stories, [{ title: null, sentence: 'It shipped.', next: null, project_ids: [p.id], item_ids: [], media_blob_id: null }])
+})
+
+test('POST /timeline/weeks/:week/entries: two entries on one project, an unknown project and an unknown picture are 400 naming the ref', async (t) => {
+  const { s, alice, agent, p } = await coordinatorFleet(t)
+  const week = thisWeek(s, alice)
+  const two = (second) => entriesBody(p, { entries: [{ project: p.id, sentence: 'One.' }, second] })
+  assert.deepEqual(await putEntries(s, week, agent.token, two({ project: p.num, sentence: 'Two.' })),
+    { status: 400, json: { error: 'bad_request', detail: 'duplicate_project', ref: p.num } })
+  assert.deepEqual(await putEntries(s, week, agent.token, two({ project: 9999, sentence: 'Two.' })),
+    { status: 400, json: { error: 'bad_request', detail: 'unknown_project', ref: 9999 } })
+  assert.deepEqual(await putEntries(s, week, agent.token, entriesBody(p, { entries: [{ project: p.id, sentence: 'One.', media_blob_id: 'b-nope' }] })),
+    { status: 400, json: { error: 'bad_request', detail: 'unknown_blob', ref: 'b-nope' } })
+  assert.equal(storedWeek(s.db, alice.id, week), null)
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM project_notes').get().n, 0)
+})
+
+test('POST /timeline/weeks/:week/entries: final only once the week has ended; a non-final write over a final week is 409; a final rewrite is 201', async (t) => {
+  const { s, alice, agent, p } = await coordinatorFleet(t)
+  assert.deepEqual(await putEntries(s, thisWeek(s, alice), agent.token, entriesBody(p, { final: true })),
+    { status: 400, json: { error: 'bad_request', detail: 'week_not_ended' } })
+  const week = lastWeek(s, alice)
+  assert.deepEqual(await putEntries(s, week, agent.token, entriesBody(p, { final: true })), { status: 201, json: { week, written: true, final: true, entries: 1 } })
+  assert.deepEqual(await putEntries(s, week, agent.token, entriesBody(p)), { status: 409, json: { error: 'conflict', detail: 'week_final' } })
+  const again = entriesBody(p, { final: true, entries: [{ project: p.id, sentence: 'Rewritten.' }] })
+  assert.equal((await putEntries(s, week, agent.token, again)).status, 201)
+  assert.equal(storedWeek(s.db, alice.id, week).stories[0].sentence, 'Rewritten.')
+  // The grouped write sees the same frozen week.
+  assert.deepEqual(await put(s, week, agent.token, goodBody(p)), { status: 409, json: { error: 'conflict', detail: 'week_final' } })
+})
+
+test('POST /timeline/weeks/:week/entries: a private-device Coordinator still cannot name private work', async (t) => {
+  const { s, alice, priv } = await coordinatorFleet(t)
+  setCoordinatorConvoId(s.db, alice.id, 'secret')
+  const hidden = createProject(s.db, { userId: alice.id, deviceId: priv.deviceId, createdBy: 'agent', title: 'Hidden' }).project
+  const r = await putEntries(s, thisWeek(s, alice), priv.token, entriesBody(hidden, { convo_id: 'secret', notes: [] }))
+  assert.deepEqual(r, { status: 400, json: { error: 'bad_request', detail: 'unknown_project', ref: hidden.num } })
+  assert.equal(storedWeek(s.db, alice.id, thisWeek(s, alice)), null)
+})
+
 // ---- GET /timeline/weeks/:week?raw=1 (the Coordinator's raw read) and the reads over a written week ----
 
 test('raw read: 401 without a token, 403 for a client, 400 for a bad key, agents get the shape', async (t) => {
