@@ -2,12 +2,12 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { startTestServer } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { upsertConversation } from '../src/journal.js'
+import { upsertConversation, append } from '../src/journal.js'
 import { setCoordinatorConvoId } from '../src/coordinator.js'
 import { storedWeek } from '../src/week-stories.js'
 import { pinDevicePrivate } from '../src/db.js'
 import { createProject, closeProject } from '../src/projects.js'
-import { createMission, closeMission } from '../src/missions.js'
+import { createMission, closeMission, createMilestone } from '../src/missions.js'
 import { weekStartOf, formatWeekKey, previousWeekStart, weekEndOf, parseWeekKey, userTimeZone } from '../src/timeline.js'
 
 async function fleet(t) {
@@ -162,7 +162,7 @@ test('POST /timeline/weeks/:week: 401 without a token, 403 for a client token', 
   const { s, alice, client, p } = await coordinatorFleet(t)
   assert.equal((await put(s, thisWeek(s, alice), undefined, goodBody(p))).status, 401)
   assert.deepEqual(await put(s, thisWeek(s, alice), client, goodBody(p)), { status: 403, json: { error: 'forbidden' } })
-  assert.equal(storedWeek(s.db, alice.id, weekStartOf(Date.now(), userTimeZone(s.db, alice.id))), null)
+  assert.equal(storedWeek(s.db, alice.id, thisWeek(s, alice)), null)
 })
 
 test('POST /timeline/weeks/:week: only the Coordinator naming its own conversation', async (t) => {
@@ -172,7 +172,7 @@ test('POST /timeline/weeks/:week: only the Coordinator naming its own conversati
   assert.deepEqual(await put(s, week, agent.token, goodBody(p, { convo_id: undefined })), { status: 403, json: { error: 'forbidden', detail: 'not_coordinator' } })
   assert.equal((await put(s, week, agent.token, goodBody(p, { convo_id: 'nope' }))).status, 404)
   assert.equal((await put(s, week, agent.token, goodBody(p, { convo_id: 7 }))).status, 400)
-  assert.equal(storedWeek(s.db, alice.id, weekStartOf(Date.now(), userTimeZone(s.db, alice.id))), null)
+  assert.equal(storedWeek(s.db, alice.id, thisWeek(s, alice)), null)
 })
 
 test('POST /timeline/weeks/:week: the Coordinator writes a week, 201, and the row is stored with resolved ids', async (t) => {
@@ -180,7 +180,7 @@ test('POST /timeline/weeks/:week: the Coordinator writes a week, 201, and the ro
   const week = thisWeek(s, alice)
   const r = await put(s, week, agent.token, goodBody(p))
   assert.deepEqual(r, { status: 201, json: { week, written: true, final: false } })
-  const stored = storedWeek(s.db, alice.id, weekStartOf(Date.now(), userTimeZone(s.db, alice.id)))
+  const stored = storedWeek(s.db, alice.id, thisWeek(s, alice))
   assert.equal(stored.lede, 'A busy week.')
   assert.deepEqual(stored.stories[0].project_ids, [p.id])
   assert.equal(s.db.prepare('SELECT note FROM project_notes WHERE project_id = ?').get(p.id).note, 'On track.')
@@ -207,7 +207,7 @@ test('POST /timeline/weeks/:week: a non-final write over a final week is 409; a 
   assert.deepEqual(await put(s, week, agent.token, goodBody(p, { final: true })), { status: 201, json: { week, written: true, final: true } })
   assert.deepEqual(await put(s, week, agent.token, goodBody(p)), { status: 409, json: { error: 'conflict', detail: 'week_final' } })
   assert.equal((await put(s, week, agent.token, goodBody(p, { final: true, lede: 'Rewritten.' }))).status, 201)
-  assert.equal(storedWeek(s.db, alice.id, weekStartOf(Date.now() - 7 * 86400e3, userTimeZone(s.db, alice.id))).lede, 'Rewritten.')
+  assert.equal(storedWeek(s.db, alice.id, lastWeek(s, alice)).lede, 'Rewritten.')
 })
 
 test('POST /timeline/weeks/:week: a private-device Coordinator still cannot name private work', async (t) => {
@@ -232,9 +232,38 @@ test('raw read: 401 without a token, 403 for a client, 400 for a bad key, agents
   assert.deepEqual(Object.keys(r.json), ['week', 'start', 'end', 'final', 'written_at', 'current', 'stored', 'projects', 'more_projects'])
   assert.equal(r.json.current, true); assert.equal(r.json.stored, null); assert.equal(r.json.written_at, null)
   assert.deepEqual(r.json.projects.map((x) => x.project.title), ['Promo launch'])
-  assert.deepEqual(Object.keys(r.json.projects[0]), ['project', 'moved', 'status', 'milestones', 'items', 'media'])
+  assert.deepEqual(Object.keys(r.json.projects[0]), ['project', 'moved', 'status', 'milestones', 'items', 'media', 'needs_you'])
   // raw=0 and other values are the ordinary read, open to the client.
   assert.equal((await get(s, `/timeline/weeks/${week}?raw=0`, client)).status, 200)
+})
+
+test('raw=1 on the quiet and long lists is always sieved for an agent, even on a private device; a client and a plain read are unchanged', async (t) => {
+  const { s, alice, agent, priv, client } = await coordinatorFleet(t)
+  const old = Date.now() - 60 * 86400e3
+  const hidden = createProject(s.db, { userId: alice.id, deviceId: priv.deviceId, createdBy: 'agent', title: 'Hidden', convoId: 'secret' }).project
+  const open = createProject(s.db, { userId: alice.id, deviceId: agent.deviceId, createdBy: 'agent', title: 'Open' }).project
+  for (const [p, convoId, device] of [[hidden, 'secret', priv.deviceId], [open, 'c1', agent.deviceId]]) {
+    const { mission: m } = createMission(s.db, { userId: alice.id, deviceId: device, createdBy: 'agent', convoId, title: p.title, projectId: p.id })
+    s.db.prepare('UPDATE missions SET created_at = ?, updated_at = ? WHERE id = ?').run(old, old, m.id)
+    s.db.prepare('UPDATE projects SET created_at = ?, updated_at = ? WHERE id = ?').run(old, old, p.id)
+    // Two weeks of moves, then silence: quiet; created long ago: open a long time.
+    for (const days of [50, 40]) {
+      const { milestone } = createMilestone(s.db, {
+        userId: alice.id, deviceId: device, createdBy: 'agent', convoId, kind: 'progress', title: 'm',
+        appendMarker: (payload) => append(s.db, { userId: alice.id, convoId, sender: 'agent:x', type: 'milestone', payload }),
+      })
+      s.db.prepare('UPDATE milestones SET created_at = ? WHERE id = ?').run(Date.now() - days * 86400e3, milestone.id)
+    }
+  }
+  for (const route of ['quiet', 'long']) {
+    const titles = async (path, token) => (await get(s, path, token)).json.rows.map((r) => r.project.title).sort()
+    // Without raw=1 the private device's agent sees its own work, as before.
+    assert.deepEqual(await titles(`/timeline/${route}`, priv.token), ['Hidden', 'Open'], `${route} plain, private agent`)
+    assert.deepEqual(await titles(`/timeline/${route}?raw=1`, priv.token), ['Open'], `${route} raw, private agent`)
+    assert.deepEqual(await titles(`/timeline/${route}?raw=1`, agent.token), ['Open'], `${route} raw, ordinary agent`)
+    // A client sending raw=1 gets the normal read.
+    assert.deepEqual(await titles(`/timeline/${route}?raw=1`, client), await titles(`/timeline/${route}`, client), `${route} client`)
+  }
 })
 
 test('raw read always applies the agent sieve, even on a private device; a written week shows in the plain reads', async (t) => {

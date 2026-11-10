@@ -533,6 +533,8 @@ CREATE TABLE IF NOT EXISTS week_stories(
   final      INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(user_id, week_start)
 );
+-- Rows are looked up by week_key: the date survives a change of time zone.
+CREATE INDEX IF NOT EXISTS week_stories_key ON week_stories(user_id, week_key);
 CREATE TABLE IF NOT EXISTS project_notes(
   user_id    INTEGER NOT NULL REFERENCES users(id),
   project_id TEXT NOT NULL,

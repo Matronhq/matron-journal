@@ -4097,11 +4097,14 @@ plus the rollup fields on every route that returns one. `idem_key` and
 There is no project marker: the apps refresh `GET /projects` on any
 `mission` marker and while the Projects tab is open.
 
-**Timeline (read-only).** `src/timeline-http.js`. Five `GET` routes that
-turn the projects into a weekly timeline; nothing is written. Weeks are the
+**Timeline.** `src/timeline-http.js` (reads) and `src/week-stories.js`
+(the Coordinator's write). Five `GET` routes turn the projects into a weekly
+timeline, a sixth read gives the Coordinator the raw material for a week, and
+one `POST` stores the lede and story cards it writes from that. Weeks are the
 user's own local Monday 00:00 to the next, in their stored time zone
 (`Europe/London` by default); a *week key* is the Monday's local date,
-`YYYY-MM-DD`. A "move" is a milestone, an item created or closed, a
+`YYYY-MM-DD`. Stored weeks are looked up by week key, so a change of time zone
+does not orphan them. A "move" is a milestone, an item created or closed, a
 user-visible item comment, or a mission created or closed; chat traffic and a
 project status edit are not. A project merged into another counts under the
 survivor and is never a row. Every route goes through the caller's sieve like
@@ -4110,14 +4113,34 @@ private-owned moves). Bad parameters are 400 `{error:'bad_request'}`.
 
 | Route | Query | Response |
 |---|---|---|
-| `GET /timeline/weeks` | `before?` a Monday week key; `limit?` integer 1..52, default 12 | `{weeks:[{week, start, end, sentence, moved}], next_before}` — newest first from the current week (or the week before `before`) back to the week of the user's earliest mission, quiet weeks included. `moved` is how many projects moved; `sentence` summarises them. `next_before` is the week key to pass for the next page, `null` at the end. |
-| `GET /timeline/weeks/:week` | | `{week, start, end, final, lede, stories:[{project, sentence, next, needs_you, media}], also:[{…project ref, moved}]}` — one week: a story per project that moved, most moves first, at most 8; the rest under `also`. `final` is false for the current week. `sentence` is the newest milestone title that week; `needs_you` the project's open items awaiting the user (consent cards left out); `media` its newest image or video that week, or `null`. A `:week` that is not a real Monday key is 400. |
-| `GET /timeline/quiet` | | `{total, rows:[{project, last_moved_at, weekly, note}]}` — *went quiet*: open projects that moved in at least two of the eight weeks up to their last move and have not moved for 14 days. Top 10 by moves; `total` counts them all. `weekly` is eight per-week move counts, oldest first, ending with the current week. |
-| `GET /timeline/long` | | `{total, rows:[{project, created_at, last_moved_at, weekly, note}]}` — *open a long time*: open projects with an open mission, created at least 21 days ago, oldest first. Top 10; `total` counts them all. |
+| `GET /timeline/weeks` | `before?` a Monday week key; `limit?` integer 1..52, default 12 | `{weeks:[{week, start, end, sentence, moved, written}], next_before}` — newest first from the current week (or the week before `before`) back to the week of the user's earliest mission, quiet weeks included. `moved` is how many projects moved; `sentence` is the first sentence of the Coordinator's lede for a written week, else a summary of the moves. `written` is true when the Coordinator has written the week (a lede, a story or the final flag; a row holding only notes is not written). `next_before` is the week key to pass for the next page, `null` at the end. |
+| `GET /timeline/weeks/:week` | | `{week, start, end, final, lede, written_at, stories:[{title, project, projects, sentence, next, needs_you, media}], also:[{…project ref, moved}]}` — one week. Unwritten: a story per project that moved, most moves first, at most 8, the rest under `also`; `title` and `lede` are `null`, `projects` is `[project]`, `written_at` is `null`, `sentence` is the newest milestone title that week, `needs_you` the project's open items awaiting the user (consent cards left out, only items created before the week ended) and `media` its newest image or video that week, or `null`. Written: the Coordinator's `lede`, `written_at` and stories in its order; `project` is the first of `projects` (the projects the story is about, merged ones through to the survivor), `needs_you` the items it named as `{id, num, title, done}` (`done` is true once an item no longer awaits the user), `media` its chosen picture (or the week's newest picture when that one is gone or hidden), and `also` the moving projects no story names. `final` is true for a week that has ended or was written final, false for the current week. A `:week` that is not a real Monday key is 400. |
+| `GET /timeline/weeks/:week?raw=1` | | Agents only (a client is 403). What the Coordinator writes a week from: `{week, start, end, final, written_at, current, stored, projects, more_projects}`. `final` is true for every week that has ended (and for one written final), so it does not say whether the week has been closed by a write: that is `stored.final`. `current` is true for the current week. `stored` is the written week with ids as refs, or `null`: `{lede, final, stories:[{title, sentence, next, projects, items, media_blob_id}]}`. `projects` are the projects that moved (most moves first, at most 40, the rest counted in `more_projects`), each `{project, moved, status, milestones, items, media, needs_you}`: up to 10 milestones, up to 10 items with activity that week, up to 5 pictures or videos, and `needs_you` — up to 10 open items awaiting the user that were created before the week ended, newest first, whatever the week's activity (consent cards left out), the set to name in `item_ids` and count in a lede. Always under the agent privacy sieve, on a private device too. |
+| `POST /timeline/weeks/:week` | body `{convo_id, lede?, stories?, final?, notes?}` | `201 {week, written, final}`. Agents only, and only the user's Coordinator naming its own conversation in `convo_id` (a client is 403 `forbidden`; any other agent 403 `forbidden` with `detail:'not_coordinator'`, as for `POST /briefings`). `lede` ≤ 600 characters. `stories` ≤ 8 of `{title ≤ 80, sentence ≤ 300, next? ≤ 300, project_ids (1..10), item_ids? (≤ 10), media_blob_id?}`; a project or item is a string id or the per-user number, `media_blob_id` a blob of the user's that is an image or a video. `notes` ≤ 50 of `{project_id, note ≤ 300}`, one sentence kept on a project. A write replaces the week's lede and stories (the notes are upserted per project). `:week` is this week or up to 10 weeks back. `final: true` closes a week that has ended (400 `week_not_ended` otherwise); after that only a final write replaces it (409 `{error:'conflict', detail:'week_final'}`). 400 `{error, detail, ref?}`: `detail` is `bad_week`, `week_out_of_range`, `week_not_ended`, or `unknown_project` / `unknown_item` / `unknown_blob` with the offending `ref`; a malformed body is a bare 400. Every reference is resolved first and nothing is written on an error. The write always runs under the agent privacy sieve (a project, item or picture of a private device's work is `unknown_*`), whatever device the Coordinator runs on. |
+| `GET /timeline/quiet` | `raw=1`? | `{total, rows:[{project, last_moved_at, weekly, note}]}` — *went quiet*: open projects that moved in at least two of the eight weeks up to their last move and have not moved for 14 days. Top 10 by moves; `total` counts them all. `weekly` is eight per-week move counts, oldest first, ending with the current week. `note` is the Coordinator's one-sentence note on the project, or `null` (see below). With `raw=1` from an agent the read is always under the agent privacy sieve, even on a private device (the Coordinator reads this list to write notes and a lede the filtered apps then show); from a client `raw=1` changes nothing. |
+| `GET /timeline/long` | `raw=1`? | `{total, rows:[{project, created_at, last_moved_at, weekly, note}]}` — *open a long time*: open projects with an open mission, created at least 21 days ago, oldest first. Top 10; `total` counts them all. `note` and `raw=1` as for `/timeline/quiet`. |
 | `GET /timeline/finished` | `before?` a `"<finished_at>:<project id>"` cursor; `limit?` integer 1..100, default 30 | `{rows:[{project, finished_at}], next_before}` — projects that are closed or have no open mission (and had at least one), newest finish first. `next_before` is the cursor for the next page, `null` at the end. |
 
 `project` in these bodies is the compact project reference `{id, num, title}` the timeline reads
 share, never the full row.
+
+**Stale notes.** A project's `note` is shown only while it is at least as new
+as the project's last move (or the project has never moved); once the project
+moves again the note reads `null` until the Coordinator writes a fresh one.
+
+**Re-sieving and its limits.** Stored stories keep resolved ids, not text, and
+every read re-checks them: a story is shown to an ordinary agent only through
+projects it may see, and its items and picture only while they are visible to
+it, so a project that turns private after the write drops out of that agent's
+view. Two limits are accepted. (1) The Coordinator's free text (the lede and
+each story's `title`, `sentence` and `next`) cannot be re-sieved: if a project
+becomes private after its week was written, a story that names it alongside a
+visible project is kept, and its sentence and the lede may still name the
+now-private project to ordinary agents. The write sieve stops private work
+entering the text at the time of writing; it cannot take it back out. (2) A
+story whose projects are all hidden from the caller is withheld from the
+caller's reads, including the raw read's `stored`, so a Coordinator that
+rewrites a week from the raw read silently drops those stories.
 
 **Visibility.** Same rules as missions. An ordinary agent never sees a
 project whose origin conversation is private-owned or that a private device

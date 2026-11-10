@@ -100,8 +100,8 @@ const mission = (db, convoId, projectId, deviceId = 7) =>
   createMission(db, { userId: 1, deviceId, createdBy: 'agent', convoId, title: `m-${convoId}`, projectId }).mission
 const item = (db, convoId, deviceId = 7) =>
   createItem(db, { userId: 1, originDeviceId: deviceId, createdBy: 'agent', kind: 'task', title: 'An item', originConvoId: convoId }).item
-const blob = (db, id, userId = 1) =>
-  db.prepare("INSERT INTO blobs(id, owner_user_id, content_type, size, sha256, disk_path, created_at) VALUES(?,?,'image/png',4,'s','p',0)").run(id, userId)
+const blob = (db, id, userId = 1, type = 'image/png') =>
+  db.prepare("INSERT INTO blobs(id, owner_user_id, content_type, size, sha256, disk_path, created_at) VALUES(?,?,?,4,'s','p',0)").run(id, userId, type)
 const attach = (db, it, blobId) => addComment(db, {
   userId: 1, itemId: it.id, author: 'agent', deviceId: it.origin_device_id ?? 7, attachments: [{ blob_ref: blobId, mime: 'image/png', name: `${blobId}.png`, size: 4 }], now: NOW - 1000,
 })
@@ -123,13 +123,13 @@ test('writeWeek stores resolved ids: numbers become ids, a merged project become
     notes: [{ project_id: c.num, note: 'Merged into beta.' }, { project_id: a.id, note: 'On track.' }],
   })
   assert.deepEqual(r, { ok: true, week: keyOf(-1) })
-  const stored = storedWeek(db, 1, weekN(-1))
+  const stored = storedWeek(db, 1, keyOf(-1))
   assert.equal(stored.week_key, keyOf(-1)); assert.equal(stored.lede, 'A busy week.')
   assert.equal(stored.written_at, NOW); assert.equal(stored.final, false)
   assert.deepEqual(stored.stories, [{ title: 'Launch', sentence: 'It shipped.', next: 'Docs', project_ids: [a.id, b.id], item_ids: [it.id], media_blob_id: 'b-shot' }])
   assert.deepEqual([...projectNotes(db, 1, [a.id, b.id, c.id])].sort(), [[a.id, { note: 'On track.', written_at: NOW }], [b.id, { note: 'Merged into beta.', written_at: NOW }]].sort())
-  assert.equal(storedWeek(db, 1, weekN(-2)), null)
-  assert.equal(storedWeek(db, 2, weekN(-1)), null)
+  assert.equal(storedWeek(db, 1, keyOf(-2)), null)
+  assert.equal(storedWeek(db, 2, keyOf(-1)), null)
 })
 
 test('writeWeek refuses a project that is not the user\'s, or hidden by the sieve, naming the ref', () => {
@@ -184,7 +184,7 @@ test("writeWeek's item numbers are per user: bob's same number is alice's own it
   assert.ok(sameNum && onlyBobs)
   const story = (item_ids) => ({ title: 'T', sentence: 'S.', project_ids: [a.id], item_ids })
   assert.equal(write(db, keyOf(0), { stories: [story([mine.num])] }).ok, true)
-  assert.deepEqual(storedWeek(db, 1, weekN(0)).stories[0].item_ids, [mine.id]) // not bob's item with the same number
+  assert.deepEqual(storedWeek(db, 1, keyOf(0)).stories[0].item_ids, [mine.id]) // not bob's item with the same number
   assert.deepEqual(write(db, keyOf(0), { stories: [story([onlyBobs.num])] }), { error: 'bad_request', detail: 'unknown_item', ref: onlyBobs.num })
   assert.equal(write(db, keyOf(0), { stories: [story([sameNum.id])] }).detail, 'unknown_item')
 })
@@ -207,6 +207,30 @@ test('writeWeek refuses an unknown blob, another user\'s, one only a private con
   assert.equal(write(db, keyOf(0), { stories: [story('b-bob')] }, { excludePrivateOwned: false }).detail, 'unknown_blob')
 })
 
+test('writeWeek refuses a blob that is not an image or a video; a video is accepted', () => {
+  const db = seeded()
+  const a = project(db, 'P'); mission(db, 'c1', a.id)
+  const mine = item(db, 'c1')
+  for (const [id, type] of [['b-pdf', 'application/pdf'], ['b-log', 'text/plain'], ['b-vid', 'video/mp4']]) { blob(db, id, 1, type); attach(db, mine, id) }
+  const story = (id) => ({ title: 'T', sentence: 'S.', project_ids: [a.id], media_blob_id: id })
+  for (const o of [{}, { excludePrivateOwned: false }]) {
+    assert.deepEqual(write(db, keyOf(0), { stories: [story('b-pdf')] }, o), { error: 'bad_request', detail: 'unknown_blob', ref: 'b-pdf' })
+    assert.equal(write(db, keyOf(0), { stories: [story('b-log')] }, o).detail, 'unknown_blob')
+    assert.equal(write(db, keyOf(0), { stories: [story('b-vid')] }, o).ok, true)
+  }
+})
+
+test('writeWeek finds the week by its key after a time-zone change: the final flag still holds and a rewrite replaces the row', () => {
+  const db = seeded()
+  assert.equal(write(db, keyOf(-1), { final: true, lede: 'one' }).ok, true)
+  db.prepare("UPDATE users SET time_zone = 'America/New_York' WHERE id = 1").run()
+  assert.equal(storedWeek(db, 1, keyOf(-1)).lede, 'one')
+  assert.deepEqual(write(db, keyOf(-1), { lede: 'two' }), { error: 'conflict', detail: 'week_final' })
+  assert.equal(write(db, keyOf(-1), { final: true, lede: 'three' }).ok, true)
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM week_stories').get().n, 1)
+  assert.equal(storedWeek(db, 1, keyOf(-1)).lede, 'three')
+})
+
 test('writeWeek: the week must be a Monday key, started, and at most reachWeeks back', () => {
   const db = seeded()
   assert.deepEqual(write(db, '2026-11-10'), { error: 'bad_request', detail: 'bad_week' })
@@ -224,16 +248,16 @@ test('writeWeek: final needs an ended week; a final week only takes a final rewr
   const db = seeded()
   assert.deepEqual(write(db, keyOf(0), { final: true }), { error: 'bad_request', detail: 'week_not_ended' })
   assert.equal(write(db, keyOf(-1), { final: true, lede: 'one' }).ok, true)
-  assert.equal(storedWeek(db, 1, weekN(-1)).final, true)
+  assert.equal(storedWeek(db, 1, keyOf(-1)).final, true)
   assert.deepEqual(write(db, keyOf(-1), { lede: 'two' }), { error: 'conflict', detail: 'week_final' })
-  assert.equal(storedWeek(db, 1, weekN(-1)).lede, 'one')
+  assert.equal(storedWeek(db, 1, keyOf(-1)).lede, 'one')
   assert.equal(write(db, keyOf(-1), { final: true, lede: 'three' }).ok, true)
-  assert.equal(storedWeek(db, 1, weekN(-1)).lede, 'three')
+  assert.equal(storedWeek(db, 1, keyOf(-1)).lede, 'three')
   // A non-final week can be rewritten and then finished.
   assert.equal(write(db, keyOf(-2), { lede: 'a' }).ok, true)
   assert.equal(write(db, keyOf(-2), { lede: 'b' }).ok, true)
   assert.equal(write(db, keyOf(-2), { lede: 'c', final: true }).ok, true)
-  assert.equal(storedWeek(db, 1, weekN(-2)).lede, 'c')
+  assert.equal(storedWeek(db, 1, keyOf(-2)).lede, 'c')
 })
 
 test('writeWeek: a rewrite replaces the stories; a second note replaces the first', () => {
@@ -242,7 +266,7 @@ test('writeWeek: a rewrite replaces the stories; a second note replaces the firs
   const s = (title) => ({ title, sentence: 'S.', project_ids: [a.id] })
   write(db, keyOf(0), { stories: [s('one'), s('two')], notes: [{ project_id: a.id, note: 'first' }] })
   write(db, keyOf(0), { stories: [s('three')], notes: [{ project_id: a.num, note: 'second' }] }, { now: NOW + 5 })
-  assert.deepEqual(storedWeek(db, 1, weekN(0)).stories.map((x) => x.title), ['three'])
+  assert.deepEqual(storedWeek(db, 1, keyOf(0)).stories.map((x) => x.title), ['three'])
   assert.deepEqual(projectNotes(db, 1, [a.id]).get(a.id), { note: 'second', written_at: NOW + 5 })
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM week_stories').get().n, 1)
   assert.equal(projectNotes(db, 1, []).size, 0)
@@ -265,12 +289,12 @@ test('writeWeek writes nothing at all when any reference fails', () => {
   // And a failing rewrite leaves the earlier week as it was.
   assert.equal(write(db, keyOf(0), { lede: 'kept', notes: [{ project_id: a.id, note: 'kept' }] }).ok, true)
   assert.equal(write(db, keyOf(0), { lede: 'lost', notes: [{ project_id: 'pj_missing', note: 'x' }] }).ok, undefined)
-  assert.equal(storedWeek(db, 1, weekN(0)).lede, 'kept')
+  assert.equal(storedWeek(db, 1, keyOf(0)).lede, 'kept')
   assert.equal(projectNotes(db, 1, [a.id]).get(a.id).note, 'kept')
 })
 
 test('writeWeek takes an already-normalised input directly', () => {
   const db = seeded()
   assert.equal(writeWeek(db, 1, keyOf(0), input({ lede: 'direct' }), opts).ok, true)
-  assert.equal(storedWeek(db, 1, weekN(0)).lede, 'direct')
+  assert.equal(storedWeek(db, 1, keyOf(0)).lede, 'direct')
 })

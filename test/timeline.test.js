@@ -922,3 +922,73 @@ test('a stored item whose mission sits in a project the agent cannot see is drop
   assert.equal(weekDetail(db, 1, keyOf(-1), at).stories[0].needs_you.length, 1)
   assert.deepEqual(weekRaw(db, 1, keyOf(-1), at).stored.stories[0].items, [])
 })
+
+// ---- Review fixes: waiting items in the raw read, zone changes, non-picture media ----
+
+test('weekRaw lists, per project, every item still waiting on the user, whatever the week\'s activity; newest first, capped at 10', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha'); const b = proj(db, 'Bravo')
+  postAt(db, a.convo, 'a1', mid(-1)); postAt(db, b.convo, 'b1', mid(-1))
+  // Waiting for weeks, no activity in the week asked about: not in `items`, but in `needs_you`.
+  const stale = item(db, a.convo, 'question', 'Old question', { awaiting: 'user', now: mid(-5) })
+  const answered = item(db, a.convo, 'question', 'Answered', { awaiting: 'agent', now: mid(-5) })
+  const closed = item(db, a.convo, 'question', 'Closed', { awaiting: 'user', now: mid(-5) })
+  closeItem(db, { userId: 1, itemId: closed.id, resolution: 'answered', author: 'user', deviceId: 8 })
+  item(db, a.convo, 'decision', 'Approve the spawn', { consent: 'spawn:x', awaiting: 'user', now: mid(-5) })
+  const later = item(db, a.convo, 'question', 'Created after the week', { awaiting: 'user', now: mid(0) })
+  const fresh = item(db, a.convo, 'question', 'Fresh question', { awaiting: 'user', now: mid(-1) })
+  const raw = weekRaw(db, 1, keyOf(-1), at)
+  const alpha = raw.projects.find((x) => x.project.id === a.p.id)
+  assert.deepEqual(alpha.needs_you, [stale, fresh].reverse().map((i) => ({ id: i.id, num: i.num, title: i.title })))
+  assert.ok(!alpha.items.some((i) => i.id === stale.id), 'the stale item has no activity in the week')
+  assert.ok(![answered, closed, later].some((i) => alpha.needs_you.some((n) => n.id === i.id)))
+  assert.deepEqual(raw.projects.find((x) => x.project.id === b.p.id).needs_you, [])
+  // The apps' fallback card for the same week shows the same set.
+  const card = weekDetail(db, 1, keyOf(-1), at).stories.find((s) => s.project.id === a.p.id)
+  assert.deepEqual(card.needs_you.map((n) => n.id), alpha.needs_you.map((n) => n.id))
+  // Capped at 10.
+  for (let i = 0; i < 12; i++) item(db, a.convo, 'question', `Q${i}`, { awaiting: 'user', now: mid(-3, i) })
+  assert.equal(weekRaw(db, 1, keyOf(-1), at).projects.find((x) => x.project.id === a.p.id).needs_you.length, 10)
+})
+
+test('weekRaw needs_you applies the agent sieve', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha')
+  db.prepare("UPDATE conversations SET mission_id = ? WHERE id = 'secret'").run(a.m.id)
+  postAt(db, a.convo, 'a1', mid(-1))
+  item(db, a.convo, 'question', 'Public', { awaiting: 'user', now: mid(-5) })
+  item(db, 'secret', 'question', 'Private', { awaiting: 'user', now: mid(-5) })
+  const titles = (o) => weekRaw(db, 1, keyOf(-1), { ...at, ...o }).projects[0].needs_you.map((n) => n.title).sort()
+  assert.deepEqual(titles({ excludePrivateOwned: true }), ['Public'])
+  assert.deepEqual(titles({ excludePrivateOwned: false }), ['Private', 'Public'])
+})
+
+test('a written week is still written after the user changes time zone', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha')
+  postAt(db, a.convo, 'a1', mid(-1))
+  put(db, -1, { lede: 'Last week. Went well.', stories: [tale({ title: 'T', project_ids: [a.p.id] })] })
+  db.prepare("UPDATE users SET time_zone = 'America/New_York' WHERE id = 1").run()
+  const detail = weekDetail(db, 1, keyOf(-1), at)
+  assert.equal(detail.lede, 'Last week. Went well.'); assert.equal(detail.stories[0].title, 'T')
+  const listed = weeksList(db, 1, at).weeks.find((w) => w.week === keyOf(-1))
+  assert.equal(listed.written, true); assert.equal(listed.sentence, 'Last week.')
+  assert.equal(weekRaw(db, 1, keyOf(-1), at).stored.lede, 'Last week. Went well.')
+  // A rewrite after the change replaces the row rather than adding a second.
+  put(db, -1, { lede: 'Rewritten.', stories: [tale({ title: 'U', project_ids: [a.p.id] })] })
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM week_stories').get().n, 1)
+  assert.equal(weekDetail(db, 1, keyOf(-1), at).lede, 'Rewritten.')
+})
+
+test('a stored picture that is not an image or video reads as missing: the week\'s roll-up picture shows instead', () => {
+  const db = seeded()
+  const a = proj(db, 'Alpha')
+  const it = item(db, a.convo, 'task', 'T', { now: mid(-1) })
+  blobRow(db, 'b-pic'); attachAt(db, it, 'b-pic', mid(-1))
+  blobRow(db, 'b-doc', 'application/pdf'); attachAt(db, it, 'b-doc', mid(-1, 1), 'application/pdf')
+  put(db, -1, { lede: 'x', stories: [tale({ project_ids: [a.p.id], media_blob_id: 'b-pic' })] })
+  // Only a write that skipped the check could store a document; forge one.
+  db.prepare("UPDATE week_stories SET stories = replace(stories, 'b-pic', 'b-doc')").run()
+  assert.equal(weekDetail(db, 1, keyOf(-1), at).stories[0].media.blob_id, 'b-pic')
+  assert.equal(weekRaw(db, 1, keyOf(-1), at).stored.stories[0].media_blob_id, null)
+})

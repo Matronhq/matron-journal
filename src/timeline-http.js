@@ -74,9 +74,14 @@ export async function handleTimelineRoute(ctx, req, res, url, who) {
   }
   if (req.method !== 'GET') return false
   const opts = { excludePrivateOwned: filteredAgent(db, who) }
+  // The Coordinator reads the stalled lists to write notes and a lede that the
+  // filtered apps then show, so (like its raw week read and its write) its
+  // `?raw=1` read of them is always under the agent privacy sieve, whatever
+  // device it runs on. A client sending raw=1 gets the ordinary read.
+  const rawOpts = url.searchParams.get('raw') === '1' && who.kind === 'agent' ? { excludePrivateOwned: true } : opts
   if (path === '/timeline/weeks') return handleWeeks(db, res, url, who, opts)
-  if (path === '/timeline/quiet') { json(res, 200, wentQuiet(db, who.userId, opts)); return true }
-  if (path === '/timeline/long') { json(res, 200, openLong(db, who.userId, opts)); return true }
+  if (path === '/timeline/quiet') { json(res, 200, wentQuiet(db, who.userId, rawOpts)); return true }
+  if (path === '/timeline/long') { json(res, 200, openLong(db, who.userId, rawOpts)); return true }
   if (path === '/timeline/finished') return handleFinished(db, res, url, who, opts)
   const m = path.match(/^\/timeline\/weeks\/([^/]+)$/)
   if (!m) return false

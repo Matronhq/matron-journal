@@ -263,13 +263,14 @@ export function weeksList(db, userId, { before = null, limit = TIMELINE.weeksPag
   const projects = rowProjects(db, userId, excludePrivateOwned)
   const byId = new Map(projects.map((p) => [p.id, p]))
   const weekly = projectWeeklyMoves(db, userId, [...byId.keys()], starts, tz, { excludePrivateOwned })
-  const stored = writtenWeeks(db, userId, starts)
+  const keys = starts.map((s) => formatWeekKey(s, tz))
+  const stored = writtenWeeks(db, userId, keys)
   const weeks = starts.map((start, i) => {
     const moved = ranked([...weekly].map(([id, counts]) => [id, counts[i]]), byId)
-    const lede = stored.get(start)?.lede
+    const lede = stored.get(keys[i])?.lede
     return {
-      week: formatWeekKey(start, tz), start, end: weekEndOf(start, tz),
-      sentence: lede ? firstSentence(lede) : weekSentence(moved), moved: moved.length, written: stored.has(start),
+      week: keys[i], start, end: weekEndOf(start, tz),
+      sentence: lede ? firstSentence(lede) : weekSentence(moved), moved: moved.length, written: stored.has(keys[i]),
     }
   })
   const oldest = starts.at(-1)
@@ -313,6 +314,9 @@ function liveItems(db, userId, ids, byId, excludePrivateOwned) {
   return out
 }
 
+// Whether a content type is one a card can show: an image or a video.
+const isPicture = (type) => /^(image|video)\//.test(type ?? '')
+
 // The stored pictures that still exist and that the caller may see (under the
 // sieve, one the files roll-up still shows): Map(blob id → { blob_id,
 // content_type, name }). One pass over the roll-up for all of them.
@@ -327,6 +331,7 @@ function liveMedia(db, userId, blobIds, excludePrivateOwned) {
     WHERE f.blob_id IN (SELECT value FROM json_each(@ids))`).all({ userId, ids }).map((r) => [r.blob_id, r]))
   for (const b of owned) {
     const r = rolled.get(b.id)
+    if (!isPicture(r?.content_type ?? b.content_type)) continue
     if (excludePrivateOwned && !r) continue
     out.set(b.id, { blob_id: b.id, content_type: r?.content_type ?? b.content_type, name: r?.name ?? null })
   }
@@ -356,6 +361,17 @@ function resolveStored(db, userId, stored, byId, excludePrivateOwned) {
   return out
 }
 
+// The project's open items awaiting the user, as the timeline shows them:
+// unlike projectDetail's needs-you, consent cards are left out, newest created
+// first, and only items created before the week ended (`@end`). Shared by the
+// apps' fallback card and the Coordinator's raw read. `limit` caps the rows.
+function needsYouStatement(db, convoSieve, inProject, ofProject, limit = -1) {
+  return db.prepare(`SELECT i.id, i.num, i.title FROM items i JOIN missions m ON m.id = i.mission_id
+      JOIN conversations c ON c.id = i.origin_convo_id
+    WHERE ${ofProject} AND i.state = 'open' AND i.awaiting = 'user' AND i.consent IS NULL AND i.created_at < @end ${convoSieve}
+    ORDER BY i.created_at DESC, i.num DESC LIMIT ${limit}`)
+}
+
 // One week's page: a story per project that moved, most moves first, at most
 // TIMELINE.storiesMax, the rest under `also` -- or, when the Coordinator has
 // written the week, its lede and stories in its order, with `also` the moving
@@ -375,19 +391,14 @@ export function weekDetail(db, userId, weekKey, { excludePrivateOwned = false, n
       JOIN conversations c ON c.id = l.convo_id
     WHERE ${ofProject} AND l.created_at >= @start AND l.created_at < @end ${convoSieve}
     ORDER BY l.created_at DESC, l.seq DESC LIMIT 1`)
-  // Unlike projectDetail's needs-you: consent cards are left out, newest created first,
-  // and only items created before the week ended.
-  const needsYou = db.prepare(`SELECT i.id, i.num, i.title FROM items i JOIN missions m ON m.id = i.mission_id
-      JOIN conversations c ON c.id = i.origin_convo_id
-    WHERE ${ofProject} AND i.state = 'open' AND i.awaiting = 'user' AND i.consent IS NULL AND i.created_at < @end ${convoSieve}
-    ORDER BY i.created_at DESC, i.num DESC`)
+  const needsYou = needsYouStatement(db, convoSieve, inProject, ofProject)
   // The project feed's files roll-up, narrowed to the week's pictures and videos.
   const media = db.prepare(`SELECT f.blob_id, f.content_type, f.name FROM (${filesSql(excludePrivateOwned, inProject)}) f
     WHERE f.at >= @start AND f.at < @end AND (f.content_type LIKE 'image/%' OR f.content_type LIKE 'video/%')
     ORDER BY f.at DESC, f.sort_key DESC LIMIT 1`)
   const weekMedia = (project) => media.get({ userId, projectId: project.id, start, end }) ?? null
   const head = { week: formatWeekKey(start, tz), start, end }
-  const stored = writtenWeek(db, userId, start)
+  const stored = writtenWeek(db, userId, weekKey)
   if (!stored) {
     const stories = moved.slice(0, TIMELINE.storiesMax).map(({ project }) => {
       const args = { userId, projectId: project.id, start, end }
@@ -428,7 +439,7 @@ export function weekDetail(db, userId, weekKey, { excludePrivateOwned = false, n
 // this): the stored week with ids resolved to refs, and every moving project
 // (most moves first, at most RAW.projects) with its milestones, items and
 // pictures of that week. null when `weekKey` is not a week key.
-const RAW = { projects: 40, milestones: 10, items: 10, media: 5 }
+const RAW = { projects: 40, milestones: 10, items: 10, media: 5, needsYou: 10 }
 export function weekRaw(db, userId, weekKey, { excludePrivateOwned = true, now = Date.now() } = {}) {
   const tz = userTimeZone(db, userId)
   const start = parseWeekKey(weekKey, tz)
@@ -472,14 +483,18 @@ export function weekRaw(db, userId, weekKey, { excludePrivateOwned = true, now =
   const media = db.prepare(`SELECT f.blob_id, f.content_type, f.name, f.at FROM (${filesSql(excludePrivateOwned, inProject)}) f
     WHERE f.at >= @start AND f.at < @end AND (f.content_type LIKE 'image/%' OR f.content_type LIKE 'video/%')
     ORDER BY f.at DESC, f.sort_key DESC LIMIT ${RAW.media}`)
+  // Everything still waiting on the user, whatever the week's activity: the
+  // Coordinator names these in `item_ids` and counts them in the lede.
+  const needsYou = needsYouStatement(db, convoSieve, inProject, ofProject, RAW.needsYou)
   const projects = shown.map(({ project, moved: n }) => {
     const args = { userId, projectId: project.id, start, end }
     return {
       project: refOf(project), moved: n, status: project.status ?? null,
       milestones: milestones.all(args), items: itemsOf.get(project.id) ?? [], media: media.all(args),
+      needs_you: needsYou.all(args),
     }
   })
-  const stored = writtenWeek(db, userId, start)
+  const stored = writtenWeek(db, userId, weekKey)
   return {
     week: formatWeekKey(start, tz), start, end,
     final: Boolean(stored?.final) || end <= now,

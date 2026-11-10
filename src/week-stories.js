@@ -111,11 +111,13 @@ function resolveItemId(db, userId, r, excludePrivateOwned) {
   return row?.id ?? null
 }
 
-// Whether the blob is the user's own and, under the sieve, in the files
+// Whether the blob is the user's own, an image or a video (a card cannot show
+// anything else) and, under the sieve, in the files
 // roll-up the apps show (a picture or file of one of the user's missions, not
 // of a private device's work).
 function blobAllowed(db, userId, blobId, excludePrivateOwned) {
-  if (!db.prepare('SELECT 1 FROM blobs WHERE id = ? AND owner_user_id = ?').get(blobId, userId)) return false
+  const blob = db.prepare('SELECT content_type FROM blobs WHERE id = ? AND owner_user_id = ?').get(blobId, userId)
+  if (!blob || !/^(image|video)\//.test(blob.content_type ?? '')) return false
   if (!excludePrivateOwned) return true
   return !!db.prepare(`SELECT 1 FROM (${filesSql(true, '1 = 1')}) f WHERE f.blob_id = @blobId LIMIT 1`).get({ userId, blobId })
 }
@@ -134,7 +136,9 @@ export function writeWeek(db, userId, weekKey, input, { now = Date.now(), exclud
   for (let i = 0; i < WEEK_LIMITS.reachWeeks; i++) oldest = previousWeekStart(oldest, tz)
   if (start > current || start < oldest) return { error: 'bad_request', detail: 'week_out_of_range' }
   if (input.final && weekEndOf(start, tz) > now) return { error: 'bad_request', detail: 'week_not_ended' }
-  const existing = db.prepare('SELECT final FROM week_stories WHERE user_id = ? AND week_start = ?').get(userId, start)
+  // Rows are found by week key (the Monday's local date), not by instant: the
+  // instant moves when the user's zone changes, the date does not.
+  const existing = db.prepare('SELECT final FROM week_stories WHERE user_id = ? AND week_key = ? ORDER BY final DESC').get(userId, weekKey)
   if (existing?.final && !input.final) return { error: 'conflict', detail: 'week_final' }
 
   const projectId = (r) => resolveProjectId(db, userId, r, excludePrivateOwned)
@@ -165,6 +169,8 @@ export function writeWeek(db, userId, weekKey, input, { now = Date.now(), exclud
   }
 
   db.transaction(() => {
+    // A row written under another zone's instant for this week is replaced.
+    db.prepare('DELETE FROM week_stories WHERE user_id = ? AND week_key = ? AND week_start != ?').run(userId, weekKey, start)
     db.prepare(`INSERT INTO week_stories(user_id, week_start, week_key, lede, stories, written_at, final)
       VALUES(?,?,?,?,?,?,?)
       ON CONFLICT(user_id, week_start) DO UPDATE SET week_key=excluded.week_key, lede=excluded.lede,
@@ -182,29 +188,30 @@ export function writeWeek(db, userId, weekKey, input, { now = Date.now(), exclud
 const written = (w) => Boolean(w.lede || w.stories.length || w.final)
 const parseRow = (row) => ({ week_key: row.week_key, lede: row.lede, stories: JSON.parse(row.stories), written_at: row.written_at, final: row.final === 1 })
 
-// The stored week starting at `weekStart`, or null.
-export function storedWeek(db, userId, weekStart) {
-  const row = db.prepare('SELECT week_key, lede, stories, written_at, final FROM week_stories WHERE user_id = ? AND week_start = ?')
-    .get(userId, weekStart)
+// The stored week with the week key (the Monday's local date), or null. Keyed
+// by date, not instant, so a change of the user's time zone orphans nothing.
+export function storedWeek(db, userId, weekKey) {
+  const row = db.prepare('SELECT week_key, lede, stories, written_at, final FROM week_stories WHERE user_id = ? AND week_key = ? ORDER BY week_start DESC')
+    .get(userId, weekKey)
   return row ? parseRow(row) : null
 }
 
 // The stored week the readers use: storedWeek, or null when the row holds only
 // notes.
-export function writtenWeek(db, userId, weekStart) {
-  const w = storedWeek(db, userId, weekStart)
+export function writtenWeek(db, userId, weekKey) {
+  const w = storedWeek(db, userId, weekKey)
   return w && written(w) ? w : null
 }
 
-// The written weeks among `weekStarts` in one query: Map(week start → week).
-export function writtenWeeks(db, userId, weekStarts) {
+// The written weeks among `weekKeys` in one query: Map(week key → week).
+export function writtenWeeks(db, userId, weekKeys) {
   const out = new Map()
-  if (!weekStarts.length) return out
-  const rows = db.prepare(`SELECT week_start, week_key, lede, stories, written_at, final FROM week_stories
-    WHERE user_id = ? AND week_start IN (SELECT value FROM json_each(?))`).all(userId, JSON.stringify(weekStarts))
+  if (!weekKeys.length) return out
+  const rows = db.prepare(`SELECT week_key, lede, stories, written_at, final FROM week_stories
+    WHERE user_id = ? AND week_key IN (SELECT value FROM json_each(?)) ORDER BY week_start`).all(userId, JSON.stringify(weekKeys))
   for (const r of rows) {
     const w = parseRow(r)
-    if (written(w)) out.set(r.week_start, w)
+    if (written(w)) out.set(r.week_key, w)
   }
   return out
 }
