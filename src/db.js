@@ -1843,6 +1843,7 @@ export function openDb(path) {
   addTransferCauses(db)
   addTransferRecipient(db)
   addTransferConsentSetting(db)
+  addPeerFailingSince(db)
   // A routine's envelope (JSON): the bounds on what an ask born of one of
   // its fires may do — how many spawns per fire, whether chats, which boxes.
   // NULL = no envelope, the value for every routine predating the column.
@@ -2440,6 +2441,14 @@ export function addTransferConsentSetting(db) {
 export function addTransferRecipient(db) {
   const cols = db.prepare('PRAGMA table_info(transfers)').all()
   if (!cols.some((c) => c.name === 'recipient_device_id')) db.exec('ALTER TABLE transfers ADD COLUMN recipient_device_id INTEGER')
+}
+
+// When deliveries to a peer journal started failing (src/federation-outbox.js):
+// the first attempt that failed after it last answered, NULL while it
+// answers. A contact's unreachable_since (src/contacts.js). Idempotent.
+export function addPeerFailingSince(db) {
+  const cols = db.prepare('PRAGMA table_info(fed_peers)').all()
+  if (!cols.some((c) => c.name === 'failing_since')) db.exec('ALTER TABLE fed_peers ADD COLUMN failing_since INTEGER')
 }
 
 // The Coordinator answers file transfers too: consent_decisions.kind gains

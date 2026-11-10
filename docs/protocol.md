@@ -4478,9 +4478,18 @@ GET    /contacts/:id/activity             {events:[…]} — the audit events na
 ```
 
 `contact`: `{id, address, peer_user, peer_journal, display_name, state,
-requested_by, origin_convo_id, key_changed, created_at, updated_at, accepted_at,
-revoked_at}`. `key_changed` is true for a contact on another journal whose
-journal now serves a different key than the one pinned for it.
+requested_by, origin_convo_id, key_changed, unreachable_since, created_at,
+updated_at, accepted_at, revoked_at}`. `key_changed` is true for a contact on
+another journal whose journal now serves a different key than the one pinned
+for it. `unreachable_since` (epoch ms, else `null`) is when deliveries to a
+contact's journal started failing: the federation outbox's first attempt to
+that journal that failed in a way it retries (a network error or timeout, an
+answer the journal did not sign, a 5xx, 408 or 429) since that journal last
+answered in its own signed word (an acknowledgement, a refusal, a stale
+clock), which clears it. It is kept through later failures and through
+entries going dead after 7 days, and is reported only while something to
+that journal is still queued or dead in the outbox: with nothing waiting
+there is no delivery failing. Always `null` for a same-journal contact.
 
 `POST /contacts` from a **client** is the user's own tap and goes straight
 to the other person. From an **agent** it needs `convo_id` (a conversation

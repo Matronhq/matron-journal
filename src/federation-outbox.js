@@ -30,6 +30,13 @@
 //   - Peers are served side by side: each peer with something due gets its
 //     own chain of attempts, in order, and up to PEER_CHAINS chains run at
 //     once. A peer that answers slowly holds up only its own entries.
+//   - fed_peers.failing_since is when deliveries to a peer started failing:
+//     set by the first attempt that fails in a retryable way (network error,
+//     timeout, an answer the peer did not sign, 5xx, 408, 429) and kept
+//     through later failures and expiry; cleared by any answer the peer
+//     signed that is not one of those (an acknowledgement, a refusal, a
+//     stale clock), since the peer is then plainly reachable. A contact's
+//     unreachable_since (src/contacts.js).
 //   - Sent and cancelled entries are deleted PRUNE_AFTER_MS after they
 //     ended (pruneOutbox), so their bodies (snapshot pages, invite tokens)
 //     are not kept for good.
@@ -199,6 +206,8 @@ export function makeOutbox({ db, hub = null, federation, client, ops = {}, befor
   const markDead = db.prepare("UPDATE fed_outbox SET state='dead', attempts=attempts+?, last_status=?, last_error=?, ended_at=? WHERE seq=? AND state='queued'")
   const markCancelled = db.prepare("UPDATE fed_outbox SET state='cancelled', last_error=?, ended_at=? WHERE seq=? AND state='queued'")
   const current = db.prepare('SELECT * FROM fed_outbox WHERE seq=?')
+  const peerFailing = db.prepare('UPDATE fed_peers SET failing_since=COALESCE(failing_since, ?) WHERE host=?')
+  const peerAnswered = db.prepare('UPDATE fed_peers SET failing_since=NULL WHERE host=? AND failing_since IS NOT NULL')
   const keys = new Map()
   const keyFor = (pub) => { if (!keys.has(pub)) keys.set(pub, importPublicKey(pub)); return keys.get(pub) }
   const hook = (entry, name, ...args) => {
@@ -287,6 +296,7 @@ export function makeOutbox({ db, hub = null, federation, client, ops = {}, befor
     } catch (err) {
       if (err.message === 'destination_refused') return dead(entry, { error: `destination_refused: ${err.why}`, at })
       markRetry.run(at + backoffMs(entry.attempts + 1, random), null, `${err.message}${err.why ? `: ${err.why}` : ''}`, entry.seq)
+      peerFailing.run(at, entry.peer_host)
       return
     }
     const s = r.status
@@ -298,7 +308,7 @@ export function makeOutbox({ db, hub = null, federation, client, ops = {}, befor
           // Cancelled while the request was in flight: the answer changes
           // nothing here.
           if (!markSent.run(s, at, at, entry.seq).changes) return null
-          db.prepare('UPDATE fed_peers SET last_ok_at=?, last_error=NULL WHERE host=?').run(at, entry.peer_host)
+          db.prepare('UPDATE fed_peers SET last_ok_at=?, last_error=NULL, failing_since=NULL WHERE host=?').run(at, entry.peer_host)
           const fn = Object.hasOwn(ops, entry.op) ? ops[entry.op]?.onAcked : undefined
           return fn ? fn(db, entry, r.body?.result ?? {}) : null
         })()
@@ -313,6 +323,7 @@ export function makeOutbox({ db, hub = null, federation, client, ops = {}, befor
       return
     }
     if (s === 401 && error === 'stale' && r.signed) {
+      peerAnswered.run(entry.peer_host)
       const skew = Number(r.body.clock) - at
       log.error(`federation: ${entry.peer_host} says our clock is off by ${skew} ms`)
       if (entry.skew_attempts + 1 >= MAX_SKEW_ATTEMPTS) return dead(entry, { status: s, error: `clock_skew: ${skew} ms`, at })
@@ -325,8 +336,10 @@ export function makeOutbox({ db, hub = null, federation, client, ops = {}, befor
     const retryable = !r.signed || s < 400 || s >= 500 || s === 408 || s === 429
     if (retryable) {
       markRetry.run(at + backoffMs(entry.attempts + 1, random), s, error ?? (r.signed ? null : 'unsigned answer'), entry.seq)
+      peerFailing.run(at, entry.peer_host)
       return
     }
+    peerAnswered.run(entry.peer_host)
     dead(entry, { status: s, error: error ?? `status ${s}`, at })
   }
 
