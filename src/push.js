@@ -147,7 +147,7 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     if (isDeadToken(result)) {
       // Retrying a dead token never succeeds, so it is pruned instead. Logged
       // only by the send that actually cleared it.
-      if (pruneApnsToken(db, device.id, device.apns_token)) {
+      if (pruneApnsToken(db, device.id, device.apns_token, device.apns_env)) {
         counters.pruned += 1
         console.error(`apns: device ${device.id} token rejected (${result.status}${result.reason ? ' ' + result.reason : ''}, env=${device.apns_env}) — token pruned until the app registers again`)
       }

@@ -441,6 +441,34 @@ test('a late dead-token result never prunes a token registered since, and concur
   assert.equal(logs.mock.calls.filter((c) => /pruned/.test(String(c.arguments[0]))).length, 1)
 })
 
+test('a late BadDeviceToken from the old environment never prunes the same token re-registered with a corrected environment', async (t) => {
+  const logs = t.mock.method(console, 'error', () => {})
+  const pending = []
+  const stub = {
+    calls: [],
+    send(opts) {
+      this.calls.push(opts)
+      return new Promise((resolve) => pending.push(() => resolve({ status: 400, reason: 'BadDeviceToken' })))
+    },
+  }
+  const { db, alice, pipeline } = await setup(t, { apnsClient: stub })
+  const deviceId = registerDevice(db, alice.id, 'phone', { token: 'phone-token', env: 'prod' })
+
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'prompt', payload: { body: 'one' } })
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'prompt', payload: { body: 'one' } }, null)
+  assert.equal(stub.calls.length, 1)
+  assert.equal(stub.calls[0].env, 'prod')
+
+  // The app corrects its environment before the prod push's answer arrives.
+  setApnsRegistration(db, deviceId, { apnsToken: 'phone-token', apnsEnv: 'sandbox' })
+  pending[0]()
+  await new Promise((res) => setTimeout(res, 5))
+
+  assert.deepEqual({ ...tokenOf(db, deviceId) }, { apns_token: 'phone-token', apns_env: 'sandbox' })
+  assert.equal(pipeline.counters.pruned, 0)
+  assert.equal(logs.mock.calls.filter((c) => /pruned/.test(String(c.arguments[0]))).length, 0)
+})
+
 test('through the push gateway, a relayed 400 BadDeviceToken prunes the token', async (t) => {
   t.mock.method(console, 'error', () => {})
   const fetchImpl = async () => new Response(JSON.stringify({ status: 400, reason: 'BadDeviceToken' }), { status: 400 })

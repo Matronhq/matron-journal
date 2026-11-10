@@ -6573,8 +6573,9 @@ considers each of that user's *client* devices with a registered token
 - a 410 response, or a 400 `BadDeviceToken`, prunes that device's
   `apns_token`/`apns_env` (dead token, logged once with its `apns_env`); the
   device itself is kept and pushes resume when the app registers a token
-  again. Only the token that failed is cleared, so a late answer never drops
-  a token registered since. Every other failure (429, 5xx, other 400s
+  again. Only the token and environment that failed are cleared, so a late
+  answer never drops a registration made since (a new token, or the same
+  token with a corrected environment). Every other failure (429, 5xx, other 400s
   including `DeviceTokenNotForTopic`, the relay's own validation errors,
   transport) keeps the token. A `BadDeviceToken` is often a sandbox/prod
   `apns_env` mismatch, but since the environment is registered with the
