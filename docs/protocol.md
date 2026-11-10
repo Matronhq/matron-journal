@@ -3374,11 +3374,24 @@ hold_seconds}` on its payload). The app answers it with a `prompt_reply`
 whose choice is `edit` (the bridge holds the message while it is edited),
 then `edit_cancel` (released as it was) or, for `mode: 'replace'`,
 `edit_save` with the edited text in `text` (the bridge replaces the message
-in place and retires the card with an `edited` release). A reply on an item
-is `mode: 'resend'`: its comment is never rewritten. The app cancels the
-held card, which withdraws the original as above, and posts the edited
-reply as a new comment. The journal passes these replies through like any
-other; the bridge's router checks them.
+in place and retires the card with an `edited` release, then posts a new
+card for the same queue slot). The journal passes these replies through
+like any other; the bridge's router checks them.
+
+A hold is not permanent. The bridge releases it after `hold_seconds`, or
+when it restarts, and the original is then delivered at the next idle
+point even if the user is still editing. An app knows a save took effect
+only from the `edited` release: a save that arrives after the message left
+the queue changes nothing (the bridge posts a notice saying the edit was
+not used), and the card's release is whatever actually happened to it
+(`send`, `send_one` or `expired`).
+
+A reply on an item is `mode: 'resend'`: its comment is never rewritten.
+The app answers the held card with `cancel`, waits for the bridge's
+`cancel` release (which withdraws the original as above), and only then
+posts the edited reply as a new comment. A `cancel` reply is a request: if
+its release does not come, the original may still be queued, and posting
+the edit could deliver both.
 
 ### Item handover
 
