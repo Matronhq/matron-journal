@@ -3398,7 +3398,9 @@ on `POST /items/:id/comments`. The journal keeps it (as `meta.replaces`,
 returned as `comment.replaces`, absent on every other comment) only when the
 id is the user's own withdrawn reply on the same item; anything else is
 dropped and the comment is stored without it, never refused. A `replaces`
-that is not a non-empty string is **400**, and an agent's is ignored. An app
+that is not a non-empty string is **400**, and an agent's is ignored. The
+edit's `commented` marker carries `comment.replaces` as well, and a
+hand-over copy (which leaves withdrawn replies out) drops it. An app
 showing the user's thread leaves out a withdrawn reply that a later comment
 replaces, so an edit reads as one reply rather than a cancelled copy and a
 second one. "Edit and resend" on a reply the user cancelled sends it the

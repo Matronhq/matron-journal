@@ -189,7 +189,7 @@ test('a cancelled tap gives the choice back to the earlier tap still standing', 
 })
 
 test('an edited resend names the cancelled reply it replaces; nothing else can be replaced', async (t) => {
-  const { s, agent, client, item, reply } = await fleet(t)
+  const { s, alice, agent, client, item, reply } = await fleet(t)
   const post = (token, body) => s.http(`/items/${item.id}/comments`, { method: 'POST', token, body })
 
   // Not withdrawn yet: the link is dropped, the reply is still kept.
@@ -217,4 +217,11 @@ test('an edited resend names the cancelled reply it replaces; nothing else can b
   assert.equal((await post(agent.token, { body: 'mine', replaces: reply.id })).json.comment.replaces, undefined)
   assert.equal((await post(client, { body: 'x', replaces: 7 })).status, 400)
   assert.equal((await post(client, { body: 'x', replaces: '' })).status, 400)
+  // An id too long to be one is unknown, so the reply is kept without it.
+  const long = await post(client, { body: 'y', replaces: 'x'.repeat(500) })
+  assert.equal(long.status, 201); assert.equal(long.json.comment.replaces, undefined)
+  // The edit's marker in the conversation carries the link too.
+  const markers = log(s, alice.id).filter((e) => e.type === 'item').map((e) => JSON.parse(e.payload))
+  assert.equal(markers.find((m) => m.comment?.id === edited.json.comment.id).comment.replaces, reply.id)
+  assert.equal(markers.filter((m) => m.comment && 'replaces' in m.comment).length, 1)
 })

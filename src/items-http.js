@@ -655,8 +655,9 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     // `replaces`: the id of the user's own withdrawn reply this one is the
     // edited version of (addComment decides whether it counts). A client's
     // field only; an agent never cancels and resends a reply.
-    if (body.replaces != null && (typeof body.replaces !== 'string' || !body.replaces || body.replaces.length > ID_MAX)) return badRequest(res)
-    const replaces = who.kind === 'agent' ? null : body.replaces ?? null
+    // An id too long to be one is unknown like any other: dropped, not refused.
+    if (body.replaces != null && (typeof body.replaces !== 'string' || !body.replaces)) return badRequest(res)
+    const replaces = who.kind === 'agent' || body.replaces == null || body.replaces.length > ID_MAX ? null : body.replaces
     // `actions` on a comment is the other half: the buttons an AGENT offers
     // with a follow-up question. A client offering buttons to its own user
     // makes no sense, and would move `awaiting` back onto them, so it is
