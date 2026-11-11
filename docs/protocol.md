@@ -2217,7 +2217,7 @@ degrade path for clients predating the tracker, not a second timeline.
 | `GET /items/:id` (shared) | `:id` = `it_…` of a colleague's item visible under *Shared visibility* | `{item, comments}` with `item.owner`; any other method or sub-route on it is **403 `forbidden`** |
 | `POST /items` | `{kind, title, body?, labels?, links?, attachments?, actions?, awaiting?, position?, after?, before?, convo_id, supersedes?, on_behalf_of?:'user' (agent callers only), private?: boolean (an owner-only item — see *Sharing between people → What a grantee reads*)}` + optional `Idempotency-Key`; `position` is **exclusive** of `after`/`before` (given together is 400); `after`/`before` may be given alone or together (a midpoint between the two, consistent with `/rank`; none means bottom) | 201 `{item}` (200 on replay) |
 | `PATCH /items/:id` | `{title?, body?, labels?, links?, awaiting?, actions?, mission?: id \| "#num" \| null}` — `attachments` is **400** (create-only in v1; it used to be dropped silently, which told a client its blob had landed), and a patch carrying neither a field nor `mission` is **400**. `mission` moves the item to that mission, or detaches it when `null`; it is an explicit move only, never inferred. Fields and the move are one write with one `updated_at`. | `{item}`. **404** if `mission` names a mission that does not exist **or** is invisible to the caller — the same sieve `GET /missions/:id` applies (see *Missions & milestones → Visibility*), never a 403, so a hidden mission is not an existence oracle here either. **409** only for `awaiting` on a closed item (clearing it with `null` is fine); a **closed mission is not refused** as a move target in v1 — closing a mission blocks on open items precisely so they can be moved, and a finished mission must stay correctable. |
-| `POST /items/:id/comments` | `{body?, attachments?, action?, reply_to?, actions?, as_convo_id?}` (body or attachments required, unless `action` is given) + optional `Idempotency-Key` | 201 `{item, comment}` (200 on replay); `action` from an agent is **403 `forbidden`**, one not among the current `actions` of what it answers (the item, or the comment `reply_to` names) is **400 `unknown_action`** — see *Action buttons*; `actions` from a client is **403 `forbidden`**, on a closed item **409 `conflict`** — see *Comment action buttons* |
+| `POST /items/:id/comments` | `{body?, attachments?, action?, reply_to?, replaces?, actions?, as_convo_id?}` (body or attachments required, unless `action` is given) + optional `Idempotency-Key` | 201 `{item, comment}` (200 on replay); `action` from an agent is **403 `forbidden`**, one not among the current `actions` of what it answers (the item, or the comment `reply_to` names) is **400 `unknown_action`** — see *Action buttons*; `actions` from a client is **403 `forbidden`**, on a closed item **409 `conflict`** — see *Comment action buttons* |
 | `PATCH /items/:id/comments/:cid` | `{blob_ref, transcript}` — agent only, else 403 | `{comment}` |
 | `POST /items/:id/close` | `{resolution, comment?, as_convo_id?}` | `{item, comment}`; 409 if already closed |
 | `POST /items/:id/reopen` | `{comment?, as_convo_id?}` | `{item, comment}`; 409 if already open |
@@ -3392,6 +3392,19 @@ The app answers the held card with `cancel`, waits for the bridge's
 posts the edited reply as a new comment. A `cancel` reply is a request: if
 its release does not come, the original may still be queued, and posting
 the edit could deliver both.
+
+The edited reply names the one it stands in for: `replaces: "<comment id>"`
+on `POST /items/:id/comments`. The journal keeps it (as `meta.replaces`,
+returned as `comment.replaces`, absent on every other comment) only when the
+id is the user's own withdrawn reply on the same item; anything else is
+dropped and the comment is stored without it, never refused. A `replaces`
+that is not a non-empty string is **400**, and an agent's is ignored. The
+edit's `commented` marker carries `comment.replaces` as well, and a
+hand-over copy (which leaves withdrawn replies out) drops it. An app
+showing the user's thread leaves out a withdrawn reply that a later comment
+replaces, so an edit reads as one reply rather than a cancelled copy and a
+second one. "Edit and resend" on a reply the user cancelled sends it the
+same way.
 
 ### Item handover
 
