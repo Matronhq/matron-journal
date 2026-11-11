@@ -742,7 +742,10 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
           ownerNotice = true
         } else {
           const row = db.prepare('SELECT title FROM conversations WHERE id=?').get(convoId)
-          const label = (row?.title ?? '').replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ').trim().slice(0, 120) || senderOf(db, who).replace(/^agent:/, '')
+          // Control characters become spaces; bidi and zero-width marks are dropped (they
+          // can reorder or hide the attribution a bridge puts in a turn header), and
+          // double quotes are flattened so the title cannot close a quoted label.
+          const label = (row?.title ?? '').replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ').replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff\u061c]/g, '').replace(/"/g, "'").trim().slice(0, 120) || senderOf(db, who).replace(/^agent:/, '')
           extra = { agent_comment: true, from_convo_id: convoId, from_label: label }
           ownerNotice = true
         }

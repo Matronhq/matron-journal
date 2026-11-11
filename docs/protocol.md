@@ -2559,15 +2559,23 @@ quiet pair: neither ever wakes and neither ever pushes.
 an item whose `origin_convo_id` is a different conversation (it sends its own
 `as_convo_id`), the `commented` marker (sender stays `agent:<name>`) carries
 `agent_comment: true`, `from_convo_id` and `from_label` (the commenter's
-conversation title, one line, at most 120 characters), and the owner's box is
-woken so its bridge can deliver the comment as a turn. Delivery is throttled
+conversation title, one line, at most 120 characters; bidi and zero-width
+marks are removed and double quotes become single quotes), and the owner's box
+is woken, so its bridge can deliver the comment as a turn. When the commenting
+conversation belongs to a private device and the owner's does not, the marker
+carries `agent_comment: true` alone: `from_convo_id` and `from_label` are
+omitted so no conversation id or title leaks. The owner is still woken. Delivery is throttled
 in memory: one comment per 30 s per (item, commenting conversation) and six
 per item per 10 min; a throttled comment is still stored and announced, but
 without those fields and without a wake. The `201` reply adds
 `owner_notified` (boolean) and, when false, `owner_notice` ("The owner session
 will not be notified of this comment: <reason>", where the reason is
-rate-limited, commenter conversation unknown, or owner conversation
-unavailable). Both are omitted for the owner's own comments, user comments,
+rate-limited, commenter conversation unknown, owner conversation unavailable,
+or, for the user's Coordinator, that its comments do not wake the owner). If
+the comment was saved but the marker could not be recorded, `owner_notice` is
+instead "The owner session was not notified: the comment was saved but the
+notification could not be recorded" and the throttle slot is released so a
+retry is not throttled. Both are omitted for the owner's own comments, user comments,
 consent mirrors and replayed idempotency keys.
 
 Push: `attention` only when an **agent-authored** marker (`by:'agent'`)

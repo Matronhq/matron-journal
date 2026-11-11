@@ -167,3 +167,12 @@ test('failed marker emission: not reported as notified, slot released for a retr
   assert.equal(retry.json.owner_notified, true)
   assert.deepEqual(wakeCalls, ['box-2'])
 })
+
+test('from_label drops bidi and zero-width controls and flattens double quotes', async (t) => {
+  const clock = { now: 1_000_000 }
+  const { s, alice, agent, item } = await fleet(t, clock)
+  upsertConversation(s.db, { id: 'c4', ownerUserId: alice.id, title: 'ok‮"evil"⁦ title​', agentDeviceId: agent.deviceId })
+  const r = await s.http(`/items/${item.id}/comments`, { method: 'POST', token: agent.token, body: { body: 'hi', as_convo_id: 'c4' } })
+  assert.equal(r.status, 201)
+  assert.equal(lastMarker(s).from_label, "ok'evil' title")
+})
