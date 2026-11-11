@@ -697,10 +697,10 @@ export function startServer({
   // well before a proxy gives it up, so a request the proxy sent down a
   // connection the journal was closing at that moment was reset, and the
   // caller got a 502 for a request that never ran. Keep idle connections
-  // longer than a proxy does (the usual 60–90 s), and the header timeout
-  // above that, as Node requires.
+  // longer than a proxy does (the usual 60–90 s). The header timeout is
+  // left alone: on the Node versions this runs on it times a request's
+  // headers from when they start arriving, not the idle wait before them.
   server.keepAliveTimeout = resolveNumericEnv('MATRON_KEEPALIVE_TIMEOUT_MS', process.env.MATRON_KEEPALIVE_TIMEOUT_MS, 120000)
-  server.headersTimeout = server.keepAliveTimeout + 5000
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
     // 55s: under the common 60s proxy idle-timeout defaults, and a 2.75x
