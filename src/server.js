@@ -692,6 +692,15 @@ export function startServer({
     github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, federationGrants, federationContribute, federationMedia, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
   }))
+  // A reverse proxy in front of the journal keeps its connections to it open
+  // and reuses them. Node closes an idle connection after 5 s by default,
+  // well before a proxy gives it up, so a request the proxy sent down a
+  // connection the journal was closing at that moment was reset, and the
+  // caller got a 502 for a request that never ran. Keep idle connections
+  // longer than a proxy does (the usual 60–90 s). The header timeout is
+  // left alone: on the Node versions this runs on it times a request's
+  // headers from when they start arriving, not the idle wait before them.
+  server.keepAliveTimeout = resolveNumericEnv('MATRON_KEEPALIVE_TIMEOUT_MS', process.env.MATRON_KEEPALIVE_TIMEOUT_MS, 120000)
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
     // 55s: under the common 60s proxy idle-timeout defaults, and a 2.75x
