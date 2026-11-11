@@ -652,6 +652,11 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       const handoverId = approvalQuestionOf(db, item.id, replyTo)
       if (handoverId) return handleApprovalTap(ctx, res, who, item, { handoverId, action, replyTo, idemKey })
     }
+    // `replaces`: the id of the user's own withdrawn reply this one is the
+    // edited version of (addComment decides whether it counts). A client's
+    // field only; an agent never cancels and resends a reply.
+    if (body.replaces != null && (typeof body.replaces !== 'string' || !body.replaces || body.replaces.length > ID_MAX)) return badRequest(res)
+    const replaces = who.kind === 'agent' ? null : body.replaces ?? null
     // `actions` on a comment is the other half: the buttons an AGENT offers
     // with a follow-up question. A client offering buttons to its own user
     // makes no sense, and would move `awaiting` back onto them, so it is
@@ -685,7 +690,7 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       // generic rule, a reply on one would reopen it (or take it out of the
       // user's Decisions list while the ask still waits) with no agent able
       // to see the item, let alone close it again.
-      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, convoId, body: text, attachments, action, replyTo, actions: v.value.actions ?? [], idemKey, keepStatus: item.consent != null })
+      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, convoId, body: text, attachments, action, replyTo, replaces, actions: v.value.actions ?? [], idemKey, keepStatus: item.consent != null })
     } catch (err) {
       if (answerKnownError(res, err)) return true
       throw err
