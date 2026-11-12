@@ -171,3 +171,25 @@ test('box: any other refusal is returned as it is, with no second send', async (
   assert.deepEqual(await client.send(BOXED_OPTS), { status: 400, reason: 'bad_box' })
   assert.equal(calls.length, 1)
 })
+
+test('box: an older relay whose body limit the box exceeds (413) is treated the same way', async () => {
+  const calls = []
+  const fetchImpl = async (url, init) => {
+    const body = JSON.parse(init.body)
+    calls.push(body)
+    return 'box' in body
+      ? new Response(JSON.stringify({ status: 413, reason: 'too_large' }), { status: 413 })
+      : new Response(JSON.stringify({ status: 200, reason: null }), { status: 200 })
+  }
+  const client = makeGatewayClient({ url: 'https://push.matron.chat', fetchImpl })
+  assert.deepEqual(await client.send(BOXED_OPTS), { status: 200, reason: null })
+  await client.send(BOXED_OPTS)
+  assert.deepEqual(calls.map((b) => 'box' in b), [true, false, false])
+})
+
+test('a 413 for a push with no box is returned as it is', async () => {
+  const { calls, fetchImpl } = makeFetchStub(() => new Response(JSON.stringify({ status: 413, reason: 'too_large' }), { status: 413 }))
+  const client = makeGatewayClient({ url: 'https://push.matron.chat', fetchImpl })
+  assert.deepEqual(await client.send(ALERT_OPTS), { status: 413, reason: 'too_large' })
+  assert.equal(calls.length, 1)
+})

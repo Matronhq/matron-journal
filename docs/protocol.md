@@ -6704,7 +6704,7 @@ screen, and a follow-up on one item replaces the notification it follows.
 |---|---|---|
 | The journal | Everything: it is the user's own server and already holds the content. It also holds each device's public key. | The private key. |
 | The push relay | The device token and environment, the category, the badge, the conversation id and the collapse id (opaque ids), the priority, the time and rate of pushes, the length of the box in 256-byte steps, and the address of the journal that sent it. | Any title, body, item text, button label or conversation name. It holds no key that opens a box, and never sees a device's public key. |
-| Apple (APNs) | What the relay sees, plus the fixed fallback text. | The same content the relay cannot see: the box crosses APNs still sealed. |
+| Apple (APNs) | What the relay sees, plus the fixed fallback text. From a journal that talks to APNs directly, also the event's `seq` (a counter), which that path sends beside the box. | The same content the relay cannot see: the box crosses APNs still sealed. |
 | The device, locked | The opened text is shown according to the system's own "Show Previews" setting for the app; with previews set to "When Unlocked" a locked device shows only that there is a notification. Buttons that answer an item ask for the device to be unlocked first. | |
 | The device, unlocked | The opened text, which the system then keeps in its notification list like any other notification's. | |
 
@@ -6727,8 +6727,13 @@ Things the seal does not do, by design:
   recorded past boxes can open them. Signing out, or re-registering, replaces
   the key.
 
+A device with a key is never sent its content in the clear: if a box cannot
+be made for it (a key the seal rejects, content that will not fit), the push
+goes out with the fixed text alone.
+
 **Relay version skew.** A relay that predates `box` refuses it with 400
-`unknown_field`. The journal's relay client then sends the same push again
+`unknown_field`, or with 413 when the box takes the request past its older
+body limit. The journal's relay client then sends the same push again
 without the box, so the notification arrives with the fixed text, and leaves
 boxes off for an hour before trying one again.
 

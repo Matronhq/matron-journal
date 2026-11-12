@@ -1223,3 +1223,34 @@ test('registration: the key is replaced each time, and goes with the token', asy
   setApnsRegistration(db, second, { apnsToken: null, apnsEnv: null, pushKey: RECIPIENT.key })
   assert.equal(keyOf(second), null, 'no key without a token')
 })
+
+test('a keyed device whose box cannot be made gets the fixed text alone, never its content in the clear', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t)
+  const id = registerDevice(db, alice.id, 'phone')
+  // A low-order point: shaped like a key, but the seal refuses it.
+  setApnsRegistration(db, id, { apnsToken: 'phone-token', apnsEnv: 'prod', pushKey: Buffer.alloc(32).toString('base64url') })
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'prompt', payload: { question: 'deploy to production?' } })
+  t.mock.method(console, 'error', () => {})
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'prompt', payload: { question: 'deploy to production?' } }, null)
+  assert.equal(stub.calls.length, 1)
+  assert.deepEqual(stub.calls[0].payload.aps.alert, { title: 'Matron', body: 'Your agent needs you' })
+  assert.equal('box' in stub.calls[0].payload, false)
+  assert.ok(!JSON.stringify(stub.calls[0].payload).includes('deploy'))
+})
+
+test('a push that waited out a coalescing window is sealed to the key registered by then', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 30 })
+  const id = registerKeyedDevice(db, alice.id, 'phone')
+  const later = keyPairFrom('re-registered')
+  const text = (n) => {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: `message ${n}` } })
+    pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body: `message ${n}` } }, null)
+  }
+  text(1)
+  text(2)
+  setApnsRegistration(db, id, { apnsToken: 'phone-token', apnsEnv: 'prod', pushKey: later.key })
+  await new Promise((res) => setTimeout(res, 80))
+  assert.equal(stub.calls.length, 2)
+  assert.equal(opened(stub.calls[0]).body, 'message 1')
+  assert.equal(opened(stub.calls[1], later).body, 'message 2')
+})

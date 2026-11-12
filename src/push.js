@@ -404,7 +404,8 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
       if (hub.isViewing(userId, device.id, event.convo_id)) continue
       if (device.cursor >= event.seq) continue
       const buildOpts = () => {
-        const box = sealedFor(device, plaintext)
+        const key = currentKey(device)
+        const box = sealedFor(device, key, plaintext)
         return {
           // seq (read state): the message this alert shows, so a tapped
           // notification can report that one message as seen.
@@ -413,8 +414,11 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
           // use: the content is in the box alone, on the direct APNs path
           // as well, and mutable-content hands it to the app's notification
           // extension to open.
-          payload: box
-            ? { aps: { alert: APS_ALERTS[cls.kind] ?? APS_ALERTS.activity, 'thread-id': event.convo_id, 'mutable-content': 1 }, seq: event.seq, box }
+          //
+          // A device that registered a key never gets its content in the
+          // clear: if the box could not be made, the fixed text goes alone.
+          payload: key
+            ? { aps: { alert: APS_ALERTS[cls.kind] ?? APS_ALERTS.activity, 'thread-id': event.convo_id, 'mutable-content': 1 }, seq: event.seq, ...(box ? { box } : {}) }
             : { aps: { alert: { title, body }, 'thread-id': event.convo_id }, seq: event.seq },
           priority: cls.priority,
           pushType: 'alert',
@@ -430,13 +434,20 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     }
   }
 
+  // The key the device holds now, for the token this push goes to. Read at
+  // send time: a coalesced push can wait out its window, and a registration
+  // made meanwhile must not get a box sealed to the key it replaced.
+  function currentKey(device) {
+    return db.prepare('SELECT push_key FROM devices WHERE id=? AND apns_token=?').get(device.id, device.apns_token)?.push_key ?? null
+  }
+
   // The box for one device, or null: no key registered, or sealing failed
-  // (the push then goes out as it would have without a key).
-  function sealedFor(device, plaintext) {
-    if (!device.push_key) return null
+  // (the push then goes out with the fixed text alone).
+  function sealedFor(device, key, plaintext) {
+    if (!key) return null
     try {
       const bytes = plaintext()
-      return bytes ? sealBox(device.push_key, bytes) : null
+      return bytes ? sealBox(key, bytes) : null
     } catch (err) {
       console.error(`push: could not seal content for device ${device.id}`, err)
       return null

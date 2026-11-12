@@ -12,10 +12,11 @@
 // device's key before it gets here (src/push-box.js): the relay cannot read
 // it.
 //
-// A relay that predates `box` answers 400 unknown_field. The push is then
-// sent again without it, so the notification still arrives with the relay's
-// fixed text, and boxes are left off for `boxRetryMs` before one is tried
-// again.
+// A relay that predates `box` answers 400 unknown_field, or 413 too_large
+// when the box takes the request past its older, smaller body limit. Either
+// way the push is sent again without it, so the notification still arrives
+// with the relay's fixed text, and boxes are left off for `boxRetryMs`
+// before one is tried again.
 export function makeGatewayClient({ url, fetchImpl = fetch, requestTimeoutMs = 30000, boxRetryMs = 60 * 60 * 1000, now = Date.now }) {
   const endpoint = new URL('/push', url).toString()
   let noBoxUntil = 0
@@ -37,7 +38,8 @@ export function makeGatewayClient({ url, fetchImpl = fetch, requestTimeoutMs = 3
     if (typeof payload?.box === 'string' && now() >= noBoxUntil) body.box = payload.box
 
     const result = await post(body)
-    if (body.box === undefined || result.status !== 400 || result.reason !== 'unknown_field') return result
+    const refusedBox = (result.status === 400 && result.reason === 'unknown_field') || result.status === 413
+    if (body.box === undefined || !refusedBox) return result
     noBoxUntil = now() + boxRetryMs
     console.warn('push: the relay does not take sealed content yet — sending notifications without it')
     delete body.box
