@@ -416,8 +416,9 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
           // extension to open.
           //
           // A device that registered a key never gets its content in the
-          // clear: if the box could not be made, the fixed text goes alone.
-          payload: key
+          // clear: if the box could not be made, or its registration changed
+          // while this push waited, the fixed text goes alone.
+          payload: key || device.push_key
             ? { aps: { alert: APS_ALERTS[cls.kind] ?? APS_ALERTS.activity, 'thread-id': event.convo_id, 'mutable-content': 1 }, seq: event.seq, ...(box ? { box } : {}) }
             : { aps: { alert: { title, body }, 'thread-id': event.convo_id }, seq: event.seq },
           priority: cls.priority,

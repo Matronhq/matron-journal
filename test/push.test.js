@@ -1254,3 +1254,20 @@ test('a push that waited out a coalescing window is sealed to the key registered
   assert.equal(opened(stub.calls[0]).body, 'message 1')
   assert.equal(opened(stub.calls[1], later).body, 'message 2')
 })
+
+test('a keyed device whose token moved on while a push waited is not sent content in the clear', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 30 })
+  const id = registerKeyedDevice(db, alice.id, 'phone')
+  const text = (n) => {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: `message ${n}` } })
+    pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:a', type: 'text', payload: { body: `message ${n}` } }, null)
+  }
+  text(1)
+  text(2)
+  setApnsRegistration(db, id, { apnsToken: 'new-token', apnsEnv: 'prod', pushKey: RECIPIENT.key })
+  await new Promise((res) => setTimeout(res, 80))
+  assert.equal(stub.calls.length, 2)
+  assert.deepEqual(stub.calls[1].payload.aps.alert, { title: 'Matron', body: 'New activity from your agent' })
+  assert.equal('box' in stub.calls[1].payload, false)
+  assert.ok(!JSON.stringify(stub.calls[1].payload).includes('message 2'))
+})
