@@ -3,7 +3,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { pipeline } from 'node:stream/promises'
 import { checkPassword, makeRateLimiter, makeKeyedQueue, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
-import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
+import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL, byLastMessageThenId } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, isPrivateDevice, deviceStatuses } from './db.js'
 import { receiveBlob } from './media.js'
 import { readBlobTranscript, isTranscribableType, transcriptWaitS } from './blob-transcripts.js'
@@ -538,9 +538,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
              AND NOT EXISTS(SELECT 1 FROM person_rooms pr WHERE pr.guest_room_id = conversations.id)${filtered
              ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
                     SELECT 1 FROM private_devices d WHERE d.id=conversations.agent_device_id))`
-             : ''}
-           ORDER BY last_seq DESC`
+             : ''}`
         ).all(who.userId)
+        rows.sort(byLastMessageThenId)
         // mission_num: the session's CURRENT mission (null when none) —
         // the number its mission-named title (src/convo-title.js) stands
         // for. A filtered caller never learns a private-origin mission's
