@@ -72,7 +72,10 @@ export function parseStatement(s) {
 }
 
 // What a signed tap commits to: an item's title and body, or a comment's body.
-export function promptDigest({ title, body }) {
+export function promptDigest(input) {
+  if (!isObj(input)) throw new TypeError('bad_prompt')
+  const { title, body } = input
+  if (typeof body !== 'string' || (title !== undefined && typeof title !== 'string')) throw new TypeError('bad_prompt')
   const prompt = title === undefined ? { body } : { title, body }
   return crypto.createHash('sha256').update(canonicalize(prompt), 'utf8').digest('hex')
 }

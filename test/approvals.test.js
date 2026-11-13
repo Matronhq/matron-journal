@@ -22,26 +22,52 @@ test('parseStatement accepts the fixture statements', () => {
   for (const s of Object.values(fx.statements)) assert.deepEqual(parseStatement(s.statement), JSON.parse(s.statement))
 })
 
-test('parseStatement refuses non-canonical and malformed statements', () => {
+test('parseStatement refuses non-canonical statements', () => {
   const obj = JSON.parse(tap.statement)
-  const bad = []
-  bad.push(tap.statement.replace('{"', '{ "'))
-  bad.push(JSON.stringify(Object.fromEntries(Object.entries(obj).reverse())))
-  const mut = (f) => { const o = structuredClone(obj); f(o); return JSON.stringify(Object.fromEntries(Object.entries(o).sort(([a], [b]) => (a < b ? -1 : 1)))) }
-  bad.push(mut((o) => { o.v = 2 }))
-  bad.push(mut((o) => { o.type = 'x' }))
-  bad.push(mut((o) => { o.subject = Object.fromEntries(Array.from({ length: 13 }, (_, i) => ['k' + i, 'v'])) }))
-  bad.push(mut((o) => { o.subject = { a: 'x'.repeat(201) } }))
-  bad.push(mut((o) => { o.subject = { a: { b: 'c' } } }))
-  bad.push(mut((o) => { o.extra = 1 }))
-  bad.push(mut((o) => { delete o.action }))
-  bad.push(mut((o) => { o.signed_at = 1.5 }))
-  bad.push(mut((o) => { o.item.num = '7' }))
-  const consent = JSON.parse(fx.statements.consent.statement)
-  bad.push(canonicalize({ ...consent, action: 'x' }))
-  bad.push('not json', '', '[]', 'null')
-  for (const s of bad) assert.equal(parseStatement(s), null, s)
+  const reversed = JSON.stringify(Object.fromEntries(Object.entries(obj).reverse()))
+  assert.notEqual(reversed, tap.statement)
+  for (const s of [tap.statement.replace('{"', '{ "'), reversed, tap.statement.replace(/"signed_at":(\d+)/, '"signed_at":$1.0')]) {
+    assert.notEqual(s, tap.statement)
+    assert.equal(parseStatement(s), null, s)
+  }
+  for (const s of ['not json', '', '[]', 'null']) assert.equal(parseStatement(s), null, s)
   for (const s of [undefined, null, 5, {}, []]) assert.equal(parseStatement(s), null)
+})
+
+test('parseStatement enforces each field rule on canonical strings', () => {
+  const base = JSON.parse(tap.statement)
+  const consent = JSON.parse(fx.statements.consent.statement)
+  const account = JSON.parse(fx.statements.account.statement)
+  const keys = (n) => Object.fromEntries(Array.from({ length: n }, (_, i) => ['k' + i, 'v']))
+  const cases = {
+    'v:2': { ...base, v: 2 },
+    'type x': { ...base, type: 'x' },
+    '13 subject keys': { ...base, subject: keys(13) },
+    '201-char subject value': { ...base, subject: { a: 'x'.repeat(201) } },
+    '201-char subject key': { ...base, subject: { ['k'.repeat(201)]: 'v' } },
+    'nested subject value': { ...base, subject: { a: { b: 'c' } } },
+    'non-string subject value': { ...base, subject: { a: 1 } },
+    'subject not an object': { ...base, subject: [] },
+    'unknown key': { ...base, extra: 1 },
+    'missing action': (({ action, ...r }) => r)(base),
+    'fractional signed_at': { ...base, signed_at: 1.5 },
+    'string item.num': { ...base, item: { ...base.item, num: '7' } },
+    'extra item key': { ...base, item: { ...base.item, x: 'y' } },
+    'consent with action': { ...consent, action: 'x' },
+    'consent with item': { ...consent, item: base.item },
+    'empty nonce': { ...base, nonce: '' },
+  }
+  for (const [name, o] of Object.entries(cases)) {
+    const s = canonicalize(o)
+    assert.equal(canonicalize(JSON.parse(s)), s, name)
+    assert.equal(parseStatement(s), null, name)
+  }
+  const ok = { ...base, subject: keys(12) }
+  assert.deepEqual(parseStatement(canonicalize(ok)), ok)
+  const lim = { ...base, subject: { ['k'.repeat(200)]: 'x'.repeat(200) } }
+  assert.deepEqual(parseStatement(canonicalize(lim)), lim)
+  const empty = { ...account, subject: {} }
+  assert.deepEqual(parseStatement(canonicalize(empty)), empty)
 })
 
 test('verifySignature', () => {
@@ -61,4 +87,11 @@ test('promptDigest', () => {
   const { input, digest } = fx.prompt_digest_example
   assert.equal(promptDigest(input), digest)
   assert.notEqual(promptDigest({ body: input.body }), digest)
+})
+
+test('promptDigest refuses malformed input', () => {
+  for (const bad of [{}, { body: 1 }, { title: 1, body: 'B' }, { title: null, body: 'B' }, null, undefined]) {
+    assert.throws(() => promptDigest(bad), TypeError)
+  }
+  assert.doesNotThrow(() => promptDigest({ title: '', body: '' }))
 })
