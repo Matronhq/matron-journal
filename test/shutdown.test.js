@@ -35,11 +35,33 @@ test('an HTTP connection with an unfinished request does not hold close() open',
   const started = Date.now()
   let timer
   await Promise.race([
-    s.close(),
+    s.close({ hardCutMs: 600 }),
     new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('an unfinished request blocked close()')), 3000) }),
   ])
   clearTimeout(timer)
-  assert.ok(Date.now() - started >= 400, 'in-flight requests get a short grace period')
+  assert.ok(Date.now() - started >= 500, 'the stalled request waits for the hard cut')
+  assert.equal(s.db.open, false)
+})
+
+test('a request in flight at close() still gets its full response, and close() does not wait for the hard cut', async (t) => {
+  const s = await startTestServer()
+  const sock = net.connect(Number(new URL(s.base).port), '127.0.0.1')
+  sock.on('error', () => {})
+  t.after(() => sock.destroy())
+  await new Promise((resolve) => sock.once('connect', resolve))
+  const received = new Promise((resolve) => s.server.once('request', resolve))
+  sock.write('POST /login HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nContent-Type: application/json\r\nConnection: keep-alive\r\n\r\n{')
+  await received
+  let data = ''
+  sock.on('data', (d) => { data += d })
+  const started = Date.now()
+  const closing = s.close({ hardCutMs: 8000 })
+  // Finish the request after close() has started.
+  await new Promise((resolve) => setTimeout(resolve, 700))
+  sock.write('}')
+  await closing
+  assert.ok(Date.now() - started < 4000, 'close() finished without the hard cut')
+  assert.match(data, /^HTTP\/1\.1 \d{3} /, 'the in-flight request got a complete response')
   assert.equal(s.db.open, false)
 })
 

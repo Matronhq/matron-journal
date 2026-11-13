@@ -893,7 +893,7 @@ export function startServer({
         // open websocket first gets a close frame carrying it, so a client
         // can tell a restart from a network drop, and up to graceMs to
         // acknowledge. Whatever is left is terminated either way.
-        close: ({ closeCode, closeReason, graceMs = 1000 } = {}) => new Promise((r) => {
+        close: ({ closeCode, closeReason, graceMs = 1000, hardCutMs = 5000 } = {}) => new Promise((r) => {
           closing = true
           startDelay.cancel()
           if (retentionInterval) { clearInterval(retentionInterval); retentionInterval.stop() }
@@ -934,10 +934,16 @@ export function startServer({
             // A POST /tts waiting on Azure would hold server.close() for up to
             // its 20 s timeout: abort it, so the caller gets its 502 now.
             if (resolvedTts) resolvedTts.close()
-            server.close(() => { Promise.all([searchBackfill, isDiffBackfill, imageDimsBackfill, embedderReady.catch(() => {}), transcriptionDone, semanticInFlight, outboxDone]).then(() => { db.close(); r() }) })
-            // Give in-flight HTTP requests a moment, then drop remaining
-            // connections so kept-alive sockets cannot hold shutdown open.
-            setTimeout(() => server.closeAllConnections(), 500).unref()
+            // A kept-alive socket whose request is still running stays open
+            // after the reply, so server.close() alone can wait out the
+            // keep-alive timeout. Release each one as soon as it is idle;
+            // a request still running at hardCutMs (before the shutdown
+            // watchdog) is cut so a stalled one cannot hold shutdown open.
+            const idleSweep = setInterval(() => server.closeIdleConnections(), 100)
+            idleSweep.unref()
+            const hardCut = setTimeout(() => server.closeAllConnections(), hardCutMs)
+            hardCut.unref()
+            server.close(() => { clearInterval(idleSweep); clearTimeout(hardCut); Promise.all([searchBackfill, isDiffBackfill, imageDimsBackfill, embedderReady.catch(() => {}), transcriptionDone, semanticInFlight, outboxDone]).then(() => { db.close(); r() }) })
           }
           const open = closeCode === undefined ? [] : [...wss.clients].filter((c) => c.readyState === 1)
           if (!open.length) { finish(); return }
@@ -977,7 +983,7 @@ export function installShutdownHandlers(s, {
       log('matron-journal: shutdown timed out, exiting')
       proc.exit(1)
     }, timeoutMs)
-    s.close({ closeCode: RESTART_CLOSE_CODE, closeReason: RESTART_CLOSE_REASON, graceMs })
+    s.close({ closeCode: RESTART_CLOSE_CODE, closeReason: RESTART_CLOSE_REASON, graceMs, hardCutMs: Math.max(0, timeoutMs - graceMs - 2000) })
       .then(() => { clearTimeout(timer); proc.exit(0) },
         (err) => { console.error('shutdown failed', err); proc.exit(1) })
   }
