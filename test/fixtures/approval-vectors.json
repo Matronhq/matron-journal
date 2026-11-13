@@ -1,0 +1,27 @@
+{
+  "note": "TEST ONLY. Throwaway key; never use it for anything real.",
+  "private_key_pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgqaOEaPyrULWgGII2\nI8K1o9uZmk/sYey5bvnLPX8BUNihRANCAARLRtjq1gcBhgKMY/2z6EE5XD7ftO77\nPi5kz942lKetwVmch4YvlsC07mFCJUg9nHI75jpYAL4T960EWcUTBXxq\n-----END PRIVATE KEY-----\n",
+  "public_key": "BEtG2OrWBwGGAoxj_bPoQTlcPt-07vs-LmTP3jaUp63BWZyHhi-WwLTuYUIlSD2ccjvmOlgAvhP3rQRZxRMFfGo",
+  "key_id": "7734f909e9f544078132cf4d9007db7ffc0b4a36a266f3e0488477995ee3552f",
+  "prompt_digest_example": {
+    "input": {
+      "title": "Deploy box-a",
+      "body": "Roll out the new build?"
+    },
+    "digest": "ed21b0d465a1c26c16a5800898c5e792473adf2eb04fd99cdbe015cd80200702"
+  },
+  "statements": {
+    "item_tap": {
+      "statement": "{\"action\":\"Approve\",\"item\":{\"id\":\"it_abc123\",\"num\":7,\"reply_to\":null},\"journal\":\"journal.example\",\"key_id\":\"7734f909e9f544078132cf4d9007db7ffc0b4a36a266f3e0488477995ee3552f\",\"nonce\":\"q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq8k\",\"prompt_digest\":\"ed21b0d465a1c26c16a5800898c5e792473adf2eb04fd99cdbe015cd80200702\",\"signed_at\":1790000000000,\"subject\":{\"box\":\"box-a\"},\"type\":\"item_tap\",\"user\":\"alice\",\"v\":1}",
+      "signature": "MEQCIFaRPTnhu8ClJxt8R8usnO-gMazAXPMSi8pFMtB8ZMyJAiAQzhUFk2wAweZI6owHu6evq2YY29kgFOrc_olu0Wsguw"
+    },
+    "consent": {
+      "statement": "{\"journal\":\"journal.example\",\"key_id\":\"7734f909e9f544078132cf4d9007db7ffc0b4a36a266f3e0488477995ee3552f\",\"nonce\":\"q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq8k\",\"signed_at\":1790000000000,\"subject\":{\"id\":\"sp_1\",\"kind\":\"spawn\"},\"type\":\"consent\",\"user\":\"alice\",\"v\":1}",
+      "signature": "MEYCIQC8jDmExpdUC8hNIpwgVC-ntNtcTRDfRcqiwym-EN8f3wIhAL07khHOvipEdaXhdivrl-HeiXYc6RBM-CnzXneJNxkE"
+    },
+    "account": {
+      "statement": "{\"journal\":\"journal.example\",\"key_id\":\"7734f909e9f544078132cf4d9007db7ffc0b4a36a266f3e0488477995ee3552f\",\"nonce\":\"q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq8k\",\"signed_at\":1790000000000,\"subject\":{\"device\":\"phone\",\"op\":\"add_device\"},\"type\":\"account\",\"user\":\"alice\",\"v\":1}",
+      "signature": "MEUCIQDvUDcud9IaUTX8F9GiGvM8f3zs2wT6dp05rpd6vKFQVwIgSLdp7bdnmzhQyL6rQBhIAiIyoQGRJgJyTK_6GHTjyWo"
+    }
+  }
+}
