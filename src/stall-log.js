@@ -59,7 +59,9 @@ export function timed(label, fn, { thresholdMs = STALL_THRESHOLD_MS, log = (line
 // Logs a request that took `thresholdMs` or longer, by method and path (no
 // query string). The event loop is single-threaded, so a request that was
 // slow because the loop was blocked shows up here too, next to the stall
-// line; a request that is itself the blocker ends right at the stall.
+// line; a request that is itself the blocker ends right at the stall. Uses its
+// own "slow request:" prefix because a media download or upload over a slow
+// link is legitimately slow and is not an event-loop stall.
 export function logSlowRequests(handler, { thresholdMs = STALL_THRESHOLD_MS, log = (line) => console.warn(line), now = defaultNow } = {}) {
   if (process.env.MATRON_STALL_LOG === '0') return handler
   return (req, res) => {
