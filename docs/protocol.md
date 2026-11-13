@@ -142,10 +142,10 @@ the machine-checkable version of this page.
   only read its transcript. `mission_num` is the number of the hit's
   conversation's current mission (same pointer `mode=chats` reports, see
   below), sieved the same way for an ordinary agent caller, or `null` when
-  it isn't on one. `why` is `'phrase'` for the adjacent prose tier,
+  it isn't on one. `why` is `'exact'` for the adjacent prose tier (the same value the tracker tiers report for a phrase match),
   `'words'` for other hits matching every query term, or `'some_words'`
   for the fallback described next. Clients should treat an unknown `why`
-  as a plain match. Fewer than 5 combined `'phrase'` and `'words'` hits,
+  as a plain match. Fewer than 5 combined `'exact'` and `'words'` hits,
   with `q` carrying 2+ terms, runs the same query again matching ANY term
   (still FTS-quoted, same ordering, same
   privacy and subagent filters) for up to the remaining `limit`, excluding

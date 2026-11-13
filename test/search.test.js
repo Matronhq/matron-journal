@@ -833,9 +833,9 @@ test('ranked: adjacent prose precedes scattered, reversed, diff and partial matc
     const partial = add('lantern repairs')
     const hits = searchMessages(db, userId, { query: 'lantern export' }).hits
     assert.equal(hits[0].seq, phrase)
-    assert.equal(hits[0].why, 'phrase')
+    assert.equal(hits[0].why, 'exact')
     assert.deepEqual(new Set(hits.slice(1, 3).map((h) => h.seq)), new Set([scattered, reversed]))
-    assert.deepEqual(hits.map((h) => h.why), ['phrase', 'words', 'words', 'words', 'some_words'])
+    assert.deepEqual(hits.map((h) => h.why), ['exact', 'words', 'words', 'words', 'some_words'])
     assert.equal(hits[3].seq, diff)
     assert.equal(hits[4].seq, partial)
     assert.equal(new Set(hits.map((h) => h.seq)).size, hits.length)
@@ -843,7 +843,7 @@ test('ranked: adjacent prose precedes scattered, reversed, diff and partial matc
     assert.deepEqual(searchMessages(db, userId, { query: 'lantern export', limit: 2 }).hits, hits.slice(0, 2))
     add('another lantern export')
     const enough = searchMessages(db, userId, { query: 'lantern export' }).hits
-    assert.equal(enough.length, 5, 'five combined phrase and words hits suppress the partial fallback')
+    assert.equal(enough.length, 5, 'five combined exact and words hits suppress the partial fallback')
     assert.ok(enough.every((h) => h.why !== 'some_words'))
   } finally { db.close() }
 })
@@ -855,12 +855,13 @@ test('ranked: phrase tier covers two through eight terms and preserves literal q
     append(db, { userId, convoId, sender: 'user:alice', type: 'text', payload: { body: 'amber birch cedar dogwood elm fir hazel ivy juniper' } })
     for (const [query, why] of [
       ['amber', 'words'],
-      ['amber birch', 'phrase'],
-      ['amber birch cedar dogwood elm fir hazel ivy', 'phrase'],
+      ['amber birch', 'exact'],
+      ['amber birch cedar dogwood elm fir hazel ivy', 'exact'],
       ['amber birch cedar dogwood elm fir hazel ivy juniper', 'words'],
-      ['  amber   birch  ', 'phrase'],
-      ['"amber birch"', 'phrase'],
-      ['amber "birch', 'phrase'],
+      ['  amber   birch  ', 'exact'],
+      ['"amber birch"', 'exact'],
+      ['amber "birch', 'exact'],
+      ['amber, birch!', 'exact'],
     ]) {
       assert.deepEqual(searchMessages(db, userId, { query }).hits.map((h) => h.why), [why], query)
     }
@@ -881,7 +882,7 @@ test('ranked: phrase tier shares user, conversation, private-owner and subagent 
     }
     const search = (options = {}) => searchMessages(db, userId, { query: 'lantern export', ...options }).hits
     assert.equal(search().length, 3)
-    assert.ok(search().every((h) => h.why === 'phrase'))
+    assert.ok(search().every((h) => h.why === 'exact'))
     assert.deepEqual(search({ excludePrivateOwned: true, excludeSubagents: true }).map((h) => h.convo_id), [convoId])
     assert.deepEqual(search({ convoId: 'private', excludePrivateOwned: true }), [])
     assert.deepEqual(search({ convoId: 'other' }), [])
