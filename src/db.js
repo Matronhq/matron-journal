@@ -1134,6 +1134,11 @@ export function openDb(path) {
   // SQLite's stock inline auto-checkpoint so a long one-shot run (e.g. a
   // backlog retention offload) cannot grow the WAL unbounded.
   db.pragma('journal_size_limit = 4194304')
+  // Keep hot pages in-process: synchronous reads can stall the event loop
+  // when the disk is busy. The 256 MiB budget is only used as pages are
+  // touched; smaller installations can lower it with MATRON_SQLITE_CACHE_MB.
+  const cacheMb = Number(process.env.MATRON_SQLITE_CACHE_MB ?? 256)
+  if (Number.isFinite(cacheMb) && cacheMb > 0) db.pragma(`cache_size = -${Math.floor(cacheMb * 1024)}`)
   // The unstemmed search mirror is populated by trigger from here on; a
   // database that predates it has rows to index. 'rebuild' reads the
   // content table (seconds for a few hundred thousand prose rows).
