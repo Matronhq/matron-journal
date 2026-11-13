@@ -956,6 +956,14 @@ Rows from before the stamp carry neither, and don't count.
   wipes its local store, calls `GET /snapshot`, and reconnects with the
   fresh cursor (spec §6). Journal rows are never deleted, so this is an
   efficiency valve, not a data-loss boundary.
+  Clients may send an optional `hello.max_replay` (non-negative integer) to
+  lower the replay ceiling to `min(MATRON_MAX_REPLAY, max_replay)` for that
+  connection, allowing a snapshot instead of costly per-event replay on
+  mobile devices. It cannot raise the server limit. Zero requests a snapshot
+  whenever replay would carry any events; equality still replays. Omitted
+  or invalid values are ignored, as is the field on agent connections.
+  Live-only connections (`cursor: null` or omitted) are unaffected. For
+  `for_you`, the lower ceiling applies to the scoped count described below.
 - **Sync scope (`hello.sync`, clients only).** `'everything'` (the default,
   and what a client that sends nothing gets) carries every event of every
   conversation. `'for_you'` is for a phone that follows only the tracker:

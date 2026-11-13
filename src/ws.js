@@ -575,13 +575,18 @@ export function attachWs({
             // replaying — tell the client to wipe, GET /snapshot, and reconnect
             // with the fresh cursor instead. Close 4009 right after; the socket
             // is never registered (no live traffic for this abandoned attempt).
+            // Clients may lower the valve for this connection only. Invalid
+            // values are ignored; agents keep the server's limit.
+            const clientMax = who.kind === 'client' && Number.isInteger(msg.max_replay) && msg.max_replay >= 0
+              ? msg.max_replay : Infinity
+            const valve = Math.min(maxReplay, clientMax)
             // A for_you replay is measured by what it would send, not by the
             // whole journal's gap: most of that gap is never sent to it.
             const scoped = conn.syncScope === 'for_you'
             const gap = scoped
-              ? scopedReplayCount(db, who.userId, msg.cursor, conn.coordinatorConvoId, maxReplay)
+              ? scopedReplayCount(db, who.userId, msg.cursor, conn.coordinatorConvoId, valve)
               : headSeq - msg.cursor
-            if (gap > maxReplay) {
+            if (gap > valve) {
               ws.send(JSON.stringify({ kind: 'control', op: 'snapshot_required' }))
               ws.close(4009)
               return
