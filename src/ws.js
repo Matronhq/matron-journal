@@ -242,6 +242,36 @@ export function makeStatusCache(max = STATUS_CACHE_MAX) {
 
 const MAX_WS_PAYLOAD_BYTES = 1048576 // 1 MiB
 
+// Compress larger messages only for peers offering permessage-deflate. Avoid
+// cross-message history and bound zlib work; ws keeps the (reset) streams
+// until the socket closes, so each compressed connection holds a few tens to
+// a couple of hundred KiB of zlib state. A 2 KiB window (serverMaxWindowBits
+// 11) roughly halves that and still compresses JSON well. Client window bits
+// stay negotiable so bare offers and peers requesting smaller windows can
+// still connect.
+const WS_DEFLATE_OPTIONS = {
+  threshold: 1024,
+  zlibDeflateOptions: { level: 6, memLevel: 7 },
+  serverNoContextTakeover: true,
+  serverMaxWindowBits: 11,
+  clientNoContextTakeover: true,
+  concurrencyLimit: 10,
+}
+
+// An offer with `server_max_window_bits=N` for N below ours cannot be
+// accepted. Browsers and ws do not send the parameter; this only guards
+// unusual clients.
+function dropUnsatisfiableDeflateOffer(req) {
+  const header = req.headers['sec-websocket-extensions']
+  if (!header || !header.includes('server_max_window_bits')) return
+  const offers = header.split(',').map((offer) => offer.trim()).filter((offer) => {
+    const m = /server_max_window_bits\s*=\s*"?(\d+)"?/.exec(offer)
+    return !(m && Number(m[1]) < WS_DEFLATE_OPTIONS.serverMaxWindowBits)
+  })
+  if (offers.length === 0) delete req.headers['sec-websocket-extensions']
+  else req.headers['sec-websocket-extensions'] = offers.join(',')
+}
+
 // Between replay batches, a slow/paused reader must not let the server
 // buffer an unbounded amount of backlog in the socket's outgoing queue.
 const REPLAY_BACKPRESSURE_BYTES = 4 * 1024 * 1024 // 4 MB
@@ -289,12 +319,20 @@ export function attachWs({
   revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES, inviteTtlMs = 1800000,
   broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null,
   journalHost = null, clientIdleMs, clientIdleClock = Date.now, securityLog = securityLogFor(db),
+  perMessageDeflate = false,
 }) {
   // Derived, never raw: the orphan sweep must always outlast a live `start`
   // RPC still in flight (see APPROVED_ORPHAN_TTL_FLOOR_MS's comment) — and,
   // since wake-before-spawn, the wake wait that may precede it.
   const approvedOrphanTtlMs = Math.max(APPROVED_ORPHAN_TTL_FLOOR_MS, (spawnStartTimeoutMs + spawnWakeWaitMs) * 2)
-  const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES })
+  // ws rejects the whole handshake (400) when a deflate offer asks for a
+  // server window smaller than ours. Drop such an offer so that client
+  // connects uncompressed instead. Registered before ws's own listener.
+  if (perMessageDeflate) server.on('upgrade', dropUnsatisfiableDeflateOffer)
+  const wss = new WebSocketServer({
+    server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES,
+    perMessageDeflate: perMessageDeflate ? { ...WS_DEFLATE_OPTIONS, zlibDeflateOptions: { ...WS_DEFLATE_OPTIONS.zlibDeflateOptions } } : false,
+  })
   const statusCache = makeStatusCache()
   // Prepared once, reused for the per-frame revocation recheck below — one
   // cheap SELECT per inbound frame, not a fresh db.prepare() call each time.

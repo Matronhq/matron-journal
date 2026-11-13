@@ -488,6 +488,8 @@ function warnIfBindTrustsSpoofableIp(bind) {
 export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, apnsClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, retentionInitialDelayMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
+  // Negotiate compression only with peers offering it; set MATRON_WS_DEFLATE=0 to disable.
+  wsDeflate = process.env.MATRON_WS_DEFLATE !== '0',
   toolLogTtlHours, voiceNoteTtlDays, deviceRetention, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
   // How long an approved spawn waits for a woken target box to attach
   // before issuing `start` (wake-before-spawn). Sized for a cold VM boot:
@@ -817,6 +819,7 @@ export function startServer({
   server.keepAliveTimeout = resolveNumericEnv('MATRON_KEEPALIVE_TIMEOUT_MS', process.env.MATRON_KEEPALIVE_TIMEOUT_MS, 120000)
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
+    perMessageDeflate: wsDeflate,
     // 55s: under the common 60s proxy idle-timeout defaults, and a 2.75x
     // cut in heartbeat radio wakes for idle phone clients vs the old 20s.
     pingMs: resolveNumericEnv('MATRON_WS_PING_MS', process.env.MATRON_WS_PING_MS, 55000),
