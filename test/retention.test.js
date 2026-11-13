@@ -1502,6 +1502,24 @@ test('drainAsync hands the loop back between batches: offloadPass yields every b
   assert.equal(slices, 4, 'the last stretch finds the empty page')
 })
 
+test('offloadPass counts skipped live-log rows toward a page, so a run of them never becomes one long stretch', async () => {
+  const { offloadPass, drainAsync } = await import('../src/retention.js')
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  for (let i = 0; i < 6; i++) {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { live_log: true, snippet: `l${i}` } })
+    backdate(db, r.seq, alice.id, 40)
+  }
+  const due = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { snippet: 'due', output: 'x'.repeat(100) } })
+  backdate(db, due.seq, alice.id, 39)
+  let turns = 0
+  const r = await drainAsync(offloadPass(db, { days: 30, mediaDir, batchSize: 2 }), {
+    yieldFn: () => new Promise((resolve) => setImmediate(() => { turns += 1; resolve() })),
+  })
+  assert.deepEqual(r, { offloaded: 1 })
+  assert.equal(turns, 4, '6 skipped rows and 1 due row in pages of 2')
+})
+
 test('drainAsync stops at the next yield once shouldStop is true, and returns null', async () => {
   const { offloadPass, drainAsync } = await import('../src/retention.js')
   const { db, alice } = await setup()

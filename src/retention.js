@@ -85,10 +85,11 @@ export function runOffload(db, opts) {
 export function* offloadPass(db, { days = 30, mediaDir, batchSize = RETENTION_ROW_BATCH }) {
   const cutoff = Date.now() - days * 86400000
   const page = db.prepare(
-    // The CASE keeps rows the loop below would only `continue` past (live-log
-    // and tombstoned payloads) out of the result, so they are not re-parsed
-    // on every pass; a malformed payload still comes through (json_extract
-    // would raise on it, hence the json_valid guard).
+    // No json filter here: live-log and tombstoned rows are skipped by the
+    // loop below instead. A filter in SQL reads every one of those payloads
+    // before it can return the first due row, and on a cold page cache that
+    // one statement held the loop for 8 s on a 1.6 GB DB. Paging on the
+    // index alone bounds each stretch to `batchSize` payload reads.
     // type is a literal, not a bound parameter: the partial index
     // idx_events_offload_pending is only usable when SQLite can see it.
     // Read in pages of `batchSize` on a (ts, rowid) cursor, in index order,
@@ -97,8 +98,6 @@ export function* offloadPass(db, { days = 30, mediaDir, batchSize = RETENTION_RO
     // `ts >= ?` is the index lower bound (the OR alone is not one, and
     // every page would re-walk the skipped live-log rows before the cursor).
     'AND ts >= ? AND (ts > ? OR rowid > ?) ' +
-    "AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.live_log') IS NULL " +
-    "AND json_extract(payload,'$.expired') IS NULL AND json_extract(payload,'$.blob_expired') IS NULL ELSE 1 END " +
     'ORDER BY ts, rowid LIMIT ?'
   )
   let offloaded = 0
