@@ -1241,6 +1241,17 @@ Rows from before the stamp carry neither, and don't count.
   `up_to_seq >= last_seq` always resets it to 0. Certain event kinds are
   never counted toward unread: `convo_meta` (a rename), `summary` (TOC metadata),
   and `edit` (not new activity).
+- Silent events: a message-type event (`text`, `prompt`, `file`, …) whose
+  payload carries `silent: true` is content the user can read in the chat
+  but is never told about. It appears in the conversation, replays and
+  fans out like any other event, and its buttons work; but it never
+  increments `unread_count` (at append or in a `read_marker` recompute),
+  never triggers an APNs alert, and is never listed as unseen. Only the
+  literal `true` counts. A bridge sets it on a card that only records
+  something, such as the Send now / Cancel card for a reminder an agent
+  set itself. Clients that count unread or raise notifications themselves
+  apply the same rule to the event: skip the count and the notification,
+  still show the row.
 - `summary` events: agent-publishable message kind carrying `{toc, detail, model}`
   (payload is opaque to the server — no field-level validation or size caps
   enforced; the server only checks the payload is a non-null object; any
@@ -4316,7 +4327,9 @@ when any of these is true:
   or by the prompt's own `payload.prompt_id` (how a bridge settles a card
   itself: a queued message it sent at turn end);
 - it is a prompt whose payload says `blocking: false` (a card nothing
-  waits on, such as a reminder the agent set itself).
+  waits on, such as a reminder the agent set itself);
+- its payload says `silent: true` (see *Unread semantics*). A silent event
+  is also never the conversation's `final` message: the one before it is.
 
 An open, non-consent item is unseen while it has agent content (its creation,
 or an agent comment) newer than what `item_seen` covers, and the user hasn't
