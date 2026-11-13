@@ -113,7 +113,10 @@ export function requireApproval(ctx, who, body, expect) {
 }
 
 // A refusal thrown out of a guarded write's transaction, so nothing it
-// wrote (a spent nonce, a spent second-factor code) stays written.
+// wrote (a spent nonce, a spent second-factor code) stays written. Used by
+// the account actions below and by the consent answers
+// (src/consent-answer.js guardedApprove). `r` is {status, body} (a guard's
+// failed answer will do).
 export class ApprovalRefused extends Error {
   constructor({ status, body }) { super('approval_refused'); this.refusal = { status, body } }
 }

@@ -17,7 +17,7 @@
 import { json, readBody } from './http-body.js'
 import { verifyUserPassword, createClientDevice } from './auth.js'
 import { isAdmin } from './users-http.js'
-import { guardedAccountAction, refuse } from './approval-keys.js'
+import { guardedAccountAction, hasActiveKey, refuse } from './approval-keys.js'
 import {
   twoFactorState, isTwoFactorEnabled, beginSetup, finishSetup, verifySecondFactor, disableTwoFactor,
   regenerateRecoveryCodes, isTwoFactorRequired, setTwoFactorRequired, isTwoFactorExempt, otpauthUri,
@@ -82,6 +82,11 @@ export async function handleTwoFactorLogin(ctx, req, res, url, { rejectEarly }) 
     json(res, 401, { error: 'two_factor_ticket_invalid' })
     return true
   }
+  // An account with an approval key sets two-factor up only from a
+  // signed-in device, with a signature (the guarded /2fa/setup and
+  // /2fa/enable). At sign-in the password alone would otherwise buy a new
+  // authenticator, and password plus TOTP can remove every key.
+  if (wantPurpose === 'enrol' && hasActiveKey(db, t.userId)) { json(res, 403, { error: 'approval_required' }); return true }
 
   if (path === '/login/2fa/setup') {
     const s = beginSetup(db, tokenBox, t.userId)

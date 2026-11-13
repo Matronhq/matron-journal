@@ -146,12 +146,6 @@ export function storedApproval(text) {
 // {statement, signature}, or null.
 export const approvalColumn = (approval) => (approval == null ? null : JSON.stringify({ statement: approval.statement, signature: approval.signature }))
 
-// A refusal thrown out of an answer's transaction, so nothing it wrote
-// (the nonce above all) stays written.
-export class ConsentRefused extends Error {
-  constructor(r) { super('consent_refused'); this.refusal = { status: r.status, body: r.body } }
-}
-
 // Set every open consent item's step_up and subject from its ask as it
 // stands now — after a box is protected or unprotected. → the ids of the
 // items that changed.

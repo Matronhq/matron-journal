@@ -9,11 +9,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
-import { createAgent, verifyUserPassword } from '../src/auth.js'
+import http from 'node:http'
+import { createAgent, createUser, verifyUserPassword } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
-import { base32Decode, hotp, totpStep } from '../src/two-factor.js'
+import { base32Decode, hotp, totpStep, isTwoFactorEnabled, setTwoFactorRequired } from '../src/two-factor.js'
 import {
-  startApprovalServer, enableTwoFactor, enrolKeyByPassword, signAccount, totpCode, TEST_PASSWORD,
+  startApprovalServer, enableTwoFactor, enrolKeyByPassword, signAccount, signIn, totpCode, TEST_PASSWORD,
 } from './approval-helpers.js'
 
 const sha = (s) => crypto.createHash('sha256').update(s, 'utf8').digest('hex')
@@ -51,7 +52,8 @@ test('POST /password with a key: the signature comes on top of the current passw
   const approval = await w.sign({ op: 'change_password' })
   // The current password is still asked for, and still checked first: a
   // wrong one with a valid signature is today's 401 and leaves the nonce.
-  assert.deepEqual((await w.post('/password', { new_password: NEW_PW, approval })).json, { error: 'bad_request' })
+  const noOld = await w.post('/password', { new_password: NEW_PW, approval })
+  assert.deepEqual([noOld.status, noOld.json], [400, { error: 'bad_request' }])
   const wrong = await w.post('/password', { ...body, old_password: 'not-the-password', approval })
   assert.deepEqual([wrong.status, wrong.json], [401, { error: 'bad_password' }])
   assert.equal(w.spentNonces(), 0)
@@ -190,15 +192,19 @@ test('POST /2fa/setup and /2fa/enable with a key: each signed; refused, the code
   // Today's checks first: a wrong password with a valid signature is a 401
   // and leaves the nonce.
   const approval = await w.sign({ op: 'two_factor', action: 'setup' })
-  assert.equal((await w.post('/2fa/setup', { password: 'not-the-password', code: rc, approval })).status, 401)
-  assert.equal((await w.post('/2fa/setup', { password: TEST_PASSWORD, code: '000000', approval })).status, 403)
+  const badPw = await w.post('/2fa/setup', { password: 'not-the-password', code: rc, approval })
+  assert.deepEqual([badPw.status, badPw.json], [401, { error: 'bad_password' }])
+  const badCode = await w.post('/2fa/setup', { password: TEST_PASSWORD, code: '000000', approval })
+  assert.deepEqual([badCode.status, badCode.json], [403, { error: 'bad_code' }])
   assert.equal(w.spentNonces(), 0)
   const setup = await w.post('/2fa/setup', { password: TEST_PASSWORD, code: rc, approval })
   assert.equal(setup.status, 200, JSON.stringify(setup.json))
   assert.equal((await w.twoFactor()).recovery_codes_left, 9)
   assert.ok(pending())
 
-  const newCode = () => { w.s.db.prepare('UPDATE two_factor SET last_step=0 WHERE user_id=?').run(w.alice.id); return hotp(base32Decode(setup.json.secret), totpStep()) }
+  // finishSetup matches the pending secret's code without a replay step, so
+  // the same step's code serves every try.
+  const newCode = () => hotp(base32Decode(setup.json.secret), totpStep())
   required(await w.post('/2fa/enable', { code: newCode() }))
   invalid(await w.post('/2fa/enable', { code: newCode(), approval: await w.sign({ op: 'two_factor', action: 'setup' }) }), 'mismatch')
   assert.ok(pending(), 'still pending')
@@ -213,7 +219,8 @@ test('POST /2fa/disable and /2fa/recovery-codes with a key: each signed; a bad c
   required(await w.post('/2fa/recovery-codes', { password: TEST_PASSWORD, code: w.code() }))
   invalid(await w.post('/2fa/recovery-codes', { password: TEST_PASSWORD, code: w.code(), approval: await w.sign({ op: 'two_factor', action: 'disable' }) }), 'mismatch')
   const approval = await w.sign({ op: 'two_factor', action: 'recovery_codes' })
-  assert.deepEqual((await w.post('/2fa/recovery-codes', { password: TEST_PASSWORD, code: '000000', approval })).json, { error: 'bad_code' })
+  const bad = await w.post('/2fa/recovery-codes', { password: TEST_PASSWORD, code: '000000', approval })
+  assert.deepEqual([bad.status, bad.json], [403, { error: 'bad_code' }])
   assert.equal(w.spentNonces(), 0)
   const codes = await w.post('/2fa/recovery-codes', { password: TEST_PASSWORD, code: w.code(), approval })
   assert.equal(codes.status, 200)
@@ -239,6 +246,176 @@ test('with a key, a recovery code alone cannot turn two-factor off to make way f
   assert.equal(state.recovery_codes_left, 10)
   required(await w.post('/2fa/setup', { password: TEST_PASSWORD, code: rc }))
   assert.equal(w.s.db.prepare('SELECT pending_secret FROM two_factor WHERE user_id=?').get(w.alice.id).pending_secret, null)
+})
+
+test('POST /2fa/setup with a key and two-factor off: the signature is the only check after the password', async (t) => {
+  const w = await world(t)
+  const off = await w.post('/2fa/disable', { password: TEST_PASSWORD, code: w.code(), approval: await w.sign({ op: 'two_factor', action: 'disable' }) })
+  assert.equal(off.status, 200, JSON.stringify(off.json))
+  const pending = () => w.s.db.prepare('SELECT pending_secret FROM two_factor WHERE user_id=?').get(w.alice.id)?.pending_secret ?? null
+  required(await w.post('/2fa/setup', { password: TEST_PASSWORD }))
+  invalid(await w.post('/2fa/setup', { password: TEST_PASSWORD, approval: await w.sign({ op: 'two_factor', action: 'disable' }) }), 'mismatch')
+  assert.equal(pending(), null)
+  const setup = await w.post('/2fa/setup', { password: TEST_PASSWORD, approval: await w.sign({ op: 'two_factor', action: 'setup' }) })
+  assert.equal(setup.status, 200, JSON.stringify(setup.json))
+  assert.ok(pending())
+})
+
+// ---- Two-factor enrolment at sign-in -------------------------------------
+
+// Sign in by password while two-factor is required and alice has none: an
+// enrolment ticket.
+async function enrolTicket(w) {
+  setTwoFactorRequired(w.s.db, true)
+  const r = await w.s.http('/login', { method: 'POST', body: { username: 'alice', password: TEST_PASSWORD, device_name: 'laptop' } })
+  assert.equal(r.json.error, 'two_factor_enrolment_required', JSON.stringify(r.json))
+  return r.json.two_factor_ticket
+}
+
+test('with a key, two-factor cannot be enrolled at sign-in: setup and enable are approval_required and write nothing', async (t) => {
+  const w = await world(t)
+  await w.post('/2fa/disable', { password: TEST_PASSWORD, code: w.code(), approval: await w.sign({ op: 'two_factor', action: 'disable' }) })
+  // A setup left pending by the signed route on the phone: the sign-in path
+  // cannot finish it either.
+  const signed = await w.post('/2fa/setup', { password: TEST_PASSWORD, approval: await w.sign({ op: 'two_factor', action: 'setup' }) })
+  const pendingNow = () => w.s.db.prepare('SELECT pending_secret FROM two_factor WHERE user_id=?').get(w.alice.id).pending_secret
+  const before = pendingNow()
+  const ticket = await enrolTicket(w)
+  required(await w.s.http('/login/2fa/setup', { method: 'POST', body: { ticket } }))
+  assert.equal(pendingNow(), before, 'no new pending secret')
+  required(await w.s.http('/login/2fa/enable', { method: 'POST', body: { ticket, code: hotp(base32Decode(signed.json.secret), totpStep()) } }))
+  assert.equal(isTwoFactorEnabled(w.s.db, w.alice.id), false)
+  assert.equal(pendingNow(), before)
+  const devices = w.s.db.prepare("SELECT COUNT(*) n FROM devices WHERE user_id=? AND kind='client'").get(w.alice.id).n
+  assert.equal(devices, 1, 'no device signed in')
+  // The signed route on a signed-in device still works.
+  const enable = await w.post('/2fa/enable', { code: hotp(base32Decode(signed.json.secret), totpStep()), approval: await w.sign({ op: 'two_factor', action: 'enable' }) })
+  assert.equal(enable.status, 200, JSON.stringify(enable.json))
+})
+
+test('without a key, enrolment at sign-in is as today', async (t) => {
+  const w = await world(t, { withKey: false })
+  await w.post('/2fa/disable', { password: TEST_PASSWORD, code: w.code() })
+  const ticket = await enrolTicket(w)
+  const setup = await w.s.http('/login/2fa/setup', { method: 'POST', body: { ticket } })
+  assert.equal(setup.status, 200, JSON.stringify(setup.json))
+  const enable = await w.s.http('/login/2fa/enable', { method: 'POST', body: { ticket, code: hotp(base32Decode(setup.json.secret), totpStep()) } })
+  assert.equal(enable.status, 200, JSON.stringify(enable.json))
+  assert.ok(enable.json.token)
+  assert.equal(isTwoFactorEnabled(w.s.db, w.alice.id), true)
+})
+
+// ---- Admin web routes ----------------------------------------------------
+
+// alice is an admin, signed in on her phone, with or without a key; bob has
+// two-factor on, with or without a key.
+async function adminWorld(t, { adminKey, targetKey }) {
+  const base = await startApprovalServer(t)
+  const { s, alice, token } = base
+  s.db.prepare('UPDATE users SET is_admin=1 WHERE id=?').run(alice.id)
+  let key = null
+  if (adminKey) {
+    const { secret } = await enableTwoFactor(s, token)
+    key = await enrolKeyByPassword(s, { token, userId: alice.id, secret })
+  }
+  const bob = await createUser(s.db, 'bob', TEST_PASSWORD)
+  const bobPhone = signIn(s, bob.id, 'bob-phone')
+  const { secret: bobSecret } = await enableTwoFactor(s, bobPhone.token)
+  if (targetKey) await enrolKeyByPassword(s, { token: bobPhone.token, userId: bob.id, secret: bobSecret })
+  const sign = (subject) => signAccount(s, { token, key, subject })
+  const spentNonces = () => s.db.prepare('SELECT COUNT(*) n FROM approval_nonces WHERE used_at IS NOT NULL').get().n
+  return { ...base, key, bob, sign, spentNonces }
+}
+
+const BOB_EMAIL = 'bob@example.com'
+const ADMIN_ROUTES = [
+  {
+    name: 'POST /users/:id/password', method: 'POST', path: (id) => `/users/${id}/password`, body: { password: 'admin-set-pw-1' },
+    subject: (user) => ({ op: 'admin_set_password', user }),
+    changed: (w) => verifyUserPassword(w.s.db, w.bob.id, 'admin-set-pw-1'),
+    ok: (r) => assert.deepEqual([r.status, r.json], [200, { ok: true }]),
+  },
+  {
+    name: 'DELETE /users/:id/two-factor', method: 'DELETE', path: (id) => `/users/${id}/two-factor`, body: null,
+    subject: (user) => ({ op: 'admin_reset_two_factor', user }),
+    changed: (w) => !isTwoFactorEnabled(w.s.db, w.bob.id),
+    ok: (r) => assert.deepEqual([r.status, r.json], [200, { ok: true }]),
+  },
+  {
+    name: 'POST /users/:id/link-code', method: 'POST', path: (id) => `/users/${id}/link-code`, body: {},
+    subject: (user) => ({ op: 'admin_link_code', user }),
+    changed: (w) => w.s.db.prepare('SELECT COUNT(*) n FROM link_preapprovals WHERE user_id=?').get(w.bob.id).n > 0,
+    ok: (r) => { assert.equal(r.status, 200, JSON.stringify(r.json)); assert.ok(r.json.link_code) },
+  },
+  {
+    name: 'PUT /users/:id/email', method: 'PUT', path: (id) => `/users/${id}/email`, body: { email: BOB_EMAIL },
+    subject: (user) => ({ op: 'admin_set_reset_email', user, email_sha256: sha(BOB_EMAIL) }),
+    changed: (w) => w.s.db.prepare('SELECT email FROM users WHERE id=?').get(w.bob.id).email === BOB_EMAIL,
+    ok: (r) => { assert.equal(r.status, 200, JSON.stringify(r.json)); assert.equal(r.json.user.email, BOB_EMAIL) },
+  },
+]
+
+for (const route of ADMIN_ROUTES) {
+  const call = (w, approval) => w.s.http(route.path(w.bob.id), {
+    method: route.method, token: w.token, body: approval === undefined ? route.body : { ...(route.body ?? {}), approval },
+  })
+
+  test(`${route.name}: an admin with a key signs it, over the target's name`, async (t) => {
+    const w = await adminWorld(t, { adminKey: true, targetKey: false })
+    required(await call(w))
+    invalid(await call(w, await w.sign(route.subject('carol'))), 'mismatch')
+    assert.equal(await route.changed(w), false, 'nothing changed')
+    assert.equal(w.spentNonces(), 0)
+    route.ok(await call(w, await w.sign(route.subject('bob'))))
+    assert.equal(await route.changed(w), true)
+  })
+
+  test(`${route.name}: an admin without a key cannot change an account that has one`, async (t) => {
+    const w = await adminWorld(t, { adminKey: false, targetKey: true })
+    required(await call(w))
+    assert.equal(await route.changed(w), false, 'nothing changed')
+  })
+
+  test(`${route.name}: neither with a key, as today`, async (t) => {
+    const w = await adminWorld(t, { adminKey: false, targetKey: false })
+    route.ok(await call(w))
+    assert.equal(await route.changed(w), true)
+  })
+}
+
+test('PUT /users/:id/email with a key: the subject names the new address by its hash; clearing it is the hash of the empty string', async (t) => {
+  const w = await adminWorld(t, { adminKey: true, targetKey: false })
+  const put = async (email, subject) => w.s.http(`/users/${w.bob.id}/email`, { method: 'PUT', token: w.token, body: { email, approval: await w.sign(subject) } })
+  invalid(await put(BOB_EMAIL, { op: 'admin_set_reset_email', user: 'bob', email_sha256: sha('eve@example.com') }), 'mismatch')
+  assert.equal((await put(BOB_EMAIL, { op: 'admin_set_reset_email', user: 'bob', email_sha256: sha(BOB_EMAIL) })).status, 200)
+  const cleared = await put(null, { op: 'admin_set_reset_email', user: 'bob', email_sha256: sha('') })
+  assert.equal(cleared.status, 200, JSON.stringify(cleared.json))
+  assert.equal(cleared.json.user.email, null)
+})
+
+test('DELETE /users/:id/two-factor re-checks the caller is still an admin after its body, like its neighbours', async (t) => {
+  // The body (it may carry the approval) is a window: a demotion while it
+  // is still arriving must be honoured.
+  const w = await adminWorld(t, { adminKey: false, targetKey: false })
+  const body = JSON.stringify({ pad: 'x'.repeat(200) })
+  const r = await new Promise((resolve, reject) => {
+    const req = http.request(`${w.s.base}/users/${w.bob.id}/two-factor`, {
+      method: 'DELETE', agent: false,
+      headers: { authorization: `Bearer ${w.token}`, 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) },
+    }, (res) => {
+      let data = ''
+      res.on('data', (c) => { data += c })
+      res.on('end', () => resolve({ status: res.statusCode, json: data ? JSON.parse(data) : null }))
+    })
+    req.on('error', reject)
+    req.write(body.slice(0, 100))
+    setTimeout(() => {
+      w.s.db.prepare('UPDATE users SET is_admin=0 WHERE id=?').run(w.alice.id)
+      req.end(body.slice(100))
+    }, 50)
+  })
+  assert.deepEqual([r.status, r.json], [403, { error: 'forbidden' }])
+  assert.equal(isTwoFactorEnabled(w.s.db, w.bob.id), true)
 })
 
 // ---- No key, agents ------------------------------------------------------

@@ -15,7 +15,8 @@ import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } fro
 import { wakeIfOffline } from './wake.js'
 import { appendAndBroadcast } from './journal.js'
 import { recordConsentDecision, CONSENT_DECISION_EVENT_TYPE } from './consent.js'
-import { consentApproval, chatAskRow, approvalColumn, ConsentRefused } from './consent-subject.js'
+import { consentApproval, chatAskRow, approvalColumn } from './consent-subject.js'
+import { ApprovalRefused } from './approval-keys.js'
 
 // Approvals of an ask aimed at a protected box (src/consent-subject.js):
 // the signature check and the state change it guards run in ONE
@@ -30,12 +31,12 @@ export function guardedApprove(db, check, apply) {
   try {
     db.transaction(() => {
       const g = check()
-      if (!g.ok) throw new ConsentRefused(g)
-      if (!apply(g.approval)) throw new ConsentRefused(CONFLICT)
+      if (!g.ok) throw new ApprovalRefused(g)
+      if (!apply(g.approval)) throw new ApprovalRefused(CONFLICT)
     })()
     return null
   } catch (err) {
-    if (err instanceof ConsentRefused) return err.refusal
+    if (err instanceof ApprovalRefused) return err.refusal
     throw err
   }
 }

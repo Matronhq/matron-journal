@@ -362,7 +362,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         console.log(`journal: said check convo=${cited.convoId} seq=${cited.seq} device=${who.deviceId} verified=${out.body.verified}${out.body.verified ? '' : ` reason=${out.body.reason}`}`)
         return json(res, 200, out.body)
       }
-      if (await handleUsersRoute({ db, links }, req, res, url, who)) return
+      if (await handleUsersRoute({ db, links, journalHost }, req, res, url, who)) return
       if (await handleAccountEmailRoute({ db, mailer, loginGuard, passwordChecks }, req, res, url, who)) return
       if (await handleTwoFactorRoute({ db, tokenBox: twoFactorBox, loginGuard, journalHost }, req, res, url, who)) return
       // Approval keys (src/approval-keys-http.js). `journalHost` is the host of

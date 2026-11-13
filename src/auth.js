@@ -12,8 +12,10 @@ export async function createUser(db, name, password) {
   return { id: r.lastInsertRowid, name }
 }
 
+export const hashPassword = (password) => argon2.hash(password, { type: argon2.argon2id })
+
 export async function setPassword(db, name, password) {
-  const hash = await argon2.hash(password, { type: argon2.argon2id })
+  const hash = await hashPassword(password)
   const r = db.prepare('UPDATE users SET password_hash=? WHERE name=?').run(hash, name)
   if (r.changes === 0) throw new Error(`no such user: ${name}`)
 }
