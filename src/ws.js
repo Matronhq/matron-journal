@@ -1557,7 +1557,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           try {
             const result = answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs, journalHost, securityLog }, {
               userId: conn.userId, requestId: spawnId, decision: 'approve',
-              decidedBy: { kind: 'coordinator', deviceId: conn.deviceId, convoId: msg.from_convo_id, reason: AUTO_APPROVE_REASON, causeKind: autoRoot.kind, causeRef: autoRoot.ref },
+              decidedBy: { kind: 'coordinator', deviceId: conn.deviceId, convoId: msg.from_convo_id, reason: AUTO_APPROVE_REASON, automatic: true, causeKind: autoRoot.kind, causeRef: autoRoot.ref },
             })
             autoApproved = result.status === 200
           } catch (err) {

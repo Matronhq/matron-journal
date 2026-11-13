@@ -14,7 +14,7 @@ import { deliverPendingInvites } from './invite-delivery.js'
 import { getSpawn, denySpawn, claimApprove, approveSpawn, emitSpawnOutcome } from './spawns.js'
 import { wakeIfOffline } from './wake.js'
 import { appendAndBroadcast } from './journal.js'
-import { recordConsentDecision, CONSENT_DECISION_EVENT_TYPE, AUTO_APPROVE_REASON } from './consent.js'
+import { recordConsentDecision, CONSENT_DECISION_EVENT_TYPE } from './consent.js'
 import { consentApproval, chatAskRow, approvalColumn } from './consent-subject.js'
 import { ApprovalRefused } from './approval-keys.js'
 import { securityLogOf, boxTarget } from './security-log.js'
@@ -75,6 +75,7 @@ export function recordAndAnnounce({ db, hub }, { userId, kind, askId, decision, 
       userId, convoId, sender: 'journal', type: CONSENT_DECISION_EVENT_TYPE,
       payload: {
         kind, ...payload, decision, by: 'coordinator', convo_id: decidedBy.convoId, reason: decidedBy.reason,
+        ...(decidedBy.automatic === true ? { auto: true } : {}),
         cause: decidedBy.causeKind ? { kind: decidedBy.causeKind, ref: decidedBy.causeRef } : null,
       },
     })
@@ -165,7 +166,9 @@ export function answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, sp
   // approvals must consume their hourly allowance durably before any session
   // starts: the decision is written inside the same guarded transaction as
   // the claim, so a failed write rolls the claim back.
-  const automatic = byCoordinator(decidedBy) && decidedBy.reason === AUTO_APPROVE_REASON
+  // Set only by the journal's own automatic path (src/ws.js); never derived
+  // from the reason text, which the Coordinator can send itself.
+  const automatic = byCoordinator(decidedBy) && decidedBy.automatic === true
   const refused = guardedApprove(db,
     () => {
       const locked = lockedApprovalRefusal(db, userId)

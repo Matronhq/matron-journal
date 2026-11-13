@@ -5257,7 +5257,9 @@ remain in ordinary decision history and count toward the daily cap for later
 The card and consent item are filed before the pending acknowledgement and
 the shared approval flow. Successful approval closes the item, records the
 verified cause and reason `auto-approved (Coordinator)`, emits the usual
-`consent_decision` and spawn outcome, and skips the consent nudge. A failed
+`consent_decision` (with `auto: true`; the journal marks the automatic path
+itself, and `POST /consent/answer` rejects that reserved reason with **400**)
+and spawn outcome, and skips the consent nudge. A failed
 claim or decision-history write leaves the card available for an answer.
 Asleep targets retain their
 wake and consent flow. Other conversations and chat invites are unchanged.
