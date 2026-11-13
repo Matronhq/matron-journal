@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import http from 'node:http'
 import { openDb, getBlob, insertBlob } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append, markRead } from '../src/journal.js'
@@ -1667,4 +1668,43 @@ test('runOffload offloads a payload whose live_log, expired and blob_expired fla
     assert.ok(row.blob_ref, 'false-valued flag stays eligible for offload')
     assert.equal(JSON.parse(row.payload).blob_ref, row.blob_ref)
   }
+})
+
+test('the first retention pass defaults to two minutes, runs async, accepts an override, and is cancelled on close', async (t) => {
+  // Exercise scheduling without opening a socket.
+  t.mock.method(http.Server.prototype, 'listen', function (_port, _bind, ready) { queueMicrotask(ready); return this })
+  t.mock.method(http.Server.prototype, 'address', () => ({ port: 0 }))
+  const { startTestServer } = await import('./helpers.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-retention-delay-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  for (const delay of [undefined, 200, 0]) {
+    const dbPath = path.join(dir, `delay-${delay}.db`)
+    const preDb = openDb(dbPath)
+    const alice = await createUser(preDb, 'alice', 'pw')
+    upsertConversation(preDb, { id: 'c1', ownerUserId: alice.id })
+    const r = append(preDb, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { snippet: 'deferred' } })
+    backdate(preDb, r.seq, alice.id, 40)
+    preDb.close()
+
+    const s = await startTestServer({ dbPath, retentionInitialDelayMs: delay })
+    const blobRef = () => s.db.prepare('SELECT blob_ref FROM events WHERE seq=?').get(r.seq).blob_ref
+    if (delay !== 0) {
+      assert.equal(blobRef(), null)
+      t.mock.timers.tick((delay ?? 120000) - 1)
+      assert.equal(blobRef(), null)
+      t.mock.timers.tick(1)
+      // The delayed pass is the async one: it starts on the timer, not
+      // inside it, and finishes after yielding to the loop.
+      for (let i = 0; i < 50 && !blobRef(); i++) await new Promise((resolve) => setImmediate(resolve))
+    }
+    assert.ok(blobRef(), 'the first pass ran at the configured delay')
+    await s.close()
+  }
+  const errors = t.mock.method(console, 'error', () => {})
+  const s = await startTestServer({ retentionInitialDelayMs: 200 })
+  await s.close()
+  t.mock.timers.tick(200)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(errors.mock.callCount(), 0, 'closed server must not run retention against its closed database')
 })

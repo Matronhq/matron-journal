@@ -66,6 +66,7 @@ export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 export const DEFAULT_MEDIA_USER_QUOTA_BYTES = 2147483648 // 2 GiB
 export const DEFAULT_MAX_REPLAY = 50000
 const DEFAULT_RETENTION_DAYS = 30
+const RETENTION_INITIAL_DELAY_MS = 2 * 60 * 1000 // let the reconnect burst after a restart pass first
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
 const DEFAULT_TOOL_LOG_TTL_HOURS = 24
 const DEFAULT_VOICE_NOTE_TTL_DAYS = 7 // audio goes a week after its transcript
@@ -235,7 +236,7 @@ export function resolveReapPcts({ mediaReapHighPct, mediaReapLowPct } = {}) {
 // once, here, at boot. The transfer-expiry pass (runExpireTransfers) runs
 // LAST and unconditionally — see the comment at its call site below.
 // Returns the interval handle (for close()).
-function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, deviceRetention }) {
+function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionIntervalMs, retentionInitialDelayMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, deviceRetention }) {
   const days = resolveRetentionDays(retentionDays)
   const ttlHours = resolveToolLogTtlHours(toolLogTtlHours)
   const voiceDays = resolveVoiceNoteTtlDays(voiceNoteTtlDays)
@@ -314,9 +315,11 @@ function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionInterval
       console.error('retention: transfer expiry run failed', err)
     }
   }
-  // The pass at boot stays synchronous (as before). Timed passes yield
-  // between batches (drainAsync), so the loop serves requests while a pass
-  // runs; the summary line says how long the pass took end to end and how
+  // The first pass waits retentionInitialDelayMs (a restart is when every
+  // client reconnects at once); 0 keeps the synchronous run-at-boot for
+  // programmatic callers and tests. Every pass after boot, the delayed
+  // first one included, yields between batches (drainAsync), so the loop
+  // serves requests while a pass runs; the summary line says how long the pass took end to end and how
   // long its longest uninterrupted stretch was. A pass still running when
   // the next is due is not doubled up. stop() (close) ends a pass in flight
   // at its next yield.
@@ -337,10 +340,17 @@ function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionInterval
       if (ms >= 1000 || longest >= 500) console.log(`retention: run took ${Math.round(ms)}ms, longest blocking stretch ${Math.round(longest)}ms`)
     }
   }
-  drainSync(pass())
+  const initialDelay = retentionInitialDelayMs ?? RETENTION_INITIAL_DELAY_MS
+  let firstTimer = null
+  if (initialDelay > 0) {
+    firstTimer = setTimeout(runAsync, initialDelay)
+    firstTimer.unref()
+  } else {
+    drainSync(pass())
+  }
   const interval = setInterval(runAsync, retentionIntervalMs ?? RETENTION_INTERVAL_MS)
   interval.unref()
-  interval.stop = () => { stopped = true }
+  interval.stop = () => { stopped = true; clearTimeout(firstTimer) }
   return interval
 }
 
@@ -449,7 +459,7 @@ function warnIfBindTrustsSpoofableIp(bind) {
 
 export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, apnsClient, replayBackpressureBytes,
-  retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
+  retentionDays, retentionIntervalMs, retentionInitialDelayMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
   toolLogTtlHours, voiceNoteTtlDays, deviceRetention, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
   // How long an approved spawn waits for a woken target box to attach
   // before issuing `start` (wake-before-spawn). Sized for a cold VM boot:
@@ -758,7 +768,7 @@ export function startServer({
     server.listen(port, bind, () => {
       const startDelay = cancellableDelay(backgroundDelayMs)
       retentionInterval = scheduleRetention(db, {
-        mediaDir: resolvedMediaDir, hub, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays,
+        mediaDir: resolvedMediaDir, hub, retentionDays, retentionIntervalMs, retentionInitialDelayMs, toolLogTtlHours, voiceNoteTtlDays,
         mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes, deviceRetention,
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
