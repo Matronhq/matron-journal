@@ -8,7 +8,7 @@ import { settingsView } from './settings.js'
 import { eventsAfter, scopedEventsAfter, scopedReplayCount, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, agentTargetsFor, CONVO_ID_MAX_CHARS } from './journal.js'
 import { parseRepo, REPO_MAX } from './repo-identity.js'
 import { participantIds, participantConvoIds, joinedAgentIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
-import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
+import { sanitizePeerText, sanitizeConsentText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, inheritedSpawnMission, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, sanitizeBoxDefaults, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem, reconcileConsentItems } from './consent-items.js'
@@ -1502,7 +1502,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           }
           const from = resolveFromConvo()
           if (from.err) return fail(...from.err)
-          const pJustification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
+          const pJustification = sanitizeConsentText(msg.justification, INVITE_TEXT_MAX_CHARS)
           if (!pJustification) return fail('bad_request', 'bad justification')
           // An address: a contact on another journal (src/federation-rooms.js).
           if (msg.target_person.includes('@')) {
@@ -1513,7 +1513,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
               half = fr.parkTalk({
                 ownerUserId: conn.userId, roomId: msg.room_id, ownerDeviceId: conn.deviceId, ownerSender: `agent:${conn.name}`, ownerConvoId: msg.from_convo_id ?? null,
                 person: msg.target_person, session: remoteSession ? msg.target_convo_id : null, missionRef: msg.mission ?? null,
-                topic: sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS), justification: pJustification,
+                topic: sanitizeConsentText(msg.topic, INVITE_TOPIC_MAX_CHARS), justification: pJustification,
               })
             } catch (err) {
               if (err.message === 'not_found' && remoteSession) return fail('not_found', 'that session is not shared with you by this contact any more: check agent_roster')
@@ -1536,7 +1536,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             link = parkTalk(db, {
               ownerUserId: conn.userId, roomId: msg.room_id, ownerDeviceId: conn.deviceId, ownerSender: `agent:${conn.name}`, ownerConvoId: msg.from_convo_id ?? null,
               person: msg.target_person, missionRef: msg.mission ?? null,
-              topic: sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS), justification: pJustification,
+              topic: sanitizeConsentText(msg.topic, INVITE_TOPIC_MAX_CHARS), justification: pJustification,
             })
           } catch (err) {
             if (err.message === 'not_found') return fail('not_found')
@@ -1573,8 +1573,8 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           }
           const from = resolveFromConvo()
           if (from.err) return fail(...from.err)
-          const pTopic = sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS)
-          const pJustification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
+          const pTopic = sanitizeConsentText(msg.topic, INVITE_TOPIC_MAX_CHARS)
+          const pJustification = sanitizeConsentText(msg.justification, INVITE_TEXT_MAX_CHARS)
           if (!pJustification) return fail('bad_request', 'bad justification')
           let link
           try {
@@ -1635,8 +1635,8 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const from = resolveFromConvo()
         if (from.err) return fail(...from.err)
         const fromConvoTitle = from.title
-        const topic = sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS)
-        const justification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
+        const topic = sanitizeConsentText(msg.topic, INVITE_TOPIC_MAX_CHARS)
+        const justification = sanitizeConsentText(msg.justification, INVITE_TEXT_MAX_CHARS)
         // The raw-string check above only catches a literally empty string —
         // a payload of spaces/control chars passes it and THEN sanitises
         // down to '', which would park/relay an invite with an empty
@@ -1710,7 +1710,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (room.agent_device_id == null) return fail('conflict', 'room has no recorded owner to ask')
         if (room.agent_device_id === conn.deviceId) return fail('bad_request', 'cannot join own room')
         if (personLinked(msg.room_id)) return fail('conflict', 'a room with another person holds just the two agents')
-        const justification = sanitizePeerText(msg.justification, INVITE_TEXT_MAX_CHARS)
+        const justification = sanitizeConsentText(msg.justification, INVITE_TEXT_MAX_CHARS)
         // See agent_invite's matching check: the raw-string check above only
         // catches a literally empty string, not whitespace/control chars
         // that sanitise down to ''.
