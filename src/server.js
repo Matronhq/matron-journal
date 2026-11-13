@@ -18,6 +18,7 @@ import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline, BACKGROUND_WAKE_MS } from './push.js'
 import { resolveMediaDir } from './media.js'
 import { offloadPass, expireLogsPass, runReapMedia, runExpireVoiceNotes, runExpireDeviceContent, runExpireTransfers, drainSync, drainAsync } from './retention.js'
+import { startStallLog, timed, logSlowRequests } from './stall-log.js'
 import { backfillSearchIndex, backfillIsDiff } from './search.js'
 import { loadEmbedder } from './embedder.js'
 import { ensureVectorSchema, runVectorIndexer, createVectorStore } from './vector-index.js'
@@ -358,7 +359,7 @@ const WAL_CHECKPOINT_INTERVAL_MS = 1000
 function scheduleWalCheckpoint(db, walCheckpointIntervalMs) {
   const run = () => {
     try {
-      db.pragma('wal_checkpoint(PASSIVE)')
+      timed('wal_checkpoint(PASSIVE)', () => db.pragma('wal_checkpoint(PASSIVE)'))
     } catch (err) {
       // A failed passive pass is retried by the next tick; log once per tick
       // rather than crash — the DB itself is still healthy (busy/locked are
@@ -381,7 +382,7 @@ function scheduleTtsSweep(tts, ttsSweepIntervalMs) {
   if (!tts) return null
   const run = () => {
     try {
-      const r = tts.sweep()
+      const r = timed('tts sweep', () => tts.sweep())
       if (r.removed > 0) console.log(`tts: removed ${r.removed} cached clip(s) older than 24h`)
     } catch (err) {
       console.error('tts: cache sweep failed', err)
@@ -716,7 +717,7 @@ export function startServer({
   let semanticTimer = null
   let indexingNow = false
   let semanticInFlight = Promise.resolve()
-  const server = http.createServer(makeHttpHandler({
+  const server = http.createServer(logSlowRequests(makeHttpHandler({
     db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     // transferChunkBytes: tests only (small chunks); production uses TRANSFER_CHUNK_BYTES.
@@ -726,7 +727,7 @@ export function startServer({
     agentCommentLimiter: makeAgentCommentLimiter({ now: agentCommentClock }),
     github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, federationGrants, federationContribute, federationMedia, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
-  }))
+  })))
   // A reverse proxy in front of the journal keeps its connections to it open
   // and reuses them. Node closes an idle connection after 5 s by default,
   // well before a proxy gives it up, so a request the proxy sent down a
@@ -750,6 +751,7 @@ export function startServer({
   })
   let retentionInterval = null
   let walCheckpointInterval = null
+  let stallLog = null
   let receiptPruneInterval = null
   let githubRefreshInterval = null
   let ttsSweepInterval = null
@@ -762,6 +764,7 @@ export function startServer({
         mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes, deviceRetention,
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
+      stallLog = startStallLog()
       // Federation receipts are the replay memory for 30 days, then go.
       // What the outbox sent or cancelled goes a week after it ended, with
       // federation on or off (its bodies hold snapshot pages and invite
@@ -898,6 +901,7 @@ export function startServer({
           startDelay.cancel()
           if (retentionInterval) { clearInterval(retentionInterval); retentionInterval.stop() }
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
+          if (stallLog) stallLog.stop()
           if (receiptPruneInterval) clearInterval(receiptPruneInterval)
           // A delivery pass in flight finishes (its requests time out at
           // 30 s) before the db handle closes.

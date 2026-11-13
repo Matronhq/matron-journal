@@ -89,6 +89,7 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_DB` | `./matron.db` | Path to the SQLite database file |
 | `MATRON_PORT` | `9810` | Listen port |
 | `MATRON_BIND` | `127.0.0.1` | Bind address (put a TLS-terminating proxy in front for `wss://`) |
+| `MATRON_STALL_LOG` | on | Set to `0` to turn off the diagnostics that log event-loop stalls (`stall: …`), requests slower than 500 ms (`slow request: …`) and slow maintenance passes. The work itself is unaffected |
 | `MATRON_GITHUB_CLIENT_ID` | Matron's published OAuth App id (`Ov23likaFmqoegaDMTtz`) | GitHub OAuth App client id for account linking (device flow works with the id alone). Set to the empty string to disable linking; set your own app's id, with its secret, for the web flow |
 | `MATRON_GITHUB_CLIENT_SECRET` | unset | Client secret of an OAuth App registered for this journal (callback `https://<journal>/github/callback`). Enables the one-click web flow |
 | `MATRON_GITHUB_DEVICE_FLOW` | on | Set to `0` to turn off the device flow (code entered on GitHub's site). It is always off when a client secret is set, so a journal with the web flow offers only that |

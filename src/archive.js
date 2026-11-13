@@ -13,6 +13,7 @@
 // `since` (GET /archive?since=, hello `archive_since`) instead of
 // downloading every archived id on each connect.
 import { MESSAGE_TYPES_SQL } from './message-types.js'
+import { timed } from './stall-log.js'
 
 export const ARCHIVE_BATCH_MAX = 500
 export const AUTO_ARCHIVE_DEFAULT_DAYS = 30
@@ -152,7 +153,7 @@ export function startAutoArchiveSweep({ db, hub, intervalMs = AUTO_ARCHIVE_INTER
     }
   }
   if (!enabled) return { stop() {}, run }
-  const t = setInterval(run, intervalMs)
+  const t = setInterval(() => timed('auto-archive sweep', run), intervalMs)
   t.unref()
   return { stop() { clearInterval(t) }, run }
 }
