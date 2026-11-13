@@ -31,7 +31,7 @@ import { inlineRefsToText, knowsInlineRefs, strayInlineRef } from './inline-refs
 import { presentWithdrawn } from './withdrawn-comments.js'
 import { handleHandoverRoute, approvalQuestionOf, handleApprovalTap, withdrawOnClose } from './item-handover-http.js'
 import { getReplicaItem, getReplicaMission } from './federation-replica.js'
-import { requireApproval } from './approval-keys.js'
+import { requireApproval, hasActiveKey } from './approval-keys.js'
 import { promptDigest } from './approvals.js'
 
 const forbiddenReply = (res) => { json(res, 403, { error: 'forbidden' }); return true }
@@ -624,11 +624,15 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
 // question's words as they stand (the item's title and body, or that
 // comment's body) and the subject: a step-up comment's own, else the item's,
 // else {}. A refusal throws, so nothing is written; `refusal` is the answer
-// to send.
+// to send. The journal's handover question (handleApprovalTap) is answered
+// through the same check.
 const storedSubject = (s) => { try { return s == null ? {} : (JSON.parse(s) ?? {}) } catch { return {} } }
 function tapApprover(ctx, who, approval, action) {
   return ({ row, asked }) => {
     if (!row.step_up && !asked?.step_up && approval == null) return null
+    // Decided once more inside requireApproval; asked first here so that
+    // nothing below can fail a keyless account's tap.
+    if (!hasActiveKey(ctx.db, who.userId)) return null
     const subject = storedSubject(asked?.step_up ? asked.subject : row.subject)
     const prompt_digest = asked ? promptDigest({ body: asked.body ?? '' }) : promptDigest({ title: row.title, body: row.body ?? '' })
     const r = requireApproval({ db: ctx.db, journalHost: ctx.journalHost }, who, { approval }, {
@@ -713,7 +717,9 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       // The journal's own "Hand this item over?" question (item handover):
       // its tap is the journal's to act on, not a turn for the owner.
       const handoverId = approvalQuestionOf(db, item.id, replyTo)
-      if (handoverId) return handleApprovalTap(ctx, res, who, item, { handoverId, action, replyTo, idemKey })
+      // Its buttons are the item's too: on a step-up item the tap is signed
+      // like any other (tapApprover).
+      if (handoverId) return handleApprovalTap(ctx, res, who, item, { handoverId, action, replyTo, idemKey, approve: tapApprover(ctx, who, body.approval, action) })
     }
     // `replaces`: the id of the user's own withdrawn reply this one is the
     // edited version of (addComment decides whether it counts). A client's

@@ -6,7 +6,9 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createAgent, createUser } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
-import { startWithKey, startApprovalServer, signTap, signIn } from './approval-helpers.js'
+import { setDeviceConsentUserOnly } from '../src/db.js'
+import { setCoordinatorConvoId } from '../src/coordinator.js'
+import { startWithKey, startApprovalServer, signTap, signIn, enrolKeyByPassword, totpCode, TEST_PASSWORD } from './approval-helpers.js'
 
 async function world(t, withKey = true) {
   const base = await (withKey ? startWithKey(t) : startApprovalServer(t))
@@ -287,4 +289,88 @@ test('the owner\'s signed tap on a contributor\'s item reaches the contributor w
   // alice's own marker does say signed.
   const mine = JSON.parse(w.s.db.prepare("SELECT payload FROM events WHERE type='item' AND convo_id=? AND user_id=? ORDER BY seq DESC LIMIT 1").get(item.origin_convo_id, w.alice.id).payload)
   assert.equal(mine.comment.signed, true)
+})
+
+test('a signature for follow-up A sent on follow-up B is a mismatch', async (t) => {
+  const w = await world(t)
+  const item = await w.file({ step_up: true })
+  const ask = (body) => w.agent(`/items/${item.id}/comments`, { method: 'POST', body: { body, actions: ['Yes', 'No'] } })
+  const a = (await ask('Restart the database?')).json.comment
+  const b = (await ask('Restart the cache?')).json.comment
+  const forA = await signTap(w.s, { token: w.token, key: w.key, item, comment: a, action: 'Yes' })
+  const before = w.count()
+  invalid(await w.tap(item, { action: 'Yes', reply_to: b.id, approval: forA }), 'mismatch')
+  assert.equal(w.count(), before)
+  assert.equal((await w.tap(item, { action: 'Yes', reply_to: a.id, approval: forA })).status, 201)
+})
+
+test('a tap signed with a since-revoked key is revoked_key', async (t) => {
+  const w = await world(t)
+  const item = await w.file({ step_up: true })
+  const approval = await signTap(w.s, { token: w.token, key: w.key, item, action: 'Approve' })
+  // Another key stays live, so the account still has one.
+  const laptop = signIn(w.s, w.alice.id, 'laptop')
+  await enrolKeyByPassword(w.s, { token: laptop.token, userId: w.alice.id, secret: w.secret, name: 'laptop' })
+  const rv = await w.s.http(`/approval-keys/${w.key.keyId}/revoke`, { method: 'POST', token: w.token, body: { password: TEST_PASSWORD, code: totpCode(w.s, w.alice.id, w.secret) } })
+  assert.equal(rv.status, 200, JSON.stringify(rv.json))
+  const before = w.count()
+  invalid(await w.tap(item, { action: 'Approve', approval }), 'revoked_key')
+  assert.equal(w.count(), before)
+})
+
+// The digest covers the item's title and body only; the label is checked
+// against the item's current actions. So a signature for a label the item
+// still offers stands when the other buttons change around it.
+test('label kept, other actions changed: the signed tap still counts', async (t) => {
+  const w = await world(t)
+  const item = await w.file({ step_up: true })
+  const approval = await signTap(w.s, { token: w.token, key: w.key, item, action: 'Approve' })
+  assert.equal((await w.agent(`/items/${item.id}`, { method: 'PATCH', body: { actions: ['Approve', 'Later'] } })).status, 200)
+  const r = await w.tap(item, { action: 'Approve', approval })
+  assert.equal(r.status, 201, JSON.stringify(r.json))
+})
+
+// The journal's own "Hand this item over?" question: a Coordinator's offer
+// of an item on a user-only box waits for the user's tap.
+async function handoverAsk(w, itemExtra) {
+  setDeviceConsentUserOnly(w.s.db, w.box.deviceId, true)
+  const boxB = createAgent(w.s.db, w.alice.id, 'box-b')
+  const coord = createAgent(w.s.db, w.alice.id, 'box-k')
+  upsertConversation(w.s.db, { id: 'b1', ownerUserId: w.alice.id, title: 'Beta', agentDeviceId: boxB.deviceId })
+  upsertConversation(w.s.db, { id: 'k1', ownerUserId: w.alice.id, title: 'Coordinator', agentDeviceId: coord.deviceId })
+  setCoordinatorConvoId(w.s.db, w.alice.id, 'k1')
+  const item = await w.file(itemExtra)
+  const off = await w.s.http(`/items/${item.num}/handover`, { method: 'POST', token: coord.token, body: { to_convo_id: 'b1', as_convo_id: 'k1' } })
+  assert.equal(off.json.handover?.state, 'awaiting_user', JSON.stringify(off.json))
+  const thread = await w.user(`/items/${item.num}`)
+  const q = thread.json.comments.find((c) => c.meta?.role === 'handover_approval')
+  assert.ok(q)
+  const state = () => w.s.db.prepare('SELECT state FROM item_handovers WHERE item_id=? ORDER BY rowid DESC LIMIT 1').get(item.id)?.state
+  return { item: thread.json.item, q, state }
+}
+
+test('the handover question on a step-up item needs a signature; unsigned settles nothing', async (t) => {
+  const w = await world(t)
+  const { item, q, state } = await handoverAsk(w, { step_up: true, subject: SUBJECT })
+  const before = w.count()
+  const r0 = await w.tap(item, { action: 'Hand over', reply_to: q.id })
+  assert.deepEqual([r0.status, r0.json], [403, { error: 'approval_required' }])
+  invalid(await w.tap(item, { action: 'Keep it here', reply_to: q.id, approval: await signTap(w.s, { token: w.token, key: w.key, item, comment: q, action: 'Hand over' }) }), 'mismatch')
+  assert.equal(w.count(), before)
+  assert.equal(state(), 'awaiting_user')
+  const approval = await signTap(w.s, { token: w.token, key: w.key, item, comment: q, action: 'Hand over' })
+  assert.deepEqual(JSON.parse(approval.statement).subject, SUBJECT)
+  const r = await w.tap(item, { action: 'Hand over', reply_to: q.id, approval })
+  assert.equal(r.status, 201, JSON.stringify(r.json))
+  assert.deepEqual(r.json.comment.approval, approval)
+  assert.equal(state(), 'offered')
+})
+
+test('the handover question on an unmarked item is tapped as before', async (t) => {
+  const w = await world(t)
+  const { item, q, state } = await handoverAsk(w)
+  const r = await w.tap(item, { action: 'Hand over', reply_to: q.id })
+  assert.equal(r.status, 201, JSON.stringify(r.json))
+  assert.equal(r.json.comment.approval, null)
+  assert.equal(state(), 'offered')
 })
