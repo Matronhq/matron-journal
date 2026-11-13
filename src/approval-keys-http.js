@@ -1,0 +1,242 @@
+// Approval-key routes (src/approval-keys.js, src/approvals.js).
+//
+// Any token (a box may read the public keys, but verifies against the keys
+// pinned on it, never these):
+//   GET  /approval-keys                        → {enabled, keys, requests}
+//
+// Bearer, client devices only:
+//   POST /approvals/nonce                      → {nonce, expires_at}
+//   POST /approval-keys {public_key, name, password, code}
+//        The bootstrap, and the fallback when no enrolled device is left:
+//        password and a TOTP code (never a recovery code) enrol the
+//        calling device's key.
+//   POST /approval-keys/requests {public_key, name}            → {id}
+//   POST /approval-keys/requests/:id/approve {approval}
+//        An enrolled device signs {op:'enrol_key', key_id} for a new
+//        device's key.
+//   POST /approval-keys/:key_id/revoke {approval} | {password, code}
+//        Signed {op:'revoke_key', key_id}, or password and TOTP.
+//   POST /approval-keys/attach {approval}
+//        After a new sign-in: the key signs {op:'attach_key', key_id} for
+//        itself and moves to the calling device.
+//
+// Everything but the revoke needs the journal's public URL (`enabled`);
+// a revoke by password works without it, so an account is never stuck
+// with keys it cannot use.
+import crypto from 'node:crypto'
+import { json, readBody } from './http-body.js'
+import { keyIdOf, parseStatement } from './approvals.js'
+import { ALG, KEY_REQUEST_TTL_MS, checkApproval, activeKeyFor, issueNonce } from './approval-keys.js'
+import { confirmIdentity } from './two-factor-http.js'
+import { isTwoFactorEnabled, classifyCode } from './two-factor.js'
+import { fileNotice } from './sharing-events.js'
+import { sanitizePeerText, plainText } from './peer-text.js'
+
+// A key's name is a label in the apps, like a device name (http.js).
+const KEY_NAME_MAX = 40
+
+const keyView = (r) => ({
+  key_id: r.key_id, public_key: r.public_key, alg: r.alg, name: r.name, device_id: r.device_id,
+  enrolled_via: r.enrolled_via, created_at: r.created_at, revoked_at: r.revoked_at,
+})
+
+const keyRow = (db, keyId) => db.prepare('SELECT * FROM approval_keys WHERE key_id=?').get(keyId)
+
+// A key added to or removed from the account: a notice in the user's For
+// you list, pushed to every device. Once per key and direction.
+export function announceKey(ctx, userId, key, { added, how }) {
+  const verb = added ? 'added' : 'removed'
+  const short = key.key_id.slice(0, 8)
+  fileNotice(ctx, {
+    userId,
+    title: `Approval key ${verb}: ${key.name} ${short}`,
+    body: `The approval key **${plainText(key.name)}** (fingerprint \`${short}\`) was ${verb} ${how}.`
+      + (added ? ' It can now approve dangerous actions for your account. If this was not you, remove it and change your password.' : ''),
+    idemKey: `approval-key:${verb}:${key.key_id}`,
+    push: true,
+  })
+}
+
+const BY_PASSWORD = 'with your password and a two-factor code'
+
+// {publicKey, keyId} for a well-formed key (stored in canonical base64url),
+// or null with a 400 sent.
+function readPublicKey(res, raw) {
+  let keyId
+  try { keyId = keyIdOf(raw) } catch { json(res, 400, { error: 'bad_public_key' }); return null }
+  return { publicKey: Buffer.from(raw, 'base64url').toString('base64url'), keyId }
+}
+
+function readName(res, raw) {
+  const name = typeof raw === 'string' ? sanitizePeerText(raw, KEY_NAME_MAX + 1) : ''
+  if (!name || name.length > KEY_NAME_MAX) { json(res, 400, { error: 'bad_request' }); return null }
+  return name
+}
+
+// The password-and-TOTP path (bootstrap enrolment, revoke). Two-factor must
+// be on and the code a TOTP code: a recovery code does not count, and is
+// refused before it could be spent. Wrong passwords and codes count against
+// the username's lockout (two-factor-http.js confirmIdentity).
+async function confirmPasswordAndTotp(ctx, res, who, { password, code }) {
+  if (!isTwoFactorEnabled(ctx.db, who.userId)) { json(res, 409, { error: 'two_factor_required' }); return false }
+  if (classifyCode(code)?.kind === 'recovery') { json(res, 400, { error: 'totp_required' }); return false }
+  return confirmIdentity(ctx, res, who, { password, code, needCode: true })
+}
+
+const keyExists = (res) => { json(res, 409, { error: 'key_exists' }); return true }
+const disabled = (res) => { json(res, 409, { error: 'approval_keys_disabled' }); return true }
+const notFound = (res) => { json(res, 404, { error: 'not_found' }); return true }
+const send = (res, r) => { json(res, r.status, r.body); return true }
+
+const liveRequest = (db, userId, id, now) => db.prepare('SELECT * FROM approval_key_requests WHERE id=? AND user_id=? AND created_at > ?')
+  .get(id, userId, now - KEY_REQUEST_TTL_MS)
+
+export async function handleApprovalKeysRoute(ctx, req, res, url, who) {
+  const { db, journalHost } = ctx
+  const path = url.pathname
+  if (path !== '/approval-keys' && !path.startsWith('/approval-keys/') && path !== '/approvals/nonce') return false
+  const enabled = !!journalHost
+
+  if (path === '/approval-keys' && req.method === 'GET') {
+    const keys = db.prepare('SELECT * FROM approval_keys WHERE user_id=? ORDER BY id').all(who.userId).map(keyView)
+    const requests = db.prepare('SELECT id, public_key, name, created_at FROM approval_key_requests WHERE user_id=? AND created_at > ? ORDER BY created_at, id')
+      .all(who.userId, Date.now() - KEY_REQUEST_TTL_MS)
+      .map((r) => ({ id: r.id, key_id: keyIdOf(r.public_key), name: r.name, created_at: r.created_at }))
+    json(res, 200, { enabled, keys, requests })
+    return true
+  }
+
+  if (who.kind !== 'client') { json(res, 403, { error: 'forbidden' }); return true }
+  if (req.method !== 'POST') return notFound(res)
+
+  if (path === '/approvals/nonce') {
+    if (!enabled) return disabled(res)
+    json(res, 200, issueNonce(db, who))
+    return true
+  }
+
+  if (path === '/approval-keys') {
+    const { public_key, name, password, code } = await readBody(req)
+    if (!enabled) return disabled(res)
+    const pk = readPublicKey(res, public_key)
+    if (!pk) return true
+    const keyName = readName(res, name)
+    if (!keyName) return true
+    if (keyRow(db, pk.keyId)) return keyExists(res)
+    if (!(await confirmPasswordAndTotp(ctx, res, who, { password, code }))) return true
+    // The password check awaited: the calling device may have been signed
+    // out meanwhile (its row deleted, its id free to be handed out again),
+    // and a key must not be attached to an id that is gone.
+    let row
+    try {
+      const added = db.prepare(`INSERT INTO approval_keys(user_id, key_id, public_key, alg, name, device_id, enrolled_via, enrolled_by, created_at)
+        SELECT ?,?,?,?,?,?,'password',NULL,? WHERE EXISTS (SELECT 1 FROM devices WHERE id=? AND user_id=?)`)
+        .run(who.userId, pk.keyId, pk.publicKey, ALG, keyName, who.deviceId, Date.now(), who.deviceId, who.userId).changes
+      if (!added) { json(res, 401, { error: 'unauthenticated' }); return true }
+      row = keyRow(db, pk.keyId)
+    } catch (err) {
+      // Enrolled meanwhile, while the password was being checked.
+      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') return keyExists(res)
+      throw err
+    }
+    announceKey(ctx, who.userId, row, { added: true, how: BY_PASSWORD })
+    json(res, 200, { key: keyView(row) })
+    return true
+  }
+
+  if (path === '/approval-keys/requests') {
+    const { public_key, name } = await readBody(req)
+    if (!enabled) return disabled(res)
+    const pk = readPublicKey(res, public_key)
+    if (!pk) return true
+    const keyName = readName(res, name)
+    if (!keyName) return true
+    if (keyRow(db, pk.keyId)) return keyExists(res)
+    const now = Date.now()
+    const id = `kr_${crypto.randomBytes(12).toString('hex')}`
+    db.transaction(() => {
+      db.prepare('DELETE FROM approval_key_requests WHERE created_at <= ?').run(now - KEY_REQUEST_TTL_MS)
+      db.prepare('INSERT INTO approval_key_requests(id, user_id, device_id, public_key, name, created_at) VALUES(?,?,?,?,?,?)')
+        .run(id, who.userId, who.deviceId, pk.publicKey, keyName, now)
+    })()
+    json(res, 200, { id })
+    return true
+  }
+
+  const approve = path.match(/^\/approval-keys\/requests\/([^/]+)\/approve$/)
+  if (approve) {
+    const { approval } = await readBody(req)
+    if (!enabled) return disabled(res)
+    // One transaction: the request, the signature check (which spends the
+    // nonce) and the new key stand or fall together.
+    const out = db.transaction(() => {
+      const now = Date.now()
+      const rq = liveRequest(db, who.userId, approve[1], now)
+      if (!rq) return { ok: false, status: 404, body: { error: 'not_found' } }
+      const keyId = keyIdOf(rq.public_key)
+      if (keyRow(db, keyId)) return { ok: false, status: 409, body: { error: 'key_exists' } }
+      const r = checkApproval({ db, journalHost, now }, who, approval, { type: 'account', subject: { op: 'enrol_key', key_id: keyId } })
+      if (!r.ok) return r
+      db.prepare(`INSERT INTO approval_keys(user_id, key_id, public_key, alg, name, device_id, enrolled_via, enrolled_by, created_at)
+        VALUES(?,?,?,?,?,?,'device',?,?)`).run(who.userId, keyId, rq.public_key, ALG, rq.name, rq.device_id, r.keyId, now)
+      db.prepare('DELETE FROM approval_key_requests WHERE id=?').run(rq.id)
+      return { ok: true, row: keyRow(db, keyId), signer: r.keyId }
+    })()
+    if (!out.ok) return send(res, out)
+    announceKey(ctx, who.userId, out.row, { added: true, how: `approved with the key \`${out.signer.slice(0, 8)}\`` })
+    json(res, 200, { key: keyView(out.row) })
+    return true
+  }
+
+  if (path === '/approval-keys/attach') {
+    const { approval } = await readBody(req)
+    if (!enabled) return disabled(res)
+    // The key being attached is the one that signed: the subject must name
+    // the signer. Whose device it was on does not matter here (anyDevice),
+    // only that the caller holds the key.
+    const signer = parseStatement(approval?.statement)?.key_id
+    const out = db.transaction(() => {
+      const r = checkApproval({ db, journalHost }, who, approval, { type: 'account', subject: { op: 'attach_key', key_id: signer } }, { anyDevice: true })
+      if (!r.ok) return r
+      db.prepare('UPDATE approval_keys SET device_id=? WHERE key_id=? AND revoked_at IS NULL').run(who.deviceId, r.keyId)
+      return { ok: true, row: keyRow(db, r.keyId) }
+    })()
+    if (!out.ok) return send(res, out)
+    json(res, 200, { key: keyView(out.row) })
+    return true
+  }
+
+  const revoke = path.match(/^\/approval-keys\/([0-9a-f]{64})\/revoke$/)
+  if (revoke) {
+    const keyId = revoke[1]
+    const { approval, password, code } = await readBody(req)
+    if (!activeKeyFor(db, who.userId, keyId)) return notFound(res)
+    const revokeNow = () => db.prepare('UPDATE approval_keys SET revoked_at=? WHERE user_id=? AND key_id=? AND revoked_at IS NULL')
+      .run(Date.now(), who.userId, keyId).changes > 0
+    let how
+    if (approval !== undefined) {
+      // The check and the revoke in one transaction: an account whose last
+      // key this is goes back to "no key" only once the revoke commits.
+      const out = db.transaction(() => {
+        const r = checkApproval({ db, journalHost }, who, approval, { type: 'account', subject: { op: 'revoke_key', key_id: keyId } })
+        if (!r.ok) return r
+        return revokeNow() ? { ok: true, signer: r.keyId } : { ok: false, status: 404, body: { error: 'not_found' } }
+      })()
+      if (!out.ok) return send(res, out)
+      how = `with a signature from the key \`${out.signer.slice(0, 8)}\``
+    } else if (password !== undefined || code !== undefined) {
+      if (!(await confirmPasswordAndTotp(ctx, res, who, { password, code }))) return true
+      if (!revokeNow()) return notFound(res)
+      how = BY_PASSWORD
+    } else {
+      json(res, 403, { error: 'approval_required' })
+      return true
+    }
+    const row = keyRow(db, keyId)
+    announceKey(ctx, who.userId, row, { added: false, how })
+    json(res, 200, { key: keyView(row) })
+    return true
+  }
+
+  return notFound(res)
+}

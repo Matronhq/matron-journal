@@ -142,7 +142,7 @@ function guardAllows(loginGuard, res, username) {
 // Password (and, when two-factor is on, a code) before a security change.
 // Wrong guesses count against the username's lockout like a sign-in, so a
 // stolen token cannot be used to grind the password here.
-async function confirmIdentity(ctx, res, who, { password, code, needCode }) {
+export async function confirmIdentity(ctx, res, who, { password, code, needCode }) {
   const { db, tokenBox, loginGuard } = ctx
   const user = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId)
   if (!guardAllows(loginGuard, res, user.name)) return false

@@ -131,15 +131,30 @@ export function authToken(db, token) {
   return { deviceId: row.id, userId: row.user_id, kind: row.kind, name: row.name }
 }
 
+// Revoking a device revokes its approval keys (src/approval-keys.js) in the
+// same transaction. Only these two explicit revokes do: a password change or
+// reset deletes device rows too, but there the key stays enrolled, detached
+// (db.js devices_approval_detach), for the app to re-attach after signing in.
+const revokeDeviceKeys = (db, deviceId) =>
+  db.prepare('UPDATE approval_keys SET revoked_at=? WHERE device_id=? AND revoked_at IS NULL').run(Date.now(), deviceId)
+
 export function revokeDevice(db, deviceId) {
-  db.prepare('DELETE FROM devices WHERE id=?').run(deviceId)
+  db.transaction(() => {
+    revokeDeviceKeys(db, deviceId)
+    db.prepare('DELETE FROM devices WHERE id=?').run(deviceId)
+  })()
 }
 
-// Owner-scoped revocation for POST /devices/:id/revoke. One atomic DELETE
-// (no TOCTOU window): the WHERE clause is the ownership check, and the
-// boolean lets the handler 404 nonexistent and not-owned identically.
+// Owner-scoped revocation for POST /devices/:id/revoke. One transaction (no
+// TOCTOU window): the ownership check, the keys, the row. The boolean lets
+// the handler 404 nonexistent and not-owned identically.
 export function revokeOwnedDevice(db, userId, deviceId) {
-  return db.prepare('DELETE FROM devices WHERE id=? AND user_id=?').run(deviceId, userId).changes > 0
+  return db.transaction(() => {
+    if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(deviceId, userId)) return false
+    revokeDeviceKeys(db, deviceId)
+    db.prepare('DELETE FROM devices WHERE id=?').run(deviceId)
+    return true
+  })()
 }
 
 // Cosmetic rename, owner-scoped like revokeOwnedDevice. Returns false when

@@ -1205,6 +1205,61 @@ export function openDb(path) {
   if (!deviceCols.some((c) => c.name === 'consent_user_only')) {
     db.exec('ALTER TABLE devices ADD COLUMN consent_user_only INTEGER NOT NULL DEFAULT 0')
   }
+  // Approval keys (src/approval-keys.js): a P-256 key per client device
+  // that signs statements for dangerous actions. A key belongs to the
+  // account, not the sign-in: only an explicit revoke (revoked_at) ends it.
+  // device_id is the client device that may sign with it; NULL while it is
+  // attached to none. enrolled_via 'password' (password and TOTP) or
+  // 'device' (approved by enrolled_by, the key_id that signed for it).
+  // approval_nonces are single use (used_at) for five minutes;
+  // approval_key_requests are a new device's asks, ten minutes each.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS approval_keys(
+      id           INTEGER PRIMARY KEY,
+      user_id      INTEGER NOT NULL REFERENCES users(id),
+      key_id       TEXT NOT NULL UNIQUE,
+      public_key   TEXT NOT NULL,
+      alg          TEXT NOT NULL,
+      name         TEXT NOT NULL,
+      device_id    INTEGER,
+      enrolled_via TEXT NOT NULL,
+      enrolled_by  TEXT,
+      created_at   INTEGER NOT NULL,
+      revoked_at   INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_approval_keys_user ON approval_keys(user_id, revoked_at);
+    CREATE INDEX IF NOT EXISTS idx_approval_keys_device ON approval_keys(device_id);
+    CREATE TABLE IF NOT EXISTS approval_nonces(
+      nonce      TEXT PRIMARY KEY,
+      user_id    INTEGER NOT NULL,
+      device_id  INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      used_at    INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_approval_nonces_created ON approval_nonces(created_at);
+    CREATE TABLE IF NOT EXISTS approval_key_requests(
+      id         TEXT PRIMARY KEY,
+      user_id    INTEGER NOT NULL,
+      device_id  INTEGER NOT NULL,
+      public_key TEXT NOT NULL,
+      name       TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_approval_key_requests_user ON approval_key_requests(user_id, created_at);
+  `)
+  // Whatever deletes a device row (a revoke, a password change or reset
+  // signing the others out) takes its nonces and key requests with it, and
+  // leaves its live keys attached to no device: device ids can be handed out
+  // again (auth.js issueDevice), and a key must never follow an id to a new
+  // sign-in. The key itself stays enrolled until the app re-attaches it
+  // (POST /approval-keys/attach); an explicit revoke (auth.js) revokes it
+  // before the row goes.
+  db.exec(`CREATE TRIGGER IF NOT EXISTS devices_approval_detach AFTER DELETE ON devices
+    BEGIN
+      UPDATE approval_keys SET device_id = NULL WHERE device_id = OLD.id AND revoked_at IS NULL;
+      DELETE FROM approval_nonces WHERE device_id = OLD.id;
+      DELETE FROM approval_key_requests WHERE device_id = OLD.id;
+    END`)
   // An APNs token names a physical app install, so at most one device row may
   // hold it. Re-pairing creates a NEW device row, and until setApnsRegistration
   // learned to claim the token, every superseded row kept it: on one deployment one Mac

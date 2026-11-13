@@ -38,7 +38,7 @@ import { makeOutbox, pruneOutbox } from './federation-outbox.js'
 import { makeConfiguredFederationClient } from './federation-client.js'
 import { makeWaker, markWakeRefused, clearWakeRefused } from './wake.js'
 import { makeConfiguredTranscriber } from './cloud-transcribe.js'
-import { makeConfiguredMailer } from './mailer.js'
+import { makeConfiguredMailer, parsePublicUrl } from './mailer.js'
 import { makeConfiguredSummariser } from './summarise.js'
 import { makeBlobTranscripts } from './blob-transcripts.js'
 import { makeConfiguredTts, resolveTtsCacheDir } from './cloud-tts.js'
@@ -460,6 +460,11 @@ export function startServer({
   // seam, {federation, publicUrl}; env (MATRON_FEDERATION,
   // MATRON_PUBLIC_URL) otherwise. Off unless turned on.
   federationEnv, federationOps, federationClient, federationLimits,
+  // The journal's public URL for approval keys (src/approval-keys.js): a
+  // signed statement names its host, so without one they are off. The
+  // option is the test seam (`null` forces it off); MATRON_PUBLIC_URL
+  // otherwise.
+  publicUrl,
   // Alertmanager webhook (src/alerts-http.js): {token, username}. The
   // option is the test seam; env otherwise. Off unless both are usable.
   alertWebhook,
@@ -672,6 +677,8 @@ export function startServer({
   if (resolvedAlertWebhook) warnAlertWebhookConfig(db, resolvedAlertWebhook)
   const resolvedSummariser = summariser !== undefined ? summariser : makeConfiguredSummariser()
   const resolvedMailer = mailer !== undefined ? mailer : makeConfiguredMailer()
+  const approvalBaseUrl = parsePublicUrl(publicUrl !== undefined ? publicUrl : process.env.MATRON_PUBLIC_URL)
+  const journalHost = approvalBaseUrl ? new URL(approvalBaseUrl).host.toLowerCase() : null
   // Unified search's similar tier (spec 2026-10-12 §5). `semantic.store`/
   // `.embedder` start null — /search/all answers `semantic: 'off'` until
   // (if ever) the embedder loads and the first index pass finishes, below.
@@ -694,6 +701,7 @@ export function startServer({
     agentCommentLimiter: makeAgentCommentLimiter({ now: agentCommentClock }),
     github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, federationGrants, federationContribute, federationMedia, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
+    journalHost,
   }))
   // A reverse proxy in front of the journal keeps its connections to it open
   // and reuses them. Node closes an idle connection after 5 s by default,
