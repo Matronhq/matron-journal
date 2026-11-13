@@ -34,17 +34,32 @@ export async function setPassword(db, name, password) {
 // awaits leave room for another device to change the password (and sign
 // this one out) first, and a stale check must not then overwrite it.
 // { ok:false, revoked:true } means the caller was signed out meanwhile.
+//
+// In two halves for a caller that must check more in the write's own
+// transaction (POST /password's approval-key guard): the async
+// preparePasswordChange (verify and hash; null on a bad old password) and
+// the synchronous applyPasswordChange (the transaction, which nests inside
+// the caller's).
 export async function changePassword(db, userId, { oldPassword, newPassword, deviceId, signOutOthers = false }) {
+  const prepared = await preparePasswordChange(db, userId, { oldPassword, newPassword })
+  if (!prepared) return { ok: false }
+  return applyPasswordChange(db, userId, prepared, { deviceId, signOutOthers })
+}
+
+export async function preparePasswordChange(db, userId, { oldPassword, newPassword }) {
   const user = db.prepare('SELECT password_hash FROM users WHERE id=?').get(userId)
   // Defensive only: Bearer auth (authToken) already guarantees a devices row
   // whose user_id references a real users row — this should be unreachable.
-  if (!user) return { ok: false }
+  if (!user) return null
   const verified = await argon2.verify(user.password_hash, oldPassword)
-  if (!verified) return { ok: false }
-  const hash = await argon2.hash(newPassword, { type: argon2.argon2id })
+  if (!verified) return null
+  return { oldHash: user.password_hash, newHash: await argon2.hash(newPassword, { type: argon2.argon2id }) }
+}
+
+export function applyPasswordChange(db, userId, { oldHash, newHash }, { deviceId, signOutOthers = false }) {
   return db.transaction(() => {
     if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(deviceId, userId)) return { ok: false, revoked: true }
-    const swapped = db.prepare('UPDATE users SET password_hash=? WHERE id=? AND password_hash=?').run(hash, userId, user.password_hash).changes
+    const swapped = db.prepare('UPDATE users SET password_hash=? WHERE id=? AND password_hash=?').run(newHash, userId, oldHash).changes
     if (!swapped) return { ok: false }
     const signedOut = signOutOthers
       ? db.prepare("DELETE FROM devices WHERE user_id=? AND kind='client' AND id<>?").run(userId, deviceId).changes

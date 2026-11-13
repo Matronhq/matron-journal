@@ -31,8 +31,10 @@ export const SUBJECT_VALUE_MAX = 200
 
 export const sha256Hex = (text) => crypto.createHash('sha256').update(String(text ?? ''), 'utf8').digest('hex')
 
-// `fields` in order; any value over the limit goes in as its hash.
-function bounded(fields) {
+// `fields` in order; any value over the limit goes in as its hash. Also the
+// rule for the account actions' subjects (a pair code, an agent name, a
+// conversation id).
+export function boundedSubject(fields) {
   const out = {}
   for (const [k, v] of Object.entries(fields)) {
     const s = String(v ?? '')
@@ -51,13 +53,13 @@ function bounded(fields) {
 export function consentSubject(kind, ask) {
   switch (kind) {
     case 'spawn':
-      return bounded({ op: 'spawn', ask: ask.id, box: ask.box, workdir: ask.workdir, task_sha256: sha256Hex(ask.task), decision: 'approve' })
+      return boundedSubject({ op: 'spawn', ask: ask.id, box: ask.box, workdir: ask.workdir, task_sha256: sha256Hex(ask.task), decision: 'approve' })
     case 'chat':
-      return bounded({ op: 'chat', ask: `${ask.room_id}/${ask.device_id}`, box: ask.box, message_sha256: sha256Hex(ask.message), decision: 'approve' })
+      return boundedSubject({ op: 'chat', ask: `${ask.room_id}/${ask.device_id}`, box: ask.box, message_sha256: sha256Hex(ask.message), decision: 'approve' })
     case 'transfer':
-      return bounded({ op: 'transfer', ask: ask.id, box: ask.box, file_sha256: ask.sha256, size: String(ask.size), decision: 'approve' })
+      return boundedSubject({ op: 'transfer', ask: ask.id, box: ask.box, file_sha256: ask.sha256, size: String(ask.size), decision: 'approve' })
     case 'start':
-      return bounded({ op: 'start', box: ask.box, workdir: ask.workdir, prompt_sha256: sha256Hex(ask.prompt) })
+      return boundedSubject({ op: 'start', box: ask.box, workdir: ask.workdir, prompt_sha256: sha256Hex(ask.prompt) })
     default:
       throw new TypeError(`no consent subject for ${kind}`)
   }

@@ -2,7 +2,7 @@ import { makeAgentCommentLimiter } from './agent-comment-limiter.js'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { pipeline } from 'node:stream/promises'
-import { checkPassword, makeRateLimiter, makeKeyedQueue, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
+import { checkPassword, makeRateLimiter, makeKeyedQueue, authToken, preparePasswordChange, applyPasswordChange, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, isPrivateDevice, deviceStatuses, setDeviceProtected } from './db.js'
 import { receiveBlob } from './media.js'
@@ -19,7 +19,7 @@ import { serveHelp } from './help.js'
 import { wakeIfOffline, isWakeableDevice } from './wake.js'
 import { handleItemsRoute, emitMarker } from './items-http.js'
 import { getItem } from './items.js'
-import { restampConsentItems, ConsentRefused } from './consent-subject.js'
+import { restampConsentItems, ConsentRefused, boundedSubject } from './consent-subject.js'
 import { handleMissionsRoute } from './missions-http.js'
 import { ORIGIN_SIEVE } from './missions.js'
 import { handleSharingRoute } from './sharing-http.js'
@@ -35,7 +35,7 @@ import { handleUsersRoute } from './users-http.js'
 import { handlePasswordResetRoute, handleAccountEmailRoute } from './password-reset-http.js'
 import { handleTwoFactorLogin, handleTwoFactorRoute, twoFactorRequiredNow } from './two-factor-http.js'
 import { handleApprovalKeysRoute, announceKey } from './approval-keys-http.js'
-import { activeKeysOfDevice, requireApproval } from './approval-keys.js'
+import { activeKeysOfDevice, requireApproval, guardedAccountAction, refuse } from './approval-keys.js'
 import { isTwoFactorEnabled, makeTwoFactorTickets } from './two-factor.js'
 import { PLAIN_BOX } from './token-box.js'
 import { githubAccountView } from './github-accounts.js'
@@ -364,7 +364,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       }
       if (await handleUsersRoute({ db, links }, req, res, url, who)) return
       if (await handleAccountEmailRoute({ db, mailer, loginGuard, passwordChecks }, req, res, url, who)) return
-      if (await handleTwoFactorRoute({ db, tokenBox: twoFactorBox, loginGuard }, req, res, url, who)) return
+      if (await handleTwoFactorRoute({ db, tokenBox: twoFactorBox, loginGuard, journalHost }, req, res, url, who)) return
       // Approval keys (src/approval-keys-http.js). `journalHost` is the host of
       // the configured public URL, null while approval keys are off.
       if (await handleApprovalKeysRoute({ db, hub, pushPipeline, tokenBox: twoFactorBox, loginGuard, journalHost }, req, res, url, who)) return
@@ -379,7 +379,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           github_linking: { enabled: !!(github && github.enabled), web_flow: !!(github && github.webFlow), device_flow: !!(github && github.deviceFlow) },
         })
       }
-      if (await handleCoordinatorRoute({ db, hub }, req, res, url, who)) return
+      if (await handleCoordinatorRoute({ db, hub, journalHost }, req, res, url, who)) return
       if (await handleNotifyRoute({ db, hub }, req, res, url, who)) return
       if (await handleDefaultsRoute({ db, hub }, req, res, url, who)) return
       // Per-box defaults (src/box-defaults-http.js): GET/PUT /devices/:id/defaults,
@@ -452,7 +452,8 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // Self-service change, client devices only — an agent (the bridge)
         // never holds/knows a user's password.
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
-        const { old_password, new_password, sign_out_others } = await readBody(req)
+        const body = await readBody(req)
+        const { old_password, new_password, sign_out_others } = body
         if (typeof old_password !== 'string' || !old_password) return json(res, 400, { error: 'bad_request' })
         if (sign_out_others !== undefined && typeof sign_out_others !== 'boolean') return json(res, 400, { error: 'bad_request' })
         if (typeof new_password !== 'string' || new_password.length < 8) return json(res, 400, { error: 'weak_password' })
@@ -464,10 +465,22 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           const user = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId)
           const gate = loginGuard.check(user.name)
           if (!gate.allowed) return { locked: Math.ceil(gate.retryAfterMs / 1000) }
-          const out = await changePassword(db, who.userId, {
-            oldPassword: old_password, newPassword: new_password,
-            deviceId: who.deviceId, signOutOthers: sign_out_others === true,
+          const prepared = await preparePasswordChange(db, who.userId, { oldPassword: old_password, newPassword: new_password })
+          // An account action: once the account has an approval key the
+          // change is signed too ({op:'change_password'}), on top of the
+          // current password, which is checked first so a wrong one never
+          // spends the nonce. A change that loses its compare-and-swap is
+          // refused inside the transaction, so it does not spend it either.
+          let out = null
+          const g = prepared && guardedAccountAction({ db, journalHost }, who, body, { op: 'change_password' }, {
+            write: () => {
+              out = applyPasswordChange(db, who.userId, prepared, { deviceId: who.deviceId, signOutOthers: sign_out_others === true })
+              if (!out.ok) refuse(401, { error: 'bad_password' })
+            },
           })
+          // The guard refused (the write never ran): no count either way.
+          if (prepared && !out) return { refused: g }
+          out ??= { ok: false }
           if (out.ok) { loginGuard.ok(user.name); signInTickets.dropUser(who.userId) }
           else if (!out.revoked) loginGuard.fail(user.name)
           return out
@@ -476,6 +489,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           res.setHeader('Retry-After', r.locked)
           return json(res, 429, { error: 'locked_out', retry_after: r.locked })
         }
+        if (r.refused) return json(res, r.refused.status, r.refused.body)
         if (r.revoked) return json(res, 401, { error: 'unauthenticated' })
         if (!r.ok) return json(res, 401, { error: 'bad_password' })
         return json(res, 200, { ok: true, signed_out: r.signedOut })
@@ -870,19 +884,30 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       }
       if (req.method === 'POST' && url.pathname === '/pair/approve') {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
-        const { pair_code, agent_name, tag_char } = await readBody(req)
+        const body = await readBody(req)
+        const { pair_code, agent_name, tag_char } = body
         if (typeof pair_code !== 'string' || !pair_code ||
             typeof agent_name !== 'string' || !agent_name ||
             (tag_char != null && typeof tag_char !== 'string')) {
           return json(res, 400, { error: 'bad_request' })
         }
-        const r = pairs.approve(pair_code, { userId: who.userId, agentName: agent_name, tagChar: tagChar(tag_char) })
+        // An account action: with an approval key, signed over the code and
+        // the name as sent ({op:'pair_bridge', code, name}; a value over 200
+        // characters as its hash). The in-memory approve is the transaction's
+        // last step; a code it cannot approve is refused there, so the nonce
+        // is not spent.
         // conflict (already approved) is distinguishable — the caller is
         // authenticated, so this leaks nothing exploitable and tells a
         // double-tapping user the truth. Unknown and expired stay merged
         // into 404, same anti-enumeration stance as everywhere else.
-        if (r === 'conflict') return json(res, 409, { error: 'conflict' })
-        if (r === 'not_found') return json(res, 404, { error: 'not_found' })
+        const g = guardedAccountAction({ db, journalHost }, who, body, boundedSubject({ op: 'pair_bridge', code: pair_code, name: agent_name }), {
+          write: () => {
+            const r = pairs.approve(pair_code, { userId: who.userId, agentName: agent_name, tagChar: tagChar(tag_char) })
+            if (r === 'conflict') refuse(409, { error: 'conflict' })
+            if (r === 'not_found') refuse(404, { error: 'not_found' })
+          },
+        })
+        if (!g.ok) return json(res, g.status, g.body)
         return json(res, 200, { status: 'approved' })
       }
       if (req.method === 'POST' && url.pathname === '/pair/preview') {
@@ -924,13 +949,21 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       }
       if (req.method === 'POST' && url.pathname === '/link/approve') {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
-        const { link_code } = await readBody(req)
+        const body = await readBody(req)
+        const { link_code } = body
         if (typeof link_code !== 'string' || !link_code) return json(res, 400, { error: 'bad_request' })
-        const r = links.approve(who.deviceId, link_code)
+        // An account action: with an approval key, signed over the code as
+        // sent ({op:'link_device', code}), as /pair/approve.
         // conflict = "nothing claimed yet, or already resolved" — the caller
         // is the authenticated starter, so the truth leaks nothing.
-        if (r === 'conflict') return json(res, 409, { error: 'conflict' })
-        if (r === 'not_found') return json(res, 404, { error: 'not_found' })
+        const g = guardedAccountAction({ db, journalHost }, who, body, boundedSubject({ op: 'link_device', code: link_code }), {
+          write: () => {
+            const r = links.approve(who.deviceId, link_code)
+            if (r === 'conflict') refuse(409, { error: 'conflict' })
+            if (r === 'not_found') refuse(404, { error: 'not_found' })
+          },
+        })
+        if (!g.ok) return json(res, g.status, g.body)
         return json(res, 200, { status: 'approved' })
       }
       if (req.method === 'POST' && url.pathname === '/link/deny') {

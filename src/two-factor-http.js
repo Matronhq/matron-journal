@@ -17,6 +17,7 @@
 import { json, readBody } from './http-body.js'
 import { verifyUserPassword, createClientDevice } from './auth.js'
 import { isAdmin } from './users-http.js'
+import { guardedAccountAction, refuse } from './approval-keys.js'
 import {
   twoFactorState, isTwoFactorEnabled, beginSetup, finishSetup, verifySecondFactor, disableTwoFactor,
   regenerateRecoveryCodes, isTwoFactorRequired, setTwoFactorRequired, isTwoFactorExempt, otpauthUri,
@@ -143,7 +144,20 @@ function guardAllows(loginGuard, res, username) {
 // Wrong guesses count against the username's lockout like a sign-in, so a
 // stolen token cannot be used to grind the password here.
 export async function confirmIdentity(ctx, res, who, { password, code, needCode }) {
-  const { db, tokenBox, loginGuard } = ctx
+  if (!(await confirmPassword(ctx, res, who, password))) return false
+  if (!needCode) return true
+  const refused = secondFactorRefusal(ctx, who, code)
+  if (refused) { json(res, refused.status, refused.body); return false }
+  return true
+}
+
+// confirmIdentity's two halves, for a route that checks the code inside its
+// write's transaction (the guarded routes below): the password (async;
+// false with the answer sent), and the code (synchronous; null, or the
+// {status, body} to answer). A good code is spent where it is checked, so
+// inside a transaction a refusal later in it leaves the code unspent.
+async function confirmPassword(ctx, res, who, password) {
+  const { db, loginGuard } = ctx
   const user = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId)
   if (!guardAllows(loginGuard, res, user.name)) return false
   if (typeof password !== 'string' || !password) { json(res, 400, { error: 'bad_request' }); return false }
@@ -152,16 +166,36 @@ export async function confirmIdentity(ctx, res, who, { password, code, needCode 
     json(res, 401, { error: 'bad_password' })
     return false
   }
-  if (!needCode) return true
-  if (typeof code !== 'string' || !code) { json(res, 400, { error: 'bad_request' }); return false }
-  const v = verifySecondFactor(db, tokenBox, who.userId, code)
-  if (!v.ok) {
-    if (v.reason === 'unavailable') { unavailable(res); return false }
-    loginGuard.fail(user.name)
-    json(res, 403, { error: 'bad_code' })
-    return false
-  }
   return true
+}
+
+function secondFactorRefusal(ctx, who, code) {
+  const { db, tokenBox, loginGuard } = ctx
+  if (typeof code !== 'string' || !code) return { status: 400, body: { error: 'bad_request' } }
+  const v = verifySecondFactor(db, tokenBox, who.userId, code)
+  if (v.ok) return null
+  if (v.reason === 'unavailable') return { status: 503, body: { error: 'two_factor_unavailable' } }
+  loginGuard.fail(db.prepare('SELECT name FROM users WHERE id=?').get(who.userId).name)
+  return { status: 403, body: { error: 'bad_code' } }
+}
+
+// The code check as a guarded transaction's `check` step.
+const codeCheck = (ctx, who, code) => () => {
+  const refused = secondFactorRefusal(ctx, who, code)
+  if (refused) refuse(refused.status, refused.body)
+}
+
+// A two-factor change is an account action: once the user has an approval
+// key it is signed too, {op:'two_factor', action}, on top of the password
+// and code it asks for today. The code is checked (and spent) in `check`,
+// in the same transaction as the guard and the write and ahead of the
+// guard, so a bad code never spends the nonce and a refused request never
+// spends the code (src/approval-keys.js guardedAccountAction).
+// → {ok:true, value}, or {ok:false} with the answer sent.
+function guardedTwoFactor(ctx, res, who, body, action, { check, write }) {
+  const g = guardedAccountAction({ db: ctx.db, journalHost: ctx.journalHost ?? null }, who, body, { op: 'two_factor', action }, { check, write })
+  if (!g.ok) json(res, g.status, g.body)
+  return g
 }
 
 export async function handleTwoFactorRoute(ctx, req, res, url, who) {
@@ -181,59 +215,79 @@ export async function handleTwoFactorRoute(ctx, req, res, url, who) {
   }
 
   if (path === '/2fa/setup' && req.method === 'POST') {
-    const { password, code } = await readBody(req)
+    const body = await readBody(req)
+    const { password, code } = body
     if (!tokenBox.enabled) { unavailable(res); return true }
     // Moving to a new authenticator app while two-factor is on needs a code
     // from the old one (or a recovery code) as well as the password.
     const enabled = twoFactorState(db, who.userId).enabled
-    if (!(await confirmIdentity(ctx, res, who, { password, code, needCode: enabled }))) return true
-    const s = beginSetup(db, tokenBox, who.userId)
-    if (!s.ok) { unavailable(res); return true }
+    if (!(await confirmPassword(ctx, res, who, password))) return true
+    const g = guardedTwoFactor(ctx, res, who, body, 'setup', {
+      check: enabled ? codeCheck(ctx, who, code) : undefined,
+      write: () => {
+        const begun = beginSetup(db, tokenBox, who.userId)
+        if (!begun.ok) refuse(503, { error: 'two_factor_unavailable' })
+        return begun.secret
+      },
+    })
+    if (!g.ok) return true
     const user = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId)
-    json(res, 200, setupBody(req, user.name, s.secret))
+    json(res, 200, setupBody(req, user.name, g.value))
     return true
   }
 
   if (path === '/2fa/enable' && req.method === 'POST') {
-    const { code, sign_out_others = false } = await readBody(req)
+    const body = await readBody(req)
+    const { code, sign_out_others = false } = body
     if (typeof code !== 'string' || !code || typeof sign_out_others !== 'boolean') { json(res, 400, { error: 'bad_request' }); return true }
     // Wrong codes here count against the username's lockout like any other
     // code, so a session cannot grind a pending secret's six digits.
     const user = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId)
     if (!guardAllows(ctx.loginGuard, res, user.name)) return true
-    const r = finishSetup(db, tokenBox, who.userId, code)
-    if (!r.ok) {
-      if (r.reason === 'unavailable') { unavailable(res); return true }
-      if (r.reason === 'no_pending') { json(res, 409, { error: 'no_pending_setup' }); return true }
-      ctx.loginGuard.fail(user.name)
-      json(res, 403, { error: 'bad_code' })
-      return true
-    }
-    // Optional: sign out the user's other web and app sessions, which were
-    // signed in with the password alone. Boxes (agent devices) are never
-    // touched — they were paired from a signed-in client, not a password.
-    const signedOut = sign_out_others
-      ? db.prepare("DELETE FROM devices WHERE user_id=? AND kind='client' AND id<>?").run(who.userId, who.deviceId).changes
-      : 0
-    json(res, 200, { recovery_codes: r.recoveryCodes, signed_out: signedOut })
+    // The pending secret's code is today's check, made (and the secret
+    // switched in) inside the guarded transaction ahead of the guard.
+    let r
+    const g = guardedTwoFactor(ctx, res, who, body, 'enable', {
+      check: () => {
+        r = finishSetup(db, tokenBox, who.userId, code)
+        if (r.ok) return
+        if (r.reason === 'unavailable') refuse(503, { error: 'two_factor_unavailable' })
+        if (r.reason === 'no_pending') refuse(409, { error: 'no_pending_setup' })
+        ctx.loginGuard.fail(user.name)
+        refuse(403, { error: 'bad_code' })
+      },
+      // Optional: sign out the user's other web and app sessions, which were
+      // signed in with the password alone. Boxes (agent devices) are never
+      // touched — they were paired from a signed-in client, not a password.
+      write: () => (sign_out_others
+        ? db.prepare("DELETE FROM devices WHERE user_id=? AND kind='client' AND id<>?").run(who.userId, who.deviceId).changes
+        : 0),
+    })
+    if (!g.ok) return true
+    json(res, 200, { recovery_codes: r.recoveryCodes, signed_out: g.value })
     return true
   }
 
   if (path === '/2fa/disable' && req.method === 'POST') {
-    const { password, code } = await readBody(req)
+    const body = await readBody(req)
+    const { password, code } = body
     if (!twoFactorState(db, who.userId).enabled) { json(res, 409, { error: 'not_enabled' }); return true }
     if (twoFactorRequiredNow(db, tokenBox, who.userId)) { json(res, 409, { error: 'two_factor_required' }); return true }
-    if (!(await confirmIdentity(ctx, res, who, { password, code, needCode: true }))) return true
-    disableTwoFactor(db, who.userId)
+    if (!(await confirmPassword(ctx, res, who, password))) return true
+    const g = guardedTwoFactor(ctx, res, who, body, 'disable', { check: codeCheck(ctx, who, code), write: () => disableTwoFactor(db, who.userId) })
+    if (!g.ok) return true
     json(res, 200, { ok: true })
     return true
   }
 
   if (path === '/2fa/recovery-codes' && req.method === 'POST') {
-    const { password, code } = await readBody(req)
+    const body = await readBody(req)
+    const { password, code } = body
     if (!twoFactorState(db, who.userId).enabled) { json(res, 409, { error: 'not_enabled' }); return true }
-    if (!(await confirmIdentity(ctx, res, who, { password, code, needCode: true }))) return true
-    json(res, 200, { recovery_codes: regenerateRecoveryCodes(db, who.userId) })
+    if (!(await confirmPassword(ctx, res, who, password))) return true
+    const g = guardedTwoFactor(ctx, res, who, body, 'recovery_codes', { check: codeCheck(ctx, who, code), write: () => regenerateRecoveryCodes(db, who.userId) })
+    if (!g.ok) return true
+    json(res, 200, { recovery_codes: g.value })
     return true
   }
 

@@ -111,3 +111,35 @@ export function requireApproval(ctx, who, body, expect) {
   if (!hasActiveKey(ctx.db, who.userId)) return { ok: true, approval: null }
   return checkApproval(ctx, who, body?.approval, expect)
 }
+
+// A refusal thrown out of a guarded write's transaction, so nothing it
+// wrote (a spent nonce, a spent second-factor code) stays written.
+export class ApprovalRefused extends Error {
+  constructor({ status, body }) { super('approval_refused'); this.refusal = { status, body } }
+}
+export const refuse = (status, body) => { throw new ApprovalRefused({ status, body }) }
+
+// An account action: the guard (type 'account' over `subject`) and the
+// write it protects, in one synchronous transaction. `check` runs first:
+// today's checks that cannot wait for the transaction (a second-factor
+// code, which spends itself). `write` runs once the guard has passed; its
+// return value is handed back. Either may refuse with refuse(); then
+// everything the transaction wrote is undone, the nonce included, so a
+// refused or failed request changes nothing and can be retried with the
+// same statement. Async checks (a password hash) belong before the call.
+// → {ok:true, value} or {ok:false, status, body} to send as is.
+export function guardedAccountAction(ctx, who, body, subject, { check = () => {}, write }) {
+  try {
+    let value
+    ctx.db.transaction(() => {
+      check()
+      const g = requireApproval(ctx, who, body, { type: 'account', subject })
+      if (!g.ok) refuse(g.status, g.body)
+      value = write()
+    })()
+    return { ok: true, value }
+  } catch (err) {
+    if (err instanceof ApprovalRefused) return { ok: false, ...err.refusal }
+    throw err
+  }
+}

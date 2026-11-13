@@ -365,9 +365,12 @@ test('revoking a device revokes its key; a sign-out that deletes the row only de
   assert.equal(notices(s, alice.id).at(-1).title, `Approval key removed: tablet ${tabletKey.keyId.slice(0, 8)}`)
 
   // A password change signing the others out: the phone's key stays enrolled,
-  // with no device until the phone signs in again and attaches it.
+  // with no device until the phone signs in again and attaches it. (The
+  // change is an account action, signed by the desk's own key.)
   const desk = signIn(s, alice.id, 'desk')
-  const changed = await s.http('/password', { method: 'POST', token: desk.token, body: { old_password: TEST_PASSWORD, new_password: TEST_PASSWORD, sign_out_others: true } })
+  const deskKey = await enrolKeyByPassword(s, { token: desk.token, userId: alice.id, secret, name: 'desk' })
+  const approval = await signAccount(s, { token: desk.token, key: deskKey, subject: { op: 'change_password' } })
+  const changed = await s.http('/password', { method: 'POST', token: desk.token, body: { old_password: TEST_PASSWORD, new_password: TEST_PASSWORD, sign_out_others: true, approval } })
   assert.equal(changed.status, 200)
   assert.equal((await s.http('/approval-keys', { token })).status, 401, 'the phone was signed out')
   const kept = activeKeyFor(s.db, alice.id, key.keyId)
