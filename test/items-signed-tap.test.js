@@ -4,7 +4,7 @@
 // signed tap's statement and signature are stored and read back unchanged.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { createAgent } from '../src/auth.js'
+import { createAgent, createUser } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import { startWithKey, startApprovalServer, signTap, signIn } from './approval-helpers.js'
 
@@ -255,4 +255,36 @@ test('a signed tap whose write fails spends no nonce: the check and the comment 
   const ok = await w.tap(item, { action: 'Approve', approval }, { 'idempotency-key': 'k2' })
   assert.equal(ok.status, 201, JSON.stringify(ok.json))
   assert.notEqual(w.s.db.prepare('SELECT used_at FROM approval_nonces WHERE nonce=?').get(nonce).used_at, null)
+})
+
+test('the owner\'s signed tap on a contributor\'s item reaches the contributor without signed or key_id', async (t) => {
+  const w = await world(t)
+  const bob = await createUser(w.s.db, 'bob', 'pw')
+  const bobBox = createAgent(w.s.db, bob.id, 'box-b')
+  upsertConversation(w.s.db, { id: 'bobwork', ownerUserId: bob.id, title: 'Bob', agentDeviceId: bobBox.deviceId })
+  const bobPhone = signIn(w.s, bob.id, 'bob-phone')
+  const as = (token) => (p, body) => w.s.http(p, { method: 'POST', token, body })
+  const m = (await as(w.box.token)('/missions', { convo_id: 'c1', title: 'Launch' })).json.mission
+  await as(w.token)('/contacts', { user: 'bob' })
+  const theirs = (await w.s.http('/contacts', { token: bobPhone.token })).json.contacts[0]
+  assert.equal((await as(bobPhone.token)(`/contacts/${theirs.id}/answer`, { decision: 'approve' })).status, 200)
+  const g = await as(w.token)(`/missions/${m.id}/shares`, { contact: 'bob', level: 'contribute' })
+  assert.equal(g.status, 201, JSON.stringify(g.json))
+  assert.equal((await as(bobPhone.token)(`/grants/${g.json.grant.id}/answer`, { decision: 'approve' })).status, 200)
+  const it = (await as(bobBox.token)('/items', { mission: m.id, kind: 'question', title: 'Order the food?', convo_id: 'bobwork' })).json.item
+  const q = await as(w.box.token)(`/items/${it.id}/comments`, { body: 'Shall I order?', actions: ['Order'], step_up: true })
+  assert.equal(q.status, 201, JSON.stringify(q.json))
+  const item = (await w.user(`/items/${it.id}`)).json.item
+  const approval = await signTap(w.s, { token: w.token, key: w.key, item, comment: q.json.comment, action: 'Order' })
+  const r = await w.tap(item, { action: 'Order', reply_to: q.json.comment.id, approval })
+  assert.equal(r.status, 201, JSON.stringify(r.json))
+  assert.equal(w.lastMarker().comment?.signed, undefined, 'the last marker is the one in bob\'s conversation')
+  const toBob = JSON.parse(w.s.db.prepare("SELECT payload FROM events WHERE type='item' AND convo_id='bobwork' ORDER BY seq DESC LIMIT 1").get().payload)
+  assert.equal(toBob.comment.action, 'Order')
+  assert.equal('signed' in toBob.comment, false)
+  assert.equal('key_id' in toBob.comment, false)
+  assert.ok(!JSON.stringify(toBob).includes(w.key.keyId))
+  // alice's own marker does say signed.
+  const mine = JSON.parse(w.s.db.prepare("SELECT payload FROM events WHERE type='item' AND convo_id=? AND user_id=? ORDER BY seq DESC LIMIT 1").get(item.origin_convo_id, w.alice.id).payload)
+  assert.equal(mine.comment.signed, true)
 })

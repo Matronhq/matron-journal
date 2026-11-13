@@ -11,6 +11,16 @@ export const ITEM_EVENT_TYPE = 'item'
 // learns of the change without re-polling /items.
 export const ITEM_ACTIONS = ['created', 'commented', 'closed', 'reopened', 'reordered', 'updated']
 
+// The stored approval was verified when it was written; its key_id is read
+// back from the statement.
+function signedTap(comment) {
+  const statement = comment.approval?.statement
+  if (typeof statement !== 'string') return {}
+  let keyId = null
+  try { keyId = JSON.parse(statement).key_id ?? null } catch { /* stored as verified */ }
+  return { signed: true, key_id: typeof keyId === 'string' ? keyId : null }
+}
+
 //
 // Journal-side transcription adds two optional things (src/items-transcribe.js).
 // An audio attachment the journal is transcribing carries
@@ -22,16 +32,6 @@ export const ITEM_ACTIONS = ['created', 'commented', 'closed', 'reopened', 'reor
 // releases the turn. A bridge that predates the fields sees `transcript:null`
 // on the first marker and transcribes as it always did, and ignores the
 // `updated` one like any other.
-// The stored approval was verified when it was written; its key_id is read
-// back from the statement.
-function signedTap(comment) {
-  const statement = comment.approval?.statement
-  if (typeof statement !== 'string') return {}
-  let keyId = null
-  try { keyId = JSON.parse(statement).key_id ?? null } catch { /* stored as verified */ }
-  return { signed: true, key_id: typeof keyId === 'string' ? keyId : null }
-}
-
 export function itemMarkerPayload({ item, action, by, comment = null, extra = null }) {
   const payload = {
     item_id: item.id,
