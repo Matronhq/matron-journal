@@ -59,13 +59,22 @@ function recordBlock(db, { userId, deviceId, agent, email, limits, now }) {
   const asOf = Math.min(limits.as_of, now)
   if (asOf < now - STALE_MS) return 0
   const login = typeof email === 'string' && email ? email.toLowerCase() : null
-  const accountKey = login ? `${agent}:login:${login}` : `${agent}:device:${deviceId}`
+  // A box with no login is its own account. Its key carries when the box
+  // was paired as well as its id: a device id can be handed out again after
+  // a box is removed, and the newcomer must not inherit the old history.
+  let accountKey = login ? `${agent}:login:${login}` : null
+  if (!accountKey) {
+    const device = db.prepare('SELECT created_at FROM devices WHERE id=? AND user_id=?').get(deviceId, userId)
+    if (!device) return 0
+    accountKey = `${agent}:device:${deviceId}:${device.created_at}`
+  }
   let written = 0
   for (const l of limits.lines) {
     if (!isWeeklyLine(l) || isCodexLine(l) !== (agent === 'codex')) continue
     if (!Number.isInteger(l.percent) || l.percent < 0) continue
     const percent = Math.min(l.percent, 100)
     let resetAt = typeof l.resets_at === 'string' ? Date.parse(l.resets_at) : NaN
+    let inferred = false
     if (Number.isFinite(resetAt)) {
       // A reading taken at or after its own reset is the old week's text.
       if (resetAt <= asOf || resetAt > asOf + RESET_HORIZON_MS) continue
@@ -85,12 +94,19 @@ function recordBlock(db, { userId, deviceId, agent, email, limits, now }) {
       ).get(userId, accountKey, l.id)
       if (!prev) continue
       resetAt = prev.reset_at
-      if (resetAt <= asOf) resetAt += Math.ceil((asOf - resetAt + 1) / WEEK_MS) * WEEK_MS
+      // Its last window is still open: that window has real readings, and
+      // a placed-by-inference zero must never replace one.
+      if (resetAt > asOf) continue
+      resetAt += Math.ceil((asOf - resetAt + 1) / WEEK_MS) * WEEK_MS
+      inferred = true
     }
     const label = sanitizePeerText(l.label, 64) || l.id
     const row = db.prepare(
       'SELECT percent, peak, first_at, last_at, devices FROM usage_windows WHERE user_id=? AND account_key=? AND line_id=? AND reset_at=?'
     ).get(userId, accountKey, l.id, resetAt)
+    // An inferred window that already has a row holds this same zero (or a
+    // real reading that arrived since): nothing to add.
+    if (row && inferred) continue
     if (!row) {
       db.prepare(
         `INSERT INTO usage_windows(user_id, account_key, line_id, reset_at, agent, label, percent, peak, first_at, last_at, devices)
@@ -136,7 +152,9 @@ export function recordBoxUsage(db, { userId, deviceId, status, now = Date.now() 
 // login.
 export function recordSessionUsage(db, { userId, deviceId, status, now = Date.now() }) {
   if (!status?.limits || !status.limits.lines?.some(isCodexLine)) return 0
-  return db.transaction(() => recordBlock(db, { userId, deviceId, agent: 'codex', email: null, limits: status.limits, now }))()
+  const n = db.transaction(() => recordBlock(db, { userId, deviceId, agent: 'codex', email: null, limits: status.limits, now }))()
+  pruneSamples(db, now)
+  return n
 }
 
 const iso = (ms) => new Date(ms).toISOString()
@@ -156,7 +174,10 @@ export function readUsageHistory(db, userId, { weeks = WEEKS_DEFAULT, now = Date
     `SELECT account_key, line_id, reset_at, agent, label, percent, peak, first_at, last_at, devices
      FROM usage_windows WHERE user_id=? AND reset_at > ? ORDER BY account_key, line_id, reset_at DESC`
   ).all(userId, since)
-  const names = new Map(db.prepare("SELECT id, name FROM devices WHERE user_id=? AND kind='agent'").all(userId).map((d) => [d.id, d.name]))
+  // id -> {name, created_at}. A box is named under a window only if it was
+  // already paired when the window was last read: an id handed out again
+  // must not put the newcomer's name on its predecessor's history.
+  const boxes = new Map(db.prepare("SELECT id, name, created_at FROM devices WHERE user_id=? AND kind='agent'").all(userId).map((d) => [d.id, d]))
   const privacy = new Map()
   const isPrivate = (id) => { if (!privacy.has(id)) privacy.set(id, isPrivateDevice(db, id)); return privacy.get(id) }
   const accounts = new Map()
@@ -172,7 +193,7 @@ export function readUsageHistory(db, userId, { weeks = WEEKS_DEFAULT, now = Date
       a = { key: r.account_key, agent: r.agent, ...(login ? { email: login } : {}), boxIds: new Set(), meters: new Map() }
       accounts.set(r.account_key, a)
     }
-    for (const id of devices) a.boxIds.add(id)
+    for (const id of devices) if (boxes.has(id) && boxes.get(id).created_at <= r.last_at) a.boxIds.add(id)
     let m = a.meters.get(r.line_id)
     if (!m) { m = { id: r.line_id, label: r.label, windows: [] }; a.meters.set(r.line_id, m) }
     if (r.reset_at > now) {
@@ -192,8 +213,8 @@ export function readUsageHistory(db, userId, { weeks = WEEKS_DEFAULT, now = Date
       m.primary = i === 0
       if (m.windows.length) m.average_unused = Math.round(m.windows.reduce((s, w) => s + w.unused, 0) / m.windows.length)
     })
-    const boxes = [...a.boxIds].filter((id) => names.has(id)).map((id) => names.get(id)).sort()
-    out.push({ key: a.key, agent: a.agent, ...(a.email ? { email: a.email } : {}), boxes, meters })
+    const boxNames = [...a.boxIds].map((id) => boxes.get(id).name).sort()
+    out.push({ key: a.key, agent: a.agent, ...(a.email ? { email: a.email } : {}), boxes: boxNames, meters })
   }
   out.sort((x, y) => (x.agent === y.agent ? (x.key < y.key ? -1 : 1) : x.agent === 'claude' ? -1 : 1))
   return { now, weeks, accounts: out }

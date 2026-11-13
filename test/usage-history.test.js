@@ -24,6 +24,8 @@ async function setup() {
   const alice = await createUser(db, 'alice', 'pw')
   const a = createAgent(db, alice.id, 'box-a')
   const b = createAgent(db, alice.id, 'box-b')
+  // Paired long before any reading in these tests.
+  db.prepare('UPDATE devices SET created_at=1').run()
   const report = (dev, at, lines, email = 'alice@example.com') => recordBoxUsage(db, {
     userId: alice.id, deviceId: dev.deviceId, now: at,
     status: { limits: { as_of: at, lines }, ...(email ? { account: { email } } : {}) },
@@ -78,7 +80,7 @@ test('a box with no login is its own account, and model meters sit beside the ma
   report(a, R0 - D, [week(30, R0), week(90, R0, 'week_fable', 'Week (Fable)')], null)
   report(b, R0 - D, [week(20, R0)], null)
   const out = readUsageHistory(db, alice.id, { now: R0 + H })
-  assert.deepEqual(out.accounts.map((x) => x.key), [`claude:device:${a.deviceId}`, `claude:device:${b.deviceId}`])
+  assert.deepEqual(out.accounts.map((x) => x.key), [`claude:device:${a.deviceId}:1`, `claude:device:${b.deviceId}:1`])
   assert.equal('email' in out.accounts[0], false)
   assert.deepEqual(out.accounts[0].meters.map((m) => [m.id, m.primary, m.windows[0].unused]), [['week_all', true, 70], ['week_fable', false, 10]])
 })
@@ -91,12 +93,16 @@ test('an untouched week (0% with no reset time) counts once the weekly rhythm is
   report(a, R0 + 2 * D, [week(0, null)])
   // Two weeks on, still untouched.
   report(a, R0 + W + D, [week(0, null)])
+  // A zero placed by inference never replaces what the window already holds.
+  report(a, R0 + W + D + H, [week(9, R0 + 2 * W)])
+  assert.equal(report(a, R0 + W + D + 2 * H, [week(0, null)]), 0)
   // A non-zero reading with no reset time is never guessed at.
   assert.equal(report(a, R0 + W + 2 * D, [week(5, null)]), 0)
   const out = readUsageHistory(db, alice.id, { now: R0 + W + 3 * D })
   const m = out.accounts[0].meters[0]
   assert.deepEqual(m.windows.map((w) => [w.resets_at, w.unused]), [[iso(R0 + W), 100], [iso(R0), 65]])
   assert.equal(m.current.resets_at, iso(R0 + 2 * W))
+  assert.equal(m.current.percent, 9)
   assert.equal(m.average_unused, 83)
 })
 
@@ -149,9 +155,34 @@ test("Codex's weekly meter comes from a session's status and is filed under the 
   assert.equal(recordSessionUsage(db, { userId: alice.id, deviceId: a.deviceId, now: R0 - 3 * D, status: { limits: { as_of: R0 - 3 * D, lines: [week(50, R0)] } } }), 0)
   const out = readUsageHistory(db, alice.id, { now: R0 + H })
   assert.equal(out.accounts.length, 1)
-  assert.equal(out.accounts[0].key, `codex:device:${a.deviceId}`)
+  assert.equal(out.accounts[0].key, `codex:device:${a.deviceId}:1`)
   assert.equal(out.accounts[0].agent, 'codex')
   assert.deepEqual(out.accounts[0].meters.map((m) => [m.id, m.windows[0].unused]), [['codex:codex:secondary', 88]])
+})
+
+test('a box that takes over a removed box\'s id does not inherit its history', async () => {
+  const { db, alice, b, report } = await setup()
+  report(b, R0 - D, [week(30, R0)], null)
+  recordSessionUsage(db, { userId: alice.id, deviceId: b.deviceId, now: R0 - D, status: { limits: { as_of: R0 - D, lines: [{ id: 'codex:codex:secondary', label: 'Codex · Weekly', percent: 5, resets_at: iso(R0) }] } } })
+  // box-b held the highest id: removing it frees that id for the next box.
+  db.prepare('DELETE FROM devices WHERE id=?').run(b.deviceId)
+  const c = createAgent(db, alice.id, 'box-c')
+  assert.equal(c.deviceId, b.deviceId)
+  db.prepare('UPDATE devices SET created_at=? WHERE id=?').run(R0 - 12 * H, c.deviceId)
+  report(c, R0 - H, [week(80, R0)], null)
+  const out = readUsageHistory(db, alice.id, { now: R0 + H })
+  const claude = out.accounts.filter((x) => x.agent === 'claude')
+  assert.deepEqual(claude.map((x) => [x.boxes, x.meters[0].windows[0].percent]), [[[], 30], [['box-c'], 80]])
+  // The removed box's Codex history is kept, under no box's name.
+  assert.deepEqual(out.accounts.filter((x) => x.agent === 'codex').map((x) => x.boxes), [[]])
+})
+
+test('Codex readings prune old samples too', async () => {
+  const { db, alice, a, report } = await setup()
+  report(a, R0 - D, [week(30, R0)])
+  const later = R0 + SAMPLE_RETENTION_MS + 2 * D
+  recordSessionUsage(db, { userId: alice.id, deviceId: a.deviceId, now: later, status: { limits: { as_of: later, lines: [{ id: 'codex:codex:secondary', label: 'Codex · Weekly', percent: 5, resets_at: iso(later + D) }] } } })
+  assert.deepEqual(db.prepare('SELECT line_id FROM usage_samples WHERE user_id=?').all(alice.id), [{ line_id: 'codex:codex:secondary' }])
 })
 
 test('GET /usage/history serves clients and agents, hiding what only a private box reported', async (t) => {
