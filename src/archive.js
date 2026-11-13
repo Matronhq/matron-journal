@@ -106,8 +106,9 @@ export function autoArchiveCandidates(db, userId, days, now = Date.now()) {
                     ORDER BY e.seq DESC LIMIT 1), 0) < ?
       AND NOT EXISTS(SELECT 1 FROM conversations k WHERE k.parent_convo_id=c.id
                      AND (k.session_state IN ('running','waiting')
-                          OR EXISTS(SELECT 1 FROM events e WHERE e.convo_id=k.id AND e.ts >= ?
-                                    AND e.type IN (${MESSAGE_TYPES_SQL}))))`).all(userId, cutoff, cutoff, cutoff, cutoff).map((r) => r.id)
+                          OR COALESCE((SELECT e.ts FROM events e WHERE e.convo_id=k.id
+                                       AND e.type IN (${MESSAGE_TYPES_SQL})
+                                       ORDER BY e.seq DESC LIMIT 1), 0) >= ?))`).all(userId, cutoff, cutoff, cutoff, cutoff).map((r) => r.id)
 }
 
 // One pass over every user. Returns {userId: changes} for users with any.
