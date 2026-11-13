@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import net from 'node:net'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { EventEmitter } from 'node:events'
@@ -19,6 +20,28 @@ import { installShutdownHandlers, RESTART_CLOSE_CODE, RESTART_CLOSE_REASON } fro
 function closeInfo(ws) {
   return new Promise((resolve) => ws.once('close', (code, reason) => resolve({ code, reason: reason.toString() })))
 }
+
+test('an HTTP connection with an unfinished request does not hold close() open', async (t) => {
+  const s = await startTestServer()
+  const sock = net.connect(Number(new URL(s.base).port), '127.0.0.1')
+  sock.on('error', () => {})
+  t.after(() => sock.destroy())
+  await new Promise((resolve) => sock.once('connect', resolve))
+  const received = new Promise((resolve) => s.server.once('request', resolve))
+  // Headers complete, body never sent: the connection is active, not idle,
+  // so server.close() alone waits for it.
+  sock.write('POST /login HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\nConnection: keep-alive\r\n\r\n')
+  await received
+  const started = Date.now()
+  let timer
+  await Promise.race([
+    s.close(),
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('an unfinished request blocked close()')), 3000) }),
+  ])
+  clearTimeout(timer)
+  assert.ok(Date.now() - started >= 400, 'in-flight requests get a short grace period')
+  assert.equal(s.db.open, false)
+})
 
 test('close({closeCode}) sends every socket the close code and reason, then shuts down', async (t) => {
   const s = await startTestServer()

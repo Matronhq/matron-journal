@@ -935,6 +935,9 @@ export function startServer({
             // its 20 s timeout: abort it, so the caller gets its 502 now.
             if (resolvedTts) resolvedTts.close()
             server.close(() => { Promise.all([searchBackfill, isDiffBackfill, imageDimsBackfill, embedderReady.catch(() => {}), transcriptionDone, semanticInFlight, outboxDone]).then(() => { db.close(); r() }) })
+            // Give in-flight HTTP requests a moment, then drop remaining
+            // connections so kept-alive sockets cannot hold shutdown open.
+            setTimeout(() => server.closeAllConnections(), 500).unref()
           }
           const open = closeCode === undefined ? [] : [...wss.clients].filter((c) => c.readyState === 1)
           if (!open.length) { finish(); return }
