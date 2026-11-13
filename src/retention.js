@@ -13,6 +13,46 @@ import { codeSpan } from './consent-items.js'
 
 const OFFLOAD_TYPE = 'tool_output'
 
+// The offload and log-expiry passes are generators: each `yield` marks a
+// point where the pass may hand the event loop back. The journal is one
+// thread with a synchronous SQLite driver, so a pass that runs start to
+// finish without yielding blocks every request and websocket for as long
+// as it takes. The 6-hourly schedule (server.js) drives them with
+// drainAsync; the exported run* functions keep their synchronous contract
+// with drainSync, for the admin CLI, tests and the run-at-boot path.
+export function drainSync(gen) {
+  for (;;) {
+    const r = gen.next()
+    if (r.done) return r.value
+  }
+}
+
+const yieldToLoop = () => new Promise((resolve) => setImmediate(resolve))
+
+// Runs `gen`, giving the event loop a turn (setImmediate: pending I/O and
+// timers run first) at every yield. `shouldStop` is checked after each
+// turn: when it returns true the generator is closed (its finally blocks
+// run) and null is returned, so a server close() never leaves a pass
+// writing to a closed DB handle. `onSlice(ms)` sees how long each
+// uninterrupted stretch ran.
+export async function drainAsync(gen, { shouldStop = () => false, yieldFn = yieldToLoop, onSlice = () => {}, now = () => performance.now() } = {}) {
+  for (;;) {
+    const start = now()
+    const r = gen.next()
+    onSlice(now() - start)
+    if (r.done) return r.value
+    await yieldFn()
+    if (shouldStop()) {
+      gen.return()
+      return null
+    }
+  }
+}
+
+// Rows written per uninterrupted stretch by the offload and log-expiry
+// passes (each row is a file write or unlink plus a transaction).
+export const RETENTION_ROW_BATCH = 50
+
 // Returns true for a payload that already has the offloaded shape
 // ({type, snippet, blob_ref}) even though its row's `blob_ref` column is
 // somehow still NULL. Rows land in that state only via a hand-edited DB or a
@@ -38,45 +78,73 @@ function looksAlreadyOffloaded(payload) {
 // referencing it. That's acceptable for v1 (disk is cheap, nothing ever
 // reads an orphan back) in exchange for the alternative being worse: an
 // event row that references a blob_ref no `blobs` row or file backs.
-export function runOffload(db, { days = 30, mediaDir }) {
-  const cutoff = Date.now() - days * 86400000
-  const rows = db.prepare(
-    'SELECT user_id, seq, ts, payload FROM events WHERE type=? AND ts<? AND blob_ref IS NULL'
-  ).all(OFFLOAD_TYPE, cutoff)
+export function runOffload(db, opts) {
+  return drainSync(offloadPass(db, opts))
+}
 
+export function* offloadPass(db, { days = 30, mediaDir, batchSize = RETENTION_ROW_BATCH }) {
+  const cutoff = Date.now() - days * 86400000
+  const page = db.prepare(
+    // The CASE keeps rows the loop below would only `continue` past (live-log
+    // and tombstoned payloads) out of the result, so they are not re-parsed
+    // on every pass; a malformed payload still comes through (json_extract
+    // would raise on it, hence the json_valid guard).
+    // type is a literal, not a bound parameter: the partial index
+    // idx_events_offload_pending is only usable when SQLite can see it.
+    // Read in pages of `batchSize` on a (ts, rowid) cursor, in index order,
+    // so one stretch never loads more than a page of payloads.
+    "SELECT rowid AS rid, user_id, seq, ts, payload FROM events WHERE type='tool_output' AND ts<? AND blob_ref IS NULL " +
+    // `ts >= ?` is the index lower bound (the OR alone is not one, and
+    // every page would re-walk the skipped live-log rows before the cursor).
+    'AND ts >= ? AND (ts > ? OR rowid > ?) ' +
+    "AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.live_log') IS NULL " +
+    "AND json_extract(payload,'$.expired') IS NULL AND json_extract(payload,'$.blob_expired') IS NULL ELSE 1 END " +
+    'ORDER BY ts, rowid LIMIT ?'
+  )
   let offloaded = 0
   const update = db.prepare('UPDATE events SET payload=?, blob_ref=? WHERE user_id=? AND seq=?')
 
-  for (const row of rows) {
-    let payload
-    try {
-      payload = JSON.parse(row.payload)
-    } catch {
-      payload = null // malformed JSON already in the row — snippetOf tolerates this
+  // Each page is read after the previous yield and written before the next,
+  // so no row changes between its read and its rewrite.
+  let ts = Number.MIN_SAFE_INTEGER
+  let rid = 0
+  for (;;) {
+    const rows = page.all(cutoff, ts, ts, rid, batchSize)
+    if (rows.length === 0) break
+    ts = rows[rows.length - 1].ts
+    rid = rows[rows.length - 1].rid
+    for (const row of rows) {
+      let payload
+      try {
+        payload = JSON.parse(row.payload)
+      } catch {
+        payload = null // malformed JSON already in the row — snippetOf tolerates this
+      }
+      if (looksAlreadyOffloaded(payload)) continue
+
+      // A live-log payload the TTL pass already tombstoned (`expired`), one in
+      // the pre-purge shape (`blob_expired`) that the next TTL pass will
+      // tombstone, or any other live-log row (`live_log`) — inline or not —
+      // whose lifecycle belongs solely to runExpireLogs: re-blobbing any of
+      // these would strand the snippet in a permanent blob and, for the
+      // inline case, drop the `live_log` key so runExpireLogs can never select
+      // the row again, permanently exempting it from the TTL purge.
+      if (payload && (payload.expired || payload.blob_expired || payload.live_log)) continue
+
+      const blob = writeBlobSync(mediaDir, Buffer.from(row.payload, 'utf8'))
+      const snippet = snippetOf(OFFLOAD_TYPE, payload)
+      const newPayload = JSON.stringify({ type: OFFLOAD_TYPE, snippet, blob_ref: blob.id })
+
+      db.transaction(() => {
+        insertBlob(db, {
+          id: blob.id, ownerUserId: row.user_id, contentType: 'application/json',
+          size: blob.size, sha256: blob.sha256, diskPath: blob.diskPath,
+        })
+        update.run(newPayload, blob.id, row.user_id, row.seq)
+      })()
+      offloaded += 1
     }
-    if (looksAlreadyOffloaded(payload)) continue
-
-    // A live-log payload the TTL pass already tombstoned (`expired`), one in
-    // the pre-purge shape (`blob_expired`) that the next TTL pass will
-    // tombstone, or any other live-log row (`live_log`) — inline or not —
-    // whose lifecycle belongs solely to runExpireLogs: re-blobbing any of
-    // these would strand the snippet in a permanent blob and, for the
-    // inline case, drop the `live_log` key so runExpireLogs can never select
-    // the row again, permanently exempting it from the TTL purge.
-    if (payload && (payload.expired || payload.blob_expired || payload.live_log)) continue
-
-    const blob = writeBlobSync(mediaDir, Buffer.from(row.payload, 'utf8'))
-    const snippet = snippetOf(OFFLOAD_TYPE, payload)
-    const newPayload = JSON.stringify({ type: OFFLOAD_TYPE, snippet, blob_ref: blob.id })
-
-    db.transaction(() => {
-      insertBlob(db, {
-        id: blob.id, ownerUserId: row.user_id, contentType: 'application/json',
-        size: blob.size, sha256: blob.sha256, diskPath: blob.diskPath,
-      })
-      update.run(newPayload, blob.id, row.user_id, row.seq)
-    })()
-    offloaded += 1
+    yield
   }
   return { offloaded }
 }
@@ -94,7 +162,11 @@ export function runOffload(db, { days = 30, mediaDir }) {
 // preview scrub share one transaction per row; file unlink happens after
 // commit — a crash between the two leaves an orphan file (same stance as
 // runOffload's write-before-commit, in the opposite direction).
-export function runExpireLogs(db, { hours = 24, mediaDir }) {
+export function runExpireLogs(db, opts) {
+  return drainSync(expireLogsPass(db, opts))
+}
+
+export function* expireLogsPass(db, { hours = 24, mediaDir, batchSize = RETENTION_ROW_BATCH }) {
   const cutoff = Date.now() - hours * 3600000
   const rows = db.prepare(
     "SELECT user_id, seq, convo_id, payload, blob_ref FROM events WHERE type='tool_output' AND ts<? " +
@@ -102,7 +174,9 @@ export function runExpireLogs(db, { hours = 24, mediaDir }) {
   ).all(cutoff)
 
   let expired = 0
-  const update = db.prepare('UPDATE events SET payload=?, blob_ref=NULL WHERE user_id=? AND seq=?')
+  // Guarded on the payload the scan read, as in offloadPass: the pass
+  // yields between batches.
+  const update = db.prepare('UPDATE events SET payload=?, blob_ref=NULL WHERE user_id=? AND seq=? AND payload=?')
   const deleteBlobRow = db.prepare('DELETE FROM blobs WHERE id=?')
   // `conversations.last_seq` is bumped by EVERY event append (read_marker,
   // session_status, ...), not just the ones that own the preview — only
@@ -116,7 +190,10 @@ export function runExpireLogs(db, { hours = 24, mediaDir }) {
   )
   const updateConvoSnippet = db.prepare('UPDATE conversations SET snippet=? WHERE id=?')
 
+  let sinceYield = 0
   for (const row of rows) {
+    if (sinceYield >= batchSize) { sinceYield = 0; yield }
+    sinceYield += 1
     let payload
     try { payload = JSON.parse(row.payload) } catch { payload = null }
     if (!payload || payload.live_log !== true) continue // defense in depth; SQL already filters
@@ -131,9 +208,9 @@ export function runExpireLogs(db, { hours = 24, mediaDir }) {
       expired: true,
       blob_ref: null,
     }
-    db.transaction(() => {
+    const done = db.transaction(() => {
+      if (!update.run(JSON.stringify(tombstone), row.user_id, row.seq, row.payload).changes) return false
       if (row.blob_ref) deleteBlobRow.run(row.blob_ref)
-      update.run(JSON.stringify(tombstone), row.user_id, row.seq)
       // Purged output must not linger in the conversation-list preview: if
       // this event is still the convo's latest MESSAGE_TYPES event, rewrite
       // the preview from the tombstone ($ <command>). A newer message-type
@@ -142,7 +219,9 @@ export function runExpireLogs(db, { hours = 24, mediaDir }) {
       if (latest && latest.seq === row.seq) {
         updateConvoSnippet.run(snippetOf('tool_output', tombstone), row.convo_id)
       }
+      return true
     })()
+    if (!done) continue
     if (blob) {
       try {
         fs.unlinkSync(blob.disk_path)
