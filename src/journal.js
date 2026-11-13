@@ -194,12 +194,17 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
   const existing = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
   const prevSessionState = existing ? existing.session_state : undefined
   let metaChanged = false
+  let summaryChanged = false
   if (existing) {
     if (existing.owner_user_id !== ownerUserId) throw new Error('not authorized: convo owned by another user')
     // The journal's own conversations (people-convo.js) are never an
     // agent's to title, adopt or re-state.
     if (existing.system != null) throw new Error('not authorized: system conversation')
     if (title != null && title !== existing.auto_title) metaChanged = true
+    // A summary change is NOT metadata: it is pushed as an ephemeral client
+    // frame (see ws.js) and rides /snapshot, never a stored event. Reconnect
+    // resends must neither emit a frame nor refresh the timestamp.
+    summaryChanged = summary != null && summary !== existing.summary
     if (repoCols && (existing.repo ?? null) !== repoCols.repo) metaChanged = true
     // agent_device_id: last upsert wins — the device currently managing the
     // session owns delivery (see hub.js). An absent agentDeviceId leaves the
@@ -227,8 +232,8 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
       && !!db.prepare('SELECT 1 FROM convo_agents WHERE convo_id=? AND agent_device_id=?').get(id, agentDeviceId)
 
     db.prepare(
-      'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id), session_outcome=COALESCE(?, session_outcome), summary=COALESCE(?, summary) WHERE id=?'
-    ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), sessionOutcome ?? null, summary ?? null, id)
+      'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id), session_outcome=COALESCE(?, session_outcome), summary=COALESCE(?, summary), summary_updated_at=COALESCE(?, summary_updated_at) WHERE id=?'
+    ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), sessionOutcome ?? null, summary ?? null, summaryChanged ? Date.now() : null, id)
     // When the session last entered and last left 'running' — a turn's start
     // and end, for an item thread's working indicator (items.js itemWorking).
     // Stamped on a real transition only: a bridge that repeats a state, or
@@ -255,8 +260,8 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     // non-null mission_id has an active link" must hold from birth.
     db.transaction(() => {
       db.prepare(
-        'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, mission_id, created_at, turn_started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)'
-      ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', inheritedMission, createdAt,
+        'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, summary_updated_at, mission_id, created_at, turn_started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'
+      ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', summary ? createdAt : 0, inheritedMission, createdAt,
         (sessionState || 'running') === 'running' ? createdAt : null)
       db.prepare('UPDATE conversations SET auto_title=@auto_title, session_short=@session_short, title_marker=@title_marker WHERE id=@id')
         .run({ id, ...autoTitleColumns(initialTitle) })
@@ -271,7 +276,7 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
   }
   const convo = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
   if (existing && convo.title !== existing.title) metaChanged = true
-  return { ...convo, metaChanged, prevSessionState }
+  return { ...convo, metaChanged, summaryChanged: summaryChanged || (!existing && !!summary), prevSessionState }
 }
 
 // Fan a convo_meta for each conversation the journal itself retitled — a
@@ -440,7 +445,7 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   const conversations = db.prepare(
     `SELECT id, title, auto_title, session_state, session_outcome, last_seq, unread_count,
             ${omitSnippet ? 'NULL' : 'snippet'} AS snippet,
-            parent_convo_id, summary, repo, created_at, agent_device_id, system,
+            parent_convo_id, summary, summary_updated_at, repo, created_at, agent_device_id, system,
             ${excludePrivateOwned
               ? `(CASE WHEN EXISTS (SELECT 1 FROM missions m WHERE m.id = conversations.mission_id AND ${ORIGIN_SIEVE}) THEN conversations.mission_id END)`
               : 'mission_id'} AS mission_id,

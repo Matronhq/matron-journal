@@ -1337,6 +1337,11 @@ export function openDb(path) {
   if (!convoCols.some((c) => c.name === 'summary')) {
     db.exec("ALTER TABLE conversations ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
   }
+  // Server observation time of the last summary change; 0 means unknown.
+  // Legacy rows stay at 0 rather than presenting old text as freshly generated.
+  if (!convoCols.some((c) => c.name === 'summary_updated_at')) {
+    db.exec('ALTER TABLE conversations ADD COLUMN summary_updated_at INTEGER NOT NULL DEFAULT 0')
+  }
   // Displayed pixel size of an image blob (spec: 2026-10-01 item thread
   // layout shift), read from the file's own header by image-size.js. NULL =
   // not read yet (blobs from before this column; backfillImageDims and

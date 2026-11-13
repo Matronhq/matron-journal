@@ -2184,6 +2184,14 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             },
           })
         }
+        // A changed summary is client-only live state: no journal event, no
+        // last_seq movement, no replay. Catch-up is /snapshot's summary and
+        // summary_updated_at.
+        if (convo.summaryChanged) {
+          try {
+            hub.sendToClients(conn.userId, { kind: 'summary', convo_id: msg.convo_id, summary: convo.summary, summary_updated_at: convo.summary_updated_at })
+          } catch (err) { console.error('summary: live frame failed (saved)', err) }
+        }
         break
       }
       case 'publish': {

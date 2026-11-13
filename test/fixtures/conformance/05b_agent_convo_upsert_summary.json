@@ -1,0 +1,219 @@
+{
+  "name": "agent convo_upsert summary: ephemeral client frame, no journal event, snapshot catch-up",
+  "description": "A summary carried by convo_upsert reaches connected clients as a client-only {kind:'summary'} frame and never appends a journal event (the head seq does not move). An identical resend emits nothing; /snapshot carries summary and summary_updated_at.",
+  "seed": {
+    "users": [
+      {
+        "as": "alice",
+        "name": "alice",
+        "password": "fixture-pw-8"
+      }
+    ],
+    "agents": [
+      {
+        "as": "bridge",
+        "user": "alice",
+        "name": "box-2"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/login",
+      "body": {
+        "username": "alice",
+        "password": "fixture-pw-8",
+        "device_name": "mac"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "token": {
+            "$bind": "alice_token"
+          },
+          "device_id": {
+            "$type": "integer"
+          },
+          "user_id": {
+            "$ref": "alice.user_id"
+          }
+        }
+      }
+    },
+    {
+      "kind": "ws_open",
+      "conn": "agent"
+    },
+    {
+      "kind": "ws_send",
+      "conn": "agent",
+      "frame": {
+        "op": "hello",
+        "token": {
+          "$ref": "bridge.token"
+        },
+        "cursor": null
+      }
+    },
+    {
+      "kind": "ws_expect",
+      "conn": "agent",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "settings": {
+          "notices": true,
+          "auto_archive_days": 30
+        },
+        "box_defaults": {
+          "default_agent": null,
+          "default_model": null,
+          "default_effort": null
+        },
+        "coordinator_convo_id": null,
+        "seq": 0,
+        "device_id": {
+          "$type": "integer"
+        },
+        "name": "box-2"
+      }
+    },
+    {
+      "kind": "ws_open",
+      "conn": "client"
+    },
+    {
+      "kind": "ws_send",
+      "conn": "client",
+      "frame": {
+        "op": "hello",
+        "token": {
+          "$ref": "alice_token"
+        },
+        "cursor": 0
+      }
+    },
+    {
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "control",
+        "op": "hello_ok",
+        "coordinator_convo_id": null,
+        "settings": {
+          "notices": true,
+          "auto_archive_days": 30
+        },
+        "pins": [],
+        "seq": 0,
+        "device_id": {
+          "$type": "integer"
+        },
+        "name": "mac"
+      }
+    },
+    {
+      "kind": "ws_send",
+      "conn": "agent",
+      "frame": {
+        "op": "convo_upsert",
+        "convo_id": "sess-sum",
+        "summary": "Fixing the build"
+      }
+    },
+    {
+      "kind": "ws_expect",
+      "conn": "client",
+      "frame": {
+        "kind": "summary",
+        "convo_id": "sess-sum",
+        "summary": "Fixing the build",
+        "summary_updated_at": {
+          "$type": "integer"
+        }
+      }
+    },
+    {
+      "kind": "ws_send",
+      "conn": "agent",
+      "frame": {
+        "op": "convo_upsert",
+        "convo_id": "sess-sum",
+        "summary": "Fixing the build"
+      }
+    },
+    {
+      "kind": "ws_expect_none",
+      "conn": "client",
+      "ms": 150
+    },
+    {
+      "kind": "ws_send",
+      "conn": "agent",
+      "frame": {
+        "op": "convo_upsert",
+        "convo_id": "sess-sum",
+        "summary": null
+      }
+    },
+    {
+      "kind": "ws_expect_none",
+      "conn": "client",
+      "ms": 150
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/snapshot",
+      "token": {
+        "$ref": "alice_token"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "coordinator_convo_id": null,
+          "pins": [],
+          "seq": 0,
+          "agents": [
+            {
+              "device_id": {
+                "$ref": "bridge.device_id"
+              },
+              "name": "box-2",
+              "tag_char": null
+            }
+          ],
+          "conversations": [
+            {
+              "id": "sess-sum",
+              "title": "",
+              "auto_title": "",
+              "session_state": "running",
+              "session_outcome": null,
+              "last_seq": 0,
+              "unread_count": 0,
+              "snippet": "",
+              "parent_convo_id": null,
+              "summary": "Fixing the build",
+              "summary_updated_at": {
+                "$type": "integer"
+              },
+              "repo": null,
+              "agent_device_id": {
+                "$ref": "bridge.device_id"
+              },
+              "mission_id": null,
+              "mission_count": 0,
+              "created_at": {
+                "$type": "integer"
+              },
+              "last_ts": null
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
