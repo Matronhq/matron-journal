@@ -1508,7 +1508,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
               half = fr.parkTalk({
                 ownerUserId: conn.userId, roomId: msg.room_id, ownerDeviceId: conn.deviceId, ownerSender: `agent:${conn.name}`, ownerConvoId: msg.from_convo_id ?? null,
                 person: msg.target_person, session: remoteSession ? msg.target_convo_id : null, missionRef: msg.mission ?? null,
-                topic: sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS), justification: pJustification,
+                topic: sanitizeConsentText(msg.topic, INVITE_TOPIC_MAX_CHARS), justification: pJustification,
               })
             } catch (err) {
               if (err.message === 'not_found' && remoteSession) return fail('not_found', 'that session is not shared with you by this contact any more: check agent_roster')
@@ -1531,7 +1531,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
             link = parkTalk(db, {
               ownerUserId: conn.userId, roomId: msg.room_id, ownerDeviceId: conn.deviceId, ownerSender: `agent:${conn.name}`, ownerConvoId: msg.from_convo_id ?? null,
               person: msg.target_person, missionRef: msg.mission ?? null,
-              topic: sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS), justification: pJustification,
+              topic: sanitizeConsentText(msg.topic, INVITE_TOPIC_MAX_CHARS), justification: pJustification,
             })
           } catch (err) {
             if (err.message === 'not_found') return fail('not_found')
@@ -1568,7 +1568,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           }
           const from = resolveFromConvo()
           if (from.err) return fail(...from.err)
-          const pTopic = sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS)
+          const pTopic = sanitizeConsentText(msg.topic, INVITE_TOPIC_MAX_CHARS)
           const pJustification = sanitizeConsentText(msg.justification, INVITE_TEXT_MAX_CHARS)
           if (!pJustification) return fail('bad_request', 'bad justification')
           let link
@@ -1630,7 +1630,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const from = resolveFromConvo()
         if (from.err) return fail(...from.err)
         const fromConvoTitle = from.title
-        const topic = sanitizePeerText(msg.topic, INVITE_TOPIC_MAX_CHARS)
+        const topic = sanitizeConsentText(msg.topic, INVITE_TOPIC_MAX_CHARS)
         const justification = sanitizeConsentText(msg.justification, INVITE_TEXT_MAX_CHARS)
         // The raw-string check above only catches a literally empty string —
         // a payload of spaces/control chars passes it and THEN sanitises
