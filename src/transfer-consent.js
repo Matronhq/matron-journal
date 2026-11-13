@@ -15,9 +15,9 @@ import { CONSENT_LABEL, codeSpan, fenced } from './consent-items.js'
 import { sanitizePeerText, PEER_NAME_CAP, plainText as plain } from './peer-text.js'
 import { appendAndBroadcast } from './journal.js'
 import { participantConvoIds } from './participants.js'
-import { recordAndAnnounce } from './consent-answer.js'
+import { recordAndAnnounce, guardedApprove } from './consent-answer.js'
 import { wakeIfOffline } from './wake.js'
-import { consentStepUp, consentApproval, ConsentRefused, approvalColumn, storedApproval } from './consent-subject.js'
+import { consentStepUp, consentApproval, approvalColumn, storedApproval } from './consent-subject.js'
 import { getTransfer, setTransferState, deleteTransferFiles, forgetChunks, transferRecipients, isTransferId, parseFindings } from './transfers.js'
 
 // "by the user." or "by the Coordinator: <reason>", for the decline's
@@ -201,7 +201,6 @@ export function readyTransferView(db, row) {
   }
 }
 
-
 // Release the file to the room once it is both approved and fully
 // uploaded. Called after each of the two (whichever comes second does it);
 // the guarded open -> released move picks a single winner, so a repeat or
@@ -269,21 +268,10 @@ export function answerTransferAsk(ctx, { userId, transferId, decision, decidedBy
     console.log(`journal: transfer declined id=${transferId} by=${stamp.decided_by}`)
     return { status: 200, body: { ok: true } }
   }
-  let approved
-  try {
-    approved = db.transaction(() => {
-      const g = consentApproval(ctx, userId, decidedBy, 'transfer', getTransfer(db, transferId) ?? row, approval)
-      if (!g.ok) throw new ConsentRefused(g)
-      const forwarded = g.approval ? { approval: approvalColumn(g.approval) } : {}
-      // A lost race throws too, so a spent nonce is rolled back with it.
-      if (!setTransferState(db, transferId, { consent: 'approved', ...stamp, approved_at: now, ...forwarded })) throw new ConsentRefused({ status: 409, body: { error: 'conflict' } })
-      return true
-    })()
-  } catch (err) {
-    if (err instanceof ConsentRefused) return err.refusal
-    throw err
-  }
-  if (!approved) return { status: 409, body: { error: 'conflict' } }
+  const refused = guardedApprove(db,
+    () => consentApproval(ctx, userId, decidedBy, 'transfer', getTransfer(db, transferId) ?? row, approval),
+    (signed) => setTransferState(db, transferId, { consent: 'approved', ...stamp, approved_at: now, ...(signed ? { approval: approvalColumn(signed) } : {}) }))
+  if (refused) return refused
   closeTransferConsentItem({ db, hub }, transferId, { outcome: 'approved', decidedBy })
   recordAndAnnounce({ db, hub }, { userId, kind: 'transfer', askId: transferId, decision, decidedBy, convoId: row.from_convo_id, payload: { transfer_id: transferId } })
   console.log(`journal: transfer approved id=${transferId} by=${stamp.decided_by}`)

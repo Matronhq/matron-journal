@@ -10,13 +10,14 @@ import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import { makeWsClient } from './helpers.js'
 import { createAgent, createUser } from '../src/auth.js'
-import { openDb } from '../src/db.js'
+import { openDb, setDeviceProtected } from '../src/db.js'
 import { upsertConversation } from '../src/journal.js'
 import { setCoordinatorConvoId } from '../src/coordinator.js'
 import { recordJoined, getParticipant } from '../src/participants.js'
 import { getSpawn } from '../src/spawns.js'
 import { getTransfer } from '../src/transfers.js'
 import { consentSubject } from '../src/consent-subject.js'
+import { needsUserTap } from '../src/item-handover.js'
 import { runAdmin } from '../bin/matron-admin.js'
 import { startWithKey, startApprovalServer, signAccount, signConsent, enableTwoFactor, enrolKeyByPassword } from './approval-helpers.js'
 
@@ -339,6 +340,17 @@ test('the account\'s first approval key restamps the open consent items aimed at
   assert.equal(item.step_up, true)
   assert.deepEqual(item.subject, spawnSubject(w, id))
   required(await w.spawnAnswer(id, 'approve'))
+})
+
+test('an item hand-over to or from a protected box needs the user\'s tap, as for a user-only one', async () => {
+  const db = openDb(':memory:')
+  const u = await createUser(db, 'alice', 'pw')
+  const a = createAgent(db, u.id, 'box-a')
+  const b = createAgent(db, u.id, 'box-b')
+  assert.equal(needsUserTap(db, u.id, a.deviceId, b.deviceId), false)
+  setDeviceProtected(db, b.deviceId, true)
+  assert.equal(needsUserTap(db, u.id, a.deviceId, b.deviceId), true)
+  db.close()
 })
 
 test('matron-admin device protected toggles the flag and device list shows it', async () => {

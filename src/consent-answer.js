@@ -23,8 +23,9 @@ import { consentApproval, chatAskRow, approvalColumn, ConsentRefused } from './c
 // check that passed cannot be left without its change, nor a change
 // without its check. `apply(approval)` makes the change and answers whether
 // it won; a lost race is the 409 and rolls the nonce back too. → null when
-// applied, else the {status, body} to answer.
-function guardedApprove(db, check, apply) {
+// applied, else the {status, body} to answer. Exported for the transfer
+// kind (src/transfer-consent.js).
+export function guardedApprove(db, check, apply) {
   try {
     db.transaction(() => {
       const g = check()

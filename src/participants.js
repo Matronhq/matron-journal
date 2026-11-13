@@ -222,9 +222,9 @@ export function undoInvite(db, convoId, agentDeviceId, prior) {
     return
   }
   db.prepare(`
-    UPDATE convo_agents SET state=?, initiator_device_id=?, justification=?, topic=?, target_convo_id=?, initiator_convo_id=?, spawn_id=?, causes=?, created_at=?, answered_at=?, delivered_at=?
+    UPDATE convo_agents SET state=?, initiator_device_id=?, justification=?, topic=?, target_convo_id=?, initiator_convo_id=?, spawn_id=?, causes=?, created_at=?, answered_at=?, delivered_at=?, approval=?
     WHERE convo_id=? AND agent_device_id=?
-  `).run(prior.state, prior.initiator_device_id, prior.justification, prior.topic, prior.target_convo_id ?? null, prior.initiator_convo_id ?? null, prior.spawn_id ?? null, prior.causes ?? null, prior.created_at, prior.answered_at, prior.delivered_at, convoId, agentDeviceId)
+  `).run(prior.state, prior.initiator_device_id, prior.justification, prior.topic, prior.target_convo_id ?? null, prior.initiator_convo_id ?? null, prior.spawn_id ?? null, prior.causes ?? null, prior.created_at, prior.answered_at, prior.delivered_at, prior.approval ?? null, convoId, agentDeviceId)
 }
 
 // Owner-leave dissolution (ws.js agent_leave): the recorded owner has no
@@ -303,7 +303,7 @@ export function participantIds(db, convoId) {
 
 export function getParticipant(db, convoId, agentDeviceId) {
   return db.prepare(
-    'SELECT state, initiator_device_id, justification, topic, target_convo_id, initiator_convo_id, spawn_id, causes, created_at, answered_at, delivered_at, item_id, answered_by, answer_reason FROM convo_agents WHERE convo_id=? AND agent_device_id=?'
+    'SELECT state, initiator_device_id, justification, topic, target_convo_id, initiator_convo_id, spawn_id, causes, created_at, answered_at, delivered_at, item_id, answered_by, answer_reason, approval FROM convo_agents WHERE convo_id=? AND agent_device_id=?'
   ).get(convoId, agentDeviceId) ?? null
 }
 
