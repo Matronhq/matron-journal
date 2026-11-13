@@ -1033,10 +1033,21 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!Number.isInteger(msg.target_seq)) return fail('bad_request')
         // Read-only sub-chat guard (see isReadOnlyChild above).
         if (isReadOnlyChild(msg.convo_id)) return fail('forbidden', 'sub-chat is read-only')
+        const replyPayload = { target_seq: msg.target_seq, choice: msg.choice ?? null, text: msg.text ?? null }
+        // Derive control provenance from the stored prompt, even when clients
+        // no longer have its card loaded. Ordinary answers can also say "send".
+        const targetPrompt = db.prepare(
+          'SELECT type, payload FROM events WHERE user_id=? AND convo_id=? AND seq=?'
+        ).get(conn.userId, msg.convo_id, msg.target_seq)
+        if (targetPrompt?.type === 'prompt') {
+          let targetKind
+          try { targetKind = JSON.parse(targetPrompt.payload)?.kind } catch { targetKind = undefined }
+          if (targetKind === 'queued_release') replyPayload.kind = 'queued_release'
+        }
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `user:${conn.username}`, type: 'prompt_reply',
-          payload: { target_seq: msg.target_seq, choice: msg.choice ?? null, text: msg.text ?? null },
+          payload: replyPayload,
         })
         wakeConvoAgent(msg.convo_id)
         break
