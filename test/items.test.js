@@ -46,7 +46,9 @@ const base = (o = {}) => ({
 test('validateItemFields: trims, caps, dedupes, rejects junk', () => {
   assert.equal(validateItemFields({ title: '  ' }).ok, false)
   assert.equal(validateItemFields({ title: 'x'.repeat(201) }).ok, false)
-  assert.equal(validateItemFields({ title: 't', body: 'x'.repeat(32769) }).ok, false)
+  assert.deepEqual(validateItemFields({ title: 't', body: 'x'.repeat(32769) }), { ok: false, error: 'body_too_long', max: 32768 })
+  assert.equal(validateItemFields({ title: 't', body: 'x'.repeat(32768) }).value.body.length, 32768)
+  assert.deepEqual(validateItemFields({ title: 't', body: 42 }), { ok: false })
   assert.equal(validateItemFields({ title: 't', labels: ['a', 'a', 'b'] }).value.labels.join(), 'a,b')
   assert.equal(validateItemFields({ title: 't', labels: 'nope' }).ok, false)
   assert.equal(validateItemFields({ title: 't', links: [{ url: 'https://x' }] }).value.links[0].url, 'https://x')
