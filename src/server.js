@@ -17,7 +17,7 @@ import { makeApnsClient } from './apns.js'
 import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline, BACKGROUND_WAKE_MS } from './push.js'
 import { resolveMediaDir } from './media.js'
-import { runOffload, runExpireLogs, runReapMedia, runExpireVoiceNotes, runExpireDeviceContent, runExpireTransfers } from './retention.js'
+import { offloadPass, expireLogsPass, runReapMedia, runExpireVoiceNotes, runExpireDeviceContent, runExpireTransfers, drainSync, drainAsync } from './retention.js'
 import { backfillSearchIndex, backfillIsDiff } from './search.js'
 import { loadEmbedder } from './embedder.js'
 import { ensureVectorSchema, runVectorIndexer, createVectorStore } from './vector-index.js'
@@ -250,7 +250,10 @@ function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionInterval
   // uncollected one past 7 days), never "everything older than N" against
   // a setting that could be misconfigured — so the schedule always runs,
   // even when every other pass below is off.
-  const run = () => {
+  // One pass, as a generator: `yield*` hands the heavy passes' own yields
+  // through, and a bare `yield` between passes gives the loop a turn there
+  // too. See drainAsync in retention.js for why.
+  function* pass() {
     if (deviceRules !== null) {
       try {
         const r = runExpireDeviceContent(db, { rules: deviceRules })
@@ -261,14 +264,16 @@ function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionInterval
       } catch (err) {
         console.error('retention: device content expiry run failed', err)
       }
+      yield
     }
     if (ttlHours !== null) {
       try {
-        const r = runExpireLogs(db, { hours: ttlHours, mediaDir })
+        const r = yield* expireLogsPass(db, { hours: ttlHours, mediaDir })
         if (r.expired > 0) console.log(`retention: purged ${r.expired} live_log payload(s) older than ${ttlHours}h`)
       } catch (err) {
         console.error('retention: expire-logs run failed', err)
       }
+      yield
     }
     // Voice-note audio before offload/reap, so the reaper sees the user's
     // footprint without recordings whose words have already outlived them.
@@ -279,14 +284,16 @@ function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionInterval
       } catch (err) {
         console.error('retention: voice-note expiry run failed', err)
       }
+      yield
     }
     if (days !== null) {
       try {
-        const r = runOffload(db, { days, mediaDir })
+        const r = yield* offloadPass(db, { days, mediaDir })
         if (r.offloaded > 0) console.log(`retention: offloaded ${r.offloaded} tool_output payload(s) older than ${days}d`)
       } catch (err) {
         console.error('retention: offload run failed', err)
       }
+      yield
     }
     if (reapPcts !== null) {
       try {
@@ -295,6 +302,7 @@ function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionInterval
       } catch (err) {
         console.error('retention: media reap run failed', err)
       }
+      yield
     }
     // Agent-to-agent file transfers: a collected copy past its 1h grace,
     // and an open or released transfer nobody collected within 7 days —
@@ -306,9 +314,33 @@ function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionInterval
       console.error('retention: transfer expiry run failed', err)
     }
   }
-  run()
-  const interval = setInterval(run, retentionIntervalMs ?? RETENTION_INTERVAL_MS)
+  // The pass at boot stays synchronous (as before). Timed passes yield
+  // between batches (drainAsync), so the loop serves requests while a pass
+  // runs; the summary line says how long the pass took end to end and how
+  // long its longest uninterrupted stretch was. A pass still running when
+  // the next is due is not doubled up. stop() (close) ends a pass in flight
+  // at its next yield.
+  let running = false
+  let stopped = false
+  const runAsync = async () => {
+    if (running || stopped) return
+    running = true
+    const start = performance.now()
+    let longest = 0
+    try {
+      await drainAsync(pass(), { shouldStop: () => stopped, onSlice: (ms) => { if (ms > longest) longest = ms } })
+    } catch (err) {
+      console.error('retention: pass failed', err)
+    } finally {
+      running = false
+      const ms = performance.now() - start
+      if (ms >= 1000 || longest >= 500) console.log(`retention: run took ${Math.round(ms)}ms, longest blocking stretch ${Math.round(longest)}ms`)
+    }
+  }
+  drainSync(pass())
+  const interval = setInterval(runAsync, retentionIntervalMs ?? RETENTION_INTERVAL_MS)
   interval.unref()
+  interval.stop = () => { stopped = true }
   return interval
 }
 
@@ -864,7 +896,7 @@ export function startServer({
         close: ({ closeCode, closeReason, graceMs = 1000 } = {}) => new Promise((r) => {
           closing = true
           startDelay.cancel()
-          if (retentionInterval) clearInterval(retentionInterval)
+          if (retentionInterval) { clearInterval(retentionInterval); retentionInterval.stop() }
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
           if (receiptPruneInterval) clearInterval(receiptPruneInterval)
           // A delivery pass in flight finishes (its requests time out at
