@@ -32,6 +32,10 @@ export function itemMarkerPayload({ item, action, by, comment = null, extra = nu
     by,
     awaiting: item.awaiting ?? null,
     resolution: item.resolution ?? null,
+    // Let clients label the item's origin without fetching it again.
+    // The title is null when unavailable or the item is undecorated.
+    origin_convo_id: item.origin_convo_id ?? null,
+    origin_convo_title: item.origin_convo_title ?? null,
     // Action buttons (2026-09-24 item-actions contract): every marker carries
     // the item's current offer and the user's latest tap, so a connected app
     // — and a hello replay — renders the buttons without refetching.
