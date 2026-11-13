@@ -794,12 +794,13 @@ export function withImageDims(db, attachments) {
   })
 }
 
-export function insertComment(db, { itemId, userId, author, deviceId, convoId = null, kind, body, attachments, meta, actions = [], stepUp = false, subject = null, idemKey, now }) {
+// `approval` is a signed tap's {statement, signature}, stored as received.
+export function insertComment(db, { itemId, userId, author, deviceId, convoId = null, kind, body, attachments, meta, actions = [], stepUp = false, subject = null, approval = null, idemKey, now }) {
   attachments = withImageDims(db, attachments)
   const id = newId('ic')
-  db.prepare(`INSERT INTO item_comments(id,item_id,user_id,author,device_id,convo_id,kind,body,attachments,meta,idem_key,created_at,actions,step_up,subject)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(id, itemId, userId, author, deviceId, author === 'agent' ? convoId : null, kind, body, JSON.stringify(attachments ?? []), meta == null ? null : JSON.stringify(meta), idemKey, now, JSON.stringify(actions ?? []), stepUp ? 1 : 0, stepUp && subject ? JSON.stringify(subject) : null)
+  db.prepare(`INSERT INTO item_comments(id,item_id,user_id,author,device_id,convo_id,kind,body,attachments,meta,idem_key,created_at,actions,step_up,subject,approval)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(id, itemId, userId, author, deviceId, author === 'agent' ? convoId : null, kind, body, JSON.stringify(attachments ?? []), meta == null ? null : JSON.stringify(meta), idemKey, now, JSON.stringify(actions ?? []), stepUp ? 1 : 0, stepUp && subject ? JSON.stringify(subject) : null, approval == null ? null : JSON.stringify({ statement: approval.statement, signature: approval.signature }))
   return commentById(db, id)
 }
 
@@ -832,7 +833,14 @@ const ownedRow = (db, userId, itemId) => db.prepare('SELECT * FROM items WHERE i
 // reply in it rather than a cancelled copy and its edit. It only counts for
 // the user's own withdrawn reply on this item; anything else is dropped
 // without refusing the comment, whose words matter more than the link.
-export function addComment(db, { userId, itemId, author, deviceId, convoId = null, body = '', attachments = [], action = null, replyTo = null, replaces = null, actions = [], stepUp = false, subject = null, idemKey = null, keepStatus = false, now = Date.now() }) {
+//
+// `approve` (a tap only) is the route's approval-key check, run here after
+// the replay answer and the label check and before anything is written, on
+// the item row (and the asked comment's row: id, actions, body, step_up,
+// subject) as this transaction reads them, so an edit cannot slip between
+// the check and the write. It answers the approval to store, or null, or
+// throws; a throw rolls back everything, the spent nonce included.
+export function addComment(db, { userId, itemId, author, deviceId, convoId = null, body = '', attachments = [], action = null, replyTo = null, replaces = null, actions = [], stepUp = false, subject = null, idemKey = null, keepStatus = false, approve = null, now = Date.now() }) {
   return db.transaction(() => {
     const row = ownedRow(db, userId, itemId)
     if (!row) return null
@@ -851,7 +859,7 @@ export function addComment(db, { userId, itemId, author, deviceId, convoId = nul
     if (replyTo != null) {
       // No tap without a label: a bare reply_to is not a thing in v1.
       if (action == null) throw new Error('unknown_action')
-      asked = db.prepare("SELECT id, actions FROM item_comments WHERE id=? AND item_id=? AND kind='comment'").get(replyTo, itemId)
+      asked = db.prepare("SELECT id, actions, body, step_up, subject FROM item_comments WHERE id=? AND item_id=? AND kind='comment'").get(replyTo, itemId)
       if (!asked || !parseJson(asked.actions, []).includes(action)) throw new Error('unknown_action')
     } else if (action != null && !parseJson(row.actions, []).includes(action)) {
       throw new Error('unknown_action')
@@ -868,9 +876,10 @@ export function addComment(db, { userId, itemId, author, deviceId, convoId = nul
       const original = db.prepare("SELECT id FROM item_comments WHERE id=? AND item_id=? AND kind='comment' AND author='user' AND withdrawn_at IS NOT NULL").get(replaces, itemId)
       if (original) meta = { ...(meta ?? {}), replaces: original.id }
     }
+    const approval = approve && action != null ? approve({ row, asked }) : null
     let comment
     try {
-      comment = insertComment(db, { itemId, userId, author, deviceId, convoId, kind: 'comment', body, attachments, meta, actions, stepUp, subject, idemKey, now })
+      comment = insertComment(db, { itemId, userId, author, deviceId, convoId, kind: 'comment', body, attachments, meta, actions, stepUp, subject, approval, idemKey, now })
     } catch (err) {
       if (idemKey && err.code === 'SQLITE_CONSTRAINT_UNIQUE') throw new Error('idem_key_conflict')
       throw err

@@ -31,6 +31,8 @@ import { inlineRefsToText, knowsInlineRefs, strayInlineRef } from './inline-refs
 import { presentWithdrawn } from './withdrawn-comments.js'
 import { handleHandoverRoute, approvalQuestionOf, handleApprovalTap, withdrawOnClose } from './item-handover-http.js'
 import { getReplicaItem, getReplicaMission } from './federation-replica.js'
+import { requireApproval } from './approval-keys.js'
+import { promptDigest } from './approvals.js'
 
 const forbiddenReply = (res) => { json(res, 403, { error: 'forbidden' }); return true }
 
@@ -612,6 +614,31 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
   return handleItemSubRoute(ctx, req, res, who, item, sub, subId)
 }
 
+// Approval keys: the check on a tap, run inside addComment's transaction
+// (its `approve`) on the rows as they stand there. A tap needs a signature
+// when the item is step-up (the mark covers every button on it, a follow-up's
+// included) or the follow-up comment it answers is; an `approval` sent on any
+// other tap is verified the same way and stored. With neither, and for an
+// account with no active key (requireApproval), the tap is today's. The
+// statement commits to the item, the button, the comment it answers, the
+// question's words as they stand (the item's title and body, or that
+// comment's body) and the subject: a step-up comment's own, else the item's,
+// else {}. A refusal throws, so nothing is written; `refusal` is the answer
+// to send.
+const storedSubject = (s) => { try { return s == null ? {} : (JSON.parse(s) ?? {}) } catch { return {} } }
+function tapApprover(ctx, who, approval, action) {
+  return ({ row, asked }) => {
+    if (!row.step_up && !asked?.step_up && approval == null) return null
+    const subject = storedSubject(asked?.step_up ? asked.subject : row.subject)
+    const prompt_digest = asked ? promptDigest({ body: asked.body ?? '' }) : promptDigest({ title: row.title, body: row.body ?? '' })
+    const r = requireApproval({ db: ctx.db, journalHost: ctx.journalHost }, who, { approval }, {
+      type: 'item_tap', item: { id: row.id, num: row.num, reply_to: asked ? asked.id : null }, action, prompt_digest, subject,
+    })
+    if (!r.ok) throw Object.assign(new Error('approval_refused'), { refusal: r })
+    return r.approval
+  }
+}
+
 // A status/close/reopen note is optional but, when present, bounded like any
 // other body the user writes.
 const okNote = (v) => v === undefined || (typeof v === 'string' && v.length <= BODY_MAX)
@@ -732,8 +759,12 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       // generic rule, a reply on one would reopen it (or take it out of the
       // user's Decisions list while the ask still waits) with no agent able
       // to see the item, let alone close it again.
-      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, convoId, body: text, attachments, action, replyTo, replaces, actions: v.value.actions ?? [], stepUp: su.stepUp, subject: su.subject, idemKey, keepStatus: item.consent != null })
+      // A tap's approval-key check runs inside the write (tapApprover); a
+      // typed reply is never a tap, and its `approval` is ignored.
+      const approve = action != null ? tapApprover(ctx, who, body.approval, action) : null
+      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, convoId, body: text, attachments, action, replyTo, replaces, actions: v.value.actions ?? [], stepUp: su.stepUp, subject: su.subject, idemKey, keepStatus: item.consent != null, approve })
     } catch (err) {
+      if (err?.refusal) { json(res, err.refusal.status, err.refusal.body); return true }
       if (answerKnownError(res, err)) return true
       throw err
     }

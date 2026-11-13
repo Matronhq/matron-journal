@@ -4,6 +4,7 @@
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import { canonicalize } from '../src/federation-jcs.js'
+import { promptDigest } from '../src/approvals.js'
 import { startTestServer } from './helpers.js'
 import { createUser, createClientDevice } from '../src/auth.js'
 import { base32Decode, hotp, totpStep } from '../src/two-factor.js'
@@ -97,3 +98,16 @@ export async function signApproval(s, { token, key, user = 'alice', journal = TE
 
 // An account statement for `subject`, signed as above.
 export const signAccount = (s, { token, key, subject, ...rest }) => signApproval(s, { token, key, type: 'account', subject, ...rest })
+
+// A signed tap: the `approval` for tapping `action` on `item` (as the journal
+// returns it), or on the follow-up `comment`'s buttons when one is given.
+// The digest and subject follow the journal's rule (a step-up comment's own
+// subject, else the item's, else {}); any statement field can be overridden.
+export function signTap(s, { token, key, item, action, comment = null, ...rest }) {
+  const subject = (comment?.step_up ? comment.subject : item.subject) ?? {}
+  const prompt_digest = comment ? promptDigest({ body: comment.body }) : promptDigest({ title: item.title, body: item.body })
+  return signApproval(s, {
+    token, key, type: 'item_tap', item: { id: item.id, num: item.num, reply_to: comment ? comment.id : null },
+    action, prompt_digest, subject, ...rest,
+  })
+}
