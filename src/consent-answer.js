@@ -25,12 +25,13 @@ import { consentApproval, chatAskRow, approvalColumn, ConsentRefused } from './c
 // it won; a lost race is the 409 and rolls the nonce back too. → null when
 // applied, else the {status, body} to answer. Exported for the transfer
 // kind (src/transfer-consent.js).
+export const CONFLICT = Object.freeze({ ok: false, status: 409, body: { error: 'conflict' } })
 export function guardedApprove(db, check, apply) {
   try {
     db.transaction(() => {
       const g = check()
       if (!g.ok) throw new ConsentRefused(g)
-      if (!apply(g.approval)) throw new ConsentRefused({ status: 409, body: { error: 'conflict' } })
+      if (!apply(g.approval)) throw new ConsentRefused(CONFLICT)
     })()
     return null
   } catch (err) {
@@ -93,7 +94,13 @@ export function answerChatAsk({ db, hub, waker, journalHost = null }, { userId, 
     return { status: 200, body: { ok: true } }
   }
   const refused = guardedApprove(db,
-    () => consentApproval({ db, journalHost }, userId, decidedBy, 'chat', chatAskRow(db, userId, roomId, targetDeviceId), approval),
+    () => {
+      // Re-read inside the transaction: an ask answered meanwhile is the
+      // 409 a lost race gives, before any signature is looked at.
+      const now = chatAskRow(db, userId, roomId, targetDeviceId)
+      if (now?.state !== 'awaiting_user') return CONFLICT
+      return consentApproval({ db, journalHost }, userId, decidedBy, 'chat', now, approval)
+    },
     (signed) => answerParkedInvite(db, { convoId: roomId, agentDeviceId: targetDeviceId, approve: true, ...stamp(decidedBy), approval: approvalColumn(signed) }))
   if (refused) return refused
   closeChatConsentItem({ db, hub }, roomId, targetDeviceId, { outcome: 'approved', answeredByDeviceId })
@@ -142,7 +149,7 @@ export function answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, sp
       // An ask already answered is the 409 a lost claim gives, before any
       // signature is looked at.
       const now = getSpawn(db, requestId)
-      if (now?.state !== 'awaiting_user') return { ok: false, status: 409, body: { error: 'conflict' } }
+      if (now?.state !== 'awaiting_user') return CONFLICT
       return consentApproval({ db, journalHost }, userId, decidedBy, 'spawn', now, approval)
     },
     (signed) => claimApprove(db, requestId, Date.now(), { ...stamp(decidedBy), approval: signed }))

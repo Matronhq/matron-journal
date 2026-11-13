@@ -24,6 +24,7 @@ import { markerTitleAllowed } from './privacy.js'
 import { sanitizePeerText, plainText as plain } from './peer-text.js'
 import { wakeIfOffline } from './wake.js'
 import { coordinatorTarget, PICK_MAX, LABEL_MAX } from './talk-requests.js'
+import { isProtectedDevice } from './consent-subject.js'
 
 export const HANDOVER_CHOICE = { accept: 'Accept', new: 'New session', pick: 'Pick a box', decline: 'Decline' }
 const JOURNAL = 'journal'
@@ -61,15 +62,22 @@ export function handoverChoices(db, userId) {
 
 // Where a session would start, from what the recipient chose: 'coordinator'
 // (the button) or {device_id, workdir?} (a box they named). {deviceId,
-// workdir} or {refused: reason}.
+// workdir} or {refused: reason}. A protected box (src/consent-subject.js)
+// is refused, 'protected_device': its sessions start only on a signed
+// approval, which this path does not carry.
 export function startTarget(db, userId, request) {
+  let target
   if (request === 'coordinator') {
     const t = coordinatorTarget(db, userId)
-    return t ? { deviceId: t.deviceId, workdir: null } : { refused: 'no_coordinator' }
+    if (!t) return { refused: 'no_coordinator' }
+    target = { deviceId: t.deviceId, workdir: null }
+  } else {
+    const d = db.prepare("SELECT id FROM devices WHERE id=? AND user_id=? AND kind='agent'").get(request.device_id, userId)
+    if (!d) return { refused: 'not_your_box' }
+    target = { deviceId: d.id, workdir: request.workdir ?? null }
   }
-  const d = db.prepare("SELECT id FROM devices WHERE id=? AND user_id=? AND kind='agent'").get(request.device_id, userId)
-  if (!d) return { refused: 'not_your_box' }
-  return { deviceId: d.id, workdir: request.workdir ?? null }
+  if (isProtectedDevice(db, userId, target.deviceId)) return { refused: 'protected_device' }
+  return target
 }
 
 // The new session's first-turn task.

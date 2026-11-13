@@ -11,7 +11,6 @@ import { getCoordinatorConvoId } from './coordinator.js'
 import { isPrivateDevice } from './db.js'
 import { causesFromFrame } from './ask-causes.js'
 import { isProtectedDevice } from './consent-subject.js'
-import { hasActiveKey } from './approval-keys.js'
 
 export const SESSION_CONTROL_ACTIONS = new Set(['set_model', 'compact', 'carry_on'])
 export const SESSION_CONTROL_AGENTS = new Set(['claude', 'codex'])
@@ -96,9 +95,8 @@ export function validateSessionControl(msg) {
 //     have a box, and that box must not be a private device hidden from an
 //     ordinary caller — all indistinguishable not_found (anti-enumeration).
 //   - a protected box (src/consent-subject.js) is out of the Coordinator's
-//     reach once the account has an approval key: forbidden /
-//     protected_device. Without a key a protected box is a user-only one,
-//     which session control has never looked at.
+//     reach, whether or not the account has an approval key: forbidden /
+//     protected_device.
 export function authorizeSessionControl(db, conn, msg) {
   const from = db.prepare('SELECT owner_user_id, agent_device_id, parent_convo_id FROM conversations WHERE id=?').get(msg.from_convo_id)
   if (!from || from.owner_user_id !== conn.userId || from.agent_device_id !== conn.deviceId || from.parent_convo_id != null) return { code: 'not_found' }
@@ -108,7 +106,7 @@ export function authorizeSessionControl(db, conn, msg) {
   if (isPrivateDevice(db, tgt.agent_device_id) && !isPrivateDevice(db, conn.deviceId)) return { code: 'not_found' }
   const dev = db.prepare("SELECT id AS device_id, name FROM devices WHERE id=? AND user_id=? AND kind='agent'").get(tgt.agent_device_id, conn.userId)
   if (!dev) return { code: 'not_found' }
-  if (isProtectedDevice(db, conn.userId, dev.device_id) && hasActiveKey(db, conn.userId)) return { code: 'forbidden', detail: 'protected_device' }
+  if (isProtectedDevice(db, conn.userId, dev.device_id)) return { code: 'forbidden', detail: 'protected_device' }
   return { target: dev }
 }
 

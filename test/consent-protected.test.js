@@ -66,7 +66,19 @@ async function world(t, { withKey = true } = {}) {
   const spawnAnswer = (id, decision, approval) => user('/agent-spawn/answer', { method: 'POST', body: { request_id: id, decision, ...(approval !== undefined ? { approval } : {}) } })
   const startRpc = () => ws.target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start', 3000)
   const replyStart = (req) => ws.target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { convo_id: 'child-1' } })
-  return { ...base, asker, target, coord, ws, user, protect, parkSpawn, parkInvite, pending, coordAnswer, spawnAnswer, startRpc, replyStart }
+  // A file from box-a to box-b in the room, fully uploaded, so an approval
+  // releases it at once.
+  const sendFile = async () => {
+    recordJoined(s.db, { convoId: 'room', agentDeviceId: target.deviceId, initiatorDeviceId: asker.deviceId })
+    const created = await s.http('/transfers', {
+      method: 'POST', token: asker.token,
+      body: { room_id: 'room', from_convo_id: 'ask', name: 'notes.txt', size: 25, sha256: 'a'.repeat(64), content_type: 'text/plain', reason: 'the notes', scan: { verdict: 'clean', findings: [] } },
+    })
+    assert.equal(created.status, 201, JSON.stringify(created.json))
+    s.db.prepare("UPDATE transfers SET upload='uploaded', uploaded_at=? WHERE id=?").run(Date.now(), created.json.transfer_id)
+    return created.json.transfer_id
+  }
+  return { ...base, asker, target, coord, ws, user, protect, parkSpawn, parkInvite, pending, coordAnswer, spawnAnswer, startRpc, replyStart, sendFile }
 }
 
 const spawnSubject = (w, id) => ({ op: 'spawn', ask: id, box: 'box-b', workdir: WORKDIR, task_sha256: sha(TASK), decision: 'approve' })
@@ -204,14 +216,8 @@ test('protected chat invitee: the consent item tap needs the signature; a declin
 
 test('protected transfer recipient: the tap needs a signature over the file\'s hash and size; the released transfer carries it', async (t) => {
   const w = await world(t)
-  recordJoined(w.s.db, { convoId: 'room', agentDeviceId: w.target.deviceId, initiatorDeviceId: w.asker.deviceId })
   await w.protect()
-  const created = await w.s.http('/transfers', {
-    method: 'POST', token: w.asker.token,
-    body: { room_id: 'room', from_convo_id: 'ask', name: 'notes.txt', size: 25, sha256: 'a'.repeat(64), content_type: 'text/plain', reason: 'the notes', scan: { verdict: 'clean', findings: [] } },
-  })
-  assert.equal(created.status, 201, JSON.stringify(created.json))
-  const id = created.json.transfer_id
+  const id = await w.sendFile()
   const subject = { op: 'transfer', ask: id, box: 'box-b', file_sha256: 'a'.repeat(64), size: '25', decision: 'approve' }
   const row = (await w.pending()).json.pending.find((p) => p.id === id)
   assert.equal(row.step_up, true)
@@ -219,8 +225,6 @@ test('protected transfer recipient: the tap needs a signature over the file\'s h
   const item = w.s.db.prepare('SELECT step_up, subject FROM items WHERE id=?').get(getTransfer(w.s.db, id).item_id)
   assert.equal(item.step_up, 1)
   assert.deepEqual(JSON.parse(item.subject), subject)
-  // Fully uploaded, so the approval releases it at once.
-  w.s.db.prepare("UPDATE transfers SET upload='uploaded', uploaded_at=? WHERE id=?").run(Date.now(), id)
   const tap = (body) => w.user(`/items/${getTransfer(w.s.db, id).item_id}/comments`, { method: 'POST', body })
   required(await tap({ action: 'Approve' }))
   assert.equal(getTransfer(w.s.db, id).consent, 'awaiting_user')
@@ -233,13 +237,68 @@ test('protected transfer recipient: the tap needs a signature over the file\'s h
   assert.deepEqual(listed.json.transfers.find((x) => x.id === id).approval, approval)
 })
 
-test('session control into a protected box is refused protected_device', async (t) => {
+for (const withKey of [true, false]) {
+  test(`session control into a protected box is refused protected_device (${withKey ? 'with' : 'without'} an approval key)`, async (t) => {
+    const w = await world(t, { withKey })
+    await w.protect()
+    w.ws.coord.send({ op: 'session_control', request_id: 'sc1', from_convo_id: 'coord', target_convo_id: 'tgt', action: 'compact' })
+    const err = await w.ws.coord.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.ref === 'session_control')
+    assert.equal(err.code, 'forbidden')
+    assert.equal(err.detail, 'protected_device')
+    assert.equal(w.ws.target.frames.some((f) => f.kind === 'rpc'), false)
+  })
+}
+
+test('the Coordinator\'s approval of a transfer to a protected box is refused as user-only, and nothing is released', async (t) => {
   const w = await world(t)
   await w.protect()
-  w.ws.coord.send({ op: 'session_control', request_id: 'sc1', from_convo_id: 'coord', target_convo_id: 'tgt', action: 'compact' })
-  const err = await w.ws.coord.waitFor((f) => f.kind === 'control' && f.op === 'error' && f.ref === 'session_control')
-  assert.equal(err.code, 'forbidden')
-  assert.equal(err.detail, 'protected_device')
+  const id = await w.sendFile()
+  const r = await w.coordAnswer({ kind: 'transfer', id, decision: 'approve' })
+  assert.deepEqual([r.status, r.json], [403, { error: 'forbidden', detail: 'user_only' }])
+  assert.equal(getTransfer(w.s.db, id).consent, 'awaiting_user')
+  assert.equal(w.ws.target.frames.some((f) => f.kind === 'transfer'), false)
+})
+
+test('no approval key: the approved chat invite and the released transfer to a protected box carry no approval', async (t) => {
+  const w = await world(t, { withKey: false })
+  await w.protect()
+  await w.parkInvite()
+  const r = await w.user('/agent-chat/answer', { method: 'POST', body: { room_id: 'room', target_device_id: w.target.deviceId, decision: 'approve' } })
+  assert.equal(r.status, 200, JSON.stringify(r.json))
+  const frame = await w.ws.target.waitFor((f) => f.kind === 'invite' && f.event === 'request' && f.room_id === 'room')
+  assert.equal('approval' in frame, false)
+  // The invitee joins, so the room's file goes to it.
+  w.ws.target.send({ op: 'agent_invite_answer', room_id: 'room', accept: true })
+  await w.ws.asker.waitFor((f) => f.kind === 'invite' && f.event === 'answer' && f.room_id === 'room')
+  const created = await w.s.http('/transfers', {
+    method: 'POST', token: w.asker.token,
+    body: { room_id: 'room', from_convo_id: 'ask', name: 'notes.txt', size: 25, sha256: 'a'.repeat(64), content_type: 'text/plain', reason: 'the notes', scan: { verdict: 'clean', findings: [] } },
+  })
+  assert.equal(created.status, 201, JSON.stringify(created.json))
+  const id = created.json.transfer_id
+  w.s.db.prepare("UPDATE transfers SET upload='uploaded', uploaded_at=? WHERE id=?").run(Date.now(), id)
+  const tap = await w.user(`/items/${getTransfer(w.s.db, id).item_id}/comments`, { method: 'POST', body: { action: 'Approve' } })
+  assert.equal(tap.status, 200, JSON.stringify(tap.json))
+  const ready = await w.ws.target.waitFor((f) => f.kind === 'transfer' && f.event === 'ready' && f.transfer_id === id)
+  assert.equal('approval' in ready.transfer, false)
+  const listed = await w.s.http('/transfers?for=me', { token: w.target.token })
+  assert.equal('approval' in listed.json.transfers.find((x) => x.id === id), false)
+})
+
+test('renaming a protected box restamps the open consent items that name it', async (t) => {
+  const w = await world(t)
+  await w.protect()
+  const id = await w.parkSpawn()
+  const itemId = getSpawn(w.s.db, id).item_id
+  const r = await w.user(`/devices/${w.target.deviceId}/rename`, { method: 'POST', body: { name: 'box-z' } })
+  assert.equal(r.status, 200)
+  const item = (await w.user(`/items/${itemId}`)).json.item
+  assert.deepEqual(item.subject, { ...spawnSubject(w, id), box: 'box-z' })
+  const row = (await w.pending()).json.pending.find((p) => p.id === id)
+  assert.deepEqual(row.subject, item.subject)
+  const marker = JSON.parse(w.s.db.prepare("SELECT payload FROM events WHERE type='item' ORDER BY seq DESC LIMIT 1").get().payload)
+  assert.equal(marker.action, 'updated')
+  assert.equal(marker.item_id, itemId)
 })
 
 test('a client\'s direct start on a protected box is an account action; the box gets the params unchanged', async (t) => {

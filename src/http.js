@@ -19,7 +19,7 @@ import { serveHelp } from './help.js'
 import { wakeIfOffline, isWakeableDevice } from './wake.js'
 import { handleItemsRoute, emitMarker } from './items-http.js'
 import { getItem } from './items.js'
-import { restampConsentItems } from './consent-subject.js'
+import { restampConsentItems, ConsentRefused } from './consent-subject.js'
 import { handleMissionsRoute } from './missions-http.js'
 import { ORIGIN_SIEVE } from './missions.js'
 import { handleSharingRoute } from './sharing-http.js'
@@ -775,14 +775,23 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         if (!db.prepare("SELECT 1 FROM devices WHERE id=? AND user_id=? AND kind='agent'").get(deviceId, who.userId)) return json(res, 404, { error: 'not_found' })
         let refusal = null
         let restamped = []
-        db.transaction(() => {
-          const g = requireApproval({ db, journalHost }, who, body, { type: 'account', subject: { op: 'protect_device', device: String(deviceId), on: String(body.on) } })
-          if (!g.ok) { refusal = g; return }
-          setDeviceProtected(db, deviceId, body.on)
-          // Open consent items aimed at the box now say whether they need a
-          // signature, and over what.
-          restamped = restampConsentItems(db, who.userId)
-        })()
+        try {
+          db.transaction(() => {
+            const g = requireApproval({ db, journalHost }, who, body, { type: 'account', subject: { op: 'protect_device', device: String(deviceId), on: String(body.on) } })
+            if (!g.ok) throw new ConsentRefused(g)
+            // A write that changes nothing (the device is gone) is the 404,
+            // never a success; thrown, so a nonce the check spent is rolled
+            // back. (The check above runs in the same synchronous step, so
+            // this is a backstop.)
+            if (!setDeviceProtected(db, deviceId, body.on)) throw new ConsentRefused({ status: 404, body: { error: 'not_found' } })
+            // Open consent items aimed at the box now say whether they need
+            // a signature, and over what.
+            restamped = restampConsentItems(db, who.userId)
+          })()
+        } catch (err) {
+          if (!(err instanceof ConsentRefused)) throw err
+          refusal = err.refusal
+        }
         if (refusal) return json(res, refusal.status, refusal.body)
         for (const id of restamped) {
           const item = getItem(db, who.userId, id)
@@ -805,6 +814,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         if (!clean || clean.length > DEVICE_NAME_MAX) return json(res, 400, { error: 'bad_request' })
         const renamedId = Number(rn[1])
         if (!renameOwnedDevice(db, who.userId, renamedId, clean)) return json(res, 404, { error: 'not_found' })
+        // A consent ask aimed at a protected box names it in its subject
+        // (src/consent-subject.js): open consent items follow the new name.
+        for (const id of restampConsentItems(db, who.userId)) {
+          const item = getItem(db, who.userId, id)
+          if (item) emitMarker({ db, hub, pushPipeline, waker }, who, { item, action: 'updated', fallback: false })
+        }
         // The frame carries the standing tag too — device_meta is "here is
         // this device's current meta", not a name-only delta, so a roster
         // built from frames alone never loses the letter.

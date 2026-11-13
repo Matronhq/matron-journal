@@ -21,6 +21,7 @@ import { setRoomItem, getPersonRoom, guestSees, expirePersonRoomAsks } from './p
 import {
   OWNER_TALK_ACTIONS, CHOICE, guestChoices, contactPending, completeTalkStart, failTalkStart, expireTalkAsks, TALK_GUEST_TTL_MS,
 } from './talk-requests.js'
+import { isProtectedDevice } from './consent-subject.js'
 
 const JOURNAL = 'journal'
 const DAYS = Math.round(TALK_GUEST_TTL_MS / (24 * 60 * 60 * 1000))
@@ -234,6 +235,10 @@ export async function issueTalkStart(ctx, l, target) {
   let convoId = null
   try {
     if (!broker) code = 'unavailable'
+    // A protected box (src/consent-subject.js) starts a session only on a
+    // signed approval, which a talk's start does not carry: refused before
+    // anything is sent to it.
+    else if (isProtectedDevice(db, l.guest_user_id, target.deviceId)) code = 'protected_device'
     else {
       if (spawnWakeWaitMs > 0) {
         let waking = false

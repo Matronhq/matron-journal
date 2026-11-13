@@ -15,7 +15,7 @@ import { CONSENT_LABEL, codeSpan, fenced } from './consent-items.js'
 import { sanitizePeerText, PEER_NAME_CAP, plainText as plain } from './peer-text.js'
 import { appendAndBroadcast } from './journal.js'
 import { participantConvoIds } from './participants.js'
-import { recordAndAnnounce, guardedApprove } from './consent-answer.js'
+import { recordAndAnnounce, guardedApprove, CONFLICT } from './consent-answer.js'
 import { wakeIfOffline } from './wake.js'
 import { consentStepUp, consentApproval, approvalColumn, storedApproval } from './consent-subject.js'
 import { getTransfer, setTransferState, deleteTransferFiles, forgetChunks, transferRecipients, isTransferId, parseFindings } from './transfers.js'
@@ -269,7 +269,13 @@ export function answerTransferAsk(ctx, { userId, transferId, decision, decidedBy
     return { status: 200, body: { ok: true } }
   }
   const refused = guardedApprove(db,
-    () => consentApproval(ctx, userId, decidedBy, 'transfer', getTransfer(db, transferId) ?? row, approval),
+    () => {
+      // Re-read inside the transaction: an ask answered meanwhile is the
+      // 409 a lost race gives, before any signature is looked at.
+      const now = getTransfer(db, transferId)
+      if (!now || !awaiting(now)) return CONFLICT
+      return consentApproval(ctx, userId, decidedBy, 'transfer', now, approval)
+    },
     (signed) => setTransferState(db, transferId, { consent: 'approved', ...stamp, approved_at: now, ...(signed ? { approval: approvalColumn(signed) } : {}) }))
   if (refused) return refused
   closeTransferConsentItem({ db, hub }, transferId, { outcome: 'approved', decidedBy })

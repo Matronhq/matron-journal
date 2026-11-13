@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
-import { pinDevicePrivate } from '../src/db.js'
+import { pinDevicePrivate, setDeviceProtected } from '../src/db.js'
 
 // Starting a session on a handed-over mission (docs/protocol.md "Hand-over"):
 // the recipient's accept can also start a new session on one of their boxes,
@@ -137,6 +137,24 @@ test('over HTTP the recipient may name any box of theirs, a private one included
   const req = await startRpc(w.ws.bobPriv, { ok: true, result: { convo_id: 'private-child' } })
   assert.equal(req.params.workdir, '/srv/club')
   assert.equal(req.params.talk, undefined, 'a named folder is an ordinary spawn')
+})
+
+test('a protected box is refused protected_device, by name or as the Coordinator\'s; nothing reaches it and the copy is made', async (t) => {
+  const w = await world(t)
+  setDeviceProtected(w.s.db, w.ids.bobBox, true)
+  setDeviceProtected(w.s.db, w.ids.bobCoord, true)
+  const first = await offered(w)
+  const r = await w.bobPhone(`/grants/${first.g.id}/answer`, post({ decision: 'approve', start_session: { device_id: w.ids.bobBox } }))
+  assert.equal(r.status, 200)
+  assert.equal(r.json.grant.state, 'active')
+  assert.deepEqual(r.json.start_session, { status: 'refused', reason: 'protected_device' })
+  const second = await offered(w)
+  const tap = await w.bobPhone(`/items/${second.mirror.id}/comments`, post({ action: 'New session' }))
+  assert.equal(tap.json.grant.state, 'active')
+  assert.deepEqual(tap.json.start_session, { status: 'refused', reason: 'protected_device' })
+  await settle()
+  assert.equal(w.ws.bobBox.frames.some((f) => f.kind === 'rpc'), false)
+  assert.equal(w.ws.bobCoord.frames.some((f) => f.kind === 'rpc'), false)
 })
 
 test('refusals stay graceful: the copy is made and the answer says why no session started', async (t) => {
