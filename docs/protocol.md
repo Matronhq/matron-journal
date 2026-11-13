@@ -129,7 +129,9 @@ the machine-checkable version of this page.
   another user (or a nonexistent one) yields the same empty result set
   the user-scoping already guarantees for a genuinely-unmatched query —
   there is no separate existence check, so this is not an oracle for
-  "does this convo_id exist." Results are ranked by `sm.is_diff` first (a
+  "does this convo_id exist." For 2–8 whitespace-separated query terms,
+  adjacent, in-order prose matches rank first. Within each tier, results
+  are ranked by `sm.is_diff` (a
   `diff` hit ranks below every prose hit matching the same terms — a code
   change is rarely what "why did we do this" means), then FTS5 `bm25()`
   (best match first), ties broken by `ts DESC`; `snippet` is the FTS5
@@ -140,10 +142,12 @@ the machine-checkable version of this page.
   only read its transcript. `mission_num` is the number of the hit's
   conversation's current mission (same pointer `mode=chats` reports, see
   below), sieved the same way for an ordinary agent caller, or `null` when
-  it isn't on one. `why` is `'words'` when the hit matched every query
-  term, or `'some_words'` when it is part of the fallback described next.
-  Fewer than 5 `'words'` hits, with `q` carrying 2+ terms, runs the same
-  query again matching ANY term (still FTS-quoted, same ordering, same
+  it isn't on one. `why` is `'phrase'` for the adjacent prose tier,
+  `'words'` for other hits matching every query term, or `'some_words'`
+  for the fallback described next. Clients should treat an unknown `why`
+  as a plain match. Fewer than 5 combined `'phrase'` and `'words'` hits,
+  with `q` carrying 2+ terms, runs the same query again matching ANY term
+  (still FTS-quoted, same ordering, same
   privacy and subagent filters) for up to the remaining `limit`, excluding
   seqs already returned, and tags those `'some_words'` — ranked search
   never goes from a handful of exact hits to nothing just because no
