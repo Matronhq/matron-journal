@@ -1605,12 +1605,12 @@ test('the scheduled retention pass yields: a timer fires while it runs', async (
   assert.ok(sawMidPass, 'the loop ran between batches of the pass')
 })
 
-test('expireLogsPass yields every batchSize rows, keeps a row rewritten while paused, and stops when closed', async () => {
+test('expireLogsPass reads and yields in pages of batchSize, reads each page fresh (a row edited while paused is left alone), and stops when closed', async () => {
   const { expireLogsPass } = await import('../src/retention.js')
   const { db, alice } = await setup()
   const mediaDir = tmpMediaDir()
   const seqs = []
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < 7; i++) {
     const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { live_log: true, command: `c${i}`, snippet: 'out' } })
     db.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 48 * 3600000, alice.id, r.seq)
     seqs.push(r.seq)
@@ -1618,15 +1618,36 @@ test('expireLogsPass yields every batchSize rows, keeps a row rewritten while pa
   const expiredCount = () => db.prepare("SELECT COUNT(*) n FROM events WHERE json_extract(payload,'$.expired') = 1").get().n
   const gen = expireLogsPass(db, { hours: 24, mediaDir, batchSize: 2 })
   assert.equal(gen.next().done, false)
-  assert.equal(expiredCount(), 2, 'exactly one batch before the first yield')
-  const rewritten = JSON.stringify({ live_log: true, command: 'edited', snippet: 'new' })
+  assert.equal(expiredCount(), 2, 'exactly one page before the first yield')
+  // A row that stops being a live log while paused is simply not in the next page.
+  const rewritten = JSON.stringify({ command: 'edited', snippet: 'new' })
   db.prepare('UPDATE events SET payload=? WHERE user_id=? AND seq=?').run(rewritten, alice.id, seqs[2])
   assert.equal(gen.next().done, false)
-  assert.equal(db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(alice.id, seqs[2]).payload, rewritten, 'a row changed after the read is not overwritten')
-  assert.equal(expiredCount(), 3)
-  // Closed before the last batch (as a stopped drainAsync closes it): the
-  // remaining row survives, and the next pass also re-reads the rewritten one.
+  assert.equal(db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(alice.id, seqs[2]).payload, rewritten, 'a row that is no longer a live log is left alone')
+  assert.equal(expiredCount(), 4, 'the next page holds the next two live logs')
+  // Closed before the last page (as a stopped drainAsync closes it): the
+  // remaining rows survive and the next pass takes them.
   gen.return()
-  assert.equal(expiredCount(), 3)
+  assert.equal(expiredCount(), 4)
   assert.deepEqual(runExpireLogs(db, { hours: 24, mediaDir }), { expired: 2 })
+})
+
+test('expireLogsPass pages past rows it cannot expire instead of re-reading them', async () => {
+  const { expireLogsPass, drainAsync } = await import('../src/retention.js')
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  // live_log truthy but not `true`: matches the SQL filter, skipped by the
+  // JS guard, never leaves the filter. Pages of 2 must still reach the rest.
+  for (let i = 0; i < 4; i++) {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { live_log: 1, command: `s${i}` } })
+    db.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 49 * 3600000, alice.id, r.seq)
+  }
+  for (let i = 0; i < 3; i++) {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'tool_output', payload: { live_log: true, command: `c${i}` } })
+    db.prepare('UPDATE events SET ts=? WHERE user_id=? AND seq=?').run(Date.now() - 48 * 3600000, alice.id, r.seq)
+  }
+  const r = await drainAsync(expireLogsPass(db, { hours: 24, mediaDir, batchSize: 2 }), {
+    yieldFn: () => new Promise((resolve) => setImmediate(resolve)),
+  })
+  assert.deepEqual(r, { expired: 3 })
 })
