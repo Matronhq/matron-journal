@@ -14,6 +14,14 @@ import { pinHintBeforeAppend, sendPinsFrame } from './pins.js'
 import { unarchiveOnMessage, sendArchiveFrame } from './archive.js'
 export { MESSAGE_TYPES, MESSAGE_TYPES_SQL }
 
+// Sort fetched rows so the correlated last_ts query need not run again for
+// ordering. Non-message activity must not change the immutable id tie-break.
+export function byLastMessageThenId(a, b) {
+  const activity = (b.last_ts ?? b.created_at) - (a.last_ts ?? a.created_at)
+  if (activity) return activity
+  return a.id > b.id ? -1 : a.id < b.id ? 1 : 0
+}
+
 // Cap for a convo id wherever one arrives from outside the process —
 // ws.js's parent_convo_id/room_id validation and spawns.js's approveSpawn
 // capping the bridge-returned `start` rpc's convo_id — same 128-char id
@@ -446,9 +454,9 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
      FROM conversations WHERE owner_user_id=?${excludeSystem ? ' AND system IS NULL' : ''}${excludePrivateOwned
        ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
               SELECT 1 FROM private_devices d WHERE d.id=conversations.agent_device_id))`
-       : ''}
-     ORDER BY last_seq DESC`
+       : ''}`
   ).all(userId)
+  conversations.sort(byLastMessageThenId)
   // archived_at (src/archive.js) only on archived rows, so the wire stays
   // the same for everything else; no key = not archived.
   for (const c of conversations) if (c.archived_at == null) delete c.archived_at
