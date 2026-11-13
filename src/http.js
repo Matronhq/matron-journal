@@ -39,6 +39,7 @@ import { handleCoordinatorRoute } from './coordinator-http.js'
 import { handleNotifyRoute } from './notify-http.js'
 import { handleDefaultsRoute } from './defaults-http.js'
 import { handleBoxDefaultsRoute } from './box-defaults-http.js'
+import { handleUsageHistoryRoute } from './usage-history-http.js'
 import { boxDefaultsByDevice } from './box-defaults.js'
 import { handlePinsRoute } from './pins-http.js'
 import { handleArchiveRoute } from './archive-http.js'
@@ -378,6 +379,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       // Per-box defaults (src/box-defaults-http.js): GET/PUT /devices/:id/defaults,
       // open to agent tokens too, unlike the other /devices/:id routes.
       if (await handleBoxDefaultsRoute({ db, hub }, req, res, url, who)) return
+      if (handleUsageHistoryRoute({ db }, req, res, url, who)) return
       if (await handlePinsRoute({ db, hub }, req, res, url, who)) return
       if (await handleArchiveRoute({ db, hub }, req, res, url, who)) return
       if (await handleSettingsRoute({ db, hub }, req, res, url, who)) return

@@ -297,6 +297,35 @@ CREATE TABLE IF NOT EXISTS device_status(
   status TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_device_status_user ON device_status(user_id);
+-- Usage history (src/usage-history.js): the past readings of each account's
+-- weekly meters. usage_windows has one row per account, meter and weekly
+-- window (named by its reset time): the last reading before the reset, the
+-- peak, and when the readings were taken. usage_samples has one row per
+-- account, meter and hour and is pruned by age; windows are kept.
+CREATE TABLE IF NOT EXISTS usage_windows(
+  user_id INTEGER NOT NULL,
+  account_key TEXT NOT NULL,
+  line_id TEXT NOT NULL,
+  reset_at INTEGER NOT NULL,
+  agent TEXT NOT NULL,
+  label TEXT NOT NULL,
+  percent INTEGER NOT NULL,
+  peak INTEGER NOT NULL,
+  first_at INTEGER NOT NULL,
+  last_at INTEGER NOT NULL,
+  devices TEXT NOT NULL,
+  PRIMARY KEY(user_id, account_key, line_id, reset_at)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS usage_samples(
+  user_id INTEGER NOT NULL,
+  account_key TEXT NOT NULL,
+  line_id TEXT NOT NULL,
+  hour INTEGER NOT NULL,
+  percent INTEGER NOT NULL,
+  reset_at INTEGER NOT NULL,
+  PRIMARY KEY(user_id, account_key, line_id, hour)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_usage_samples_hour ON usage_samples(hour);
 -- Per-conversation session header (spec 2026-09-29 coordinator session
 -- control §1): the persisted subset of the bridge's status op — model,
 -- context gauge, usage-limit stall, account meters — so the roster and a
