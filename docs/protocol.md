@@ -962,6 +962,11 @@ Rows from before the stamp carry neither, and don't count.
   mobile devices. It cannot raise the server limit. Zero requests a snapshot
   whenever replay would carry any events; equality still replays. Omitted
   or invalid values are ignored, as is the field on agent connections.
+  A very low ceiling can loop on a busy account: events that land between
+  `GET /snapshot` and the reconnect count as a gap, so the reconnect gets
+  `snapshot_required` again. Send `max_replay` on ordinary connects only;
+  on the reconnect straight after a snapshot, omit it (or send a generous
+  value) so that reconnect always replays.
   Live-only connections (`cursor: null` or omitted) are unaffected. For
   `for_you`, the lower ceiling applies to the scoped count described below.
 - **Sync scope (`hello.sync`, clients only).** `'everything'` (the default,
