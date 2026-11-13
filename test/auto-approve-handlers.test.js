@@ -13,6 +13,7 @@ import { getAutoApproveCoordinatorSpawns, setAutoApproveCoordinatorSpawns, setNo
 import { createRoutine } from '../src/routines.js'
 import { makeHub } from '../src/hub.js'
 import { handleOp } from '../src/ws.js'
+import { answerSpawnAsk } from '../src/consent-answer.js'
 import { handleSettingsRoute } from '../src/settings-http.js'
 
 // Exercise the production handlers without binding a network port.
@@ -197,4 +198,29 @@ test('automatic approval never reaches a device belonging to another user', asyn
   assert.equal(f.frames.at(-1).code, 'not_found')
   assert.equal(f.db.prepare('SELECT COUNT(*) n FROM agent_spawn_requests').get().n, 0)
   assert.equal(f.calls.length, 0)
+})
+
+test('the automatic path is identified by a flag, not by the reason text', async (t) => {
+  const f = await fixture(t)
+  await f.request()
+  await new Promise((resolve) => setImmediate(resolve))
+  const ack = f.frames.find((x) => x.kind === 'spawn' && x.event === 'pending')
+  const decidedBy = { kind: 'coordinator', deviceId: f.parent.deviceId, convoId: 'coordinator', reason: AUTO_APPROVE_REASON, causeKind: 'routine', causeRef: 'r1', verifierNote: 'checked' }
+  const r = answerSpawnAsk(f.ctx, { userId: f.user.id, requestId: ack.spawn_id, decision: 'approve', decidedBy })
+  assert.equal(r.status, 200)
+  // The same text as an ordinary Coordinator answer keeps the verifier note
+  // and is announced without the automatic marker.
+  const row = f.db.prepare('SELECT * FROM consent_decisions WHERE ask_id=?').get(ack.spawn_id)
+  assert.equal(row.verifier_note, 'checked')
+  const ev = f.db.prepare("SELECT payload FROM events WHERE type='consent_decision'").get()
+  assert.equal('auto' in JSON.parse(ev.payload), false)
+})
+
+test('an automatic approval marks its consent_decision event with auto: true', async (t) => {
+  const f = await fixture(t)
+  setAutoApproveCoordinatorSpawns(f.db, f.user.id, true)
+  await f.request()
+  await new Promise((resolve) => setImmediate(resolve))
+  const ev = f.db.prepare("SELECT payload FROM events WHERE type='consent_decision'").get()
+  assert.equal(JSON.parse(ev.payload).auto, true)
 })
