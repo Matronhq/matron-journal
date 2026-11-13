@@ -19,7 +19,7 @@ import { serveHelp } from './help.js'
 import { wakeIfOffline, isWakeableDevice } from './wake.js'
 import { handleItemsRoute, emitMarker } from './items-http.js'
 import { getItem } from './items.js'
-import { restampConsentItems, ConsentRefused, boundedSubject } from './consent-subject.js'
+import { restampConsentItems, boundedSubject } from './consent-subject.js'
 import { handleMissionsRoute } from './missions-http.js'
 import { ORIGIN_SIEVE } from './missions.js'
 import { handleSharingRoute } from './sharing-http.js'
@@ -35,7 +35,7 @@ import { handleUsersRoute } from './users-http.js'
 import { handlePasswordResetRoute, handleAccountEmailRoute } from './password-reset-http.js'
 import { handleTwoFactorLogin, handleTwoFactorRoute, twoFactorRequiredNow } from './two-factor-http.js'
 import { handleApprovalKeysRoute, announceKey } from './approval-keys-http.js'
-import { activeKeysOfDevice, requireApproval, guardedAccountAction, refuse } from './approval-keys.js'
+import { activeKeysOfDevice, guardedAccountAction, refuse } from './approval-keys.js'
 import { isTwoFactorEnabled, makeTwoFactorTickets } from './two-factor.js'
 import { PLAIN_BOX } from './token-box.js'
 import { githubAccountView } from './github-accounts.js'
@@ -471,8 +471,15 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           // current password, which is checked first so a wrong one never
           // spends the nonce. A change that loses its compare-and-swap is
           // refused inside the transaction, so it does not spend it either.
+          // A caller signed out during the hashing is today's 401 before any
+          // signature is looked at.
           let out = null
           const g = prepared && guardedAccountAction({ db, journalHost }, who, body, { op: 'change_password' }, {
+            check: () => {
+              if (db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(who.deviceId, who.userId)) return
+              out = { ok: false, revoked: true }
+              refuse(401, { error: 'unauthenticated' })
+            },
             write: () => {
               out = applyPasswordChange(db, who.userId, prepared, { deviceId: who.deviceId, signOutOthers: sign_out_others === true })
               if (!out.ok) refuse(401, { error: 'bad_password' })
@@ -780,34 +787,27 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // tokens only, an agent box only (anything else is 404, as for a
         // device that is not there). An account action: with an active key
         // the account statement {op:'protect_device', device, on} is
-        // required (requireApproval), checked in the write's transaction.
+        // required (guardedAccountAction), checked in the write's transaction.
         // The user-only flag is left as it is.
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
         const body = await readBody(req)
         if (typeof body.on !== 'boolean') return json(res, 400, { error: 'bad_request' })
         const deviceId = Number(pd[1])
         if (!db.prepare("SELECT 1 FROM devices WHERE id=? AND user_id=? AND kind='agent'").get(deviceId, who.userId)) return json(res, 404, { error: 'not_found' })
-        let refusal = null
-        let restamped = []
-        try {
-          db.transaction(() => {
-            const g = requireApproval({ db, journalHost }, who, body, { type: 'account', subject: { op: 'protect_device', device: String(deviceId), on: String(body.on) } })
-            if (!g.ok) throw new ConsentRefused(g)
+        const g = guardedAccountAction({ db, journalHost }, who, body, { op: 'protect_device', device: String(deviceId), on: String(body.on) }, {
+          write: () => {
             // A write that changes nothing (the device is gone) is the 404,
-            // never a success; thrown, so a nonce the check spent is rolled
+            // never a success; refused, so a nonce the check spent is rolled
             // back. (The check above runs in the same synchronous step, so
             // this is a backstop.)
-            if (!setDeviceProtected(db, deviceId, body.on)) throw new ConsentRefused({ status: 404, body: { error: 'not_found' } })
+            if (!setDeviceProtected(db, deviceId, body.on)) refuse(404, { error: 'not_found' })
             // Open consent items aimed at the box now say whether they need
             // a signature, and over what.
-            restamped = restampConsentItems(db, who.userId)
-          })()
-        } catch (err) {
-          if (!(err instanceof ConsentRefused)) throw err
-          refusal = err.refusal
-        }
-        if (refusal) return json(res, refusal.status, refusal.body)
-        for (const id of restamped) {
+            return restampConsentItems(db, who.userId)
+          },
+        })
+        if (!g.ok) return json(res, g.status, g.body)
+        for (const id of g.value) {
           const item = getItem(db, who.userId, id)
           if (item) emitMarker({ db, hub, pushPipeline, waker }, who, { item, action: 'updated', fallback: false })
         }
