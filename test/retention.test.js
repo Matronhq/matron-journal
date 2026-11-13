@@ -1651,3 +1651,20 @@ test('expireLogsPass pages past rows it cannot expire instead of re-reading them
   })
   assert.deepEqual(r, { expired: 3 })
 })
+
+test('runOffload offloads a payload whose live_log, expired and blob_expired flags are all false', async () => {
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  const flags = [{ live_log: false }, { expired: false }, { blob_expired: false }]
+  const seqs = flags.map((f, i) => {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:box-2', type: 'tool_output', payload: { command: `c${i}`, snippet: 'output', ...f } })
+    backdate(db, r.seq, alice.id, 40)
+    return r.seq
+  })
+  assert.equal(runOffload(db, { days: 30, mediaDir }).offloaded, 3)
+  for (const seq of seqs) {
+    const row = db.prepare('SELECT payload, blob_ref FROM events WHERE user_id=? AND seq=?').get(alice.id, seq)
+    assert.ok(row.blob_ref, 'false-valued flag stays eligible for offload')
+    assert.equal(JSON.parse(row.payload).blob_ref, row.blob_ref)
+  }
+})
