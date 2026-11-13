@@ -5225,9 +5225,9 @@ stored and read back by `GET /panic`, never written to a line.
 
 ## User settings
 
-`GET /settings` (either device kind) → `{notices: boolean, auto_archive_days: integer}`.
-`PATCH /settings {notices?, auto_archive_days?}` (client only, else **403**;
-an unknown key, a non-boolean `notices` or an `auto_archive_days` outside
+`GET /settings` (either device kind) → `{notices: boolean, auto_approve_coordinator_spawns: boolean, auto_archive_days: integer}`.
+`PATCH /settings {notices?, auto_approve_coordinator_spawns?, auto_archive_days?}` (or `PUT`; client only, else **403**;
+an empty object, an unknown key, a non-boolean switch or an `auto_archive_days` outside
 0–3650 is **400**) → the new view. `auto_archive_days` is the auto-archive
 idle window (see *Archived conversations*), default 30, `0` = off. `notices` — "Send things I need to
 read to For you" — defaults to `true` (no row reads as `true`). While on,
@@ -5238,6 +5238,31 @@ with one has no `final` entry. Prompts, permission asks and failures are
 listed either way. A change is sent live to every socket of the user as
 `{kind: 'control', op: 'settings', settings}`; `hello_ok` carries the
 current view, so nothing needs replaying.
+
+`auto_approve_coordinator_spawns` defaults to `false`, also for existing
+accounts. When enabled, requests from the current Coordinator conversation
+are approved automatically only onto the user's own online box, with a live
+registered socket, Coordinator consent enabled, and neither device user-only.
+The ask's causes must resolve through the existing own-ask rules to a verified
+non-routine root: the user's words or an item comment/tap. Missing, unverified
+and routine causes retain the normal approval flow; routine envelopes,
+verification and routine caps are not waived.
+
+This opt-in loosens the daily approval policy: automatic approvals bypass the
+rolling daily cap and instead have a ceiling of 60 per user per rolling hour.
+At that ceiling, requests wait for an answer as usual. Automatic approvals
+remain in ordinary decision history and count toward the daily cap for later
+`/consent/answer` approvals. Transfer caps are unchanged.
+
+The card and consent item are filed before the pending acknowledgement and
+the shared approval flow. Successful approval closes the item, records the
+verified cause and reason `auto-approved (Coordinator)`, emits the usual
+`consent_decision` and spawn outcome, and skips the consent nudge. A failed
+claim or decision-history write leaves the card available for an answer.
+Asleep targets retain their
+wake and consent flow. Other conversations and chat invites are unchanged.
+Apps may briefly display or notify the card before it closes. The setting is
+included in existing settings and hello frames; no client polling is added.
 
 ## Default model and effort
 
