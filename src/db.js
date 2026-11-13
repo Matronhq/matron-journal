@@ -1,3 +1,4 @@
+import os from 'node:os'
 import Database from 'better-sqlite3'
 import { healBakedTitles } from './heal-titles.js'
 import { autoTitleColumns, recomputeConvoTitle } from './convo-title.js'
@@ -1120,6 +1121,10 @@ function migrateDeviceIds(db) {
   }
 }
 
+export function defaultCacheMb(totalMem = os.totalmem()) {
+  return Math.max(8, Math.min(64, Math.floor(totalMem / 1048576 / 16)))
+}
+
 export function openDb(path) {
   const db = new Database(path)
   db.pragma('journal_mode = WAL')
@@ -1135,9 +1140,11 @@ export function openDb(path) {
   // backlog retention offload) cannot grow the WAL unbounded.
   db.pragma('journal_size_limit = 4194304')
   // Keep hot pages in-process: synchronous reads can stall the event loop
-  // when the disk is busy. The 256 MiB budget is only used as pages are
-  // touched; smaller installations can lower it with MATRON_SQLITE_CACHE_MB.
-  const cacheMb = Number(process.env.MATRON_SQLITE_CACHE_MB ?? 256)
+  // when the disk is busy. The budget is only used as pages are
+  // touched but never given back, so the default is small: 64 MiB, capped at
+  // 1/16 of RAM for small hosts. Large installs can raise it with
+  // MATRON_SQLITE_CACHE_MB.
+  const cacheMb = Number(process.env.MATRON_SQLITE_CACHE_MB ?? defaultCacheMb())
   if (Number.isFinite(cacheMb) && cacheMb > 0) db.pragma(`cache_size = -${Math.floor(cacheMb * 1024)}`)
   // The unstemmed search mirror is populated by trigger from here on; a
   // database that predates it has rows to index. 'rebuild' reads the

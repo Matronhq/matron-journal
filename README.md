@@ -88,6 +88,7 @@ on each dev box, then sign in from an app with your journal URL + username.
 |---|---|---|
 | `MATRON_DB` | `./matron.db` | Path to the SQLite database file |
 | `MATRON_PORT` | `9810` | Listen port |
+| `MATRON_SQLITE_CACHE_MB` | `64` (or 1/16 of RAM on hosts under 1 GiB, minimum 8) | SQLite page cache per connection, in MiB. Pages are cached as they are touched and never released, so a large value adds that much resident memory after a retention pass or search rebuild, on top of the OS page cache; `matron-admin` opens its own. Raise it on a large host with a busy disk. `0` or an invalid value keeps SQLite's stock cache |
 | `MATRON_BIND` | `127.0.0.1` | Bind address (put a TLS-terminating proxy in front for `wss://`) |
 | `MATRON_GITHUB_CLIENT_ID` | Matron's published OAuth App id (`Ov23likaFmqoegaDMTtz`) | GitHub OAuth App client id for account linking (device flow works with the id alone). Set to the empty string to disable linking; set your own app's id, with its secret, for the web flow |
 | `MATRON_GITHUB_CLIENT_SECRET` | unset | Client secret of an OAuth App registered for this journal (callback `https://<journal>/github/callback`). Enables the one-click web flow |
