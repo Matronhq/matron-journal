@@ -11,7 +11,7 @@ import { joinedAgentIds } from './participants.js'
 import { json, readBody } from './http-body.js'
 import { idemKeyOf, senderOf, badRequest, notFound, conflict } from './http-who.js'
 import {
-  ITEM_KINDS, NOTICE_ACTIONS, AWAITING, RESOLUTIONS, BODY_MAX, validateItemFields, createItem, getItem, listItems, listComments,
+  ITEM_KINDS, NOTICE_ACTIONS, AWAITING, RESOLUTIONS, BODY_MAX, validateItemFields, resolveStepUp, createItem, getItem, listItems, listComments,
   updateItem, addComment, setAttachmentTranscript, closeItem, reopenItem, rerankItem,
   markTranscriptsPending, isAudioAttachment, isConsentMirror, hidePrivateAuthors, listSharedItems, getSharedItem, listGrantedComments, listSharedComments,
   requestTurn,
@@ -379,6 +379,8 @@ async function handleCreate(ctx, req, res, who) {
   if (!v.ok) return badFields(res, v)
   if (strayRef(res, v.value.body, v.value.attachments)) return true
   if (body.kind === 'notice' && !noticeActionsOk(v.value.actions)) return badFields(res, { error: 'invalid_actions' })
+  // A notice has one built-in button and nothing to sign.
+  if (body.kind === 'notice' && v.value.step_up === true) return badFields(res, { error: 'invalid_actions' })
   if (body.awaiting !== undefined && body.awaiting !== null && !AWAITING.includes(body.awaiting)) return badRequest(res)
   if (body.position !== undefined && !POSITIONS.includes(body.position)) return badRequest(res)
   // `position` is exclusive: given alongside either neighbour, the intent is
@@ -397,6 +399,10 @@ async function handleCreate(ctx, req, res, who) {
   if (body.on_behalf_of !== undefined && (body.on_behalf_of !== 'user' || who.kind !== 'agent')) return badRequest(res)
   const idemKey = idemKeyOf(req, who)
   if (idemKey === undefined) return badRequest(res)
+  // step_up only counts for an owner who has an approval key.
+  const su = resolveStepUp(db, who.userId, v.value)
+  delete v.value.step_up
+  delete v.value.subject
   // Every body-only rule is settled above, so a malformed field answers 400
   // even when the conversation is one this caller may not see.
   //
@@ -428,6 +434,7 @@ async function handleCreate(ctx, req, res, who) {
       originConvoId: body.convo_id, originDeviceId: who.deviceId,
       createdBy,
       supersedes: body.supersedes ?? null, idemKey, isPrivate: body.private === true,
+      stepUp: su.stepUp, subject: su.subject,
     })
   } catch (err) {
     if (answerKnownError(res, err)) return true
@@ -442,7 +449,7 @@ async function handleCreate(ctx, req, res, who) {
       for (const blobRef of bodyAudio) ctx.itemTranscription.enqueue({ commentId: out.bodyComment.id, userId: who.userId, blobRef })
     }
   }
-  replyItems(who, res, out.duplicate ? 200 : 201, { item: out.item })
+  replyItems(who, res, out.duplicate ? 200 : 201, { item: out.item, ...(su.ignored && { step_up_ignored: true }) })
   return true
 }
 
@@ -460,6 +467,15 @@ async function handlePatch(ctx, req, res, who, item) {
   // A notice's one button is built in (createItem); it cannot be swapped.
   if (item.kind === 'notice' && !noticeActionsOk(v.value.actions)) return badFields(res, { error: 'invalid_actions' })
   const fields = { ...v.value }
+  // Approval keys: a subject belongs to a step-up item (this write's or the
+  // stored one); a notice never is one.
+  if (fields.subject !== undefined && !(fields.step_up ?? item.step_up)) return badFields(res, { error: 'invalid_subject' })
+  if (item.kind === 'notice' && fields.step_up === true) return badFields(res, { error: 'invalid_actions' })
+  let stepUpIgnored = false
+  if (fields.step_up === true) {
+    const su = resolveStepUp(db, who.userId, fields)
+    if (su.ignored) { stepUpIgnored = true; delete fields.step_up; delete fields.subject }
+  }
   // Whatever an allowed list said, a notice keeps its built-in one as stored;
   // a patch of nothing else changes nothing.
   if (item.kind === 'notice' && 'actions' in fields) {
@@ -492,7 +508,11 @@ async function handlePatch(ctx, req, res, who, item) {
       missionTarget = target.id
     }
   }
-  if (Object.keys(fields).length === 0 && body.mission === undefined) return badRequest(res)
+  if (Object.keys(fields).length === 0 && body.mission === undefined) {
+    if (!stepUpIgnored) return badRequest(res)
+    replyItems(who, res, 200, { item, step_up_ignored: true })
+    return true
+  }
   // Fields and the mission move are ONE write with ONE `updated_at` (final
   // review minor): they used to be two statements in two transactions, so a
   // `{title, mission}` patch could half-apply and stamped two timestamps.
@@ -504,7 +524,7 @@ async function handlePatch(ctx, req, res, who, item) {
   // re-polling. It is a quiet action though — no wake, no push (see
   // ITEM_ACTIONS in items-marker.js).
   emitMarker(ctx, who, { item: result, action: 'updated', from: item.mission_id })
-  replyItems(who, res, 200, { item: result })
+  replyItems(who, res, 200, { item: result, ...(stepUpIgnored && { step_up_ignored: true }) })
   return true
 }
 
@@ -680,8 +700,12 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     // refused like an agent's `action` is. `[]` is "none", same as absent.
     const offers = body.actions != null && !(Array.isArray(body.actions) && body.actions.length === 0)
     if (offers && who.kind !== 'agent') { json(res, 403, { error: 'forbidden' }); return true }
-    const v = validateItemFields({ body: body.body ?? '', attachments: body.attachments, actions: body.actions ?? undefined }, { partial: true })
+    const v = validateItemFields({ body: body.body ?? '', attachments: body.attachments, actions: body.actions ?? undefined, step_up: body.step_up, subject: body.subject }, { partial: true })
     if (!v.ok) return badFields(res, v)
+    // Signing applies to the buttons a comment offers; a subject needs it.
+    if (v.value.step_up === true && !offers) return badFields(res, { error: 'invalid_actions' })
+    if (v.value.subject !== undefined && v.value.step_up !== true) return badFields(res, { error: 'invalid_subject' })
+    const su = resolveStepUp(db, who.userId, v.value)
     if (strayRef(res, v.value.body, v.value.attachments)) return true
     // An empty body on a tap reads as the label: an old client, the fallback
     // text and the agent's turn all see exactly what the user chose.
@@ -708,7 +732,7 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       // generic rule, a reply on one would reopen it (or take it out of the
       // user's Decisions list while the ask still waits) with no agent able
       // to see the item, let alone close it again.
-      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, convoId, body: text, attachments, action, replyTo, replaces, actions: v.value.actions ?? [], idemKey, keepStatus: item.consent != null })
+      out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, convoId, body: text, attachments, action, replyTo, replaces, actions: v.value.actions ?? [], stepUp: su.stepUp, subject: su.subject, idemKey, keepStatus: item.consent != null })
     } catch (err) {
       if (answerKnownError(res, err)) return true
       throw err
@@ -778,6 +802,7 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       forwardMirrorReply(ctx, emitMarker, who, item, out.comment)
     }
     const reply = { item: out.item, comment: seenBy(out.comment) }
+    if (su.ignored) reply.step_up_ignored = true
     if (ownerNotice === true) reply.owner_notified = true
     else if (ownerNotice != null) { reply.owner_notified = false; reply.owner_notice = ownerNotice }
     replyItems(who, res, out.duplicate ? 200 : 201, reply)

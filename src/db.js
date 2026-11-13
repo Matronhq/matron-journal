@@ -1695,6 +1695,26 @@ export function openDb(path) {
   // when its session_state last entered and last left 'running'. All NULL
   // until the first such write. Placed after the notice rebuild, like
   // filed_convo_id.
+  // Approval keys (src/approval-keys.js): an agent marks an item, or one
+  // comment's buttons, as needing a signed tap. `step_up` is 0/1 and `subject`
+  // the JSON text of a flat string map the key's owner is shown; a comment's
+  // `approval` is the JSON {statement, signature} of the signed tap that
+  // answered it. All inert (0 / NULL) on every row from before the columns.
+  if (!itemHandoverCols.some((c) => c.name === 'step_up')) {
+    db.exec('ALTER TABLE items ADD COLUMN step_up INTEGER NOT NULL DEFAULT 0')
+  }
+  if (!itemHandoverCols.some((c) => c.name === 'subject')) {
+    db.exec('ALTER TABLE items ADD COLUMN subject TEXT')
+  }
+  if (!commentActionCols.some((c) => c.name === 'step_up')) {
+    db.exec('ALTER TABLE item_comments ADD COLUMN step_up INTEGER NOT NULL DEFAULT 0')
+  }
+  if (!commentActionCols.some((c) => c.name === 'subject')) {
+    db.exec('ALTER TABLE item_comments ADD COLUMN subject TEXT')
+  }
+  if (!commentActionCols.some((c) => c.name === 'approval')) {
+    db.exec('ALTER TABLE item_comments ADD COLUMN approval TEXT')
+  }
   if (!itemHandoverCols.some((c) => c.name === 'turn_requested_at')) {
     db.exec('ALTER TABLE items ADD COLUMN turn_requested_at INTEGER')
   }

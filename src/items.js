@@ -8,6 +8,8 @@ import { blobImageDims, isPrivateDevice } from './db.js'
 import { yieldTurn } from './background.js'
 import { presentWithdrawn } from './withdrawn-comments.js'
 import { listReplicaItems } from './federation-replica.js'
+import { validSubject } from './approvals.js'
+import { hasActiveKey } from './approval-keys.js'
 
 export const ITEM_KINDS = ['task', 'question', 'decision', 'notice']
 // A notice (mission: For you) is something the user needs to read but not
@@ -137,6 +139,19 @@ export function validateItemFields(fields, { partial = false, allowTranscript = 
     if (!actions) return { ok: false, error: 'invalid_actions' }
     value.actions = actions
   }
+  // Approval keys: `step_up` marks the item (or a comment's buttons) as
+  // needing a signed tap; `subject` is the flat string map shown with it.
+  // A subject needs step_up on: absent in a partial write, the caller checks
+  // it against what is stored.
+  if (fields.step_up !== undefined) {
+    if (typeof fields.step_up !== 'boolean') return { ok: false }
+    value.step_up = fields.step_up
+  }
+  if (fields.subject !== undefined) {
+    if (!validSubject(fields.subject)) return { ok: false, error: 'invalid_subject' }
+    if (fields.step_up === false || (fields.step_up === undefined && !partial)) return { ok: false, error: 'invalid_subject' }
+    value.subject = fields.subject
+  }
   const att = validateAttachments(fields.attachments, { allowTranscript })
   if (!att.ok) return att.error ? { ok: false, error: att.error, max: ATTACHMENTS_MAX } : { ok: false }
   if (fields.attachments !== undefined) value.attachments = att.value
@@ -144,6 +159,15 @@ export function validateItemFields(fields, { partial = false, allowTranscript = 
 }
 
 const parseJson = (s, fallback) => { try { return JSON.parse(s) } catch { return fallback } }
+
+// What to store for a write that asked for step_up: only an owner with an
+// active approval key can have one, so for anyone else the item stays
+// ordinary and the caller says `step_up_ignored`.
+export function resolveStepUp(db, ownerUserId, { step_up: stepUp, subject }) {
+  if (stepUp !== true) return { stepUp: false, subject: null, ignored: false }
+  if (!hasActiveKey(db, ownerUserId)) return { stepUp: false, subject: null, ignored: true }
+  return { stepUp: true, subject: subject ?? null, ignored: false }
+}
 
 // `idem_key` is an internal column (same stance as toEventShape in
 // journal.js): the caller sent the key, so handing it back tells it nothing,
@@ -172,6 +196,8 @@ export function rowToItem(row) {
     // Owner-only (see db.js): never on another person's wire, so a row
     // that reaches one is always false there.
     private: !!rest.private,
+    step_up: !!rest.step_up,
+    subject: rest.subject == null ? null : parseJson(rest.subject, null),
   }
   // Filed by another person, a contributor to the item's mission: who, in
   // words. Absent on every other item, so their shape is unchanged.
@@ -245,7 +271,7 @@ export function requestTurn(db, itemId, now = Date.now()) {
 // reader may not learn them (hidePrivateAuthors, listSharedComments).
 export function rowToComment(row) {
   if (!row) return null
-  const { attachments, meta, actions, idem_key: _idemKey, user_id: _userId, withdrawn_at: withdrawnAt, ...rest } = row
+  const { attachments, meta, actions, idem_key: _idemKey, user_id: _userId, withdrawn_at: withdrawnAt, step_up: stepUp, subject, approval, ...rest } = row
   const agent = rest.author === 'agent'
   rest.device_name = agent ? rest.device_name ?? null : null
   rest.convo_id = agent ? rest.convo_id ?? null : null
@@ -271,6 +297,8 @@ export function rowToComment(row) {
   return {
     ...rest, attachments: parseJson(attachments, []), meta: m, action, reply_to: replyTo, ...attribution,
     actions: parseJson(actions ?? '[]', []), chosen_action: rest.chosen_action ?? null,
+    step_up: !!stepUp, subject: subject == null ? null : parseJson(subject, null),
+    approval: approval == null ? null : parseJson(approval, null),
   }
 }
 
@@ -370,7 +398,7 @@ export function resolveRank(db, userId, { position, after, before, excludeId = n
 }
 
 export function createItem(db, {
-  userId, kind, title, body = '', labels = [], links = [], attachments = [], actions = [], awaiting, position, after, before,
+  userId, kind, title, body = '', labels = [], links = [], attachments = [], actions = [], stepUp = false, subject = null, awaiting, position, after, before,
   originConvoId, originDeviceId, createdBy, supersedes = null, idemKey = null, consent = null, isPrivate = false, now = Date.now(),
 }) {
   return db.transaction(() => {
@@ -391,10 +419,10 @@ export function createItem(db, {
     const missionId = db.prepare('SELECT mission_id FROM conversations WHERE id=?').get(originConvoId)?.mission_id ?? null
     try {
       db.prepare(`INSERT INTO items(id,user_id,num,kind,state,resolution,awaiting,rank,title,body,labels,links,supersedes,
-        origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at,mission_id,consent,actions,private)
-        VALUES(?,?,?,?,'open',NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        origin_convo_id,origin_device_id,created_by,idem_key,created_at,updated_at,mission_id,consent,actions,private,step_up,subject)
+        VALUES(?,?,?,?,'open',NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(id, userId, num, kind, aw, rank, title, body, JSON.stringify(labels), JSON.stringify(links), supersedes,
-          originConvoId, originDeviceId, createdBy, idemKey, now, now, missionId, consent, JSON.stringify(actions), isPrivate ? 1 : 0)
+          originConvoId, originDeviceId, createdBy, idemKey, now, now, missionId, consent, JSON.stringify(actions), isPrivate ? 1 : 0, stepUp ? 1 : 0, stepUp && subject ? JSON.stringify(subject) : null)
     } catch (err) {
       // A racing writer on another connection committed the same
       // (user_id, idem_key) between our lookup above and this INSERT. That
@@ -701,7 +729,7 @@ export function listSharedComments(db, itemId) {
   const hidden = new Set(db.prepare(`SELECT DISTINCT c.device_id AS id FROM item_comments c JOIN private_devices pd ON pd.id = c.device_id
     WHERE c.item_id = ? AND c.author = 'agent'`).all(itemId).map((r) => r.id))
   return listComments(db, itemId).filter((c) => !c.meta?.handover && !(c.author === 'agent' && hidden.has(c.device_id)))
-    .map((c) => presentWithdrawn({ ...c, device_name: null, convo_id: null, convo_title: null }))
+    .map((c) => presentWithdrawn({ ...c, device_name: null, convo_id: null, convo_title: null, approval: null }))
 }
 
 export function listSharedItems(db, viewerUserId, { kind = null, state = null, awaiting = null, limit = 100, cursor = null } = {}) {
@@ -766,12 +794,12 @@ export function withImageDims(db, attachments) {
   })
 }
 
-export function insertComment(db, { itemId, userId, author, deviceId, convoId = null, kind, body, attachments, meta, actions = [], idemKey, now }) {
+export function insertComment(db, { itemId, userId, author, deviceId, convoId = null, kind, body, attachments, meta, actions = [], stepUp = false, subject = null, idemKey, now }) {
   attachments = withImageDims(db, attachments)
   const id = newId('ic')
-  db.prepare(`INSERT INTO item_comments(id,item_id,user_id,author,device_id,convo_id,kind,body,attachments,meta,idem_key,created_at,actions)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(id, itemId, userId, author, deviceId, author === 'agent' ? convoId : null, kind, body, JSON.stringify(attachments ?? []), meta == null ? null : JSON.stringify(meta), idemKey, now, JSON.stringify(actions ?? []))
+  db.prepare(`INSERT INTO item_comments(id,item_id,user_id,author,device_id,convo_id,kind,body,attachments,meta,idem_key,created_at,actions,step_up,subject)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(id, itemId, userId, author, deviceId, author === 'agent' ? convoId : null, kind, body, JSON.stringify(attachments ?? []), meta == null ? null : JSON.stringify(meta), idemKey, now, JSON.stringify(actions ?? []), stepUp ? 1 : 0, stepUp && subject ? JSON.stringify(subject) : null)
   return commentById(db, id)
 }
 
@@ -804,7 +832,7 @@ const ownedRow = (db, userId, itemId) => db.prepare('SELECT * FROM items WHERE i
 // reply in it rather than a cancelled copy and its edit. It only counts for
 // the user's own withdrawn reply on this item; anything else is dropped
 // without refusing the comment, whose words matter more than the link.
-export function addComment(db, { userId, itemId, author, deviceId, convoId = null, body = '', attachments = [], action = null, replyTo = null, replaces = null, actions = [], idemKey = null, keepStatus = false, now = Date.now() }) {
+export function addComment(db, { userId, itemId, author, deviceId, convoId = null, body = '', attachments = [], action = null, replyTo = null, replaces = null, actions = [], stepUp = false, subject = null, idemKey = null, keepStatus = false, now = Date.now() }) {
   return db.transaction(() => {
     const row = ownedRow(db, userId, itemId)
     if (!row) return null
@@ -842,7 +870,7 @@ export function addComment(db, { userId, itemId, author, deviceId, convoId = nul
     }
     let comment
     try {
-      comment = insertComment(db, { itemId, userId, author, deviceId, convoId, kind: 'comment', body, attachments, meta, actions, idemKey, now })
+      comment = insertComment(db, { itemId, userId, author, deviceId, convoId, kind: 'comment', body, attachments, meta, actions, stepUp, subject, idemKey, now })
     } catch (err) {
       if (idemKey && err.code === 'SQLITE_CONSTRAINT_UNIQUE') throw new Error('idem_key_conflict')
       throw err
@@ -928,6 +956,11 @@ export function updateItem(db, { userId, itemId, fields, missionId, now = Date.n
       // field at once) keeps the user's choice.
       if (next !== row.actions) sets.push('chosen_action=NULL')
     }
+    if (fields.step_up !== undefined) {
+      sets.push('step_up=?'); args.push(fields.step_up ? 1 : 0)
+      if (!fields.step_up) sets.push('subject=NULL')
+    }
+    if (fields.step_up !== false && fields.subject !== undefined) { sets.push('subject=?'); args.push(JSON.stringify(fields.subject)) }
     db.prepare(`UPDATE items SET ${sets.join(', ')} WHERE id=?`).run(...args, itemId)
     return getItem(db, userId, itemId)
   })()

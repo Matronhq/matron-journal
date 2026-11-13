@@ -38,7 +38,7 @@ export function keyIdOf(publicKeyB64u) {
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
 const isStr = (v) => typeof v === 'string' && v.length > 0
 
-function validSubject(s) {
+export function validSubject(s) {
   if (!isObj(s)) return false
   const entries = Object.entries(s)
   if (entries.length > SUBJECT_MAX_KEYS) return false
