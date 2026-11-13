@@ -8,9 +8,9 @@
       { "id": "c2", "owner": "alice", "title": "Newer chat", "sessionState": "running" }
     ],
     "events": [
-      { "convo": "c1", "sender": "agent:dev-2", "type": "text", "payload": { "body": "older message" } },
-      { "convo": "c2", "sender": "agent:dev-2", "type": "text", "payload": { "body": "newer message" } },
-      { "convo": "c1", "sender": "agent:dev-2", "type": "session_status", "payload": { "state": "waiting" } }
+      { "convo": "c1", "sender": "agent:box-2", "type": "text", "payload": { "body": "older message" } },
+      { "convo": "c2", "sender": "agent:box-2", "type": "text", "payload": { "body": "newer message" } },
+      { "convo": "c1", "sender": "agent:box-2", "type": "session_status", "payload": { "state": "waiting" } }
     ]
   },
   "steps": [
