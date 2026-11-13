@@ -31,6 +31,7 @@ import { confirmIdentity } from './two-factor-http.js'
 import { isTwoFactorEnabled, classifyCode } from './two-factor.js'
 import { fileNotice } from './sharing-events.js'
 import { sanitizePeerText, plainText } from './peer-text.js'
+import { restampConsentItems } from './consent-subject.js'
 
 // A key's name is a label in the apps, like a device name (http.js).
 const KEY_NAME_MAX = 40
@@ -55,6 +56,15 @@ export function announceKey(ctx, userId, key, { added, how }) {
     idemKey: `approval-key:${verb}:${key.key_id}`,
     push: true,
   })
+  // Whether the account has a key decides whether a consent item aimed at a
+  // protected box says it needs a signature (src/consent-subject.js): its
+  // first key added or its last removed changes that. Best-effort; the
+  // answer path decides afresh either way.
+  try {
+    restampConsentItems(ctx.db, userId)
+  } catch (err) {
+    console.error('approval keys: restamping consent items failed', err)
+  }
 }
 
 const BY_PASSWORD = 'with your password and a two-factor code'

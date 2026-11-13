@@ -699,7 +699,11 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       // consent-answer.js).
       if (item.consent === 'transfer' || item.consent === 'spawn' || item.consent === 'chat') {
         if (body.reply_to != null) { json(res, 400, { error: 'unknown_action' }); return true }
-        const r = item.consent === 'transfer' ? transferTapAnswer(ctx, who, item, action) : consentItemTapAnswer(ctx, who, item, action)
+        // `approval`: a consent statement, needed to approve an ask aimed
+        // at a protected box once the account has a key
+        // (src/consent-subject.js); never an item_tap one.
+        const approval = body.approval ?? null
+        const r = item.consent === 'transfer' ? transferTapAnswer(ctx, who, item, action, approval) : consentItemTapAnswer(ctx, who, item, action, approval)
         if (r.status !== 200) { json(res, r.status, r.body); return true }
         json(res, 200, { item: getItem(db, who.userId, item.id) ?? item, ...r.body })
         return true

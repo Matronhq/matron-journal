@@ -13,6 +13,8 @@ import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, inheritedSpawnMission, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, sanitizeBoxDefaults, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem, reconcileConsentItems } from './consent-items.js'
 import { nudgeCoordinator, chatAskId } from './consent.js'
+import { isProtectedDevice, consentSubject } from './consent-subject.js'
+import { hasActiveKey, requireApproval } from './approval-keys.js'
 import { expireContactAsks } from './contacts.js'
 import { expireInviteAsks, onInviteAskExpired } from './federation-invite-asks.js'
 import { expireGrantAsks } from './grants.js'
@@ -272,6 +274,7 @@ export function attachWs({
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
   revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES, inviteTtlMs = 1800000,
   broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null,
+  journalHost = null,
 }) {
   // Derived, never raw: the orphan sweep must always outlast a live `start`
   // RPC still in flight (see APPROVED_ORPHAN_TTL_FLOOR_MS's comment) — and,
@@ -704,7 +707,7 @@ export function attachWs({
         // reserialization, which JSON.parse's whitespace-stripping would
         // shrink. `data` is a Buffer here (ws delivers text frames as
         // Buffers), so .length is the byte count.
-        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker })
+        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker, journalHost })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -760,7 +763,7 @@ export function notifyStale(db, hub, entry, reason = 'stale') {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null }) {
+export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null, journalHost = null }) {
   const fail = (code, detail) => {
     conn.ws.send(JSON.stringify({
       kind: 'control', op: 'error', code, ref: msg.op,
@@ -1073,12 +1076,43 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // indistinguishable — anti-enumeration, same stance as the HTTP 404s.
         const target = db.prepare('SELECT user_id, kind FROM devices WHERE id=?').get(msg.agent_device_id)
         if (!target || target.user_id !== conn.userId || target.kind !== 'agent') return failRpc('not_found')
-        // Single-consumer delivery (see hub.sendRpcRequest): false means no
-        // live socket — no queueing, the client hears it immediately.
-        const delivered = hub.sendRpcRequest(conn.userId, msg.agent_device_id, {
+        const send = () => hub.sendRpcRequest(conn.userId, msg.agent_device_id, {
           kind: 'rpc',
           request: { request_id: rid, from_device_id: conn.deviceId, method: msg.method, params: msg.params ?? null },
         })
+        // A direct `start` on a protected box (src/consent-subject.js) is an
+        // account action once the account has an approval key: the client
+        // signs {op:'start', box, workdir, prompt_sha256} and sends it as
+        // params.approval; the params go to the box unchanged, approval
+        // included, for the box to check itself. Checked and sent in one
+        // transaction: a refusal, or a box with no live socket, leaves the
+        // nonce unspent. Every other request, and every request of an
+        // account with no key, is today's.
+        let delivered
+        if (msg.method === 'start' && isProtectedDevice(db, conn.userId, msg.agent_device_id) && hasActiveKey(db, conn.userId)) {
+          const p = msg.params
+          const isText = (v) => v === undefined || typeof v === 'string'
+          if (p === null || typeof p !== 'object' || Array.isArray(p) || !isText(p.workdir) || !isText(p.prompt)) return failRpc('bad_request', 'bad params')
+          const box = db.prepare('SELECT name FROM devices WHERE id=?').get(msg.agent_device_id).name
+          const subject = consentSubject('start', { box, workdir: p.workdir ?? '', prompt: p.prompt ?? '' })
+          let refused = null
+          try {
+            delivered = db.transaction(() => {
+              const g = requireApproval({ db, journalHost }, conn, { approval: p.approval }, { type: 'account', subject })
+              if (!g.ok) { refused = g; return false }
+              if (!send()) throw new Error('undelivered')
+              return true
+            })()
+          } catch (err) {
+            if (err?.message !== 'undelivered') throw err
+            delivered = false
+          }
+          if (refused) return failRpc(refused.body.error, refused.body.reason)
+        } else {
+          // Single-consumer delivery (see hub.sendRpcRequest): false means no
+          // live socket — no queueing, the client hears it immediately.
+          delivered = send()
+        }
         if (!delivered) {
           // Still refused — no RPC queueing — but the box starts booting, so
           // the caller's retry lands on a live bridge.

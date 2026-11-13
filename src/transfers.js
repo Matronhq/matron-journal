@@ -57,7 +57,7 @@ const TRANSITIONS = {
   },
 }
 // Columns a patch may set besides the three state axes.
-const PATCH_COLUMNS = new Set(['item_id', 'decided_by', 'decided_reason', 'approved_at', 'uploaded_at', 'released_at', 'delivered_at', 'deleted_at'])
+const PATCH_COLUMNS = new Set(['item_id', 'decided_by', 'decided_reason', 'approval', 'approved_at', 'uploaded_at', 'released_at', 'delivered_at', 'deleted_at'])
 
 const ID_RE = /^tr_[0-9a-f]{32}$/
 export const isTransferId = (id) => typeof id === 'string' && ID_RE.test(id)

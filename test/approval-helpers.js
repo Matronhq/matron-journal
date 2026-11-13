@@ -99,6 +99,10 @@ export async function signApproval(s, { token, key, user = 'alice', journal = TE
 // An account statement for `subject`, signed as above.
 export const signAccount = (s, { token, key, subject, ...rest }) => signApproval(s, { token, key, type: 'account', subject, ...rest })
 
+// A consent statement for `subject` (the ask's, as GET /consent/pending or
+// its consent item publishes it), signed as above.
+export const signConsent = (s, { token, key, subject, ...rest }) => signApproval(s, { token, key, type: 'consent', subject, ...rest })
+
 // A signed tap: the `approval` for tapping `action` on `item` (as the journal
 // returns it), or on the follow-up `comment`'s buttons when one is given.
 // The digest and subject follow the journal's rule (a step-up comment's own

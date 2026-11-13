@@ -723,6 +723,7 @@ export function startServer({
     // spawnStartTimeoutMs rides along so the orphan sweep's TTL can never
     // undercut a configured start timeout (attachWs derives the TTL).
     broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, sessionControlTimeoutMs, waker: resolvedWaker,
+    journalHost,
   })
   let retentionInterval = null
   let walCheckpointInterval = null

@@ -1950,6 +1950,7 @@ export function openDb(path) {
   addTransferRecipient(db)
   addTransferConsentSetting(db)
   addPeerFailingSince(db)
+  addProtectedDevices(db)
   // A routine's envelope (JSON): the bounds on what an ask born of one of
   // its fires may do — how many spawns per fire, whether chats, which boxes.
   // NULL = no envelope, the value for every routine predating the column.
@@ -2374,8 +2375,8 @@ export function listDevices(db, userId) {
   const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)
   const headSeq = head ? head.seq : 0
   return db.prepare(
-    'SELECT id AS device_id, kind, name, tag_char, created_at, cursor, last_seen_at FROM devices WHERE user_id=? ORDER BY id'
-  ).all(userId).map((d) => ({ ...d, lag: headSeq - d.cursor }))
+    'SELECT id AS device_id, kind, name, tag_char, created_at, cursor, last_seen_at, protected FROM devices WHERE user_id=? ORDER BY id'
+  ).all(userId).map((d) => ({ ...d, protected: d.protected === 1, lag: headSeq - d.cursor }))
 }
 
 // Box status (spec: 2026-09-21 "usage and allowances live in the journal").
@@ -2434,6 +2435,12 @@ export function isPrivateDevice(db, deviceId) {
 
 export function setDeviceConsentUserOnly(db, deviceId, on) {
   db.prepare('UPDATE devices SET consent_user_only=? WHERE id=?').run(on ? 1 : 0, deviceId)
+}
+
+// The protected flag (src/consent-subject.js). Leaves consent_user_only as
+// it is: protected implies user-only while it is set, on its own.
+export function setDeviceProtected(db, deviceId, on) {
+  return db.prepare('UPDATE devices SET protected=? WHERE id=?').run(on ? 1 : 0, deviceId).changes > 0
 }
 
 // matron-admin's write: sets the value AND takes ownership (pin). Both
@@ -2560,6 +2567,21 @@ export function addTransferConsentSetting(db) {
 export function addTransferRecipient(db) {
   const cols = db.prepare('PRAGMA table_info(transfers)').all()
   if (!cols.some((c) => c.name === 'recipient_device_id')) db.exec('ALTER TABLE transfers ADD COLUMN recipient_device_id INTEGER')
+}
+
+// Protected boxes (src/consent-subject.js): devices.protected marks a box
+// whose consent asks are the user's alone and, once the account has an
+// approval key, need a signed approval. The approval the user's answer
+// carried ({statement, signature} as JSON, exactly as received) is kept on
+// the ask's row until it is forwarded to the box: the spawn's `start`, the
+// chat invite (delivered later, on the box's hello, when it is asleep) and
+// the released transfer. NULL for every other answer. Idempotent.
+export function addProtectedDevices(db) {
+  const has = (table, col) => db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === col)
+  if (!has('devices', 'protected')) db.exec('ALTER TABLE devices ADD COLUMN protected INTEGER NOT NULL DEFAULT 0')
+  if (!has('agent_spawn_requests', 'approval')) db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN approval TEXT')
+  if (!has('convo_agents', 'approval')) db.exec('ALTER TABLE convo_agents ADD COLUMN approval TEXT')
+  if (!has('transfers', 'approval')) db.exec('ALTER TABLE transfers ADD COLUMN approval TEXT')
 }
 
 // When deliveries to a peer journal started failing (src/federation-outbox.js):

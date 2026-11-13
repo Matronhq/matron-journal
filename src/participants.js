@@ -42,7 +42,8 @@ function upsertRow(db, { convoId, agentDeviceId, initiatorDeviceId, state, justi
       causes=excluded.causes,
       created_at=excluded.created_at,
       answered_at=NULL,
-      delivered_at=NULL
+      delivered_at=NULL,
+      approval=NULL
   `).run(convoId, agentDeviceId, initiatorDeviceId, state, justification, topic, targetConvoId, initiatorConvoId, spawnId, causes ? JSON.stringify(causes) : null, Date.now())
   return { ok: true, prior: existing ?? null }
 }
@@ -106,9 +107,12 @@ export function recordOwnerConvo(db, { roomId, convoId, deviceId, createdAt }) {
 // `answeredBy` / `answerReason` (spec: 2026-09-29 coordinator consent) name
 // the Coordinator and its reason when it, not a tap, answered; null for a
 // tap, which is the pre-field row shape.
-export function answerParkedInvite(db, { convoId, agentDeviceId, approve, now = Date.now(), answeredBy = null, answerReason = null }) {
+// `approval` (approve only): the user's signed approval of an invite to a
+// protected box, the JSON of {statement, signature} as received
+// (src/consent-subject.js), delivered with the invite; null otherwise.
+export function answerParkedInvite(db, { convoId, agentDeviceId, approve, now = Date.now(), answeredBy = null, answerReason = null, approval = null }) {
   const r = approve
-    ? db.prepare("UPDATE convo_agents SET state='invited', created_at=?, answered_at=NULL, answered_by=?, answer_reason=? WHERE convo_id=? AND agent_device_id=? AND state='awaiting_user'").run(now, answeredBy, answerReason, convoId, agentDeviceId)
+    ? db.prepare("UPDATE convo_agents SET state='invited', created_at=?, answered_at=NULL, answered_by=?, answer_reason=?, approval=? WHERE convo_id=? AND agent_device_id=? AND state='awaiting_user'").run(now, answeredBy, answerReason, approval, convoId, agentDeviceId)
     : db.prepare("UPDATE convo_agents SET state='denied', answered_at=?, answered_by=?, answer_reason=? WHERE convo_id=? AND agent_device_id=? AND state='awaiting_user'").run(now, answeredBy, answerReason, convoId, agentDeviceId)
   return r.changes === 1
 }
@@ -133,7 +137,7 @@ export function markDelivered(db, { convoId, agentDeviceId, now = Date.now() }) 
 // feeds).
 export function undeliveredInvites(db) {
   return db.prepare(`
-    SELECT ca.convo_id, ca.agent_device_id, ca.initiator_device_id, ca.justification, ca.topic, ca.target_convo_id, ca.initiator_convo_id, ca.answered_by,
+    SELECT ca.convo_id, ca.agent_device_id, ca.initiator_device_id, ca.justification, ca.topic, ca.target_convo_id, ca.initiator_convo_id, ca.answered_by, ca.approval,
            c.owner_user_id, c.agent_device_id AS room_agent_device_id
     FROM convo_agents ca JOIN conversations c ON c.id = ca.convo_id
     WHERE ca.state='invited' AND ca.delivered_at IS NULL

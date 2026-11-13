@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import { pipeline } from 'node:stream/promises'
 import { checkPassword, makeRateLimiter, makeKeyedQueue, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
-import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, isPrivateDevice, deviceStatuses } from './db.js'
+import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, isPrivateDevice, deviceStatuses, setDeviceProtected } from './db.js'
 import { receiveBlob } from './media.js'
 import { readBlobTranscript, isTranscribableType, transcriptWaitS } from './blob-transcripts.js'
 import { imageSizeFromFile } from './image-size.js'
@@ -17,7 +17,9 @@ import { canReadConvo, canReadBlob } from './visibility.js'
 import { parseCitation, verifySaid } from './said.js'
 import { serveHelp } from './help.js'
 import { wakeIfOffline, isWakeableDevice } from './wake.js'
-import { handleItemsRoute } from './items-http.js'
+import { handleItemsRoute, emitMarker } from './items-http.js'
+import { getItem } from './items.js'
+import { restampConsentItems } from './consent-subject.js'
 import { handleMissionsRoute } from './missions-http.js'
 import { ORIGIN_SIEVE } from './missions.js'
 import { handleSharingRoute } from './sharing-http.js'
@@ -33,7 +35,7 @@ import { handleUsersRoute } from './users-http.js'
 import { handlePasswordResetRoute, handleAccountEmailRoute } from './password-reset-http.js'
 import { handleTwoFactorLogin, handleTwoFactorRoute, twoFactorRequiredNow } from './two-factor-http.js'
 import { handleApprovalKeysRoute, announceKey } from './approval-keys-http.js'
-import { activeKeysOfDevice } from './approval-keys.js'
+import { activeKeysOfDevice, requireApproval } from './approval-keys.js'
 import { isTwoFactorEnabled, makeTwoFactorTickets } from './two-factor.js'
 import { PLAIN_BOX } from './token-box.js'
 import { githubAccountView } from './github-accounts.js'
@@ -621,7 +623,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // The answer itself lives in src/consent-answer.js, shared with the
         // Coordinator's route: a tap and a Coordinator decision do exactly
         // the same thing, with the deny masked as a peer refusal either way.
-        const r = answerChatAsk({ db, hub, waker }, { userId: who.userId, roomId: room_id, targetDeviceId: target_device_id, decision: decision === 'deny' ? 'decline' : 'approve', decidedBy: { kind: 'user', deviceId: who.deviceId } })
+        // `approval`: the signed approval an invite to a protected box needs
+        // once the account has a key (src/consent-subject.js).
+        const r = answerChatAsk({ db, hub, waker, journalHost }, { userId: who.userId, roomId: room_id, targetDeviceId: target_device_id, decision: decision === 'deny' ? 'decline' : 'approve', decidedBy: { kind: 'user', deviceId: who.deviceId }, approval: body.approval ?? null })
         return json(res, r.status, r.body)
       }
       if (req.method === 'POST' && url.pathname === '/agent-spawn/answer') {
@@ -640,7 +644,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // Shared with the Coordinator's route (src/consent-answer.js): the
         // claim, the off-cycle orchestration and the wake-before-spawn are
         // one code path whoever answered.
-        const r = answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs }, { userId: who.userId, requestId: request_id, decision: decision === 'deny' ? 'decline' : 'approve', decidedBy: { kind: 'user', deviceId: who.deviceId } })
+        // `approval`: the signed approval a spawn onto a protected box needs
+        // once the account has a key (src/consent-subject.js).
+        const r = answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs, journalHost }, { userId: who.userId, requestId: request_id, decision: decision === 'deny' ? 'decline' : 'approve', decidedBy: { kind: 'user', deviceId: who.deviceId }, approval: body.approval ?? null })
         return json(res, r.status, r.body)
       }
       if (req.method === 'GET' && url.pathname === '/search') {
@@ -750,6 +756,39 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // db.js — not a call here. This route used to do the cleanup itself,
         // which left `matron-admin device revoke` quietly not doing it.
         return json(res, 200, { ok: true })
+      }
+      const pd = url.pathname.match(/^\/devices\/(\d+)\/protected$/)
+      if (req.method === 'POST' && pd) {
+        // Mark one of the user's own boxes protected, or not
+        // (src/consent-subject.js): its consent asks become the user's alone
+        // and, once the account has an approval key, need a signature; its
+        // sessions are out of the Coordinator's session control. Client
+        // tokens only, an agent box only (anything else is 404, as for a
+        // device that is not there). An account action: with an active key
+        // the account statement {op:'protect_device', device, on} is
+        // required (requireApproval), checked in the write's transaction.
+        // The user-only flag is left as it is.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const body = await readBody(req)
+        if (typeof body.on !== 'boolean') return json(res, 400, { error: 'bad_request' })
+        const deviceId = Number(pd[1])
+        if (!db.prepare("SELECT 1 FROM devices WHERE id=? AND user_id=? AND kind='agent'").get(deviceId, who.userId)) return json(res, 404, { error: 'not_found' })
+        let refusal = null
+        let restamped = []
+        db.transaction(() => {
+          const g = requireApproval({ db, journalHost }, who, body, { type: 'account', subject: { op: 'protect_device', device: String(deviceId), on: String(body.on) } })
+          if (!g.ok) { refusal = g; return }
+          setDeviceProtected(db, deviceId, body.on)
+          // Open consent items aimed at the box now say whether they need a
+          // signature, and over what.
+          restamped = restampConsentItems(db, who.userId)
+        })()
+        if (refusal) return json(res, refusal.status, refusal.body)
+        for (const id of restamped) {
+          const item = getItem(db, who.userId, id)
+          if (item) emitMarker({ db, hub, pushPipeline, waker }, who, { item, action: 'updated', fallback: false })
+        }
+        return json(res, 200, { ok: true, device_id: deviceId, protected: body.on })
       }
       const rn = url.pathname.match(/^\/devices\/(\d+)\/rename$/)
       if (req.method === 'POST' && rn) {

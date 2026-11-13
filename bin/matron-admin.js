@@ -4,7 +4,7 @@ import os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import qrcode from 'qrcode-terminal'
 import QRCode from 'qrcode'
-import { openDb, pinDevicePrivate, unpinDevicePrivate, setDeviceConsentUserOnly } from '../src/db.js'
+import { openDb, pinDevicePrivate, unpinDevicePrivate, setDeviceConsentUserOnly, setDeviceProtected } from '../src/db.js'
 import { createUser, setPassword, createAgent, revokeDevice } from '../src/auth.js'
 import { resolveMediaDir } from '../src/media.js'
 import { resolvePreapproveKeyPath } from '../src/preapprove-key.js'
@@ -13,6 +13,7 @@ import { listAwaiting, answerParkedInvite } from '../src/participants.js'
 import { closeChatConsentItem } from '../src/consent-items.js'
 import { normaliseEmail, setUserEmail } from '../src/password-reset.js'
 import { setTransferConsentEnabled } from '../src/consent.js'
+import { restampConsentItems } from '../src/consent-subject.js'
 import { resolveFederationConfig, storedFederationKeyInfo } from '../src/federation-identity.js'
 import { formatFingerprint } from '../src/federation-envelope.js'
 import { makeTokenBox } from '../src/token-box.js'
@@ -39,6 +40,7 @@ const USAGE = `usage:
   matron-admin device revoke <device_id>
   matron-admin device private <device_id> on|off|auto
   matron-admin device consent <device_id> user-only|any
+  matron-admin device protected <device_id> on|off
   matron-admin coordinator transfers <username> on|off
   matron-admin link-code <username> --server-url <url> [--port <n>] [--expires <30m|24h>] [--png <path>]
   matron-admin offload [--days N]
@@ -308,12 +310,13 @@ export async function runAdmin(db, argv, deps = {}) {
     if (!username) throw new Error(USAGE)
     const user = db.prepare('SELECT id FROM users WHERE name=?').get(username)
     if (!user) throw new Error(`no such user: ${username}`)
-    const devices = db.prepare('SELECT id, kind, name, cursor, last_seen_at, private, private_pinned, consent_user_only FROM devices WHERE user_id=? ORDER BY id').all(user.id)
+    const devices = db.prepare('SELECT id, kind, name, cursor, last_seen_at, private, private_pinned, consent_user_only, protected FROM devices WHERE user_id=? ORDER BY id').all(user.id)
     if (devices.length === 0) return `no devices for ${username}`
     return devices.map((d) =>
       `${d.id} kind=${d.kind} name=${d.name} cursor=${d.cursor} last_seen_at=${d.last_seen_at ?? 'never'}` +
       ` private=${d.private ? 'yes' : 'no'}${d.private_pinned ? ' (pinned)' : ''}` +
-      (d.consent_user_only ? ' consent=user-only' : '')
+      (d.consent_user_only ? ' consent=user-only' : '') +
+      (d.protected ? ' protected' : '')
     ).join('\n')
   }
   // Spec §8: "Revocation: delete the device/agent row; its socket is closed
@@ -360,6 +363,27 @@ export async function runAdmin(db, argv, deps = {}) {
     return mode === 'user-only'
       ? `device ${deviceId} consent=user-only — only the user's tap approves its asks; the Coordinator may still decline`
       : `device ${deviceId} consent=any — the Coordinator may approve its asks again`
+  }
+  // A protected box (src/consent-subject.js; also POST /devices/:id/protected
+  // from the user's own app, which needs a signature once the account has an
+  // approval key — this is host-level access and does not): its consent
+  // asks are the user's alone and, with a key, need a signed approval; the
+  // Coordinator's session control cannot reach it. The user-only flag is
+  // left as it is. Open consent items aimed at it are restamped here; the
+  // apps see that on their next read (the CLI sends no live marker).
+  if (a === 'device' && b === 'protected') {
+    const deviceId = Number(argv[2])
+    const mode = argv[3]
+    if (!Number.isInteger(deviceId) || !['on', 'off'].includes(mode)) throw new Error(USAGE)
+    const existing = db.prepare('SELECT id, user_id FROM devices WHERE id=?').get(deviceId)
+    if (!existing) throw new Error(`no such device: ${deviceId}`)
+    db.transaction(() => {
+      setDeviceProtected(db, deviceId, mode === 'on')
+      restampConsentItems(db, existing.user_id)
+    })()
+    return mode === 'on'
+      ? `device ${deviceId} protected — its consent asks are the user's alone, signed once the account has an approval key`
+      : `device ${deviceId} not protected`
   }
   // The user's switch "Let the Coordinator approve file transfers" (also
   // PUT /coordinator transfer_consent from the user's own app): while on,
