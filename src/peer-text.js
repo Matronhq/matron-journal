@@ -17,6 +17,16 @@ export function sanitizePeerText(value, max) {
     .trim()
     .slice(0, max)
 }
+// For text shown on a consent card (an agent-room invite/join justification).
+// sanitizePeerText leaves Unicode format characters alone, so a justification
+// of only zero-width spaces passes the empty check and renders as a blank
+// card, and a bidi override can reorder the text around it. Strip \p{Cf}
+// first, keeping U+200C/U+200D: emoji such as a ZWJ sequence need the joiner.
+// Kept separate so the other callers of sanitizePeerText are unchanged.
+export function sanitizeConsentText(value, max) {
+  if (value == null) return ''
+  return sanitizePeerText(String(value).replace(/(?![‌‍])\p{Cf}/gu, ''), max)
+}
 // Peer text placed inside markdown the journal writes in its own voice (a
 // consent item's body): the characters that would bold, link, image-load or
 // close a code span from inside the sentence around it are dropped.

@@ -1017,3 +1017,33 @@ test('a renewed chat ask does not expose the previous ask\'s item: consent items
   assert.equal(mine.status, 200)
   assert.equal(mine.json.item.consent, 'chat')
 })
+
+// A justification of only invisible format characters is not whitespace to
+// sanitizePeerText, so it used to pass and publish a blank-looking card.
+
+test('agent_invite rejects a zero-width-only justification: nothing parked, no card published', async (t) => {
+  const { s, agB, client, a } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: '​⁠​' })
+  const err = await a.waitFor((f) => f.op === 'error' && f.ref === 'agent_invite')
+  assert.equal(err.detail, 'bad justification')
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId), null)
+  await new Promise((r) => setTimeout(r, 50))
+  assert.ok(!client.frames.some(isCard))
+})
+
+test('agent_join rejects a zero-width-only justification: nothing parked, no card published', async (t) => {
+  const { s, agB, client, b } = await roomFleet(t)
+  b.send({ op: 'agent_join', room_id: 'room', justification: '​⁠' })
+  const err = await b.waitFor((f) => f.op === 'error' && f.ref === 'agent_join')
+  assert.equal(err.detail, 'bad justification')
+  assert.equal(getParticipant(s.db, 'room', agB.deviceId), null)
+  await new Promise((r) => setTimeout(r, 50))
+  assert.ok(!client.frames.some(isCard))
+})
+
+test('agent_invite card strips bidi overrides and keeps a ZWJ emoji in the justification', async (t) => {
+  const { agB, client, a } = await roomFleet(t)
+  a.send({ op: 'agent_invite', room_id: 'room', target_device_id: agB.deviceId, justification: '‮need logs‬ \u{1F469}‍\u{1F4BB}' })
+  const card = await client.waitFor((f) => f.kind === 'journal' && f.type === 'permission_request' && f.payload?.kind === 'agent_chat')
+  assert.equal(card.payload.justification, 'need logs \u{1F469}‍\u{1F4BB}')
+})
