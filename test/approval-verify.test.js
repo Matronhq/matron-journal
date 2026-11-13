@@ -63,11 +63,13 @@ test('subject mismatch, extra subject key and missing subject key', () => {
 test('journal, user, type, item_num and action mismatches', () => {
   assert.equal(ok(fx.statements.item_tap, { ...EXPECT.item_tap, journal: 'other.example' }).reason, 'mismatch')
   assert.equal(ok(fx.statements.item_tap, { ...EXPECT.item_tap, user: 'bob' }).reason, 'mismatch')
-  assert.equal(ok(fx.statements.item_tap, { ...EXPECT.item_tap, type: 'consent' }).reason, 'mismatch')
+  assert.equal(ok(fx.statements.item_tap, { ...EXPECT.consent, subject: { box: 'box-a' } }).reason, 'mismatch')
   assert.equal(ok(fx.statements.item_tap, { ...EXPECT.item_tap, item_num: 8 }).reason, 'mismatch')
   assert.equal(ok(fx.statements.item_tap, { ...EXPECT.item_tap, action: 'Deny' }).reason, 'mismatch')
   const { item_num, action, ...loose } = EXPECT.item_tap
-  assert.equal(ok(fx.statements.item_tap, loose).ok, true)
+  assert.throws(() => ok(fx.statements.item_tap, loose), TypeError)
+  assert.throws(() => ok(fx.statements.item_tap, { ...loose, item_num }), TypeError)
+  assert.throws(() => ok(fx.statements.item_tap, { ...loose, action }), TypeError)
 })
 
 test('a bad signature is signature', () => {
@@ -112,7 +114,23 @@ test('bad_statement cases never throw', () => {
   assert.equal(trun(tsign({})).ok, true) // the well-formed tap baseline passes
 })
 
+test('a signed Deny tap and a misspelt key never verify as an approval', () => {
+  const k = generateApprovalKey()
+  const pinned = { keys: [{ key_id: k.keyId, public_key: k.publicKey, name: 'k' }] }
+  const tap = JSON.parse(fx.statements.item_tap.statement)
+  const deny = signForTest(k.privateKeyPem, { ...tap, key_id: k.keyId, action: 'Deny', item: { id: 'it_x', num: 999, reply_to: null } })
+  const { item_num, action, ...loose } = EXPECT.item_tap
+  assert.throws(() => verifyApproval(deny, { keys: pinned, expect: loose, now: T0 }), TypeError)
+  assert.throws(() => verifyApproval(deny, { keys: pinned, expect: { ...loose, itemNum: 7, action }, now: T0 }), TypeError)
+  assert.equal(verifyApproval(deny, { keys: pinned, expect: EXPECT.item_tap, now: T0 }).reason, 'mismatch')
+  assert.equal(verifyApproval(deny, { keys: pinned, expect: { ...EXPECT.item_tap, item_num: 999 }, now: T0 }).reason, 'mismatch')
+  assert.equal(verifyApproval(deny, { keys: pinned, expect: { ...EXPECT.item_tap, item_num: 999, action: 'Deny' }, now: T0 }).ok, true)
+})
+
 test('a malformed expect is a TypeError', () => {
+  assert.throws(() => ok(fx.statements.consent, { ...EXPECT.consent, item_num: 7 }), TypeError)
+  assert.throws(() => ok(fx.statements.consent, { ...EXPECT.consent, action: 'Approve' }), TypeError)
+  assert.throws(() => ok(fx.statements.consent, { ...EXPECT.consent, extra: 1 }), TypeError)
   for (const e of [null, 5, {}, { ...EXPECT.consent, subject: undefined }, { ...EXPECT.consent, journal: '' },
     { ...EXPECT.consent, subject: { a: 1 } }, { ...EXPECT.item_tap, item_num: '7' }, { ...EXPECT.item_tap, action: 3 }]) {
     assert.throws(() => verifyApproval(fx.statements.consent, { keys, expect: e, now: T0 }), TypeError)
@@ -148,6 +166,7 @@ test('the module imports only node:crypto and node:fs', () => {
   const src = fs.readFileSync(TOOL, 'utf8')
   const specs = [...src.matchAll(/^\s*import\s[^'"]*['"]([^'"]+)['"]/gm)].map((m) => m[1])
   assert.deepEqual(specs.sort(), ['node:crypto', 'node:fs'])
+  assert.doesNotMatch(src, /\bimport\s*\(|\brequire\s*\(/)
 })
 
 // CLI
@@ -162,7 +181,18 @@ test('CLI: valid approval exits 0 and prints the statement', () => {
   assert.deepEqual(JSON.parse(r.stdout), JSON.parse(fx.statements.consent.statement))
 })
 
+test('CLI: prints the exact signed statement string', () => {
+  const k = generateApprovalKey()
+  const kf = path.join(dir, 'k2.json'); fs.writeFileSync(kf, JSON.stringify({ keys: [{ key_id: k.keyId, public_key: k.publicKey, name: 'k' }] }))
+  const subject = { 10: 'a', 9: 'b' }
+  const a = signForTest(k.privateKeyPem, { v: 1, type: 'account', journal: 'journal.example', user: 'alice', key_id: k.keyId, nonce: 'n', signed_at: Date.now(), subject })
+  const r = cli(['--keys', kf, '--expect', JSON.stringify({ ...base, type: 'account', subject })], JSON.stringify(a))
+  assert.equal(r.status, 0, r.stderr)
+  assert.equal(r.stdout, a.statement + '\n')
+})
+
 test('CLI: refusals exit 1 with the reason on stderr', () => {
+  assert.ok(Date.now() > T0 + 5 * 60 * 1000, 'the fixture must be older than the default window')
   const stale = cli(['--keys', keysFile, '--expect', JSON.stringify(EXPECT.consent)], JSON.stringify(fx.statements.consent))
   assert.equal(stale.status, 1); assert.equal(stale.stderr.trim(), 'stale'); assert.equal(stale.stdout, '')
   const mm = cli(['--keys', keysFile, '--expect', JSON.stringify({ ...EXPECT.consent, user: 'bob' }), '--max-age-ms', '99999999999999'], JSON.stringify(fx.statements.consent))
@@ -177,6 +207,8 @@ test('CLI: bad arguments exit 2 with usage', () => {
     ['--keys', path.join(dir, 'missing.json'), '--expect', JSON.stringify(EXPECT.consent)],
     ['--keys', keysFile, '--expect', JSON.stringify(EXPECT.consent), '--max-age-ms', 'x'],
     ['--keys', keysFile, '--expect', JSON.stringify(EXPECT.consent), '--bogus'],
+    ['--keys', keysFile, '--expect', JSON.stringify(EXPECT.consent), '--max-age-ms', '9'.repeat(300)],
+    ['--keys', keysFile, '--expect', JSON.stringify(EXPECT.consent), '--max-age-ms', '0'],
     ['--keys', keysFile, '--expect', '{}']]) {
     const r = cli(args, inp)
     assert.equal(r.status, 2, args.join(' ') + r.stderr)

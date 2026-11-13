@@ -44,8 +44,12 @@
 // API: verifyApproval(approval, {keys, expect, now, maxAgeMs}) returns
 // {ok:true, statement} or {ok:false, reason}. It never throws on a bad
 // approval or bad keys. A malformed `expect` or option is a bug in the caller
-// and throws TypeError. expect = {journal, user, type, subject, item_num?,
-// action?}; journal, user, type and subject are required (subject may be {}).
+// and throws TypeError. expect = {journal, user, type, subject, item_num,
+// action}: journal, user, type and subject are always required (subject may
+// be {}); for type item_tap, item_num (integer) and action (the button label)
+// are required too, so a tap can never verify without its item and button
+// being named; for consent and account they must be absent. Any other key in
+// expect (a misspelling, say) is a TypeError.
 //
 // CLI: approval-verify.mjs --keys FILE --expect JSON [--max-age-ms N] < approval.json
 // Exit 0 and the statement as JSON on stdout when valid; exit 1 and the reason
@@ -64,7 +68,7 @@ const DEFAULT_MAX_AGE_MS = 5 * 60 * 1000
 const FUTURE_SKEW_MS = 60 * 1000
 
 // RFC 8785 canonical JSON (same output as the journal's serialiser).
-const NONCHARACTER = /[﷐-﷯￾￿]|[\uD83F\uD87F\uD8BF\uD8FF\uD93F\uD97F\uD9BF\uD9FF\uDA3F\uDA7F\uDABF\uDAFF\uDB3F\uDB7F\uDBBF\uDBFF][\uDFFE\uDFFF]/
+const NONCHARACTER = /[\uFDD0-\uFDEF\uFFFE\uFFFF]|[\uD83F\uD87F\uD8BF\uD8FF\uD93F\uD97F\uD9BF\uD9FF\uDA3F\uDA7F\uDABF\uDAFF\uDB3F\uDB7F\uDBBF\uDBFF][\uDFFE\uDFFF]/
 const isIJsonString = (s) => s.isWellFormed() && !NONCHARACTER.test(s)
 const notCanonical = () => { throw new Error('not_canonical') }
 
@@ -169,13 +173,21 @@ function checkExpect(e) {
   if (!isStr(e.journal) || !isStr(e.user)) throw new TypeError('expect.journal and expect.user are required strings')
   if (!TYPES.includes(e.type)) throw new TypeError('expect.type must be item_tap, consent or account')
   if (!validSubject(e.subject)) throw new TypeError('expect.subject is required: a flat object of strings (may be empty)')
-  if (e.item_num !== undefined && !Number.isSafeInteger(e.item_num)) throw new TypeError('expect.item_num must be an integer')
-  if (e.action !== undefined && !isStr(e.action)) throw new TypeError('expect.action must be a non-empty string')
+  const known = ['journal', 'user', 'type', 'subject', 'item_num', 'action']
+  const unknown = Object.keys(e).find((k) => !known.includes(k))
+  if (unknown !== undefined) throw new TypeError(`unknown expect key: ${unknown}`)
+  if (e.type === 'item_tap') {
+    if (!Number.isSafeInteger(e.item_num)) throw new TypeError('expect.item_num (integer) is required for item_tap')
+    if (!isStr(e.action)) throw new TypeError('expect.action (non-empty string) is required for item_tap')
+  } else if (e.item_num !== undefined || e.action !== undefined) {
+    throw new TypeError('expect.item_num and expect.action are only for item_tap')
+  }
 }
 
 function sameSubject(a, b) {
   const ka = Object.keys(a)
-  return ka.length === Object.keys(b).length && ka.every((k) => Object.hasOwn(b, k) && a[k] === b[k])
+  const kb = Object.keys(b)
+  return ka.length === kb.length && ka.every((k) => kb.includes(k) && a[k] === b[k])
 }
 
 export function verifyApproval(approval, opts) {
@@ -204,8 +216,7 @@ export function verifyApproval(approval, opts) {
   if (!valid) return fail('signature')
 
   if (st.journal !== expect.journal || st.user !== expect.user || st.type !== expect.type) return fail('mismatch')
-  if (expect.item_num !== undefined && st.item?.num !== expect.item_num) return fail('mismatch')
-  if (expect.action !== undefined && st.action !== expect.action) return fail('mismatch')
+  if (expect.type === 'item_tap' && (st.item.num !== expect.item_num || st.action !== expect.action)) return fail('mismatch')
   if (!sameSubject(st.subject, expect.subject)) return fail('mismatch')
 
   if (st.signed_at < now - maxAgeMs || st.signed_at > now + FUTURE_SKEW_MS) return fail('stale')
@@ -223,8 +234,9 @@ function main(argv) {
     if (a === '--keys' && v !== undefined) { keysFile = v; i++ }
     else if (a === '--expect' && v !== undefined) { expectJson = v; i++ }
     else if (a === '--max-age-ms' && v !== undefined) {
-      if (!/^\d+$/.test(v)) return usage('bad --max-age-ms')
-      maxAgeMs = Number(v); i++
+      maxAgeMs = Number(v)
+      if (!/^\d+$/.test(v) || !Number.isSafeInteger(maxAgeMs) || maxAgeMs < 1) return usage('bad --max-age-ms')
+      i++
     } else return usage(`bad argument: ${a}`)
   }
   if (keysFile === undefined || expectJson === undefined) return usage()
@@ -235,7 +247,8 @@ function main(argv) {
   try { approval = JSON.parse(fs.readFileSync(0, 'utf8')) } catch { approval = null }
   const r = verifyApproval(approval, { keys, expect, maxAgeMs })
   if (!r.ok) { process.stderr.write(r.reason + '\n'); return 1 }
-  process.stdout.write(JSON.stringify(r.statement) + '\n')
+  // The exact signed string, so key order is what was signed.
+  process.stdout.write(approval.statement + '\n')
   return 0
 }
 
