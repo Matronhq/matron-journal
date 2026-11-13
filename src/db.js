@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS users(
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS devices(
-  id INTEGER PRIMARY KEY,
+  -- A replacement must never inherit a revoked device's identity.
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id),
   kind TEXT NOT NULL CHECK(kind IN ('client','agent')),
   name TEXT NOT NULL,
@@ -73,10 +74,9 @@ CREATE TABLE IF NOT EXISTS link_preapprovals(
   expires_at INTEGER NOT NULL,
   created_at INTEGER NOT NULL
 );
--- \`agent_device_id\` cascades from devices deliberately. \`devices.id\` is a
--- plain INTEGER PRIMARY KEY, so SQLite hands a deleted rowid straight to the
--- next device created; a membership row that outlives its device therefore
--- grants a brand new agent write access to an old room (authorizeAgentWrite)
+-- \`agent_device_id\` cascades from devices deliberately. Historically, a
+-- plain INTEGER PRIMARY KEY handed deleted rowids to the next device created.
+-- A membership row that outlives its device therefore grants a new agent access to an old room (authorizeAgentWrite)
 -- purely by inheriting its number. Enforcing that in the schema rather than
 -- at each revoke site is the point: revocation happens from the HTTP route
 -- and from the admin CLI, and the CLI used to forget.
@@ -1047,6 +1047,71 @@ CREATE TABLE IF NOT EXISTS transfer_chunks(
 );
 `
 
+// Rebuild the parent with FK actions disabled: dropping it with enforcement
+// enabled would cascade into its children. Preserve the original DDL, including
+// newer columns and constraints, and restore schema objects in the transaction.
+function migrateDeviceIds(db) {
+  const needsMigration = () => {
+    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='devices'").get()
+    return row && !/\bAUTOINCREMENT\b/i.test(row.sql) ? row.sql : null
+  }
+  if (!needsMigration()) return
+  const quote = (name) => `"${name.replace(/"/g, '""')}"`
+  db.pragma('foreign_keys = OFF')
+  try {
+    db.transaction(() => {
+      // Another opener may have migrated while this connection waited.
+      const tableSql = needsMigration()
+      if (!tableSql) return
+
+      // Include dangling references before later migrations clean up old rows.
+      // Device references use device_id or *_device_id; private tombstones use id.
+      let highWater = 0n
+      const maxOf = (sql) => {
+        const value = db.prepare(sql).safeIntegers().get().n
+        if (value != null && value > highWater) highWater = value
+      }
+      for (const { name } of db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()) {
+        for (const col of db.prepare(`PRAGMA table_info(${quote(name)})`).all()) {
+          if (col.name === 'device_id' || col.name.endsWith('_device_id')
+            || (col.name === 'id' && ['devices', 'revoked_private_devices'].includes(name))) {
+            maxOf(`SELECT MAX(${quote(col.name)}) AS n FROM ${quote(name)}`)
+          }
+        }
+      }
+      // Events retain device-scoped idempotency keys after revocation. Accept
+      // only decimal int64 ids; CAST alone also accepts malformed numeric prefixes.
+      if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").get()) {
+        maxOf(`SELECT MAX(CAST(seg AS INTEGER)) AS n FROM (
+          SELECT substr(rest, 1, instr(rest, ':') - 1) AS seg FROM (
+            SELECT substr(idem_key, instr(idem_key, ':') + 1) AS rest FROM events
+            WHERE idem_key IS NOT NULL
+              AND (idem_key LIKE 'client:%:%' OR idem_key LIKE 'agent:%:%')
+          )) WHERE length(seg) BETWEEN 1 AND 19 AND seg NOT GLOB '*[^0-9]*'
+            AND (length(seg) < 19 OR seg <= '9223372036854775807')`)
+      }
+
+      // Views and triggers on other tables can also reference devices and
+      // prevent ALTER TABLE from renaming its replacement while they exist.
+      const objects = db.prepare(`SELECT type, name, sql FROM sqlite_master
+        WHERE type IN ('view','trigger') OR (type='index' AND tbl_name='devices' AND sql IS NOT NULL)`).all()
+      for (const obj of objects) db.exec(`DROP ${obj.type} ${quote(obj.name)}`)
+      const ddl = tableSql.replace(/^(CREATE TABLE\s+)(?:"devices"|`devices`|\[devices\]|devices)/i, '$1devices_ai')
+        .replace(/\bid\s+INTEGER\s+PRIMARY\s+KEY\b/i, '$& AUTOINCREMENT')
+      if (!/\bAUTOINCREMENT\b/i.test(ddl)) throw new Error('Unrecognized devices primary key')
+      db.exec(ddl)
+      db.exec(`INSERT INTO devices_ai SELECT * FROM devices;
+        DROP TABLE devices;
+        ALTER TABLE devices_ai RENAME TO devices;`)
+      for (const obj of objects) db.exec(obj.sql)
+      db.prepare("DELETE FROM sqlite_sequence WHERE name='devices'").run()
+      db.prepare("INSERT INTO sqlite_sequence(name, seq) VALUES('devices', ?)").run(highWater)
+    }).immediate()
+  } finally {
+    db.pragma('foreign_keys = ON')
+  }
+}
+
 export function openDb(path) {
   const db = new Database(path)
   db.pragma('journal_mode = WAL')
@@ -1070,6 +1135,7 @@ export function openDb(path) {
   // makes that the only moment a pre-existing search_messages can still be
   // told apart from a table this call is creating for the first time.
   const hadSearchMessages = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_messages'").get()
+  migrateDeviceIds(db)
   db.exec(SCHEMA)
   if (!hadPlainFts) db.exec("INSERT INTO search_fts_plain(search_fts_plain) VALUES('rebuild')")
   // search_messages.is_diff (spec 2026-10-12 unified search): a
@@ -1144,9 +1210,8 @@ export function openDb(path) {
   // ordinary agents. The trigger writes the tombstone whatever deletes the
   // row (the HTTP route, the admin CLI), and the view is what every sieve
   // reads: the live flag for devices that exist, the tombstone for those
-  // that do not. Ids are reusable rowids, so a tombstoned id must never be
-  // handed to a new device (it would inherit the private flag, and with it
-  // an ordinary box would read everything private): issueDevice (auth.js)
+  // that do not. A tombstoned id must never be handed to a new device: it
+  // would inherit the private flag and read everything private. issueDevice (auth.js)
   // allocates above both tables, and the second trigger refuses anything
   // else that tries.
   db.exec(`CREATE TABLE IF NOT EXISTS revoked_private_devices(
@@ -1890,7 +1955,7 @@ export function openDb(path) {
   // Retrofit the device_status -> devices cascade onto a database that
   // created the table before it carried one (the constraint cannot be added
   // in place; same rebuild as convo_agents above). Without it a revoked box
-  // left its last report behind, and since devices.id is a plain rowid the
+  // left its last report behind, and since devices.id was a plain rowid the
   // next box to take that id inherited the old usage, paths and account on
   // /devices and /roster until it reported. The copy skips rows whose device
   // is already gone — with foreign_keys=ON the INSERT would refuse them.

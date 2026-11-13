@@ -764,12 +764,8 @@ test('a forged device name reaches /agent-chat/pending sanitised, never as forge
   assert.ok(!r.json.pending[0].initiator_name.includes('\n'), 'no newline reaches the client as two forged lines')
 })
 
-// Device ids are reused: `devices.id` is a plain INTEGER PRIMARY KEY, so
-// SQLite assigns max(rowid)+1 — revoke the newest device and the next one
-// created lands on exactly its id. Anything keyed on a device id therefore
-// has to die with the device. "Retire an agent, register its replacement" is
-// the ordinary sequence that hits this.
-test('revoking a device clears its room membership, so a reused id inherits nothing', async (t) => {
+// Revocation removes membership; a replacement also gets a fresh identity.
+test('revoking a device clears its room membership and never reuses its id', async (t) => {
   const { s, alice, agA, clientToken } = await roomFleet(t)
   const doomed = createAgent(s.db, alice.id, 'dev-doomed')
   parkInvite(s.db, { convoId: 'room', agentDeviceId: doomed.deviceId, initiatorDeviceId: agA.deviceId })
@@ -780,10 +776,8 @@ test('revoking a device clears its room membership, so a reused id inherits noth
 
   assert.equal(getParticipant(s.db, 'room', doomed.deviceId), null, 'its room membership')
 
-  // The reused id is the real test: the replacement agent lands on the
-  // revoked device's id and must start from nothing.
   const fresh = createAgent(s.db, alice.id, 'dev-replacement')
-  assert.equal(fresh.deviceId, doomed.deviceId, 'precondition: SQLite reused the id')
+  assert.ok(fresh.deviceId > doomed.deviceId, 'the replacement gets a new identity')
   assert.equal(getParticipant(s.db, 'room', fresh.deviceId), null)
 })
 
