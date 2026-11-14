@@ -700,6 +700,9 @@ function rowToSharedItem(row) {
   // pass the sharing rule themselves, and the filing box is the user's own:
   // never shown to another person (listSharedComments drops a comment's).
   Object.assign(item, { filed_convo_id: null, handover: null, device_name: null })
+  // Approval keys: whether a tap needs the owner's signature, and over what,
+  // is the owner's (the federated wire carries neither).
+  Object.assign(item, { step_up: false, subject: null })
   // Whether the owner's session is busy is the owner's to see.
   delete item.working
   if (orgShared === 0) {
@@ -729,7 +732,7 @@ export function listSharedComments(db, itemId) {
   const hidden = new Set(db.prepare(`SELECT DISTINCT c.device_id AS id FROM item_comments c JOIN private_devices pd ON pd.id = c.device_id
     WHERE c.item_id = ? AND c.author = 'agent'`).all(itemId).map((r) => r.id))
   return listComments(db, itemId).filter((c) => !c.meta?.handover && !(c.author === 'agent' && hidden.has(c.device_id)))
-    .map((c) => presentWithdrawn({ ...c, device_name: null, convo_id: null, convo_title: null, approval: null }))
+    .map((c) => presentWithdrawn({ ...c, device_name: null, convo_id: null, convo_title: null, step_up: false, subject: null, approval: null }))
 }
 
 export function listSharedItems(db, viewerUserId, { kind = null, state = null, awaiting = null, limit = 100, cursor = null } = {}) {

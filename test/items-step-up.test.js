@@ -5,7 +5,8 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
-import { validateItemFields, listSharedComments, listGrantedComments } from '../src/items.js'
+import { validateItemFields, listSharedComments, listGrantedComments, grantedItemsExport } from '../src/items.js'
+import { createMission } from '../src/missions.js'
 import { startWithKey, startApprovalServer, signIn, signAccount, signTap } from './approval-helpers.js'
 
 async function world(t, withKey = true) {
@@ -14,7 +15,7 @@ async function world(t, withKey = true) {
   upsertConversation(base.s.db, { id: 'c1', ownerUserId: base.alice.id, title: 'C1', agentDeviceId: box.deviceId })
   const agent = (p, opts = {}) => base.s.http(p, { token: box.token, ...opts })
   const post = (body) => ({ method: 'POST', body })
-  return { ...base, agent, post }
+  return { ...base, box, agent, post }
 }
 const ask = (extra) => ({ convo_id: 'c1', kind: 'question', title: 'Wire it?', actions: ['Approve', 'Deny'], ...extra })
 const SUBJECT = { payee: 'Acme', amount: '12.00' }
@@ -108,20 +109,30 @@ test('a comment with actions and step_up round-trips; step_up needs actions', as
   assert.equal(noStep.json.error, 'invalid_subject')
 })
 
-test('shared and granted reads do not expose a comment approval', async (t) => {
+test('shared and granted reads show no step_up, subject or approval: the marking is the owner\'s, as on the federated wire', async (t) => {
   const w = await world(t)
   const { db } = w.s
-  const item = (await w.agent('/items', w.post(ask()))).json.item
-  const c = (await w.agent(`/items/${item.id}/comments`, w.post({ body: 'Really?', actions: ['Yes'], step_up: true }))).json.comment
+  const item = (await w.agent('/items', w.post(ask({ step_up: true, subject: SUBJECT })))).json.item
+  const c = (await w.agent(`/items/${item.id}/comments`, w.post({ body: 'Really?', actions: ['Yes'], step_up: true, subject: SUBJECT }))).json.comment
   db.prepare('UPDATE item_comments SET approval=? WHERE id=?').run(JSON.stringify({ statement: 's', signature: 'g' }), c.id)
   const owner = (await w.s.http(`/items/${item.id}`, { token: w.token })).json
   const own = owner.comments.find((x) => x.id === c.id)
   assert.deepEqual(own.approval, { statement: 's', signature: 'g' }, 'the owner sees it')
+  assert.deepEqual([own.step_up, own.subject], [true, SUBJECT])
+  assert.deepEqual([owner.item.step_up, owner.item.subject], [true, SUBJECT])
   for (const list of [listSharedComments(db, item.id), listGrantedComments(db, item.id)]) {
     const seen = list.find((x) => x.id === c.id)
     assert.ok(seen)
-    assert.equal(seen.approval, null)
+    assert.deepEqual([seen.approval, seen.step_up, seen.subject], [null, false, null])
   }
+  // The item itself, as a grant shows it (and a copy on another journal is
+  // built from).
+  const { mission } = createMission(db, { userId: w.alice.id, deviceId: w.box.deviceId, createdBy: 'agent', convoId: 'c1', title: 'M', attach: false })
+  db.prepare('UPDATE items SET mission_id=? WHERE id=?').run(mission.id, item.id)
+  const [exported] = grantedItemsExport(db, mission.id, { only: item.id })
+  assert.deepEqual([exported.item.step_up, exported.item.subject], [false, null])
+  const comment = exported.comments.find((x) => x.id === c.id)
+  assert.deepEqual([comment.step_up, comment.subject, comment.approval], [false, null, null])
 })
 
 // Lowering the mark (step_up:false) or changing the subject of a step-up
