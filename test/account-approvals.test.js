@@ -356,6 +356,19 @@ const ADMIN_ROUTES = [
     changed: (w) => w.s.db.prepare('SELECT email FROM users WHERE id=?').get(w.bob.id).email === BOB_EMAIL,
     ok: (r) => { assert.equal(r.status, 200, JSON.stringify(r.json)); assert.equal(r.json.user.email, BOB_EMAIL) },
   },
+  {
+    name: 'PATCH /users/:id is_admin:true', method: 'PATCH', path: (id) => `/users/${id}`, body: { is_admin: true },
+    subject: (user) => ({ op: 'admin_set_admin', user, admin: 'true' }),
+    changed: (w) => w.s.db.prepare('SELECT is_admin FROM users WHERE id=?').get(w.bob.id).is_admin === 1,
+    ok: (r) => { assert.equal(r.status, 200, JSON.stringify(r.json)); assert.equal(r.json.user.is_admin, true) },
+  },
+  {
+    name: 'PATCH /users/:id is_admin:false', method: 'PATCH', path: (id) => `/users/${id}`, body: { is_admin: false },
+    setup: (w) => w.s.db.prepare('UPDATE users SET is_admin=1 WHERE id=?').run(w.bob.id),
+    subject: (user) => ({ op: 'admin_set_admin', user, admin: 'false' }),
+    changed: (w) => w.s.db.prepare('SELECT is_admin FROM users WHERE id=?').get(w.bob.id).is_admin === 0,
+    ok: (r) => { assert.equal(r.status, 200, JSON.stringify(r.json)); assert.equal(r.json.user.is_admin, false) },
+  },
 ]
 
 for (const route of ADMIN_ROUTES) {
@@ -365,6 +378,7 @@ for (const route of ADMIN_ROUTES) {
 
   test(`${route.name}: an admin with a key signs it, over the target's name`, async (t) => {
     const w = await adminWorld(t, { adminKey: true, targetKey: false })
+    route.setup?.(w)
     required(await call(w))
     invalid(await call(w, await w.sign(route.subject('carol'))), 'mismatch')
     assert.equal(await route.changed(w), false, 'nothing changed')
@@ -375,16 +389,55 @@ for (const route of ADMIN_ROUTES) {
 
   test(`${route.name}: an admin without a key cannot change an account that has one`, async (t) => {
     const w = await adminWorld(t, { adminKey: false, targetKey: true })
+    route.setup?.(w)
     required(await call(w))
     assert.equal(await route.changed(w), false, 'nothing changed')
   })
 
   test(`${route.name}: neither with a key, as today`, async (t) => {
     const w = await adminWorld(t, { adminKey: false, targetKey: false })
+    route.setup?.(w)
     route.ok(await call(w))
     assert.equal(await route.changed(w), true)
   })
 }
+
+test('PATCH /users/:id is_admin with a key: the last admin still cannot be demoted, and the refusal spends no nonce', async (t) => {
+  const w = await adminWorld(t, { adminKey: true, targetKey: false })
+  const approval = await w.sign({ op: 'admin_set_admin', user: 'alice', admin: 'false' })
+  const r = await w.s.http(`/users/${w.alice.id}`, { method: 'PATCH', token: w.token, body: { is_admin: false, approval } })
+  assert.deepEqual([r.status, r.json], [409, { error: 'conflict', reason: 'last_admin' }])
+  assert.equal(w.spentNonces(), 0)
+})
+
+test('POST /users by an admin with a key: every creation is signed over the new name and its admin flag', async (t) => {
+  const w = await adminWorld(t, { adminKey: true, targetKey: false })
+  const create = (body) => w.s.http('/users', { method: 'POST', token: w.token, body: { password: 'carol-pw-123', ...body } })
+  const exists = (name) => !!w.s.db.prepare('SELECT 1 FROM users WHERE name=?').get(name)
+  required(await create({ name: 'carol' }))
+  invalid(await create({ name: 'carol', is_admin: true, approval: await w.sign({ op: 'admin_create_user', user: 'carol', admin: 'false' }) }), 'mismatch')
+  invalid(await create({ name: 'carol', approval: await w.sign({ op: 'admin_create_user', user: 'dave', admin: 'false' }) }), 'mismatch')
+  assert.equal(exists('carol'), false)
+  assert.equal(w.spentNonces(), 0)
+  const plain = await create({ name: 'carol', approval: await w.sign({ op: 'admin_create_user', user: 'carol', admin: 'false' }) })
+  assert.equal(plain.status, 201, JSON.stringify(plain.json))
+  assert.equal(plain.json.user.is_admin, false)
+  const admin = await create({ name: 'dave', is_admin: true, approval: await w.sign({ op: 'admin_create_user', user: 'dave', admin: 'true' }) })
+  assert.equal(admin.status, 201, JSON.stringify(admin.json))
+  assert.equal(admin.json.user.is_admin, true)
+  // A taken name is today's 409 and spends nothing.
+  const before = w.spentNonces()
+  const taken = await create({ name: 'dave', approval: await w.sign({ op: 'admin_create_user', user: 'dave', admin: 'false' }) })
+  assert.equal(taken.status, 409)
+  assert.equal(w.spentNonces(), before)
+})
+
+test('POST /users by an admin with no key is as today, admin or not', async (t) => {
+  const w = await adminWorld(t, { adminKey: false, targetKey: true })
+  const r = await w.s.http('/users', { method: 'POST', token: w.token, body: { name: 'carol', password: 'carol-pw-123', is_admin: true } })
+  assert.equal(r.status, 201, JSON.stringify(r.json))
+  assert.equal(r.json.user.is_admin, true)
+})
 
 test('PUT /users/:id/email with a key: the subject names the new address by its hash; clearing it is the hash of the empty string', async (t) => {
   const w = await adminWorld(t, { adminKey: true, targetKey: false })

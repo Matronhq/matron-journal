@@ -7,7 +7,7 @@
 // mint a pairing code.
 import { json, readBody } from './http-body.js'
 import { badRequest, notFound, conflict } from './http-who.js'
-import { createUser, hashPassword } from './auth.js'
+import { hashPassword } from './auth.js'
 import { deleteGithubAccount } from './github-accounts.js'
 import { disableTwoFactor } from './two-factor.js'
 import { normaliseEmail, setUserEmail } from './password-reset.js'
@@ -46,12 +46,17 @@ function stillAdmin(db, who) {
 // account's protection is not the web admin's to lift; `matron-admin` on
 // the host still can); neither with a key is today's behaviour. The admin
 // check is made again in the write's transaction. → as guardedAccountAction.
+//
+// The same guard covers what makes or unmakes an admin: creating any user
+// (target null: there is no account yet whose key could refuse a keyless
+// admin) and the admin flag, so a keyed admin's stolen token cannot mint a
+// keyless admin to act for it.
 function adminAccountAction(ctx, who, body, target, subject, write) {
   const { db } = ctx
   return guardedAccountAction({ db, journalHost: ctx.journalHost ?? null }, who, body, boundedSubject(subject), {
     check: () => {
       if (!stillAdmin(db, who)) refuse(403, { error: 'forbidden' })
-      if (!hasActiveKey(db, who.userId) && hasActiveKey(db, target.id)) refuse(403, { error: 'approval_required' })
+      if (target && !hasActiveKey(db, who.userId) && hasActiveKey(db, target.id)) refuse(403, { error: 'approval_required' })
     },
     write,
   })
@@ -82,21 +87,26 @@ export async function handleUsersRoute(ctx, req, res, url, who) {
     return true
   }
   if (path === '/users' && req.method === 'POST') {
-    const { name, password, is_admin = false } = await readBody(req)
+    const body = await readBody(req)
+    const { name, password, is_admin = false } = body
     if (!stillAdmin(db, who)) return forbidden(res)
     if (typeof name !== 'string' || !USERNAME_RE.test(name)) return badRequest(res)
     if (typeof is_admin !== 'boolean') return badRequest(res)
     if (typeof password !== 'string' || password.length < PASSWORD_MIN) return weakPassword(res)
     if (db.prepare('SELECT 1 FROM users WHERE name=?').get(name)) return conflict(res)
-    let u
-    try {
-      u = await createUser(db, name, password)
-    } catch (err) {
-      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') return conflict(res)
-      throw err
-    }
-    if (is_admin) db.prepare('UPDATE users SET is_admin=1 WHERE id=?').run(u.id)
-    json(res, 201, { user: shape(userRow(db, u.id)) })
+    // The hash first (it awaits); the row and its admin flag are written in
+    // the guarded transaction, so a refused creation leaves no user behind.
+    const hash = await hashPassword(password)
+    const g = adminAccountAction(ctx, who, body, null, { op: 'admin_create_user', user: name, admin: String(is_admin) }, () => {
+      try {
+        return db.prepare('INSERT INTO users(name, password_hash, is_admin, created_at) VALUES(?,?,?,?)').run(name, hash, is_admin ? 1 : 0, Date.now()).lastInsertRowid
+      } catch (err) {
+        if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') refuse(409, { error: 'conflict' })
+        throw err
+      }
+    })
+    if (refused(res, g)) return true
+    json(res, 201, { user: shape(userRow(db, g.value)) })
     return true
   }
 
@@ -107,18 +117,22 @@ export async function handleUsersRoute(ctx, req, res, url, who) {
   const sub = m[2]
 
   if (!sub && req.method === 'PATCH') {
-    const { is_admin } = await readBody(req)
+    const body = await readBody(req)
+    const { is_admin } = body
     if (!stillAdmin(db, who)) return forbidden(res)
     const fresh = userRow(db, target.id); if (!fresh) return notFound(res)
     if (typeof is_admin !== 'boolean') return badRequest(res)
-    // The admin surface must never become unreachable from inside the app:
-    // the last admin cannot demote themselves (or be demoted).
-    if (!is_admin) {
-      const r = db.prepare(`UPDATE users SET is_admin=0 WHERE id=? AND (is_admin=0 OR (SELECT COUNT(*) FROM users WHERE is_admin=1 AND id<>?) > 0)`).run(fresh.id, fresh.id)
-      if (r.changes === 0) return conflict(res, { reason: 'last_admin' })
-    } else {
-      db.prepare('UPDATE users SET is_admin=1 WHERE id=?').run(fresh.id)
-    }
+    const g = adminAccountAction(ctx, who, body, fresh, { op: 'admin_set_admin', user: fresh.name, admin: String(is_admin) }, () => {
+      // The admin surface must never become unreachable from inside the
+      // app: the last admin cannot demote themselves (or be demoted).
+      if (!is_admin) {
+        const r = db.prepare(`UPDATE users SET is_admin=0 WHERE id=? AND (is_admin=0 OR (SELECT COUNT(*) FROM users WHERE is_admin=1 AND id<>?) > 0)`).run(fresh.id, fresh.id)
+        if (r.changes === 0) refuse(409, { error: 'conflict', reason: 'last_admin' })
+      } else {
+        db.prepare('UPDATE users SET is_admin=1 WHERE id=?').run(fresh.id)
+      }
+    })
+    if (refused(res, g)) return true
     json(res, 200, { user: shape(userRow(db, fresh.id)) })
     return true
   }
