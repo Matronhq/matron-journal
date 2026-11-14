@@ -54,6 +54,16 @@ export function validateKeyTable(doc) {
 function semanticErrors(f) {
   const errs = []
   if (f.since !== undefined && f.since > f.protocol) errs.push(`since (${f.since}) is greater than protocol (${f.protocol})`)
+  const seed = f.seed || {}
+  const users = new Set((seed.users || []).map((u) => u.as))
+  const agents = new Set((seed.agents || []).map((a) => a.as))
+  const convos = new Set((seed.conversations || []).map((c) => c.id))
+  for (const a of seed.agents || []) if (!users.has(a.user)) errs.push(`seed.agents '${a.as}': unknown user '${a.user}'`)
+  for (const c of seed.conversations || []) {
+    if (!users.has(c.owner)) errs.push(`seed.conversations '${c.id}': unknown user '${c.owner}'`)
+    if (c.agent !== undefined && !agents.has(c.agent)) errs.push(`seed.conversations '${c.id}': unknown agent '${c.agent}'`)
+  }
+  for (const e of seed.events || []) if (!convos.has(e.convo)) errs.push(`seed.events: unknown conversation '${e.convo}'`)
   // Every connection belongs to exactly one actor (role plus client id), so
   // each actor can run in its own lane and a platform runner owns whole sockets.
   const owner = new Map()

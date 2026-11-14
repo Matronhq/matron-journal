@@ -166,7 +166,7 @@
       "description": "Open the named socket again and send hello with a cursor: the highest journal seq the actor applied before the disconnect, unless cursor is given.",
       "allOf": [{ "$ref": "#/$defs/stepBase" }],
       "type": "object", "unevaluatedProperties": false, "required": ["kind", "role", "conn"],
-      "properties": { "kind": { "const": "reconnect_from_cursor" }, "role": { "enum": ["client", "agent"] }, "client": true, "conn": { "$ref": "#/$defs/name" }, "cursor": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }, { "type": "object", "required": ["$ref"], "properties": { "$ref": { "type": "string" } } }] } }
+      "properties": { "kind": { "const": "reconnect_from_cursor" }, "role": { "enum": ["client", "agent"] }, "client": true, "conn": { "$ref": "#/$defs/name" }, "cursor": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }, { "type": "object", "required": ["$ref"], "additionalProperties": false, "properties": { "$ref": { "type": "string" } } }] } }
     },
     "step_advance_clock": {
       "description": "Advance the client's virtual clock by ms (timers, backoff, grace periods). Real sockets and the server are not slowed or sped up.",

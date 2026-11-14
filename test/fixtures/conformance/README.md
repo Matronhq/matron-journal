@@ -4,14 +4,15 @@ Golden JSON exchanges for matron-journal's wire protocol (`POST /login`,
 `GET /snapshot`, `GET /convo/:id/messages`, `POST`/`GET /media`,
 `POST /password`, `GET /metrics`, and the `/ws` socket). Each file here is
 one canonical scenario, replayed against a **real, freshly-started,
-in-process server** by the committed runner, `test/conformance.test.js`
-(`npm test` runs it along with everything else).
+in-process server** through the replay coordinator, by the committed runner,
+`test/conformance.test.js` (`npm test` runs it along with everything else).
+See "Tooling" at the bottom for the seeded-server CLI and the runner protocol.
 
 The point of this suite: two independent client implementations (the Node
 runner in this repo, and the Matron Swift client's test target) can both
 replay the same fixtures against a local server instance and assert
 byte-for-byte agreement on every exchange, so the protocol can't quietly
-drift out from under either implementation. `test/conformance.test.js` is
+drift out from under either implementation. `tools/conformance/matcher.js` is
 the **reference implementation** of the matcher described below — a Swift
 harness re-implements the same four rules (they're deliberately small; see
 "Porting to Swift" at the bottom).
@@ -20,7 +21,8 @@ Fixtures are **hand-shaped, not generated**: write them by driving a local
 server and a real client (or `test/helpers.js`) and capturing the actual
 exchange, then trim it down to the essential shape. There is no fixture
 generator committed to this repo — that would just be another thing that
-could silently drift from the runner.
+could silently drift from the runner. (The decoder extracts under `payloads/`
+are different: they are derived from the fixtures and checked in CI.)
 
 ## File format
 
@@ -246,7 +248,7 @@ under `~/.config/matron/`.
 ## Porting to Swift
 
 The whole matcher is ~40 lines (`match`/`resolve`/`resolveString` in
-`test/conformance.test.js`) — deliberately small enough to re-implement in
+`tools/conformance/matcher.js`) — deliberately small enough to re-implement in
 an afternoon:
 
 1. Load a fixture, walk `seed` calling the equivalent local setup.
@@ -268,3 +270,48 @@ this repo) and points its own matcher/runner at `test/fixtures/conformance/*.jso
 from this repo (vendored or checked out as a submodule/CI artifact) —
 whichever is more convenient for that repo's CI; nothing here assumes one
 particular mechanism.
+
+## Tooling
+
+All of it is test tooling; nothing changes at runtime.
+
+- **`tools/conformance-server.js <fixture>`** boots a seeded journal for one
+  fixture and prints one JSON line, `{fixture, base, bindings, control}`.
+  `bindings` are the seed's values (user ids, agent tokens); `control` is a unix
+  socket on which admin steps run (`{"op":"admin_revoke_device","device_id":N}`,
+  one JSON line each way). A client in any language spawns it and stops it by
+  closing stdin. Server overrides are flags, else environment variables, else the
+  fixture's `server`: `--max-replay N` (`MATRON_CONFORMANCE_MAX_REPLAY`),
+  `--media-max-bytes N` (`MATRON_CONFORMANCE_MEDIA_MAX_BYTES`), `--tmp-db`
+  (`MATRON_CONFORMANCE_TMP_DB=1`).
+- **The replay coordinator** (`tools/conformance/coordinator.js`, also
+  `tools/conformance-server.js --replay <fixture>`) runs every step in order and
+  plays every actor the platform under test does not (admin, agent, any other
+  client). Bindings are shared across actors. Each actor is a lane; with the
+  barrier on (the default) a step waits for every earlier step of the other lanes,
+  so a frame an agent step causes is in flight before the client step that
+  expects it. `--no-barrier` frees the lanes (to show what the barrier is for).
+  It refuses a fixture that fails the schema, skips one whose `since` is newer than
+  the client's declared protocol, and skips one that needs a step kind the runner
+  does not implement. A failure names the step that failed, and later steps do
+  not run.
+- **A platform runner** performs only its own actor's steps, through its real
+  networking and decoding code. The coordinator spawns it and talks
+  newline-delimited JSON on stdio (`tools/conformance/stdio-runner.js` describes
+  the messages: `init`, `ready` with a capability list, `step` with the step and
+  a snapshot of the bindings, a result with `ok`, an error and the bindings the
+  step recorded). `tools/conformance/stub-runner.js` is a minimal runner that
+  plays only the client role; `tools/conformance/actor.js` is the Node reference.
+  A runner that implements no model or notification hook leaves out
+  `set_app_state`, `expect_model` and `expect_notification`, and fixtures using
+  them are skipped for it.
+- **Decoder extracts** are generated, never edited: `npm run conformance:extracts`
+  rewrites `payloads/`, `npm run conformance:check` fails if `payloads/` differs
+  from a fresh generation (run it in CI). Variable values become stable samples
+  (named bindings map to the same number or string everywhere), so two
+  generations are byte-identical.
+- **The artifact**: `npm run conformance:pack` writes
+  `dist/matron-journal-conformance-<version>.tgz` with the fixtures, schema,
+  extracts, key table and a manifest (package version, protocol revision, a hash
+  of every file). Attach it to a release of this repository; each client pins a
+  release.
