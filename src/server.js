@@ -765,7 +765,7 @@ export function startServer({
     account: process.env.MATRON_SECURITY_FEED_ACCOUNT || null,
   })
   if (resolvedSecurityFeed && !db.prepare('SELECT 1 FROM users WHERE name=?').get(resolvedSecurityFeed.account)) {
-    console.warn(`security feed: MATRON_SECURITY_FEED_ACCOUNT ${JSON.stringify(resolvedSecurityFeed.account)} is not a user; GET /security-events answers 404 until it exists`)
+    console.warn('security feed: MATRON_SECURITY_FEED_ACCOUNT names no user; GET /security-events answers 404 until it exists')
   }
   const resolvedSummariser = summariser !== undefined ? summariser : makeConfiguredSummariser()
   const resolvedMailer = mailer !== undefined ? mailer : makeConfiguredMailer()
