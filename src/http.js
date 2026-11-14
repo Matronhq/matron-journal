@@ -62,8 +62,8 @@ import { convoStatuses } from './convo-status.js'
 import { makeAlertsHandler } from './alerts-http.js'
 import { handleSummariseRoute } from './summarise-http.js'
 import { securityLogFor, withRequestScope, handleSecurityFeed, deviceTarget, keyTarget } from './security-log.js'
-import { panicLock, lockedBody, signOutLockedClient } from './panic.js'
-import { handlePanic } from './panic-lock.js'
+import { panicLock, lockedBody, refuseLockedClient } from './panic.js'
+import { handlePanic, handlePanicUnlock } from './panic-lock.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
 // card's `from_name` gets. NULL stays null rather than collapsing to '' —
@@ -372,23 +372,30 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       // A client token of a panic-locked account still working (a race, or
       // a device made by a path the lock missed): 423 on every route, and
-      // the device is signed out. Agent tokens keep working: a bridge needs
-      // its socket and routes to hear the clear.
+      // the device is signed out. A frozen device (one with an approval key
+      // attached) is not signed out: 423 with `unlock: true` on every route
+      // but the two it clears the lock with. Agent tokens keep working: a
+      // bridge needs its socket and routes to hear the clear.
       if (who.kind === 'client') {
-        const lock = lockOf(who.userId)
-        if (lock) {
-          signOutLockedClient({ db, hub, securityLog }, who.userId, who.deviceId, lock)
-          return rejectEarly(req, res, 423, lockedBody(lock))
+        const unlockRoute = req.method === 'POST' && (url.pathname === '/approvals/nonce' || url.pathname === '/panic/unlock')
+        // → the refusal's body, or null to let the request on.
+        const refusal = () => {
+          const lock = lockOf(who.userId)
+          if (!lock) return null
+          const frozen = refuseLockedClient({ db, hub, securityLog }, who.userId, who.deviceId, lock)
+          return frozen && unlockRoute ? null : lockedBody(lock, frozen)
         }
+        const locked = refusal()
+        if (locked) return rejectEarly(req, res, 423, locked)
         // Locked while the body was on its way: refused the same way once it
         // has arrived, before the route acts on it (src/http-body.js).
         req[AFTER_BODY] = () => {
-          const late = lockOf(who.userId)
-          if (!late) return
-          signOutLockedClient({ db, hub, securityLog }, who.userId, who.deviceId, late)
-          throw Object.assign(new Error('account_locked'), { statusCode: 423, body: lockedBody(late) })
+          const late = refusal()
+          if (late) throw Object.assign(new Error('account_locked'), { statusCode: 423, body: late })
         }
       }
+      // The signed clear of the lock by a frozen device (src/panic-lock.js).
+      if (await handlePanicUnlock({ db, hub, json, securityLog, journalHost }, req, res, url, who)) return
       // The tracker's own surface (src/items-http.js) — mounted first so
       // its /items* paths never collide with the chain below, and inside the
       // outer try/catch so readBody's 400/413 map like every other route's.
