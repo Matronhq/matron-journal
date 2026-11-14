@@ -25,7 +25,13 @@
           "sent": 0,
           "failed": 0,
           "pruned": 0,
-          "by_reason": {}
+          "by_reason": {},
+          "web": {
+            "sent": 0,
+            "failed": 0,
+            "pruned": 0,
+            "by_reason": {}
+          }
         },
         "summarise": {
           "enabled": false,
@@ -62,7 +68,13 @@
           "sent": 0,
           "failed": 0,
           "pruned": 0,
-          "by_reason": {}
+          "by_reason": {},
+          "web": {
+            "sent": 0,
+            "failed": 0,
+            "pruned": 0,
+            "by_reason": {}
+          }
         },
         "summarise": {
           "enabled": false,
