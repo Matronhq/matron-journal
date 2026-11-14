@@ -165,10 +165,10 @@ test('validRef', () => {
 })
 
 test('inNudgeHours: 07:00–22:00 in the nudge zone (Europe/London by default)', () => {
-  assert.equal(inNudgeHours(Date.UTC(2026, 0, 15, 6, 59)), false) // GMT
-  assert.equal(inNudgeHours(Date.UTC(2026, 0, 15, 7, 0)), true)
-  assert.equal(inNudgeHours(Date.UTC(2026, 6, 15, 6, 0)), true) // 07:00 BST
-  assert.equal(inNudgeHours(Date.UTC(2026, 6, 15, 21, 0)), false) // 22:00 BST
+  assert.equal(inNudgeHours(Date.UTC(2026, 0, 15, 6, 59), 'Europe/London'), false) // GMT
+  assert.equal(inNudgeHours(Date.UTC(2026, 0, 15, 7, 0), 'Europe/London'), true)
+  assert.equal(inNudgeHours(Date.UTC(2026, 6, 15, 6, 0), 'Europe/London'), true) // 07:00 BST
+  assert.equal(inNudgeHours(Date.UTC(2026, 6, 15, 21, 0), 'Europe/London'), false) // 22:00 BST
   assert.equal(inNudgeHours(Date.UTC(2026, 0, 15, 6, 59), 'Europe/Paris'), true) // 07:59 CET
   assert.equal(inNudgeHours(Date.UTC(2026, 0, 15, 21, 0), 'Europe/Paris'), false) // 22:00 CET
   assert.equal(resolveNudgeTz(undefined), 'Europe/London')
