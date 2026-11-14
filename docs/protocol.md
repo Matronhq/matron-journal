@@ -5022,7 +5022,7 @@ spent budget refuses the right token too). It is not a device token and authenti
 A body that is not JSON or not an object, or a `source` or `alert` that is
 not a string, is **400** `bad_request` and locks nothing. No body at all
 locks with both null. `source` and `alert` are sieved before they are
-stored: control characters become spaces, bidi and other format
+stored: control characters (C0 and C1) become spaces, bidi and other format
 characters are removed (the zero-width joiners emoji need are kept),
 whitespace runs collapse to one space, and the result is cut to 200
 characters; one with nothing left is stored as null. The frames, the
@@ -5052,7 +5052,9 @@ the account:
 - a spawn approved but not yet started fails: the parent gets its
   `spawn_outcome` with `outcome: 'failed'`, `error_code: 'account_locked'`;
   a start still waiting on a wake finds its spawn failed and sends
-  nothing, even if the lock was cleared meanwhile;
+  nothing, even if the lock was cleared meanwhile. A spawn whose `start`
+  is already with the box is left to the box's reply, which settles it as
+  ever (the bridge's own lock deals with the session);
 - a file transfer approved but not yet released is declined as a user's
   decline is: its bytes go, the sender gets
   `{"kind":"transfer","event":"declined","transfer_id","reason":"Declined: the account is locked."}`,
