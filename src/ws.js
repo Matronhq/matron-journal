@@ -35,6 +35,7 @@ import { listPins, isSuccessorOfAPin, pinHintBeforeAppend, sendPinsFrame } from 
 import { archiveChanges, sendArchiveFrame } from './archive.js'
 import { coordinatorFor, getCoordinatorConvoId } from './coordinator.js'
 import { forwardPeopleMessage, isPeopleConvo } from './people-replies.js'
+import { forwardInboundMessage, isInboundConvo } from './inbound-replies.js'
 import { emitMarker } from './items-http.js'
 import { withdrawForQueuedCancel } from './withdrawn-comments.js'
 import { getMission } from './missions.js'
@@ -1176,8 +1177,14 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // The People conversation has no agent (people-convo.js), so a file
         // sent there would reach no one: refused, where text is passed on.
         if (type !== 'text' && isPeopleConvo(db, conn.userId, msg.convo_id)) return fail('bad_request', 'files and images are not passed on from People')
+        // The same goes for an inbound source's conversation (src/inbound.js).
+        const inboundConvo = isInboundConvo(db, conn.userId, msg.convo_id)
+        if (type !== 'text' && inboundConvo) return fail('bad_request', 'files and images are not passed on from this conversation')
         const sent = appendAndFan(sendArgs)
         copyOut(sendArgs, sent)
+        if (type === 'text' && sent.seq != null && inboundConvo) {
+          forwardInboundMessage(personCtx, emitMarker, { kind: 'client', userId: conn.userId, deviceId: conn.deviceId }, { convoId: msg.convo_id, seq: sent.seq, text: typeof msg.payload.body === 'string' ? msg.payload.body : '' })
+        }
         // ...and text there goes to the user's Coordinator, with a line in
         // People saying so (src/people-replies.js).
         // A replay runs it again: its writes are keyed to the message, so a

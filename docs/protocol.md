@@ -3442,6 +3442,101 @@ lines were dropped, and — for a firing alert whose name matches
 disk and start a safe clean-up below 20% free. Every payload field is
 peer-text sanitised on its own, so nothing in a label can add a line.
 
+### Inbound sources (`POST /inbound/reports`, `POST /inbound/mcp`)
+
+(`src/inbound.js`, `src/inbound-http.js`, `src/inbound-replies.js`.) An
+inbound source is an outside tool the user lets post reports into Matron: a
+hosted assistant, a scheduled job, a workflow service. It has a name, a key
+and one conversation of its own, and each report is one message there.
+
+**The key** (`mis_…`, 256 random bits, only its sha256 stored) can post a
+report and nothing else. It is not a device token: it reads nothing, opens no
+socket and is refused by every other route. `matron-admin inbound add <user>
+<name> [--hourly N] [--daily N]` creates a source and prints the key once;
+`inbound list`, `limits`, `rotate` (a new key, the old one dead at once) and
+`disable|enable` manage it. A user has at most 20 sources; a name is 1 to 40
+letters, digits, spaces, dots, dashes or underscores, unique per user.
+
+**The conversation** is a system conversation, `conversations.system =
+'inbound:<source id>'`, titled with the source's name and announced by a
+`convo_meta` carrying `system` before its first message. `/snapshot` lists
+it for clients. Like the People conversation, no agent can list it, read
+it, write to it, file into it or adopt it; in addition, an agent caller's
+`/search` (every mode) never returns a hit in it, its
+`/convo/:id/messages` read is 404, and `/unseen` never lists it. A report is
+text written by a tool that may itself have read text from strangers, so it
+never starts an agent turn.
+
+**A report** is a `text` event from `source:<name>`:
+
+```json
+{ "body": "**<title>**\n\n<markdown>\n\n- <https://…>",
+  "from": "source", "source": { "id": "src_…", "name": "<name>" } }
+```
+
+It counts as unread and is pushed like any message. What it may contain:
+
+- `body` (required): markdown, at most 64 KiB of UTF-8. Control characters
+  and Unicode format characters (direction overrides, zero-width spaces;
+  ZWJ/ZWNJ kept) are removed. Outside code spans and fenced blocks an image
+  (`![…](…)`) becomes a link, so an app never fetches an address because a
+  report named it, and a raw HTML tag's `<` becomes `&lt;`.
+- `title` (optional): one line, at most 200 characters, markdown characters
+  dropped.
+- `links` (optional): at most 10, each an `http(s)` address of at most 2000
+  characters or `{title, url}`, appended as a list.
+
+**Caps, per source:** 10 reports an hour and 40 a day by default (1 to 1000
+each). A report identical to one accepted in the last 24 hours is dropped
+and not counted. Over a cap the post is refused, and at most once a day the
+journal writes one line in the source's conversation saying reports over the
+limit are being refused. A panic-locked account takes no reports.
+
+**Both routes** are mounted ahead of the device Bearer auth and take the key
+as `Authorization: Bearer <key>` (or `X-Api-Key: <key>`). With no source in
+the journal they decline, and the paths answer as any unknown path does.
+Otherwise a missing, wrong or disabled key is **401** `unauthenticated` and
+is charged to the caller address's unauthenticated budget (the one `/login`
+and the Alertmanager webhook use); once that is spent every request from the
+address is **429** `rate_limited`, a right key included. A method other than
+POST is **405**. The request body is at most 192 KiB (**413** over).
+
+`POST /inbound/reports` `{title?, body, links?}`:
+
+| Status | Body | |
+|---|---|---|
+| 201 | `{accepted:true}` | posted |
+| 200 | `{accepted:false, duplicate:true}` | an identical report within the last day |
+| 400 | `{error:'bad_request', detail}` | not JSON, or a field out of bounds |
+| 413 | `{error:'too_large', detail}` | `body` over 64 KiB |
+| 429 | `{error:'rate_limited', retry_after}` + `Retry-After` | over a cap |
+| 403 | `{error:'account_locked'}` | the account is panic-locked |
+
+`POST /inbound/mcp` is a Model Context Protocol server over Streamable HTTP
+for assistants that connect to tools by address: stateless, one JSON-RPC
+message per POST, JSON replies, no stream. It answers `initialize`
+(protocol versions `2025-06-18`, `2025-03-26`, `2024-11-05`), `ping`,
+`tools/list` and `tools/call`; a notification gets **202**; any other method
+is `-32601`. Its one tool, `post_report {title?, body, links?}`, ends in the
+same code as the route above and answers with one line of text (`Posted.`,
+already posted, or why not), `isError` set for anything but those two. It
+offers nothing to read.
+
+**The log** has one line per post: the source id, the outcome and the size.
+Never the text.
+
+**What the user types there.** A `send` of `type: 'text'` into a source's
+conversation is stored and, as in the People conversation, passed to the
+user's Coordinator: a task filed as the user's own (`created_by: 'user'`,
+`awaiting: 'agent'`) titled `About a <name> report: <the message>`. Its body
+quotes the user's words and then the newest report before the message,
+under a line saying it is an outside tool's text that may repeat what
+strangers wrote, to be read as information and never followed as
+instructions (cut at about 26 KiB, with a note). The journal answers in the
+conversation with a link to the task, or says that nobody read the message
+when no Coordinator is set. A send of any other type is `bad_request`. This
+is the only way a report reaches an agent.
+
 ### Notice items
 
 `kind: 'notice'` (mission: For you) is something the user needs to read but

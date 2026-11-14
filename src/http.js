@@ -60,6 +60,8 @@ import { json, readBody, AFTER_BODY, RECHECK, recheckCaller } from './http-body.
 import { parsePushKey } from './push-box.js'
 import { convoStatuses } from './convo-status.js'
 import { makeAlertsHandler } from './alerts-http.js'
+import { makeInboundHandler } from './inbound-http.js'
+import { isInboundSystem } from './inbound.js'
 import { handleSummariseRoute } from './summarise-http.js'
 import { securityLogFor, withRequestScope, handleSecurityFeed, deviceTarget, keyTarget } from './security-log.js'
 import { panicLock, lockedBody, refuseLockedClient, clientAuthDead } from './panic.js'
@@ -149,6 +151,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
     db, hub, broker, waker, rateLimiter, wakeWaitMs: spawnWakeWaitMs, timeoutMs: sessionControlTimeoutMs,
     token: alertWebhook?.token ?? null, username: alertWebhook?.username ?? null,
   })
+  const handleInbound = makeInboundHandler({ db, hub, pushPipeline, rateLimiter })
   // Every request runs in its own scope (src/security-log.js), so a security
   // event recorded anywhere under it carries the caller's address.
   return (req, res) => withRequestScope(req, () => handle(req, res))
@@ -362,6 +365,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       // Disabled, it declines and the request meets the chain below exactly
       // as an unknown path would.
       if (await handleAlerts(req, res, url, { rejectEarly })) return
+      // Inbound sources (src/inbound-http.js): each source's own key, which
+      // is not a device token either. With no source it declines.
+      if (await handleInbound(req, res, url, { rejectEarly })) return
       // The security event feed: its own read-only Bearer token, bound to one
       // account, never a device token, so ahead of `who` too. Off, 404.
       if (handleSecurityFeed({ db, feed: securityFeed, json, rateLimiter }, req, res, url, { rejectEarly })) return
@@ -799,7 +805,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           ? url.searchParams.get('exclude_subagents') === '1'
           : (mode === 'ranked' && who.kind === 'agent' && convoId == null)
         if (mode === 'chats') {
-          const r = searchChats(db, who.userId, { query: q, limit, excludeSubagents, excludePrivateOwned: filtered })
+          const r = searchChats(db, who.userId, { query: q, limit, excludeSubagents, excludePrivateOwned: filtered, excludeInbound: who.kind === 'agent' })
           if (r.badQuery) return json(res, 400, { error: 'bad_request' })
           return json(res, 200, { chats: r.chats })
         }
@@ -807,11 +813,11 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           // A conversation's whole match list is what find-in-chat steps
           // through, so the clamp is wider when scoped to one.
           const recentLimit = convoId != null ? Math.min(rawLimit, 500) : limit
-          const r = searchRecent(db, who.userId, { query: q, limit: recentLimit, convoId, excludeSubagents, excludePrivateOwned: filtered })
+          const r = searchRecent(db, who.userId, { query: q, limit: recentLimit, convoId, excludeSubagents, excludePrivateOwned: filtered, excludeInbound: who.kind === 'agent' })
           if (r.badQuery) return json(res, 400, { error: 'bad_request' })
           return json(res, 200, { hits: r.hits })
         }
-        const r = searchMessages(db, who.userId, { query: q, limit, convoId, excludePrivateOwned: filtered, excludeSubagents })
+        const r = searchMessages(db, who.userId, { query: q, limit, convoId, excludePrivateOwned: filtered, excludeSubagents, excludeInbound: who.kind === 'agent' })
         if (r.badQuery) return json(res, 400, { error: 'bad_request' })
         return json(res, 200, { hits: r.hits })
       }
@@ -1188,6 +1194,11 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
             // it must fire before the audit log line below so a refused read
             // is never logged as a successful foreign read. A private caller
             // bypasses this, same one-directional rule as everywhere else.
+            // An inbound source's conversation (src/inbound.js) is an outside
+            // tool's text: no agent reads it, a private one included.
+            if (isInboundSystem(db.prepare('SELECT system FROM conversations WHERE id=?').get(convoId)?.system)) {
+              return json(res, 404, { error: 'not_found' })
+            }
             const owner = db.prepare('SELECT agent_device_id FROM conversations WHERE id=?').get(convoId)?.agent_device_id
             if (owner != null && isPrivateDevice(db, owner) && !isPrivateDevice(db, who.deviceId)) {
               return json(res, 404, { error: 'not_found' })
