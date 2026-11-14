@@ -769,7 +769,7 @@ export function startServer({
     account: process.env.MATRON_SECURITY_FEED_ACCOUNT || null,
   })
   if (resolvedSecurityFeed && !db.prepare('SELECT 1 FROM users WHERE name=?').get(resolvedSecurityFeed.account)) {
-    console.warn(`security feed: MATRON_SECURITY_FEED_ACCOUNT ${JSON.stringify(resolvedSecurityFeed.account)} is not a user; GET /security-events answers 404 until it exists`)
+    console.warn('security feed: MATRON_SECURITY_FEED_ACCOUNT names no user; GET /security-events answers 404 until it exists')
   }
   const resolvedPanic = panic !== undefined ? (panic && resolvePanic(panic)) : resolvePanic({
     token: process.env.MATRON_PANIC_TOKEN || null,

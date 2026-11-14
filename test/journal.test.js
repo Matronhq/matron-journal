@@ -414,3 +414,33 @@ test('a silent event never counts as unread, at append or when a read recomputes
   assert.equal(row().unread_count, 2)
   assert.equal(row().snippet, '? Reminder set')
 })
+
+test('summary freshness: stamped on change only, null and identical resends keep it, legacy rows are 0, no event is appended', async () => {
+  const db = openDb(':memory:')
+  const alice = await createUser(db, 'alice', 'pw')
+  const ag = createAgent(db, alice.id, 'box-a')
+  const stamp = () => db.prepare('SELECT summary_updated_at t FROM conversations WHERE id=?').get('s1').t
+  const bare = upsertConversation(db, { id: 's0', ownerUserId: alice.id, agentDeviceId: ag.deviceId })
+  assert.equal(bare.summaryChanged, false)
+  assert.equal(bare.summary_updated_at, 0)
+  const created = upsertConversation(db, { id: 's1', ownerUserId: alice.id, agentDeviceId: ag.deviceId, summary: 'one' })
+  assert.equal(created.summaryChanged, true)
+  assert.equal(created.metaChanged, false, 'a summary alone is not a convo_meta')
+  const t1 = stamp()
+  assert.ok(t1 > 0)
+  db.prepare('UPDATE conversations SET summary_updated_at=5 WHERE id=?').run('s1')
+  for (const summary of ['one', null, undefined]) {
+    const r = upsertConversation(db, { id: 's1', ownerUserId: alice.id, agentDeviceId: ag.deviceId, summary })
+    assert.equal(r.summaryChanged, false)
+    assert.equal(stamp(), 5)
+  }
+  const changed = upsertConversation(db, { id: 's1', ownerUserId: alice.id, agentDeviceId: ag.deviceId, summary: 'two' })
+  assert.equal(changed.summaryChanged, true)
+  assert.ok(stamp() > 5)
+  const cleared = upsertConversation(db, { id: 's1', ownerUserId: alice.id, agentDeviceId: ag.deviceId, summary: '' })
+  assert.equal(cleared.summaryChanged, true)
+  assert.equal(cleared.summary, '')
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM events').get().c, 0)
+  const row = snapshot(db, alice.id).conversations.find((c) => c.id === 's1')
+  assert.equal(row.summary_updated_at, stamp())
+})

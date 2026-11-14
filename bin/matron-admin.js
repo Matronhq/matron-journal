@@ -448,11 +448,13 @@ export async function runAdmin(db, argv, deps = {}) {
     if (!Number.isInteger(deviceId) || !['on', 'off'].includes(mode)) throw new Error(USAGE)
     const existing = db.prepare('SELECT id, user_id FROM devices WHERE id=?').get(deviceId)
     if (!existing) throw new Error(`no such device: ${deviceId}`)
-    const changed = !!db.prepare('SELECT protected FROM devices WHERE id=?').get(deviceId).protected !== (mode === 'on')
-    const restamped = db.transaction(() => {
+    // "Did it change" is read inside the write transaction (the write lock
+    // is taken first), so a concurrent server change cannot skew it.
+    const { changed, restamped } = db.transaction(() => {
+      const was = !!db.prepare('SELECT protected FROM devices WHERE id=?').get(deviceId)?.protected
       setDeviceProtected(db, deviceId, mode === 'on')
-      return restampConsentItems(db, existing.user_id)
-    })()
+      return { changed: was !== (mode === 'on'), restamped: restampConsentItems(db, existing.user_id) }
+    }).immediate()
     announceRestamped(cliCtx(db), asUser(existing.user_id), restamped)
     if (changed) adminEvent(existing.user_id, 'device_protection_changed', `${deviceTarget(deviceId)}:${mode}`)
     return mode === 'on'
@@ -469,8 +471,11 @@ export async function runAdmin(db, argv, deps = {}) {
     if (!username || !['on', 'off'].includes(mode)) throw new Error(USAGE)
     const user = db.prepare('SELECT id FROM users WHERE name=?').get(username)
     if (!user) throw new Error(`no such user: ${username}`)
-    const changed = getTransferConsentEnabled(db, user.id) !== (mode === 'on')
-    setTransferConsentEnabled(db, user.id, mode === 'on')
+    const changed = db.transaction(() => {
+      const was = getTransferConsentEnabled(db, user.id)
+      setTransferConsentEnabled(db, user.id, mode === 'on')
+      return was !== (mode === 'on')
+    }).immediate()
     if (changed) adminEvent(user.id, 'consent_switch_changed', 'transfers')
     return mode === 'on'
       ? `${username}: the Coordinator may approve file transfers, including ones it had another session send (flagged files and user-only boxes stay the user's)`
