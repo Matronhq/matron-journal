@@ -3,11 +3,12 @@
 // a later task). An owner with no active key gets an ordinary item.
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import http from 'node:http'
 import { createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import { validateItemFields, listSharedComments, listGrantedComments, grantedItemsExport } from '../src/items.js'
 import { createMission } from '../src/missions.js'
-import { startWithKey, startApprovalServer, signIn, signAccount, signTap } from './approval-helpers.js'
+import { startWithKey, startApprovalServer, signIn, signAccount, signTap, signForTest, TEST_JOURNAL } from './approval-helpers.js'
 
 async function world(t, withKey = true) {
   const base = await (withKey ? startWithKey(t) : startApprovalServer(t))
@@ -79,17 +80,16 @@ test('an owner with no active key gets an ordinary item and step_up_ignored', as
   assert.equal(c.json.comment.step_up, false)
 })
 
-test('PATCH changes step_up and subject; step_up:false clears subject', async (t) => {
+test('PATCH raises step_up with a subject; a signed step_up:false clears the subject', async (t) => {
   const w = await world(t)
   const id = (await w.agent('/items', w.post(ask()))).json.item.id
   const patch = (body) => w.agent(`/items/${id}`, { method: 'PATCH', body })
   assert.equal((await patch({ subject: SUBJECT })).json.error, 'invalid_subject') // not step-up yet
   const on = await patch({ step_up: true, subject: SUBJECT })
   assert.deepEqual([on.json.item.step_up, on.json.item.subject], [true, SUBJECT])
-  const re = await patch({ subject: { payee: 'Other' } })
-  assert.deepEqual(re.json.item.subject, { payee: 'Other' })
-  const off = await patch({ step_up: false })
-  assert.deepEqual([off.json.item.step_up, off.json.item.subject], [false, null])
+  const approval = await signAccount(w.s, { token: w.token, key: w.key, subject: { op: 'item_step_up', item: id, on: 'false' } })
+  const off = await w.s.http(`/items/${id}`, { method: 'PATCH', token: w.token, body: { step_up: false, approval } })
+  assert.deepEqual([off.status, off.json.item.step_up, off.json.item.subject], [200, false, null])
 })
 
 test('a comment with actions and step_up round-trips; step_up needs actions', async (t) => {
@@ -191,30 +191,68 @@ test('a client lowers step_up with a signed item_step_up; the subject then chang
   assert.equal(ok.status, 201, JSON.stringify(ok.json))
 })
 
-test('a refused signed lowering spends no nonce', async (t) => {
+test('a signed lowering refused for a mismatch leaves the item step-up and its nonce unspent; the right statement over that nonce then works', async (t) => {
   const w = await world(t)
   const item = (await w.agent('/items', w.post(ask({ step_up: true, subject: SUBJECT })))).json.item
-  const approval = await signAccount(w.s, { token: w.token, key: w.key, subject: { ...lower, item: item.id } })
-  // A mission that does not exist: 404 before the guard.
-  const nf = await w.s.http(`/items/${item.id}`, { method: 'PATCH', token: w.token, body: { step_up: false, mission: 9999, approval } })
-  assert.equal(nf.status, 404)
-  const ok = await w.s.http(`/items/${item.id}`, { method: 'PATCH', token: w.token, body: { step_up: false, approval } })
+  const n = (await w.s.http('/approvals/nonce', { method: 'POST', token: w.token })).json.nonce
+  const sign = (subject) => signForTest(w.key.privateKeyPem, {
+    v: 1, type: 'account', journal: TEST_JOURNAL, user: 'alice', key_id: w.key.keyId, nonce: n, signed_at: Date.now(), subject,
+  })
+  const patch = (approval) => w.s.http(`/items/${item.id}`, { method: 'PATCH', token: w.token, body: { title: 'Retitled', step_up: false, approval } })
+  const bad = await patch(sign({ ...lower, item: 'it_other' }))
+  assert.deepEqual([bad.status, bad.json], [400, { error: 'approval_invalid', reason: 'mismatch' }])
+  const row = w.s.db.prepare('SELECT step_up, title FROM items WHERE id=?').get(item.id)
+  assert.deepEqual({ ...row }, { step_up: 1, title: 'Wire it?' })
+  assert.equal(w.s.db.prepare('SELECT used_at FROM approval_nonces WHERE nonce=?').get(n).used_at, null)
+  const ok = await patch(sign({ ...lower, item: item.id }))
   assert.equal(ok.status, 200, JSON.stringify(ok.json))
+  assert.deepEqual([ok.json.item.step_up, ok.json.item.title], [false, 'Retitled'])
+  assert.ok(w.s.db.prepare('SELECT used_at FROM approval_nonces WHERE nonce=?').get(n).used_at > 0)
 })
 
-test('only the agent that filed a step-up item lowers it or changes its subject', async (t) => {
+test('no agent lowers a step-up item or changes its subject, the box that filed it included', async (t) => {
   const w = await world(t)
   const other = createAgent(w.s.db, w.alice.id, 'box-b')
   const item = (await w.agent('/items', w.post(ask({ step_up: true, subject: SUBJECT })))).json.item
-  const byOther = (body) => w.s.http(`/items/${item.id}`, { method: 'PATCH', token: other.token, body })
-  assert.deepEqual([(await byOther({ step_up: false })).status, (await byOther({ step_up: false })).json.error], [403, 'forbidden'])
-  assert.equal((await byOther({ subject: { payee: 'Mallory' } })).status, 403)
-  assert.equal((await byOther({ title: 'Retitled' })).status, 200, 'other fields stay open')
-  assert.equal((await byOther({ step_up: true })).status, 200, 'raising stays open')
-  const sub = await w.agent(`/items/${item.id}`, { method: 'PATCH', body: { subject: { payee: 'Other' } } })
-  assert.deepEqual([sub.status, sub.json.item.subject], [200, { payee: 'Other' }])
-  const off = await w.agent(`/items/${item.id}`, { method: 'PATCH', body: { step_up: false } })
-  assert.deepEqual([off.status, off.json.item.step_up], [200, false])
+  for (const token of [w.box.token, other.token]) {
+    const patch = (body) => w.s.http(`/items/${item.id}`, { method: 'PATCH', token, body })
+    for (const body of [{ step_up: false }, { subject: { payee: 'Mallory' } }, { step_up: true, subject: { payee: 'Mallory' } }, { title: 'X', step_up: false }]) {
+      const r = await patch(body)
+      assert.deepEqual([r.status, r.json], [403, { error: 'forbidden' }], JSON.stringify(body))
+    }
+    assert.equal((await patch({ title: 'Retitled' })).status, 200, 'other fields stay open')
+    assert.equal((await patch({ step_up: true })).status, 200, 'raising stays open')
+  }
+  const row = w.s.db.prepare('SELECT step_up, subject, title FROM items WHERE id=?').get(item.id)
+  assert.deepEqual({ ...row }, { step_up: 1, subject: JSON.stringify(SUBJECT), title: 'Retitled' })
+})
+
+test('the mark is read in the write: a patch whose body arrives after an agent raised the item cannot lower it unsigned', async (t) => {
+  const w = await world(t)
+  const item = (await w.agent('/items', w.post(ask()))).json.item
+  const laptop = signIn(w.s, w.alice.id, 'laptop')
+  const body = JSON.stringify({ step_up: false, title: 'Lowered' })
+  const r = await new Promise((resolve, reject) => {
+    const req = http.request(`${w.s.base}/items/${item.id}`, {
+      method: 'PATCH', agent: false,
+      headers: { authorization: `Bearer ${laptop.token}`, 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) },
+    }, (res) => {
+      let data = ''
+      res.on('data', (c) => { data += c })
+      res.on('end', () => resolve({ status: res.statusCode, json: data ? JSON.parse(data) : null }))
+    })
+    req.on('error', reject)
+    req.write(body.slice(0, 5))
+    setTimeout(async () => {
+      // The agent raises the item while the patch's body is still arriving.
+      const up = await w.agent(`/items/${item.id}`, { method: 'PATCH', body: { step_up: true, subject: SUBJECT } })
+      assert.equal(up.status, 200)
+      req.end(body.slice(5))
+    }, 50)
+  })
+  assert.deepEqual([r.status, r.json], [403, { error: 'approval_required' }])
+  const row = w.s.db.prepare('SELECT step_up, title FROM items WHERE id=?').get(item.id)
+  assert.deepEqual({ ...row }, { step_up: 1, title: 'Wire it?' })
 })
 
 test('a keyless owner: PATCH step_up:true is step_up_ignored, and step_up:false is an ordinary patch', async (t) => {

@@ -111,9 +111,9 @@ test('a signature for another item, another label or another reply_to is a misma
   assert.equal(ok.status, 201, JSON.stringify(ok.json))
 })
 
-test('an item edited after the user signed is a mismatch: body, title, subject', async (t) => {
+test('an item edited after the user signed is a mismatch: body, title; its subject cannot be changed at all', async (t) => {
   const w = await world(t)
-  for (const patch of [{ body: 'Pay the other invoice' }, { title: 'Wire it now?' }, { subject: { payee: 'Mallory', amount: '12.00' } }]) {
+  for (const patch of [{ body: 'Pay the other invoice' }, { title: 'Wire it now?' }]) {
     const item = await w.file({ step_up: true, subject: SUBJECT })
     const approval = await signTap(w.s, { token: w.token, key: w.key, item, action: 'Approve' })
     const p = await w.agent(`/items/${item.id}`, { method: 'PATCH', body: patch })
@@ -122,6 +122,10 @@ test('an item edited after the user signed is a mismatch: body, title, subject',
     invalid(await w.tap(item, { action: 'Approve', approval }), 'mismatch')
     assert.equal(w.count(), before, JSON.stringify(patch))
   }
+  // A step-up item's subject is fixed once filed (test/items-step-up.test.js).
+  const item = await w.file({ step_up: true, subject: SUBJECT })
+  const p = await w.agent(`/items/${item.id}`, { method: 'PATCH', body: { subject: { payee: 'Mallory', amount: '12.00' } } })
+  assert.deepEqual([p.status, p.json], [403, { error: 'forbidden' }])
 })
 
 test('a signature for a button the item no longer offers is refused', async (t) => {

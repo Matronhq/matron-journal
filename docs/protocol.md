@@ -2309,9 +2309,9 @@ signed approval its tap was accepted with. A tap on a step-up item, or on a
 step-up comment's buttons, carries `approval` once the account has a key
 (`403 approval_required`, `400 approval_invalid`), and its `commented`
 marker's `comment` gains `signed: true` and `key_id`. An owner with no key
-gets an ordinary item and `step_up_ignored: true` in the reply. Lowering the
-mark on a step-up item of an account with a key is the item's own box's, or
-a client's with a signature; another person's view shows `step_up: false`,
+gets an ordinary item and `step_up_ignored: true` in the reply. On a
+step-up item of an account with a key only a client's signed patch lowers
+the mark, and no one changes its subject; another person's view shows `step_up: false`,
 `subject: null`. Validation (`invalid_subject`, `invalid_actions`) and the
 rules are in *Approval keys (step-up)* → *Step-up items and comments*.
 **Comment author.** `device_name`, `convo_id` and `convo_title` say who wrote
@@ -4088,8 +4088,8 @@ among them, these answer before the signature is looked at: the protected
 toggle's `404` for anything but one of the caller's own boxes, a device
 revoke's `404` for a device not the caller's, the admin routes' `403
 forbidden` (no longer an admin) and `404` (no such user), a step-up patch's
-`403 forbidden` for an agent that did not file the item and `400
-invalid_subject` for a client, and a consent answer's `409`.
+`403 forbidden` for an agent and `400 invalid_subject` for a client, and a
+consent answer's `409`.
 
 ### Step-up items and comments
 
@@ -4141,25 +4141,32 @@ a `PATCH /items/:id` that lowers the mark (`step_up: false`) or sends a
 `subject` is restricted, because a token that could clear the mark could
 then tap unsigned:
 
-- an **agent** may do either only if it is the item's own box (its
-  `origin_device_id`: the box that filed it, or the one it was handed
-  over to); any other agent gets `403 {error:'forbidden'}`;
+- **no agent** may do either: every agent token gets
+  `403 {error:'forbidden'}`, the box that filed the item included. An
+  item's origin box can move on a hand-over, and a filing agent can be
+  asked to lower its own mark by whoever holds a client token; so only the
+  user's signature lowers it. An agent that marked an item by mistake
+  closes it and files a new one;
 - a **client** never changes a step-up item's subject
   (`400 {error:'invalid_subject'}`, `step_up: true` with a new subject
   included: lower the mark, then raise it again with the new subject), and
   lowers the mark only as an account action, an `account` statement over
   `{op:'item_step_up', item:<the item's it_ id>, on:'false'}` in
   `approval`: `403 approval_required` without one, `400 approval_invalid`
-  for a bad one. The check runs in the patch's own transaction, so a
-  refused patch changes nothing, its other fields and a mission move
-  included, and spends no nonce.
+  for a bad one.
+
+These rules are decided on the item as the patch's own write transaction
+reads it, not as it stood when the request arrived: a patch whose body is
+still arriving when an agent raises the item meets the raised mark. A
+refused patch changes nothing, its other fields and a mission move
+included, and spends no nonce.
 
 Raising the mark (`step_up: true` with no subject, on any item) stays open,
 and an account with no key patches as before. Past this, the mark is
 advisory: it is the filing agent's statement that the question needs the
-user's signature, and that agent can still lower it, re-word the question
-or change its buttons (a re-worded question no longer matches a signature
-made over the old words). What the journal guarantees is that a tap on a
+user's signature. That agent cannot lower it or change its subject, but it
+can still re-word the question or change its buttons (a re-worded question
+no longer matches a signature made over the old words). What the journal guarantees is that a tap on a
 question marked when the user tapped carries the user's signature over that
 question; a box that must not act without one checks the signed tap itself
 (*Verifying on a box*). A comment's mark cannot be changed once posted: a
@@ -4392,8 +4399,8 @@ and addresses are signed **exactly as sent**, not normalised
 (`ABCD-1234` and `abcd1234` are different subjects), and a value over 200
 characters follows the `<name>_sha256` rule (a 250-character agent name is
 signed as `name_sha256`). All routes here but the item patch were already
-client-only (`403 forbidden` for an agent); on the item patch an agent
-follows its own rule (*Lowering the mark*).
+client-only (`403 forbidden` for an agent); on the item patch an agent may
+not lower the mark at all (*Lowering the mark*).
 
 | Route | `subject` | Notes |
 |---|---|---|
