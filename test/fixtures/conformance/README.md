@@ -31,6 +31,16 @@ One JSON file per scenario:
   "name": "human-readable scenario name",
   "description": "one or two sentences: what this proves and why",
 
+  // Required. The protocol revision this fixture was written against, an
+  // integer starting at 1.
+  "protocol": 1,
+
+  // Optional (default 1, never greater than `protocol`). The first protocol
+  // revision a client must pass this fixture on. A client that declares an
+  // older revision skips the fixture instead of failing it, so a scenario for a
+  // new protocol addition can ship before every client has caught up.
+  "since": 1,
+
   // Optional. Overrides passed straight into startServer() (src/server.js),
   // e.g. {"maxReplay": 5} to force the snapshot_required valve, or
   // {"mediaMaxBytes": 16} to force the 413 cap. `dbPath` is always chosen by
@@ -66,6 +76,22 @@ own `convo_upsert`. Needed by any fixture step where an agent caller must
 clear `authorizeAgentWrite` against this convo (e.g. filing an item).
 Omitted, the conversation is seeded with no manager, same as before this
 field existed.
+
+## Roles
+
+Every step carries a required `role` saying which actor performs it:
+
+- `client`: an app's side of the exchange (login, hello, sending, expecting).
+- `agent`: the bridge's side (an agent token's calls and its socket).
+- `admin`: an out-of-band operational action (`admin_revoke_device`).
+
+When a fixture has more than one client, client steps also carry `client`, a
+name for that client (`mac`, `ipad`). `client` is only legal on `role: "client"`.
+Every WebSocket connection belongs to exactly one actor (the same role and
+client name on every step that names it). A platform harness runs the steps of
+its own role through its real networking and decoding code; a coordinator
+(`tools/conformance-server.js`) plays every other actor. The schema and the
+coordinator both enforce these rules.
 
 ## Step kinds
 
@@ -119,6 +145,31 @@ field existed.
   its own test DB directly) — the fixture only specifies *what* out-of-band
   operational action occurred, never *how*.
 
+### Client lifecycle steps
+
+These describe what an app does around a dropped connection and how it decides
+to notify. All are `role: "client"` except `disconnect` and
+`reconnect_from_cursor`, which an agent can also use. A runner that cannot
+perform a step kind reports that and the fixture is skipped for it.
+
+- **`disconnect`**: `{kind, role, conn}`. Drops the socket as a network drop
+  would. The platform runner severs its own socket.
+- **`reconnect_from_cursor`**: `{kind, role, conn, cursor?}`. Opens the socket
+  again and sends `hello` with `cursor`: the highest journal seq the actor
+  applied before the drop unless `cursor` is given (an integer, `null`, or a
+  `{"$ref"}`). The hello token is the one the connection used before.
+- **`advance_clock`**: `{kind, role, ms}`. Advances the client's virtual clock
+  (timers, backoff, grace periods). The server and the real sockets keep real time.
+- **`set_app_state`**: `{kind, role, app?, muted?}`. `app` is `foreground` or
+  `background`; `muted` is a boolean. At least one is required.
+- **`expect_model`**: `{kind, role, expect}`. Matches the client's model state,
+  as the platform runner reports it through its test hook, against `expect`.
+- **`expect_notification`**: `{kind, role, expect}`. Matches the client's most
+  recent notification decision, reported the same way.
+
+`expect_model` and `expect_notification` use the standard matcher below. The
+shape each runner reports is defined by its test hook.
+
 ## The variable convention (bind / ref / type / ignore)
 
 Dynamic values — tokens, device/user ids, seqs, timestamps, media ids,
@@ -164,6 +215,23 @@ of the value matcher.
 `$bind`, `$ref`, `$type`, `$ignore` are reserved as *object keys standing
 alone* in this fixture format. No matron-journal protocol payload uses a
 field named that way, so this never collides with real traffic.
+
+## Schema, decoder extracts and the key table
+
+- `schema/fixture.schema.json` is the JSON Schema (draft 2020-12) for the
+  fixture format above. Every fixture here validates against it
+  (`test/conformance-schema.test.js`), with the extra rules a schema cannot
+  express: `since` is not greater than `protocol`, and each connection belongs to
+  one actor.
+- `payloads/<frame-type>.json` are decoder-only extracts: frames and response
+  bodies taken from fixtures with every variable resolved to a stable sample
+  value, validated by `schema/payload-extract.schema.json`. A client decodes each
+  sample and checks the store effect, without a server.
+- `keys/message-box.json` is the message-box key table: rows of key, modifiers,
+  input-method state and primary pointer, with the expected outcome (`send`,
+  `newline` or `none`). Each platform runs every row against every message box it
+  has. `schema/key-table.schema.json` describes it. A row without an expected
+  outcome is rejected.
 
 ## Isolation
 

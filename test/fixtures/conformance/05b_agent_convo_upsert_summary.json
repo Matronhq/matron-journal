@@ -1,6 +1,7 @@
 {
   "name": "agent convo_upsert summary: ephemeral client frame, no journal event, snapshot catch-up",
   "description": "A summary carried by convo_upsert reaches connected clients as a client-only {kind:'summary'} frame and never appends a journal event (the head seq does not move). An identical resend emits nothing; /snapshot carries summary and summary_updated_at.",
+  "protocol": 1,
   "seed": {
     "users": [
       {
@@ -19,7 +20,7 @@
   },
   "steps": [
     {
-      "kind": "http",
+      "kind": "http", "role": "client",
       "method": "POST",
       "path": "/login",
       "body": {
@@ -43,11 +44,11 @@
       }
     },
     {
-      "kind": "ws_open",
+      "kind": "ws_open", "role": "agent",
       "conn": "agent"
     },
     {
-      "kind": "ws_send",
+      "kind": "ws_send", "role": "agent",
       "conn": "agent",
       "frame": {
         "op": "hello",
@@ -58,7 +59,7 @@
       }
     },
     {
-      "kind": "ws_expect",
+      "kind": "ws_expect", "role": "agent",
       "conn": "agent",
       "frame": {
         "kind": "control",
@@ -81,11 +82,11 @@
       }
     },
     {
-      "kind": "ws_open",
+      "kind": "ws_open", "role": "client",
       "conn": "client"
     },
     {
-      "kind": "ws_send",
+      "kind": "ws_send", "role": "client",
       "conn": "client",
       "frame": {
         "op": "hello",
@@ -96,7 +97,7 @@
       }
     },
     {
-      "kind": "ws_expect",
+      "kind": "ws_expect", "role": "client",
       "conn": "client",
       "frame": {
         "kind": "control",
@@ -115,7 +116,7 @@
       }
     },
     {
-      "kind": "ws_send",
+      "kind": "ws_send", "role": "agent",
       "conn": "agent",
       "frame": {
         "op": "convo_upsert",
@@ -124,7 +125,7 @@
       }
     },
     {
-      "kind": "ws_expect",
+      "kind": "ws_expect", "role": "client",
       "conn": "client",
       "frame": {
         "kind": "summary",
@@ -136,7 +137,7 @@
       }
     },
     {
-      "kind": "ws_send",
+      "kind": "ws_send", "role": "agent",
       "conn": "agent",
       "frame": {
         "op": "convo_upsert",
@@ -145,12 +146,12 @@
       }
     },
     {
-      "kind": "ws_expect_none",
+      "kind": "ws_expect_none", "role": "client",
       "conn": "client",
       "ms": 150
     },
     {
-      "kind": "ws_send",
+      "kind": "ws_send", "role": "agent",
       "conn": "agent",
       "frame": {
         "op": "convo_upsert",
@@ -159,12 +160,12 @@
       }
     },
     {
-      "kind": "ws_expect_none",
+      "kind": "ws_expect_none", "role": "client",
       "conn": "client",
       "ms": 150
     },
     {
-      "kind": "http",
+      "kind": "http", "role": "client",
       "method": "GET",
       "path": "/snapshot",
       "token": {

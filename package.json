@@ -29,5 +29,8 @@
   },
   "optionalDependencies": {
     "@huggingface/transformers": "^3.0.0"
+  },
+  "devDependencies": {
+    "ajv": "^8.20.0"
   }
 }
