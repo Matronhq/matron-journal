@@ -155,7 +155,9 @@ to notify. All are `role: "client"` except `disconnect` and
 perform a step kind reports that and the fixture is skipped for it.
 
 - **`disconnect`**: `{kind, role, conn}`. Drops the socket as a network drop
-  would. The platform runner severs its own socket.
+  would. The platform runner severs its own socket and does not reconnect on its
+  own: not on a timer, and not when `advance_clock` moves virtual time. The
+  connection comes back only with `reconnect_from_cursor`.
 - **`reconnect_from_cursor`**: `{kind, role, conn, cursor?}`. Opens the socket
   again and sends `hello` with `cursor`: the highest journal seq the actor
   applied before the drop unless `cursor` is given (an integer, `null`, or a
@@ -163,7 +165,12 @@ perform a step kind reports that and the fixture is skipped for it.
 - **`advance_clock`**: `{kind, role, ms}`. Advances the client's virtual clock
   (timers, backoff, grace periods). The server and the real sockets keep real time.
 - **`set_app_state`**: `{kind, role, app?, muted?}`. `app` is `foreground` or
-  `background`; `muted` is a boolean. At least one is required.
+  `background`; `muted` is a boolean. At least one is required. `muted` mutes (or
+  unmutes) the conversations the app knows through its own settings write
+  (`PUT /notify`), so the journal pushes a `notify` frame to the user's client
+  sockets; a fixture expects that frame next. An app that has the conversation
+  open on screen says so with a `viewing` frame, which is also what a foreground
+  notification decision reads.
 - **`expect_model`**: `{kind, role, expect}`. Matches the client's model state,
   as the platform runner reports it through its test hook, against `expect`.
 - **`expect_notification`**: `{kind, role, expect}`. Matches the client's most
@@ -304,7 +311,9 @@ All of it is test tooling; nothing changes at runtime.
   plays only the client role; `tools/conformance/actor.js` is the Node reference.
   A runner that implements no model or notification hook leaves out
   `set_app_state`, `expect_model` and `expect_notification`, and fixtures using
-  them are skipped for it.
+  them are skipped for it. The decoder extracts are not mined from a fixture whose
+  muting is an app's own write (`set_app_state` with `muted`): only an app causes
+  the frames it shows.
 - **Decoder extracts** are generated, never edited: `npm run conformance:extracts`
   rewrites `payloads/`, `npm run conformance:check` fails if `payloads/` differs
   from a fresh generation (run it in CI). Variable values become stable samples

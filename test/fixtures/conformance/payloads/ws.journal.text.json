@@ -255,6 +255,107 @@
           "body": "pre-revocation"
         }
       }
+    },
+    {
+      "source": "19a_recovery_events_while_away.json#step[7]",
+      "frame": {
+        "kind": "journal",
+        "seq": 1,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "type": "text",
+        "payload": {
+          "body": "m0"
+        }
+      }
+    },
+    {
+      "source": "19a_recovery_events_while_away.json#step[10]",
+      "frame": {
+        "kind": "journal",
+        "seq": 2,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "text",
+        "payload": {
+          "body": "live"
+        }
+      }
+    },
+    {
+      "source": "19a_recovery_events_while_away.json#step[15]",
+      "frame": {
+        "kind": "journal",
+        "seq": 3,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "text",
+        "payload": {
+          "body": "away one"
+        }
+      }
+    },
+    {
+      "source": "19a_recovery_events_while_away.json#step[20]",
+      "frame": {
+        "kind": "journal",
+        "seq": 3,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "type": "text",
+        "payload": {
+          "body": "away one"
+        }
+      }
+    },
+    {
+      "source": "19b_recovery_replay_has_no_duplicates.json#step[8]",
+      "frame": {
+        "kind": "journal",
+        "seq": 2,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "type": "text",
+        "payload": {
+          "body": "m1"
+        }
+      }
+    },
+    {
+      "source": "19b_recovery_replay_has_no_duplicates.json#step[13]",
+      "frame": {
+        "kind": "journal",
+        "seq": 3,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "sender_device_id": 9308,
+        "type": "text",
+        "payload": {
+          "body": "away"
+        }
+      }
+    },
+    {
+      "source": "19b_recovery_replay_has_no_duplicates.json#step[17]",
+      "frame": {
+        "kind": "journal",
+        "seq": 3,
+        "convo_id": "c1",
+        "ts": 1700000000000,
+        "sender": "agent:box-2",
+        "type": "text",
+        "payload": {
+          "body": "away"
+        }
+      }
     }
   ]
 }
