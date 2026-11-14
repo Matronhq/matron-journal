@@ -41,6 +41,7 @@ import { getMission } from './missions.js'
 import { sanitizeConvoStatus, upsertConvoStatus } from './convo-status.js'
 import { validateSessionControl, authorizeSessionControl, sessionControlResultFrame } from './session-control.js'
 import { validRanges, addSeenRanges, markDeviceUsesRanges, legacyReadAsSeen, markItemSeen } from './seen.js'
+import { panicLock, isPanicLocked, panicHelloField, panicAnnounced, panicOnFrame, PANIC_OFF_FRAME, announcePanicClears, signOutLockedClient, closeLockedSocket, ACCOUNT_LOCKED } from './panic.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -437,6 +438,14 @@ export function attachWs({
       // chat consent item still open on an ask that is not waiting is
       // closed (consent-items.js reconcileConsentItems).
       reconcileConsentItems({ db, hub })
+      // Panic locks cleared on the host (matron-admin panic clear, a
+      // separate process): the clear frame to the account's connected
+      // bridges, once, within one sweep interval (src/panic.js).
+      try {
+        announcePanicClears(db, hub)
+      } catch (err) {
+        console.error('panic: clear announcement failed', err)
+      }
       const conns = hub.allConns()
       if (conns.length === 0) return
       const ids = [...new Set(conns.map((c) => c.deviceId))]
@@ -492,6 +501,19 @@ export function attachWs({
             ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'auth' }))
             ws.close()
             return
+          }
+          // A client of a panic-locked account (src/panic.js): the auth
+          // error's shape with account_locked and since, the usual close,
+          // and the device is signed out. Agents of the account connect as
+          // ever (hello_ok then carries `panic`).
+          if (who.kind === 'client') {
+            const lock = panicLock(db, who.userId)
+            if (lock) {
+              signOutLockedClient({ db, hub, securityLog }, who.userId, who.deviceId, lock)
+              ws.send(JSON.stringify({ kind: 'control', op: 'error', code: ACCOUNT_LOCKED, since: lock.since }))
+              ws.close()
+              return
+            }
           }
           // Same shape as ack's own cursor validation below (`!Number.isInteger(msg.cursor)
           // || msg.cursor < 0`) — a negative cursor is exactly as invalid here as a
@@ -578,6 +600,11 @@ export function attachWs({
             ? archiveChanges(db, who.userId, msg.archive_since)
             : null
           conn.archiveAt = archive?.at ?? null
+          // panic: on every agent hello while the account is locked, read
+          // from the database (so a restart cannot forget it); absent
+          // otherwise, which a bridge reads as "not locked".
+          const helloLock = who.kind === 'agent' ? panicLock(db, who.userId) : null
+          if (helloLock) panicAnnounced(hub).add(who.userId)
           ws.send(JSON.stringify({
             kind: 'control', op: 'hello_ok', seq: headSeq, device_id: who.deviceId, name: who.name, coordinator_convo_id: coordinator,
             settings: settingsView(db, who.userId),
@@ -588,6 +615,7 @@ export function attachWs({
             ...(who.kind === 'client' && msg.sync != null ? { sync: conn.syncScope ?? 'everything' } : {}),
             ...(archive ? { archive } : {}),
             ...(who.kind === 'agent' ? { box_defaults: getBoxDefaults(db, who.userId, who.deviceId) } : {}),
+            ...panicHelloField(helloLock),
           }))
           if (msg.cursor != null) {
             // snapshot_required valve (spec §6): a gap this large is not worth
@@ -702,6 +730,15 @@ export function attachWs({
           }
           hub.register(conn)
           conn.registered = true
+          // A lock set or cleared while the replay above yielded reached
+          // registered sockets only: tell this one now.
+          if (who.kind === 'agent') {
+            const lockNow = panicLock(db, who.userId)
+            if (lockNow && lockNow.since !== helloLock?.since) {
+              panicAnnounced(hub).add(who.userId)
+              ws.send(JSON.stringify(panicOnFrame(lockNow)))
+            } else if (!lockNow && helloLock) ws.send(JSON.stringify(PANIC_OFF_FRAME))
+          }
           if (yielded && who.kind === 'client') ws.send(JSON.stringify({ kind: 'pins', pins: listPins(db, who.userId) }))
           if (yielded && conn.archiveAt != null) {
             const missed = archiveChanges(db, who.userId, conn.archiveAt)
@@ -724,6 +761,20 @@ export function attachWs({
           conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
           conn.ws.close(4001)
           return
+        }
+        // A client socket of a panic-locked account still open (a race, or
+        // a device made by a path the lock missed): the frame is refused
+        // with account_locked (its ref and request_id echoed, so an RPC
+        // caller can correlate it), the device is signed out and the socket
+        // closed as a revoked one is.
+        if (conn.kind === 'client') {
+          const lock = panicLock(db, conn.userId)
+          if (lock) {
+            conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: ACCOUNT_LOCKED, ref: msg.op, ...requestIdEcho(msg), since: lock.since }))
+            signOutLockedClient({ db, hub, securityLog }, conn.userId, conn.deviceId, lock)
+            if (conn.ws.readyState === 1) closeLockedSocket(conn.ws, lock)
+            return
+          }
         }
         // frameBytes = the inbound frame's size as received on the wire —
         // the RPC ops cap THAT (spec: whole inbound frame <= 16 KiB), not a
@@ -1124,6 +1175,13 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // indistinguishable — anti-enumeration, same stance as the HTTP 404s.
         const target = db.prepare('SELECT user_id, kind FROM devices WHERE id=?').get(msg.agent_device_id)
         if (!target || target.user_id !== conn.userId || target.kind !== 'agent') return failRpc('not_found')
+        // A panic-locked account (src/panic.js): nothing goes to its boxes.
+        // The socket check above signs such a client out first; a backstop.
+        const rpcLock = panicLock(db, conn.userId)
+        if (rpcLock) {
+          conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: ACCOUNT_LOCKED, ref: msg.op, request_id: rid, since: rpcLock.since }))
+          return
+        }
         // approval_key_id: the approval key attached to the calling client
         // device, or null, stamped from the journal's own tables like a
         // user's journal event (hub.js agentJournalFrame); never the
@@ -2431,11 +2489,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (conn.kind !== 'agent') return fail('forbidden')
         if (!conn.registered) return fail('not_ready')
         const v = validateSessionControl(msg)
-        const failRpc = (code, detail) => conn.ws.send(JSON.stringify(
-          { kind: 'control', op: 'error', code, ref: msg.op, ...(v.rid ? { request_id: v.rid } : {}), ...(detail ? { detail } : {}) }))
+        const failRpc = (code, detail, extra = {}) => conn.ws.send(JSON.stringify(
+          { kind: 'control', op: 'error', code, ref: msg.op, ...(v.rid ? { request_id: v.rid } : {}), ...(detail ? { detail } : {}), ...extra }))
         if (!v.ok) return failRpc(v.code, v.detail)
         const auth = authorizeSessionControl(db, conn, msg)
-        if (auth.code) return failRpc(auth.code, auth.detail)
+        if (auth.code) return failRpc(auth.code, auth.detail, auth.since != null ? { since: auth.since } : {})
         const { target } = auth
         // Each op parks a wake waiter (minutes) and a broker entry; bound
         // them per connection so a looping Coordinator cannot stack them.
@@ -2467,7 +2525,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           let frame
           try {
             if (waking && spawnWakeWaitMs > 0) await hub.waitForDevice(conn.userId, target.device_id, spawnWakeWaitMs)
-            const r = await broker.issue(hub, conn.userId, target.device_id, 'session_control', params, { timeoutMs: sessionControlTimeoutMs })
+            // Locked while the box was being woken: nothing is sent.
+            const r = isPanicLocked(db, conn.userId)
+              ? { ok: false, error: { code: 'forbidden', detail: ACCOUNT_LOCKED } }
+              : await broker.issue(hub, conn.userId, target.device_id, 'session_control', params, { timeoutMs: sessionControlTimeoutMs })
             frame = sessionControlResultFrame(rid, r)
           } catch (err) {
             console.error(`session_control: ${err?.message || err}`)

@@ -62,6 +62,7 @@ import { convoStatuses } from './convo-status.js'
 import { makeAlertsHandler } from './alerts-http.js'
 import { handleSummariseRoute } from './summarise-http.js'
 import { securityLogFor, withRequestScope, handleSecurityFeed, deviceTarget, keyTarget } from './security-log.js'
+import { handlePanic, panicLock, lockedBody, signOutLockedClient } from './panic.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
 // card's `from_name` gets. NULL stays null rather than collapsing to '' —
@@ -124,7 +125,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, agentCommentLimiter = makeAgentCommentLimiter(), blobTranscripts = null, github = null, handleWellKnown = () => false, handleFederation = async () => false, federationOutbox = null, federationContacts = null, federationGrants = null, federationContribute = null, federationMedia = null, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null, journalHost = null, clientIdleMs, clientIdleClock = Date.now, securityLog = securityLogFor(db), securityFeed = null }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, agentCommentLimiter = makeAgentCommentLimiter(), blobTranscripts = null, github = null, handleWellKnown = () => false, handleFederation = async () => false, federationOutbox = null, federationContacts = null, federationGrants = null, federationContribute = null, federationMedia = null, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null, journalHost = null, clientIdleMs, clientIdleClock = Date.now, securityLog = securityLogFor(db), securityFeed = null, panic = null }) {
   // Two-factor sign-in (src/two-factor-http.js). The server passes its own;
   // the defaults keep a bare handler (tests) working the same way.
   const twoFactorBox = tokenBox || PLAIN_BOX
@@ -134,6 +135,11 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
   // Consent items restamped reach the user's apps as an `updated` marker
   // (approval-keys-http.js announceRestamped).
   const announceRestamped = (who, ids) => announceRestampedItems({ db, hub, pushPipeline, waker }, who, ids)
+  // A panic-locked account (src/panic.js): its sign-in, link and pair
+  // routes answer 423 before any password or code is looked at. → the lock,
+  // or null.
+  const lockOf = (userId) => panicLock(db, userId)
+  const refuseLocked = (res, lock) => json(res, 423, lockedBody(lock))
   // Forgot/reset password: their own per-IP budget, a few asks per quarter hour.
   const passwordResetLimiter = resetLimiter || makeRateLimiter({ max: 5, windowMs: 15 * 60000 })
   // Alertmanager webhook (src/alerts-http.js): built once so its in-flight
@@ -180,6 +186,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
             (device_name != null && typeof device_name !== 'string')) {
           return json(res, 400, { error: 'bad_request' })
         }
+        // A panic-locked account: 423 before the password is checked (so
+        // the route is no password oracle) and before the lockout, which
+        // it never counts toward.
+        const lockedUser = db.prepare('SELECT id FROM users WHERE name=?').get(username)
+        const lock = lockedUser && lockOf(lockedUser.id)
+        if (lock) return refuseLocked(res, lock)
         const gate = loginGuard.check(username)
         if (!gate.allowed) {
           const retryAfter = Math.ceil(gate.retryAfterMs / 1000)
@@ -189,6 +201,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         const u = await checkPassword(db, { username, password })
         if (!u) { loginGuard.fail(username); return json(res, 403, { error: 'bad_credentials' }) }
         const deviceName = device_name || 'unnamed'
+        // Locked while the password was being checked: still no device.
+        const lockNow = lockOf(u.userId)
+        if (lockNow) return refuseLocked(res, lockNow)
         // Two-factor (src/two-factor-http.js): a right password alone buys a
         // short-lived ticket, not a token. The lockout is not reset yet —
         // only a right code clears it, so wrong codes keep counting. 401,
@@ -237,6 +252,10 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         const c = pairs.claim(poll_token)
         if (c.status === 'not_found') return json(res, 404, { error: 'not_found' })
         if (c.status === 'pending') return json(res, 200, { status: 'pending' })
+        // Approved before the account was panic-locked: no new box for it.
+        // The pair is spent either way.
+        const pairLock = lockOf(c.userId)
+        if (pairLock) return refuseLocked(res, pairLock)
         // Mint at claim (spec): the devices row first exists HERE. The pair
         // is already deleted; if createAgent somehow threw, the box retries
         // with a fresh code and no orphan row exists either way.
@@ -257,6 +276,10 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         if (typeof link_code !== 'string' || !link_code || !name || name.length > 64) {
           return json(res, 400, { error: 'bad_request' })
         }
+        // A code of a panic-locked account (a starter's, or a pre-approved
+        // one): 423, and the code is left as it was.
+        const linkLock = lockOf(links.ownerOf(link_code))
+        if (linkLock) return refuseLocked(res, linkLock)
         const c = links.claim(link_code, { deviceName: name, requesterIp: ip })
         // conflict (already claimed) is distinguishable from 404: telling
         // the second claimant the code was used leaks nothing useful and
@@ -281,6 +304,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // claimant never types one.
         const user = db.prepare('SELECT name FROM users WHERE id=?').get(p.userId)
         if (!user) return json(res, 404, { error: 'not_found' }) // user row gone mid-flow; claimant rescans
+        // Claimed or approved before the account was panic-locked: no device.
+        const pollLock = lockOf(p.userId)
+        if (pollLock) return refuseLocked(res, pollLock)
         const d = createClientDevice(db, p.userId, p.deviceName)
         // Who approved it: the starter device's tap, or whoever minted a
         // pre-approved code (no device: the host, or a web admin's own).
@@ -338,8 +364,22 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       // The security event feed: its own read-only Bearer token, bound to one
       // account, never a device token, so ahead of `who` too. Off, 404.
       if (handleSecurityFeed({ db, feed: securityFeed, json, rateLimiter }, req, res, url, { rejectEarly })) return
+      // The panic lock (src/panic.js): its own Bearer token, bound to one
+      // account, that can only lock it and read whether it is locked. Off, 404.
+      if (await handlePanic({ db, hub, panic, json, rateLimiter, securityLog, signInTickets }, req, res, url, { rejectEarly })) return
       const who = bearer(req) && authToken(db, bearer(req), { now: clientIdleClock(), clientIdleMs })
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
+      // A client token of a panic-locked account still working (a race, or
+      // a device made by a path the lock missed): 423 on every route, and
+      // the device is signed out. Agent tokens keep working: a bridge needs
+      // its socket and routes to hear the clear.
+      if (who.kind === 'client') {
+        const lock = lockOf(who.userId)
+        if (lock) {
+          signOutLockedClient({ db, hub, securityLog }, who.userId, who.deviceId, lock)
+          return rejectEarly(req, res, 423, lockedBody(lock))
+        }
+      }
       // The tracker's own surface (src/items-http.js) — mounted first so
       // its /items* paths never collide with the chain below, and inside the
       // outer try/catch so readBody's 400/413 map like every other route's.

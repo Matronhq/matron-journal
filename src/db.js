@@ -2053,6 +2053,7 @@ export function openDb(path) {
   addProtectedDevices(db)
   addApprovalLockdown(db)
   addSecurityEvents(db)
+  addPanicLocks(db)
   // A routine's envelope (JSON): the bounds on what an ask born of one of
   // its fires may do — how many spawns per fire, whether chats, which boxes.
   // NULL = no envelope, the value for every routine predating the column.
@@ -2784,6 +2785,21 @@ export function addSecurityEvents(db) {
   // Who minted a pre-approved link code ('admin_cli', 'admin'), named on the
   // device_linked event when it is used; NULL for codes from before.
   if (!db.prepare('PRAGMA table_info(link_preapprovals)').all().some((c) => c.name === 'minted_by')) db.exec('ALTER TABLE link_preapprovals ADD COLUMN minted_by TEXT')
+}
+
+// Panic lock (src/panic.js): one row per account that was ever locked;
+// locked while cleared_at is NULL. `source` and `alert` are the watcher's
+// own text, at most 200 characters each. Idempotent.
+export function addPanicLocks(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS panic_locks(
+      user_id    INTEGER PRIMARY KEY,
+      since      INTEGER NOT NULL,
+      source     TEXT,
+      alert      TEXT,
+      cleared_at INTEGER
+    );
+  `)
 }
 
 // When deliveries to a peer journal started failing (src/federation-outbox.js):

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
 import { installApprovalLockdown } from './approval-keys-http.js'
 import { makeSecurityLog, installSecurityLog, resolveSecurityFeed, sweepSecurityEvents } from './security-log.js'
+import { resolvePanic } from './panic.js'
 import { makeLoginGuard, makeRateLimiter, DEFAULT_CLIENT_IDLE_DAYS, DEFAULT_CLIENT_IDLE_MS } from './auth.js'
 import { makeTwoFactorTickets, isTwoFactorRequired } from './two-factor.js'
 import { makeHttpHandler } from './http.js'
@@ -545,6 +546,9 @@ export function startServer({
   // or null for off (MATRON_SECURITY_FEED_TOKEN, MATRON_SECURITY_FEED_ACCOUNT
   // otherwise).
   securityLog, securityFeed,
+  // Panic lock (src/panic.js): {token, account} for POST/GET /panic, or
+  // null for off; MATRON_PANIC_TOKEN and MATRON_PANIC_ACCOUNT otherwise.
+  panic,
   // POST /summarise (src/summarise.js): the test seam; `null` forces it
   // off. Undefined resolves from MATRON_SUMMARY_ANTHROPIC_KEY(_FILE).
   summariser,
@@ -767,6 +771,13 @@ export function startServer({
   if (resolvedSecurityFeed && !db.prepare('SELECT 1 FROM users WHERE name=?').get(resolvedSecurityFeed.account)) {
     console.warn(`security feed: MATRON_SECURITY_FEED_ACCOUNT ${JSON.stringify(resolvedSecurityFeed.account)} is not a user; GET /security-events answers 404 until it exists`)
   }
+  const resolvedPanic = panic !== undefined ? (panic && resolvePanic(panic)) : resolvePanic({
+    token: process.env.MATRON_PANIC_TOKEN || null,
+    account: process.env.MATRON_PANIC_ACCOUNT || null,
+  })
+  if (resolvedPanic && !db.prepare('SELECT 1 FROM users WHERE name=?').get(resolvedPanic.account)) {
+    console.warn(`panic: MATRON_PANIC_ACCOUNT ${JSON.stringify(resolvedPanic.account)} is not a user; /panic answers 404 until it exists`)
+  }
   const resolvedSummariser = summariser !== undefined ? summariser : makeConfiguredSummariser()
   const resolvedMailer = mailer !== undefined ? mailer : makeConfiguredMailer()
   const approvalBaseUrl = parsePublicUrl(publicUrl !== undefined ? publicUrl : process.env.MATRON_PUBLIC_URL)
@@ -793,7 +804,7 @@ export function startServer({
     agentCommentLimiter: makeAgentCommentLimiter({ now: agentCommentClock }),
     github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, federationGrants, federationContribute, federationMedia, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
-    journalHost, clientIdleMs, clientIdleClock, securityLog: resolvedSecurityLog, securityFeed: resolvedSecurityFeed,
+    journalHost, clientIdleMs, clientIdleClock, securityLog: resolvedSecurityLog, securityFeed: resolvedSecurityFeed, panic: resolvedPanic,
   })))
   // A reverse proxy in front of the journal keeps its connections to it open
   // and reuses them. Node closes an idle connection after 5 s by default,

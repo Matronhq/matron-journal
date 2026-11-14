@@ -8,7 +8,8 @@
 // text, passwords, codes, tokens, statements, signatures or public keys.
 // `target` is a short identifier (device:<id>, key:<first 8 of key_id>,
 // convo:<id>, spawns, transfers, a two-factor action, a lock length, a
-// refusal reason), never free text.
+// refusal reason), never free text, but for the panic's `source`, the
+// watcher's own label, which only goes out JSON-encoded.
 import fs from 'node:fs'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { sharedTokenMatches } from './auth.js'
@@ -19,6 +20,7 @@ export const SECURITY_EVENTS = Object.freeze([
   'spawn_approved', 'chat_approved', 'session_started_direct', 'coordinator_carry_on',
   'approval_key_enrolled', 'approval_key_revoked', 'approval_key_attached', 'approval_invalid',
   'device_signed_out_bad_signatures', 'enrolment_locked', 'transfer_approved',
+  'panic_locked', 'panic_cleared',
 ])
 const KNOWN = new Set(SECURITY_EVENTS)
 export const DECIDERS = Object.freeze(['user', 'coordinator', 'admin', 'admin_cli', 'journal'])

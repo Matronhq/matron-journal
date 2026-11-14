@@ -16,6 +16,7 @@
 //   PUT  /2fa/policy         {required}     (admins only)
 import { json, readBody } from './http-body.js'
 import { verifyUserPassword, createClientDevice } from './auth.js'
+import { panicLock, lockedBody } from './panic.js'
 import { isAdmin } from './users-http.js'
 import { guardedAccountAction, hasActiveKey, refuse } from './approval-keys.js'
 import { securityLogOf, deviceTarget } from './security-log.js'
@@ -82,6 +83,10 @@ export async function handleTwoFactorLogin(ctx, req, res, url, { rejectEarly }) 
   const t = tickets.get(ticket)
   const wantPurpose = path === '/login/2fa' ? 'verify' : 'enrol'
   if (!t || t.purpose !== wantPurpose) { json(res, 401, { error: 'two_factor_ticket_invalid' }); return true }
+  // A panic-locked account (src/panic.js): 423 before any code is checked
+  // or the lockout counts anything, on every step.
+  const lock = panicLock(db, t.userId)
+  if (lock) { json(res, 423, lockedBody(lock)); return true }
   // An enrol ticket is for a user who had no two-factor when it was issued.
   // Once they have it (enrolled from another tab or device meanwhile), the
   // password-only ticket must not be able to replace their secret.
