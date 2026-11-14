@@ -50,6 +50,15 @@ export function makeRoutineFirer({ db, hub, broker, waker = null, wakeWaitMs = 0
   async function fire(routine, { retry = false, now = Date.now(), message = null, onOutcome = null } = {}) {
     const coord = coordinatorDevice(db, routine.user_id)
     const label = `${routine.name} for ${userName(routine.user_id)}`
+    // A panic-locked account (src/panic.js): no routine turn, not retried,
+    // whatever else is true of its Coordinator.
+    if (isPanicLocked(db, routine.user_id)) {
+      if (onOutcome) onOutcome(LOCKED, false)
+      else recordOutcome(db, routine.id, { outcome: LOCKED, retryable: false, retry, now })
+      finish(routine, LOCKED)
+      log.log(`routines: ${label} not delivered: the account is panic-locked`)
+      return LOCKED
+    }
     if (!coord) {
       if (onOutcome) onOutcome('no_coordinator', false)
       else recordOutcome(db, routine.id, { outcome: 'no_coordinator', retryable: false, retry, now })
@@ -66,14 +75,6 @@ export function makeRoutineFirer({ db, hub, broker, waker = null, wakeWaitMs = 0
       finish(routine, PROTECTED)
       log.log(`routines: ${label} not delivered: the Coordinator's box is protected`)
       return PROTECTED
-    }
-    // A panic-locked account (src/panic.js): no routine turn, not retried.
-    if (isPanicLocked(db, routine.user_id)) {
-      if (onOutcome) onOutcome(LOCKED, false)
-      else recordOutcome(db, routine.id, { outcome: LOCKED, retryable: false, retry, now })
-      finish(routine, LOCKED)
-      log.log(`routines: ${label} not delivered: the account is panic-locked`)
-      return LOCKED
     }
     const params = {
       convo_id: coord.convoId, action: 'routine', routine_id: routine.id, name: routine.name, title: routine.title,

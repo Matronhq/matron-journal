@@ -79,7 +79,17 @@ export function issueResetToken(db, userId, now = Date.now()) {
 // token that is unknown, used or expired (one answer for all three). The
 // token row is consumed before the slow hash, so a second use of the same
 // link fails even while the first is still hashing.
-export async function resetPassword(db, token, newPassword, now = Date.now()) {
+// The account a token would reset, without spending it: a token that is
+// known, unexpired and of the account as it was; else null.
+export function resetTokenOwner(db, token, now = Date.now()) {
+  if (typeof token !== 'string' || !token || token.length > 128) return null
+  const r = db.prepare('SELECT user_id, expires_at, account_state FROM password_resets WHERE token_hash=?').get(sha256(token))
+  return r && r.expires_at > now && r.account_state === accountState(db, r.user_id) ? r.user_id : null
+}
+
+// `refuse(userId)`: checked again in the write's transaction (after the
+// slow hash); truthy refuses the write with {ok:false, refused}.
+export async function resetPassword(db, token, newPassword, now = Date.now(), { refuse = null } = {}) {
   if (typeof token !== 'string' || !token || token.length > 128) return { ok: false }
   const row = db.transaction(() => {
     const r = db.prepare('SELECT user_id, expires_at, account_state FROM password_resets WHERE token_hash=?').get(sha256(token))
@@ -92,6 +102,8 @@ export async function resetPassword(db, token, newPassword, now = Date.now()) {
   return db.transaction(() => {
     const user = db.prepare('SELECT name FROM users WHERE id=?').get(row.user_id)
     if (!user || accountState(db, row.user_id) !== row.account_state) return { ok: false }
+    const refused = refuse?.(row.user_id)
+    if (refused) return { ok: false, refused }
     db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hash, row.user_id)
     db.prepare('DELETE FROM password_resets WHERE user_id=?').run(row.user_id)
     // The ids too, for the security log's device_revoked per device.

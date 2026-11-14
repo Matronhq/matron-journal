@@ -99,15 +99,16 @@ export function makeAlertsHandler({ db, hub, broker, waker = null, rateLimiter =
     if (!isAlertmanagerPayload(body)) { json(res, 400, { error: 'bad_request' }); return true }
     const coord = coordinatorDevice(db, user.id)
     const label = `${sanitizePeerText(body.status, 10) || '?'} ${alertName(body)} (${body.alerts.length})`
-    if (!coord) {
-      console.log(`alerts: ${label} not delivered: no Coordinator (or it has no box) for ${username}`)
-      json(res, 202, { delivered: false, reason: 'no_coordinator' })
-      return true
-    }
-    // A panic-locked account (src/panic.js): its boxes get no new work.
+    // A panic-locked account (src/panic.js): its boxes get no new work,
+    // whatever else is true of its Coordinator.
     if (isPanicLocked(db, user.id)) {
       console.log(`alerts: ${label} not delivered: the account is panic-locked, for ${username}`)
       json(res, 202, { delivered: false, reason: 'account_locked' })
+      return true
+    }
+    if (!coord) {
+      console.log(`alerts: ${label} not delivered: no Coordinator (or it has no box) for ${username}`)
+      json(res, 202, { delivered: false, reason: 'no_coordinator' })
       return true
     }
     // A protected box is out of the Coordinator's session control
