@@ -2058,6 +2058,7 @@ export function openDb(path) {
   addProtectedDevices(db)
   addApprovalLockdown(db)
   addSecurityEvents(db)
+  addPanicLocks(db)
   // A routine's envelope (JSON): the bounds on what an ask born of one of
   // its fires may do — how many spawns per fire, whether chats, which boxes.
   // NULL = no envelope, the value for every routine predating the column.
@@ -2478,38 +2479,55 @@ export function unreadBadge(db, userId) {
 // Roster for GET /devices — same devices+user_seq read as buildMetrics
 // (src/metrics.js), plus name/created_at, which metrics deliberately omits.
 // token_hash and user_id never leave this function.
-export function listDevices(db, userId, now = Date.now()) {
+export function listDevices(db, userId) {
   const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)
   const headSeq = head ? head.seq : 0
   return db.prepare(
     'SELECT id AS device_id, kind, name, tag_char, created_at, cursor, last_seen_at, protected, locked FROM devices WHERE user_id=? ORDER BY id'
-  ).all(userId).map((d) => ({ ...d, protected: d.protected === 1, locked: storedLocked(d.locked, now), lag: headSeq - d.cursor }))
+  ).all(userId).map((d) => ({ ...d, protected: d.protected === 1, locked: storedLocked(d.locked), lag: headSeq - d.cursor }))
 }
 
 // A box's locked mode as its bridge reports it (hello, status, box_status):
-// {on: boolean, until: non-negative integer ms | null}, normalised, or
-// undefined when `raw` is not that shape.
+// {on: boolean, until: non-negative integer ms | null, lockdown_until:
+// non-negative integer ms | null} (the two times optional, null when
+// absent; any other key dropped). `null` is the bridge clearing it. →
+// the normalised object, null, or undefined when `raw` is neither.
+// The journal does not interpret it: locked with no window ({on:true,
+// until:null}), inside an unlock window ({on:false, until}) and a
+// lockdown ({on:true, lockdown_until}) are all stored and shown as sent.
+const lockedTime = (v) => (v === undefined || v === null ? null : Number.isSafeInteger(v) && v >= 0 ? v : undefined)
 export function parseLocked(raw) {
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw) || typeof raw.on !== 'boolean') return undefined
-  const until = raw.until ?? null
-  if (until !== null && !(Number.isSafeInteger(until) && until >= 0)) return undefined
-  return { on: raw.on, until }
+  if (raw === null) return null
+  if (typeof raw !== 'object' || Array.isArray(raw) || typeof raw.on !== 'boolean') return undefined
+  const until = lockedTime(raw.until)
+  const lockdownUntil = lockedTime(raw.lockdown_until)
+  if (until === undefined || lockdownUntil === undefined) return undefined
+  return { on: raw.on, until, lockdown_until: lockdownUntil }
 }
 
-// The bridge's report for its own device: kept while on, cleared by on:false
-// (or, at hello, by a hello that reports nothing). A malformed report is
-// ignored: the caller passes only what parseLocked accepted.
+// The bridge's report for its own device, stored as it is (on:false
+// included: an unlock window is a state of a locked box); null clears it.
+// A malformed report is ignored: the caller passes only what parseLocked
+// accepted. → true when the stored value changed.
 export function setDeviceLocked(db, deviceId, locked) {
-  db.prepare('UPDATE devices SET locked=? WHERE id=?').run(locked?.on ? JSON.stringify(locked) : null, deviceId)
+  const text = locked == null ? null : JSON.stringify(locked)
+  return db.prepare('UPDATE devices SET locked=? WHERE id=? AND locked IS NOT ?').run(text, deviceId, text).changes > 0
 }
 
-// What the device list shows: the stored report, or null when there is
-// none or its `until` has passed.
-const storedLocked = (text, now) => {
+// What the device list shows: the stored report as the bridge sent it, or
+// null when there is none. No expiry here: the app compares `until` and
+// `lockdown_until` with its own clock, and the bridge reports again when a
+// window or a lockdown ends.
+const storedLocked = (text) => {
   if (text == null) return null
   let v
   try { v = parseLocked(JSON.parse(text)) } catch { return null }
-  return v && (v.until == null || v.until > now) ? v : null
+  return v ?? null
+}
+
+// A device's stored locked report, as GET /devices shows it.
+export function deviceLocked(db, deviceId) {
+  return storedLocked(db.prepare('SELECT locked FROM devices WHERE id=?').get(deviceId)?.locked)
 }
 
 // Box status (spec: 2026-09-21 "usage and allowances live in the journal").
@@ -2789,6 +2807,21 @@ export function addSecurityEvents(db) {
   // Who minted a pre-approved link code ('admin_cli', 'admin'), named on the
   // device_linked event when it is used; NULL for codes from before.
   if (!db.prepare('PRAGMA table_info(link_preapprovals)').all().some((c) => c.name === 'minted_by')) db.exec('ALTER TABLE link_preapprovals ADD COLUMN minted_by TEXT')
+}
+
+// Panic lock (src/panic.js): one row per account that was ever locked;
+// locked while cleared_at is NULL. `source` and `alert` are the watcher's
+// own text, at most 200 characters each. Idempotent.
+export function addPanicLocks(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS panic_locks(
+      user_id    INTEGER PRIMARY KEY,
+      since      INTEGER NOT NULL,
+      source     TEXT,
+      alert      TEXT,
+      cleared_at INTEGER
+    );
+  `)
 }
 
 // When deliveries to a peer journal started failing (src/federation-outbox.js):

@@ -121,9 +121,15 @@ test('POST /devices/:id/rename: renames, sanitises, caps, owner-scoped, client-g
   // happy path
   const ok = await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', token, body: { name: 'dev-y' } })
   assert.equal(ok.status, 200)
-  assert.deepEqual(ok.json, { ok: true, device: { device_id: agent.deviceId, name: 'dev-y', tag_char: null } })
+  assert.deepEqual(ok.json, { ok: true, device: { device_id: agent.deviceId, name: 'dev-y', tag_char: null, locked: null } })
   const roster = await s.http('/devices', { token })
   assert.equal(roster.json.devices.find((d) => d.device_id === agent.deviceId).name, 'dev-y')
+  // The body carries the box's standing locked report, as device_meta does.
+  const locked = { on: false, until: 4102444800000, lockdown_until: null }
+  s.db.prepare('UPDATE devices SET locked=? WHERE id=?').run(JSON.stringify(locked), agent.deviceId)
+  const again = await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', token, body: { name: 'dev-y' } })
+  assert.deepEqual(again.json.device.locked, locked)
+  s.db.prepare('UPDATE devices SET locked=NULL WHERE id=?').run(agent.deviceId)
 
   // a client device (including self) may be renamed too
   const self = await s.http(`/devices/${login.json.device_id}/rename`, { method: 'POST', token, body: { name: 'Alice Mac' } })
@@ -188,7 +194,7 @@ test('rename fans out device_meta to client sockets only', async (t) => {
   assert.equal(r.status, 200)
 
   const frame = await client.waitFor((f) => f.kind === 'device_meta')
-  assert.deepEqual(frame, { kind: 'device_meta', device_id: agent.deviceId, name: 'dev-y', tag_char: null })
+  assert.deepEqual(frame, { kind: 'device_meta', device_id: agent.deviceId, name: 'dev-y', tag_char: null, locked: null })
   // agents never receive it (a box has no roster to update), and another
   // user's socket never sees it at all
   await new Promise((res) => setTimeout(res, 150))
@@ -209,7 +215,7 @@ test('POST /devices/:id/tag: sets, clears, keeps one grapheme, owner-scoped, cli
   // happy path — the response echoes the device's current name alongside
   const ok = await s.http(`/devices/${agent.deviceId}/tag`, { method: 'POST', token, body: { tag_char: 'a' } })
   assert.equal(ok.status, 200)
-  assert.deepEqual(ok.json, { ok: true, device: { device_id: agent.deviceId, name: 'dev-a', tag_char: 'a' } })
+  assert.deepEqual(ok.json, { ok: true, device: { device_id: agent.deviceId, name: 'dev-a', tag_char: 'a', locked: null } })
   const roster = await s.http('/devices', { token })
   assert.equal(roster.json.devices.find((d) => d.device_id === agent.deviceId).tag_char, 'a')
 
@@ -290,7 +296,7 @@ test('tag change fans out device_meta (name + tag_char) to client sockets only',
   assert.equal(r.status, 200)
 
   const frame = await client.waitFor((f) => f.kind === 'device_meta')
-  assert.deepEqual(frame, { kind: 'device_meta', device_id: agent.deviceId, name: 'box-9', tag_char: '9' })
+  assert.deepEqual(frame, { kind: 'device_meta', device_id: agent.deviceId, name: 'box-9', tag_char: '9', locked: null })
   await new Promise((res) => setTimeout(res, 150))
   assert.equal(box.frames.filter((f) => f.kind === 'device_meta').length, 0)
   assert.equal(stranger.frames.filter((f) => f.kind === 'device_meta').length, 0)
@@ -300,7 +306,7 @@ test('tag change fans out device_meta (name + tag_char) to client sockets only',
   const rn = await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', token: login.json.token, body: { name: 'dev-y' } })
   assert.equal(rn.status, 200)
   const renamed = await client.waitFor((f) => f.kind === 'device_meta' && f.name === 'dev-y')
-  assert.deepEqual(renamed, { kind: 'device_meta', device_id: agent.deviceId, name: 'dev-y', tag_char: '9' })
+  assert.deepEqual(renamed, { kind: 'device_meta', device_id: agent.deviceId, name: 'dev-y', tag_char: '9', locked: null })
 })
 
 test('rename patches the live socket, so a connected box mints the new name at once', async (t) => {

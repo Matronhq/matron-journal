@@ -36,6 +36,7 @@ import { isProtectedDevice } from './consent-subject.js'
 import { wakeIfOffline } from './wake.js'
 import { sanitizePeerText } from './peer-text.js'
 import { isAlertmanagerPayload, formatAlertMessage, alertName } from './alerts.js'
+import { isPanicLocked } from './panic.js'
 
 export const ALERT_PATH = '/alerts/alertmanager'
 export const ALERT_TOKEN_MIN = 32
@@ -98,6 +99,13 @@ export function makeAlertsHandler({ db, hub, broker, waker = null, rateLimiter =
     if (!isAlertmanagerPayload(body)) { json(res, 400, { error: 'bad_request' }); return true }
     const coord = coordinatorDevice(db, user.id)
     const label = `${sanitizePeerText(body.status, 10) || '?'} ${alertName(body)} (${body.alerts.length})`
+    // A panic-locked account (src/panic.js): its boxes get no new work,
+    // whatever else is true of its Coordinator.
+    if (isPanicLocked(db, user.id)) {
+      console.log(`alerts: ${label} not delivered: the account is panic-locked, for ${username}`)
+      json(res, 202, { delivered: false, reason: 'account_locked' })
+      return true
+    }
     if (!coord) {
       console.log(`alerts: ${label} not delivered: no Coordinator (or it has no box) for ${username}`)
       json(res, 202, { delivered: false, reason: 'no_coordinator' })
@@ -129,6 +137,8 @@ export function makeAlertsHandler({ db, hub, broker, waker = null, rateLimiter =
         // Checked again after the wait: a box protected meanwhile gets nothing.
         if (isProtectedDevice(db, user.id, coord.deviceId)) {
           outcome = 'not delivered: the Coordinator\'s box is protected'
+        } else if (isPanicLocked(db, user.id)) {
+          outcome = 'not delivered: the account is panic-locked'
         } else {
           const r = await broker.issue(hub, user.id, coord.deviceId, 'session_control', params, { timeoutMs })
           // The reply is the bridge's text: sieved before it reaches the log.

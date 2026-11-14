@@ -4,7 +4,8 @@
 // whether or not the account exists or has an address, and mails
 // in the background so the reply time says nothing either.
 import { json, readBody } from './http-body.js'
-import { normaliseEmail, setUserEmail, getUserEmail, findResetTarget, issueResetToken, resetPassword, resetEmail, EMAIL_MAX } from './password-reset.js'
+import { normaliseEmail, setUserEmail, getUserEmail, findResetTarget, issueResetToken, resetPassword, resetTokenOwner, resetEmail, EMAIL_MAX } from './password-reset.js'
+import { panicLock, lockedBody } from './panic.js'
 import { verifyUserPassword } from './auth.js'
 import { securityLogOf, deviceTarget } from './security-log.js'
 
@@ -57,7 +58,13 @@ export async function handlePasswordResetRoute(ctx, req, res, url, { rejectEarly
     const { token, new_password } = await readBody(req)
     if (typeof token !== 'string' || !token) { json(res, 400, { error: 'bad_request' }); return true }
     if (typeof new_password !== 'string' || new_password.length < PASSWORD_MIN) { json(res, 400, { error: 'weak_password' }); return true }
-    const r = await resetPassword(db, token, new_password)
+    // A panic-locked account (src/panic.js): 423, and the token is left
+    // unused for after the clear. Only a valid token reaches this, so it
+    // tells nothing to anyone without one. Checked again after the hash.
+    const lock = panicLock(db, resetTokenOwner(db, token))
+    if (lock) { json(res, 423, lockedBody(lock)); return true }
+    const r = await resetPassword(db, token, new_password, Date.now(), { refuse: (userId) => panicLock(db, userId) })
+    if (r.refused) { json(res, 423, lockedBody(r.refused)); return true }
     if (!r.ok) { json(res, 400, { error: 'invalid_token' }); return true }
     // Whoever was guessing the old password is no longer a reason to keep
     // the owner out with the new one.

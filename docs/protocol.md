@@ -536,7 +536,8 @@ the machine-checkable version of this page.
   cursor, lag, last_seen_at, protected, locked, idle_expired, is_self,
   connected, status?, defaults?}]}`. The
   caller's own user's devices only; `is_self` marks the requesting device.
-  `protected` (boolean), `locked` (`{on, until}` or `null`) and
+  `protected` (boolean), `locked` (`{on, until, lockdown_until}` as the
+  box's bridge last reported it, or `null`) and
   `idle_expired` (boolean) are on every device: see *Approval keys
   (step-up)* → *Protected boxes*, *Locked boxes* and *Client-token idle
   expiry*. `last_seen_at` is written at most once an hour.
@@ -959,8 +960,8 @@ Rows from before the stamp carry neither, and don't count.
   `box_defaults` (agents only, always present for them) is the connecting
   box's own `{default_agent, default_model, default_effort}`, nulls when
   unset (see *Box defaults*).
-  An agent's `hello` may carry `locked: {on, until}` (its box's locked
-  mode; absent clears it), and every journal frame an agent receives from a
+  An agent's `hello` may carry `locked: {on, until?, lockdown_until?}` (its
+  box's locked mode; absent or `null` clears it), and every journal frame an agent receives from a
   user carries `approval_key_id`, replayed ones as `null`: see *Approval
   keys (step-up)* → *Locked boxes*. An idle-expired client token is refused
   like an unknown one (`code:'auth'`).
@@ -1123,12 +1124,15 @@ Rows from before the stamp carry neither, and don't count.
   changed: refusals and repeat dissolves append nothing. Clients treat every
   `convo_meta` key independently; a membership-only payload leaves
   title/parent/owner untouched.
-- `device_meta` — `{kind:'device_meta', device_id, name, tag_char}`, sent to
-  a user's **client** sockets when `POST /devices/:id/rename` or
-  `POST /devices/:id/tag` succeeds. The frame always carries the device's
-  full current meta (a rename repeats the standing `tag_char`, a tag change
-  repeats the standing `name`), so a roster built from frames alone never
-  loses either half. Transient: not
+- `device_meta` — `{kind:'device_meta', device_id, name, tag_char, locked}`,
+  sent to a user's **client** sockets when `POST /devices/:id/rename` or
+  `POST /devices/:id/tag` succeeds, and when a box's bridge reports a
+  `locked` that differs from the stored one (*Approval keys (step-up)* →
+  *Locked boxes*). The frame always carries the device's full current meta
+  (a rename repeats the standing `tag_char` and `locked`, a tag change the
+  standing `name`, a locked change both), so a roster built from frames
+  alone never loses any of them. `locked` is `null` for a client device
+  and for a box that has reported none. Transient: not
   a journal event, carries no seq, and is never replayed. Recovery for a
   client that misses one depends on the renamed device's kind, because every
   kind may be renamed but `/snapshot`'s `agents` list carries only agent
@@ -4307,13 +4311,15 @@ needs the user's own approval, signed once the account has a key.
 | Coordinator `session_control` aimed at a session on it | `{kind:'control', op:'error', code:'forbidden', ref:'session_control', request_id, detail:'protected_device'}` (after the existing ownership, role and target checks) |
 | the journal's own `session_control` to a Coordinator whose conversation is on it: a routine's fire (scheduled, triggered or `POST /routines/:key/run`) and an Alertmanager alert | not sent. The routine's `last_outcome` (and its `fired` marker's `outcome`) is `protected_device`, never retried, and `run` answers `202 {delivered:false, reason:'protected_device'}`; `POST /alerts/alertmanager` answers `202 {delivered:false, reason:'protected_device'}`. Choosing such a Coordinator (`PUT /coordinator`) is not refused |
 | a mission hand-over's session start (`start_session`, including **New session** on a protected Coordinator box) | `start_session: {status:'refused', reason:'protected_device'}`; the hand-over itself still goes through and the copy is made |
-| a talk request's **New session** on it | no start is sent; the guest's card reads "Couldn't start a session: protected_device. Pick another option." and the request waits for the guest again |
+| a talk request's **New session** on it | no start is sent; the guest's card reads "Couldn't start a session: protected_device. Pick another option." and the request waits for the guest again. A box protected while the start is with it: the session it reports is not invited, and the talk goes back to the guest the same way |
 | inviting a guest box on accepting a person-room ask or a talk request (on one journal or across journals) | `409 {error:'conflict', blocked_by:'protected_device'}`; nothing changes and the ask stays as it was |
 
 Where the journal first wakes an asleep box and waits for it (a routine, an
-alert, a hand-over's or a talk's session start), it checks again once the
-wait is over: a box protected meanwhile gets nothing, with the same outcome
-as above.
+alert, a hand-over's or a talk's session start, a Coordinator's
+`session_control`), it checks again once the wait is over: a box protected
+meanwhile gets nothing, with the same outcome as above (for
+`session_control`, the result frame with `error: {code:'forbidden',
+detail:'protected_device'}`).
 
 **With a key**, an ask **aimed at** a protected box needs a signed
 `consent` statement to be approved. Aimed at means: a spawn's target box; a
@@ -4582,18 +4588,34 @@ sent one, is part of its message and is left as it is.
 ```
 
 **`locked`.** A bridge reports its box's mode as `locked: {on: boolean,
-until: <ms> | null}` (`until` a non-negative integer or absent/`null`;
-other keys are dropped) on `hello`, on `box_status` and on `status`, for
-its own device only (a `device_id` in the frame is ignored; clients cannot
-set it). On `hello`, an absent `locked` clears the mode (a bridge restarted
-without it is not locked); a malformed one is ignored and the hello goes on.
-On `box_status` and `status` an absent or malformed one changes nothing
-(`status` applies it before its own checks); `{on:false}` clears it. A
-`box_status` whose only valid content is `locked` is accepted silently;
-one with nothing valid is `bad_request` (`no valid status block`).
-`GET /devices` shows `locked: {on: true, until} | null` on every device
-(`null` for clients, for a box not locked, and once `until` has passed).
-No live frame announces a change; `/roster` does not carry it.
+until: <ms> | null, lockdown_until: <ms> | null}` (each time a
+non-negative integer, or absent/`null`, which is stored as `null`; other
+keys are dropped) on `hello`, on `box_status` and on `status`, for its own
+device only (a `device_id` in the frame is ignored; clients cannot set it).
+The journal stores the report as sent and does not interpret it; the
+states a bridge reports, and the app tells apart, are:
+
+| State | Report |
+|---|---|
+| locked, no unlock window | `{on: true, until: null, lockdown_until: null}` |
+| inside an unlock window | `{on: false, until: <window end>, lockdown_until: null}` |
+| lockdown | `{on: true, until: null \| <ms>, lockdown_until: <ms>}` |
+
+It is stored whenever the bridge reports an object, `on: false` included
+(an unlock window is a state of a locked box, not "not locked"). It is
+cleared only by a `hello` without the `locked` key (a bridge restarted
+without it is not locked) or by an explicit `locked: null` on `hello`,
+`status` or `box_status`. A malformed one is ignored (on `hello` the hello
+goes on). On `box_status` and `status` an absent one changes nothing
+(`status` applies it before its own checks). A `box_status` whose only
+valid content is `locked` (an object or `null`) is accepted silently; one
+with nothing valid is `bad_request` (`no valid status block`).
+`GET /devices` returns the stored object as is on every device (`null` for
+clients and for a box with none): the journal applies no expiry. The app
+compares `until` and `lockdown_until` with its own clock; the bridge
+reports again when a window or a lockdown ends. When a report changes the
+stored value, the user's client sockets get `device_meta` with the new
+`locked`. `/roster` does not carry it.
 
 **Unlock, lock, clear lockdown.** There is no journal route: the app sends
 an ordinary `agent_request` with `method: 'unlock' | 'lock' |
@@ -4862,10 +4884,12 @@ the file named by `MATRON_SECURITY_LOG` (when set):
   conversation, `spawns` or `transfers` for a Coordinator consent switch,
   `setup|enable|disable|recovery_codes|reset` for a two-factor change,
   `1h|6h|24h` for an enrolment lock, the refusal reason for an invalid
-  approval.
+  approval, the watcher's `source` for a panic lock (its own text, at most
+  200 characters; *Panic lock*).
 - `decided_by`: `user`, `coordinator`, `admin` (the web admin acting on an
   account, `/users/*`), `admin_cli` (`matron-admin`, or a pre-approved link
-  code from it) or `journal` (the journal's own lockdown); null when it does
+  code from it) or `journal` (the journal's own lockdown, or a panic lock's
+  own changes); null when it does
   not apply, and for a `device_linked` from a pre-approved code minted
   before the journal recorded who minted it.
 
@@ -4889,24 +4913,26 @@ back.
 | `client_signin` | A sign-in that creates a client device: `/login`, `/login/2fa`, `/login/2fa/enable`. | `device:<new id>` | `user` |
 | `device_linked` | A link code approved and claimed: `/link/poll` mints the new client device. A pre-approved code too. | `device:<new id>` | `user` for an approve tap (the starter device named); for a pre-approved code `admin_cli` (`/link/preapprove`, `matron-admin link-code`) or `admin` (`/users/:id/link-code`), no device |
 | `bridge_paired` | A pairing approved and claimed: `/pair/claim` mints the new agent device; `matron-admin agent add`. | `device:<new id>` | `user` (the approving device named), `admin_cli` |
-| `device_revoked` | `POST /devices/:id/revoke` (another device, or signing yourself out), `matron-admin device revoke`; and one per client device signed out by `POST /password` or `POST /2fa/enable` with `sign_out_others` (the asking device named) or by a completed `/password/reset` (no device). Not the lockdown's sign-out, which is its own event. | `device:<id>` | `user`, `admin_cli` |
+| `device_revoked` | `POST /devices/:id/revoke` (another device, or signing yourself out), `matron-admin device revoke`; and one per client device signed out by `POST /password` or `POST /2fa/enable` with `sign_out_others` (the asking device named) or by a completed `/password/reset` (no device); one per client device a panic lock signs out (no device). Not the lockdown's sign-out, which is its own event. | `device:<id>` | `user`, `admin_cli`, `journal` |
 | `password_changed` | `POST /password`; the web admin's `POST /users/:id/password` (recorded on the target account, the admin's device named); a completed `/password/reset`; `matron-admin user passwd`. | null | `user`, `admin`, `admin_cli` |
 | `two_factor_changed` | `/2fa/setup`, `/2fa/enable`, `/2fa/recovery-codes`, `/2fa/disable`; `/login/2fa/setup` and `/login/2fa/enable` at sign-in (no device yet); the web admin's `DELETE /users/:id/two-factor`; `matron-admin user 2fa-reset` when it turned two-factor off. | `setup`, `enable`, `recovery_codes`, `disable`, `reset` | `user`, `admin`, `admin_cli` |
 | `password_reset_requested` | `POST /password/forgot` naming an account that exists (by name, or by its address). The answer is the same either way, and the event is recorded after it has been sent. | null | null |
 | `coordinator_changed` | `PUT /coordinator` setting or clearing the Coordinator conversation, when it changes. | `convo:<id>`, null when cleared | `user` |
-| `consent_switch_changed` | `PUT /coordinator` turning `consent` or `transfer_consent`, when it changes; `matron-admin coordinator transfers`. | `spawns`, `transfers` | `user`, `admin_cli` |
+| `consent_switch_changed` | `PUT /coordinator` turning `consent` or `transfer_consent`, when it changes; `matron-admin coordinator transfers`; a panic lock turning either off. | `spawns`, `transfers` | `user`, `admin_cli`, `journal` |
 | `device_protection_changed` | `POST /devices/:id/protected`, `matron-admin device protected`, when it changes. | `device:<id>:on`, `device:<id>:off` | `user`, `admin_cli` |
 | `spawn_approved` | An approve of a spawn consent ask (the card, the item's button, the Coordinator's `POST /consent/answer`). Not a decline. | `box:<name of the target box>` | `user`, `coordinator` |
 | `chat_approved` | An approve of an agent-chat consent ask (as above), `matron-admin agent-chat approve`. | `box:<name of the invited box>` | `user`, `coordinator`, `admin_cli` |
 | `transfer_approved` | An approve of a file-transfer consent ask (the card's button, the Coordinator's `POST /consent/answer`). Not a decline. | `transfer:<id>` | `user`, `coordinator` |
 | `session_started_direct` | A client's `agent_request` with `method: 'start'` forwarded to a box. | `box:<name of the box>` | `user` |
-| `coordinator_carry_on` | A Coordinator `session_control` `carry_on` the journal accepted (`sent`). | `convo:<target session>` | `coordinator` |
+| `coordinator_carry_on` | A Coordinator `session_control` `carry_on` the journal handed to the target box's live socket (after any wake). Not one refused, before or after the wake, nor one whose box never came up. | `convo:<target session>` | `coordinator` |
 | `approval_key_enrolled` | A key enrolled by the password and a TOTP code, or approved by an enrolled key (the approving device named). | `key:<8>` | `user` |
 | `approval_key_revoked` | `POST /approval-keys/:key_id/revoke` (signed or by password); each key revoked with its device by `POST /devices/:id/revoke` or `matron-admin device revoke`; `matron-admin approval-key revoke`. | `key:<8>` | `user`, `admin_cli` |
 | `approval_key_attached` | `POST /approval-keys/attach`. | `key:<8>` | `user` |
 | `approval_invalid` | Every `approval_invalid` answer to an account with an active key, where its failure is recorded (*Lockdown after invalid approvals*). | the reason | null |
 | `device_signed_out_bad_signatures` | The lockdown's sign-out of a device for invalid approvals. | `device:<id>` | `journal` |
 | `enrolment_locked` | The password-and-code path locks (*The enrolment lock*). | `1h`, `6h`, `24h` | `journal` |
+| `panic_locked` | `POST /panic` locks an account that was not locked (*Panic lock*); the caller's address. | the request's `source`, or null | `journal` |
+| `panic_cleared` | `matron-admin panic clear` on a locked account. | null | `admin_cli` |
 
 Events are recorded for every account; only the feed is bound to one.
 
@@ -4946,6 +4972,256 @@ Configuration (environment, read at start):
 Both feed variables must be set and the token well formed for the route to
 exist; otherwise it is off, and a malformed token or a missing half is one
 warning at start (the token is never printed).
+
+## Panic lock
+
+An external watcher that sees an account being misused can lock it with
+one request. The journal then signs out every client device of the
+account, refuses new sign-ins, device links and pairs for it, turns the
+Coordinator's consent switches off, refuses to deliver new work to its
+boxes, and tells every bridge of the account to lock. The token can only
+lock the one account it is bound to, and read whether it is locked:
+unlocking is done on the journal host. Other accounts on the journal are
+not affected in any way.
+
+Configuration (environment, read at start):
+
+| Variable | Meaning |
+|---|---|
+| `MATRON_PANIC_TOKEN` | The panic token: 32 to 128 characters of `A-Z a-z 0-9 _ -`. |
+| `MATRON_PANIC_ACCOUNT` | The user name the token is bound to. |
+
+Both must be set and the token well formed for the routes to exist;
+otherwise `POST /panic` and `GET /panic` answer **404** `not_found`, as an
+unknown path does, and a malformed token or a missing half is one warning
+at start (the token is never printed). With the configured account not
+(yet) a user, both are **404** too.
+
+### The routes
+
+Both take `Authorization: Bearer <panic token>` and are handled before
+device authentication. The token is compared first, in constant time. A
+missing or wrong token is **401** `unauthenticated` and counts against the
+caller address's budget, the one `/login`, the alerts webhook and the
+security feed share; once it is spent, a missing or wrong token from that
+address is **429** `rate_limited`. The right token is never charged to
+the budget and never answered 429, so bad guesses from an address cannot
+keep the watcher there from locking (unlike the security feed, where a
+spent budget refuses the right token too). It is not a device token and authenticates nothing else
+(every other route answers it 401, a WebSocket `hello` with it gets
+`code:'auth'`); no device token, feed token or admin's token can call
+`/panic` (each is 401).
+
+`POST /panic` with the JSON body `{"source": <string>, "alert": <string>}`
+(both optional, `null` meaning absent; any other key ignored) →
+
+```
+200 {"ok":true,"locked":true,"already_locked":<bool>,"devices_revoked":<int>,"bridges_notified":<int>}
+```
+
+A body that is not JSON or not an object, or a `source` or `alert` that is
+not a string, is **400** `bad_request` and locks nothing. No body at all
+locks with both null. `source` and `alert` are sieved before they are
+stored: control characters (C0 and C1) become spaces, bidi and other format
+characters are removed (the zero-width joiners emoji need are kept),
+whitespace runs collapse to one space, and the result is cut to 200
+characters; one with nothing left is stored as null. The frames, the
+security line and `matron-admin panic status` carry the sieved text.
+
+In one transaction it records the lock (unless the account is already
+locked), signs out every client device of the account and turns both
+Coordinator consent switches (`consent`, spawns and chats, and
+`transfer_consent`) off; then it closes the signed-out devices' sockets,
+sends the frame below to every connected agent device of the account and
+records the security events. Client devices are signed out as a device
+signing itself out is: the row is deleted, its approval keys stay enrolled
+with no device (`device_id` null), so after the clear the owner signs in
+again and re-attaches them (`POST /approval-keys/attach`). Approval keys
+are never revoked by a panic. Agent (bridge) devices are not signed out.
+A two-factor sign-in started before the lock cannot be finished.
+
+Nothing approved before the lock takes effect, during it or after the
+clear; the asker can ask again. Right after the transaction commits, for
+the account:
+
+- a chat invite approved but not yet delivered to its box is finished as
+  refused: the initiator gets
+  `{"kind":"invite","event":"answer","room_id","peer_device_id","accept":false,"reason":"refused"}`,
+  exactly as a decline tells it (for a room with another person's agent,
+  that agent is told as when the guest refuses);
+- a spawn approved but not yet started fails: the parent gets its
+  `spawn_outcome` with `outcome: 'failed'`, `error_code: 'account_locked'`;
+  a start still waiting on a wake finds its spawn failed and sends
+  nothing, even if the lock was cleared meanwhile. A spawn whose `start`
+  is already with the box is left to the box's reply, which settles it as
+  ever (the bridge's own lock deals with the session);
+- a file transfer approved but not yet released is declined as a user's
+  decline is: its bytes go, the sender gets
+  `{"kind":"transfer","event":"declined","transfer_id","reason":"Declined: the account is locked."}`,
+  the room a notice, and it is never released or used to wake a box.
+
+The delivery pump and the transfer release do the same whenever they meet
+such work of a locked account. Pairs approved and links approved or
+pre-approved for the account (a starter's link, a claimed pre-approved
+code, or an unused one from `matron-admin link-code`, `/link/preapprove` or
+`/users/:id/link-code`) are dropped, so a box or a claimant that holds back
+until after the clear gets `404 not_found`, never a device.
+
+It is idempotent. A call while the account is locked keeps the lock as it
+is (its `since`, `source` and `alert`), answers the same shape with
+`already_locked: true`, signs out any client device that has appeared
+since (normally none: `devices_revoked` is the number signed out by this
+call), turns a switch that was turned back on off again, and sends the
+frame again: `bridges_notified` is the number of connected agent sockets
+this call sent it to.
+
+`GET /panic` →
+`200 {"locked":<bool>,"since":<ms|null>,"source":<string|null>,"alert":<string|null>}`.
+
+### The bridge's side
+
+On a panic, every connected agent socket of the account gets:
+
+```
+{"kind":"panic","on":true,"since":<ms>,"source":<string|null>}
+```
+
+and on a clear:
+
+```
+{"kind":"panic","on":false}
+```
+
+`hello_ok` to an agent device of a locked account carries
+`"panic":{"on":true,"since":<ms>,"source":<string|null>}`. It is sent on
+**every** agent `hello` while the account is locked, including a reconnect
+after a journal restart (the journal reads the lock from its database on
+each hello), and the key is **absent** whenever the account is not locked.
+A bridge that connects after a clear simply gets no key. A bridge reads a
+`hello_ok` without the key as "not locked". A lock set or cleared while
+the journal is still replaying a reconnecting bridge's history is sent to
+it as the frame once its socket is registered.
+
+On `on: true` (the frame or the `hello_ok` key) a bridge must:
+
+- interrupt every running turn;
+- refuse new turns from any source (the user, the Coordinator, another
+  agent, a routine, an alert), and refuse spawns, chat invites and file
+  transfers, until the lock is cleared;
+- persist the lock, so it holds across the bridge's own restarts;
+- clear it only on `{"kind":"panic","on":false}` or a `hello_ok` without
+  the `panic` key.
+
+The bridge keeps its socket: agent tokens go on working, so it hears the
+clear. Agents may keep sending their own events.
+
+### What clients see
+
+- Just before the journal closes each client socket of the locked
+  account, it sends that socket `{"kind":"panic","on":true,"since":<ms>}`
+  (no `source`), then closes it as a revoked device's socket is closed:
+  `{"kind":"control","op":"error","code":"revoked"}` and close code 4001.
+  A socket still replaying its history when the lock commits gets the same
+  before its next batch of history (a device signed out meanwhile gets the
+  revoked close the same way).
+- Any HTTP request made with a client token of a locked account (a race,
+  or a device created by a path that slipped through) answers
+  `423 {"error":"account_locked","since":<ms>}`, and the device is signed
+  out (its approval keys detached, as above). A WebSocket `hello` with such
+  a token gets the auth error's shape,
+  `{"kind":"control","op":"error","code":"account_locked","since":<ms>}`,
+  then the usual close; the device is signed out. A frame on a client
+  socket that was still open gets
+  `{"kind":"control","op":"error","code":"account_locked","ref":<op>,"request_id"?:<id>,"since":<ms>}`
+  (`request_id` echoed when the frame had a well-formed one, as for an
+  `agent_request`), then the panic frame and the revoked close above.
+- A request authenticated before the lock whose body arrives after it is
+  refused the same way, `423 {"error":"account_locked","since":<ms>}`,
+  before the route acts on the body; the device is signed out.
+- Sign-in, link and pair refusals (below) are
+  `423 {"error":"account_locked","since":<ms>}`.
+
+A client should treat `account_locked` in any status's body or any control
+error as "this account is locked": show it, sign out locally, and stop
+retrying. Nothing it can do unlocks the account.
+
+### What the journal refuses while locked
+
+For the locked account only. Every refusal comes before anything is sent
+to a box, and where the journal first wakes an asleep box and waits for
+it, the lock is checked again after the wait.
+
+| Path | Refusal |
+|---|---|
+| `POST /login` | `423 {"error":"account_locked","since"}` at once, before the password is checked, whether it is right or wrong; not counted toward the sign-in lockout. So the answer says, to anyone, that the account exists and is locked: by design, it is no password oracle. A lock that commits while the password is being verified is checked again after: 423, no device |
+| `POST /login/2fa`, `/login/2fa/setup`, `/login/2fa/enable` | `423 {"error":"account_locked","since"}` once the ticket is known, before the code is checked or counted. A ticket issued before the lock was dropped by it (`401 two_factor_ticket_invalid`) |
+| `POST /password/reset` (completing an email reset) | `423 {"error":"account_locked","since"}`, checked once the token is known to be valid (an invalid one answers `400 invalid_token` as ever), and again after the new password is hashed; the token is left unused for after the clear |
+| `POST /link/claim` (a starter's code or a pre-approved one) | `423 {"error":"account_locked","since"}`; the code is left as it was |
+| `POST /link/poll` for a link claimed or approved before the lock | `423 {"error":"account_locked","since"}`; the link is spent, no device is made |
+| `POST /pair/claim` for a pair approved before the lock | `423 {"error":"account_locked","since"}`; the pair is spent, no device is made |
+| any request or `hello` with a client token of the account (`/link/start`, `/link/approve`, `/pair/approve`, consent taps, every other route) | see *What clients see* |
+| the Coordinator's `POST /consent/answer` (spawn, chat or transfer), approve **and decline** | `403 {"error":"forbidden","detail":"account_locked","since"}`, after the ownership and role checks, before the consent switch. `GET /consent/pending` is not refused for the lock: it answers as the switch says (the lock turned it off: `403 {"error":"forbidden","detail":"consent_disabled"}`) |
+| an approval of a spawn, chat or transfer ask by any path (the answer itself, user or Coordinator) | `403 {"error":"forbidden","detail":"account_locked","since"}`; the ask stays waiting |
+| a spawn approved before the lock whose `start` has not gone out | not sent, no box woken; the spawn fails with `error_code: 'account_locked'` (above) |
+| an approved chat invite not yet delivered | refused, the initiator told `refused` (above); never delivered, after the clear either |
+| an approved file transfer not yet released | declined, the sender told (above); never released, after the clear either |
+| a client's `agent_request` (every method) | `{"kind":"control","op":"error","code":"account_locked","ref":"agent_request","request_id","since"}` |
+| Coordinator `session_control` | `{"kind":"control","op":"error","code":"forbidden","ref":"session_control","request_id","detail":"account_locked","since"}` (after the existing checks); locked (or the box protected) during the wake wait: nothing is sent, and the result frame is `{"kind":"session_control","event":"result","request_id","ok":false,"error":{"code":"forbidden","detail":"account_locked"}}` (`protected_device` for protection); a carry-on not sent records no `coordinator_carry_on` |
+| a routine's fire (scheduled, triggered or `POST /routines/:key/run`) | not sent, never retried; `last_outcome` (and the `fired` marker's `outcome`) is `account_locked`, and `run` answers `202 {"delivered":false,"reason":"account_locked"}`. The lock is checked first, ahead of `no_coordinator` and `protected_device` |
+| `POST /alerts/alertmanager` | `202 {"delivered":false,"reason":"account_locked"}`, not sent; checked first, ahead of `no_coordinator` and `protected_device` |
+| a mission hand-over's session start | `start_session: {"status":"refused","reason":"account_locked"}`; the hand-over itself still goes through |
+| a talk request's **New session** | no start is sent; the guest's card reads "Couldn't start a session: account_locked. Pick another option." A lock that commits while the start is with the box: the session it reports is not invited, and the talk goes back to the guest's choice with the same line |
+| inviting a guest box of the account on accepting a person-room ask or a talk request (on one journal or across journals) | `409 {"error":"conflict","blocked_by":"account_locked"}`; the ask stays as it was |
+
+`POST /password/forgot` is left as it is, so its answer for a locked
+account is the same as for any other (no oracle): the mail goes out as
+usual. Completing the reset is refused (above) until the lock is cleared.
+The web admin's `/users/*` routes act on the account as before.
+
+### Clearing
+
+Only on the journal host:
+
+```
+matron-admin panic status <user>   # alice: locked since <ISO time> (source: "…", alert: "…") | alice: not locked
+matron-admin panic clear <user>    # clears it; on an account that is not locked says so and exits 0
+```
+
+The CLI writes the database; it has no connection to the running journal.
+The journal reads the lock from the database at every check, so sign-in
+and the rest work again at once, and its periodic sweep (the one that
+closes revoked devices' sockets, every 60 seconds; this is its first step,
+apart from the rest, so nothing else in the sweep can skip it) sends
+`{"kind":"panic","on":false}` once to each connected agent socket of an
+account whose lock it had announced and that is now cleared, and only to
+sockets that were told it was locked (by the frame or `hello_ok`'s key);
+a socket that already had the clear (a reconnect cleared mid-replay gets
+it as soon as its replay ends) does not get it again. A journal restarted
+in between announces nothing: a bridge reconnecting gets a `hello_ok`
+without the key.
+
+Nothing else is restored: client devices sign in again (and re-attach
+their approval keys), and the Coordinator's consent switches stay off
+until the owner turns them on again.
+
+### Security events
+
+Two events in the security event feed:
+
+- `panic_locked`: when `POST /panic` locks an account that was not
+  locked. `target` is the request's `source` (at most 200 characters, or
+  null), `decided_by` is `journal`, the device fields are null and
+  `source_ip` is the caller's. A call while locked records nothing new.
+- `panic_cleared`: `matron-admin panic clear` on a locked account,
+  `decided_by` `admin_cli`.
+
+Each client device signed out by a panic (or later, on its token's use
+while locked) also gets a `device_revoked` (`target` `device:<id>`,
+`decided_by` `journal`, no device), and each consent switch the panic
+actually turned off a `consent_switch_changed` (`spawns`, `transfers`,
+`decided_by` `journal`). `source` is the watcher's own text: it goes into
+a line only as `target`, JSON encoded like every other field. `alert` is
+stored and read back by `GET /panic`, never written to a line.
 
 ## User settings
 
@@ -7808,7 +8084,8 @@ keys are detached the same way, never revoked. An account with no active
 key revokes exactly as described above.
 
 `POST /devices/:id/rename` (Bearer, client devices only — agents get 403)
-renames a device, body `{name}`, 200 `{ok:true, device:{device_id, name}}`.
+renames a device, body `{name}`, 200 `{ok:true, device:{device_id, name,
+tag_char, locked}}` (the device's current meta, as `device_meta` carries it).
 The name is sanitised (control characters flattened, whitespace collapsed,
 trimmed) and then capped at 40 characters — over the cap is rejected with
 400 `{error:'bad_request'}`, never truncated, as is an empty or non-string
@@ -7822,7 +8099,7 @@ boxes) or from `GET /devices` (any kind, client devices included) — see
 
 `POST /devices/:id/tag` (Bearer, client devices only — agents get 403) sets
 the device's roster tag character, body `{tag_char}`, 200 `{ok:true,
-device:{device_id, name, tag_char}}`. The tag is the one-character label
+device:{device_id, name, tag_char, locked}}`. The tag is the one-character label
 clients show beside a box; when it is null clients derive a letter from the
 device name — journal-held so the same character shows on every one of the
 user's devices. Input goes through the device-name sieve and then only the
@@ -7834,7 +8111,8 @@ render as nothing) also sieves to null. `null`, empty, whitespace-only, and
 those sieved-out inputs all clear back to automatic (stored NULL); an absent
 key or non-string non-null value is 400 `{error:'bad_request'}`.
 Owner-scoping, 404 merging, and the `device_meta` fan-out all match rename
-exactly; rename's own 200 body carries the standing `tag_char` too. Note the
+exactly; rename's own 200 body carries the standing `tag_char` and
+`locked` too. Note the
 recovery split matches names: a client-kind device's tag is only in
 `GET /devices` — `/snapshot`'s `agents` list carries tags for agent boxes.
 

@@ -180,6 +180,65 @@ test('inside a transaction: a failure event marked to survive is kept though it 
   db.close()
 })
 
+test('a rolled-back event followed at once by another with the same event, device and target gets no phantom line', async () => {
+  const db = openDb(':memory:')
+  const alice = await createUser(db, 'alice', 'pw-alice-1')
+  const cap = capture()
+  // One clock value for every row, so the rolled-back row and the next one
+  // share seq, ts, event, device and target.
+  const log = makeSecurityLog({ db, out: cap.out, file: null, now: () => 5000 })
+  // The next one differs in decided_by only.
+  assert.throws(() => db.transaction(() => {
+    log.record(alice.id, 'device_revoked', { target: 'device:9', decidedBy: 'user' })
+    throw new Error('refused')
+  })())
+  log.record(alice.id, 'device_revoked', { target: 'device:9', decidedBy: 'admin_cli' })
+  await tick(0)
+  assert.deepEqual(cap.all().map((e) => [e.seq, e.event, e.target, e.decided_by]), [[1, 'device_revoked', 'device:9', 'admin_cli']])
+  // ... or in nothing at all: still one line for the one row.
+  assert.throws(() => db.transaction(() => {
+    log.record(alice.id, 'device_revoked', { target: 'device:9', decidedBy: 'user' })
+    throw new Error('refused')
+  })())
+  log.record(alice.id, 'device_revoked', { target: 'device:9', decidedBy: 'user' })
+  await tick(0)
+  assert.deepEqual(cap.all().map((e) => [e.seq, e.decided_by]), [[1, 'admin_cli'], [2, 'user']])
+  // A rolled-back row whose number a later transaction's row reuses.
+  assert.throws(() => db.transaction(() => {
+    log.record(alice.id, 'device_revoked', { target: 'device:9', decidedBy: 'user' })
+    throw new Error('refused')
+  })())
+  db.transaction(() => log.record(alice.id, 'device_revoked', { target: 'device:9', decidedBy: 'user' }))()
+  await tick(0)
+  assert.deepEqual(cap.all().map((e) => [e.seq, e.decided_by]), [[1, 'admin_cli'], [2, 'user'], [3, 'user']])
+  assert.deepEqual(readSecurityEvents(db, alice.id).events, cap.all())
+  db.close()
+})
+
+test('a line deferred by a transaction and an immediate one in the same run go out in seq order, on stdout and in the file', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'security-order-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const db = openDb(':memory:')
+  const alice = await createUser(db, 'alice', 'pw-alice-1')
+  const bob = await createUser(db, 'bob', 'pw-bob-123')
+  const file = path.join(dir, 'security.log')
+  const cap = capture()
+  const log = makeSecurityLog({ db, out: cap.out, file })
+  db.transaction(() => log.record(alice.id, 'password_changed', { decidedBy: 'user' }))()
+  log.record(alice.id, 'device_revoked', { target: 'device:3', decidedBy: 'user' })
+  db.transaction(() => log.record(alice.id, 'client_signin', { decidedBy: 'user' }))()
+  // Another account's line is not held behind alice's.
+  log.record(bob.id, 'client_signin', { decidedBy: 'user' })
+  assert.deepEqual(cap.all().map((e) => [e.account, e.seq]), [['bob', 1]])
+  await tick(0)
+  assert.deepEqual(cap.all().filter((e) => e.account === 'alice').map((e) => [e.seq, e.event]), [[1, 'password_changed'], [2, 'device_revoked'], [3, 'client_signin']])
+  assert.deepEqual(fs.readFileSync(file, 'utf8').split('\n'), [...cap.lines, ''])
+  // Nothing pending: an immediate line is written at once again.
+  log.record(alice.id, 'device_revoked', { target: 'device:4', decidedBy: 'user' })
+  assert.equal(cap.all().at(-1).seq, 4)
+  db.close()
+})
+
 test('the retention schedule sweeps rows past 30 days on a journal with no approval keys; numbers are never reused', async (t) => {
   const cap = capture()
   const s = await startTestServer(serverOpts(cap, { retentionIntervalMs: 40 }))

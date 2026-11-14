@@ -62,6 +62,8 @@ node itself; on Linux that is what always happens.
     MATRON_DB=./matron.db npx matron-admin two-factor require on|off
     MATRON_DB=./matron.db npx matron-admin user 2fa-reset alice
     MATRON_DB=./matron.db npx matron-admin user 2fa-exempt demo-review on|off
+    MATRON_DB=./matron.db npx matron-admin panic status alice
+    MATRON_DB=./matron.db npx matron-admin panic clear alice
 
 Passwords come from stdin (`--password-stdin`) or the `MATRON_PASSWORD` env
 var, never from the command line, where any local user could read them via
@@ -172,6 +174,8 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_SECURITY_LOG` | unset (stdout only) | A file each security event line is appended to, as well as stdout (docs/protocol.md "Security event feed"). An unwritable file is reported once; the events still go to the database and stdout |
 | `MATRON_SECURITY_FEED_TOKEN` | unset (feed off) | Read-only token for `GET /security-events`, the feed an external watcher reads: 32 to 128 characters of `A-Z a-z 0-9 _ -`. Not a device token: it opens nothing else. Needs `MATRON_SECURITY_FEED_ACCOUNT` |
 | `MATRON_SECURITY_FEED_ACCOUNT` | unset (feed off) | The user name the feed token is bound to: the feed serves that account's events and no other's |
+| `MATRON_PANIC_TOKEN` | unset (panic lock off) | Token for `POST /panic` and `GET /panic`, with which an external watcher locks one account in one request: 32 to 128 characters of `A-Z a-z 0-9 _ -`. It can only lock that account and read whether it is locked; only `matron-admin panic clear` on the journal host unlocks it. Needs `MATRON_PANIC_ACCOUNT`. See *Panic lock* in `docs/protocol.md` |
+| `MATRON_PANIC_ACCOUNT` | unset (panic lock off) | The user name the panic token is bound to |
 | `MATRON_APNS_KEY_FILE` / `_KEY_ID` / `_TEAM_ID` / `_TOPIC` | unset | All four set = push enabled; otherwise push is an inert no-op |
 | `MATRON_PUSH_GATEWAY_URL` | unset | Push relay URL when you have no APNs key — see Push relay section |
 | `MATRON_RELAY_PORT` / `MATRON_RELAY_BIND` | `9821` / `127.0.0.1` | matron-push-relay only |

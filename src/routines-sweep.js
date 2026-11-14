@@ -19,6 +19,7 @@ import { sanitizePeerText } from './peer-text.js'
 import { dueRoutines, advanceRoutine, recordOutcome, routineRow } from './routines.js'
 import { emitRoutineMarker } from './routines-marker.js'
 import { runTriggerSweep } from './routines-triggers.js'
+import { isPanicLocked } from './panic.js'
 
 export const ROUTINES_SWEEP_INTERVAL_MS = 60_000
 export const ROUTINES_TRIGGER_INTERVAL_MS = 5 * 60_000
@@ -26,6 +27,8 @@ export const ROUTINE_MAX_INFLIGHT = 4
 export const ROUTINE_FROM_NAME = 'Routines'
 // A Coordinator on a protected box: not sent, never retried.
 const PROTECTED = 'protected_device'
+// An account under a panic lock (src/panic.js): not sent, never retried.
+const LOCKED = 'account_locked'
 // Failures the next attempt might cure: the box was asleep or slow, the
 // socket dropped. A bridge's refusal (bad_request, not_coordinator, gone)
 // is final for this fire.
@@ -47,6 +50,15 @@ export function makeRoutineFirer({ db, hub, broker, waker = null, wakeWaitMs = 0
   async function fire(routine, { retry = false, now = Date.now(), message = null, onOutcome = null } = {}) {
     const coord = coordinatorDevice(db, routine.user_id)
     const label = `${routine.name} for ${userName(routine.user_id)}`
+    // A panic-locked account (src/panic.js): no routine turn, not retried,
+    // whatever else is true of its Coordinator.
+    if (isPanicLocked(db, routine.user_id)) {
+      if (onOutcome) onOutcome(LOCKED, false)
+      else recordOutcome(db, routine.id, { outcome: LOCKED, retryable: false, retry, now })
+      finish(routine, LOCKED)
+      log.log(`routines: ${label} not delivered: the account is panic-locked`)
+      return LOCKED
+    }
     if (!coord) {
       if (onOutcome) onOutcome('no_coordinator', false)
       else recordOutcome(db, routine.id, { outcome: 'no_coordinator', retryable: false, retry, now })
@@ -75,9 +87,12 @@ export function makeRoutineFirer({ db, hub, broker, waker = null, wakeWaitMs = 0
     try {
       waking = wakeIfOffline({ db, hub, waker }, routine.user_id, coord.deviceId)
       if (waking && wakeWaitMs > 0) await hub.waitForDevice(routine.user_id, coord.deviceId, wakeWaitMs)
-      // Checked again after the wait: a box protected meanwhile gets nothing.
+      // Checked again after the wait: a box protected meanwhile gets nothing,
+      // nor does an account locked meanwhile.
       if (isProtectedDevice(db, routine.user_id, coord.deviceId)) {
         outcome = PROTECTED
+      } else if (isPanicLocked(db, routine.user_id)) {
+        outcome = LOCKED
       } else {
         const r = await broker.issue(hub, routine.user_id, coord.deviceId, 'session_control', params, { timeoutMs })
         if (r.ok) {

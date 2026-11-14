@@ -238,6 +238,28 @@ test('New session: bob\'s Coordinator box starts a session for the talk, and it 
   assert.equal(w.b.db.prepare("SELECT title FROM conversations WHERE id='talk-child'").get().title, 'Talk with alice@a.example — Cover editor')
 })
 
+test('New session onto a box whose account is panic-locked before the start returns: the accept is refused account_locked, no invite reaches it, the guest is asked again', async (t) => {
+  const w = await rooms(t)
+  const coord = createAgent(w.b.db, w.users.bob.id, 'bob-coord')
+  upsertConversation(w.b.db, { id: 'bobcoord', ownerUserId: w.users.bob.id, title: 'Coordinator', agentDeviceId: coord.deviceId })
+  assert.equal((await w.phones.bob('/coordinator', { method: 'PUT', body: { convo_id: 'bobcoord' } })).status, 200)
+  const coordWs = await makeWsClient(w.b.base, { token: coord.token, cursor: null })
+  t.after(() => { try { coordWs.close() } catch { /* closed */ } })
+  await coordWs.waitFor((f) => f.op === 'hello_ok')
+  await askAndSend(w)
+  const card = await roomItem(w.phones.bob)
+  assert.equal((await w.phones.bob(`/items/${card.id}/comments`, post({ action: 'New session' }))).status, 200)
+  const rpc = await coordWs.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start')
+  // Locked while the box was starting the session.
+  w.b.db.prepare('INSERT INTO panic_locks(user_id, since) VALUES(?,?)').run(w.users.bob.id, Date.now())
+  coordWs.send({ op: 'agent_response', request_id: rpc.request.request_id, to_device_id: 0, ok: true, result: { convo_id: 'talk-child' } })
+  await tick()
+  await w.settle()
+  assert.equal(coordWs.frames.some((f) => f.kind === 'invite' && f.event === 'request'), false)
+  assert.equal(half(w.b).state, 'awaiting_guest')
+  assert.equal(w.b.db.prepare("SELECT COUNT(*) n FROM convo_agents WHERE agent_device_id=?").get(coord.deviceId).n, 0)
+})
+
 test('the owner ending the room from their phone ends it on both journals', async (t) => {
   const w = await rooms(t)
   await askAndSend(w)

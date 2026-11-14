@@ -11,6 +11,7 @@ import { getCoordinatorConvoId } from './coordinator.js'
 import { isPrivateDevice } from './db.js'
 import { causesFromFrame } from './ask-causes.js'
 import { isProtectedDevice } from './consent-subject.js'
+import { panicLock } from './panic.js'
 
 export const SESSION_CONTROL_ACTIONS = new Set(['set_model', 'compact', 'carry_on'])
 export const SESSION_CONTROL_AGENTS = new Set(['claude', 'codex'])
@@ -97,6 +98,8 @@ export function validateSessionControl(msg) {
 //   - a protected box (src/consent-subject.js) is out of the Coordinator's
 //     reach, whether or not the account has an approval key: forbidden /
 //     protected_device.
+//   - an account under a panic lock (src/panic.js): forbidden /
+//     account_locked, with since.
 export function authorizeSessionControl(db, conn, msg) {
   const from = db.prepare('SELECT owner_user_id, agent_device_id, parent_convo_id FROM conversations WHERE id=?').get(msg.from_convo_id)
   if (!from || from.owner_user_id !== conn.userId || from.agent_device_id !== conn.deviceId || from.parent_convo_id != null) return { code: 'not_found' }
@@ -107,6 +110,9 @@ export function authorizeSessionControl(db, conn, msg) {
   const dev = db.prepare("SELECT id AS device_id, name FROM devices WHERE id=? AND user_id=? AND kind='agent'").get(tgt.agent_device_id, conn.userId)
   if (!dev) return { code: 'not_found' }
   if (isProtectedDevice(db, conn.userId, dev.device_id)) return { code: 'forbidden', detail: 'protected_device' }
+  // A panic-locked account (src/panic.js): no box of it gets new work.
+  const lock = panicLock(db, conn.userId)
+  if (lock) return { code: 'forbidden', detail: 'account_locked', since: lock.since }
   return { target: dev }
 }
 

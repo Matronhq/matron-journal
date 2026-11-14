@@ -25,6 +25,7 @@ import { sanitizePeerText, plainText as plain } from './peer-text.js'
 import { wakeIfOffline } from './wake.js'
 import { coordinatorTarget, PICK_MAX, LABEL_MAX } from './talk-requests.js'
 import { isProtectedDevice } from './consent-subject.js'
+import { isPanicLocked } from './panic.js'
 
 export const HANDOVER_CHOICE = { accept: 'Accept', new: 'New session', pick: 'Pick a box', decline: 'Decline' }
 const JOURNAL = 'journal'
@@ -77,6 +78,8 @@ export function startTarget(db, userId, request) {
     target = { deviceId: d.id, workdir: request.workdir ?? null }
   }
   if (isProtectedDevice(db, userId, target.deviceId)) return { refused: 'protected_device' }
+  // A panic-locked account (src/panic.js): no session starts on its boxes.
+  if (isPanicLocked(db, userId)) return { refused: 'account_locked' }
   return target
 }
 
@@ -134,6 +137,7 @@ async function startHandoverSession(ctx, { g, copy, target, itemId }) {
     }
     // Checked again after the wait: a box protected meanwhile gets no start.
     if (isProtectedDevice(db, userId, target.deviceId)) code = 'protected_device'
+    else if (isPanicLocked(db, userId)) code = 'account_locked'
     else {
       const params = {
         workdir: target.workdir ?? '', ...(target.workdir ? {} : { talk: true }),
