@@ -17,7 +17,7 @@
 // with `cleared_at` NULL. Every check reads the database (a primary-key
 // lookup), never memory, so the CLI's clear takes effect at once for the
 // refusals and a journal restart cannot forget a lock.
-import { signOutOwnedDevice } from './auth.js'
+import { signOutOwnedDevice, tokenReplaced } from './auth.js'
 import { activeKeysOfDevice } from './approval-keys.js'
 import { FEED_TOKEN_RE, deviceTarget } from './security-log.js'
 
@@ -52,10 +52,21 @@ export const unlockKeysOfDevice = (db, userId, deviceId, lock) => (deviceId == n
 // signed out as any other.
 export const isFrozenDevice = (db, userId, deviceId, lock) => unlockKeysOfDevice(db, userId, deviceId, lock).length > 0
 
-// Whether the account was locked at or after `at` (ms), cleared since or
-// not: a request authenticated before that used a token that existed at a
-// lock, and every such token is dead once the lock is cleared.
-export const lockedSince = (db, userId, at) => !!db.prepare('SELECT 1 FROM panic_locks WHERE user_id=? AND since>=?').get(userId, at)
+// Whether a lock of the account ended after `at` (ms): it was open at some
+// moment since then, whether it began before `at` or after, and is cleared
+// now. Whatever a client authenticated at `at` used a token that existed
+// at that lock, and no such token outlives it. (After, not at or after: a
+// request made with the new token in the millisecond of the clear is not
+// refused; one made in that millisecond with an old token finds its device
+// gone or its token replaced, below.)
+export const lockEndedSince = (db, userId, at) =>
+  !!db.prepare('SELECT 1 FROM panic_locks WHERE user_id=? AND cleared_at IS NOT NULL AND cleared_at>?').get(userId, at)
+
+// A client request or socket authenticated at `at` with `token` that must
+// not act any more: the device's token has been replaced since (an unlock
+// gave it a new one), or a lock of the account has ended since. A device
+// that is gone is not this check's: the caller's own does that.
+export const clientAuthDead = (db, { userId, deviceId, token, at }) => tokenReplaced(db, deviceId, token) || lockEndedSince(db, userId, at)
 
 // Every account_locked refusal's body (HTTP 423, and the error frames):
 // the reason and since when; `unlock: true` to a frozen device.

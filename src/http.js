@@ -62,7 +62,7 @@ import { convoStatuses } from './convo-status.js'
 import { makeAlertsHandler } from './alerts-http.js'
 import { handleSummariseRoute } from './summarise-http.js'
 import { securityLogFor, withRequestScope, handleSecurityFeed, deviceTarget, keyTarget } from './security-log.js'
-import { panicLock, lockedBody, refuseLockedClient, lockedSince } from './panic.js'
+import { panicLock, lockedBody, refuseLockedClient, clientAuthDead } from './panic.js'
 import { handlePanic, handlePanicUnlock } from './panic-lock.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
@@ -390,13 +390,17 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         if (locked) return rejectEarly(req, res, 423, locked)
         // Locked while the body was on its way: refused the same way once it
         // has arrived, before the route acts on it (src/http-body.js).
-        // Locked and cleared again meanwhile: the token is one that existed
-        // at a lock, and no such token outlives it.
+        // A lock ended meanwhile (whether it began before this request was
+        // authenticated or after), or an unlock replaced this device's
+        // token: the token is one that existed at a lock, and no such
+        // token outlives it. The replaced token first, so it is 401 under
+        // a later lock too and never reaches the unlock route.
         const unauthenticated = () => Object.assign(new Error('unauthenticated'), { statusCode: 401, body: { error: 'unauthenticated' } })
+        const auth = { userId: who.userId, deviceId: who.deviceId, token: bearer(req), at: authAt }
         req[AFTER_BODY] = () => {
+          if (clientAuthDead(db, auth)) throw unauthenticated()
           const late = refusal()
           if (late) throw Object.assign(new Error('account_locked'), { statusCode: 423, body: late })
-          if (!lockOf(who.userId) && lockedSince(db, who.userId, authAt)) throw unauthenticated()
         }
         // And for a route that waits on something else before it writes
         // (a password hash, an upload, another server): the same, and the

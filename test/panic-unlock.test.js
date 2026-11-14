@@ -7,7 +7,7 @@ import assert from 'node:assert/strict'
 import http from 'node:http'
 import argon2 from 'argon2'
 import { startTestServer, makeWsClient } from './helpers.js'
-import { createUser, createAgent, createClientDevice } from '../src/auth.js'
+import { createUser, createAgent, createClientDevice, rotateClientToken } from '../src/auth.js'
 import { openDb, setApnsRegistration } from '../src/db.js'
 import { makeHub } from '../src/hub.js'
 import { makePushPipeline } from '../src/push.js'
@@ -583,6 +583,86 @@ test('a lock that commits while a frozen device\'s request waits on the password
   const r = await s.http('/password', { method: 'POST', token: phone.token, body: { old_password: TEST_PASSWORD, new_password: 'a-new-password-1' } })
   assert.deepEqual([r.status, r.json], [401, { error: 'unauthenticated' }])
   assert.equal(hashOf(), before)
+})
+
+// ---- No token that existed at a lock acts after it ---------------------------------------
+
+test('a request authenticated while the lock was open whose body arrives after the clear is 401', async (t) => {
+  const { s, alice, phone, key } = await journal(t)
+  assert.equal((await lockIt(s)).status, 200)
+  const approval = await signUnlock(s, phone, key)
+  // The lock ends while the unlock's body is on its way (cleared past the
+  // journal, so the device and its token are as they were): the request
+  // was authenticated with a token that existed at a lock that has ended.
+  const r = await delayedPost(s, '/panic/unlock', phone.token, { approval }, () => { clearPanic(s.db, alice.id) })
+  assert.deepEqual([r.status, r.json], [401, { error: 'unauthenticated' }])
+  assert.equal(s.db.prepare('SELECT used_at FROM approval_nonces ORDER BY created_at DESC LIMIT 1').get().used_at, null)
+  // A request made after the clear is as ever.
+  await tick(5)
+  assert.equal((await s.http('/me', { token: phone.token })).status, 200)
+})
+
+test('a request authenticated with a token that an unlock has since replaced cannot clear a later lock', async (t) => {
+  const { s, alice, phone, key } = await journal(t)
+  assert.equal((await lockIt(s)).status, 200)
+  // Signed in advance for the lock to come, over a nonce of this device.
+  const later = Date.now() + 50
+  const forLater = await signUnlock(s, phone, key, later)
+  const first = await signUnlock(s, phone, key)
+  let fresh
+  const r = await delayedPost(s, '/panic/unlock', phone.token, { approval: forLater }, async () => {
+    const u = await unlock(s, phone.token, { approval: first })
+    assert.equal(u.status, 200)
+    fresh = u.json.token
+    lockAccount({ db: s.db, hub: s.hub, securityLog: { record() {} } }, alice.id, { now: later })
+    assert.equal(lockedSince(s), later)
+  })
+  assert.deepEqual([r.status, r.json], [401, { error: 'unauthenticated' }])
+  assert.equal(isPanicLocked(s.db, alice.id), true)
+  // The device's current token is frozen under the new lock, and unlocks it.
+  assert.deepEqual((await s.http('/me', { token: fresh })).json, FROZEN(s))
+  const ok = await unlock(s, fresh, { approval: forLater })
+  assert.equal(ok.status, 200)
+})
+
+test('a client socket still replaying its history across a lock and its signed clear is closed, not registered under the old token', async (t) => {
+  const { s, alice, phone } = await journal(t)
+  const box = createAgent(s.db, alice.id, 'box-a')
+  upsertConversation(s.db, { id: 'c1', ownerUserId: alice.id, title: 'C1', agentDeviceId: box.deviceId })
+  const total = 1300
+  s.db.transaction(() => { for (let i = 0; i < total; i++) append(s.db, { userId: alice.id, convoId: 'c1', sender: 'agent:box-a', type: 'text', payload: { body: `m${i}` } }) })()
+  // While the first batch is read, before the replay's first yield: the
+  // lock, then what a signed unlock does to this device.
+  const realPrepare = s.db.prepare.bind(s.db)
+  let armed = true
+  t.mock.method(s.db, 'prepare', (sql) => {
+    const stmt = realPrepare(sql)
+    if (!armed || !sql.startsWith('SELECT * FROM events WHERE user_id=? AND seq>?')) return stmt
+    armed = false
+    return { all: (...args) => {
+      const rows = stmt.all(...args)
+      lockAccount({ db: s.db, hub: s.hub, securityLog: { record() {} } }, alice.id)
+      clearPanic(s.db, alice.id)
+      rotateClientToken(s.db, alice.id, phone.deviceId)
+      return rows
+    } }
+  })
+  const c = await makeWsClient(s.base, { token: phone.token, cursor: 0 })
+  assert.equal(await closed(c), 4001)
+  assert.ok(c.frames.filter((x) => x.kind === 'journal').length <= 500)
+  assert.deepEqual(c.frames.filter((x) => x.op === 'error'), [{ kind: 'control', op: 'error', code: 'revoked' }])
+  assert.equal([...s.hub.connsOf(alice.id)].length, 0)
+  assert.equal(deviceExists(s, phone.deviceId), true)
+})
+
+test('a registered socket whose device token has been replaced is closed at its next frame', async (t) => {
+  const { s, alice, phone } = await journal(t)
+  const p = await socket(s, phone.token)
+  const pClosed = closed(p.w)
+  rotateClientToken(s.db, alice.id, phone.deviceId)
+  p.w.send({ op: 'ack', cursor: 0 })
+  assert.equal(await pClosed, 4001)
+  assert.deepEqual(p.w.frames.filter((x) => x.op === 'error'), [{ kind: 'control', op: 'error', code: 'revoked' }])
 })
 
 // ---- The host's clear ------------------------------------------------------------------

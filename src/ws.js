@@ -41,7 +41,7 @@ import { getMission } from './missions.js'
 import { sanitizeConvoStatus, upsertConvoStatus } from './convo-status.js'
 import { validateSessionControl, authorizeSessionControl, sessionControlResultFrame } from './session-control.js'
 import { validRanges, addSeenRanges, markDeviceUsesRanges, legacyReadAsSeen, markItemSeen } from './seen.js'
-import { panicLock, isPanicLocked, panicHelloField, panicAnnounced, panicOnFrame, PANIC_OFF_FRAME, announcePanicClears, refuseLockedClient, isFrozenDevice, signOutLockedClient, lockedError, closeLockedSocket, closeFrozenSocket, markPanicTold, ACCOUNT_LOCKED } from './panic.js'
+import { panicLock, isPanicLocked, panicHelloField, panicAnnounced, panicOnFrame, PANIC_OFF_FRAME, announcePanicClears, clientAuthDead, refuseLockedClient, isFrozenDevice, signOutLockedClient, lockedError, closeLockedSocket, closeFrozenSocket, markPanicTold, ACCOUNT_LOCKED } from './panic.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -478,7 +478,7 @@ export function attachWs({
       // in use, so its clock is kept fresh (at most hourly, see touchDevice).
       const alive = new Set(rows.filter((r) => touchDevice(db, r, { now, clientIdleMs })).map((r) => r.id))
       for (const c of conns) {
-        if (alive.has(c.deviceId)) continue
+        if (alive.has(c.deviceId) && !c.authDead?.()) continue
         if (c.ws.readyState !== 1) continue // already closing; its 'close' handler unregisters it
         c.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
         c.ws.close(4001)
@@ -519,6 +519,7 @@ export function attachWs({
       try {
         if (!conn) {
           if (msg.op !== 'hello') { ws.close(); return }
+          const authAt = Date.now()
           const who = msg.token && authToken(db, msg.token, { now: clientIdleClock(), clientIdleMs })
           if (!who) {
             ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'auth' }))
@@ -589,6 +590,15 @@ export function attachWs({
           // than the in-flight cursor, so it's picked up by a later replay batch rather
           // than lost. Revisit this assumption if a future op has other side effects.
           conn = { ws, ...who, viewingConvoIds: new Set(), syncScope: who.kind === 'client' ? syncScope : null }
+          // A client's socket is as dead as its token: once an unlock has
+          // replaced the device's token, or a panic lock of the account has
+          // ended since this hello, it is closed as a revoked one (checked
+          // where the device row is: mid-replay, at registration, on every
+          // frame and in the sweep).
+          if (who.kind === 'client') {
+            const auth = { userId: who.userId, deviceId: who.deviceId, token: msg.token, at: authAt }
+            Object.defineProperty(conn, 'authDead', { value: () => clientAuthDead(db, auth) })
+          }
           // Kept on the device row for the push pipeline's wakes, which
           // decide for devices that have no socket.
           if (who.kind === 'client') setDeviceSyncScope(db, who.deviceId, conn.syncScope)
@@ -742,7 +752,7 @@ export function attachWs({
                 closeLockedClient(ws, who, replayLock)
                 return
               }
-              if (!deviceAlive(who.deviceId)) {
+              if (!deviceAlive(who.deviceId) || conn.authDead?.()) {
                 ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
                 ws.close(4001)
                 return
@@ -790,7 +800,7 @@ export function attachWs({
               closeLockedClient(ws, who, lockNow)
               return
             }
-            if (!deviceAlive(who.deviceId)) {
+            if (!deviceAlive(who.deviceId) || conn.authDead?.()) {
               ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
               ws.close(4001)
               return
@@ -814,7 +824,7 @@ export function attachWs({
         // (hello itself already does the equivalent check via authToken's
         // token-hash lookup, so this must only run post-hello or a revoked
         // token's hello would get checked twice for no benefit).
-        if (!deviceAlive(conn.deviceId)) {
+        if (!deviceAlive(conn.deviceId) || conn.authDead?.()) {
           conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
           conn.ws.close(4001)
           return

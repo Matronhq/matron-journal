@@ -5074,8 +5074,17 @@ A request that was waiting when the lock committed (on a password check,
 an upload, another server) is checked again before it writes: a frozen
 device's is refused `423` with `unlock: true` and nothing is changed, a
 signed-out device's `401 unauthenticated`. Every client token that
-existed at a lock is dead once the lock is cleared (below), so a request
-still waiting across both the lock and its clear is `401` too.
+existed at a lock is dead once the lock is cleared (below). So a client
+request authenticated before a lock ended does not act after it: one
+still waiting (on its body, or as above) when the lock is cleared, whether
+the lock began before the request or during it, is `401`, and so is one
+whose device has been given a new token since, under a later lock too. A
+client socket is held to the same: one authenticated before a lock ended,
+or with a token since replaced, is closed as a revoked device's is, while
+it is still replaying its history as once it is registered.
+
+A push that was waiting to be sent when its device was signed out (by a
+lock, a clear, or any other sign-out) is not sent.
 
 Nothing approved before the lock takes effect, during it or after the
 clear; the asker can ask again. Right after the transaction commits, for
