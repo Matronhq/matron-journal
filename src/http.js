@@ -62,7 +62,7 @@ import { parsePushKey } from './push-box.js'
 import { convoStatuses } from './convo-status.js'
 import { makeAlertsHandler } from './alerts-http.js'
 import { handleSummariseRoute } from './summarise-http.js'
-import { securityLogFor, withRequestScope, handleSecurityFeed } from './security-log.js'
+import { securityLogFor, withRequestScope, handleSecurityFeed, deviceTarget, keyTarget } from './security-log.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
 // card's `from_name` gets. NULL stays null rather than collapsing to '' —
@@ -212,10 +212,11 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         }
         loginGuard.ok(username)
         const d = createClientDevice(db, u.userId, deviceName)
+        securityLog.record(u.userId, 'client_signin', { deviceId: d.deviceId, target: deviceTarget(d.deviceId), decidedBy: 'user' })
         return json(res, 200, { token: d.token, device_id: d.deviceId, user_id: u.userId })
       }
-      if (await handleTwoFactorLogin({ db, tokenBox: twoFactorBox, tickets: signInTickets, twoFactorLimiter: codeLimiter, loginGuard }, req, res, url, { rejectEarly })) return
-      if (await handlePasswordResetRoute({ db, mailer, resetLimiter: passwordResetLimiter, loginGuard, signInTickets }, req, res, url, { rejectEarly })) return
+      if (await handleTwoFactorLogin({ db, tokenBox: twoFactorBox, tickets: signInTickets, twoFactorLimiter: codeLimiter, loginGuard, securityLog }, req, res, url, { rejectEarly })) return
+      if (await handlePasswordResetRoute({ db, mailer, resetLimiter: passwordResetLimiter, loginGuard, signInTickets, securityLog }, req, res, url, { rejectEarly })) return
       if (req.method === 'POST' && url.pathname === '/pair/start') {
         // Unauthenticated by design: this grants nothing — the pair becomes
         // an agent only if an authenticated client approves the code, and
@@ -246,6 +247,8 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // is already deleted; if createAgent somehow threw, the box retries
         // with a fresh code and no orphan row exists either way.
         const d = createAgent(db, c.userId, c.agentName, c.tagChar)
+        // The device that approved the pair decided; this request is the box's.
+        securityLog.record(c.userId, 'bridge_paired', { deviceId: c.approvedBy, target: deviceTarget(d.deviceId), decidedBy: 'user' })
         return json(res, 200, { status: 'approved', token: d.token, device_id: d.deviceId })
       }
       if (req.method === 'POST' && url.pathname === '/link/claim') {
@@ -285,6 +288,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         const user = db.prepare('SELECT name FROM users WHERE id=?').get(p.userId)
         if (!user) return json(res, 404, { error: 'not_found' }) // user row gone mid-flow; claimant rescans
         const d = createClientDevice(db, p.userId, p.deviceName)
+        // Who approved it: the starter device's tap, or whoever minted a
+        // pre-approved code (no device: the host, or a web admin's own).
+        securityLog.record(p.userId, 'device_linked', { deviceId: p.approvedBy ?? null, target: deviceTarget(d.deviceId), decidedBy: p.decidedBy ?? null })
         return json(res, 200, { status: 'approved', token: d.token, device_id: d.deviceId, user_id: p.userId, username: user.name })
       }
       if (req.method === 'POST' && url.pathname === '/link/preapprove') {
@@ -324,7 +330,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         }
         const user = db.prepare('SELECT id FROM users WHERE name=?').get(username)
         if (!user) return json(res, 404, { error: 'not_found' })
-        const l = links.startPreapproved(user.id, ttl_seconds !== undefined ? { ttlMs: ttl_seconds * 1000 } : {})
+        const l = links.startPreapproved(user.id, { ...(ttl_seconds !== undefined ? { ttlMs: ttl_seconds * 1000 } : {}), by: 'admin_cli' })
         // Pending-map cap: same envelope as the limiter — a caller can't
         // tell which throttle it hit, and shouldn't need to.
         if (!l) return json(res, 429, { error: 'rate_limited' })
@@ -343,7 +349,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       // The tracker's own surface (src/items-http.js) — mounted first so
       // its /items* paths never collide with the chain below, and inside the
       // outer try/catch so readBody's 400/413 map like every other route's.
-      if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription, agentCommentLimiter, broker, spawnStartTimeoutMs, spawnWakeWaitMs, mediaDir, federationContacts, federationGrants, federationContribute, journalHost }, req, res, url, who)) return
+      if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription, agentCommentLimiter, broker, spawnStartTimeoutMs, spawnWakeWaitMs, mediaDir, federationContacts, federationGrants, federationContribute, journalHost, securityLog }, req, res, url, who)) return
       if (await handleFederationRoute({ db, outbox: federationOutbox }, req, res, url, who)) return
       // Ahead of the missions routes: /missions/:id/shares is its own surface.
       if (await handleSharingRoute({ db, hub, pushPipeline, waker, broker, spawnStartTimeoutMs, spawnWakeWaitMs, federationContacts, federationGrants }, req, res, url, who)) return
@@ -377,12 +383,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         console.log(`journal: said check convo=${cited.convoId} seq=${cited.seq} device=${who.deviceId} verified=${out.body.verified}${out.body.verified ? '' : ` reason=${out.body.reason}`}`)
         return json(res, 200, out.body)
       }
-      if (await handleUsersRoute({ db, links, journalHost }, req, res, url, who)) return
+      if (await handleUsersRoute({ db, links, journalHost, securityLog }, req, res, url, who)) return
       if (await handleAccountEmailRoute({ db, mailer, loginGuard, passwordChecks }, req, res, url, who)) return
-      if (await handleTwoFactorRoute({ db, tokenBox: twoFactorBox, loginGuard, journalHost }, req, res, url, who)) return
+      if (await handleTwoFactorRoute({ db, tokenBox: twoFactorBox, loginGuard, journalHost, securityLog }, req, res, url, who)) return
       // Approval keys (src/approval-keys-http.js). `journalHost` is the host of
       // the configured public URL, null while approval keys are off.
-      if (await handleApprovalKeysRoute({ db, hub, pushPipeline, tokenBox: twoFactorBox, loginGuard, journalHost, passwordChecks }, req, res, url, who)) return
+      if (await handleApprovalKeysRoute({ db, hub, pushPipeline, tokenBox: twoFactorBox, loginGuard, journalHost, passwordChecks, securityLog }, req, res, url, who)) return
       // Cloud speech for voice mode (src/tts-http.js): client devices only.
       if (await handleTtsRoute({ tts }, req, res, url, who)) return
       if (req.method === 'GET' && url.pathname === '/me') {
@@ -394,7 +400,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           github_linking: { enabled: !!(github && github.enabled), web_flow: !!(github && github.webFlow), device_flow: !!(github && github.deviceFlow) },
         })
       }
-      if (await handleCoordinatorRoute({ db, hub, journalHost }, req, res, url, who)) return
+      if (await handleCoordinatorRoute({ db, hub, journalHost, securityLog }, req, res, url, who)) return
       if (await handleNotifyRoute({ db, hub }, req, res, url, who)) return
       if (await handleDefaultsRoute({ db, hub }, req, res, url, who)) return
       // Per-box defaults (src/box-defaults-http.js): GET/PUT /devices/:id/defaults,
@@ -405,7 +411,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       if (await handleSettingsRoute({ db, hub }, req, res, url, who)) return
       // Coordinator consent approval (src/consent-http.js): the same answer
       // path the two client routes below use, gated on the Coordinator.
-      if (await handleConsentRoute({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs, consentDailyCap, consentTransferDailyCap, consentRoutineCap, verifier, mediaDir }, req, res, url, who)) return
+      if (await handleConsentRoute({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs, consentDailyCap, consentTransferDailyCap, consentRoutineCap, verifier, mediaDir, securityLog }, req, res, url, who)) return
       // Agent-to-agent file transfers (src/transfers-http.js): agent tokens
       // only. Chunk bodies are streamed to disk there, never read here.
       if (await handleTransferRoute({ db, hub, waker, mediaDir, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes }, req, res, url, who, { rejectEarly })) return
@@ -514,6 +520,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         if (r.refused) return json(res, r.refused.status, r.refused.body)
         if (r.revoked) return json(res, 401, { error: 'unauthenticated' })
         if (!r.ok) return json(res, 401, { error: 'bad_password' })
+        securityLog.record(who.userId, 'password_changed', { deviceId: who.deviceId, deviceName: who.name, decidedBy: 'user' })
         return json(res, 200, { ok: true, signed_out: r.signedOut })
       }
       if (req.method === 'GET' && url.pathname === '/devices') {
@@ -662,7 +669,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // the same thing, with the deny masked as a peer refusal either way.
         // `approval`: the signed approval an invite to a protected box needs
         // once the account has a key (src/consent-subject.js).
-        const r = answerChatAsk({ db, hub, waker, journalHost }, { userId: who.userId, roomId: room_id, targetDeviceId: target_device_id, decision: decision === 'deny' ? 'decline' : 'approve', decidedBy: { kind: 'user', deviceId: who.deviceId }, approval: body.approval ?? null })
+        const r = answerChatAsk({ db, hub, waker, journalHost, securityLog }, { userId: who.userId, roomId: room_id, targetDeviceId: target_device_id, decision: decision === 'deny' ? 'decline' : 'approve', decidedBy: { kind: 'user', deviceId: who.deviceId }, approval: body.approval ?? null })
         return json(res, r.status, r.body)
       }
       if (req.method === 'POST' && url.pathname === '/agent-spawn/answer') {
@@ -683,7 +690,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // one code path whoever answered.
         // `approval`: the signed approval a spawn onto a protected box needs
         // once the account has a key (src/consent-subject.js).
-        const r = answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs, journalHost }, { userId: who.userId, requestId: request_id, decision: decision === 'deny' ? 'decline' : 'approve', decidedBy: { kind: 'user', deviceId: who.deviceId }, approval: body.approval ?? null })
+        const r = answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs, journalHost, securityLog }, { userId: who.userId, requestId: request_id, decision: decision === 'deny' ? 'decline' : 'approve', decidedBy: { kind: 'user', deviceId: who.deviceId }, approval: body.approval ?? null })
         return json(res, r.status, r.body)
       }
       if (req.method === 'GET' && url.pathname === '/search') {
@@ -792,8 +799,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // Revoking ANOTHER device (a client or a bridge) is an account
         // action, {op:'revoke_device', device}, and revokes its keys with
         // it. An account with no key: today's unsigned revoke.
+        // Recorded once the revoke has committed; `who.name` is the calling
+        // device's, which may be the one just signed out.
+        const revoked = () => securityLog.record(who.userId, 'device_revoked', { deviceId: who.deviceId, deviceName: who.name, target: deviceTarget(revokedId), decidedBy: 'user' })
         if (revokedId === who.deviceId && hasActiveKey(db, who.userId)) {
           if (!signOutOwnedDevice(db, who.userId, revokedId)) return json(res, 404, { error: 'not_found' })
+          revoked()
           return json(res, 200, { ok: true })
         }
         let keys
@@ -806,7 +817,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           // device with no key.
           if (body.approval === undefined && (body.password !== undefined || body.code !== undefined)) {
             if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(revokedId, who.userId)) return json(res, 404, { error: 'not_found' })
-            const pwCtx = { db, hub, pushPipeline, tokenBox: twoFactorBox, loginGuard, journalHost, passwordChecks }
+            const pwCtx = { db, hub, pushPipeline, tokenBox: twoFactorBox, loginGuard, journalHost, passwordChecks, securityLog }
             if (!(await confirmPasswordAndTotp(pwCtx, res, who, { password: body.password, code: body.code }))) return
             keys = activeKeysOfDevice(db, who.userId, revokedId)
             if (!revokeOwnedDevice(db, who.userId, revokedId)) return json(res, 404, { error: 'not_found' })
@@ -829,7 +840,11 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           keys = activeKeysOfDevice(db, who.userId, revokedId)
           if (!revokeOwnedDevice(db, who.userId, revokedId)) return json(res, 404, { error: 'not_found' })
         }
-        for (const key of keys) announceKey({ db, hub, pushPipeline }, who.userId, key, { added: false, how: 'with the device it was on' })
+        revoked()
+        for (const key of keys) {
+          securityLog.record(who.userId, 'approval_key_revoked', { deviceId: who.deviceId, deviceName: who.name, target: keyTarget(key.key_id), decidedBy: 'user' })
+          announceKey({ db, hub, pushPipeline }, who.userId, key, { added: false, how: 'with the device it was on' })
+        }
         // Room membership goes with it, via the convo_agents cascade in
         // db.js — not a call here. This route used to do the cleanup itself,
         // which left `matron-admin device revoke` quietly not doing it.
@@ -864,6 +879,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           },
         })
         if (!g.ok) return json(res, g.status, g.body)
+        securityLog.record(who.userId, 'device_protection_changed', { deviceId: who.deviceId, deviceName: who.name, target: `${deviceTarget(deviceId)}:${body.on ? 'on' : 'off'}`, decidedBy: 'user' })
         announceRestamped(who, g.value)
         return json(res, 200, { ok: true, device_id: deviceId, protected: body.on })
       }
@@ -953,7 +969,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // into 404, same anti-enumeration stance as everywhere else.
         const g = guardedAccountAction({ db, journalHost }, who, body, boundedSubject({ op: 'pair_bridge', code: pair_code, name: agent_name }), {
           write: () => {
-            const r = pairs.approve(pair_code, { userId: who.userId, agentName: agent_name, tagChar: tagChar(tag_char) })
+            const r = pairs.approve(pair_code, { userId: who.userId, agentName: agent_name, tagChar: tagChar(tag_char), approvedBy: who.deviceId })
             if (r === 'conflict') refuse(409, { error: 'conflict' })
             if (r === 'not_found') refuse(404, { error: 'not_found' })
           },

@@ -2781,6 +2781,9 @@ export function addSecurityEvents(db) {
       seq     INTEGER NOT NULL
     );
   `)
+  // Who minted a pre-approved link code ('admin_cli', 'admin'), named on the
+  // device_linked event when it is used; NULL for codes from before.
+  if (!db.prepare('PRAGMA table_info(link_preapprovals)').all().some((c) => c.name === 'minted_by')) db.exec('ALTER TABLE link_preapprovals ADD COLUMN minted_by TEXT')
 }
 
 // When deliveries to a peer journal started failing (src/federation-outbox.js):

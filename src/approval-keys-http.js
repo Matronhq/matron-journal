@@ -41,6 +41,7 @@ import { isTwoFactorEnabled, classifyCode } from './two-factor.js'
 import { fileNotice } from './sharing-events.js'
 import { sanitizePeerText, plainText } from './peer-text.js'
 import { restampConsentItems } from './consent-subject.js'
+import { securityLogOf, keyTarget } from './security-log.js'
 
 // A key's name is a label in the apps, like a device name (http.js).
 const KEY_NAME_MAX = 40
@@ -146,6 +147,7 @@ function countEnrolmentFailure(ctx, res, who, now) {
   const lock = recordEnrolmentFailure(ctx.db, who, outcome, now)
   if (!lock) return
   const hours = ENROL_LOCK_MS[Math.min(lock.level, ENROL_LOCK_MS.length) - 1] / 3600000
+  securityLogOf(ctx).record(who.userId, 'enrolment_locked', { deviceId: who.deviceId, deviceName: who.name, target: `${hours}h`, decidedBy: 'journal' })
   fileNotice(ctx, {
     userId: who.userId,
     title: `Approval key enrolment locked until ${shortTime(lock.until)}`,
@@ -210,6 +212,8 @@ const liveRequest = (db, userId, id, now) => db.prepare('SELECT * FROM approval_
 
 export async function handleApprovalKeysRoute(ctx, req, res, url, who) {
   const { db, journalHost } = ctx
+  // A key change that has committed (the security log), by the caller.
+  const record = (event, keyId) => securityLogOf(ctx).record(who.userId, event, { deviceId: who.deviceId, deviceName: who.name, target: keyTarget(keyId), decidedBy: 'user' })
   const path = url.pathname
   if (path !== '/approval-keys' && !path.startsWith('/approval-keys/') && path !== '/approvals/nonce') return false
   const enabled = !!journalHost
@@ -261,6 +265,7 @@ export async function handleApprovalKeysRoute(ctx, req, res, url, who) {
       if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') return keyExists(res)
       throw err
     }
+    record('approval_key_enrolled', row.key_id)
     announceKey(ctx, who.userId, row, { added: true, how: BY_PASSWORD })
     json(res, 200, { key: keyView(row) })
     return true
@@ -306,6 +311,7 @@ export async function handleApprovalKeysRoute(ctx, req, res, url, who) {
       return { ok: true, row: keyRow(db, keyId), signer: r.keyId }
     })()
     if (!out.ok) return send(res, out)
+    record('approval_key_enrolled', out.row.key_id)
     announceKey(ctx, who.userId, out.row, { added: true, how: `approved with the key \`${out.signer.slice(0, 8)}\`` })
     json(res, 200, { key: keyView(out.row) })
     return true
@@ -325,6 +331,7 @@ export async function handleApprovalKeysRoute(ctx, req, res, url, who) {
       return { ok: true, row: keyRow(db, r.keyId) }
     })()
     if (!out.ok) return send(res, out)
+    record('approval_key_attached', out.row.key_id)
     announceAttach(ctx, who, out.row)
     json(res, 200, { key: keyView(out.row) })
     return true
@@ -357,6 +364,7 @@ export async function handleApprovalKeysRoute(ctx, req, res, url, who) {
       return true
     }
     const row = keyRow(db, keyId)
+    record('approval_key_revoked', keyId)
     announceKey(ctx, who.userId, row, { added: false, how })
     json(res, 200, { key: keyView(row) })
     return true

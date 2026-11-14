@@ -156,6 +156,9 @@ const installed = new WeakMap()
 const NOOP_LOG = Object.freeze({ record() {}, read: () => ({ account: null, last_seq: 0, events: [] }) })
 export function installSecurityLog(db, log) { installed.set(db, log) }
 export function securityLogFor(db) { return installed.get(db) ?? NOOP_LOG }
+// A route's context's log (makeHttpHandler passes its own), else the one
+// installed for its database.
+export const securityLogOf = (ctx) => ctx.securityLog ?? securityLogFor(ctx.db)
 
 // MATRON_SECURITY_FEED_TOKEN / MATRON_SECURITY_FEED_ACCOUNT: both set and
 // the token well formed, or the feed is off (and a malformed token says so

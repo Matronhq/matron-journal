@@ -6,6 +6,7 @@
 import { json, readBody } from './http-body.js'
 import { normaliseEmail, setUserEmail, getUserEmail, findResetTarget, issueResetToken, resetPassword, resetEmail, EMAIL_MAX } from './password-reset.js'
 import { verifyUserPassword } from './auth.js'
+import { securityLogOf } from './security-log.js'
 
 const PASSWORD_MIN = 8
 const clientIp = (req) => req.headers['cf-connecting-ip'] || req.socket.remoteAddress || 'unknown'
@@ -30,6 +31,10 @@ export async function handlePasswordResetRoute(ctx, req, res, url, { rejectEarly
     if (typeof identifier !== 'string' || !identifier.trim() || identifier.length > EMAIL_MAX) { json(res, 400, { error: 'bad_request' }); return true }
     if (!mailer) { json(res, 503, { error: 'unavailable' }); return true }
     const target = findResetTarget(db, identifier)
+    // Asked for an account that exists, whether or not it has an address
+    // (the security log); the answer below stays the same either way.
+    const account = target ?? (identifier.includes('@') ? null : db.prepare('SELECT id FROM users WHERE name=?').get(identifier.trim()))
+    if (account) securityLogOf(ctx).record(account.id, 'password_reset_requested', { decidedBy: 'user' })
     const token = target && issueResetToken(db, target.id)
     if (token) {
       const link = `${mailer.publicUrl}/app/reset-password#token=${token}`
@@ -51,6 +56,7 @@ export async function handlePasswordResetRoute(ctx, req, res, url, { rejectEarly
     loginGuard.ok(r.name)
     // Nor may a two-factor sign-in started with the old password finish.
     signInTickets.dropUser(r.userId)
+    securityLogOf(ctx).record(r.userId, 'password_changed', { decidedBy: 'user' })
     json(res, 200, { ok: true, signed_out: r.signedOut })
     return true
   }
