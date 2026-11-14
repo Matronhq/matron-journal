@@ -20,6 +20,22 @@ export function setNoticesEnabled(db, userId, on, now = Date.now()) {
     .run(userId, on ? 1 : 0, now)
 }
 
+// Explicit opt-in: no settings row means Coordinator spawns still need approval.
+export function getAutoApproveCoordinatorSpawns(db, userId) {
+  const row = db.prepare('SELECT auto_approve_coordinator_spawns FROM user_settings WHERE user_id=?').get(userId)
+  return Number(row?.auto_approve_coordinator_spawns) === 1
+}
+
+export function setAutoApproveCoordinatorSpawns(db, userId, on, now = Date.now()) {
+  db.prepare(`INSERT INTO user_settings(user_id, auto_approve_coordinator_spawns, updated_at) VALUES(?,?,?)
+    ON CONFLICT(user_id) DO UPDATE SET auto_approve_coordinator_spawns=excluded.auto_approve_coordinator_spawns, updated_at=excluded.updated_at`)
+    .run(userId, on ? 1 : 0, now)
+}
+
 // auto_archive_days — archive conversations idle this long (src/archive.js);
 // 0 = off.
-export const settingsView = (db, userId) => ({ notices: getNoticesEnabled(db, userId), auto_archive_days: getAutoArchiveDays(db, userId) })
+export const settingsView = (db, userId) => ({
+  notices: getNoticesEnabled(db, userId),
+  auto_approve_coordinator_spawns: getAutoApproveCoordinatorSpawns(db, userId),
+  auto_archive_days: getAutoArchiveDays(db, userId),
+})
