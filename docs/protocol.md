@@ -1153,9 +1153,19 @@ Rows from before the stamp carry neither, and don't count.
   "Agent chat rooms" below). Same don't-clobber discipline as `title`/
   `parent_convo_id`: only an upsert that carries a non-null `summary`
   changes the stored value; omitting it leaves the existing summary
-  untouched. Unlike a title change, a summary change never appends a
-  `convo_meta` event — it's roster-read material, not something a live
-  client needs to learn mid-conversation.
+  untouched; `null` also leaves it unchanged, and `""` clears it. A summary
+  change never appends a `convo_meta` event (it would add a stored event per
+  turn to every conversation's history). Instead connected clients get an
+  ephemeral frame `{kind: 'summary', convo_id, summary, summary_updated_at}`:
+  not journaled, not replayed, no `seq`, no `last_seq` movement. `/snapshot`
+  conversation rows carry `summary` and `summary_updated_at` for catch-up.
+  `summary_updated_at` is Unix milliseconds when the server first observed
+  the changed text, including a clear; it is not the producer's generation
+  time. It stays unchanged on identical resends or omitted/null summaries.
+  A new conversation with a non-empty summary is stamped at creation;
+  summary-less creations and pre-migration rows start at `0` (unknown), and
+  re-sending unchanged legacy text keeps `0`. Clients should hide an age
+  label for `0` and tolerate these additive fields.
 - Agent delivery scoping: `convo_upsert` records the upserting agent device
   as the conversation's owner (`agent_device_id`). Ownership is
   last-writer-wins **except** for a guest: a device that has ever appeared
