@@ -1,4 +1,3 @@
-import { checkEndpoint } from './webpush.js'
 import { makeAgentCommentLimiter } from './agent-comment-limiter.js'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
@@ -536,7 +535,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         let stored
         try {
           // Stored as the parsed form, so two spellings of one host are one endpoint.
-          const checked = checkEndpoint(endpoint)
+          const checked = webPushClient.checkEndpoint(endpoint)
           if (!checked.ok) throw new Error('endpoint')
           stored = checked.url.href
           if (typeof p256dh !== 'string' || !/^[A-Za-z0-9_-]+$/.test(p256dh)

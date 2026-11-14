@@ -76,7 +76,23 @@ export function isPublicAddress(ip) {
   } catch { return false }
 }
 
-export function checkEndpoint(value) {
+const defaultHosts = ['fcm.googleapis.com', 'updates.push.services.mozilla.com', '*.push.apple.com', '*.notify.windows.com']
+
+function normalizeExtraHosts(entries) {
+  return entries.map((entry) => entry.trim().toLowerCase()).filter(Boolean).map((entry) => {
+    const host = entry.startsWith('*.') ? entry.slice(2) : entry
+    if (host.length > 253 || !host.split('.').every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) {
+      throw new Error('Invalid MATRON_WEBPUSH_EXTRA_HOSTS entry')
+    }
+    return entry
+  })
+}
+
+function matchesHost(host, entry) {
+  return entry.startsWith('*.') ? host.endsWith(entry.slice(1)) : host === entry
+}
+
+export function checkEndpoint(value, extraHosts = []) {
   if (typeof value !== 'string' || value.length > 2048) return { ok: false, reason: 'bad_endpoint' }
   try {
     const url = new URL(value)
@@ -84,6 +100,11 @@ export function checkEndpoint(value) {
     if (url.protocol !== 'https:' || url.username || url.password || (url.port && url.port !== '443')
       || host === 'localhost' || /\.(localhost|local|internal)$/.test(host)
       || ((host.includes(':') || /^[\d.]+$/.test(host)) && !isPublicAddress(host))) return { ok: false, reason: 'bad_endpoint' }
+    const extras = normalizeExtraHosts(extraHosts)
+    const literal = net.isIP(host) !== 0
+    if (literal ? !extras.includes(host) : ![...defaultHosts, ...extras].some((entry) => matchesHost(host, entry))) {
+      return { ok: false, reason: 'bad_endpoint' }
+    }
     return { ok: true, url }
   } catch { return { ok: false, reason: 'bad_endpoint' } }
 }
@@ -111,7 +132,9 @@ function defaultRequest({ address, family, hostname, port, path, headers, body, 
   })
 }
 
-export function makeWebPushClient({ privateKeyFile, subject, lookup = dns.lookup, request = defaultRequest, now = Date.now, timeoutMs = 10000 }) {
+export function makeWebPushClient({ privateKeyFile, subject, extraHosts = [], lookup = dns.lookup, request = defaultRequest, now = Date.now, timeoutMs = 10000 }) {
+  const hosts = normalizeExtraHosts(extraHosts)
+  const check = (value) => checkEndpoint(value, hosts)
   const privateKey = crypto.createPrivateKey(fs.readFileSync(privateKeyFile))
   if (privateKey.asymmetricKeyType !== 'ec' || privateKey.asymmetricKeyDetails?.namedCurve !== 'prime256v1') throw new Error('VAPID key must be P-256')
   const subjectUrl = new URL(subject)
@@ -121,10 +144,11 @@ export function makeWebPushClient({ privateKeyFile, subject, lookup = dns.lookup
   let closed = false
   return {
     publicKey,
+    checkEndpoint: check,
     async send({ endpoint, p256dh, auth, payload, urgency, topic, ttl }) {
       try {
         if (closed) return { status: 0, reason: 'closed' }
-        const checked = checkEndpoint(endpoint)
+        const checked = check(endpoint)
         if (!checked.ok) return { status: 0, reason: checked.reason }
         let body
         try { body = encryptPayload({ payload, p256dh, auth }) } catch { return { status: 0, reason: 'encrypt_failed' } }
@@ -152,6 +176,7 @@ export function makeWebPushClient({ privateKeyFile, subject, lookup = dns.lookup
 }
 
 export function webPushConfigFromEnv(env) {
+  const extraHosts = normalizeExtraHosts((env.MATRON_WEBPUSH_EXTRA_HOSTS || '').split(','))
   const kill = env.MATRON_WEBPUSH_DISABLED
   if (kill === '1' || kill === 'true') return null
   if (kill !== undefined && kill !== '' && kill !== '0' && kill !== 'false') throw new Error('MATRON_WEBPUSH_DISABLED must be 1, true, 0 or false')
@@ -160,5 +185,5 @@ export function webPushConfigFromEnv(env) {
   if (!privateKeyFile && !subject) return null
   if (!privateKeyFile) throw new Error('Missing MATRON_WEBPUSH_VAPID_KEY_FILE')
   if (!subject) throw new Error('Missing MATRON_WEBPUSH_SUBJECT')
-  return { privateKeyFile, subject }
+  return { privateKeyFile, subject, extraHosts }
 }

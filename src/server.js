@@ -578,7 +578,6 @@ export function startServer({
   backgroundPace = resolveZeroableEnv('MATRON_BACKGROUND_PACE', process.env.MATRON_BACKGROUND_PACE, 1),
 } = {}) {
   const { client: resolvedWebPushClient, owned: ownsWebPushClient } = resolveWebPushClient(webPushClient)
-  if (!resolvedWebPushClient) console.info('web push: off')
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
   const db = openDb(resolvedDbPath)

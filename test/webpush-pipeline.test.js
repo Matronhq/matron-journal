@@ -54,7 +54,7 @@ async function setup(t, { status = 201, web = true, apns = false, coalesceMs = 4
   const requests = []
   const apnsCalls = []
   const webPushClient = makeWebPushClient({
-    privateKeyFile, subject: 'mailto:alice@example.com',
+    privateKeyFile, subject: 'mailto:alice@example.com', extraHosts: ['push.example.com'],
     lookup: async () => [{ address: '93.184.216.34', family: 4 }],
     request: async (request) => { requests.push(request); return { status, headers: {} } },
   })
@@ -198,4 +198,31 @@ test('web never sends a silent wake or read-marker notification', async (t) => {
   await tick()
   assert.equal(s.requests.length, 1)
   assert.equal(s.decode(s.requests[0]).kind, 'attention')
+})
+
+test('a trailing web push queued before a panic lock is dropped at the send', async (t) => {
+  const s = await setup(t, { coalesceMs: 60 })
+  s.send({ type: 'text', payload: { body: 'first' } })
+  s.send({ type: 'text', payload: { body: 'queued' } })
+  await tick()
+  assert.equal(s.requests.length, 1)
+  s.db.prepare('INSERT INTO panic_locks(user_id, since) VALUES(?,?)').run(s.alice.id, Date.now())
+  await pause(100)
+  assert.equal(s.requests.length, 1, 'the queued push is not sent to a frozen account')
+  s.db.prepare('UPDATE panic_locks SET cleared_at=? WHERE user_id=?').run(Date.now(), s.alice.id)
+  s.send()
+  await tick()
+  assert.equal(s.requests.length, 2, 'positive control after the lock is cleared')
+})
+
+test('a trailing web push queued before the device signed out is dropped at the send', async (t) => {
+  const s = await setup(t, { coalesceMs: 60 })
+  s.send({ type: 'text', payload: { body: 'first' } })
+  s.send({ type: 'text', payload: { body: 'queued' } })
+  await tick()
+  assert.equal(s.requests.length, 1)
+  s.db.prepare('DELETE FROM web_push_subscriptions WHERE device_id=?').run(s.deviceId)
+  s.db.prepare('DELETE FROM devices WHERE id=?').run(s.deviceId)
+  await pause(100)
+  assert.equal(s.requests.length, 1)
 })

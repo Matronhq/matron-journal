@@ -5,11 +5,12 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { startTestServer } from './helpers.js'
+import { checkEndpoint } from '../src/webpush.js'
 import { resolveWebPushClient } from '../src/server.js'
 import { openDb, setWebPushSubscription, clearWebPushSubscription, pruneWebPushSubscription, clientDevicesForPush } from '../src/db.js'
 import { createUser, createAgent, createClientDevice } from '../src/auth.js'
 
-const envVars = ['MATRON_WEBPUSH_VAPID_KEY_FILE', 'MATRON_WEBPUSH_SUBJECT', 'MATRON_WEBPUSH_DISABLED', 'MATRON_APNS_KEY_FILE', 'MATRON_APNS_KEY_ID', 'MATRON_APNS_TEAM_ID', 'MATRON_APNS_TOPIC', 'MATRON_PUSH_GATEWAY_URL']
+const envVars = ['MATRON_WEBPUSH_EXTRA_HOSTS', 'MATRON_WEBPUSH_VAPID_KEY_FILE', 'MATRON_WEBPUSH_SUBJECT', 'MATRON_WEBPUSH_DISABLED', 'MATRON_APNS_KEY_FILE', 'MATRON_APNS_KEY_ID', 'MATRON_APNS_TEAM_ID', 'MATRON_APNS_TOPIC', 'MATRON_PUSH_GATEWAY_URL']
 
 function withEnv(t, values = {}) {
   const saved = Object.fromEntries(envVars.map((k) => [k, process.env[k]]))
@@ -32,7 +33,7 @@ function subscription(name = 'alice') {
 async function setup(t, { off = false, dbPath = ':memory:' } = {}) {
   withEnv(t)
   const publicKey = subscription().keys.p256dh
-  const client = { publicKey, send: async () => ({ status: 201 }), close() {} }
+  const client = { publicKey, checkEndpoint: (value) => checkEndpoint(value, ['push.example.com', '*.custom.example.com']), send: async () => ({ status: 201 }), close() {} }
   const s = await startTestServer({ dbPath, webPushClient: off ? undefined : client })
   t.after(() => s.close())
   const alice = await createUser(s.db, 'alice', 'pw')
@@ -185,7 +186,7 @@ test('startServer fails loudly for key file without subject', async (t) => {
   }, /MATRON_WEBPUSH_SUBJECT/)
 })
 
-test('neither web env variable boots with web off and logs it once', async (t) => {
+test('neither web env variable boots with web off quietly', async (t) => {
   withEnv(t)
   const lines = []
   const original = console.info
@@ -197,7 +198,7 @@ test('neither web env variable boots with web off and logs it once', async (t) =
   } finally { console.info = original }
   assert.ok(s.port > 0)
   assert.deepEqual(resolveWebPushClient(undefined), { client: undefined, owned: false })
-  assert.equal(lines.filter((line) => line === 'web push: off').length, 1)
+  assert.equal(lines.filter((line) => line.includes('web push')).length, 0)
 })
 
 test('an endpoint is stored in its parsed form, so one host spelled two ways is one endpoint', async (t) => {
@@ -205,4 +206,29 @@ test('an endpoint is stored in its parsed form, so one host spelled two ways is 
   const sub = subscription()
   assert.equal((await s.post({ ...sub, endpoint: 'https://PUSH.example.com/x' })).status, 200)
   assert.equal(s.db.prepare('SELECT endpoint FROM web_push_subscriptions WHERE device_id=?').get(s.device.deviceId).endpoint, 'https://push.example.com/x')
+})
+
+test('registration applies the client host policy for default hosts, extras and rejected hosts', async (t) => {
+  const s = await setup(t)
+  const sub = subscription()
+  for (const endpoint of [
+    'https://fcm.googleapis.com/fcm/send/x',
+    'https://updates.push.services.mozilla.com/wpush/v2/x',
+    'https://web.push.apple.com/x',
+    'https://wns2-par02p.notify.windows.com/x',
+    'https://push.example.com/x', 'https://one.custom.example.com/x',
+  ]) assert.equal((await s.post({ ...sub, endpoint })).status, 200, endpoint)
+  for (const endpoint of ['https://example.org/x', 'https://custom.example.com/x', 'https://push.apple.com/x']) {
+    assert.deepEqual(await s.post({ ...sub, endpoint }), { status: 400, json: { error: 'bad_request' } }, endpoint)
+  }
+  assert.equal(s.db.prepare('SELECT endpoint FROM web_push_subscriptions WHERE device_id=?').get(s.device.deviceId).endpoint,
+    'https://one.custom.example.com/x')
+})
+
+test('server startup rejects invalid extra-host configuration', async (t) => {
+  withEnv(t, { MATRON_WEBPUSH_EXTRA_HOSTS: 'push.example.com/path' })
+  await assert.rejects(async () => {
+    const s = await startTestServer()
+    t.after(() => s.close())
+  }, /MATRON_WEBPUSH_EXTRA_HOSTS/)
 })

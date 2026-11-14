@@ -45,7 +45,7 @@ function setup(t, { lookup, respond = () => ({ status: 201, headers: {} }), ...o
   const requests = []
   const lookups = []
   const client = makeWebPushClient({
-    privateKeyFile, subject: 'mailto:alice@example.com',
+    privateKeyFile, subject: 'mailto:alice@example.com', extraHosts: ['push.example.com'],
     lookup: async (...args) => {
       lookups.push(args)
       return lookup ? lookup(...args) : [{ address: '93.184.216.34', family: 4 }]
@@ -110,11 +110,11 @@ test('encryption failure resolves fail-closed with zero requests', async (t) => 
 })
 
 test('endpoint guard accepts public HTTPS and rejects unsafe URLs without DNS', () => {
-  const good = checkEndpoint(endpoint)
+  const good = checkEndpoint(endpoint, ['push.example.com'])
   assert.equal(good.ok, true)
   assert.ok(good.url instanceof URL)
-  assert.equal(checkEndpoint('https://93.184.216.34/x').ok, true)
-  assert.equal(checkEndpoint('https://push.example.com:443/x').ok, true)
+  assert.equal(checkEndpoint('https://93.184.216.34/x', ['93.184.216.34']).ok, true)
+  assert.equal(checkEndpoint('https://push.example.com:443/x', ['push.example.com']).ok, true)
   const blocked = [
     'http://push.example.com/x', 'https://127.0.0.1/x', 'https://10.0.0.1/x',
     'https://169.254.169.254/x', 'https://[::1]/x', 'https://[::ffff:127.0.0.1]/x',
@@ -124,7 +124,7 @@ test('endpoint guard accepts public HTTPS and rejects unsafe URLs without DNS', 
     'https://2130706433/x', 'https://0x7f000001/x', 'https://0177.0.0.1/x',
     'https://203.0.113.5/x', 'not a URL', `https://push.example.com/${'a'.repeat(2048)}`,
   ]
-  for (const url of blocked) assert.equal(checkEndpoint(url).ok, false, url)
+  for (const url of blocked) assert.equal(checkEndpoint(url, ['push.example.com', '127.0.0.1', '10.0.0.1', '169.254.169.254', '203.0.113.5', 'localhost', '*.localhost', '*.local', '*.internal']).ok, false, url)
 })
 
 test('address guard covers public addresses and non-public IPv4, IPv6 and embedded IPv4', () => {
@@ -219,7 +219,7 @@ test('VAPID JWT signature, endpoint origin, subject and expiration', () => {
 test('environment config enables only complete pairs and kill switch overrides them', () => {
   const config = { MATRON_WEBPUSH_VAPID_KEY_FILE: '/tmp/example-vapid.pem', MATRON_WEBPUSH_SUBJECT: 'mailto:alice@example.com' }
   assert.equal(webPushConfigFromEnv({}), null)
-  assert.deepEqual(webPushConfigFromEnv(config), { privateKeyFile: config.MATRON_WEBPUSH_VAPID_KEY_FILE, subject: config.MATRON_WEBPUSH_SUBJECT })
+  assert.deepEqual(webPushConfigFromEnv(config), { privateKeyFile: config.MATRON_WEBPUSH_VAPID_KEY_FILE, subject: config.MATRON_WEBPUSH_SUBJECT, extraHosts: [] })
   for (const value of ['1', 'true']) assert.equal(webPushConfigFromEnv({ ...config, MATRON_WEBPUSH_DISABLED: value }), null)
   assert.equal(webPushConfigFromEnv({ MATRON_WEBPUSH_VAPID_KEY_FILE: config.MATRON_WEBPUSH_VAPID_KEY_FILE, MATRON_WEBPUSH_DISABLED: '1' }), null)
 })
@@ -246,6 +246,58 @@ test('a lookup that never answers is cut off at the timeout and sends nothing', 
 test('an unrecognised kill switch value fails loudly instead of leaving web push on', () => {
   const base = { MATRON_WEBPUSH_VAPID_KEY_FILE: '/k.pem', MATRON_WEBPUSH_SUBJECT: 'mailto:alice@example.com' }
   for (const v of ['yes', 'on', 'TRUE', '2']) assert.throws(() => webPushConfigFromEnv({ ...base, MATRON_WEBPUSH_DISABLED: v }), /MATRON_WEBPUSH_DISABLED/, v)
-  for (const v of [undefined, '', '0', 'false']) assert.deepEqual(webPushConfigFromEnv({ ...base, MATRON_WEBPUSH_DISABLED: v }), { privateKeyFile: '/k.pem', subject: 'mailto:alice@example.com' }, String(v))
+  for (const v of [undefined, '', '0', 'false']) assert.deepEqual(webPushConfigFromEnv({ ...base, MATRON_WEBPUSH_DISABLED: v }), { privateKeyFile: '/k.pem', subject: 'mailto:alice@example.com', extraHosts: [] }, String(v))
   for (const v of ['1', 'true']) assert.equal(webPushConfigFromEnv({ ...base, MATRON_WEBPUSH_DISABLED: v }), null, v)
+})
+
+const defaultEndpoints = [
+  'https://fcm.googleapis.com/fcm/send/x',
+  'https://updates.push.services.mozilla.com/wpush/v2/x',
+  'https://web.push.apple.com/x',
+  'https://wns2-par02p.notify.windows.com/x',
+]
+
+test('default push-service hosts pass the endpoint policy and send', async (t) => {
+  const s = setup(t, { extraHosts: [] })
+  for (const endpoint of defaultEndpoints) {
+    assert.equal(checkEndpoint(endpoint).ok, true, endpoint)
+    assert.equal(s.client.checkEndpoint(endpoint).ok, true, endpoint)
+    assert.equal((await s.send({ endpoint })).status, 201, endpoint)
+  }
+})
+
+test('unlisted public hosts fail before DNS or transport, including wildcard apexes and lookalikes', async (t) => {
+  const s = setup(t, { extraHosts: ['*.custom.example.com'] })
+  for (const endpoint of [
+    'https://example.org/x', 'https://push.example.com/x',
+    'https://push.apple.com/x', 'https://notify.windows.com/x',
+    'https://custom.example.com/x', 'https://fakecustom.example.com/x',
+    'https://web.push.apple.com.example.org/x', 'https://93.184.216.34/x',
+  ]) {
+    assert.equal(s.client.checkEndpoint(endpoint).ok, false, endpoint)
+    assert.deepEqual(await s.send({ endpoint }), { status: 0, reason: 'bad_endpoint' }, endpoint)
+  }
+  assert.equal(s.lookups.length, 0)
+  assert.equal(s.requests.length, 0)
+})
+
+test('extra exact and wildcard hosts extend both client checking and sending', async (t) => {
+  const s = setup(t, { extraHosts: ['push.example.com', '*.custom.example.com', '93.184.216.34', '10.0.0.1'] })
+  for (const endpoint of ['https://push.example.com/x', 'https://one.custom.example.com/x', 'https://one.two.custom.example.com/x', 'https://93.184.216.34/x']) {
+    assert.equal(s.client.checkEndpoint(endpoint).ok, true, endpoint)
+    assert.equal((await s.send({ endpoint })).status, 201, endpoint)
+  }
+  assert.deepEqual(await s.send({ endpoint: 'https://10.0.0.1/x' }), { status: 0, reason: 'bad_endpoint' })
+  assert.equal(checkEndpoint('https://93.184.216.34/x', ['*.216.34']).ok, false)
+})
+
+test('extra-host environment entries are trimmed, lowercased and validated at startup', (t) => {
+  const base = { MATRON_WEBPUSH_VAPID_KEY_FILE: '/k.pem', MATRON_WEBPUSH_SUBJECT: 'mailto:alice@example.com' }
+  assert.deepEqual(webPushConfigFromEnv({ ...base, MATRON_WEBPUSH_EXTRA_HOSTS: ' PUSH.Example.COM, , *.Custom.Example.COM,,' }).extraHosts,
+    ['push.example.com', '*.custom.example.com'])
+  const s = setup(t)
+  for (const entry of ['https://push.example.com', 'push.example.com/path', 'push.example.com:443', 'push example.com', '*example.com', 'foo.*.example.com', '.example.com', 'example..com', '-example.com']) {
+    assert.throws(() => webPushConfigFromEnv({ ...base, MATRON_WEBPUSH_EXTRA_HOSTS: entry }), /MATRON_WEBPUSH_EXTRA_HOSTS/, entry)
+    assert.throws(() => makeWebPushClient({ privateKeyFile: s.privateKeyFile, subject: base.MATRON_WEBPUSH_SUBJECT, extraHosts: [entry] }), /MATRON_WEBPUSH_EXTRA_HOSTS/, entry)
+  }
 })

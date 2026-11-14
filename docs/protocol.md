@@ -8790,6 +8790,14 @@ Keep the private key outside source control. Set both
 `MATRON_WEBPUSH_SUBJECT` (a `mailto:` or `https:` contact URL). With neither,
 Web Push is off; an incomplete pair or invalid key fails startup.
 `MATRON_WEBPUSH_DISABLED=1` or `true` disables it regardless of configuration.
+Endpoints are limited to `fcm.googleapis.com`,
+`updates.push.services.mozilla.com`, `*.push.apple.com`, and
+`*.notify.windows.com`. Set `MATRON_WEBPUSH_EXTRA_HOSTS` to a comma-separated
+list of extra exact hosts or `*.suffix` entries to extend this list. Entries
+are trimmed and lowercased; empty entries are ignored. A wildcard matches
+subdomains only, not the suffix itself. Invalid entries fail startup.
+Public IP literals require an exact entry in the extra hosts; private and
+reserved addresses remain blocked.
 
 The decrypted RFC 8291 `aes128gcm` payload is bounded JSON, optionally followed
 by whitespace padding:
