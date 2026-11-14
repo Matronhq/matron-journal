@@ -139,12 +139,37 @@ export function createClientDevice(db, userId, name) {
   return issueDevice(db, userId, 'client', name)
 }
 
-export function authToken(db, token) {
+// Client (app) tokens idle out: unused for this long, the token stops
+// working and the device signs in again. Agent (bridge) tokens never do.
+// The row stays, so the device list can show it as signed out, idle, and the
+// account's approval key stays enrolled for the app to re-attach.
+export const DEFAULT_CLIENT_IDLE_DAYS = 30
+export const DEFAULT_CLIENT_IDLE_MS = DEFAULT_CLIENT_IDLE_DAYS * 24 * 60 * 60 * 1000
+// Using a token keeps the device alive, but the clock is only written when it
+// is this stale, so a busy client costs one write an hour, not one a request.
+const SEEN_REFRESH_MS = 60 * 60 * 1000
+
+export function clientIdleExpired(row, now = Date.now(), clientIdleMs = DEFAULT_CLIENT_IDLE_MS) {
+  return row.kind === 'client' && clientIdleMs > 0 && now - (row.last_seen_at ?? row.created_at) > clientIdleMs
+}
+
+// Any authenticated use of a device (HTTP request, WebSocket hello, frame or
+// sweep tick): false when it has idled out (never refreshed after that, so an
+// expired token cannot come back), otherwise refresh last_seen_at if stale.
+export function touchDevice(db, row, { now = Date.now(), clientIdleMs = DEFAULT_CLIENT_IDLE_MS } = {}) {
+  if (clientIdleExpired(row, now, clientIdleMs)) return false
+  if (row.last_seen_at == null || now - row.last_seen_at >= SEEN_REFRESH_MS) {
+    db.prepare('UPDATE devices SET last_seen_at=? WHERE id=?').run(now, row.id)
+  }
+  return true
+}
+
+export function authToken(db, token, opts) {
   const row = db.prepare(
-    'SELECT id, user_id, kind, name FROM devices WHERE token_hash=?'
+    'SELECT id, user_id, kind, name, created_at, last_seen_at FROM devices WHERE token_hash=?'
   ).get(sha256(token))
   if (!row) return null
-  db.prepare('UPDATE devices SET last_seen_at=? WHERE id=?').run(Date.now(), row.id)
+  if (!touchDevice(db, row, opts)) return null
   return { deviceId: row.id, userId: row.user_id, kind: row.kind, name: row.name }
 }
 

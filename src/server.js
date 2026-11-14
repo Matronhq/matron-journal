@@ -4,7 +4,7 @@ import path from 'node:path'
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
-import { makeLoginGuard, makeRateLimiter } from './auth.js'
+import { makeLoginGuard, makeRateLimiter, DEFAULT_CLIENT_IDLE_DAYS, DEFAULT_CLIENT_IDLE_MS } from './auth.js'
 import { makeTwoFactorTickets, isTwoFactorRequired } from './two-factor.js'
 import { makeHttpHandler } from './http.js'
 import { ensurePreapproveKey } from './preapprove-key.js'
@@ -69,6 +69,22 @@ const DEFAULT_RETENTION_DAYS = 30
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
 const DEFAULT_TOOL_LOG_TTL_HOURS = 24
 const DEFAULT_VOICE_NOTE_TTL_DAYS = 7 // audio goes a week after its transcript
+
+// MATRON_CLIENT_IDLE_DAYS / the clientIdleDays option: days a client (app)
+// token may sit unused before it stops working (agent tokens never expire).
+// A non-negative number, fractions allowed; 0 turns the expiry off; anything
+// else warns and falls back to the default. Returns milliseconds (0 = off).
+export function resolveClientIdleMs(override) {
+  const fromEnv = override === undefined
+  const raw = fromEnv ? process.env.MATRON_CLIENT_IDLE_DAYS : override
+  if (raw === undefined || raw === '') return DEFAULT_CLIENT_IDLE_MS
+  const n = typeof raw === 'string' && raw.trim() === '' ? NaN : Number(raw)
+  if (!Number.isFinite(n) || n < 0) {
+    console.warn(`auth: ${fromEnv ? 'MATRON_CLIENT_IDLE_DAYS' : 'clientIdleDays'}=${JSON.stringify(raw)} is invalid — using the default of ${DEFAULT_CLIENT_IDLE_DAYS} days`)
+    return DEFAULT_CLIENT_IDLE_MS
+  }
+  return n * 24 * 60 * 60 * 1000
+}
 
 // Shared validator for small numeric env knobs that guard a size/gap check
 // (`size > mediaMaxBytes`, `gap > maxReplay`): an unset var is the normal,
@@ -434,6 +450,8 @@ export function startServer({
   // from the daily cap above. 0 = no cap.
   consentTransferDailyCap = resolveZeroableEnv('MATRON_COORDINATOR_TRANSFER_DAILY_CAP', process.env.MATRON_COORDINATOR_TRANSFER_DAILY_CAP, CONSENT_TRANSFER_DAILY_CAP_DEFAULT),
   agentCommentClock = Date.now,
+  // Client-token idle expiry (resolveClientIdleMs); the clock is a test seam.
+  clientIdleDays, clientIdleClock = Date.now,
   // Approvals of the Coordinator's own routine-born asks per rolling 24 h
   // (src/consent-own-ask.js), on top of the daily cap. 0 = no cap.
   consentRoutineCap = resolveZeroableEnv('MATRON_COORDINATOR_ROUTINE_CAP', process.env.MATRON_COORDINATOR_ROUTINE_CAP, CONSENT_ROUTINE_CAP_DEFAULT),
@@ -691,6 +709,7 @@ export function startServer({
   let semanticTimer = null
   let indexingNow = false
   let semanticInFlight = Promise.resolve()
+  const clientIdleMs = resolveClientIdleMs(clientIdleDays)
   const server = http.createServer(makeHttpHandler({
     db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
@@ -701,7 +720,7 @@ export function startServer({
     agentCommentLimiter: makeAgentCommentLimiter({ now: agentCommentClock }),
     github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, federationGrants, federationContribute, federationMedia, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
-    journalHost,
+    journalHost, clientIdleMs, clientIdleClock,
   }))
   // A reverse proxy in front of the journal keeps its connections to it open
   // and reuses them. Node closes an idle connection after 5 s by default,
@@ -723,7 +742,7 @@ export function startServer({
     // spawnStartTimeoutMs rides along so the orphan sweep's TTL can never
     // undercut a configured start timeout (attachWs derives the TTL).
     broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, sessionControlTimeoutMs, waker: resolvedWaker,
-    journalHost,
+    journalHost, clientIdleMs, clientIdleClock,
   })
   let retentionInterval = null
   let walCheckpointInterval = null

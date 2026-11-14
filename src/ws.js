@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { WebSocketServer } from 'ws'
-import { authToken, authorizeAgentWrite } from './auth.js'
+import { authToken, touchDevice, authorizeAgentWrite } from './auth.js'
 import { getBoxDefaults, boxDefaultsByDevice, effectiveBoxDefaults, normaliseAgent } from './box-defaults.js'
 import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses, setDeviceSyncScope } from './db.js'
 import { parseSyncScope } from './sync-scope.js'
@@ -274,7 +274,7 @@ export function attachWs({
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
   revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES, inviteTtlMs = 1800000,
   broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null,
-  journalHost = null,
+  journalHost = null, clientIdleMs, clientIdleClock = Date.now,
 }) {
   // Derived, never raw: the orphan sweep must always outlast a live `start`
   // RPC still in flight (see APPROVED_ORPHAN_TTL_FLOOR_MS's comment) — and,
@@ -284,7 +284,13 @@ export function attachWs({
   const statusCache = makeStatusCache()
   // Prepared once, reused for the per-frame revocation recheck below — one
   // cheap SELECT per inbound frame, not a fresh db.prepare() call each time.
-  const deviceExistsStmt = db.prepare('SELECT 1 FROM devices WHERE id=?')
+  const deviceRowStmt = db.prepare('SELECT id, kind, created_at, last_seen_at FROM devices WHERE id=?')
+  // Alive = the row exists and, for a client, it has not idled out. A live
+  // check is also a use of the device, so an open socket keeps it signed in.
+  const deviceAlive = (id) => {
+    const row = deviceRowStmt.get(id)
+    return !!row && touchDevice(db, row, { now: clientIdleClock(), clientIdleMs })
+  }
   const interval = setInterval(() => {
     const now = Date.now()
     for (const ws of wss.clients) {
@@ -432,12 +438,13 @@ export function attachWs({
       const conns = hub.allConns()
       if (conns.length === 0) return
       const ids = [...new Set(conns.map((c) => c.deviceId))]
-      const existing = new Set(
-        db.prepare(`SELECT id FROM devices WHERE id IN (${ids.map(() => '?').join(',')})`)
-          .all(...ids).map((r) => r.id)
-      )
+      const rows = db.prepare(`SELECT id, kind, created_at, last_seen_at FROM devices WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids)
+      const now = clientIdleClock()
+      // Gone or idled out: both close the socket as revoked. A live one is
+      // in use, so its clock is kept fresh (at most hourly, see touchDevice).
+      const alive = new Set(rows.filter((r) => touchDevice(db, r, { now, clientIdleMs })).map((r) => r.id))
       for (const c of conns) {
-        if (existing.has(c.deviceId)) continue
+        if (alive.has(c.deviceId)) continue
         if (c.ws.readyState !== 1) continue // already closing; its 'close' handler unregisters it
         c.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
         c.ws.close(4001)
@@ -478,7 +485,7 @@ export function attachWs({
       try {
         if (!conn) {
           if (msg.op !== 'hello') { ws.close(); return }
-          const who = msg.token && authToken(db, msg.token)
+          const who = msg.token && authToken(db, msg.token, { now: clientIdleClock(), clientIdleMs })
           if (!who) {
             ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'auth' }))
             ws.close()
@@ -697,7 +704,7 @@ export function attachWs({
         // (hello itself already does the equivalent check via authToken's
         // token-hash lookup, so this must only run post-hello or a revoked
         // token's hello would get checked twice for no benefit).
-        if (!deviceExistsStmt.get(conn.deviceId)) {
+        if (!deviceAlive(conn.deviceId)) {
           conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
           conn.ws.close(4001)
           return
