@@ -160,6 +160,16 @@ export function transferRecipients(db, row) {
   return recipientDevices(db, row.room_id, row.sender_device_id)
 }
 
+// An approved transfer not released yet, declined by the journal (a panic
+// lock, src/panic.js): consent and phase both `declined`, as a decline
+// leaves them, with decided_by 'journal'. The one move from `approved`
+// back to `declined`; setTransferState's table never allows it. → true
+// when this call made it.
+export function declineApprovedTransfer(db, id, { reason, now = Date.now() }) {
+  return db.prepare(`UPDATE transfers SET consent='declined', phase='declined', decided_by='journal', decided_reason=?, deleted_at=?
+    WHERE id=? AND consent='approved' AND phase='open'`).run(reason, now, id).changes === 1
+}
+
 // A guarded update. `patch` may set consent / upload / phase (each moved
 // only from an allowed prior state, see TRANSITIONS) plus the timestamp and
 // decision columns. Returns false when the row is missing or not in an

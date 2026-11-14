@@ -19,8 +19,8 @@ import { recordAndAnnounce, recordApproved, guardedApprove, CONFLICT } from './c
 import { transferTarget } from './security-log.js'
 import { wakeIfOffline } from './wake.js'
 import { consentStepUp, consentApproval, approvalColumn, storedApproval } from './consent-subject.js'
-import { getTransfer, setTransferState, deleteTransferFiles, forgetChunks, transferRecipients, isTransferId, parseFindings } from './transfers.js'
-import { lockedApprovalRefusal } from './panic.js'
+import { getTransfer, setTransferState, deleteTransferFiles, forgetChunks, transferRecipients, isTransferId, parseFindings, declineApprovedTransfer } from './transfers.js'
+import { lockedApprovalRefusal, isPanicLocked } from './panic.js'
 
 // "by the user." or "by the Coordinator: <reason>", for the decline's
 // room line: the reason flattened to one line, without markdown, capped.
@@ -211,8 +211,15 @@ export function readyTransferView(db, row) {
 // the recipient device a `ready` frame; a box that is asleep is woken,
 // and its bridge catches up on hello (GET /transfers?for=me). → true when
 // this call released it.
-export function releaseIfReady({ db, hub, waker = null }, id) {
+export function releaseIfReady(ctx, id) {
+  const { db, hub, waker = null } = ctx
   const row = getTransfer(db, id)
+  // A panic-locked account (src/panic.js): an approved transfer is never
+  // released, now or after the clear, nor used to wake a box. Declined.
+  if (row && row.consent === 'approved' && row.phase === 'open' && isPanicLocked(db, row.user_id)) {
+    declineLockedTransfer(ctx, row)
+    return false
+  }
   if (!row || row.consent !== 'approved' || row.upload !== 'uploaded' || row.phase !== 'open') return false
   if (!setTransferState(db, id, { phase: 'released', released_at: Date.now() })) return false
   const view = readyTransferView(db, row)
@@ -233,6 +240,43 @@ export function releaseIfReady({ db, hub, waker = null }, id) {
 }
 
 const awaiting = (row) => row.consent === 'awaiting_user' && row.phase === 'open'
+
+export const LOCKED_TRANSFER_REASON = 'Declined: the account is locked.'
+// An approved, unreleased transfer of a panic-locked account, declined the
+// way a user's decline does it: the bytes and chunks go, the card closes,
+// the sender is told `declined`, the room gets a notice. → true when this
+// call declined it.
+export function declineLockedTransfer(ctx, row) {
+  const { db, hub, mediaDir } = ctx
+  if (!declineApprovedTransfer(db, row.id, { reason: 'account_locked' })) return false
+  if (mediaDir) {
+    try {
+      deleteTransferFiles(mediaDir, row.id)
+    } catch (err) {
+      console.error(`transfer: deleting ${row.id} of a locked account failed`, err)
+    }
+  }
+  forgetChunks(db, row.id)
+  closeTransferConsentItem({ db, hub }, row.id, { outcome: 'declined', decidedBy: null })
+  hub.sendToDevice(row.user_id, row.sender_device_id, { kind: 'transfer', event: 'declined', transfer_id: row.id, reason: LOCKED_TRANSFER_REASON })
+  try {
+    appendAndBroadcast(db, hub, { userId: row.user_id, convoId: row.room_id, sender: 'journal', type: 'text', payload: { body: `Not sent: ${codeSpan(row.name)} was declined because the account is locked.` } })
+  } catch (err) {
+    console.error('transfer: room notice failed (the decline stands)', err)
+  }
+  console.log(`journal: transfer declined id=${row.id} by=journal (account locked)`)
+  return true
+}
+
+// Every approved, unreleased transfer of `userId` (the panic lock's own
+// step, src/panic.js lockAccount). → how many.
+export function declineApprovedTransfers(ctx, userId) {
+  let n = 0
+  for (const row of ctx.db.prepare("SELECT * FROM transfers WHERE user_id=? AND consent='approved' AND phase='open'").all(userId)) {
+    if (declineLockedTransfer(ctx, row)) n += 1
+  }
+  return n
+}
 
 // Apply a decision — the one path behind the user's tap and the
 // Coordinator's answer. `decidedBy` is {kind: 'user', deviceId} or

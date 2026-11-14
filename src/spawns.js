@@ -198,6 +198,32 @@ export function expireApproved(db, ttlMs, now = Date.now()) {
   ).all(now, now - ttlMs)
 }
 
+// A panic lock (src/panic.js lockAccount): every spawn of the account
+// approved but not started yet fails, error_code `code`, told to its
+// parent as any failed start is, with the epitaph a linked room gets. An
+// orchestration still waiting on a wake then finds its row no longer
+// approved and sends nothing (approveSpawn), so nothing approved before the
+// lock starts after the clear. → how many.
+export function failApprovedSpawns(db, hub, userId, code) {
+  const rows = db.prepare(
+    "UPDATE agent_spawn_requests SET state='failed', resolved_at=? WHERE user_id=? AND state='approved' RETURNING id, user_id, from_device_id, room_id, from_convo_id"
+  ).all(Date.now(), userId)
+  for (const row of rows) {
+    if (row.room_id) {
+      try {
+        appendAndBroadcast(db, hub, {
+          userId: row.user_id, convoId: row.room_id, sender: 'journal', type: 'text',
+          payload: { body: `❌ spawn failed — ${code}. This room's child session never started.` },
+        })
+      } catch (err) {
+        console.error('failApprovedSpawns: epitaph write failed', err)
+      }
+    }
+    emitSpawnOutcome(db, hub, { userId: row.user_id, fromDeviceId: row.from_device_id, fromConvoId: row.from_convo_id, requestId: row.id, outcome: 'failed', errorCode: code })
+  }
+  return rows.length
+}
+
 // Undo for a spawn ask whose consent card never made it out: spawn_request
 // inserts the row FIRST (the card must carry a real request_id), so a
 // publish failure right after would otherwise leave a phantom
@@ -486,14 +512,19 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
     // Wake-and-wait before the start RPC. Only when a wake is actually under
     // way: a target that is offline with no wake possible fails fast below,
     // exactly as before, rather than holding the row for the whole window.
+    // A panic-locked account (src/panic.js): no box of it is woken or sent
+    // a start.
+    if (isPanicLocked(db, row.user_id)) return fail('account_locked')
     if (wakeTarget && wakeWaitMs > 0) {
       let waking = false
       try { waking = wakeTarget() === true } catch (err) { console.error('approveSpawn: wake threw', err) }
       if (waking) await hub.waitForDevice(row.user_id, row.target_device_id, wakeWaitMs)
     }
-    // A panic-locked account (src/panic.js): no start goes to its box, the
-    // approval (or the lock) having come while the box was woken.
+    // Checked again after the wait: locked meanwhile. A lock that came and
+    // went meanwhile failed the row (failApprovedSpawns), so a row no
+    // longer approved is never started either.
     if (isPanicLocked(db, row.user_id)) return fail('account_locked')
+    if (getSpawn(db, row.id)?.state !== 'approved') return 'failed'
     const r = await broker.issue(hub, row.user_id, row.target_device_id, 'start',
       {
         // spawn_id: the child's bridge names it on the opening turn's cause,

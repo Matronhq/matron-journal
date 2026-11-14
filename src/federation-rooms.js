@@ -462,13 +462,18 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
 
   // A new session for the talk, on the guest's Coordinator box.
   async function startSession(ctx, who, r, target, spawnId) {
-    const { convoId, code } = await issueTalkStart(ctx, asLink(r), target)
+    const started = await issueTalkStart(ctx, asLink(r), target)
+    const { convoId } = started
+    let { code } = started
     const cur = reread(db, r.id)
     if (!cur || cur.state !== 'starting' || cur.spawn_id !== spawnId) return 'stale'
     if (convoId) {
       let out
       try { out = acceptOnto(cur, { deviceId: target.deviceId, convoId }, clock()) } catch (err) {
-        if (err.message !== 'not_available') throw err
+        // The box became unavailable, protected or panic-locked while the
+        // session started: back to the guest's choice, nothing invited.
+        if (!['not_available', 'protected_device', 'account_locked'].includes(err.message)) throw err
+        code = err.message === 'not_available' ? code : err.message
         out = null
       }
       if (out) { afterAccepted(ctx, who, cur, out); return 'started' }

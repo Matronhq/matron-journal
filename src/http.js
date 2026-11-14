@@ -56,13 +56,14 @@ import { handleTransferRoute } from './transfers-http.js'
 import { handleTtsRoute } from './tts-http.js'
 import { answerChatAsk, answerSpawnAsk } from './consent-answer.js'
 import { coordinatorFor } from './coordinator.js'
-import { json, readBody } from './http-body.js'
+import { json, readBody, AFTER_BODY } from './http-body.js'
 import { parsePushKey } from './push-box.js'
 import { convoStatuses } from './convo-status.js'
 import { makeAlertsHandler } from './alerts-http.js'
 import { handleSummariseRoute } from './summarise-http.js'
 import { securityLogFor, withRequestScope, handleSecurityFeed, deviceTarget, keyTarget } from './security-log.js'
-import { handlePanic, panicLock, lockedBody, signOutLockedClient } from './panic.js'
+import { panicLock, lockedBody, signOutLockedClient } from './panic.js'
+import { handlePanic } from './panic-lock.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
 // card's `from_name` gets. NULL stays null rather than collapsing to '' —
@@ -366,7 +367,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       if (handleSecurityFeed({ db, feed: securityFeed, json, rateLimiter }, req, res, url, { rejectEarly })) return
       // The panic lock (src/panic.js): its own Bearer token, bound to one
       // account, that can only lock it and read whether it is locked. Off, 404.
-      if (await handlePanic({ db, hub, panic, json, rateLimiter, securityLog, signInTickets }, req, res, url, { rejectEarly })) return
+      if (await handlePanic({ db, hub, panic, json, rateLimiter, securityLog, signInTickets, mediaDir }, req, res, url, { rejectEarly })) return
       const who = bearer(req) && authToken(db, bearer(req), { now: clientIdleClock(), clientIdleMs })
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       // A client token of a panic-locked account still working (a race, or
@@ -378,6 +379,14 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         if (lock) {
           signOutLockedClient({ db, hub, securityLog }, who.userId, who.deviceId, lock)
           return rejectEarly(req, res, 423, lockedBody(lock))
+        }
+        // Locked while the body was on its way: refused the same way once it
+        // has arrived, before the route acts on it (src/http-body.js).
+        req[AFTER_BODY] = () => {
+          const late = lockOf(who.userId)
+          if (!late) return
+          signOutLockedClient({ db, hub, securityLog }, who.userId, who.deviceId, late)
+          throw Object.assign(new Error('account_locked'), { statusCode: 423, body: lockedBody(late) })
         }
       }
       // The tracker's own surface (src/items-http.js) — mounted first so
@@ -1361,6 +1370,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         return json(res, 413, { error: 'too_large' })
       }
       if (e.statusCode === 400) return json(res, 400, { error: 'bad_request' })
+      if (e.statusCode === 423) return json(res, 423, e.body)
       // Never leak e.message to the client (could echo internals like a SQL
       // error) — log it server-side instead.
       console.error('http handler error:', e)
