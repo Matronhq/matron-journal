@@ -12,13 +12,14 @@ import { runOffload, runExpireLogs } from '../src/retention.js'
 import { listAwaiting, answerParkedInvite } from '../src/participants.js'
 import { closeChatConsentItem } from '../src/consent-items.js'
 import { normaliseEmail, setUserEmail } from '../src/password-reset.js'
-import { setTransferConsentEnabled } from '../src/consent.js'
+import { setTransferConsentEnabled, getTransferConsentEnabled } from '../src/consent.js'
 import { restampConsentItems } from '../src/consent-subject.js'
 import { announceKey, announceRestamped, asUser } from '../src/approval-keys-http.js'
 import { activeKeysOfDevice } from '../src/approval-keys.js'
 import { resolveFederationConfig, storedFederationKeyInfo } from '../src/federation-identity.js'
 import { formatFingerprint } from '../src/federation-envelope.js'
 import { makeTokenBox } from '../src/token-box.js'
+import { makeSecurityLog, deviceTarget, keyTarget, boxTarget } from '../src/security-log.js'
 import {
   disableTwoFactor, twoFactorState, isTwoFactorRequired, setTwoFactorRequired, isTwoFactorExempt, setTwoFactorExempt,
 } from '../src/two-factor.js'
@@ -153,6 +154,12 @@ const BY_ADMIN = 'by the journal administrator'
 
 export async function runAdmin(db, argv, deps = {}) {
   const renderPng = deps.renderPng ?? ((uri) => QRCode.toBuffer(uri, { type: 'png', scale: 8 }))
+  // Security events (src/security-log.js) for what the host does to an
+  // account: in the database (the journal's feed serves them) and in
+  // MATRON_SECURITY_LOG when set, never on this command's own output.
+  // No device and no address: decided by the host's administrator.
+  const securityLog = deps.securityLog ?? makeSecurityLog({ db, out: () => {} })
+  const adminEvent = (userId, event, target = null) => securityLog.record(userId, event, { deviceId: null, sourceIp: null, target, decidedBy: 'admin_cli' })
   const [a, b] = argv
   if (a === 'user' && b === 'add') {
     const name = argv[2]
@@ -166,6 +173,8 @@ export async function runAdmin(db, argv, deps = {}) {
     const pw = await resolvePassword(argv, deps)
     if (!name || !pw) throw new Error(USAGE)
     await setPassword(db, name, pw)
+    const changed = db.prepare('SELECT id FROM users WHERE name=?').get(name)
+    if (changed) adminEvent(changed.id, 'password_changed')
     return `password updated for ${name}`
   }
   if (a === 'user' && b === 'admin') {
@@ -208,9 +217,9 @@ export async function runAdmin(db, argv, deps = {}) {
     // The exemption is the operator's choice about the requirement, not
     // part of the factor, so a reset leaves it as it was.
     const exemptNote = isTwoFactorExempt(db, user.id) ? ' (still exempt from the requirement)' : ''
-    return disableTwoFactor(db, user.id)
-      ? `two-factor turned off for ${name}; they sign in with their password and can set it up again${exemptNote}`
-      : `${name} did not have two-factor on${exemptNote}`
+    if (!disableTwoFactor(db, user.id)) return `${name} did not have two-factor on${exemptNote}`
+    adminEvent(user.id, 'two_factor_changed', 'reset')
+    return `two-factor turned off for ${name}; they sign in with their password and can set it up again${exemptNote}`
   }
   // An account (a review or demo login, say) that keeps signing in with its
   // password while two-factor is required for everyone else. It waives the
@@ -314,7 +323,8 @@ export async function runAdmin(db, argv, deps = {}) {
     if (!username || !agentName) throw new Error(USAGE)
     const user = db.prepare('SELECT id FROM users WHERE name=?').get(username)
     if (!user) throw new Error(`no such user: ${username}`)
-    const { token } = createAgent(db, user.id, agentName)
+    const { token, deviceId } = createAgent(db, user.id, agentName)
+    adminEvent(user.id, 'bridge_paired', deviceTarget(deviceId))
     return `agent ${agentName} token: ${token}\n(store in the bridge credentials file; it is not shown again)`
   }
   if (a === 'device' && b === 'list') {
@@ -344,7 +354,11 @@ export async function runAdmin(db, argv, deps = {}) {
     // removal is announced, as from the device list in the apps.
     const keys = activeKeysOfDevice(db, existing.user_id, deviceId)
     revokeDevice(db, deviceId)
-    for (const key of keys) announceKey(cliCtx(db), existing.user_id, keyRowOf(db, key.key_id), { added: false, how: BY_ADMIN })
+    adminEvent(existing.user_id, 'device_revoked', deviceTarget(deviceId))
+    for (const key of keys) {
+      adminEvent(existing.user_id, 'approval_key_revoked', keyTarget(key.key_id))
+      announceKey(cliCtx(db), existing.user_id, keyRowOf(db, key.key_id), { added: false, how: BY_ADMIN })
+    }
     return `device ${deviceId} revoked`
   }
   // Approval keys from the host. A key outlives its device's sign-in
@@ -376,7 +390,10 @@ export async function runAdmin(db, argv, deps = {}) {
     db.transaction(() => {
       for (const k of keys) db.prepare('UPDATE approval_keys SET revoked_at=? WHERE id=? AND revoked_at IS NULL').run(now, k.id)
     })()
-    for (const k of keys) announceKey(cliCtx(db), user.id, keyRowOf(db, k.key_id), { added: false, how: BY_ADMIN })
+    for (const k of keys) {
+      adminEvent(user.id, 'approval_key_revoked', keyTarget(k.key_id))
+      announceKey(cliCtx(db), user.id, keyRowOf(db, k.key_id), { added: false, how: BY_ADMIN })
+    }
     return all
       ? `revoked ${keys.length} approval key${keys.length === 1 ? '' : 's'} for ${username}`
       : `revoked approval key ${keys[0].key_id.slice(0, 8)} (${keys[0].name}) for ${username}`
@@ -428,11 +445,15 @@ export async function runAdmin(db, argv, deps = {}) {
     if (!Number.isInteger(deviceId) || !['on', 'off'].includes(mode)) throw new Error(USAGE)
     const existing = db.prepare('SELECT id, user_id FROM devices WHERE id=?').get(deviceId)
     if (!existing) throw new Error(`no such device: ${deviceId}`)
-    const restamped = db.transaction(() => {
+    // "Did it change" is read inside the write transaction (the write lock
+    // is taken first), so a concurrent server change cannot skew it.
+    const { changed, restamped } = db.transaction(() => {
+      const was = !!db.prepare('SELECT protected FROM devices WHERE id=?').get(deviceId)?.protected
       setDeviceProtected(db, deviceId, mode === 'on')
-      return restampConsentItems(db, existing.user_id)
-    })()
+      return { changed: was !== (mode === 'on'), restamped: restampConsentItems(db, existing.user_id) }
+    }).immediate()
     announceRestamped(cliCtx(db), asUser(existing.user_id), restamped)
+    if (changed) adminEvent(existing.user_id, 'device_protection_changed', `${deviceTarget(deviceId)}:${mode}`)
     return mode === 'on'
       ? `device ${deviceId} protected — its consent asks are the user's alone, signed once the account has an approval key`
       : `device ${deviceId} not protected`
@@ -447,7 +468,12 @@ export async function runAdmin(db, argv, deps = {}) {
     if (!username || !['on', 'off'].includes(mode)) throw new Error(USAGE)
     const user = db.prepare('SELECT id FROM users WHERE name=?').get(username)
     if (!user) throw new Error(`no such user: ${username}`)
-    setTransferConsentEnabled(db, user.id, mode === 'on')
+    const changed = db.transaction(() => {
+      const was = getTransferConsentEnabled(db, user.id)
+      setTransferConsentEnabled(db, user.id, mode === 'on')
+      return was !== (mode === 'on')
+    }).immediate()
+    if (changed) adminEvent(user.id, 'consent_switch_changed', 'transfers')
     return mode === 'on'
       ? `${username}: the Coordinator may approve file transfers, including ones it had another session send (flagged files and user-only boxes stay the user's)`
       : `${username}: file transfers the Coordinator had another session send are the user's to approve again`
@@ -672,6 +698,7 @@ export async function runAdmin(db, argv, deps = {}) {
     if (!answerParkedInvite(db, { convoId: roomId, agentDeviceId: deviceId, approve: true })) {
       throw new Error(`room ${roomId} device ${deviceId} is not awaiting approval (already answered, or never parked)`)
     }
+    adminEvent(user.id, 'chat_approved', boxTarget(db, deviceId))
     // No hub here: the tracker mirror is closed in the table; live clients
     // see it at their next /items (spec: 2026-09-22 consent-items).
     closeChatConsentItem({ db, hub: null }, roomId, deviceId, { outcome: 'approved' })

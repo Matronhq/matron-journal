@@ -10,6 +10,7 @@
 import crypto from 'node:crypto'
 import { parseStatement, verifySignature } from './approvals.js'
 import { signOutOwnedDevice } from './auth.js'
+import { securityLogFor, deviceTarget } from './security-log.js'
 
 export const ALG = 'ES256'
 export const NONCE_TTL_MS = 5 * 60000
@@ -128,7 +129,12 @@ export function recordApprovalFailure(db, who, reason, now = Date.now()) {
     signOutOwnedDevice(db, who.userId, device.id)
     return { device: { id: device.id, name: device.name }, keys, reasons: counted.map((r) => r.reason) }
   })()
-  if (out) signedOutListeners.get(db)?.(who.userId, out)
+  if (out) {
+    securityLogFor(db).record(who.userId, 'device_signed_out_bad_signatures', {
+      deviceId: out.device.id, deviceName: out.device.name, target: deviceTarget(out.device.id), decidedBy: 'journal',
+    }, { evenIfRolledBack: true })
+    signedOutListeners.get(db)?.(who.userId, out)
+  }
   return out
 }
 
@@ -140,10 +146,13 @@ export function recordApprovalFailure(db, who, reason, now = Date.now()) {
 // sqlite3's are synchronous) has committed or rolled back, before any I/O:
 // the refusal is answered first, the device is signed out before the
 // caller's next request can be read. Outside one it is recorded at once.
+// The security log's approval_invalid line goes out first, from the same
+// place: the device is still there to be named (the failure may sign it out).
 function noteInvalid(ctx, who, reason) {
   const { db } = ctx
   const now = ctx.now ?? Date.now()
   const run = () => {
+    securityLogFor(db).record(who.userId, 'approval_invalid', { deviceId: who.deviceId ?? null, target: reason }, { evenIfRolledBack: true })
     try {
       recordApprovalFailure(db, who, reason, now)
     } catch (err) {

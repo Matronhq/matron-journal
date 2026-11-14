@@ -5,6 +5,7 @@ import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
 import { installApprovalLockdown } from './approval-keys-http.js'
+import { makeSecurityLog, installSecurityLog, resolveSecurityFeed, sweepSecurityEvents } from './security-log.js'
 import { makeLoginGuard, makeRateLimiter, DEFAULT_CLIENT_IDLE_DAYS, DEFAULT_CLIENT_IDLE_MS } from './auth.js'
 import { makeTwoFactorTickets, isTwoFactorRequired } from './two-factor.js'
 import { makeHttpHandler } from './http.js'
@@ -332,6 +333,14 @@ function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionInterval
     } catch (err) {
       console.error('retention: transfer expiry run failed', err)
     }
+    yield
+    // Security events past their 30 days (src/security-log.js), always on
+    // like the transfers: the per-account numbers stay, never reused.
+    try {
+      sweepSecurityEvents(db)
+    } catch (err) {
+      console.error('retention: security event sweep failed', err)
+    }
   }
   // The first pass waits retentionInitialDelayMs (a restart is when every
   // client reconnects at once); 0 keeps the synchronous run-at-boot for
@@ -530,6 +539,12 @@ export function startServer({
   // Alertmanager webhook (src/alerts-http.js): {token, username}. The
   // option is the test seam; env otherwise. Off unless both are usable.
   alertWebhook,
+  // Security events (src/security-log.js): `securityLog` is the test seam
+  // for the log's sinks, {out?, file?, now?} (MATRON_SECURITY_LOG
+  // otherwise); `securityFeed` for GET /security-events, {token, account}
+  // or null for off (MATRON_SECURITY_FEED_TOKEN, MATRON_SECURITY_FEED_ACCOUNT
+  // otherwise).
+  securityLog, securityFeed,
   // POST /summarise (src/summarise.js): the test seam; `null` forces it
   // off. Undefined resolves from MATRON_SUMMARY_ANTHROPIC_KEY(_FILE).
   summariser,
@@ -647,6 +662,11 @@ export function startServer({
   const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient, backgroundWakeMs: BACKGROUND_WAKE_MS, clientIdleMs, now: clientIdleClock })
   // A device signed out for invalid approval signatures: its notice and push.
   installApprovalLockdown({ db, hub, pushPipeline })
+  // The security event log, one per journal: handed to the HTTP and
+  // WebSocket handlers, and installed for the code that has only the
+  // database (the approval guard, the lockdown).
+  const resolvedSecurityLog = makeSecurityLog({ db, ...(securityLog || {}) })
+  installSecurityLog(db, resolvedSecurityLog)
   // A consent-card push whose 30 s hold a restart swallowed still goes out.
   try { pushPipeline.resumeHeldConsent() } catch (err) { console.error('push: consent resume failed', err) }
   // Voice notes are transcribed here when the journal has a transcriber: a
@@ -740,6 +760,13 @@ export function startServer({
     username: process.env.MATRON_ALERT_WEBHOOK_USER || null,
   }
   if (resolvedAlertWebhook) warnAlertWebhookConfig(db, resolvedAlertWebhook)
+  const resolvedSecurityFeed = securityFeed !== undefined ? (securityFeed && resolveSecurityFeed(securityFeed)) : resolveSecurityFeed({
+    token: process.env.MATRON_SECURITY_FEED_TOKEN || null,
+    account: process.env.MATRON_SECURITY_FEED_ACCOUNT || null,
+  })
+  if (resolvedSecurityFeed && !db.prepare('SELECT 1 FROM users WHERE name=?').get(resolvedSecurityFeed.account)) {
+    console.warn('security feed: MATRON_SECURITY_FEED_ACCOUNT names no user; GET /security-events answers 404 until it exists')
+  }
   const resolvedSummariser = summariser !== undefined ? summariser : makeConfiguredSummariser()
   const resolvedMailer = mailer !== undefined ? mailer : makeConfiguredMailer()
   const approvalBaseUrl = parsePublicUrl(publicUrl !== undefined ? publicUrl : process.env.MATRON_PUBLIC_URL)
@@ -766,7 +793,7 @@ export function startServer({
     agentCommentLimiter: makeAgentCommentLimiter({ now: agentCommentClock }),
     github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, federationGrants, federationContribute, federationMedia, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
-    journalHost, clientIdleMs, clientIdleClock,
+    journalHost, clientIdleMs, clientIdleClock, securityLog: resolvedSecurityLog, securityFeed: resolvedSecurityFeed,
   })))
   // A reverse proxy in front of the journal keeps its connections to it open
   // and reuses them. Node closes an idle connection after 5 s by default,
@@ -788,7 +815,7 @@ export function startServer({
     // spawnStartTimeoutMs rides along so the orphan sweep's TTL can never
     // undercut a configured start timeout (attachWs derives the TTL).
     broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, sessionControlTimeoutMs, waker: resolvedWaker,
-    journalHost, clientIdleMs, clientIdleClock,
+    journalHost, clientIdleMs, clientIdleClock, securityLog: resolvedSecurityLog,
   })
   let retentionInterval = null
   let walCheckpointInterval = null

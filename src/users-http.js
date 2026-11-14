@@ -12,6 +12,7 @@ import { deleteGithubAccount } from './github-accounts.js'
 import { disableTwoFactor } from './two-factor.js'
 import { normaliseEmail, setUserEmail } from './password-reset.js'
 import { guardedAccountAction, hasActiveKey, refuse, boundedSubject, sha256Hex } from './approval-keys.js'
+import { securityLogOf } from './security-log.js'
 
 // A journal name is a URL path segment in shareable links (/u/<name>/<n>)
 // and a sender prefix (user:<name>), so it is ASCII, starts alphanumeric,
@@ -60,6 +61,11 @@ function adminAccountAction(ctx, who, body, target, subject, write) {
     write,
   })
 }
+
+// The web admin's change to an account, recorded on that account once it has
+// committed (the security log), naming the admin's own device.
+const recordAdmin = (ctx, who, target, event, fields = {}) =>
+  securityLogOf(ctx).record(target.id, event, { deviceId: who.deviceId, deviceName: who.name, decidedBy: 'admin', ...fields })
 
 // guardedAccountAction's answer as the response: true when it refused.
 const refused = (res, g) => { if (g.ok) return false; json(res, g.status, g.body); return true }
@@ -147,6 +153,7 @@ export async function handleUsersRoute(ctx, req, res, url, who) {
       if (!db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hash, fresh.id).changes) refuse(404, { error: 'not_found' })
     })
     if (refused(res, g)) return true
+    recordAdmin(ctx, who, fresh, 'password_changed')
     json(res, 200, { ok: true })
     return true
   }
@@ -183,6 +190,7 @@ export async function handleUsersRoute(ctx, req, res, url, who) {
       if (!disableTwoFactor(db, fresh.id)) refuse(404, { error: 'not_found' })
     })
     if (refused(res, g)) return true
+    recordAdmin(ctx, who, fresh, 'two_factor_changed', { target: 'reset' })
     json(res, 200, { ok: true })
     return true
   }
@@ -197,7 +205,7 @@ export async function handleUsersRoute(ctx, req, res, url, who) {
     // With a db-backed link store the code's row is written in the guarded
     // transaction.
     const g = adminAccountAction(ctx, who, body, fresh, { op: 'admin_link_code', user: fresh.name }, () => {
-      const l = links.startPreapproved(fresh.id, ttl_seconds !== undefined ? { ttlMs: ttl_seconds * 1000 } : {})
+      const l = links.startPreapproved(fresh.id, { ...(ttl_seconds !== undefined ? { ttlMs: ttl_seconds * 1000 } : {}), by: 'admin' })
       if (!l) refuse(429, { error: 'rate_limited' })
       return l
     })

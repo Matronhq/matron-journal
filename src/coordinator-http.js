@@ -10,6 +10,7 @@ import { COORDINATOR_EVENT_TYPE, coordinatorFor, setCoordinatorConvoId } from '.
 import { getConsentEnabled, setConsentEnabled, getTransferConsentEnabled, setTransferConsentEnabled } from './consent.js'
 import { seedRoutines } from './routines.js'
 import { guardedAccountAction, hasActiveKey, refuse, boundedSubject } from './approval-keys.js'
+import { securityLogOf, convoTarget } from './security-log.js'
 
 export async function handleCoordinatorRoute(ctx, req, res, url, who) {
   if (url.pathname !== '/coordinator') return false
@@ -54,6 +55,8 @@ export async function handleCoordinatorRoute(ctx, req, res, url, who) {
   // approval's nonce commit or roll back together.
   const appended = []
   let out = null
+  // Which switches the write actually turned (the security log).
+  const switched = []
   const g = guardedAccountAction({ db, journalHost }, who, body, subject, {
     check: () => {
       if (changes.length > 1 && hasActiveKey(db, who.userId)) refuse(400, { error: 'bad_request', detail: 'one_change_per_approval' })
@@ -72,11 +75,21 @@ export async function handleCoordinatorRoute(ctx, req, res, url, who) {
           throw err
         }
       }
-      if ('consent' in body) setConsentEnabled(db, who.userId, body.consent, Date.now())
-      if ('transfer_consent' in body) setTransferConsentEnabled(db, who.userId, body.transfer_consent, Date.now())
+      if ('consent' in body) {
+        if (getConsentEnabled(db, who.userId) !== body.consent) switched.push('spawns')
+        setConsentEnabled(db, who.userId, body.consent, Date.now())
+      }
+      if ('transfer_consent' in body) {
+        if (getTransferConsentEnabled(db, who.userId) !== body.transfer_consent) switched.push('transfers')
+        setTransferConsentEnabled(db, who.userId, body.transfer_consent, Date.now())
+      }
     },
   })
   if (!g.ok) { json(res, g.status, g.body); return true }
+  // Committed: each real change, once.
+  const record = (event, target) => securityLogOf(ctx).record(who.userId, event, { deviceId: who.deviceId, deviceName: who.name, target, decidedBy: 'user' })
+  if (out?.changed) record('coordinator_changed', out.current == null ? null : convoTarget(out.current))
+  for (const which of switched) record('consent_switch_changed', which)
   if (!out) {
     json(res, 200, view())
     return true

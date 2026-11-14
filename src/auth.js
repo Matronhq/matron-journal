@@ -4,6 +4,15 @@ import argon2 from 'argon2'
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex')
 const newToken = () => crypto.randomBytes(32).toString('hex')
 
+// A shared-secret Bearer token (not a device token: the alerts webhook's,
+// the security feed's) against the configured one. Both sides hashed first:
+// equal-length buffers for timingSafeEqual, and no early return that would
+// leak the configured token's length.
+const digest = (s) => crypto.createHash('sha256').update(String(s)).digest()
+export function sharedTokenMatches(expected, given) {
+  return crypto.timingSafeEqual(digest(expected), digest(given ?? ''))
+}
+
 export async function createUser(db, name, password) {
   const hash = await argon2.hash(password, { type: argon2.argon2id })
   const r = db.prepare(
@@ -63,10 +72,11 @@ export function applyPasswordChange(db, userId, { oldHash, newHash }, { deviceId
     if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(deviceId, userId)) return { ok: false, revoked: true }
     const swapped = db.prepare('UPDATE users SET password_hash=? WHERE id=? AND password_hash=?').run(newHash, userId, oldHash).changes
     if (!swapped) return { ok: false }
-    const signedOut = signOutOthers
-      ? db.prepare("DELETE FROM devices WHERE user_id=? AND kind='client' AND id<>?").run(userId, deviceId).changes
-      : 0
-    return { ok: true, signedOut }
+    // The ids too, for the security log's device_revoked per device.
+    const signedOutIds = signOutOthers
+      ? db.prepare("DELETE FROM devices WHERE user_id=? AND kind='client' AND id<>? RETURNING id").all(userId, deviceId).map((r) => r.id).sort((a, b) => a - b)
+      : []
+    return { ok: true, signedOut: signedOutIds.length, signedOutIds }
   })()
 }
 

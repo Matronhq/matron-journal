@@ -15,7 +15,8 @@ import { CONSENT_LABEL, codeSpan, fenced } from './consent-items.js'
 import { sanitizePeerText, PEER_NAME_CAP, plainText as plain } from './peer-text.js'
 import { appendAndBroadcast } from './journal.js'
 import { participantConvoIds } from './participants.js'
-import { recordAndAnnounce, guardedApprove, CONFLICT } from './consent-answer.js'
+import { recordAndAnnounce, recordApproved, guardedApprove, CONFLICT } from './consent-answer.js'
+import { transferTarget } from './security-log.js'
 import { wakeIfOffline } from './wake.js'
 import { consentStepUp, consentApproval, approvalColumn, storedApproval } from './consent-subject.js'
 import { getTransfer, setTransferState, deleteTransferFiles, forgetChunks, transferRecipients, isTransferId, parseFindings } from './transfers.js'
@@ -278,6 +279,7 @@ export function answerTransferAsk(ctx, { userId, transferId, decision, decidedBy
     },
     (signed) => setTransferState(db, transferId, { consent: 'approved', ...stamp, approved_at: now, ...(signed ? { approval: approvalColumn(signed) } : {}) }))
   if (refused) return refused
+  recordApproved(ctx, userId, 'transfer_approved', decidedBy, transferTarget(transferId))
   closeTransferConsentItem({ db, hub }, transferId, { outcome: 'approved', decidedBy })
   recordAndAnnounce({ db, hub }, { userId, kind: 'transfer', askId: transferId, decision, decidedBy, convoId: row.from_convo_id, payload: { transfer_id: transferId } })
   console.log(`journal: transfer approved id=${transferId} by=${stamp.decided_by}`)

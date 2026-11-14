@@ -29,8 +29,8 @@
 // something a retry storm fixes. The 202 body says which:
 // {accepted:true}, {delivered:false, reason:'no_coordinator'|'busy'}.
 // The outcome of an accepted delivery is logged (one line), never returned.
-import crypto from 'node:crypto'
 import { json, readBody } from './http-body.js'
+import { sharedTokenMatches } from './auth.js'
 import { coordinatorDevice } from './consent.js'
 import { isProtectedDevice } from './consent-subject.js'
 import { wakeIfOffline } from './wake.js'
@@ -43,13 +43,8 @@ export const ALERT_BODY_MAX = 256 * 1024
 export const ALERT_MAX_INFLIGHT = 4
 export const ALERT_FROM_NAME = 'Alertmanager'
 
-const digest = (s) => crypto.createHash('sha256').update(String(s)).digest()
-
-// Both sides hashed first: equal-length buffers for timingSafeEqual, and no
-// early return that would leak the configured token's length.
-export function alertTokenMatches(expected, given) {
-  return crypto.timingSafeEqual(digest(expected), digest(given ?? ''))
-}
+// The shared-secret compare (auth.js), also the security feed's.
+export const alertTokenMatches = sharedTokenMatches
 
 // The route is on only with a long-enough token AND a username; the user
 // row itself is looked up per request (a user created after boot works, a

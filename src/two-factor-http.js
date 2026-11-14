@@ -18,6 +18,7 @@ import { json, readBody } from './http-body.js'
 import { verifyUserPassword, createClientDevice } from './auth.js'
 import { isAdmin } from './users-http.js'
 import { guardedAccountAction, hasActiveKey, refuse } from './approval-keys.js'
+import { securityLogOf, deviceTarget } from './security-log.js'
 import {
   twoFactorState, isTwoFactorEnabled, beginSetup, finishSetup, verifySecondFactor, disableTwoFactor,
   regenerateRecoveryCodes, isTwoFactorRequired, setTwoFactorRequired, isTwoFactorExempt, otpauthUri,
@@ -45,6 +46,13 @@ const setupBody = (req, username, secret) => ({
 const deviceBody = (d, userId) => ({ token: d.token, device_id: d.deviceId, user_id: userId })
 
 const unavailable = (res) => json(res, 503, { error: 'two_factor_unavailable' })
+
+// A two-factor change, once it has committed (the security log): from a
+// signed-in device, or (no device yet) at sign-in.
+const recordChange = (ctx, userId, action, who = null) =>
+  securityLogOf(ctx).record(userId, 'two_factor_changed', { deviceId: who?.deviceId ?? null, deviceName: who?.name ?? null, target: action, decidedBy: 'user' })
+const recordSignIn = (ctx, userId, d) =>
+  securityLogOf(ctx).record(userId, 'client_signin', { deviceId: d.deviceId, target: deviceTarget(d.deviceId), decidedBy: 'user' })
 
 // Two-factor can only be required when it can be set up: without the token
 // box key nobody could enrol, and requiring it would lock everyone out.
@@ -91,6 +99,7 @@ export async function handleTwoFactorLogin(ctx, req, res, url, { rejectEarly }) 
   if (path === '/login/2fa/setup') {
     const s = beginSetup(db, tokenBox, t.userId)
     if (!s.ok) { unavailable(res); return true }
+    recordChange(ctx, t.userId, 'setup')
     json(res, 200, setupBody(req, t.username, s.secret))
     return true
   }
@@ -108,7 +117,9 @@ export async function handleTwoFactorLogin(ctx, req, res, url, { rejectEarly }) 
     }
     tickets.consume(ticket)
     loginGuard.ok(t.username)
+    recordChange(ctx, t.userId, 'enable')
     const d = createClientDevice(db, t.userId, t.deviceName)
+    recordSignIn(ctx, t.userId, d)
     json(res, 200, { ...deviceBody(d, t.userId), recovery_codes: r.recoveryCodes })
     return true
   }
@@ -129,6 +140,7 @@ export async function handleTwoFactorLogin(ctx, req, res, url, { rejectEarly }) 
   tickets.consume(ticket)
   loginGuard.ok(t.username)
   const d = createClientDevice(db, t.userId, t.deviceName)
+  recordSignIn(ctx, t.userId, d)
   const left = twoFactorState(db, t.userId).recoveryCodesLeft
   json(res, 200, { ...deviceBody(d, t.userId), used_recovery_code: v.method === 'recovery', recovery_codes_left: left })
   return true
@@ -236,6 +248,7 @@ export async function handleTwoFactorRoute(ctx, req, res, url, who) {
       },
     })
     if (!g.ok) return true
+    recordChange(ctx, who.userId, 'setup', who)
     const user = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId)
     json(res, 200, setupBody(req, user.name, g.value))
     return true
@@ -265,11 +278,14 @@ export async function handleTwoFactorRoute(ctx, req, res, url, who) {
       // signed in with the password alone. Boxes (agent devices) are never
       // touched — they were paired from a signed-in client, not a password.
       write: () => (sign_out_others
-        ? db.prepare("DELETE FROM devices WHERE user_id=? AND kind='client' AND id<>?").run(who.userId, who.deviceId).changes
-        : 0),
+        ? db.prepare("DELETE FROM devices WHERE user_id=? AND kind='client' AND id<>? RETURNING id").all(who.userId, who.deviceId).map((d) => d.id).sort((a, b) => a - b)
+        : []),
     })
     if (!g.ok) return true
-    json(res, 200, { recovery_codes: r.recoveryCodes, signed_out: g.value })
+    recordChange(ctx, who.userId, 'enable', who)
+    // Each client it signed out (the security log).
+    for (const id of g.value) securityLogOf(ctx).record(who.userId, 'device_revoked', { deviceId: who.deviceId, deviceName: who.name, target: deviceTarget(id), decidedBy: 'user' })
+    json(res, 200, { recovery_codes: r.recoveryCodes, signed_out: g.value.length })
     return true
   }
 
@@ -281,6 +297,7 @@ export async function handleTwoFactorRoute(ctx, req, res, url, who) {
     if (!(await confirmPassword(ctx, res, who, password))) return true
     const g = guardedTwoFactor(ctx, res, who, body, 'disable', { check: codeCheck(ctx, who, code), write: () => disableTwoFactor(db, who.userId) })
     if (!g.ok) return true
+    recordChange(ctx, who.userId, 'disable', who)
     json(res, 200, { ok: true })
     return true
   }
@@ -292,6 +309,7 @@ export async function handleTwoFactorRoute(ctx, req, res, url, who) {
     if (!(await confirmPassword(ctx, res, who, password))) return true
     const g = guardedTwoFactor(ctx, res, who, body, 'recovery_codes', { check: codeCheck(ctx, who, code), write: () => regenerateRecoveryCodes(db, who.userId) })
     if (!g.ok) return true
+    recordChange(ctx, who.userId, 'recovery_codes', who)
     json(res, 200, { recovery_codes: g.value })
     return true
   }
