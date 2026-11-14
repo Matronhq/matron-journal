@@ -155,7 +155,8 @@ function readName(res, raw) {
   return name
 }
 
-// The password-and-TOTP path (bootstrap enrolment, revoke). Two-factor must
+// The password-and-TOTP path (bootstrap enrolment, revoke, and revoking
+// another device, http.js POST /devices/:id/revoke). Two-factor must
 // be on and the code a TOTP code: a recovery code does not count, and is
 // refused before it could be spent. Wrong passwords and codes count against
 // the username's lockout (two-factor-http.js confirmIdentity).
@@ -172,7 +173,7 @@ function readName(res, raw) {
 // requests sent together cannot each get a guess while the first ones are
 // still being hashed. `ctx.clock` is the test seam for the time.
 const ownQueue = makeKeyedQueue()
-function confirmPasswordAndTotp(ctx, res, who, { password, code }) {
+export function confirmPasswordAndTotp(ctx, res, who, { password, code }) {
   const clock = ctx.clock ?? Date.now
   return (ctx.passwordChecks ?? ownQueue).run(who.userId, async () => {
     if (enrolmentLocked(ctx, res, who, clock())) return false

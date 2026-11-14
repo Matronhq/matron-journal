@@ -604,6 +604,50 @@ test('with a key on the account, revoking another device is signed; unsigned cha
   assert.equal(s.db.prepare('SELECT 1 FROM devices WHERE id=?').get(w.box.deviceId), undefined)
 })
 
+test('with a key on the account, another device is revoked with the password and a TOTP code too: the stolen keyed phone from a keyless laptop', async (t) => {
+  const w = await world(t)
+  const { s, alice } = w
+  const laptop = signIn(s, alice.id, 'laptop')
+  const revoke = (body) => s.http(`/devices/${w.deviceId}/revoke`, { method: 'POST', token: laptop.token, body })
+  const wrong = () => (totpCode(s, alice.id, w.secret) === '000000' ? '000001' : '000000')
+  // A recovery code is refused before the password is checked, and guesses nothing.
+  const rec = await revoke({ password: TEST_PASSWORD, code: 'abcd-efgh-ijkl-mnop' })
+  assert.deepEqual([rec.status, rec.json], [400, { error: 'totp_required' }])
+  assert.equal((await revoke({ password: 'wrong-password', code: totpCode(s, alice.id, w.secret) })).status, 401)
+  assert.equal(await signedIn(s, w.token), true)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM approval_enrol_failures WHERE user_id=?').get(alice.id).n, 1, 'a wrong password counts towards the lock')
+  // Not owned is the same 404, before the password.
+  const bob = await createUser(s.db, 'bob', 'pw')
+  const bobBox = createAgent(s.db, bob.id, 'box-c')
+  assert.equal((await s.http(`/devices/${bobBox.deviceId}/revoke`, { method: 'POST', token: laptop.token, body: { password: TEST_PASSWORD, code: wrong() } })).status, 404)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM approval_enrol_failures WHERE user_id=?').get(alice.id).n, 1)
+  const ok = await revoke({ password: TEST_PASSWORD, code: totpCode(s, alice.id, w.secret) })
+  assert.deepEqual([ok.status, ok.json], [200, { ok: true }])
+  assert.equal(await signedIn(s, w.token), false)
+  assert.ok(s.db.prepare('SELECT revoked_at FROM approval_keys WHERE key_id=?').get(w.key.keyId).revoked_at > 0)
+  assert.equal(hasActiveKey(s.db, alice.id), false)
+  assert.ok(notices(s, alice.id).some((n) => n.title === `Approval key removed: phone ${w.key.keyId.slice(0, 8)}`))
+})
+
+test('a password-and-code device revoke shares the enrolment lock: wrong codes count, and it is refused while locked', async (t) => {
+  const w = await world(t)
+  const { s, alice } = w
+  const laptop = signIn(s, alice.id, 'laptop')
+  const revoke = (code) => s.http(`/devices/${w.deviceId}/revoke`, { method: 'POST', token: laptop.token, body: { password: TEST_PASSWORD, code } })
+  const wrong = () => (totpCode(s, alice.id, w.secret) === '000000' ? '000001' : '000000')
+  for (let i = 0; i < 3; i++) assert.equal((await revoke(wrong())).status, 403)
+  const r = await revoke(totpCode(s, alice.id, w.secret))
+  assert.deepEqual([r.status, r.json.error], [429, 'enrolment_locked'])
+  assert.ok(r.json.retry_at > Date.now())
+  assert.equal(await signedIn(s, w.token), true)
+  // The same lock as the key routes' password path.
+  const k = await s.http(`/approval-keys/${w.key.keyId}/revoke`, { method: 'POST', token: laptop.token, body: { password: TEST_PASSWORD, code: totpCode(s, alice.id, w.secret) } })
+  assert.equal(k.status, 429)
+  // A signed revoke is not the password path.
+  const approval = await signAccount(s, { token: w.token, key: w.key, subject: { op: 'revoke_device', device: String(laptop.deviceId) } })
+  assert.equal((await s.http(`/devices/${laptop.deviceId}/revoke`, { method: 'POST', token: w.token, body: { approval } })).status, 200)
+})
+
 test('signing yourself out needs no signature and detaches your key: the account keeps it', async (t) => {
   const w = await world(t)
   const { s, alice } = w

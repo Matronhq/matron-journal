@@ -34,7 +34,7 @@ import { handleLookupRoute } from './lookup-http.js'
 import { handleUsersRoute } from './users-http.js'
 import { handlePasswordResetRoute, handleAccountEmailRoute } from './password-reset-http.js'
 import { handleTwoFactorLogin, handleTwoFactorRoute, twoFactorRequiredNow } from './two-factor-http.js'
-import { handleApprovalKeysRoute, announceKey } from './approval-keys-http.js'
+import { handleApprovalKeysRoute, announceKey, confirmPasswordAndTotp } from './approval-keys-http.js'
 import { activeKeysOfDevice, guardedAccountAction, hasActiveKey, refuse } from './approval-keys.js'
 import { isTwoFactorEnabled, makeTwoFactorTickets } from './two-factor.js'
 import { PLAIN_BOX } from './token-box.js'
@@ -784,18 +784,31 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         let keys
         if (hasActiveKey(db, who.userId)) {
           const body = await readBody(req)
-          const g = guardedAccountAction({ db, journalHost }, who, body, { op: 'revoke_device', device: String(revokedId) }, {
-            // Not owned and nonexistent are the same 404, before any
-            // signature is looked at (anti-enumeration, as below).
-            check: () => { if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(revokedId, who.userId)) refuse(404, { error: 'not_found' }) },
-            write: () => {
-              const live = activeKeysOfDevice(db, who.userId, revokedId)
-              if (!revokeOwnedDevice(db, who.userId, revokedId)) refuse(404, { error: 'not_found' })
-              return live
-            },
-          })
-          if (!g.ok) return json(res, g.status, g.body)
-          keys = g.value
+          // Or the password and a TOTP code, as for removing a key
+          // (approval-keys-http.js confirmPasswordAndTotp: never a recovery
+          // code, one attempt at a time, the same enrolment lock): so a
+          // user whose only keyed phone is stolen can sign it out from a
+          // device with no key.
+          if (body.approval === undefined && (body.password !== undefined || body.code !== undefined)) {
+            if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(revokedId, who.userId)) return json(res, 404, { error: 'not_found' })
+            const pwCtx = { db, hub, pushPipeline, tokenBox: twoFactorBox, loginGuard, journalHost, passwordChecks }
+            if (!(await confirmPasswordAndTotp(pwCtx, res, who, { password: body.password, code: body.code }))) return
+            keys = activeKeysOfDevice(db, who.userId, revokedId)
+            if (!revokeOwnedDevice(db, who.userId, revokedId)) return json(res, 404, { error: 'not_found' })
+          } else {
+            const g = guardedAccountAction({ db, journalHost }, who, body, { op: 'revoke_device', device: String(revokedId) }, {
+              // Not owned and nonexistent are the same 404, before any
+              // signature is looked at (anti-enumeration, as below).
+              check: () => { if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(revokedId, who.userId)) refuse(404, { error: 'not_found' }) },
+              write: () => {
+                const live = activeKeysOfDevice(db, who.userId, revokedId)
+                if (!revokeOwnedDevice(db, who.userId, revokedId)) refuse(404, { error: 'not_found' })
+                return live
+              },
+            })
+            if (!g.ok) return json(res, g.status, g.body)
+            keys = g.value
+          }
         } else {
           // Its approval keys are revoked with it (auth.js), each with a notice.
           keys = activeKeysOfDevice(db, who.userId, revokedId)
