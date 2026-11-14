@@ -24,10 +24,11 @@ export const ROUTINES_SWEEP_INTERVAL_MS = 60_000
 export const ROUTINES_TRIGGER_INTERVAL_MS = 5 * 60_000
 export const ROUTINE_MAX_INFLIGHT = 4
 export const ROUTINE_FROM_NAME = 'Routines'
+// A Coordinator on a protected box: not sent, never retried.
+const PROTECTED = 'protected_device'
 // Failures the next attempt might cure: the box was asleep or slow, the
 // socket dropped. A bridge's refusal (bad_request, not_coordinator, gone)
 // is final for this fire.
-const PROTECTED = 'protected_device'
 const RETRYABLE = new Set(['agent_unreachable', 'timeout', 'send_failed', 'internal'])
 
 // One firer per journal process (server.js): the sweep and the run route

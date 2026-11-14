@@ -16,8 +16,9 @@
 // The subject is a flat object of strings, at most 12 keys of at most 200
 // characters each (src/approvals.js validSubject). A value that can be
 // longer — a box name, a working directory, an ask id — is replaced
-// (boundedSubject, src/approval-keys.js), when it is over 200 characters, by the lowercase hex SHA-256 of its UTF-8
-// bytes under the key `<name>_sha256` (so a 300-character workdir is
+// (boundedSubject, src/approval-keys.js), when it is over 200 characters,
+// by the lowercase hex SHA-256 of its UTF-8 bytes under the key
+// `<name>_sha256` (so a 300-character workdir is
 // `workdir_sha256`, never a truncated `workdir`). Texts are always hashed:
 // `task_sha256` (the spawn's task), `message_sha256` (a chat ask's opening
 // message, its justification), `prompt_sha256` (a direct start's prompt);

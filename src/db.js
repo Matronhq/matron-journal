@@ -1256,18 +1256,25 @@ export function openDb(path) {
   // before the row goes. Revoked keys lose the id too, so the key list never
   // names a later device that was given it.
   //
-  // Dropped and created afresh on every open: an earlier body (which left a
-  // revoked key's id in place) is replaced, and a key still naming a device
-  // that is gone loses the id.
-  db.exec(`DROP TRIGGER IF EXISTS devices_approval_detach;
-    CREATE TRIGGER devices_approval_detach AFTER DELETE ON devices
+  // A database made with the earlier body (which left a revoked key's id in
+  // place) gets this one, in one transaction so no delete runs between the
+  // drop and the create; and a key still naming a device that is gone loses
+  // the id.
+  const detachSql = `CREATE TRIGGER devices_approval_detach AFTER DELETE ON devices
     BEGIN
       UPDATE approval_keys SET device_id = NULL WHERE device_id = OLD.id;
       DELETE FROM approval_nonces WHERE device_id = OLD.id;
       DELETE FROM approval_key_requests WHERE device_id = OLD.id;
-    END;
-    UPDATE approval_keys SET device_id = NULL
-     WHERE device_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.id = approval_keys.device_id);`)
+    END`
+  db.transaction(() => {
+    const current = db.prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='devices_approval_detach'").get()?.sql
+    if (current !== detachSql) {
+      db.exec('DROP TRIGGER IF EXISTS devices_approval_detach')
+      db.exec(detachSql)
+    }
+    db.exec(`UPDATE approval_keys SET device_id = NULL
+      WHERE device_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.id = approval_keys.device_id)`)
+  })()
   // An APNs token names a physical app install, so at most one device row may
   // hold it. Re-pairing creates a NEW device row, and until setApnsRegistration
   // learned to claim the token, every superseded row kept it: on one deployment one Mac

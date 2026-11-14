@@ -20,8 +20,9 @@
 //        After a new sign-in: the key signs {op:'attach_key', key_id} for
 //        itself and moves to the calling device, with a notice.
 //
-// Three wrong passwords or codes within an hour on either password route
-// lock both for the account: 429 {error:'enrolment_locked', retry_at} (ms),
+// Three wrong passwords or codes within an hour on any password route (the
+// two here and POST /devices/:id/revoke, http.js) lock all three for the
+// account: 429 {error:'enrolment_locked', retry_at} (ms),
 // before the password is checked, for 1 h, then 6 h, then 24 h.
 //
 // Everything but the revoke needs the journal's public URL (`enabled`);

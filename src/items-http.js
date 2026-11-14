@@ -654,8 +654,8 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
 // question's words as they stand (the item's title and body, or that
 // comment's body) and the subject: a step-up comment's own, else the item's,
 // else {}. A refusal throws ApprovalRefused, so nothing is written; its
-// `refusal` is the answer to send. The journal's handover question (handleApprovalTap) is answered
-// through the same check.
+// `refusal` is the answer to send. The journal's handover question
+// (handleApprovalTap) is answered through the same check.
 const storedSubject = (s) => { try { return s == null ? {} : (JSON.parse(s) ?? {}) } catch { return {} } }
 function tapApprover(ctx, who, approval, action) {
   return ({ row, asked }) => {
