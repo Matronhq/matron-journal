@@ -2,14 +2,14 @@
 //
 // Any token (a box may read the public keys, but verifies against the keys
 // pinned on it, never these):
-//   GET  /approval-keys                        → {enabled, keys, requests}
+//   GET  /approval-keys                        → {enabled, journal, keys, requests}
 //
 // Bearer, client devices only:
 //   POST /approvals/nonce                      → {nonce, expires_at}
 //   POST /approval-keys {public_key, name, password, code}
 //        The bootstrap, and the fallback when no enrolled device is left:
 //        password and a TOTP code (never a recovery code) enrol the
-//        calling device's key.
+//        calling device's key. 409 key_exists only once both have passed.
 //   POST /approval-keys/requests {public_key, name}            → {id}
 //   POST /approval-keys/requests/:id/approve {approval}
 //        An enrolled device signs {op:'enrol_key', key_id} for a new
@@ -18,7 +18,7 @@
 //        Signed {op:'revoke_key', key_id}, or password and TOTP.
 //   POST /approval-keys/attach {approval}
 //        After a new sign-in: the key signs {op:'attach_key', key_id} for
-//        itself and moves to the calling device.
+//        itself and moves to the calling device, with a notice.
 //
 // Three wrong passwords or codes within an hour on either password route
 // lock both for the account: 429 {error:'enrolment_locked', retry_at} (ms),
@@ -73,6 +73,21 @@ export function announceKey(ctx, userId, key, { added, how }) {
   } catch (err) {
     console.error('approval keys: restamping consent items failed', err)
   }
+}
+
+// A key moved to the calling device (POST /approval-keys/attach): a notice
+// like the enrolment's, pushed, once per key and device.
+function announceAttach(ctx, who, key) {
+  const short = key.key_id.slice(0, 8)
+  const device = ctx.db.prepare('SELECT name FROM devices WHERE id=?').get(who.deviceId)?.name ?? 'a device'
+  fileNotice(ctx, {
+    userId: who.userId,
+    title: `Approval key attached: ${key.name} ${short}`,
+    body: `The approval key **${plainText(key.name)}** (fingerprint \`${short}\`) was attached to **${plainText(device)}**, signed by the key itself.`
+      + ' It now approves dangerous actions from that device. If this was not you, remove it and change your password.',
+    idemKey: `approval-key:attached:${key.key_id}:${who.deviceId}`,
+    push: true,
+  })
 }
 
 const BY_PASSWORD = 'with your password and a two-factor code'
@@ -204,7 +219,9 @@ export async function handleApprovalKeysRoute(ctx, req, res, url, who) {
     const requests = db.prepare('SELECT id, public_key, name, created_at FROM approval_key_requests WHERE user_id=? AND created_at > ? ORDER BY created_at, id')
       .all(who.userId, Date.now() - KEY_REQUEST_TTL_MS)
       .map((r) => ({ id: r.id, key_id: keyIdOf(r.public_key), name: r.name, created_at: r.created_at }))
-    json(res, 200, { enabled, keys, requests })
+    // `journal`: the host every statement must name (null while approval
+    // keys are off), so an app need not derive it from the URL it uses.
+    json(res, 200, { enabled, journal: journalHost || null, keys, requests })
     return true
   }
 
@@ -224,8 +241,11 @@ export async function handleApprovalKeysRoute(ctx, req, res, url, who) {
     if (!pk) return true
     const keyName = readName(res, name)
     if (!keyName) return true
-    if (keyRow(db, pk.keyId)) return keyExists(res)
     if (!(await confirmPasswordAndTotp(ctx, res, who, { password, code }))) return true
+    // Whether the key is enrolled (to this account or any other: key ids
+    // are unique across the journal) is told only to a caller who has just
+    // passed the password and code.
+    if (keyRow(db, pk.keyId)) return keyExists(res)
     // The password check awaited: the calling device may have been signed
     // out meanwhile (its row deleted, its id free to be handed out again),
     // and a key must not be attached to an id that is gone.
@@ -253,6 +273,7 @@ export async function handleApprovalKeysRoute(ctx, req, res, url, who) {
     if (!pk) return true
     const keyName = readName(res, name)
     if (!keyName) return true
+    // The same answer whichever account has the key.
     if (keyRow(db, pk.keyId)) return keyExists(res)
     const now = Date.now()
     const id = `kr_${crypto.randomBytes(12).toString('hex')}`
@@ -304,6 +325,7 @@ export async function handleApprovalKeysRoute(ctx, req, res, url, who) {
       return { ok: true, row: keyRow(db, r.keyId) }
     })()
     if (!out.ok) return send(res, out)
+    announceAttach(ctx, who, out.row)
     json(res, 200, { key: keyView(out.row) })
     return true
   }

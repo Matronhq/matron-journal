@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { createAgent, revokeDevice } from '../src/auth.js'
+import { createAgent, createUser, revokeDevice } from '../src/auth.js'
 import { hasActiveKey, activeKeyFor, issueNonce, consumeNonce, requireApproval, NONCE_TTL_MS } from '../src/approval-keys.js'
 import {
   generateApprovalKey, signForTest, startApprovalServer, startWithKey, enableTwoFactor, enrolKeyByPassword,
@@ -23,7 +23,7 @@ function makeStubApnsClient() {
 test('without a public URL approval keys are off: listed as disabled, enrolment refused', async (t) => {
   const { s, alice, token } = await startApprovalServer(t, { publicUrl: null })
   const { secret } = await enableTwoFactor(s, token)
-  assert.deepEqual(await keysOf(s, token), { enabled: false, keys: [], requests: [] })
+  assert.deepEqual(await keysOf(s, token), { enabled: false, journal: null, keys: [], requests: [] })
   const key = generateApprovalKey()
   const boot = await s.http('/approval-keys', {
     method: 'POST', token, body: { public_key: key.publicKey, name: 'phone', password: TEST_PASSWORD, code: totpCode(s, alice.id, secret) },
@@ -57,6 +57,7 @@ test('bootstrap: password and a TOTP code enrol the calling device\'s key, with 
   assert.equal(activeKeyFor(s.db, alice.id, key.keyId).device_id, deviceId)
   const listed = await keysOf(s, token)
   assert.equal(listed.enabled, true)
+  assert.equal(listed.journal, TEST_JOURNAL, 'the host a statement must name')
   assert.equal(listed.keys.length, 1)
   const k = listed.keys[0]
   assert.deepEqual(
@@ -124,6 +125,37 @@ test('bootstrap: a malformed public key or name is refused; an enrolled key cann
   assert.equal((await enrol({ public_key: generateApprovalKey().publicKey, name: 'x'.repeat(41) })).status, 400)
   const again = await enrol({ public_key: key.publicKey })
   assert.deepEqual([again.status, again.json], [409, { error: 'key_exists' }])
+})
+
+test('bootstrap: whether a key is enrolled anywhere is told only after the password and code pass, and the same for any account', async (t) => {
+  const { s, alice, token, secret, key } = await startWithKey(t)
+  const bob = await createUser(s.db, 'bob', TEST_PASSWORD)
+  const bobPhone = signIn(s, bob.id, 'bob-phone')
+  const { secret: bobSecret } = await enableTwoFactor(s, bobPhone.token)
+  const enrolAsBob = (body) => s.http('/approval-keys', { method: 'POST', token: bobPhone.token, body: { name: 'phone', public_key: key.publicKey, ...body } })
+  // alice's key, sent by bob with a wrong password: the password's answer, not key_exists.
+  const wrongPw = await enrolAsBob({ password: 'not-the-password', code: totpCode(s, bob.id, bobSecret) })
+  assert.deepEqual([wrongPw.status, wrongPw.json], [401, { error: 'bad_password' }])
+  forgetEnrolmentFailures(s)
+  const right = await enrolAsBob({ password: TEST_PASSWORD, code: totpCode(s, bob.id, bobSecret) })
+  assert.deepEqual([right.status, right.json], [409, { error: 'key_exists' }])
+  assert.equal(activeKeyFor(s.db, bob.id, key.keyId), null)
+  // alice's own key, a wrong password: the same.
+  const own = await s.http('/approval-keys', { method: 'POST', token, body: { name: 'phone', public_key: key.publicKey, password: 'nope-nope', code: totpCode(s, alice.id, secret) } })
+  assert.equal(own.status, 401)
+})
+
+test('a key request for a key already enrolled is the same key_exists whichever account has it', async (t) => {
+  const { s, alice, token, key } = await startWithKey(t)
+  const bob = await createUser(s.db, 'bob', TEST_PASSWORD)
+  const bobPhone = signIn(s, bob.id, 'bob-phone')
+  const laptop = signIn(s, alice.id, 'laptop')
+  const ask = (tok) => s.http('/approval-keys/requests', { method: 'POST', token: tok, body: { public_key: key.publicKey, name: 'k' } })
+  const mine = await ask(laptop.token)
+  const theirs = await ask(bobPhone.token)
+  assert.deepEqual([mine.status, mine.json], [409, { error: 'key_exists' }])
+  assert.deepEqual([theirs.status, theirs.json], [mine.status, mine.json])
+  assert.ok(token)
 })
 
 test('bootstrap still works while a key is enrolled: the fallback when no enrolled device is left', async (t) => {
@@ -402,6 +434,7 @@ test('attach: a new sign-in re-attaches its key; the old device row then gets wr
   assert.equal(r.status, 200, JSON.stringify(r.json))
   assert.equal(r.json.key.device_id, again.deviceId)
   assert.equal(activeKeyFor(s.db, alice.id, key.keyId).device_id, again.deviceId)
+  assert.equal(notices(s, alice.id).at(-1).title, `Approval key attached: phone ${key.keyId.slice(0, 8)}`)
   const replay = await s.http('/approval-keys/attach', { method: 'POST', token: again.token, body: { approval } })
   assert.deepEqual(replay.json, { error: 'approval_invalid', reason: 'nonce' })
 
