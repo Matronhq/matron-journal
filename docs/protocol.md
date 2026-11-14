@@ -2839,7 +2839,34 @@ frame: agent connection (`forbidden`); registered (`not_ready`);
 ordinary caller — all indistinguishable `not_found`; and its box is not
 **protected** (`forbidden`, detail `protected_device`, whether or not the
 account has an approval key; see *Approval keys (step-up)* → *Protected
-boxes*). Then the target box:
+boxes*); and, for a `carry_on` (either `when`), its box is not
+**user-only** unless the user started the turn that sends it (`forbidden`,
+detail `user_only`, with a fixed `why`; see *Consent approval* →
+*User-only boxes*): a carry-on's `message` becomes a turn in the target
+session, which on such a box is the user's alone to start. `set_model` and
+`compact` are not refused there: the journal relays no turn text for them,
+only the model, agent and effort names and the optional `reason`, which the
+target bridge shows as a notice in the session's chat.
+
+**A carry-on to a user-only box on the user's own word.** The carry-on
+goes through when its `causes` resolve, by the journal's own record and
+from the Coordinator's conversation (the resolver of *The Coordinator's own
+asks*, with its rules), to a message the user typed or spoke in that
+conversation, or to a comment or tap of theirs on an item that conversation
+owns, and that event is at most 10 minutes older than the request's arrival
+(`CARRY_ON_USER_ONLY_WINDOW_MS`). So the Coordinator can file an item
+asking whether to tell a stalled session to carry on, and send the carry-on
+in the turn the user's tap starts. Refused as before: no `causes`; a
+routine fire; a `spawn_outcome` cause, whatever ask it answers; any cause
+of a kind that cannot carry the user's authority (a room message other than
+the Coordinator's own echo, a reminder, an alert, another carry-on), even
+beside a user cause; a cited message in another conversation or an item
+another conversation owns; a user event older than the window. With
+`when: 'after_limit_reset'` the rule is the same and is applied once, when
+the request arrives: the target bridge holds the message until the limit
+resets, and the journal is not asked again at delivery.
+
+Then the target box:
 offline and unwakeable → `agent_unreachable`; otherwise the op is acked at
 once with `{kind:'session_control', event:'sent', request_id, target_waking?}`
 and, off the socket's message loop, the box is woken if needed and waited
@@ -2848,8 +2875,9 @@ for (`MATRON_SPAWN_WAKE_WAIT_MS`), a journal-originated RPC
 from_convo_id, from_name, carry_on_id?}` is issued (`MATRON_SESSION_CONTROL_TIMEOUT_MS`,
 default 30 s) and its reply delivered to every live socket of the caller's
 device as `{kind:'session_control', event:'result', request_id, ok,
-result?|error:{code, detail?}}` (`timeout` / `agent_unreachable` /
-`internal` when the bridge never answered). Strings in `params`
+result?|error:{code, detail?, why?}}` (`timeout` / `agent_unreachable` /
+`internal` when the bridge never answered; `why` only on the journal's own
+`user_only` refusal). Strings in `params`
 (including `from_name`) and in the relayed error are peer-text sanitised.
 At most 8 ops may be in flight per connection (each holds a wake waiter
 and a broker entry); a ninth is `conflict`. The shape checks run before
@@ -3351,6 +3379,11 @@ rows `user_only: true` (absent otherwise); `POST /consent/answer` refuses a
 Coordinator approval of one with **403** `user_only` before any state
 changes, and still accepts a decline. The user's own tap is unaffected. This is for a box that handles something
 only the user should sign off on, such as one that reads their private mail.
+The Coordinator cannot tell a session on such a box to carry on of its own
+accord either: a `session_control` `carry_on` aimed at one is refused
+`forbidden`, detail `user_only`, unless the turn that sends it was started
+by the user's own recent message, or their comment or tap on one of the
+Coordinator's items (*Session control*); `set_model` and `compact` still go.
 A **protected** box (`devices.protected`, see *Approval keys (step-up)* →
 *Protected boxes*) is user-only too, for chats, spawns and transfers alike,
 and once the account has an approval key an ask aimed at one adds
@@ -4429,7 +4462,11 @@ alert, a hand-over's or a talk's session start, a Coordinator's
 `session_control`), it checks again once the wait is over: a box protected
 meanwhile gets nothing, with the same outcome as above (for
 `session_control`, the result frame with `error: {code:'forbidden',
-detail:'protected_device'}`).
+detail:'protected_device'}`; a carry-on to a box that is user-only by then
+is checked again as it was on arrival — its causes must still resolve to
+the user's own message or tap, whose age is measured from the request's
+arrival, not from the end of the wait — and otherwise gets nothing, with
+`detail:'user_only'` and the `why` in the same frame).
 
 **With a key**, an ask **aimed at** a protected box needs a signed
 `consent` statement to be approved. Aimed at means: a spawn's target box; a
