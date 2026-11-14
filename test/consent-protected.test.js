@@ -19,7 +19,7 @@ import { getTransfer } from '../src/transfers.js'
 import { consentSubject } from '../src/consent-subject.js'
 import { needsUserTap } from '../src/item-handover.js'
 import { runAdmin } from '../bin/matron-admin.js'
-import { startWithKey, startApprovalServer, signAccount, signConsent, enableTwoFactor, enrolKeyByPassword } from './approval-helpers.js'
+import { startWithKey, startApprovalServer, signAccount, signConsent, enableTwoFactor, enrolKeyByPassword, forgetApprovalFailures } from './approval-helpers.js'
 
 const sha = (s) => crypto.createHash('sha256').update(s, 'utf8').digest('hex')
 const TASK = 'fix the flaky test'
@@ -316,6 +316,9 @@ test('a client\'s direct start on a protected box is an account action; the box 
   assert.equal(e2.detail, 'mismatch')
   // A consent statement is not an account one.
   const consent = await signConsent(w.s, { token: w.token, key: w.key, subject })
+  // Two invalid approvals from one device would sign it out
+  // (test/approval-lockdown.test.js): this one is checked on its own.
+  forgetApprovalFailures(w.s)
   w.ws.client.send({ op: 'agent_request', request_id: 'r3', agent_device_id: w.target.deviceId, method: 'start', params: { ...params, approval: consent } })
   assert.equal((await errOf('r3')).detail, 'mismatch')
   assert.equal(w.ws.target.frames.some((f) => f.kind === 'rpc'), false)

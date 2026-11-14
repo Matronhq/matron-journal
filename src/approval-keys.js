@@ -9,10 +9,24 @@
 // that was handed to that same device and is spent by the check.
 import crypto from 'node:crypto'
 import { parseStatement, verifySignature } from './approvals.js'
+import { revokeDevice } from './auth.js'
 
 export const ALG = 'ES256'
 export const NONCE_TTL_MS = 5 * 60000
 export const KEY_REQUEST_TTL_MS = 10 * 60000
+
+// Lockdown after failures (a genuine app never sends a bad signature):
+// two invalid approvals from one client device within ten minutes sign it
+// out; three wrong passwords or codes on the password-and-code path within
+// an hour lock that path for the account, 1 h, then 6 h, then 24 h, back
+// to 1 h after seven days without a lock. Failure rows are kept seven days.
+export const DEVICE_FAILURE_WINDOW_MS = 10 * 60000
+export const DEVICE_FAILURE_LIMIT = 2
+export const ENROL_FAILURE_WINDOW_MS = 60 * 60000
+export const ENROL_FAILURE_LIMIT = 3
+export const ENROL_LOCK_MS = [1, 6, 24].map((h) => h * 60 * 60000)
+export const ENROL_LEVEL_RESET_MS = 7 * 24 * 60 * 60000
+const FAILURE_KEEP_MS = 7 * 24 * 60 * 60000
 
 export function hasActiveKey(db, userId) {
   return !!db.prepare('SELECT 1 FROM approval_keys WHERE user_id=? AND revoked_at IS NULL').get(userId)
@@ -29,14 +43,118 @@ export function activeKeysOfDevice(db, userId, deviceId) {
 }
 
 // A nonce for the calling device: 32 random bytes, base64url, good for
-// five minutes and one statement. Spent and expired nonces are swept here.
+// five minutes and one statement. Spent and expired nonces are swept here,
+// and with them the lockdown counters nothing reads any more.
 export function issueNonce(db, who, now = Date.now()) {
   const nonce = crypto.randomBytes(32).toString('base64url')
   db.transaction(() => {
     db.prepare('DELETE FROM approval_nonces WHERE created_at <= ?').run(now - NONCE_TTL_MS)
+    sweepLockdownCounters(db, now)
     db.prepare('INSERT INTO approval_nonces(nonce, user_id, device_id, created_at) VALUES(?,?,?,?)').run(nonce, who.userId, who.deviceId, now)
   })()
   return { nonce, expires_at: now + NONCE_TTL_MS }
+}
+
+// Device failures after their review week; enrolment failures out of the
+// hour; locks that ended more than a week ago (their level has reset).
+function sweepLockdownCounters(db, now) {
+  db.prepare('DELETE FROM approval_failures WHERE at <= ?').run(now - FAILURE_KEEP_MS)
+  db.prepare('DELETE FROM approval_enrol_failures WHERE at <= ?').run(now - ENROL_FAILURE_WINDOW_MS)
+  db.prepare('DELETE FROM approval_enrol_locks WHERE until <= ?').run(now - ENROL_LEVEL_RESET_MS)
+}
+
+// The approval key a user's event is stamped with when the journal delivers
+// it to an agent (approval_key_id): the live key attached to the client
+// device that sent it, the newest if somehow more than one, or null.
+export function approvalKeyIdOfDevice(db, userId, deviceId) {
+  if (deviceId == null) return null
+  return db.prepare(`SELECT k.key_id FROM approval_keys k JOIN devices d ON d.id = k.device_id AND d.user_id = k.user_id AND d.kind = 'client'
+    WHERE k.user_id=? AND k.device_id=? AND k.revoked_at IS NULL ORDER BY k.created_at DESC, k.id DESC LIMIT 1`).get(userId, deviceId)?.key_id ?? null
+}
+
+// ---- Lockdown: invalid approvals per device ---------------------------------
+
+// What the journal does once a device is signed out for invalid approvals
+// (the notices and pushes, src/approval-keys-http.js), per database: the
+// sign-out itself happens here whether or not one is installed.
+const signedOutListeners = new WeakMap()
+export function onSignedOutForFailures(db, fn) { signedOutListeners.set(db, fn) }
+
+// Record one invalid approval from `who` and, when it is the second from
+// that client device within ten minutes, sign the device out: revokeDevice,
+// which revokes its approval keys with it. Only client devices count (an
+// agent never signs). → {device: {id, name}, keys} (the keys it revoked)
+// when it signed the device out, else null.
+export function recordApprovalFailure(db, who, reason, now = Date.now()) {
+  const out = db.transaction(() => {
+    const device = db.prepare("SELECT id, name FROM devices WHERE id=? AND user_id=? AND kind='client'").get(who.deviceId, who.userId)
+    if (!device) return null
+    db.prepare('INSERT INTO approval_failures(user_id, device_id, device_name, reason, at) VALUES(?,?,?,?,?)')
+      .run(who.userId, device.id, device.name, String(reason), now)
+    // Rows of an earlier sign-in that had this id lost it with their device
+    // (db.js devices_approval_failures_detach).
+    const n = db.prepare('SELECT COUNT(*) AS n FROM approval_failures WHERE device_id=? AND user_id=? AND at > ? AND at <= ?')
+      .get(device.id, who.userId, now - DEVICE_FAILURE_WINDOW_MS, now).n
+    if (n < DEVICE_FAILURE_LIMIT) return null
+    const keys = activeKeysOfDevice(db, who.userId, device.id)
+    revokeDevice(db, device.id)
+    return { device: { id: device.id, name: device.name }, keys }
+  })()
+  if (out) signedOutListeners.get(db)?.(who.userId, out)
+  return out
+}
+
+// An invalid approval, from wherever checkApproval was called. Most callers
+// run the check inside the transaction of the write it guards, and roll that
+// transaction back on the refusal: a counter written there would be rolled
+// back with it. So inside a transaction the record waits for a microtask,
+// which runs once the synchronous code that holds the transaction (better-
+// sqlite3's are synchronous) has committed or rolled back, before any I/O:
+// the refusal is answered first, the device is signed out before the
+// caller's next request can be read. Outside one it is recorded at once.
+function noteInvalid(ctx, who, reason) {
+  const { db } = ctx
+  const now = ctx.now ?? Date.now()
+  const run = () => {
+    try {
+      recordApprovalFailure(db, who, reason, now)
+    } catch (err) {
+      console.error('approval keys: recording an invalid approval failed', err)
+    }
+  }
+  if (db.inTransaction) queueMicrotask(run)
+  else run()
+}
+
+// ---- Lockdown: the password-and-code path ------------------------------------
+
+// When the account's password-and-code path unlocks (ms), or null while it
+// is open.
+export function enrolmentLockedUntil(db, userId, now = Date.now()) {
+  const lock = db.prepare('SELECT until FROM approval_enrol_locks WHERE user_id=?').get(userId)
+  return lock && lock.until > now ? lock.until : null
+}
+
+// Record a wrong password or code on that path (`outcome` 'bad_password' or
+// 'bad_code'). The third within an hour locks it: → {level, until} for the
+// new lock, else null. The level is one more than the last lock's when that
+// one ended under seven days ago, else 1; it picks the length (1 h, 6 h,
+// then 24 h for every later one). Failures made before the last lock ended
+// never count towards the next.
+export function recordEnrolmentFailure(db, who, outcome, now = Date.now()) {
+  return db.transaction(() => {
+    db.prepare('INSERT INTO approval_enrol_failures(user_id, device_id, outcome, at) VALUES(?,?,?,?)').run(who.userId, who.deviceId ?? null, outcome, now)
+    const last = db.prepare('SELECT level, until FROM approval_enrol_locks WHERE user_id=?').get(who.userId)
+    const n = db.prepare('SELECT COUNT(*) AS n FROM approval_enrol_failures WHERE user_id=? AND at > ? AND at <= ? AND at >= ?')
+      .get(who.userId, now - ENROL_FAILURE_WINDOW_MS, now, last?.until ?? 0).n
+    if (n < ENROL_FAILURE_LIMIT) return null
+    const level = last && now - last.until < ENROL_LEVEL_RESET_MS ? last.level + 1 : 1
+    const until = now + ENROL_LOCK_MS[Math.min(level, ENROL_LOCK_MS.length) - 1]
+    db.prepare(`INSERT INTO approval_enrol_locks(user_id, level, locked_at, until) VALUES(?,?,?,?)
+      ON CONFLICT(user_id) DO UPDATE SET level=excluded.level, locked_at=excluded.locked_at, until=excluded.until`).run(who.userId, level, now, until)
+    db.prepare('DELETE FROM approval_enrol_failures WHERE user_id=?').run(who.userId)
+    return { level, until }
+  })()
 }
 
 // Spend a nonce: true once, for the user and device it was issued to, while
@@ -79,7 +197,17 @@ const invalid = (reason) => ({ ok: false, status: 400, body: { error: 'approval_
 // device; expected fields; signature; the nonce last, so a failed attempt
 // does not spend it. On success `approval` is {statement, signature} as
 // received, byte for byte, and `keyId` the key that signed.
-export function checkApproval(ctx, who, approval, expect, { anyDevice = false } = {}) {
+//
+// Every approval_invalid answer is also recorded against the calling
+// device (noteInvalid): the second within ten minutes signs it out. An
+// approval_required (nothing sent) is not.
+export function checkApproval(ctx, who, approval, expect, opts) {
+  const r = check(ctx, who, approval, expect, opts)
+  if (!r.ok && r.body.error === 'approval_invalid') noteInvalid(ctx, who, r.body.reason)
+  return r
+}
+
+function check(ctx, who, approval, expect, { anyDevice = false } = {}) {
   const { db, journalHost, now = Date.now() } = ctx
   if (approval === undefined || approval === null) return required
   if (!isObj(approval) || Object.keys(approval).length !== 2

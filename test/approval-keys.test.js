@@ -4,7 +4,7 @@ import { createAgent, revokeDevice } from '../src/auth.js'
 import { hasActiveKey, activeKeyFor, issueNonce, consumeNonce, requireApproval, NONCE_TTL_MS } from '../src/approval-keys.js'
 import {
   generateApprovalKey, signForTest, startApprovalServer, startWithKey, enableTwoFactor, enrolKeyByPassword,
-  signIn, signApproval, signAccount, totpCode, TEST_JOURNAL, TEST_PASSWORD,
+  signIn, signApproval, signAccount, totpCode, forgetApprovalFailures, forgetEnrolmentFailures, TEST_JOURNAL, TEST_PASSWORD,
 } from './approval-helpers.js'
 
 const keysOf = async (s, token) => (await s.http('/approval-keys', { token })).json
@@ -99,9 +99,12 @@ test('bootstrap: wrong codes count against the username lockout', async (t) => {
   const right = totpCode(s, alice.id, secret)
   const wrong = right === '000000' ? '000001' : '000000'
   for (let i = 0; i < 5; i++) {
+    // Three would lock the path for the account first (test/approval-lockdown.test.js).
+    forgetEnrolmentFailures(s)
     const r = await s.http('/approval-keys', { method: 'POST', token, body: { public_key: key.publicKey, name: 'phone', password: TEST_PASSWORD, code: wrong } })
     assert.equal(r.status, 403)
   }
+  forgetEnrolmentFailures(s)
   const locked = await s.http('/approval-keys', {
     method: 'POST', token, body: { public_key: key.publicKey, name: 'phone', password: TEST_PASSWORD, code: totpCode(s, alice.id, secret) },
   })
@@ -251,7 +254,8 @@ test('requireApproval: each check fails with its own reason, in order', async (t
   const { s, alice, token, deviceId, key } = await startWithKey(t)
   const who = client(alice.id, deviceId)
   const expect = { type: 'account', subject: { op: 'test', target: 'x' } }
-  const check = (approval, e = expect) => requireApproval(ctxOf(s), who, { approval }, e)
+  // Each refusal on its own: two from one device would sign it out.
+  const check = (approval, e = expect) => { forgetApprovalFailures(s); return requireApproval(ctxOf(s), who, { approval }, e) }
 
   assert.deepEqual(requireApproval(ctxOf(s), who, {}, expect), { ok: false, status: 403, body: { error: 'approval_required' } })
   const good = await signAccount(s, { token, key, subject: expect.subject })
@@ -286,7 +290,7 @@ test('requireApproval: an item tap must match item, action and prompt digest', a
   const who = client(alice.id, deviceId)
   const tap = { type: 'item_tap', item: { id: 'it_1', num: 7, reply_to: null }, action: 'Merge', prompt_digest: 'a'.repeat(64), subject: { op: 'merge' } }
   const sign = (over = {}) => signApproval(s, { token, key, ...tap, ...over })
-  const check = async (over) => requireApproval(ctxOf(s), who, { approval: await sign(over) }, tap)
+  const check = async (over) => { const approval = await sign(over); forgetApprovalFailures(s); return requireApproval(ctxOf(s), who, { approval }, tap) }
   assert.deepEqual(await check({ item: { id: 'it_2', num: 7, reply_to: null } }), invalid('mismatch'))
   assert.deepEqual(await check({ item: { id: 'it_1', num: 8, reply_to: null } }), invalid('mismatch'))
   assert.deepEqual(await check({ item: { id: 'it_1', num: 7, reply_to: 'ic_1' } }), invalid('mismatch'))
@@ -387,6 +391,7 @@ test('attach: a new sign-in re-attaches its key; the old device row then gets wr
 
   const before = await signAccount(s, { token: again.token, key, subject: { op: 'test' } })
   assert.deepEqual(requireApproval(ctxOf(s), client(alice.id, again.deviceId), { approval: before }, expect), invalid('wrong_device'))
+  forgetApprovalFailures(s)
 
   const unsigned = await s.http('/approval-keys/attach', { method: 'POST', token: again.token, body: {} })
   assert.deepEqual([unsigned.status, unsigned.json], [403, { error: 'approval_required' }])
@@ -413,12 +418,14 @@ test('attach: only with the key\'s own signature, for an enrolled key of this ac
   const r = await s.http('/approval-keys/attach', { method: 'POST', token, body: { approval: other } })
   assert.deepEqual(r.json, { error: 'approval_invalid', reason: 'mismatch' })
   assert.equal(activeKeyFor(s.db, alice.id, laptopKey.keyId).device_id, laptop.deviceId)
+  forgetApprovalFailures(s)
   // A key that was never enrolled.
   const stranger = generateApprovalKey()
   const u = await s.http('/approval-keys/attach', {
     method: 'POST', token, body: { approval: await signAccount(s, { token, key: stranger, subject: { op: 'attach_key', key_id: stranger.keyId } }) },
   })
   assert.deepEqual(u.json, { error: 'approval_invalid', reason: 'unknown_key' })
+  forgetApprovalFailures(s)
   // A revoked key.
   const revoked = await s.http(`/approval-keys/${laptopKey.keyId}/revoke`, {
     method: 'POST', token, body: { approval: await signAccount(s, { token, key, subject: { op: 'revoke_key', key_id: laptopKey.keyId } }) },

@@ -14,7 +14,7 @@ import { createAgent, createUser, verifyUserPassword } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import { base32Decode, hotp, totpStep, isTwoFactorEnabled, setTwoFactorRequired } from '../src/two-factor.js'
 import {
-  startApprovalServer, enableTwoFactor, enrolKeyByPassword, signAccount, signIn, totpCode, TEST_PASSWORD,
+  startApprovalServer, enableTwoFactor, enrolKeyByPassword, signAccount, signIn, totpCode, forgetApprovalFailures, TEST_PASSWORD,
 } from './approval-helpers.js'
 
 const sha = (s) => crypto.createHash('sha256').update(s, 'utf8').digest('hex')
@@ -32,7 +32,10 @@ async function world(t, { withKey = true } = {}) {
   const box = createAgent(s.db, alice.id, 'box-a')
   upsertConversation(s.db, { id: 'c1', ownerUserId: alice.id, title: 'One', agentDeviceId: box.deviceId })
   upsertConversation(s.db, { id: 'c2', ownerUserId: alice.id, title: 'Two', agentDeviceId: box.deviceId })
-  const post = (path, body, method = 'POST') => s.http(path, { method, token, body })
+  // Each request on its own: these tests send several invalid approvals
+  // from the phone on purpose, and two would sign it out
+  // (test/approval-lockdown.test.js).
+  const post = (path, body, method = 'POST') => { forgetApprovalFailures(s); return s.http(path, { method, token, body }) }
   const sign = (subject) => signAccount(s, { token, key, subject })
   const code = () => totpCode(s, alice.id, secret)
   const spentNonces = () => s.db.prepare('SELECT COUNT(*) n FROM approval_nonces WHERE used_at IS NOT NULL').get().n

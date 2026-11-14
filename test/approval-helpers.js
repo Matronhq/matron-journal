@@ -115,3 +115,16 @@ export function signTap(s, { token, key, item, action, comment = null, ...rest }
     action, prompt_digest, subject, ...rest,
   })
 }
+
+// Lockdown (src/approval-keys.js): two invalid approvals from one device
+// within ten minutes sign it out. A test that sends several on purpose, to
+// check each refusal, forgets the ones recorded so far before the next.
+export function forgetApprovalFailures(s) {
+  s.db.prepare('DELETE FROM approval_failures').run()
+}
+
+// Likewise for the password-and-code path's lock.
+export function forgetEnrolmentFailures(s) {
+  s.db.prepare('DELETE FROM approval_enrol_failures').run()
+  s.db.prepare('DELETE FROM approval_enrol_locks').run()
+}

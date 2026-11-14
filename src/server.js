@@ -4,6 +4,7 @@ import path from 'node:path'
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
+import { installApprovalLockdown } from './approval-keys-http.js'
 import { makeLoginGuard, makeRateLimiter, DEFAULT_CLIENT_IDLE_DAYS, DEFAULT_CLIENT_IDLE_MS } from './auth.js'
 import { makeTwoFactorTickets, isTwoFactorRequired } from './two-factor.js'
 import { makeHttpHandler } from './http.js'
@@ -601,6 +602,8 @@ export function startServer({
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
   const clientIdleMs = resolveClientIdleMs(clientIdleDays)
   const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient, backgroundWakeMs: BACKGROUND_WAKE_MS, clientIdleMs, now: clientIdleClock })
+  // A device signed out for invalid approval signatures: its notice and push.
+  installApprovalLockdown({ db, hub, pushPipeline })
   // A consent-card push whose 30 s hold a restart swallowed still goes out.
   try { pushPipeline.resumeHeldConsent() } catch (err) { console.error('push: consent resume failed', err) }
   // Voice notes are transcribed here when the journal has a transcriber: a

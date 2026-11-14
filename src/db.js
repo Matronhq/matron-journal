@@ -1951,6 +1951,7 @@ export function openDb(path) {
   addTransferConsentSetting(db)
   addPeerFailingSince(db)
   addProtectedDevices(db)
+  addApprovalLockdown(db)
   // A routine's envelope (JSON): the bounds on what an ask born of one of
   // its fires may do — how many spawns per fire, whether chats, which boxes.
   // NULL = no envelope, the value for every routine predating the column.
@@ -2582,6 +2583,49 @@ export function addProtectedDevices(db) {
   if (!has('agent_spawn_requests', 'approval')) db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN approval TEXT')
   if (!has('convo_agents', 'approval')) db.exec('ALTER TABLE convo_agents ADD COLUMN approval TEXT')
   if (!has('transfers', 'approval')) db.exec('ALTER TABLE transfers ADD COLUMN approval TEXT')
+}
+
+// Lockdown after failures and locked boxes (src/approval-keys.js).
+// approval_failures: every invalid approval a client device sent, with the
+// reason and the device's name at the time, kept seven days for review;
+// two within ten minutes sign the device out. device_id goes NULL when the
+// device row goes (ids are handed out again, auth.js issueDevice): what an
+// old sign-in sent never counts against a new one. approval_enrol_failures: a
+// wrong password or code on the password-and-code path (bootstrap
+// enrolment, revoke by password); approval_enrol_locks: the account's
+// current or last lock of that path, its escalation level and when it
+// ends. Idempotent.
+export function addApprovalLockdown(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS approval_failures(
+      id          INTEGER PRIMARY KEY,
+      user_id     INTEGER NOT NULL,
+      device_id   INTEGER,
+      device_name TEXT NOT NULL,
+      reason      TEXT NOT NULL,
+      at          INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_approval_failures_device ON approval_failures(device_id, at);
+    CREATE INDEX IF NOT EXISTS idx_approval_failures_at ON approval_failures(at);
+    CREATE TABLE IF NOT EXISTS approval_enrol_failures(
+      id        INTEGER PRIMARY KEY,
+      user_id   INTEGER NOT NULL,
+      device_id INTEGER,
+      outcome   TEXT NOT NULL,
+      at        INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_approval_enrol_failures_user ON approval_enrol_failures(user_id, at);
+    CREATE TABLE IF NOT EXISTS approval_enrol_locks(
+      user_id   INTEGER PRIMARY KEY,
+      level     INTEGER NOT NULL,
+      locked_at INTEGER NOT NULL,
+      until     INTEGER NOT NULL
+    );
+  `)
+  db.exec(`CREATE TRIGGER IF NOT EXISTS devices_approval_failures_detach AFTER DELETE ON devices
+    BEGIN
+      UPDATE approval_failures SET device_id = NULL WHERE device_id = OLD.id;
+    END`)
 }
 
 // When deliveries to a peer journal started failing (src/federation-outbox.js):

@@ -8,7 +8,7 @@ import { createAgent, createUser } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
 import { setDeviceConsentUserOnly } from '../src/db.js'
 import { setCoordinatorConvoId } from '../src/coordinator.js'
-import { startWithKey, startApprovalServer, signTap, signIn, enrolKeyByPassword, totpCode, TEST_PASSWORD } from './approval-helpers.js'
+import { startWithKey, startApprovalServer, signTap, signIn, enrolKeyByPassword, totpCode, forgetApprovalFailures, TEST_PASSWORD } from './approval-helpers.js'
 
 async function world(t, withKey = true) {
   const base = await (withKey ? startWithKey(t) : startApprovalServer(t))
@@ -21,7 +21,10 @@ async function world(t, withKey = true) {
     assert.equal(r.status, 201, JSON.stringify(r.json))
     return r.json.item
   }
-  const tap = (item, body, headers = {}) => user(`/items/${item.id}/comments`, { method: 'POST', body, headers })
+  // Each tap on its own: these tests send several invalid approvals from
+  // the phone on purpose, and two would sign it out
+  // (test/approval-lockdown.test.js).
+  const tap = (item, body, headers = {}) => { forgetApprovalFailures(base.s); return user(`/items/${item.id}/comments`, { method: 'POST', body, headers }) }
   const count = () => base.s.db.prepare('SELECT COUNT(*) n FROM item_comments').get().n
   const lastMarker = () => JSON.parse(base.s.db.prepare("SELECT payload FROM events WHERE type='item' ORDER BY seq DESC LIMIT 1").get().payload)
   return { ...base, box, agent, user, file, tap, count, lastMarker }

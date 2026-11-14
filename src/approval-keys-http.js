@@ -20,13 +20,20 @@
 //        After a new sign-in: the key signs {op:'attach_key', key_id} for
 //        itself and moves to the calling device.
 //
+// Three wrong passwords or codes within an hour on either password route
+// lock both for the account: 429 {error:'enrolment_locked', retry_at} (ms),
+// before the password is checked, for 1 h, then 6 h, then 24 h.
+//
 // Everything but the revoke needs the journal's public URL (`enabled`);
 // a revoke by password works without it, so an account is never stuck
 // with keys it cannot use.
 import crypto from 'node:crypto'
 import { json, readBody } from './http-body.js'
 import { keyIdOf, parseStatement } from './approvals.js'
-import { ALG, KEY_REQUEST_TTL_MS, checkApproval, activeKeyFor, issueNonce } from './approval-keys.js'
+import {
+  ALG, KEY_REQUEST_TTL_MS, DEVICE_FAILURE_WINDOW_MS, ENROL_LOCK_MS, checkApproval, activeKeyFor, issueNonce,
+  onSignedOutForFailures, enrolmentLockedUntil, recordEnrolmentFailure,
+} from './approval-keys.js'
 import { confirmIdentity } from './two-factor-http.js'
 import { isTwoFactorEnabled, classifyCode } from './two-factor.js'
 import { fileNotice } from './sharing-events.js'
@@ -69,6 +76,61 @@ export function announceKey(ctx, userId, key, { added, how }) {
 
 const BY_PASSWORD = 'with your password and a two-factor code'
 
+const shortTime = (ms) => `${new Date(ms).toISOString().slice(0, 16).replace('T', ' ')} UTC`
+const minutes = (ms) => Math.round(ms / 60000)
+
+// Lockdown after failures (src/approval-keys.js recordApprovalFailure): once
+// a device is signed out for invalid approvals, a notice naming it, pushed
+// to every device the user has left, and each key it took with it announced
+// as any device revoke announces it. Installed once per journal (server.js).
+export function installApprovalLockdown(ctx) {
+  onSignedOutForFailures(ctx.db, (userId, { device, keys }) => {
+    const name = plainText(device.name)
+    const keyLine = keys.length
+      ? ` Its approval key${keys.length > 1 ? 's' : ''} (${keys.map((k) => `\`${k.key_id.slice(0, 8)}\``).join(', ')}) ${keys.length > 1 ? 'were' : 'was'} revoked with it, as with any device you sign out.`
+      : ' Signing a device out revokes any approval key on it; it had none.'
+    fileNotice(ctx, {
+      userId,
+      title: `Signed out ${device.name}: invalid approval signatures`,
+      body: `**${name}** sent two invalid approval signatures within ${minutes(DEVICE_FAILURE_WINDOW_MS)} minutes, so it was signed out.${keyLine}`
+        + ' A genuine app never sends an invalid signature: if this was not you, change your password. Your other devices are not affected.',
+      idemKey: `approval-lockdown:device:${device.id}:${Date.now()}`,
+      push: true,
+    })
+    for (const key of keys) announceKey(ctx, userId, key, { added: false, how: 'with the device it was on, signed out for invalid approval signatures' })
+  })
+}
+
+// The password-and-code path is locked for the account (three wrong
+// passwords or codes within an hour): 429 with when it opens again, sent
+// before anything is checked.
+function enrolmentLocked(ctx, res, who) {
+  const until = enrolmentLockedUntil(ctx.db, who.userId)
+  if (until == null) return false
+  res.setHeader('Retry-After', Math.max(1, Math.ceil((until - Date.now()) / 1000)))
+  json(res, 429, { error: 'enrolment_locked', retry_at: until })
+  return true
+}
+
+// A wrong password (401) or code (403) from confirmIdentity counts towards
+// that lock; the third within the hour sets it, with a notice and a push.
+function countEnrolmentFailure(ctx, res, who) {
+  const outcome = res.statusCode === 401 ? 'bad_password' : res.statusCode === 403 ? 'bad_code' : null
+  if (!outcome) return
+  const lock = recordEnrolmentFailure(ctx.db, who, outcome)
+  if (!lock) return
+  const hours = ENROL_LOCK_MS[Math.min(lock.level, ENROL_LOCK_MS.length) - 1] / 3600000
+  fileNotice(ctx, {
+    userId: who.userId,
+    title: `Approval key enrolment locked until ${shortTime(lock.until)}`,
+    body: `Three wrong passwords or two-factor codes were sent within an hour to add or remove an approval key ${BY_PASSWORD}, so that way is locked for ${hours} hour${hours === 1 ? '' : 's'}: until ${shortTime(lock.until)}.`
+      + ' Removing a key with your password and a code is locked too. Adding a key approved on a device that already has one still works.'
+      + ' If this was not you, change your password.',
+    idemKey: `approval-lockdown:enrol:${who.userId}:${lock.until}`,
+    push: true,
+  })
+}
+
 // {publicKey, keyId} for a well-formed key (stored in canonical base64url),
 // or null with a 400 sent.
 function readPublicKey(res, raw) {
@@ -87,10 +149,19 @@ function readName(res, raw) {
 // be on and the code a TOTP code: a recovery code does not count, and is
 // refused before it could be spent. Wrong passwords and codes count against
 // the username's lockout (two-factor-http.js confirmIdentity).
+//
+// Three wrong passwords or codes within an hour lock this path for the
+// account (enrolment and revoke alike: both lead back to an account the
+// password alone controls), refused with 429 before anything is checked.
+// A recovery code is refused before the password is checked, so it guesses
+// nothing and does not count; nor does a malformed request.
 async function confirmPasswordAndTotp(ctx, res, who, { password, code }) {
+  if (enrolmentLocked(ctx, res, who)) return false
   if (!isTwoFactorEnabled(ctx.db, who.userId)) { json(res, 409, { error: 'two_factor_required' }); return false }
   if (classifyCode(code)?.kind === 'recovery') { json(res, 400, { error: 'totp_required' }); return false }
-  return confirmIdentity(ctx, res, who, { password, code, needCode: true })
+  if (await confirmIdentity(ctx, res, who, { password, code, needCode: true })) return true
+  countEnrolmentFailure(ctx, res, who)
+  return false
 }
 
 const keyExists = (res) => { json(res, 409, { error: 'key_exists' }); return true }
