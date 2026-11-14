@@ -1,5 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { BODY_MAX } from '../src/items.js'
+import { quotedReport, QUOTED_REPORT_MAX } from '../src/inbound-replies.js'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent, authorizeAgentWrite } from '../src/auth.js'
 import { openDb } from '../src/db.js'
@@ -72,6 +74,10 @@ test('createSource: a key that is only kept as a hash, and a conversation no age
   const next = rotateSourceKey(db, source.id)
   assert.equal(sourceForKey(db, key), null)
   assert.equal(sourceForKey(db, next).id, source.id)
+  // A request that checked the old key before the rotation posts nothing.
+  const held = sourceForKey(db, next)
+  rotateSourceKey(db, source.id)
+  assert.equal(acceptReport({ db }, held, { body: 'Late.' }).status, 'bad_request')
 })
 
 test('buildReport: text only', () => {
@@ -81,8 +87,18 @@ test('buildReport: text only', () => {
   assert.equal(buildReport({ body: 'just this' }).text, 'just this')
   // Images become links and raw HTML is shown as typed; code is left alone.
   assert.equal(defuseMarkdown('see ![chart](https://example.com/p.png) <img src=x> a<b 1 < 2'), 'see [chart](https://example.com/p.png) &lt;img src=x> a&lt;b 1 < 2')
-  assert.equal(defuseMarkdown('use `<b>` and `![x](y)` here'), 'use `<b>` and `![x](y)` here')
-  assert.equal(defuseMarkdown('```html\n<script>![a](b)</script>\n```\n<script>'), '```html\n<script>![a](b)</script>\n```\n&lt;script>')
+  assert.equal(defuseMarkdown('use `<b>` and `![x](y)` here'), 'use `<b>` and `[x](y)` here')
+  assert.equal(defuseMarkdown('```html\n<script>![a](b)</script>\n```\n<script>'), '```html\n<script>[a](b)</script>\n```\n&lt;script>')
+  // What only looks like code is prose: a run of another length does not
+  // close a span, an escaped backtick does not open one, a span does not
+  // run over a line, and a fence opens only at the start of a line.
+  assert.equal(defuseMarkdown('`![c](https://example.com/p.png) <img src=x>``'), '`[c](https://example.com/p.png) &lt;img src=x>``')
+  assert.equal(defuseMarkdown('``a ` <b>`` <i>'), '``a ` <b>`` &lt;i>')
+  assert.equal(defuseMarkdown('\\`<img src=x>`'), '\\`&lt;img src=x>`')
+  assert.equal(defuseMarkdown('a ` b\n` <img src=x> `'), 'a ` b\n` &lt;img src=x> `')
+  assert.equal(defuseMarkdown('a ` b\n\n`<b>` <i>'), 'a ` b\n\n`<b>` &lt;i>')
+  assert.equal(defuseMarkdown('- a\n  ```\n  x\n<img src=x>'), '- a\n  ```\n  x\n&lt;img src=x>')
+  assert.equal(defuseMarkdown('``` a`b\n<img src=x>'), '``` a`b\n&lt;img src=x>')
   // Hidden text: control characters and direction overrides go.
   assert.equal(buildReport({ body: 'a\u0000b‮c​d\te' }).text, 'abcd\te')
   for (const [input, error] of [
@@ -304,4 +320,20 @@ test('matron-admin inbound: add, list, limits, rotate, disable', async () => {
   await assert.rejects(runAdmin(db, ['inbound', 'rotate', 'src_nope']), /no such source/)
   await assert.rejects(runAdmin(db, ['inbound', 'add', 'bob', 'Scout']), /no such user/)
   assert.equal(await runAdmin(db, ['inbound', 'list', 'alice']).then((s) => s.includes('disabled')), true)
+})
+
+test('a long reply about a long report keeps the report; the user\'s words are cut first', async (t) => {
+  // Short lines: quoting adds the most.
+  const report = 'a\n'.repeat(20000)
+  const quoted = quotedReport({ name: 'Scout' }, report)
+  assert.match(quoted, /\(Cut here\./)
+  assert.ok(quoted.length <= QUOTED_REPORT_MAX + 600)
+  const w = await world(t)
+  assert.equal((await w.report({ body: report })).status, 201)
+  w.ws.phone.send({ op: 'send', convo_id: w.source.convo_id, type: 'text', payload: { body: 'w'.repeat(30000) } })
+  await w.ws.phone.waitFor((f) => f.kind === 'journal' && f.convo_id === w.source.convo_id && f.sender === 'journal' && f.type === 'text')
+  const task = w.s.db.prepare("SELECT * FROM items WHERE user_id=? AND origin_convo_id='coord'").get(w.alice.id)
+  assert.ok(task.body.length <= BODY_MAX)
+  assert.match(task.body, /\*\*The latest report from Scout, an outside tool\.\*\*/)
+  assert.match(task.body, /\(Cut here\. The whole report is in the user's Scout conversation, which no agent can read\.\)$/)
 })

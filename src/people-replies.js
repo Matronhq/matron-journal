@@ -64,8 +64,9 @@ export function fileForCoordinator(ctx, emitMarker, who, { title, where, text, c
     words,
   ]
   if (context) parts.push('', `**The card:** ${context}`, '', CONTEXT_NOTE)
-  if (extra) parts.push('', extra)
-  const body = cut(parts.join('\n'), BODY_MAX)
+  // The user's words give way before `extra` does: it is cut last.
+  const tail = extra ? `\n\n${extra}` : ''
+  const body = cut(cut(parts.join('\n'), Math.max(0, BODY_MAX - tail.length)) + tail, BODY_MAX)
   // Voice notes go with the words, as copies with no transcript yet: the
   // reply's own transcript lands on the reply, not here. Like a body the user
   // files (items-http.js handleCreate), this journal transcribes them when it

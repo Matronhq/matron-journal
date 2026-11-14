@@ -108,24 +108,60 @@ export function setSourceCaps(db, id, { hourlyMax, dailyMax }) {
 // direction overrides.
 const stripHidden = (s) => s.replace(/\r\n?/g, '\n').replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '').replace(/(?![‌‍])\p{Cf}/gu, '')
 
-// Outside code, an image becomes a link (an app must not fetch an address
-// because a report named it) and a raw HTML tag is shown as typed. Code
-// spans and fenced blocks are left exactly as written.
-function defuseProse(s) {
-  return s.replace(/!(?=\[)/g, '').replace(/<(?=[A-Za-z/!?])/g, '&lt;')
+// An image becomes a link everywhere, code included: an app must not fetch
+// an address because a report named it, and no reading of where code starts
+// and ends is safe enough to stake that on (a span may run over lines, a
+// fence may sit in a list). Outside code a raw HTML tag is shown as typed.
+// Code is read narrowly, so a doubtful stretch is treated as prose: a span
+// closes only on a backtick run of the same length on the same line and
+// never opens on an escaped backtick, a line that follows an unclosed
+// backtick run in the same paragraph is all prose (a renderer may pair
+// that run with one further down), and a fence opens only at the start of
+// a line.
+const dropImages = (s) => s.replace(/!(?=\[)/g, '')
+const escapeTags = (s) => s.replace(/<(?=[A-Za-z/!?])/g, '&lt;')
+function defuseLine(line, state) {
+  if (!line.trim()) state.open = false
+  if (state.open) return escapeTags(line)
+  let out = ''
+  let prose = 0
+  let i = 0
+  while (i < line.length) {
+    if (line[i] === '\\') { i += 2; continue }
+    if (line[i] !== '`') { i++; continue }
+    let end = i
+    while (line[end] === '`') end++
+    const run = end - i
+    // The closing run: the next one of exactly this length.
+    let close = -1
+    for (let j = end; j < line.length;) {
+      if (line[j] !== '`') { j++; continue }
+      let k = j
+      while (line[k] === '`') k++
+      if (k - j === run) { close = k; break }
+      j = k
+    }
+    if (close < 0) { state.open = true; i = end; continue }
+    out += escapeTags(line.slice(prose, i)) + line.slice(i, close)
+    prose = i = close
+  }
+  return out + escapeTags(line.slice(prose))
 }
 export function defuseMarkdown(text) {
   const out = []
   let fence = null
-  for (const line of text.split('\n')) {
-    const m = /^ {0,3}(`{3,}|~{3,})/.exec(line)
+  const state = { open: false }
+  for (const line of dropImages(text).split('\n')) {
     if (fence) {
+      // Closes wherever CommonMark would, and a little more readily.
+      const m = /^ {0,3}(`{3,}|~{3,})/.exec(line)
       out.push(line)
       if (m && m[1][0] === fence[0] && m[1].length >= fence.length) fence = null
       continue
     }
-    if (m) { fence = m[1]; out.push(line); continue }
-    out.push(line.split(/(`+[^`\n]*`+)/).map((part, i) => (i % 2 ? part : defuseProse(part))).join(''))
+    const m = /^(`{3,}(?=[^`]*$)|~{3,})/.exec(line)
+    if (m) { fence = m[1]; state.open = false; out.push(line); continue }
+    out.push(defuseLine(line, state))
   }
   return out.join('\n')
 }
@@ -203,6 +239,7 @@ function refuseOverCap(db, fan, source, { windowMs, max, per, now }) {
 // {status: 'account_locked'}.
 export function acceptReport(ctx, source, input, { now = Date.now() } = {}) {
   const { db, hub = null, pushPipeline = null } = ctx
+  const keyHash = source.token_hash
   const built = buildReport(input)
   if (!built.ok) return { status: built.error, detail: built.detail }
   // A panic-locked account (src/panic.js) takes nothing new from outside.
@@ -212,9 +249,10 @@ export function acceptReport(ctx, source, input, { now = Date.now() } = {}) {
   const out = db.transaction(() => {
     // Read again inside the transaction: the caller's row was loaded before
     // the request body arrived, and another post may have announced the
-    // conversation, said the limit line, or disabled the source since.
+    // conversation, said the limit line, or disabled the source since,
     source = getSource(db, source.id)
-    if (!source || !source.enabled) return { status: 'bad_request', detail: 'the source is no longer enabled' }
+    // ...or its key may have been replaced.
+    if (!source || !source.enabled || source.token_hash !== keyHash) return { status: 'bad_request', detail: 'the source is no longer enabled, or its key changed' }
     if (db.prepare('SELECT 1 FROM inbound_posts WHERE source_id=? AND body_hash=? AND ts>?').get(source.id, hash, now - DAY)) return { status: 'duplicate' }
     const count = (windowMs) => db.prepare('SELECT COUNT(*) AS n FROM inbound_posts WHERE source_id=? AND ts>?').get(source.id, now - windowMs).n
     if (count(HOUR) >= source.hourly_max) return refuseOverCap(db, fan, source, { windowMs: HOUR, max: source.hourly_max, per: 'an hour', now })

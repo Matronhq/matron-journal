@@ -3478,9 +3478,12 @@ It counts as unread and is pushed like any message. What it may contain:
 
 - `body` (required): markdown, at most 64 KiB of UTF-8. Control characters
   and Unicode format characters (direction overrides, zero-width spaces;
-  ZWJ/ZWNJ kept) are removed. Outside code spans and fenced blocks an image
-  (`![…](…)`) becomes a link, so an app never fetches an address because a
-  report named it, and a raw HTML tag's `<` becomes `&lt;`.
+  ZWJ/ZWNJ kept) are removed. An image (`![…](…)`) becomes a link
+  everywhere, inside code too, so an app never fetches an address because a
+  report named it. Outside code spans and fenced blocks a raw HTML tag's
+  `<` becomes `&lt;`; code is read narrowly (a span closes on the same line
+  with a backtick run of the same length, a fence opens at the start of a
+  line), and anything doubtful is treated as prose.
 - `title` (optional): one line, at most 200 characters, markdown characters
   dropped.
 - `links` (optional): at most 10, each an `http(s)` address of at most 2000
