@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
-import { pinDevicePrivate, setDeviceProtected } from '../src/db.js'
+import { openDb, pinDevicePrivate, setDeviceProtected } from '../src/db.js'
+import { beginHandoverSession } from '../src/handover-session.js'
 
 // Starting a session on a handed-over mission (docs/protocol.md "Hand-over"):
 // the recipient's accept can also start a new session on one of their boxes,
@@ -155,6 +156,26 @@ test('a protected box is refused protected_device, by name or as the Coordinator
   await settle()
   assert.equal(w.ws.bobBox.frames.some((f) => f.kind === 'rpc'), false)
   assert.equal(w.ws.bobCoord.frames.some((f) => f.kind === 'rpc'), false)
+})
+
+test('a box protected while it is being woken gets no start', async () => {
+  const db = openDb(':memory:')
+  const bob = await createUser(db, 'bob', 'pw')
+  const box = createAgent(db, bob.id, 'bob-box')
+  const issued = []
+  const ctx = {
+    db,
+    hub: { connsOf: () => [], waitForDevice: async () => { setDeviceProtected(db, box.deviceId, true); return true }, broadcastJournal() {} },
+    broker: { issue: async (...args) => { issued.push(args); return { ok: true, result: { convo_id: 'handed-child' } } } },
+    waker: { enabled: true, wake: () => true },
+    spawnWakeWaitMs: 1000,
+  }
+  const g = { grantee_user_id: bob.id, subject_kind: 'mission', owner_name: 'alice' }
+  const out = beginHandoverSession(ctx, { g, h: { copies: [{ id: 1, num: 1, title: 'Garden Club launch' }] }, request: { device_id: box.deviceId }, itemId: 'it_none' })
+  assert.deepEqual(out, { status: 'starting', device_id: box.deviceId })
+  await settle(50)
+  assert.equal(issued.length, 0)
+  db.close()
 })
 
 test('refusals stay graceful: the copy is made and the answer says why no session started', async (t) => {

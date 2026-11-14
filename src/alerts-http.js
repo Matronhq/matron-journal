@@ -131,9 +131,14 @@ export function makeAlertsHandler({ db, hub, broker, waker = null, rateLimiter =
       try {
         const waking = wakeIfOffline({ db, hub, waker }, user.id, coord.deviceId)
         if (waking && wakeWaitMs > 0) await hub.waitForDevice(user.id, coord.deviceId, wakeWaitMs)
-        const r = await broker.issue(hub, user.id, coord.deviceId, 'session_control', params, { timeoutMs })
-        // The reply is the bridge's text: sieved before it reaches the log.
-        outcome = r.ok ? `applied ${sanitizePeerText(r.result?.applied, 20) || '?'}` : `failed ${sanitizePeerText(r.error?.code, 40) || 'unknown'}`
+        // Checked again after the wait: a box protected meanwhile gets nothing.
+        if (isProtectedDevice(db, user.id, coord.deviceId)) {
+          outcome = 'not delivered: the Coordinator\'s box is protected'
+        } else {
+          const r = await broker.issue(hub, user.id, coord.deviceId, 'session_control', params, { timeoutMs })
+          // The reply is the bridge's text: sieved before it reaches the log.
+          outcome = r.ok ? `applied ${sanitizePeerText(r.result?.applied, 20) || '?'}` : `failed ${sanitizePeerText(r.error?.code, 40) || 'unknown'}`
+        }
         if (waking) outcome += ' (after wake)'
       } catch (err) {
         outcome = `failed internal (${err?.message || err})`

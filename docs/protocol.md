@@ -4298,6 +4298,11 @@ needs the user's own approval, signed once the account has a key.
 | a talk request's **New session** on it | no start is sent; the guest's card reads "Couldn't start a session: protected_device. Pick another option." and the request waits for the guest again |
 | inviting a guest box on accepting a person-room ask or a talk request (on one journal or across journals) | `409 {error:'conflict', blocked_by:'protected_device'}`; nothing changes and the ask stays as it was |
 
+Where the journal first wakes an asleep box and waits for it (a routine, an
+alert, a hand-over's or a talk's session start), it checks again once the
+wait is over: a box protected meanwhile gets nothing, with the same outcome
+as above.
+
 **With a key**, an ask **aimed at** a protected box needs a signed
 `consent` statement to be approved. Aimed at means: a spawn's target box; a
 chat ask's box the invite is delivered to (the invitee; for a join request,

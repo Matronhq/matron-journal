@@ -3,8 +3,8 @@ import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
-import { setDeviceProtected } from '../src/db.js'
-import { sweepTalkAsks } from '../src/talk-requests-events.js'
+import { openDb, setDeviceProtected } from '../src/db.js'
+import { sweepTalkAsks, issueTalkStart } from '../src/talk-requests-events.js'
 import { TALK_GUEST_TTL_MS } from '../src/talk-requests.js'
 
 // Talk requests (docs/protocol.md "Rooms between people"): alice's agent
@@ -320,6 +320,24 @@ test('a protected Coordinator box: New session sends it nothing and bob is offer
   await settle()
   assert.equal(w.ws.bobCoord.frames.some((f) => f.kind === 'invite'), false)
   assert.equal(talkRow(w).state, 'awaiting_guest')
+})
+
+test('a box protected while it is being woken gets no talk start: protected_device', async () => {
+  const db = openDb(':memory:')
+  const bob = await createUser(db, 'bob', 'pw')
+  const box = createAgent(db, bob.id, 'bob-coord')
+  const issued = []
+  const ctx = {
+    db,
+    hub: { connsOf: () => [], waitForDevice: async () => { setDeviceProtected(db, box.deviceId, true); return true } },
+    broker: { issue: async (...args) => { issued.push(args); return { ok: true, result: { convo_id: 'talk-child' } } } },
+    waker: { enabled: true, wake: () => true },
+    spawnWakeWaitMs: 1000,
+  }
+  const out = await issueTalkStart(ctx, { guest_user_id: bob.id, owner_name: 'alice', topic: 'the club' }, { deviceId: box.deviceId })
+  assert.deepEqual(out, { convoId: null, code: 'protected_device' })
+  assert.equal(issued.length, 0)
+  db.close()
 })
 
 test('bob declining refuses alice\'s agent and declines the contact request the talk made', async (t) => {
