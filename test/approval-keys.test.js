@@ -212,6 +212,23 @@ test('a second key enrols by request, approved with a statement signed by the fi
   assert.equal(notices(s, alice.id).at(-1).title, `Approval key added: laptop ${second.keyId.slice(0, 8)}`)
 })
 
+test('a request approved while its key is enrolled under it is key_exists, not a 500, and spends nothing', async (t) => {
+  const { s, alice, token, key } = await startWithKey(t)
+  const laptop = signIn(s, alice.id, 'laptop')
+  const second = generateApprovalKey()
+  const { id } = (await s.http('/approval-keys/requests', { method: 'POST', token: laptop.token, body: { public_key: second.publicKey, name: 'laptop' } })).json
+  // The same key lands first, inside the approval's own insert: the row the
+  // unique key_id refuses.
+  s.db.exec(`CREATE TEMP TRIGGER enrolled_meanwhile BEFORE INSERT ON approval_keys WHEN NEW.enrolled_via = 'device' BEGIN
+    INSERT INTO approval_keys(user_id, key_id, public_key, alg, name, device_id, enrolled_via, created_at)
+      VALUES(NEW.user_id, NEW.key_id, NEW.public_key, NEW.alg, NEW.name, NEW.device_id, 'password', NEW.created_at);
+  END`)
+  const approval = await signAccount(s, { token, key, subject: { op: 'enrol_key', key_id: second.keyId } })
+  const r = await s.http(`/approval-keys/requests/${id}/approve`, { method: 'POST', token, body: { approval } })
+  assert.deepEqual([r.status, r.json], [409, { error: 'key_exists' }])
+  assert.equal(s.db.prepare('SELECT used_at FROM approval_nonces WHERE nonce=?').get(JSON.parse(approval.statement).nonce).used_at, null)
+})
+
 test('an approval signed for a different key_id is a mismatch, and does not burn the nonce', async (t) => {
   const { s, alice, token, key } = await startWithKey(t)
   const laptop = signIn(s, alice.id, 'laptop')

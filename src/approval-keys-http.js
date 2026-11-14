@@ -308,19 +308,27 @@ export async function handleApprovalKeysRoute(ctx, req, res, url, who) {
     if (!enabled) return disabled(res)
     // One transaction: the request, the signature check (which spends the
     // nonce) and the new key stand or fall together.
-    const out = db.transaction(() => {
-      const now = Date.now()
-      const rq = liveRequest(db, who.userId, approve[1], now)
-      if (!rq) return { ok: false, status: 404, body: { error: 'not_found' } }
-      const keyId = keyIdOf(rq.public_key)
-      if (keyRow(db, keyId)) return { ok: false, status: 409, body: { error: 'key_exists' } }
-      const r = checkApproval({ db, journalHost, now }, who, approval, { type: 'account', subject: { op: 'enrol_key', key_id: keyId } })
-      if (!r.ok) return r
-      db.prepare(`INSERT INTO approval_keys(user_id, key_id, public_key, alg, name, device_id, enrolled_via, enrolled_by, created_at)
-        VALUES(?,?,?,?,?,?,'device',?,?)`).run(who.userId, keyId, rq.public_key, ALG, rq.name, rq.device_id, r.keyId, now)
-      db.prepare('DELETE FROM approval_key_requests WHERE id=?').run(rq.id)
-      return { ok: true, row: keyRow(db, keyId), signer: r.keyId }
-    })()
+    let out
+    try {
+      out = db.transaction(() => {
+        const now = Date.now()
+        const rq = liveRequest(db, who.userId, approve[1], now)
+        if (!rq) return { ok: false, status: 404, body: { error: 'not_found' } }
+        const keyId = keyIdOf(rq.public_key)
+        if (keyRow(db, keyId)) return { ok: false, status: 409, body: { error: 'key_exists' } }
+        const r = checkApproval({ db, journalHost, now }, who, approval, { type: 'account', subject: { op: 'enrol_key', key_id: keyId } })
+        if (!r.ok) return r
+        db.prepare(`INSERT INTO approval_keys(user_id, key_id, public_key, alg, name, device_id, enrolled_via, enrolled_by, created_at)
+          VALUES(?,?,?,?,?,?,'device',?,?)`).run(who.userId, keyId, rq.public_key, ALG, rq.name, rq.device_id, r.keyId, now)
+        db.prepare('DELETE FROM approval_key_requests WHERE id=?').run(rq.id)
+        return { ok: true, row: keyRow(db, keyId), signer: r.keyId }
+      })()
+    } catch (err) {
+      // The unique key_id refused the insert (enrolled meanwhile), as on
+      // the password path: rolled back, the nonce with it.
+      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') return keyExists(res)
+      throw err
+    }
     if (!out.ok) return send(res, out)
     announceKey(ctx, who.userId, out.row, { added: true, how: `approved with the key \`${out.signer.slice(0, 8)}\`` })
     json(res, 200, { key: keyView(out.row) })
