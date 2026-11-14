@@ -24,9 +24,9 @@ const KNOWN = new Set(SECURITY_EVENTS)
 export const DECIDERS = Object.freeze(['user', 'coordinator', 'admin', 'admin_cli', 'journal'])
 const KNOWN_DECIDERS = new Set(DECIDERS)
 
-// Rows are kept 30 days (swept with the approval nonces,
-// src/approval-keys.js); the per-account counter is kept apart from them,
-// so a sweep never lets a sequence number be handed out again.
+// Rows are kept 30 days (swept by the retention schedule, src/server.js
+// sweepSecurityEvents below); the per-account counter is kept apart from
+// them, so a sweep never lets a sequence number be handed out again.
 export const SECURITY_EVENT_KEEP_MS = 30 * 24 * 60 * 60000
 export const FEED_LIMIT_DEFAULT = 100
 export const FEED_LIMIT_MAX = 500
@@ -99,11 +99,13 @@ export function makeSecurityLog({ db, out = (line) => process.stdout.write(line 
       return null
     }
   }
+  // Is this exact row there now: its number AND every column, so a row
+  // that rolled back is never taken for the one that got its number next.
   const stillThere = db.prepare(`SELECT 1 FROM security_events WHERE user_id=? AND seq=? AND ts=? AND event=?
-    AND device_id IS ? AND target IS ?`)
+    AND device_id IS ? AND device_name IS ? AND source_ip IS ? AND target IS ? AND decided_by IS ?`)
 
   // The line: stdout, then the file.
-  const emit = ({ row, account }) => {
+  const write = ({ row, account }) => {
     const line = JSON.stringify(lineOf(row, account))
     try { out(line) } catch (err) { console.error(`security log: writing a line failed (${err?.message || err})`) }
     if (!file) return
@@ -117,6 +119,30 @@ export function makeSecurityLog({ db, out = (line) => process.stdout.write(line 
     }
   }
 
+  // Lines go out in seq order per account. While an account has a line
+  // waiting for its transaction's outcome (`held`), its other lines queue
+  // (`ready`, by seq) and all go out, in order, once none is waiting. A
+  // number already queued is a committed row (written outside a
+  // transaction, or checked after one): a waiting line for the same number
+  // is a row that rolled back and is dropped.
+  const pending = new Map() // userId -> { held, ready: Map<seq, entry> }
+  const slot = (userId) => {
+    let p = pending.get(userId)
+    if (!p) { p = { held: 0, ready: new Map() }; pending.set(userId, p) }
+    return p
+  }
+  const flush = (userId) => {
+    const p = pending.get(userId)
+    if (!p || p.held > 0) return
+    pending.delete(userId)
+    for (const seq of [...p.ready.keys()].sort((a, b) => a - b)) write(p.ready.get(seq))
+  }
+  const emit = (userId, r) => {
+    const p = pending.get(userId)
+    if (!p) { write(r); return }
+    p.ready.set(r.row.seq, r)
+  }
+
   return {
     // One event for the account `userId`. Never throws. `deviceName`
     // defaults to the device's current name; `sourceIp` to the request's.
@@ -126,11 +152,12 @@ export function makeSecurityLog({ db, out = (line) => process.stdout.write(line 
     //   transaction, so it goes if the change rolls back; its line goes
     //   out a microtask later (by then the synchronous better-sqlite3
     //   transaction has committed or rolled back), only if its row is
-    //   there;
+    //   there, exactly as it was written;
     // - an event that describes the refusal itself (`evenIfRolledBack`:
     //   an invalid approval, the lockdown after it, the enrolment lock)
     //   waits for that microtask and is written in its own transaction, so
     //   the rollback of the request that caused it cannot lose it.
+    // Either way an account's lines go out in seq order.
     record(userId, event, fields = {}, { evenIfRolledBack = false } = {}) {
       try {
         if (!KNOWN.has(event)) throw new Error(`unknown security event ${JSON.stringify(event)}`)
@@ -141,21 +168,28 @@ export function makeSecurityLog({ db, out = (line) => process.stdout.write(line 
         if (resolved.sourceIp === undefined) resolved.sourceIp = requestScope.getStore()?.sourceIp ?? null
         if (!db.inTransaction) {
           const r = insertRow(userId, event, resolved)
-          if (r) emit(r)
+          if (r) emit(userId, r)
         } else if (evenIfRolledBack) {
           queueMicrotask(() => {
             const r = insertRow(userId, event, resolved)
-            if (r) emit(r)
+            if (r) emit(userId, r)
           })
         } else {
           const r = insertRow(userId, event, resolved)
           if (r) {
+            const p = slot(userId)
+            p.held += 1
             queueMicrotask(() => {
               try {
                 const { row } = r
-                if (stillThere.get(userId, row.seq, row.ts, row.event, row.device_id, row.target)) emit(r)
+                if (!p.ready.has(row.seq) && stillThere.get(userId, row.seq, row.ts, row.event, row.device_id, row.device_name, row.source_ip, row.target, row.decided_by)) {
+                  p.ready.set(row.seq, r)
+                }
               } catch (err) {
                 console.error(`security log: ${event}: ${err?.message || err}`)
+              } finally {
+                p.held -= 1
+                flush(userId)
               }
             })
           }
