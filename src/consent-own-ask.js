@@ -125,12 +125,16 @@ const REFUSAL_TTL_MS = 30 * 24 * 60 * 60 * 1000
 
 const askKey = (ask) => (ask.kind === 'spawn' ? ask.id : `${ask.roomId}/${ask.targetDeviceId}`)
 
-function refusalCount(db, userId, ask) {
+export function refusalCount(db, userId, ask) {
   const row = db.prepare('SELECT ask_created_at, refusals FROM verifier_refusals WHERE user_id=? AND kind=? AND ask_id=?').get(userId, ask.kind, askKey(ask))
   return row && row.ask_created_at === ask.createdAt ? row.refusals : 0
 }
 
-function recordRefusal(db, userId, ask, note, now = Date.now()) {
+export function recordRefusal(db, userId, ask, note, now = Date.now()) {
+  // A call that outlived its ask (a chat ask declined and parked again while
+  // the verifier was still answering) says nothing about the newer one.
+  const stored = db.prepare('SELECT ask_created_at FROM verifier_refusals WHERE user_id=? AND kind=? AND ask_id=?').get(userId, ask.kind, askKey(ask))
+  if (stored && stored.ask_created_at > ask.createdAt) return
   const refusals = refusalCount(db, userId, ask) + 1
   db.prepare(`
     INSERT INTO verifier_refusals(user_id, kind, ask_id, ask_created_at, refusals, last_note, updated_at) VALUES(?,?,?,?,?,?,?)
@@ -185,7 +189,7 @@ export async function verifyOwnAsk(ctx, { who, convoId, reason, ask }) {
   // The routine's name and prompt only: the title is editable without the
   // user's ask, the prompt is the remit.
   const { name, prompt } = root.routine
-  const flightKey = `${who.userId}:${ask.kind}:${askKey(ask)}`
+  const flightKey = `${who.userId}:${ask.kind}:${askKey(ask)}:${ask.createdAt}`
   const flying = inFlight.get(flightKey) ?? 0
   if (refusalCount(db, who.userId, ask) + flying >= VERIFIER_REFUSALS_MAX) return refusal(403, 'left_for_user', { why: WHY_LEFT_FOR_USER })
   inFlight.set(flightKey, flying + 1)

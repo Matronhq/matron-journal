@@ -7,7 +7,8 @@ import { append, upsertConversation } from '../src/journal.js'
 import { createRoutine } from '../src/routines.js'
 import { WHY_NO_CAUSE } from '../src/ask-cause.js'
 import { fleet, parkSpawn, parkInviteAsk, answer, settle } from './consent-fleet.js'
-import { VERIFIER_REFUSALS_MAX, WHY_VERIFIER_REFUSED, WHY_LEFT_FOR_USER } from '../src/consent-own-ask.js'
+import { VERIFIER_REFUSALS_MAX, WHY_VERIFIER_REFUSED, WHY_LEFT_FOR_USER, recordRefusal, refusalCount } from '../src/consent-own-ask.js'
+import { openDb as openMemoryDb } from '../src/db.js'
 
 // The Coordinator's own asks (spawns it asked for from its own
 // conversation, chat rooms it opened from it): approving one itself needs a
@@ -544,4 +545,15 @@ test('a decision row that cannot be written: the answer stands, and the log name
   assert.ok(line, lines.join('\n'))
   assert.ok(line.includes(`spawn ${id}`), line)
   for (const text of ['fix the flaky test', 'flaky test', 'follows the box rules']) assert.ok(!line.includes(text), line)
+})
+
+test('a refusal recorded for an earlier park of a chat ask does not touch the count of the ask parked after it', () => {
+  const db = openMemoryDb(':memory:')
+  const older = { kind: 'chat', roomId: 'r1', targetDeviceId: 2, createdAt: 1000 }
+  const newer = { ...older, createdAt: 2000 }
+  recordRefusal(db, 1, newer, 'first')
+  recordRefusal(db, 1, newer, 'second')
+  recordRefusal(db, 1, older, 'late answer for the earlier park')
+  assert.equal(refusalCount(db, 1, newer), 2)
+  assert.equal(refusalCount(db, 1, older), 0)
 })
