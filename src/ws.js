@@ -41,7 +41,7 @@ import { getMission } from './missions.js'
 import { sanitizeConvoStatus, upsertConvoStatus } from './convo-status.js'
 import { validateSessionControl, authorizeSessionControl, sessionControlResultFrame } from './session-control.js'
 import { validRanges, addSeenRanges, markDeviceUsesRanges, legacyReadAsSeen, markItemSeen } from './seen.js'
-import { panicLock, isPanicLocked, panicHelloField, panicAnnounced, panicOnFrame, PANIC_OFF_FRAME, announcePanicClears, signOutLockedClient, closeLockedSocket, ACCOUNT_LOCKED } from './panic.js'
+import { panicLock, isPanicLocked, panicHelloField, panicAnnounced, panicOnFrame, PANIC_OFF_FRAME, announcePanicClears, signOutLockedClient, closeLockedSocket, markPanicTold, ACCOUNT_LOCKED } from './panic.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -323,6 +323,16 @@ export function attachWs({
   // next-frame or ≤ one sweep interval (60s default), whichever comes
   // first. unref'd — never keeps the process alive on its own.
   const sweep = setInterval(() => {
+    // Panic locks cleared on the host (matron-admin panic clear, a separate
+    // process): the clear frame to each of the account's bridge sockets that
+    // was told it was locked, once, within one sweep interval
+    // (src/panic.js). First and on its own, so nothing else in this sweep
+    // can skip it.
+    try {
+      announcePanicClears(db, hub)
+    } catch (err) {
+      console.error('panic: clear announcement failed', err)
+    }
     // Whole-body guard: this callback now does DB work (expireInvites below
     // plus a per-expired-row lookup) ahead of the connection-count
     // early-return, so any SQLite error here (a shutdown race, SQLITE_BUSY)
@@ -449,14 +459,6 @@ export function attachWs({
       // chat consent item still open on an ask that is not waiting is
       // closed (consent-items.js reconcileConsentItems).
       reconcileConsentItems({ db, hub })
-      // Panic locks cleared on the host (matron-admin panic clear, a
-      // separate process): the clear frame to the account's connected
-      // bridges, once, within one sweep interval (src/panic.js).
-      try {
-        announcePanicClears(db, hub)
-      } catch (err) {
-        console.error('panic: clear announcement failed', err)
-      }
       const conns = hub.allConns()
       if (conns.length === 0) return
       const ids = [...new Set(conns.map((c) => c.deviceId))]
@@ -617,6 +619,7 @@ export function attachWs({
           // otherwise, which a bridge reads as "not locked".
           const helloLock = who.kind === 'agent' ? panicLock(db, who.userId) : null
           if (helloLock) panicAnnounced(hub).add(who.userId)
+          markPanicTold(conn, !!helloLock)
           ws.send(JSON.stringify({
             kind: 'control', op: 'hello_ok', seq: headSeq, device_id: who.deviceId, name: who.name, coordinator_convo_id: coordinator,
             settings: settingsView(db, who.userId),
@@ -749,7 +752,26 @@ export function attachWs({
             if (lockNow && lockNow.since !== helloLock?.since) {
               panicAnnounced(hub).add(who.userId)
               ws.send(JSON.stringify(panicOnFrame(lockNow)))
-            } else if (!lockNow && helloLock) ws.send(JSON.stringify(PANIC_OFF_FRAME))
+              markPanicTold(conn, true)
+            } else if (!lockNow && conn.panicTold) {
+              ws.send(JSON.stringify(PANIC_OFF_FRAME))
+              markPanicTold(conn, false)
+            }
+          } else {
+            // A client: locked or signed out while the replay above yielded,
+            // when the lock's own close could not see this unregistered
+            // socket. Closed now, as the lock closes the others.
+            const lockNow = panicLock(db, who.userId)
+            if (lockNow) {
+              signOutLockedClient({ db, hub, securityLog }, who.userId, who.deviceId, lockNow)
+              if (ws.readyState === 1) closeLockedSocket(ws, lockNow)
+              return
+            }
+            if (!deviceAlive(who.deviceId)) {
+              ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
+              ws.close(4001)
+              return
+            }
           }
           if (yielded && who.kind === 'client') ws.send(JSON.stringify({ kind: 'pins', pins: listPins(db, who.userId) }))
           if (yielded && conn.archiveAt != null) {
@@ -2522,9 +2544,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const waking = !online && wakeIfOffline(target.device_id)
         if (!online && !waking) return failRpc('agent_unreachable')
         conn.ws.send(JSON.stringify({ kind: 'session_control', event: 'sent', request_id: v.rid, ...(waking ? { target_waking: true } : {}) }))
-        // Accepted (the security log): a carry-on names its target session.
-        if (v.params.action === 'carry_on') {
-          securityLog.record(conn.userId, 'coordinator_carry_on', { deviceId: conn.deviceId, target: convoTarget(msg.target_convo_id), decidedBy: 'coordinator' })
+        // The security log's coordinator_carry_on is recorded below, once the
+        // carry-on has actually gone to the box: a refusal after the wait
+        // sends nothing and records nothing.
+        const recordCarryOnEvent = () => {
+          if (v.params.action === 'carry_on') securityLog.record(conn.userId, 'coordinator_carry_on', { deviceId: conn.deviceId, target: convoTarget(msg.target_convo_id), decidedBy: 'coordinator' })
         }
         const fromName = sanitizePeerText(db.prepare('SELECT name FROM devices WHERE id=?').get(conn.deviceId)?.name || '', PEER_NAME_CAP) || 'coordinator'
         const params = { ...v.params, from_convo_id: msg.from_convo_id, from_name: fromName }
@@ -2545,10 +2569,20 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           let frame
           try {
             if (waking && spawnWakeWaitMs > 0) await hub.waitForDevice(conn.userId, target.device_id, spawnWakeWaitMs)
-            // Locked while the box was being woken: nothing is sent.
-            const r = isPanicLocked(db, conn.userId)
-              ? { ok: false, error: { code: 'forbidden', detail: ACCOUNT_LOCKED } }
-              : await broker.issue(hub, conn.userId, target.device_id, 'session_control', params, { timeoutMs: sessionControlTimeoutMs })
+            // Locked, or the box protected, while it was being woken:
+            // nothing is sent.
+            const refusal = isPanicLocked(db, conn.userId) ? ACCOUNT_LOCKED
+              : isProtectedDevice(db, conn.userId, target.device_id) ? 'protected_device' : null
+            let r
+            if (refusal) r = { ok: false, error: { code: 'forbidden', detail: refusal } }
+            else {
+              // broker.issue hands the frame to the box's live socket at once
+              // (none: agent_unreachable); recorded when it went.
+              const live = hub.connsOf(conn.userId).some((c) => c.deviceId === target.device_id && c.ws.readyState === 1)
+              const issued = broker.issue(hub, conn.userId, target.device_id, 'session_control', params, { timeoutMs: sessionControlTimeoutMs })
+              if (live) recordCarryOnEvent()
+              r = await issued
+            }
             frame = sessionControlResultFrame(rid, r)
           } catch (err) {
             console.error(`session_control: ${err?.message || err}`)
