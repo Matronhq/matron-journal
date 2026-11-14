@@ -15,6 +15,7 @@ import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem, reconc
 import { nudgeCoordinator, chatAskId } from './consent.js'
 import { isProtectedDevice, consentSubject } from './consent-subject.js'
 import { hasActiveKey, requireApproval, approvalKeyIdOfDevice, refuse, ApprovalRefused } from './approval-keys.js'
+import { securityLogFor, deviceTarget, convoTarget } from './security-log.js'
 import { agentJournalFrame } from './hub.js'
 import { expireContactAsks } from './contacts.js'
 import { expireInviteAsks, onInviteAskExpired } from './federation-invite-asks.js'
@@ -275,7 +276,7 @@ export function attachWs({
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
   revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES, inviteTtlMs = 1800000,
   broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null,
-  journalHost = null, clientIdleMs, clientIdleClock = Date.now,
+  journalHost = null, clientIdleMs, clientIdleClock = Date.now, securityLog = securityLogFor(db),
 }) {
   // Derived, never raw: the orphan sweep must always outlast a live `start`
   // RPC still in flight (see APPROVED_ORPHAN_TTL_FLOOR_MS's comment) — and,
@@ -729,7 +730,7 @@ export function attachWs({
         // reserialization, which JSON.parse's whitespace-stripping would
         // shrink. `data` is a Buffer here (ws delivers text frames as
         // Buffers), so .length is the byte count.
-        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker, journalHost })
+        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker, journalHost, securityLog })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -785,7 +786,7 @@ export function notifyStale(db, hub, entry, reason = 'stale') {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null, journalHost = null }) {
+export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null, journalHost = null, securityLog = securityLogFor(db) }) {
   const fail = (code, detail) => {
     conn.ws.send(JSON.stringify({
       kind: 'control', op: 'error', code, ref: msg.op,

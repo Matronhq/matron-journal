@@ -2052,6 +2052,7 @@ export function openDb(path) {
   addPeerFailingSince(db)
   addProtectedDevices(db)
   addApprovalLockdown(db)
+  addSecurityEvents(db)
   // A routine's envelope (JSON): the bounds on what an ask born of one of
   // its fires may do — how many spawns per fire, whether chats, which boxes.
   // NULL = no envelope, the value for every routine predating the column.
@@ -2754,6 +2755,32 @@ export function addApprovalLockdown(db) {
       UPDATE approval_failures SET device_id = NULL WHERE device_id = OLD.id;
     END`)
   if (!db.prepare('PRAGMA table_info(devices)').all().some((c) => c.name === 'locked')) db.exec('ALTER TABLE devices ADD COLUMN locked TEXT')
+}
+
+// Security events (src/security-log.js): one row per event, numbered per
+// account. security_event_seqs holds each account's last number apart from
+// the rows, which are swept after 30 days, so a number is never handed out
+// twice. Idempotent.
+export function addSecurityEvents(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS security_events(
+      user_id     INTEGER NOT NULL,
+      seq         INTEGER NOT NULL,
+      ts          INTEGER NOT NULL,
+      event       TEXT NOT NULL,
+      device_id   INTEGER,
+      device_name TEXT,
+      source_ip   TEXT,
+      target      TEXT,
+      decided_by  TEXT,
+      PRIMARY KEY(user_id, seq)
+    );
+    CREATE INDEX IF NOT EXISTS idx_security_events_ts ON security_events(ts);
+    CREATE TABLE IF NOT EXISTS security_event_seqs(
+      user_id INTEGER PRIMARY KEY,
+      seq     INTEGER NOT NULL
+    );
+  `)
 }
 
 // When deliveries to a peer journal started failing (src/federation-outbox.js):

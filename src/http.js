@@ -62,6 +62,7 @@ import { parsePushKey } from './push-box.js'
 import { convoStatuses } from './convo-status.js'
 import { makeAlertsHandler } from './alerts-http.js'
 import { handleSummariseRoute } from './summarise-http.js'
+import { securityLogFor, withRequestScope, handleSecurityFeed } from './security-log.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
 // card's `from_name` gets. NULL stays null rather than collapsing to '' —
@@ -124,7 +125,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, agentCommentLimiter = makeAgentCommentLimiter(), blobTranscripts = null, github = null, handleWellKnown = () => false, handleFederation = async () => false, federationOutbox = null, federationContacts = null, federationGrants = null, federationContribute = null, federationMedia = null, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null, journalHost = null, clientIdleMs, clientIdleClock = Date.now }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, agentCommentLimiter = makeAgentCommentLimiter(), blobTranscripts = null, github = null, handleWellKnown = () => false, handleFederation = async () => false, federationOutbox = null, federationContacts = null, federationGrants = null, federationContribute = null, federationMedia = null, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null, journalHost = null, clientIdleMs, clientIdleClock = Date.now, securityLog = securityLogFor(db), securityFeed = null }) {
   // Two-factor sign-in (src/two-factor-http.js). The server passes its own;
   // the defaults keep a bare handler (tests) working the same way.
   const twoFactorBox = tokenBox || PLAIN_BOX
@@ -147,7 +148,10 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
     db, hub, broker, waker, rateLimiter, wakeWaitMs: spawnWakeWaitMs, timeoutMs: sessionControlTimeoutMs,
     token: alertWebhook?.token ?? null, username: alertWebhook?.username ?? null,
   })
-  return async (req, res) => {
+  // Every request runs in its own scope (src/security-log.js), so a security
+  // event recorded anywhere under it carries the caller's address.
+  return (req, res) => withRequestScope(req, () => handle(req, res))
+  async function handle(req, res) {
     try {
       const url = new URL(req.url, 'http://x')
       if (handleWellKnown(req, res, url)) return
@@ -331,6 +335,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       // Disabled, it declines and the request meets the chain below exactly
       // as an unknown path would.
       if (await handleAlerts(req, res, url, { rejectEarly })) return
+      // The security event feed: its own read-only Bearer token, bound to one
+      // account, never a device token, so ahead of `who` too. Off, 404.
+      if (handleSecurityFeed({ db, feed: securityFeed, json }, req, res, url, { rejectEarly })) return
       const who = bearer(req) && authToken(db, bearer(req), { now: clientIdleClock(), clientIdleMs })
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       // The tracker's own surface (src/items-http.js) — mounted first so
