@@ -49,9 +49,14 @@ export async function refreshGithubAccount(db, github, userId, now = Date.now(),
     return { view: githubAccountView(db, userId), outcome: 'unchanged', error: { code: err.message } }
   }
   const hash = row.token_hash ?? tokenHash(token)
+  // GitHub's answer, good or bad, then the caller's check, before any
+  // write: the update below, and the stale mark in the catch.
+  let identity
+  let failed = null
+  try { identity = await github.fetchIdentity(token) } catch (err) { failed = err }
+  beforeSave()
   try {
-    const identity = await github.fetchIdentity(token)
-    beforeSave()
+    if (failed) throw failed
     const view = updateGithubIdentity(db, { userId, tokenHash: hash, identity, now })
     if (!view) return { view: githubAccountView(db, userId), outcome: 'unchanged' }
     return { view, outcome: 'ok' }

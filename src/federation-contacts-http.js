@@ -75,9 +75,7 @@ export async function handleInviteRoute(ctx, req, res, url, who) {
       const body = await readBody(req)
       if (typeof body.link !== 'string') return badRequest(res)
       if (path.endsWith('/open')) {
-        const preview = await fed.preview(who.userId, body.link)
-        recheckCaller(req)
-        json(res, 200, preview)
+        json(res, 200, await fed.preview(who.userId, body.link, { beforeSave: () => recheckCaller(req) }))
         return true
       }
       // The other journal is asked first; signed out, or the account
