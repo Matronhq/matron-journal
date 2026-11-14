@@ -13,6 +13,7 @@ import {
   githubIdentityBoundElsewhere, createLinkConfirm, takeLinkConfirm,
 } from './github-accounts.js'
 import { PLAIN_BOX, tokenHash } from './token-box.js'
+import { isPanicLocked } from './panic.js'
 
 const FLOWS = ['device', 'web']
 const notConfigured = (res) => { json(res, 404, { error: 'not_configured' }); return true }
@@ -205,6 +206,9 @@ export async function handleGithubCallback(ctx, req, res, url) {
     if (!parked) return redirect('/app/account?link_error=expired')
     if (body.decision !== 'link') return redirect('/app/account?link_error=denied')
     if (!github || !github.enabled) return redirect('/app/account?link_error=not_configured')
+    // A link flow started before a panic lock does not finish during it
+    // (src/panic.js); the parked row is already spent.
+    if (isPanicLocked(db, parked.user_id)) return redirect('/app/account?link_error=denied')
     try {
       saveGithubIdentity(db, { userId: parked.user_id, host: github.host, identity: parked.identity, token: parked.token, box: tokenBox })
     } catch (err) {
