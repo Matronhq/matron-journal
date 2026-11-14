@@ -1173,6 +1173,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           wakeIfOffline(msg.agent_device_id)
           return failRpc('agent_unreachable')
         }
+        // A session started on a box directly, not through a consent ask:
+        // once it has gone to the box (the security log).
+        if (msg.method === 'start') {
+          securityLog.record(conn.userId, 'session_started_direct', { deviceId: conn.deviceId, deviceName: conn.name, target: deviceTarget(msg.agent_device_id), decidedBy: 'user' })
+        }
         break
       }
       case 'agent_response': {
@@ -2439,6 +2444,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const waking = !online && wakeIfOffline(target.device_id)
         if (!online && !waking) return failRpc('agent_unreachable')
         conn.ws.send(JSON.stringify({ kind: 'session_control', event: 'sent', request_id: v.rid, ...(waking ? { target_waking: true } : {}) }))
+        // Accepted (the security log): a carry-on names its target session.
+        if (v.params.action === 'carry_on') {
+          securityLog.record(conn.userId, 'coordinator_carry_on', { deviceId: conn.deviceId, deviceName: conn.name, target: convoTarget(msg.target_convo_id), decidedBy: 'coordinator' })
+        }
         const fromName = sanitizePeerText(db.prepare('SELECT name FROM devices WHERE id=?').get(conn.deviceId)?.name || '', PEER_NAME_CAP) || 'coordinator'
         const params = { ...v.params, from_convo_id: msg.from_convo_id, from_name: fromName }
         // A carry-on is recorded before it is relayed, so the target's turn

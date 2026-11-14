@@ -17,6 +17,7 @@ import { appendAndBroadcast } from './journal.js'
 import { recordConsentDecision, CONSENT_DECISION_EVENT_TYPE } from './consent.js'
 import { consentApproval, chatAskRow, approvalColumn } from './consent-subject.js'
 import { ApprovalRefused } from './approval-keys.js'
+import { securityLogOf, deviceTarget } from './security-log.js'
 
 // Approvals of an ask aimed at a protected box (src/consent-subject.js):
 // the signature check and the state change it guards run in ONE
@@ -42,6 +43,15 @@ export function guardedApprove(db, check, apply) {
 }
 
 const byCoordinator = (decidedBy) => decidedBy?.kind === 'coordinator'
+
+// An approval that has committed (the security log): by the user's tap or
+// the Coordinator's answer, from the device that sent it, for the box it
+// lets in.
+function recordApproved(ctx, userId, event, decidedBy, boxId) {
+  securityLogOf(ctx).record(userId, event, {
+    deviceId: decidedBy?.deviceId ?? null, target: deviceTarget(boxId), decidedBy: byCoordinator(decidedBy) ? 'coordinator' : 'user',
+  })
+}
 const stamp = (decidedBy) => (byCoordinator(decidedBy) ? { answeredBy: 'coordinator', answerReason: decidedBy.reason } : {})
 
 // Exported for the transfer kind (src/transfer-consent.js), which answers
@@ -73,7 +83,7 @@ export function recordAndAnnounce({ db, hub }, { userId, kind, askId, decision, 
 // `approval` (the user's signed approval, src/consent-subject.js) counts
 // only on an approval of an ask aimed at a protected box; it is ignored on
 // a decline and on every other ask.
-export function answerChatAsk({ db, hub, waker, journalHost = null }, { userId, roomId, targetDeviceId, decision, decidedBy, approval = null }) {
+export function answerChatAsk({ db, hub, waker, journalHost = null, securityLog }, { userId, roomId, targetDeviceId, decision, decidedBy, approval = null }) {
   const room = db.prepare('SELECT owner_user_id, agent_device_id FROM conversations WHERE id=?').get(roomId)
   // Unknown room and a room owned by someone else are indistinguishable
   // (404, never 403) — same anti-enumeration stance as GET /convo/:id/messages.
@@ -104,6 +114,7 @@ export function answerChatAsk({ db, hub, waker, journalHost = null }, { userId, 
     },
     (signed) => answerParkedInvite(db, { convoId: roomId, agentDeviceId: targetDeviceId, approve: true, ...stamp(decidedBy), approval: approvalColumn(signed) }))
   if (refused) return refused
+  recordApproved({ db, securityLog }, userId, 'chat_approved', decidedBy, targetDeviceId)
   closeChatConsentItem({ db, hub }, roomId, targetDeviceId, { outcome: 'approved', answeredByDeviceId })
   recordAndAnnounce({ db, hub }, { userId, kind: 'chat', askId: `${roomId}/${targetDeviceId}`, decision, decidedBy, convoId: roomId, payload: { room_id: roomId, target_device_id: targetDeviceId } })
   // Join requests self-target (row.initiator_device_id === targetDeviceId,
@@ -127,7 +138,7 @@ export function answerChatAsk({ db, hub, waker, journalHost = null }, { userId, 
   return { status: 200, body: { ok: true, delivered } }
 }
 
-export function answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs, journalHost = null }, { userId, requestId, decision, decidedBy, approval = null }) {
+export function answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs, journalHost = null, securityLog }, { userId, requestId, decision, decidedBy, approval = null }) {
   const row = getSpawn(db, requestId)
   // Unknown id and another user's row are indistinguishable.
   if (!row || row.user_id !== userId) return { status: 404, body: { error: 'not_found' } }
@@ -155,6 +166,7 @@ export function answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, sp
     },
     (signed) => claimApprove(db, requestId, Date.now(), { ...stamp(decidedBy), approval: signed }))
   if (refused) return refused
+  recordApproved({ db, securityLog }, userId, 'spawn_approved', decidedBy, row.target_device_id)
   // The ask stopped waiting at the claim, so its tracker item closes now —
   // not at the outcome, which can be minutes away when the target box has
   // to be woken first. Left open, the item sits in the user's Decisions
