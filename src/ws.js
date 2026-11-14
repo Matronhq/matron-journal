@@ -790,10 +790,13 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
   // A bridge's locked-mode report on a later frame (box_status, status), for
   // its own device only: absent or malformed changes nothing, on:false
   // clears it (src/db.js parseLocked).
+  // → whether it applied one.
   const applyLocked = () => {
-    if (conn.kind !== 'agent' || msg.locked === undefined) return
+    if (conn.kind !== 'agent' || msg.locked === undefined) return false
     const locked = parseLocked(msg.locked)
-    if (locked !== undefined) setDeviceLocked(db, conn.deviceId, locked)
+    if (locked === undefined) return false
+    setDeviceLocked(db, conn.deviceId, locked)
+    return true
   }
   // Invite ops: validate a room id + load the row. Rooms are top-level
   // conversations of this conn's user; children (sub-chats) are silenced
@@ -1104,9 +1107,16 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // indistinguishable — anti-enumeration, same stance as the HTTP 404s.
         const target = db.prepare('SELECT user_id, kind FROM devices WHERE id=?').get(msg.agent_device_id)
         if (!target || target.user_id !== conn.userId || target.kind !== 'agent') return failRpc('not_found')
+        // approval_key_id: the approval key attached to the calling client
+        // device, or null, stamped from the journal's own tables like a
+        // user's journal event (hub.js agentJournalFrame); never the
+        // client's. A locked box binds its unlock window to it.
         const send = () => hub.sendRpcRequest(conn.userId, msg.agent_device_id, {
           kind: 'rpc',
-          request: { request_id: rid, from_device_id: conn.deviceId, method: msg.method, params: msg.params ?? null },
+          request: {
+            request_id: rid, from_device_id: conn.deviceId, approval_key_id: approvalKeyIdOfDevice(db, conn.userId, conn.deviceId),
+            method: msg.method, params: msg.params ?? null,
+          },
         })
         // A direct `start` on a protected box (src/consent-subject.js) is an
         // account action once the account has an approval key: the client
@@ -2378,12 +2388,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // sends the one payload for both.
         if (conn.kind !== 'agent') return fail('forbidden')
         // `locked` (the box's locked mode) rides here too, kept on the
-        // device row apart from the report: a report without it leaves it.
-        // A malformed one is ignored, and a frame with only `locked` is not
-        // an empty report.
-        applyLocked()
+        // device row apart from the report: a report without it leaves it,
+        // a malformed one is ignored. A valid `locked` alone is a report;
+        // a frame with nothing valid in it is the bad_request it always was.
+        const lockedOk = applyLocked()
         const status = sanitizeBoxStatus(msg)
-        if (!status && msg.locked !== undefined) break
+        if (!status && lockedOk) break
         if (!status) return fail('bad_request', 'no valid status block')
         const reportedAt = Date.now()
         upsertDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt })

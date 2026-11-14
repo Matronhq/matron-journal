@@ -360,10 +360,12 @@ test('revoking a device revokes its key; a sign-out that deletes the row only de
   revokeDevice(s.db, laptop.deviceId)
   assert.equal(activeKeyFor(s.db, alice.id, laptopKey.keyId), null)
 
-  // The user's revoke of one of their devices, from another.
+  // The user's revoke of one of their devices, from another: signed, once
+  // the account has a key (test/approval-lockdown.test.js has the rest).
   const tablet = signIn(s, alice.id, 'tablet')
   const tabletKey = await enrolKeyByPassword(s, { token: tablet.token, userId: alice.id, secret, name: 'tablet' })
-  const r = await s.http(`/devices/${tablet.deviceId}/revoke`, { method: 'POST', token })
+  const revokeApproval = await signAccount(s, { token, key, subject: { op: 'revoke_device', device: String(tablet.deviceId) } })
+  const r = await s.http(`/devices/${tablet.deviceId}/revoke`, { method: 'POST', token, body: { approval: revokeApproval } })
   assert.equal(r.status, 200)
   assert.equal(activeKeyFor(s.db, alice.id, tabletKey.keyId), null)
   assert.equal(notices(s, alice.id).at(-1).title, `Approval key removed: tablet ${tabletKey.keyId.slice(0, 8)}`)

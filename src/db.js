@@ -2372,12 +2372,12 @@ export function unreadBadge(db, userId) {
 // Roster for GET /devices — same devices+user_seq read as buildMetrics
 // (src/metrics.js), plus name/created_at, which metrics deliberately omits.
 // token_hash and user_id never leave this function.
-export function listDevices(db, userId) {
+export function listDevices(db, userId, now = Date.now()) {
   const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)
   const headSeq = head ? head.seq : 0
   return db.prepare(
     'SELECT id AS device_id, kind, name, tag_char, created_at, cursor, last_seen_at, protected, locked FROM devices WHERE user_id=? ORDER BY id'
-  ).all(userId).map((d) => ({ ...d, protected: d.protected === 1, locked: storedLocked(d.locked), lag: headSeq - d.cursor }))
+  ).all(userId).map((d) => ({ ...d, protected: d.protected === 1, locked: storedLocked(d.locked, now), lag: headSeq - d.cursor }))
 }
 
 // A box's locked mode as its bridge reports it (hello, status, box_status):
@@ -2397,9 +2397,13 @@ export function setDeviceLocked(db, deviceId, locked) {
   db.prepare('UPDATE devices SET locked=? WHERE id=?').run(locked?.on ? JSON.stringify(locked) : null, deviceId)
 }
 
-const storedLocked = (text) => {
+// What the device list shows: the stored report, or null when there is
+// none or its `until` has passed.
+const storedLocked = (text, now) => {
   if (text == null) return null
-  try { return parseLocked(JSON.parse(text)) ?? null } catch { return null }
+  let v
+  try { v = parseLocked(JSON.parse(text)) } catch { return null }
+  return v && (v.until == null || v.until > now) ? v : null
 }
 
 // Box status (spec: 2026-09-21 "usage and allowances live in the journal").

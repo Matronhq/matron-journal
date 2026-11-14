@@ -176,8 +176,10 @@ export function authToken(db, token, opts) {
 
 // Revoking a device revokes its approval keys (src/approval-keys.js) in the
 // same transaction. Only these two explicit revokes do: a password change or
-// reset deletes device rows too, but there the key stays enrolled, detached
-// (db.js devices_approval_detach), for the app to re-attach after signing in.
+// reset, a device signing itself out and the lockdown after invalid
+// approvals delete device rows too, but there the key stays enrolled,
+// detached (db.js devices_approval_detach), for the app to re-attach after
+// signing in (signOutOwnedDevice).
 const revokeDeviceKeys = (db, deviceId) =>
   db.prepare('UPDATE approval_keys SET revoked_at=? WHERE device_id=? AND revoked_at IS NULL').run(Date.now(), deviceId)
 
@@ -198,6 +200,17 @@ export function revokeOwnedDevice(db, userId, deviceId) {
     db.prepare('DELETE FROM devices WHERE id=?').run(deviceId)
     return true
   })()
+}
+
+// Owner-scoped sign-out that keeps the device's approval keys enrolled:
+// the row goes, its keys are left attached to no device (db.js
+// devices_approval_detach) for the app to re-attach after signing in again.
+// For a device signing itself out, and for the lockdown after invalid
+// approvals (src/approval-keys.js): neither may take the account's keys
+// away, or either would be a way back to an account with none. Same
+// boolean as revokeOwnedDevice.
+export function signOutOwnedDevice(db, userId, deviceId) {
+  return db.prepare('DELETE FROM devices WHERE id=? AND user_id=?').run(deviceId, userId).changes > 0
 }
 
 // Cosmetic rename, owner-scoped like revokeOwnedDevice. Returns false when

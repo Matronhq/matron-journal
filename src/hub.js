@@ -40,7 +40,9 @@ function agentMayReceive(conn, agentTargets) {
 // copy from another person). A locked box binds an unlock window to it.
 // Every other frame, and every frame to a client, is unchanged. The stamp
 // is set last, so nothing in `frame` can supply it. `keyIdOf` is asked only
-// for a user's event.
+// for a user's event. Only frames delivered over the socket carry it: an
+// agent reading history over HTTP gets events with no approval_key_id, and
+// absent means the same as null (the journal cannot say which key).
 export function agentJournalFrame(frame, keyIdOf = null) {
   if (typeof frame?.sender !== 'string' || !frame.sender.startsWith('user:')) return frame
   return { ...frame, approval_key_id: keyIdOf?.() ?? null }

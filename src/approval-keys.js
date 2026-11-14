@@ -9,7 +9,7 @@
 // that was handed to that same device and is spent by the check.
 import crypto from 'node:crypto'
 import { parseStatement, verifySignature } from './approvals.js'
-import { revokeDevice } from './auth.js'
+import { signOutOwnedDevice } from './auth.js'
 
 export const ALG = 'ES256'
 export const NONCE_TTL_MS = 5 * 60000
@@ -22,6 +22,14 @@ export const KEY_REQUEST_TTL_MS = 10 * 60000
 // to 1 h after seven days without a lock. Failure rows are kept seven days.
 export const DEVICE_FAILURE_WINDOW_MS = 10 * 60000
 export const DEVICE_FAILURE_LIMIT = 2
+// The reasons that count towards a device's sign-out: what only a forged or
+// tampered request sends. The others are stored but never count: `nonce` (a
+// slow network, a retry), `mismatch` (an agent edited the question while the
+// user signed) and `revoked_key` (revoked from another device meanwhile)
+// can each come from an honest app, and must not let an agent or a flaky
+// connection sign a phone out.
+export const COUNTED_REASONS = Object.freeze(['signature', 'bad_statement', 'unknown_key', 'wrong_device'])
+const COUNTED_SQL = COUNTED_REASONS.map((r) => `'${r}'`).join(',')
 export const ENROL_FAILURE_WINDOW_MS = 60 * 60000
 export const ENROL_FAILURE_LIMIT = 3
 export const ENROL_LOCK_MS = [1, 6, 24].map((h) => h * 60 * 60000)
@@ -81,10 +89,13 @@ const signedOutListeners = new WeakMap()
 export function onSignedOutForFailures(db, fn) { signedOutListeners.set(db, fn) }
 
 // Record one invalid approval from `who` and, when it is the second from
-// that client device within ten minutes, sign the device out: revokeDevice,
-// which revokes its approval keys with it. Only client devices count (an
-// agent never signs). → {device: {id, name}, keys} (the keys it revoked)
-// when it signed the device out, else null.
+// that client device within ten minutes with a reason that counts
+// (COUNTED_REASONS), sign the device out: its row goes, its approval keys
+// stay enrolled, detached (auth.js signOutOwnedDevice), so the lockdown is
+// never a way back to an account with no key. Only client devices are
+// recorded (an agent never signs). → {device: {id, name}, keys (detached),
+// reasons (the counted ones, oldest first)} when it signed the device out,
+// else null.
 export function recordApprovalFailure(db, who, reason, now = Date.now()) {
   const out = db.transaction(() => {
     const device = db.prepare("SELECT id, name FROM devices WHERE id=? AND user_id=? AND kind='client'").get(who.deviceId, who.userId)
@@ -93,12 +104,12 @@ export function recordApprovalFailure(db, who, reason, now = Date.now()) {
       .run(who.userId, device.id, device.name, String(reason), now)
     // Rows of an earlier sign-in that had this id lost it with their device
     // (db.js devices_approval_failures_detach).
-    const n = db.prepare('SELECT COUNT(*) AS n FROM approval_failures WHERE device_id=? AND user_id=? AND at > ? AND at <= ?')
-      .get(device.id, who.userId, now - DEVICE_FAILURE_WINDOW_MS, now).n
-    if (n < DEVICE_FAILURE_LIMIT) return null
+    const counted = db.prepare(`SELECT reason FROM approval_failures WHERE device_id=? AND user_id=? AND at > ? AND at <= ?
+      AND reason IN (${COUNTED_SQL}) ORDER BY at, id`).all(device.id, who.userId, now - DEVICE_FAILURE_WINDOW_MS, now)
+    if (counted.length < DEVICE_FAILURE_LIMIT) return null
     const keys = activeKeysOfDevice(db, who.userId, device.id)
-    revokeDevice(db, device.id)
-    return { device: { id: device.id, name: device.name }, keys }
+    signOutOwnedDevice(db, who.userId, device.id)
+    return { device: { id: device.id, name: device.name }, keys, reasons: counted.map((r) => r.reason) }
   })()
   if (out) signedOutListeners.get(db)?.(who.userId, out)
   return out
@@ -198,12 +209,14 @@ const invalid = (reason) => ({ ok: false, status: 400, body: { error: 'approval_
 // does not spend it. On success `approval` is {statement, signature} as
 // received, byte for byte, and `keyId` the key that signed.
 //
-// Every approval_invalid answer is also recorded against the calling
-// device (noteInvalid): the second within ten minutes signs it out. An
-// approval_required (nothing sent) is not.
+// Every approval_invalid answer to an account with an active key is also
+// recorded against the calling device (noteInvalid): the second of the
+// reasons that count within ten minutes signs it out. An approval_required
+// (nothing sent) is not recorded, nor is anything for an account with no
+// active key (a key route's check there is today's, and nothing else).
 export function checkApproval(ctx, who, approval, expect, opts) {
   const r = check(ctx, who, approval, expect, opts)
-  if (!r.ok && r.body.error === 'approval_invalid') noteInvalid(ctx, who, r.body.reason)
+  if (!r.ok && r.body.error === 'approval_invalid' && hasActiveKey(ctx.db, who.userId)) noteInvalid(ctx, who, r.body.reason)
   return r
 }
 

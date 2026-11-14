@@ -17,6 +17,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createAgent, createUser } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
@@ -71,7 +72,13 @@ const refused = (r, reason) => assert.deepEqual(r, { ok: false, status: 400, bod
 
 // ---- Per device ------------------------------------------------------------
 
-test('two invalid approvals from one device sign it out: its key revoked, a notice and a push; other devices untouched', async (t) => {
+// A statement the journal accepts in every way but its signature.
+const badSignature = async (s, token, key, subject) => {
+  const a = await signAccount(s, { token, key, subject })
+  return { ...a, signature: a.signature.slice(0, -6) + 'AAAAAA' }
+}
+
+test('two invalid approvals from one device sign it out: its key detached, not revoked; a notice naming the reasons, and a push; other devices untouched', async (t) => {
   const apns = makeStubApnsClient()
   const w = await world(t, { apnsClient: apns })
   const { s, alice } = w
@@ -84,29 +91,107 @@ test('two invalid approvals from one device sign it out: its key revoked, a noti
   assert.deepEqual(failures(s, w.deviceId).map((f) => [f.user_id, f.reason, f.device_name]), [[alice.id, 'bad_statement', 'phone']])
 
   // The second one is still answered as itself.
-  const wrong = await signAccount(s, { token: w.token, key: w.key, subject: { op: 'protect_device', device: String(w.box.deviceId), on: 'false' } })
-  invalid(await s.http(`/devices/${w.box.deviceId}/protected`, { method: 'POST', token: w.token, body: { on: true, approval: wrong } }), 'mismatch')
+  const subject = { op: 'protect_device', device: String(w.box.deviceId), on: 'true' }
+  invalid(await s.http(`/devices/${w.box.deviceId}/protected`, { method: 'POST', token: w.token, body: { on: true, approval: await badSignature(s, w.token, w.key, subject) } }), 'signature')
 
   assert.equal(await signedIn(s, w.token), false, 'the phone is signed out')
   assert.equal(s.db.prepare('SELECT 1 FROM devices WHERE id=?').get(w.deviceId), undefined)
   assert.equal(await signedIn(s, laptop.token), true, 'the laptop is not')
-  const keys = s.db.prepare('SELECT key_id, revoked_at FROM approval_keys ORDER BY id').all()
-  assert.equal(keys.find((k) => k.key_id === w.key.keyId).revoked_at > 0, true, 'the phone\'s key is revoked with it')
+  const keys = s.db.prepare('SELECT key_id, device_id, revoked_at FROM approval_keys ORDER BY id').all()
+  assert.deepEqual(keys.find((k) => k.key_id === w.key.keyId), { key_id: w.key.keyId, device_id: null, revoked_at: null }, 'the phone\'s key stays enrolled, attached to no device')
   assert.equal(keys.find((k) => k.key_id === laptopKey.keyId).revoked_at, null)
-  assert.equal(hasActiveKey(s.db, alice.id), true)
 
   const n = notices(s, alice.id)
   const out = n.find((x) => x.title === 'Signed out phone: invalid approval signatures')
   assert.ok(out, JSON.stringify(n.map((x) => x.title)))
-  assert.match(out.body, /approval key/i)
   assert.match(out.body, new RegExp(w.key.keyId.slice(0, 8)))
-  assert.ok(n.some((x) => x.title === `Approval key removed: phone ${w.key.keyId.slice(0, 8)}`), 'and the key removal, as any device revoke files it')
+  assert.match(out.body, /stays enrolled/)
+  assert.match(out.body, /attach/i)
+  assert.match(out.body, /malformed statement/)
+  assert.match(out.body, /signature that does not verify/)
+  assert.equal(n.some((x) => x.title.startsWith('Approval key removed')), false, 'no key was removed')
   await new Promise((r) => setTimeout(r, 50))
   assert.ok(apns.calls.some((c) => c.deviceToken === 'laptop-token' && /Signed out phone/.test(JSON.stringify(c.payload))), 'pushed to the other devices')
   // Reviewable later: both failures and their reasons stay, no longer tied
   // to a device id the next sign-in may be given.
   assert.deepEqual(s.db.prepare("SELECT device_id, reason FROM approval_failures WHERE device_name='phone' ORDER BY id").all(),
-    [{ device_id: null, reason: 'bad_statement' }, { device_id: null, reason: 'mismatch' }])
+    [{ device_id: null, reason: 'bad_statement' }, { device_id: null, reason: 'signature' }])
+
+  // Signed in again, the phone re-attaches its key with the key's own signature.
+  const again = signIn(s, alice.id, 'phone')
+  const approval = await signAccount(s, { token: again.token, key: w.key, subject: { op: 'attach_key', key_id: w.key.keyId } })
+  assert.equal((await s.http('/approval-keys/attach', { method: 'POST', token: again.token, body: { approval } })).status, 200)
+})
+
+test('a lockdown sign-out is no way back to unsigned: the only keyed device signed out, the account still has its key and a step-up tap still needs a signature', async (t) => {
+  const w = await world(t)
+  const { s, alice } = w
+  const laptop = signIn(s, alice.id, 'laptop')
+  invalid(await s.http('/approval-keys/attach', { method: 'POST', token: w.token, body: { approval: GARBAGE } }), 'bad_statement')
+  invalid(await s.http('/approval-keys/attach', { method: 'POST', token: w.token, body: { approval: GARBAGE } }), 'bad_statement')
+  assert.equal(await signedIn(s, w.token), false)
+  assert.equal(hasActiveKey(s.db, alice.id), true)
+  const item = (await s.http('/items', { method: 'POST', token: w.box.token, body: { convo_id: 'c1', kind: 'question', title: 'Go?', body: 'b', actions: ['Yes', 'No'], step_up: true } })).json.item
+  const r = await s.http(`/items/${item.id}/comments`, { method: 'POST', token: laptop.token, body: { action: 'Yes' } })
+  assert.deepEqual([r.status, r.json], [403, { error: 'approval_required' }])
+})
+
+test('only signature, bad_statement, unknown_key and wrong_device count; nonce, mismatch and revoked_key are stored but never sign a device out', async (t) => {
+  const w = await world(t)
+  const { s, alice } = w
+  const laptop = signIn(s, alice.id, 'laptop')
+  const laptopKey = await enrolKeyByPassword(s, { token: laptop.token, userId: alice.id, secret: w.secret, name: 'laptop' })
+  const subject = { op: 'protect_device', device: String(w.box.deviceId), on: 'true' }
+  const protect = (token, approval) => s.http(`/devices/${w.box.deviceId}/protected`, { method: 'POST', token, body: { on: true, approval } })
+  // An agent editing the question while the user signs, a retry, a key
+  // revoked elsewhere: an honest app can send each of these.
+  for (let i = 0; i < 3; i++) {
+    invalid(await protect(w.token, await signAccount(s, { token: w.token, key: w.key, subject: { ...subject, on: 'false' } })), 'mismatch')
+    const used = await signAccount(s, { token: w.token, key: w.key, subject })
+    s.db.prepare('UPDATE approval_nonces SET used_at=? WHERE nonce=?').run(Date.now(), JSON.parse(used.statement).nonce)
+    invalid(await protect(w.token, used), 'nonce')
+  }
+  const revokeLaptop = await signAccount(s, { token: laptop.token, key: laptopKey, subject: { op: 'revoke_key', key_id: laptopKey.keyId } })
+  const old = await signAccount(s, { token: laptop.token, key: laptopKey, subject })
+  assert.equal((await s.http(`/approval-keys/${laptopKey.keyId}/revoke`, { method: 'POST', token: laptop.token, body: { approval: revokeLaptop } })).status, 200)
+  invalid(await protect(laptop.token, old), 'revoked_key')
+  invalid(await protect(laptop.token, await signAccount(s, { token: laptop.token, key: laptopKey, subject })), 'revoked_key')
+  assert.equal(await signedIn(s, w.token), true)
+  assert.equal(await signedIn(s, laptop.token), true)
+  assert.deepEqual(failures(s, w.deviceId).map((f) => f.reason), ['mismatch', 'nonce', 'mismatch', 'nonce', 'mismatch', 'nonce'])
+  assert.deepEqual(failures(s, laptop.deviceId).map((f) => f.reason), ['revoked_key', 'revoked_key'])
+
+  // Three that count, from fresh devices, two of a kind each.
+  const stranger = generateApprovalKey()
+  const kinds = {
+    bad_statement: async () => GARBAGE,
+    unknown_key: (d) => signAccount(s, { token: d.token, key: stranger, subject }),
+    wrong_device: (d) => signAccount(s, { token: d.token, key: w.key, subject }),
+  }
+  for (const [reason, make] of Object.entries(kinds)) {
+    const d = signIn(s, alice.id, `dev-${reason}`)
+    invalid(await protect(d.token, await make(d)), reason)
+    assert.equal(await signedIn(s, d.token), true, reason)
+    invalid(await protect(d.token, await make(d)), reason)
+    assert.equal(await signedIn(s, d.token), false, `${reason} counts`)
+  }
+  // And signature, from the phone itself (the key's own device), after the
+  // mismatches and nonces that did not count.
+  invalid(await protect(w.token, await badSignature(s, w.token, w.key, subject)), 'signature')
+  assert.equal(await signedIn(s, w.token), true, 'mismatch and nonce before it did not count')
+  invalid(await protect(w.token, await badSignature(s, w.token, w.key, subject)), 'signature')
+  assert.equal(await signedIn(s, w.token), false)
+})
+
+test('an account with no key: a failed check on the key routes is not recorded and never signs a device out', async (t) => {
+  const { s, alice, token } = await startApprovalServer(t)
+  for (let i = 0; i < 3; i++) {
+    const r = await s.http('/approval-keys/attach', { method: 'POST', token, body: { approval: GARBAGE } })
+    assert.equal(r.json.error, 'approval_invalid')
+  }
+  assert.equal(await signedIn(s, token), true)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM approval_failures').get().n, 0)
+  assert.equal(notices(s, alice.id).length, 0)
 })
 
 test('a missing approval never counts; failures are per device', async (t) => {
@@ -124,7 +209,7 @@ test('a missing approval never counts; failures are per device', async (t) => {
   assert.equal(notices(s, alice.id).some((x) => x.title.startsWith('Signed out')), false)
 })
 
-test('the window is ten minutes, on the injected clock; a nonce failure counts and is recorded as such', async (t) => {
+test('the window is ten minutes, on the injected clock; a nonce failure is recorded as such and does not count', async (t) => {
   const w = await world(t)
   const { s, alice } = w
   const tablet = signIn(s, alice.id, 'tablet')
@@ -139,6 +224,8 @@ test('the window is ten minutes, on the injected clock; a nonce failure counts a
   const phone = { userId: alice.id, deviceId: w.deviceId, kind: 'client' }
   refused(requireApproval({ db: s.db, journalHost: TEST_JOURNAL, now: Date.now() + 10 * 60000 }, phone, { approval }, expect), 'nonce')
   assert.deepEqual(failures(s, w.deviceId).map((f) => f.reason), ['nonce'])
+  refused(requireApproval({ db: s.db, journalHost: TEST_JOURNAL, now: Date.now() + 10 * 60000 + 1 }, phone, { approval: GARBAGE }, expect), 'bad_statement')
+  assert.equal(await signedIn(s, w.token), true, 'a nonce and a bad statement: one that counts')
   refused(requireApproval({ db: s.db, journalHost: TEST_JOURNAL, now: t0 + DEVICE_FAILURE_WINDOW_MS + 2 }, who, { approval: GARBAGE }, expect), 'bad_statement')
   assert.equal(await signedIn(s, tablet.token), false, 'the third, a millisecond after the second')
   assert.equal(await signedIn(s, w.token), true)
@@ -378,12 +465,16 @@ test('a bridge reports locked in its hello and later updates; the device list sh
   await tick()
   assert.deepEqual(await lockedOf(box.deviceId), { on: true, until })
   assert.equal(await lockedOf(other.deviceId), null, 'never another device')
-  for (const bad of ['yes', { on: 'true' }, { on: true, until: -1 }, { on: true, until: 1.5 }, [true], null]) {
-    agent.send({ op: 'box_status', locked: bad })
-  }
+  const bads = ['yes', { on: 'true' }, { on: true, until: -1 }, { on: true, until: 1.5 }, [true], null]
+  for (const bad of bads) agent.send({ op: 'box_status', locked: bad })
   await tick()
   assert.deepEqual(await lockedOf(box.deviceId), { on: true, until }, 'malformed reports change nothing')
-  assert.equal(agent.frames.some((f) => f.op === 'error' && f.ref === 'box_status'), false, 'and are not errors either')
+  assert.equal(agent.frames.filter((f) => f.op === 'error' && f.ref === 'box_status' && f.code === 'bad_request').length, bads.length,
+    'and a box_status with nothing valid in it is a bad_request, as before')
+  // A malformed `locked` beside a valid report: the report lands, the lock stays.
+  agent.send({ op: 'box_status', locked: 'yes', disk: { free_bytes: 1, total_bytes: 2 } })
+  await tick()
+  assert.deepEqual(await lockedOf(box.deviceId), { on: true, until })
 
   upsertConversation(s.db, { id: 'c1', ownerUserId: alice.id, title: 'C1', agentDeviceId: box.deviceId })
   agent.send({ op: 'status', convo_id: 'c1', status: { model: 'x' }, locked: { on: true, until: until + 1 } })
@@ -392,6 +483,10 @@ test('a bridge reports locked in its hello and later updates; the device list sh
   agent.send({ op: 'box_status', locked: { on: false, until: null } })
   await tick()
   assert.equal(await lockedOf(box.deviceId), null, 'on:false clears it')
+  // Once its `until` has passed, the device list no longer shows it.
+  agent.send({ op: 'box_status', locked: { on: true, until: Date.now() - 1 } })
+  await tick()
+  assert.equal(await lockedOf(box.deviceId), null, 'an until in the past reads as null')
 
   // A client cannot report one, and a hello that is malformed only there
   // still connects.
@@ -409,9 +504,10 @@ test('a hello without locked clears what an earlier one reported', async (t) => 
   const { s, alice, token } = await startApprovalServer(t)
   const box = createAgent(s.db, alice.id, 'box-a')
   const lockedOf = async () => (await s.http('/devices', { token })).json.devices.find((d) => d.device_id === box.deviceId).locked
-  const one = await makeWsClient(s.base, { token: box.token, cursor: null, hello: { locked: { on: true, until: 5 } } })
+  const until = Date.now() + 60000
+  const one = await makeWsClient(s.base, { token: box.token, cursor: null, hello: { locked: { on: true, until } } })
   await one.waitFor((f) => f.op === 'hello_ok')
-  assert.deepEqual(await lockedOf(), { on: true, until: 5 })
+  assert.deepEqual(await lockedOf(), { on: true, until })
   one.close()
   const two = await makeWsClient(s.base, { token: box.token, cursor: null })
   t.after(() => two.close())
@@ -435,4 +531,97 @@ test('unlock, lock and clear_lockdown are ordinary RPCs: forwarded with params u
   }
   // The journal did not check the signature: its nonce is unspent.
   assert.equal(w.s.db.prepare('SELECT used_at FROM approval_nonces WHERE nonce=?').get(JSON.parse(approval.statement).nonce).used_at, null)
+})
+
+test('client RPCs reach the agent with approval_key_id: the calling device\'s key or null, never the client\'s', async (t) => {
+  const w = await world(t)
+  const { s, alice } = w
+  await w.protect()
+  const laptop = signIn(s, alice.id, 'laptop')
+  const phoneWs = await w.clientWs(w.token)
+  const laptopWs = await w.clientWs(laptop.token)
+  const approval = await signAccount(s, { token: w.token, key: w.key, subject: { op: 'unlock_box', box: 'box-a', minutes: '30' } })
+  phoneWs.send({ op: 'agent_request', request_id: 'u1', agent_device_id: w.box.deviceId, method: 'unlock', approval_key_id: 'forged', params: { approval } })
+  const u1 = await w.agentWs.waitFor((f) => f.kind === 'rpc' && f.request?.request_id === 'u1')
+  assert.equal(u1.request.approval_key_id, w.key.keyId)
+  assert.equal(u1.request.from_device_id, w.deviceId)
+  laptopWs.send({ op: 'agent_request', request_id: 'u2', agent_device_id: w.box.deviceId, method: 'unlock', params: { approval } })
+  assert.equal((await w.agentWs.waitFor((f) => f.kind === 'rpc' && f.request?.request_id === 'u2')).request.approval_key_id, null)
+  // A start on the protected box, signed: the request carries the stamp too.
+  const prompt = 'look at the logs'
+  const sha = (x) => crypto.createHash('sha256').update(x, 'utf8').digest('hex')
+  const startApproval = await signAccount(s, { token: w.token, key: w.key, subject: { op: 'start', box: 'box-a', workdir: '/w', prompt_sha256: sha(prompt) } })
+  phoneWs.send({ op: 'agent_request', request_id: 's1', agent_device_id: w.box.deviceId, method: 'start', params: { workdir: '/w', prompt, approval: startApproval } })
+  const s1 = await w.agentWs.waitFor((f) => f.kind === 'rpc' && f.request?.request_id === 's1')
+  assert.equal(s1.request.approval_key_id, w.key.keyId)
+  assert.deepEqual(s1.request.params, { workdir: '/w', prompt, approval: startApproval })
+})
+
+test('password-and-code guesses are taken one at a time: ten at once verify at most three, the rest are refused as locked', async (t) => {
+  const { s, alice, token } = await startApprovalServer(t)
+  const { secret } = await enableTwoFactor(s, token)
+  const wrong = totpCode(s, alice.id, secret) === '000000' ? '000001' : '000000'
+  const key = generateApprovalKey()
+  const all = await Promise.all(Array.from({ length: 10 }, () => s.http('/approval-keys', {
+    method: 'POST', token, body: { public_key: key.publicKey, name: 'phone', password: TEST_PASSWORD, code: wrong },
+  })))
+  const statuses = all.map((r) => r.status)
+  assert.equal(statuses.filter((x) => x === 403).length, 3, JSON.stringify(statuses))
+  assert.ok(all.filter((r) => r.status === 429).every((r) => r.json.error === 'enrolment_locked'), JSON.stringify(all.map((r) => r.json)))
+  assert.equal(statuses.filter((x) => x === 429).length, 7)
+})
+
+// ---- POST /devices/:id/revoke --------------------------------------------------
+
+test('with a key on the account, revoking another device is signed; unsigned changes nothing; signed revokes it with its key', async (t) => {
+  const w = await world(t)
+  const { s, alice } = w
+  const tablet = signIn(s, alice.id, 'tablet')
+  const tabletKey = await enrolKeyByPassword(s, { token: tablet.token, userId: alice.id, secret: w.secret, name: 'tablet' })
+  // Even the account's only other keyed device cannot strip the phone's key.
+  const r = await s.http(`/devices/${w.deviceId}/revoke`, { method: 'POST', token: tablet.token })
+  assert.deepEqual([r.status, r.json], [403, { error: 'approval_required' }])
+  assert.equal(await signedIn(s, w.token), true)
+  assert.equal(s.db.prepare('SELECT revoked_at FROM approval_keys WHERE key_id=?').get(w.key.keyId).revoked_at, null)
+  // Not owned and nonexistent stay the same 404, before any signature.
+  const bob = await createUser(s.db, 'bob', 'pw')
+  const bobBox = createAgent(s.db, bob.id, 'box-c')
+  assert.equal((await s.http(`/devices/${bobBox.deviceId}/revoke`, { method: 'POST', token: w.token })).status, 404)
+  // The subject names the device.
+  const other = await signAccount(s, { token: w.token, key: w.key, subject: { op: 'revoke_device', device: String(w.box.deviceId) } })
+  invalid(await s.http(`/devices/${tablet.deviceId}/revoke`, { method: 'POST', token: w.token, body: { approval: other } }), 'mismatch')
+  const approval = await signAccount(s, { token: w.token, key: w.key, subject: { op: 'revoke_device', device: String(tablet.deviceId) } })
+  const ok = await s.http(`/devices/${tablet.deviceId}/revoke`, { method: 'POST', token: w.token, body: { approval } })
+  assert.deepEqual([ok.status, ok.json], [200, { ok: true }])
+  assert.equal(await signedIn(s, tablet.token), false)
+  assert.ok(s.db.prepare('SELECT revoked_at FROM approval_keys WHERE key_id=?').get(tabletKey.keyId).revoked_at > 0)
+  assert.ok(notices(s, alice.id).some((n) => n.title === `Approval key removed: tablet ${tabletKey.keyId.slice(0, 8)}`))
+  // A bridge too.
+  const unsignedBox = await s.http(`/devices/${w.box.deviceId}/revoke`, { method: 'POST', token: w.token })
+  assert.deepEqual([unsignedBox.status, unsignedBox.json], [403, { error: 'approval_required' }])
+  const boxApproval = await signAccount(s, { token: w.token, key: w.key, subject: { op: 'revoke_device', device: String(w.box.deviceId) } })
+  assert.equal((await s.http(`/devices/${w.box.deviceId}/revoke`, { method: 'POST', token: w.token, body: { approval: boxApproval } })).status, 200)
+  assert.equal(s.db.prepare('SELECT 1 FROM devices WHERE id=?').get(w.box.deviceId), undefined)
+})
+
+test('signing yourself out needs no signature and detaches your key: the account keeps it', async (t) => {
+  const w = await world(t)
+  const { s, alice } = w
+  const r = await s.http(`/devices/${w.deviceId}/revoke`, { method: 'POST', token: w.token })
+  assert.deepEqual([r.status, r.json], [200, { ok: true }])
+  assert.equal(await signedIn(s, w.token), false)
+  assert.deepEqual(s.db.prepare('SELECT device_id, revoked_at FROM approval_keys WHERE key_id=?').get(w.key.keyId), { device_id: null, revoked_at: null })
+  assert.equal(hasActiveKey(s.db, alice.id), true)
+  assert.equal(notices(s, alice.id).some((n) => n.title.startsWith('Approval key removed')), false)
+})
+
+test('an account with no key: revoking any device is today\'s unsigned revoke', async (t) => {
+  const { s, alice, token } = await startApprovalServer(t)
+  const tablet = signIn(s, alice.id, 'tablet')
+  const box = createAgent(s.db, alice.id, 'box-a')
+  assert.equal((await s.http(`/devices/${tablet.deviceId}/revoke`, { method: 'POST', token })).status, 200)
+  assert.equal((await s.http(`/devices/${box.deviceId}/revoke`, { method: 'POST', token })).status, 200)
+  assert.equal(await signedIn(s, tablet.token), false)
+  assert.equal((await s.http(`/devices/${s.db.prepare("SELECT id FROM devices WHERE name='phone'").get().id}/revoke`, { method: 'POST', token })).status, 200)
+  assert.equal(await signedIn(s, token), false)
 })

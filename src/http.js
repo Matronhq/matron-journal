@@ -2,7 +2,7 @@ import { makeAgentCommentLimiter } from './agent-comment-limiter.js'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { pipeline } from 'node:stream/promises'
-import { checkPassword, makeRateLimiter, makeKeyedQueue, authToken, clientIdleExpired, preparePasswordChange, applyPasswordChange, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
+import { checkPassword, makeRateLimiter, makeKeyedQueue, authToken, clientIdleExpired, preparePasswordChange, applyPasswordChange, revokeOwnedDevice, signOutOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL } from './journal.js'
 import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, isPrivateDevice, deviceStatuses, setDeviceProtected } from './db.js'
 import { receiveBlob } from './media.js'
@@ -35,7 +35,7 @@ import { handleUsersRoute } from './users-http.js'
 import { handlePasswordResetRoute, handleAccountEmailRoute } from './password-reset-http.js'
 import { handleTwoFactorLogin, handleTwoFactorRoute, twoFactorRequiredNow } from './two-factor-http.js'
 import { handleApprovalKeysRoute, announceKey } from './approval-keys-http.js'
-import { activeKeysOfDevice, guardedAccountAction, refuse } from './approval-keys.js'
+import { activeKeysOfDevice, guardedAccountAction, hasActiveKey, refuse } from './approval-keys.js'
 import { isTwoFactorEnabled, makeTwoFactorTickets } from './two-factor.js'
 import { PLAIN_BOX } from './token-box.js'
 import { githubAccountView } from './github-accounts.js'
@@ -367,7 +367,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       if (await handleTwoFactorRoute({ db, tokenBox: twoFactorBox, loginGuard, journalHost }, req, res, url, who)) return
       // Approval keys (src/approval-keys-http.js). `journalHost` is the host of
       // the configured public URL, null while approval keys are off.
-      if (await handleApprovalKeysRoute({ db, hub, pushPipeline, tokenBox: twoFactorBox, loginGuard, journalHost }, req, res, url, who)) return
+      if (await handleApprovalKeysRoute({ db, hub, pushPipeline, tokenBox: twoFactorBox, loginGuard, journalHost, passwordChecks }, req, res, url, who)) return
       // Cloud speech for voice mode (src/tts-http.js): client devices only.
       if (await handleTtsRoute({ tts }, req, res, url, who)) return
       if (req.method === 'GET' && url.pathname === '/me') {
@@ -770,9 +770,37 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // revocation"): HTTP 401s on the next call, WS closes next-frame or
         // via the ≤60s sweep. Not-owned and nonexistent are indistinguishable.
         const revokedId = Number(dm[1])
-        // Its approval keys are revoked with it (auth.js), each with a notice.
-        const keys = activeKeysOfDevice(db, who.userId, revokedId)
-        if (!revokeOwnedDevice(db, who.userId, revokedId)) return json(res, 404, { error: 'not_found' })
+        // Once the account has an approval key, a revoke must not be a way
+        // back to an account without one. Signing YOURSELF out needs no
+        // signature and leaves your keys enrolled, detached, for the app to
+        // re-attach after signing in again (auth.js signOutOwnedDevice).
+        // Revoking ANOTHER device (a client or a bridge) is an account
+        // action, {op:'revoke_device', device}, and revokes its keys with
+        // it. An account with no key: today's unsigned revoke.
+        if (revokedId === who.deviceId && hasActiveKey(db, who.userId)) {
+          if (!signOutOwnedDevice(db, who.userId, revokedId)) return json(res, 404, { error: 'not_found' })
+          return json(res, 200, { ok: true })
+        }
+        let keys
+        if (hasActiveKey(db, who.userId)) {
+          const body = await readBody(req)
+          const g = guardedAccountAction({ db, journalHost }, who, body, { op: 'revoke_device', device: String(revokedId) }, {
+            // Not owned and nonexistent are the same 404, before any
+            // signature is looked at (anti-enumeration, as below).
+            check: () => { if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(revokedId, who.userId)) refuse(404, { error: 'not_found' }) },
+            write: () => {
+              const live = activeKeysOfDevice(db, who.userId, revokedId)
+              if (!revokeOwnedDevice(db, who.userId, revokedId)) refuse(404, { error: 'not_found' })
+              return live
+            },
+          })
+          if (!g.ok) return json(res, g.status, g.body)
+          keys = g.value
+        } else {
+          // Its approval keys are revoked with it (auth.js), each with a notice.
+          keys = activeKeysOfDevice(db, who.userId, revokedId)
+          if (!revokeOwnedDevice(db, who.userId, revokedId)) return json(res, 404, { error: 'not_found' })
+        }
         for (const key of keys) announceKey({ db, hub, pushPipeline }, who.userId, key, { added: false, how: 'with the device it was on' })
         // Room membership goes with it, via the convo_agents cascade in
         // db.js — not a call here. This route used to do the cleanup itself,
