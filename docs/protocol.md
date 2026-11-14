@@ -4315,9 +4315,11 @@ needs the user's own approval, signed once the account has a key.
 | inviting a guest box on accepting a person-room ask or a talk request (on one journal or across journals) | `409 {error:'conflict', blocked_by:'protected_device'}`; nothing changes and the ask stays as it was |
 
 Where the journal first wakes an asleep box and waits for it (a routine, an
-alert, a hand-over's or a talk's session start), it checks again once the
-wait is over: a box protected meanwhile gets nothing, with the same outcome
-as above.
+alert, a hand-over's or a talk's session start, a Coordinator's
+`session_control`), it checks again once the wait is over: a box protected
+meanwhile gets nothing, with the same outcome as above (for
+`session_control`, the result frame with `error: {code:'forbidden',
+detail:'protected_device'}`).
 
 **With a key**, an ask **aimed at** a protected box needs a signed
 `consent` statement to be approved. Aimed at means: a spawn's target box; a
@@ -4922,7 +4924,7 @@ back.
 | `chat_approved` | An approve of an agent-chat consent ask (as above), `matron-admin agent-chat approve`. | `box:<name of the invited box>` | `user`, `coordinator`, `admin_cli` |
 | `transfer_approved` | An approve of a file-transfer consent ask (the card's button, the Coordinator's `POST /consent/answer`). Not a decline. | `transfer:<id>` | `user`, `coordinator` |
 | `session_started_direct` | A client's `agent_request` with `method: 'start'` forwarded to a box. | `box:<name of the box>` | `user` |
-| `coordinator_carry_on` | A Coordinator `session_control` `carry_on` the journal accepted (`sent`). | `convo:<target session>` | `coordinator` |
+| `coordinator_carry_on` | A Coordinator `session_control` `carry_on` the journal handed to the target box's live socket (after any wake). Not one refused, before or after the wake, nor one whose box never came up. | `convo:<target session>` | `coordinator` |
 | `approval_key_enrolled` | A key enrolled by the password and a TOTP code, or approved by an enrolled key (the approving device named). | `key:<8>` | `user` |
 | `approval_key_revoked` | `POST /approval-keys/:key_id/revoke` (signed or by password); each key revoked with its device by `POST /devices/:id/revoke` or `matron-admin device revoke`; `matron-admin approval-key revoke`. | `key:<8>` | `user`, `admin_cli` |
 | `approval_key_attached` | `POST /approval-keys/attach`. | `key:<8>` | `user` |
@@ -4998,19 +5000,20 @@ at start (the token is never printed). With the configured account not
 ### The routes
 
 Both take `Authorization: Bearer <panic token>` and are handled before
-device authentication, exactly as the security feed is: a missing or wrong
-token is **401** `unauthenticated` and counts against the caller address's
-budget, the one `/login`, the alerts webhook and the security feed share;
-once it is spent every request from that address is **429**
-`rate_limited`, the right token included. The token is compared in
-constant time. It is not a device token and authenticates nothing else
+device authentication. The token is compared first, in constant time. A
+missing or wrong token is **401** `unauthenticated` and counts against the
+caller address's budget, the one `/login`, the alerts webhook and the
+security feed share; once it is spent, a missing or wrong token from that
+address is **429** `rate_limited`. The right token is never charged to
+the budget and never answered 429, so bad guesses from an address cannot
+keep the watcher there from locking (unlike the security feed, where a
+spent budget refuses the right token too). It is not a device token and authenticates nothing else
 (every other route answers it 401, a WebSocket `hello` with it gets
 `code:'auth'`); no device token, feed token or admin's token can call
 `/panic` (each is 401).
 
 `POST /panic` with the JSON body `{"source": <string>, "alert": <string>}`
-(both optional, `null` meaning absent; each stored to at most 200
-characters, a longer one cut there; any other key ignored) →
+(both optional, `null` meaning absent; any other key ignored) →
 
 ```
 200 {"ok":true,"locked":true,"already_locked":<bool>,"devices_revoked":<int>,"bridges_notified":<int>}
@@ -5018,7 +5021,12 @@ characters, a longer one cut there; any other key ignored) →
 
 A body that is not JSON or not an object, or a `source` or `alert` that is
 not a string, is **400** `bad_request` and locks nothing. No body at all
-locks with both null.
+locks with both null. `source` and `alert` are sieved before they are
+stored: control characters become spaces, bidi and other format
+characters are removed (the zero-width joiners emoji need are kept),
+whitespace runs collapse to one space, and the result is cut to 200
+characters; one with nothing left is stored as null. The frames, the
+security line and `matron-admin panic status` carry the sieved text.
 
 In one transaction it records the lock (unless the account is already
 locked), signs out every client device of the account and turns both
@@ -5031,6 +5039,27 @@ with no device (`device_id` null), so after the clear the owner signs in
 again and re-attaches them (`POST /approval-keys/attach`). Approval keys
 are never revoked by a panic. Agent (bridge) devices are not signed out.
 A two-factor sign-in started before the lock cannot be finished.
+
+Nothing approved before the lock takes effect, during it or after the
+clear; the asker can ask again. Right after the transaction commits, for
+the account:
+
+- a chat invite approved but not yet delivered to its box is finished as
+  refused: the initiator gets
+  `{"kind":"invite","event":"answer","room_id","peer_device_id","accept":false,"reason":"refused"}`,
+  exactly as a decline tells it (for a room with another person's agent,
+  that agent is told as when the guest refuses);
+- a spawn approved but not yet started fails: the parent gets its
+  `spawn_outcome` with `outcome: 'failed'`, `error_code: 'account_locked'`;
+  a start still waiting on a wake finds its spawn failed and sends
+  nothing, even if the lock was cleared meanwhile;
+- a file transfer approved but not yet released is declined as a user's
+  decline is: its bytes go, the sender gets
+  `{"kind":"transfer","event":"declined","transfer_id","reason":"Declined: the account is locked."}`,
+  the room a notice, and it is never released or used to wake a box.
+
+The delivery pump and the transfer release do the same whenever they meet
+such work of a locked account.
 
 It is idempotent. A call while the account is locked keeps the lock as it
 is (its `since`, `source` and `alert`), answers the same shape with
@@ -5086,6 +5115,8 @@ clear. Agents may keep sending their own events.
   account, it sends that socket `{"kind":"panic","on":true,"since":<ms>}`
   (no `source`), then closes it as a revoked device's socket is closed:
   `{"kind":"control","op":"error","code":"revoked"}` and close code 4001.
+  A socket still replaying its history when the lock commits gets the same
+  as soon as its replay ends.
 - Any HTTP request made with a client token of a locked account (a race,
   or a device created by a path that slipped through) answers
   `423 {"error":"account_locked","since":<ms>}`, and the device is signed
@@ -5097,6 +5128,9 @@ clear. Agents may keep sending their own events.
   `{"kind":"control","op":"error","code":"account_locked","ref":<op>,"request_id"?:<id>,"since":<ms>}`
   (`request_id` echoed when the frame had a well-formed one, as for an
   `agent_request`), then the panic frame and the revoked close above.
+- A request authenticated before the lock whose body arrives after it is
+  refused the same way, `423 {"error":"account_locked","since":<ms>}`,
+  before the route acts on the body; the device is signed out.
 - Sign-in, link and pair refusals (below) are
   `423 {"error":"account_locked","since":<ms>}`.
 
@@ -5112,29 +5146,30 @@ it, the lock is checked again after the wait.
 
 | Path | Refusal |
 |---|---|
-| `POST /login` | `423 {"error":"account_locked","since"}` before the password is checked, whether it is right or wrong; not counted toward the sign-in lockout |
+| `POST /login` | `423 {"error":"account_locked","since"}` at once, before the password is checked, whether it is right or wrong; not counted toward the sign-in lockout. So the answer says, to anyone, that the account exists and is locked: by design, it is no password oracle. A lock that commits while the password is being verified is checked again after: 423, no device |
 | `POST /login/2fa`, `/login/2fa/setup`, `/login/2fa/enable` | `423 {"error":"account_locked","since"}` once the ticket is known, before the code is checked or counted. A ticket issued before the lock was dropped by it (`401 two_factor_ticket_invalid`) |
+| `POST /password/reset` (completing an email reset) | `423 {"error":"account_locked","since"}`, checked once the token is known to be valid (an invalid one answers `400 invalid_token` as ever), and again after the new password is hashed; the token is left unused for after the clear |
 | `POST /link/claim` (a starter's code or a pre-approved one) | `423 {"error":"account_locked","since"}`; the code is left as it was |
 | `POST /link/poll` for a link claimed or approved before the lock | `423 {"error":"account_locked","since"}`; the link is spent, no device is made |
 | `POST /pair/claim` for a pair approved before the lock | `423 {"error":"account_locked","since"}`; the pair is spent, no device is made |
 | any request or `hello` with a client token of the account (`/link/start`, `/link/approve`, `/pair/approve`, consent taps, every other route) | see *What clients see* |
-| the Coordinator's `POST /consent/answer` (spawn, chat or transfer) | `403 {"error":"forbidden","detail":"account_locked","since"}`, after the ownership and role checks, before the consent switch |
+| the Coordinator's `POST /consent/answer` (spawn, chat or transfer), approve **and decline** | `403 {"error":"forbidden","detail":"account_locked","since"}`, after the ownership and role checks, before the consent switch. `GET /consent/pending` is not refused for the lock: it answers as the switch says (the lock turned it off: `403 {"error":"forbidden","detail":"consent_disabled"}`) |
 | an approval of a spawn, chat or transfer ask by any path (the answer itself, user or Coordinator) | `403 {"error":"forbidden","detail":"account_locked","since"}`; the ask stays waiting |
-| a spawn approved before the lock whose `start` has not gone out | not sent; the spawn fails with `error_code: 'account_locked'` |
-| an approved chat invite not yet delivered | held, undelivered, until the lock is cleared |
+| a spawn approved before the lock whose `start` has not gone out | not sent, no box woken; the spawn fails with `error_code: 'account_locked'` (above) |
+| an approved chat invite not yet delivered | refused, the initiator told `refused` (above); never delivered, after the clear either |
+| an approved file transfer not yet released | declined, the sender told (above); never released, after the clear either |
 | a client's `agent_request` (every method) | `{"kind":"control","op":"error","code":"account_locked","ref":"agent_request","request_id","since"}` |
-| Coordinator `session_control` | `{"kind":"control","op":"error","code":"forbidden","ref":"session_control","request_id","detail":"account_locked","since"}` (after the existing checks); locked during the wake wait: the result frame `{"kind":"session_control","event":"result","request_id","ok":false,"error":{"code":"forbidden","detail":"account_locked"}}` |
-| a routine's fire (scheduled, triggered or `POST /routines/:key/run`) | not sent, never retried; `last_outcome` (and the `fired` marker's `outcome`) is `account_locked`, and `run` answers `202 {"delivered":false,"reason":"account_locked"}` |
-| `POST /alerts/alertmanager` | `202 {"delivered":false,"reason":"account_locked"}`, not sent |
+| Coordinator `session_control` | `{"kind":"control","op":"error","code":"forbidden","ref":"session_control","request_id","detail":"account_locked","since"}` (after the existing checks); locked (or the box protected) during the wake wait: nothing is sent, and the result frame is `{"kind":"session_control","event":"result","request_id","ok":false,"error":{"code":"forbidden","detail":"account_locked"}}` (`protected_device` for protection); a carry-on not sent records no `coordinator_carry_on` |
+| a routine's fire (scheduled, triggered or `POST /routines/:key/run`) | not sent, never retried; `last_outcome` (and the `fired` marker's `outcome`) is `account_locked`, and `run` answers `202 {"delivered":false,"reason":"account_locked"}`. The lock is checked first, ahead of `no_coordinator` and `protected_device` |
+| `POST /alerts/alertmanager` | `202 {"delivered":false,"reason":"account_locked"}`, not sent; checked first, ahead of `no_coordinator` and `protected_device` |
 | a mission hand-over's session start | `start_session: {"status":"refused","reason":"account_locked"}`; the hand-over itself still goes through |
 | a talk request's **New session** | no start is sent; the guest's card reads "Couldn't start a session: account_locked. Pick another option." |
 | inviting a guest box of the account on accepting a person-room ask or a talk request (on one journal or across journals) | `409 {"error":"conflict","blocked_by":"account_locked"}`; the ask stays as it was |
 
 `POST /password/forgot` is left as it is, so its answer for a locked
 account is the same as for any other (no oracle): the mail goes out as
-usual. Completing a reset (`POST /password/reset`) signs nothing in, so
-it is not refused either: the new password works once the lock is
-cleared. The web admin's `/users/*` routes act on the account as before.
+usual. Completing the reset is refused (above) until the lock is cleared.
+The web admin's `/users/*` routes act on the account as before.
 
 ### Clearing
 
@@ -5148,9 +5183,13 @@ matron-admin panic clear <user>    # clears it; on an account that is not locked
 The CLI writes the database; it has no connection to the running journal.
 The journal reads the lock from the database at every check, so sign-in
 and the rest work again at once, and its periodic sweep (the one that
-closes revoked devices' sockets, every 60 seconds) sends
-`{"kind":"panic","on":false}` once to each connected agent of an account
-whose lock it had announced and that is now cleared. A journal restarted
+closes revoked devices' sockets, every 60 seconds; this is its first step,
+apart from the rest, so nothing else in the sweep can skip it) sends
+`{"kind":"panic","on":false}` once to each connected agent socket of an
+account whose lock it had announced and that is now cleared, and only to
+sockets that were told it was locked (by the frame or `hello_ok`'s key);
+a socket that already had the clear (a reconnect cleared mid-replay gets
+it as soon as its replay ends) does not get it again. A journal restarted
 in between announces nothing: a bridge reconnecting gets a `hello_ok`
 without the key.
 
