@@ -223,6 +223,15 @@ export function signOutOwnedDevice(db, userId, deviceId) {
   return db.prepare('DELETE FROM devices WHERE id=? AND user_id=?').run(deviceId, userId).changes > 0
 }
 
+// A new token for a client device, the old one dead at once: the row, and
+// with it the device's approval keys and push registration, stays. → the
+// new token, or null when the device is not this user's client device.
+export function rotateClientToken(db, userId, deviceId) {
+  const token = newToken()
+  const changed = db.prepare("UPDATE devices SET token_hash=? WHERE id=? AND user_id=? AND kind='client'").run(sha256(token), deviceId, userId).changes
+  return changed ? token : null
+}
+
 // Cosmetic rename, owner-scoped like revokeOwnedDevice. Returns false when
 // the device is not this user's (or does not exist) — the caller cannot
 // distinguish the two, same anti-enumeration stance as revoke. A remembered

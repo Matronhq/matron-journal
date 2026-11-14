@@ -829,7 +829,7 @@ export function attachWs({
           const lock = panicLock(db, conn.userId)
           if (lock) {
             // The refusal first: the sign-out closes the device's sockets.
-            const frozen = isFrozenDevice(db, conn.userId, conn.deviceId)
+            const frozen = isFrozenDevice(db, conn.userId, conn.deviceId, lock)
             conn.ws.send(JSON.stringify(lockedError(lock, frozen, { ref: msg.op, ...requestIdEcho(msg) })))
             if (!frozen) signOutLockedClient({ db, hub, securityLog }, conn.userId, conn.deviceId, lock)
             if (frozen) conn.ws.close()

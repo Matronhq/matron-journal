@@ -256,7 +256,7 @@ test('the stored source and alert are at most 200 characters each', async (t) =>
 
 // ---- The lock -----------------------------------------------------------------------
 
-test('POST /panic: client devices signed out, their sockets closed, a device with an approval key frozen, agents told, switches off; idempotent; another account untouched', async (t) => {
+test('POST /panic: client devices signed out (keys detached), their sockets closed, agents told, switches off; idempotent; another account untouched', async (t) => {
   const { s, alice, bob, cap } = await journal(t, { tokenKey: 'ab'.repeat(32), publicUrl: 'https://journal.example' })
   // alice: a phone with an approval key, a laptop with an open socket, two
   // connected boxes and one that is not connected.
@@ -284,21 +284,19 @@ test('POST /panic: client devices signed out, their sockets closed, a device wit
   const before = Date.now()
   const r = await lockIt(s, { source: 'watcher-1', alert: 'disk wiped on box-a' })
   assert.equal(r.status, 200)
-  assert.deepEqual(r.json, { ok: true, locked: true, already_locked: false, devices_revoked: 1, devices_frozen: 1, bridges_notified: 2 })
+  assert.deepEqual(r.json, { ok: true, locked: true, already_locked: false, devices_revoked: 2, devices_frozen: 0, bridges_notified: 2 })
   assert.deepEqual(Object.keys(r.json), ['ok', 'locked', 'already_locked', 'devices_revoked', 'devices_frozen', 'bridges_notified'])
-  // The laptop is gone, its open socket closed as a revoked one is; the
-  // phone, which holds an approval key, is frozen (test/panic-unlock.test.js).
-  assert.equal(clientCount(s, alice.id), 1)
+  // Client devices gone, the open socket closed as a revoked one is.
+  assert.equal(clientCount(s, alice.id), 0)
   assert.equal(await laptopClosed, 4001)
   // Told first that the account is locked (no source), then closed as a
   // revoked device's socket is.
   const lf = laptopWs.frames.filter((f) => f.kind === 'panic' || (f.kind === 'control' && f.op === 'error'))
   assert.deepEqual(lf, [{ kind: 'panic', on: true, since: lockedSince(s) }, { kind: 'control', op: 'error', code: 'revoked' }])
-  assert.equal((await s.http('/me', { token: laptop.token })).status, 401)
-  assert.deepEqual((await s.http('/me', { token: phone.token })).json, { ...LOCKED(s), unlock: true })
-  // The approval key stays enrolled, on the frozen phone.
+  assert.equal((await s.http('/me', { token: phone.token })).status, 401)
+  // The approval key stays enrolled, detached.
   const k = s.db.prepare('SELECT device_id, revoked_at FROM approval_keys WHERE key_id=?').get(key.keyId)
-  assert.deepEqual(k, { device_id: phone.deviceId, revoked_at: null })
+  assert.deepEqual(k, { device_id: null, revoked_at: null })
   assert.equal(hasActiveKey(s.db, alice.id), true)
   // Agents stay; each connected one got exactly the frame.
   assert.equal(s.db.prepare("SELECT COUNT(*) n FROM devices WHERE user_id=? AND kind='agent'").get(alice.id).n, 3)
@@ -320,7 +318,7 @@ test('POST /panic: client devices signed out, their sockets closed, a device wit
 
   // Again: the same shape, nothing revoked, the frame sent again.
   const again = await lockIt(s, { source: 'watcher-2' })
-  assert.deepEqual(again.json, { ok: true, locked: true, already_locked: true, devices_revoked: 0, devices_frozen: 1, bridges_notified: 2 })
+  assert.deepEqual(again.json, { ok: true, locked: true, already_locked: true, devices_revoked: 0, devices_frozen: 0, bridges_notified: 2 })
   await a.w.waitFor((f) => f.kind === 'panic' && panicFrames(a.w).length === 2)
   assert.deepEqual(panicFrames(a.w)[1], panicFrames(a.w)[0])
   assert.deepEqual((await panicStatus(s)).json, st)

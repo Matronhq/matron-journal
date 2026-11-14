@@ -2,7 +2,7 @@
 // and its signed clear (POST /panic/unlock) (docs/protocol.md "Panic lock"). Apart from src/panic.js, the state and
 // its checks, because locking finishes the account's approved work through
 // modules that themselves check the lock.
-import { sharedTokenMatches, signOutOwnedDevice } from './auth.js'
+import { sharedTokenMatches, signOutOwnedDevice, rotateClientToken } from './auth.js'
 import { requestSourceIp, deviceTarget } from './security-log.js'
 import { getConsentEnabled, setConsentEnabled, getTransferConsentEnabled, setTransferConsentEnabled } from './consent.js'
 import { readBody } from './http-body.js'
@@ -10,10 +10,11 @@ import { sanitizeConsentText } from './peer-text.js'
 import { refuseLockedInvites } from './invite-delivery.js'
 import { failApprovedSpawns } from './spawns.js'
 import { declineApprovedTransfers } from './transfer-consent.js'
-import { guardedAccountAction, refuse } from './approval-keys.js'
+import { guardedAccountAction, refuse, activeKeysOfDevice } from './approval-keys.js'
+import { parseStatement } from './approvals.js'
 import {
   PANIC_TEXT_MAX, ACCOUNT_LOCKED, PANIC_OFF_FRAME, panicLock, isPanicLocked, panicOnFrame, panicAnnounced, sendToAgents,
-  closeDeviceSockets, closeFrozenSockets, isFrozenDevice, clearPanic,
+  closeDeviceSockets, closeFrozenSockets, isFrozenDevice, keyUnlocks, clearPanic,
 } from './panic.js'
 
 // The watcher's text as stored: control characters (C0 and, here only, C1),
@@ -31,9 +32,10 @@ const clip = (s) => {
 // then the frames and the security events. Idempotent: a call while locked
 // keeps the lock as it is, signs out any client device that has appeared
 // since, turns a switch that was turned back on off again, and sends the
-// frame again. A client device with an approval key attached is frozen,
-// not signed out (src/panic.js isFrozenDevice): it can clear the lock with
-// a signed statement (handlePanicUnlock below).
+// frame again. A client device with an approval key attached that was
+// enrolled at least a day before the lock is frozen, not signed out
+// (src/panic.js isFrozenDevice): it can clear the lock with a signed
+// statement (handlePanicUnlock below).
 // → {alreadyLocked, devicesRevoked, devicesFrozen, bridgesNotified}.
 export function lockAccount({ db, hub, securityLog, signInTickets = null, mediaDir = null, pairs = null, links = null }, userId, { source = null, alert = null, now = Date.now() } = {}) {
   let alreadyLocked = false
@@ -50,9 +52,11 @@ export function lockAccount({ db, hub, securityLog, signInTickets = null, mediaD
     // Every client device, signed out as a device signing itself out is:
     // its approval keys stay enrolled, detached, for the owner to re-attach
     // after signing in again once the lock is cleared. Agent devices stay,
-    // and so does a client device that holds an approval key: frozen.
+    // and so does a client device that holds an approval key old enough
+    // to count under this lock: frozen.
+    const held = panicLock(db, userId)
     const clients = db.prepare("SELECT id FROM devices WHERE user_id=? AND kind='client' ORDER BY id").all(userId).map((r) => r.id)
-    frozen = clients.filter((id) => isFrozenDevice(db, userId, id))
+    frozen = clients.filter((id) => isFrozenDevice(db, userId, id, held))
     revoked = clients.filter((id) => !frozen.includes(id) && signOutOwnedDevice(db, userId, id))
     // Both Coordinator switches off; nothing is remembered, so they stay
     // off after a clear until the owner turns them on again.
@@ -131,13 +135,17 @@ export async function handlePanic({ db, hub, panic, json, rateLimiter = null, se
 // POST /panic/unlock (a device token, client devices only; there whether
 // or not the panic token is configured): a frozen device clears the lock
 // with an account statement over {op:'clear_panic', since:<the lock's
-// since>} signed by the approval key attached to it. A signature is always
-// needed: a device with no key attached, or a body with no approval, is
-// 403 approval_required, whatever keys the account has. The clear and the
+// since>} signed by an approval key attached to it that counts under the
+// lock (enrolled a day before it, src/panic.js). A signature by such a key
+// is always needed: a body with no approval, a device that is not frozen,
+// or a statement signed by a younger key on the same device, is 403
+// approval_required, whatever keys the account has. The clear, the
 // sign-out of every other client device of the account (their approval
-// keys detached, not revoked) are one transaction with the check; then
-// their sockets close as a revoked device's do and the account's bridges
-// get the clear frame at once. The consent switches stay off.
+// keys detached, not revoked) and a new token for the calling device are
+// one transaction with the check, so every client token that existed at
+// the lock is dead; then the sockets close as a revoked device's do and
+// the account's bridges get the clear frame at once. The consent switches
+// stay off.
 // → true when it answered.
 export async function handlePanicUnlock({ db, hub, json, securityLog, journalHost = null }, req, res, url, who) {
   if (url.pathname !== '/panic/unlock' || req.method !== 'POST') return false
@@ -150,22 +158,33 @@ export async function handlePanicUnlock({ db, hub, json, securityLog, journalHos
       // The lock the statement names, still there.
       if (panicLock(db, who.userId)?.since !== lock.since) refuse(409, { error: 'not_locked' })
       // Never unsigned: the guard alone lets an account with no key through.
-      if (body.approval == null || !isFrozenDevice(db, who.userId, who.deviceId)) refuse(403, { error: 'approval_required' })
+      if (body.approval == null || !isFrozenDevice(db, who.userId, who.deviceId, lock)) refuse(403, { error: 'approval_required' })
+      // Nor signed by a key on this device that does not count under the
+      // lock, beside one that does. Any other key the statement names (not
+      // this device's, revoked, unknown) is the guard's to refuse.
+      const signer = typeof body.approval?.statement === 'string' ? parseStatement(body.approval.statement)?.key_id : null
+      const signing = signer ? activeKeysOfDevice(db, who.userId, who.deviceId).find((k) => k.key_id === signer) : null
+      if (signing && !keyUnlocks(signing, lock)) refuse(403, { error: 'approval_required' })
     },
     write: () => {
       if (!clearPanic(db, who.userId)) refuse(409, { error: 'not_locked' })
-      return db.prepare("SELECT id FROM devices WHERE user_id=? AND kind='client' AND id<>? ORDER BY id").all(who.userId, who.deviceId)
+      const revoked = db.prepare("SELECT id FROM devices WHERE user_id=? AND kind='client' AND id<>? ORDER BY id").all(who.userId, who.deviceId)
         .map((d) => d.id).filter((id) => signOutOwnedDevice(db, who.userId, id))
+      // The token this device had at the lock dies with the others'.
+      const token = rotateClientToken(db, who.userId, who.deviceId)
+      if (!token) refuse(401, { error: 'unauthenticated' })
+      return { revoked, token }
     },
   })
   if (!r.ok) { json(res, r.status, r.body); return true }
-  const revoked = r.value
-  closeDeviceSockets(hub, who.userId, revoked, null)
+  const { revoked, token } = r.value
+  // The calling device's too: opened with the token it no longer has.
+  closeDeviceSockets(hub, who.userId, [...revoked, who.deviceId], null)
   // The bridges now, not at the next sweep, which then has nothing to send.
   panicAnnounced(hub).delete(who.userId)
   sendToAgents(hub, who.userId, PANIC_OFF_FRAME)
   securityLog.record(who.userId, 'panic_cleared', { deviceId: who.deviceId, deviceName: who.name, decidedBy: 'user' })
   for (const id of revoked) securityLog.record(who.userId, 'device_revoked', { deviceId: null, target: deviceTarget(id), decidedBy: 'journal' })
-  json(res, 200, { ok: true, locked: false, devices_revoked: revoked.length })
+  json(res, 200, { ok: true, locked: false, devices_revoked: revoked.length, token })
   return true
 }

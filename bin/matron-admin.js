@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url'
 import qrcode from 'qrcode-terminal'
 import QRCode from 'qrcode'
 import { openDb, pinDevicePrivate, unpinDevicePrivate, setDeviceConsentUserOnly, setDeviceProtected } from '../src/db.js'
-import { createUser, setPassword, createAgent, revokeDevice } from '../src/auth.js'
+import { createUser, setPassword, createAgent, revokeDevice, signOutOwnedDevice } from '../src/auth.js'
 import { resolveMediaDir } from '../src/media.js'
 import { resolvePreapproveKeyPath } from '../src/preapprove-key.js'
 import { runOffload, runExpireLogs } from '../src/retention.js'
@@ -486,7 +486,8 @@ export async function runAdmin(db, argv, deps = {}) {
   // database; the running journal reads the lock there on every check, so
   // sign-in works again at once, and its periodic sweep tells the
   // account's connected bridges within a minute. Nothing else is restored:
-  // the client devices stay signed out and the Coordinator's consent
+  // the client devices stay signed out (those the lock left frozen are
+  // signed out by the clear) and the Coordinator's consent
   // switches stay off until the owner turns them on again.
   if (a === 'panic' && (b === 'status' || b === 'clear')) {
     const username = argv[2]
@@ -497,10 +498,22 @@ export async function runAdmin(db, argv, deps = {}) {
       if (!lock) return `${username}: not locked`
       return `${username}: locked since ${new Date(lock.since).toISOString()} (source: ${JSON.stringify(lock.source)}, alert: ${JSON.stringify(lock.alert)})`
     }
-    if (!lock || !clearPanic(db, user.id)) return `${username}: not locked; nothing to clear`
+    if (!lock) return `${username}: not locked; nothing to clear`
+    // With the clear, every client device still signed in (the frozen
+    // ones: those that held an approval key at the lock) is signed out, so
+    // no client token that existed at the lock outlives it. Their approval
+    // keys stay enrolled, detached, as after any sign-out.
+    const signedOut = db.transaction(() => {
+      if (!clearPanic(db, user.id)) return null
+      return db.prepare("SELECT id FROM devices WHERE user_id=? AND kind='client' ORDER BY id").all(user.id)
+        .map((d) => d.id).filter((id) => signOutOwnedDevice(db, user.id, id))
+    })()
+    if (!signedOut) return `${username}: not locked; nothing to clear`
     adminEvent(user.id, 'panic_cleared')
+    for (const id of signedOut) adminEvent(user.id, 'device_revoked', deviceTarget(id))
     return [
       `${username}: panic lock cleared — sign-in works again now; the running journal tells the account's connected bridges within a minute.`,
+      `${signedOut.length} client device${signedOut.length === 1 ? '' : 's'} signed out (approval keys stay enrolled, to re-attach after signing in).`,
       'nothing else is restored: client devices sign in again, and the Coordinator\'s consent switches stay off until the owner turns them on.',
     ].join('\n')
   }

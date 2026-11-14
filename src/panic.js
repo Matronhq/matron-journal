@@ -34,12 +34,28 @@ export function panicLock(db, userId) {
 }
 export const isPanicLocked = (db, userId) => !!panicLock(db, userId)
 
-// A frozen device: a client device with an active approval key attached to
-// it. A lock does not sign it out; every route and frame refuses it with
+// Which approval keys count under a lock: one enrolled (its enrolment, not
+// when it was last attached to a device) at least this long before the
+// lock began. A key added shortly before a lock may be the intruder's own,
+// so it neither keeps its device signed in nor clears the lock.
+export const PANIC_UNLOCK_KEY_AGE_MS = 24 * 60 * 60000
+export const keyUnlocks = (key, lock) => !!lock && key.revoked_at == null && key.created_at <= lock.since - PANIC_UNLOCK_KEY_AGE_MS
+// The device's attached, active keys that count under `lock`.
+export const unlockKeysOfDevice = (db, userId, deviceId, lock) => (deviceId == null || !lock ? []
+  : activeKeysOfDevice(db, userId, deviceId).filter((k) => keyUnlocks(k, lock)))
+
+// A frozen device: a client device with such a key attached to it. The
+// lock does not sign it out; every route and frame refuses it with
 // `unlock: true` but the two it needs to clear the lock with a statement
 // signed by that key (POST /approvals/nonce, POST /panic/unlock). Read at
-// every check: a device whose key has gone since is signed out as any other.
-export const isFrozenDevice = (db, userId, deviceId) => deviceId != null && activeKeysOfDevice(db, userId, deviceId).length > 0
+// every check, against the lock: a device whose key has gone since is
+// signed out as any other.
+export const isFrozenDevice = (db, userId, deviceId, lock) => unlockKeysOfDevice(db, userId, deviceId, lock).length > 0
+
+// Whether the account was locked at or after `at` (ms), cleared since or
+// not: a request authenticated before that used a token that existed at a
+// lock, and every such token is dead once the lock is cleared.
+export const lockedSince = (db, userId, at) => !!db.prepare('SELECT 1 FROM panic_locks WHERE user_id=? AND since>=?').get(userId, at)
 
 // Every account_locked refusal's body (HTTP 423, and the error frames):
 // the reason and since when; `unlock: true` to a frozen device.
@@ -136,7 +152,7 @@ export function closeFrozenSockets(hub, userId, deviceIds, lock) {
 // a frame): frozen → true, and it is left as it is; otherwise it is signed
 // out (below) → false.
 export function refuseLockedClient(ctx, userId, deviceId, lock) {
-  if (isFrozenDevice(ctx.db, userId, deviceId)) return true
+  if (isFrozenDevice(ctx.db, userId, deviceId, lock)) return true
   signOutLockedClient(ctx, userId, deviceId, lock)
   return false
 }
