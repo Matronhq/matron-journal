@@ -5,7 +5,7 @@
 // verb, before any id is looked up, so the surface leaks nothing. Mirrors
 // matron-admin: create, reset password, admin flag, clear a GitHub link,
 // mint a pairing code.
-import { json, readBody } from './http-body.js'
+import { json, readBody, recheckCaller } from './http-body.js'
 import { badRequest, notFound, conflict } from './http-who.js'
 import { hashPassword } from './auth.js'
 import { deleteGithubAccount } from './github-accounts.js'
@@ -102,6 +102,8 @@ export async function handleUsersRoute(ctx, req, res, url, who) {
     // The hash first (it awaits); the row and its admin flag are written in
     // the guarded transaction, so a refused creation leaves no user behind.
     const hash = await hashPassword(password)
+    // The admin signed out, or their account locked, during the hash.
+    recheckCaller(req)
     const g = adminAccountAction(ctx, who, body, null, { op: 'admin_create_user', user: name, admin: String(is_admin) }, () => {
       try {
         return db.prepare('INSERT INTO users(name, password_hash, is_admin, created_at) VALUES(?,?,?,?)').run(name, hash, is_admin ? 1 : 0, Date.now()).lastInsertRowid
@@ -149,6 +151,8 @@ export async function handleUsersRoute(ctx, req, res, url, who) {
     if (typeof password !== 'string' || password.length < PASSWORD_MIN) return weakPassword(res)
     // Same semantics as `matron-admin user passwd`: device tokens stay valid.
     const hash = await hashPassword(password)
+    // The admin signed out, or their account locked, during the hash.
+    recheckCaller(req)
     const g = adminAccountAction(ctx, who, body, fresh, { op: 'admin_set_password', user: fresh.name }, () => {
       if (!db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hash, fresh.id).changes) refuse(404, { error: 'not_found' })
     })

@@ -41,7 +41,7 @@ import { getMission } from './missions.js'
 import { sanitizeConvoStatus, upsertConvoStatus } from './convo-status.js'
 import { validateSessionControl, authorizeSessionControl, sessionControlResultFrame } from './session-control.js'
 import { validRanges, addSeenRanges, markDeviceUsesRanges, legacyReadAsSeen, markItemSeen } from './seen.js'
-import { panicLock, isPanicLocked, panicHelloField, panicAnnounced, panicOnFrame, PANIC_OFF_FRAME, announcePanicClears, signOutLockedClient, closeLockedSocket, markPanicTold, ACCOUNT_LOCKED } from './panic.js'
+import { panicLock, isPanicLocked, panicHelloField, panicAnnounced, panicOnFrame, PANIC_OFF_FRAME, announcePanicClears, clientAuthDead, refuseLockedClient, isFrozenDevice, signOutLockedClient, lockedError, closeLockedSocket, closeFrozenSocket, markPanicTold, ACCOUNT_LOCKED } from './panic.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
 
@@ -301,6 +301,16 @@ export function attachWs({
   const deviceRowStmt = db.prepare('SELECT id, kind, created_at, last_seen_at FROM devices WHERE id=?')
   // Alive = the row exists and, for a client, it has not idled out. A live
   // check is also a use of the device, so an open socket keeps it signed in.
+  // A client socket of a locked account met after its hello (mid-replay,
+  // or as it registers): a frozen device's is closed as the lock closes
+  // them, the device left as it is; any other is signed out and closed as
+  // a revoked one.
+  const closeLockedClient = (ws, who, lock) => {
+    const frozen = refuseLockedClient({ db, hub, securityLog }, who.userId, who.deviceId, lock)
+    if (ws.readyState !== 1) return
+    if (frozen) closeFrozenSocket(ws, lock)
+    else closeLockedSocket(ws, lock)
+  }
   const deviceAlive = (id) => {
     const row = deviceRowStmt.get(id)
     return !!row && touchDevice(db, row, { now: clientIdleClock(), clientIdleMs })
@@ -468,7 +478,7 @@ export function attachWs({
       // in use, so its clock is kept fresh (at most hourly, see touchDevice).
       const alive = new Set(rows.filter((r) => touchDevice(db, r, { now, clientIdleMs })).map((r) => r.id))
       for (const c of conns) {
-        if (alive.has(c.deviceId)) continue
+        if (alive.has(c.deviceId) && !c.authDead?.()) continue
         if (c.ws.readyState !== 1) continue // already closing; its 'close' handler unregisters it
         c.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
         c.ws.close(4001)
@@ -509,6 +519,7 @@ export function attachWs({
       try {
         if (!conn) {
           if (msg.op !== 'hello') { ws.close(); return }
+          const authAt = Date.now()
           const who = msg.token && authToken(db, msg.token, { now: clientIdleClock(), clientIdleMs })
           if (!who) {
             ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'auth' }))
@@ -517,13 +528,14 @@ export function attachWs({
           }
           // A client of a panic-locked account (src/panic.js): the auth
           // error's shape with account_locked and since, the usual close,
-          // and the device is signed out. Agents of the account connect as
-          // ever (hello_ok then carries `panic`).
+          // and the device is signed out, or, frozen (an approval key
+          // attached), left as it is and told `unlock: true`. Agents of the
+          // account connect as ever (hello_ok then carries `panic`).
           if (who.kind === 'client') {
             const lock = panicLock(db, who.userId)
             if (lock) {
-              signOutLockedClient({ db, hub, securityLog }, who.userId, who.deviceId, lock)
-              ws.send(JSON.stringify({ kind: 'control', op: 'error', code: ACCOUNT_LOCKED, since: lock.since }))
+              const frozen = refuseLockedClient({ db, hub, securityLog }, who.userId, who.deviceId, lock)
+              ws.send(JSON.stringify(lockedError(lock, frozen)))
               ws.close()
               return
             }
@@ -578,6 +590,15 @@ export function attachWs({
           // than the in-flight cursor, so it's picked up by a later replay batch rather
           // than lost. Revisit this assumption if a future op has other side effects.
           conn = { ws, ...who, viewingConvoIds: new Set(), syncScope: who.kind === 'client' ? syncScope : null }
+          // A client's socket is as dead as its token: once an unlock has
+          // replaced the device's token, or a panic lock of the account has
+          // ended since this hello, it is closed as a revoked one (checked
+          // where the device row is: mid-replay, at registration, on every
+          // frame and in the sweep).
+          if (who.kind === 'client') {
+            const auth = { userId: who.userId, deviceId: who.deviceId, token: msg.token, at: authAt }
+            Object.defineProperty(conn, 'authDead', { value: () => clientAuthDead(db, auth) })
+          }
           // Kept on the device row for the push pipeline's wakes, which
           // decide for devices that have no socket.
           if (who.kind === 'client') setDeviceSyncScope(db, who.deviceId, conn.syncScope)
@@ -728,11 +749,10 @@ export function attachWs({
               // closes a registered socket, before the next batch.
               const replayLock = who.kind === 'client' ? panicLock(db, who.userId) : null
               if (replayLock) {
-                signOutLockedClient({ db, hub, securityLog }, who.userId, who.deviceId, replayLock)
-                if (ws.readyState === 1) closeLockedSocket(ws, replayLock)
+                closeLockedClient(ws, who, replayLock)
                 return
               }
-              if (!deviceAlive(who.deviceId)) {
+              if (!deviceAlive(who.deviceId) || conn.authDead?.()) {
                 ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
                 ws.close(4001)
                 return
@@ -777,11 +797,10 @@ export function attachWs({
             // socket. Closed now, as the lock closes the others.
             const lockNow = panicLock(db, who.userId)
             if (lockNow) {
-              signOutLockedClient({ db, hub, securityLog }, who.userId, who.deviceId, lockNow)
-              if (ws.readyState === 1) closeLockedSocket(ws, lockNow)
+              closeLockedClient(ws, who, lockNow)
               return
             }
-            if (!deviceAlive(who.deviceId)) {
+            if (!deviceAlive(who.deviceId) || conn.authDead?.()) {
               ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
               ws.close(4001)
               return
@@ -805,7 +824,7 @@ export function attachWs({
         // (hello itself already does the equivalent check via authToken's
         // token-hash lookup, so this must only run post-hello or a revoked
         // token's hello would get checked twice for no benefit).
-        if (!deviceAlive(conn.deviceId)) {
+        if (!deviceAlive(conn.deviceId) || conn.authDead?.()) {
           conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
           conn.ws.close(4001)
           return
@@ -814,13 +833,17 @@ export function attachWs({
         // a device made by a path the lock missed): the frame is refused
         // with account_locked (its ref and request_id echoed, so an RPC
         // caller can correlate it), the device is signed out and the socket
-        // closed as a revoked one is.
+        // closed as a revoked one is. A frozen device's: the same refusal
+        // with `unlock: true`, an ordinary close, and the device stays.
         if (conn.kind === 'client') {
           const lock = panicLock(db, conn.userId)
           if (lock) {
-            conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: ACCOUNT_LOCKED, ref: msg.op, ...requestIdEcho(msg), since: lock.since }))
-            signOutLockedClient({ db, hub, securityLog }, conn.userId, conn.deviceId, lock)
-            if (conn.ws.readyState === 1) closeLockedSocket(conn.ws, lock)
+            // The refusal first: the sign-out closes the device's sockets.
+            const frozen = isFrozenDevice(db, conn.userId, conn.deviceId, lock)
+            conn.ws.send(JSON.stringify(lockedError(lock, frozen, { ref: msg.op, ...requestIdEcho(msg) })))
+            if (!frozen) signOutLockedClient({ db, hub, securityLog }, conn.userId, conn.deviceId, lock)
+            if (frozen) conn.ws.close()
+            else if (conn.ws.readyState === 1) closeLockedSocket(conn.ws, lock)
             return
           }
         }

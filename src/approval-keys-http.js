@@ -29,7 +29,7 @@
 // a revoke by password works without it, so an account is never stuck
 // with keys it cannot use.
 import crypto from 'node:crypto'
-import { json, readBody } from './http-body.js'
+import { json, readBody, recheckCaller } from './http-body.js'
 import { keyIdOf, parseStatement } from './approvals.js'
 import {
   ALG, KEY_REQUEST_TTL_MS, DEVICE_FAILURE_WINDOW_MS, ENROL_LOCK_MS, checkApproval, activeKeyFor, issueNonce,
@@ -266,6 +266,8 @@ export async function handleApprovalKeysRoute(ctx, req, res, url, who) {
     const keyName = readName(res, name)
     if (!keyName) return true
     if (!(await confirmPasswordAndTotp(ctx, res, who, { password, code }))) return true
+    // Signed out, or the account locked, while the password was checked.
+    recheckCaller(req)
     // Whether the key is enrolled (to this account or any other: key ids
     // are unique across the journal) is told only to a caller who has just
     // passed the password and code.
@@ -386,7 +388,9 @@ export async function handleApprovalKeysRoute(ctx, req, res, url, who) {
     } else if (password !== undefined || code !== undefined) {
       if (!(await confirmPasswordAndTotp(ctx, res, who, { password, code }))) return true
       // As on enrolment: a caller signed out while the password was being
-      // checked changes nothing (no await between this and the revoke).
+      // checked changes nothing (no await between this and the revoke);
+      // nor does one whose account was locked meanwhile.
+      recheckCaller(req)
       if (!callerSignedIn(db, who)) { json(res, 401, { error: 'unauthenticated' }); return true }
       if (!revokeNow()) return notFound(res)
       how = BY_PASSWORD

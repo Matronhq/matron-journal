@@ -212,7 +212,7 @@ test('the body: optional strings, stored and read back; a wrong type or a malfor
   const before = Date.now()
   const r = await s.http('/panic', { method: 'POST', token: PANIC_TOKEN })
   assert.equal(r.status, 200)
-  assert.deepEqual(r.json, { ok: true, locked: true, already_locked: false, devices_revoked: 0, bridges_notified: 0 })
+  assert.deepEqual(r.json, { ok: true, locked: true, already_locked: false, devices_revoked: 0, devices_frozen: 0, bridges_notified: 0 })
   const st = (await panicStatus(s)).json
   assert.equal(st.locked, true)
   assert.ok(st.since >= before && st.since <= Date.now())
@@ -284,8 +284,8 @@ test('POST /panic: client devices signed out (keys detached), their sockets clos
   const before = Date.now()
   const r = await lockIt(s, { source: 'watcher-1', alert: 'disk wiped on box-a' })
   assert.equal(r.status, 200)
-  assert.deepEqual(r.json, { ok: true, locked: true, already_locked: false, devices_revoked: 2, bridges_notified: 2 })
-  assert.deepEqual(Object.keys(r.json), ['ok', 'locked', 'already_locked', 'devices_revoked', 'bridges_notified'])
+  assert.deepEqual(r.json, { ok: true, locked: true, already_locked: false, devices_revoked: 2, devices_frozen: 0, bridges_notified: 2 })
+  assert.deepEqual(Object.keys(r.json), ['ok', 'locked', 'already_locked', 'devices_revoked', 'devices_frozen', 'bridges_notified'])
   // Client devices gone, the open socket closed as a revoked one is.
   assert.equal(clientCount(s, alice.id), 0)
   assert.equal(await laptopClosed, 4001)
@@ -318,7 +318,7 @@ test('POST /panic: client devices signed out (keys detached), their sockets clos
 
   // Again: the same shape, nothing revoked, the frame sent again.
   const again = await lockIt(s, { source: 'watcher-2' })
-  assert.deepEqual(again.json, { ok: true, locked: true, already_locked: true, devices_revoked: 0, bridges_notified: 2 })
+  assert.deepEqual(again.json, { ok: true, locked: true, already_locked: true, devices_revoked: 0, devices_frozen: 0, bridges_notified: 2 })
   await a.w.waitFor((f) => f.kind === 'panic' && panicFrames(a.w).length === 2)
   assert.deepEqual(panicFrames(a.w)[1], panicFrames(a.w)[0])
   assert.deepEqual((await panicStatus(s)).json, st)

@@ -11,6 +11,7 @@ import { boxPlaintext, sealBox } from './push-box.js'
 import { APS_ALERTS } from './relay.js'
 import { inlineRefsToText } from './inline-refs.js'
 import { isSilentEvent } from './message-types.js'
+import { isPanicLocked } from './panic.js'
 
 // Min gap between routine (priority-5) pushes to the same (device, convo).
 const ROUTINE_COALESCE_MS = 10000
@@ -204,6 +205,16 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
   }
 
   function doSend(device, userId, opts) {
+    // A panic-locked account (src/panic.js): nothing is pushed. Its only
+    // client devices left are frozen ones, which get nothing but the means
+    // to clear the lock. Checked at the send, so a push queued before the
+    // lock is dropped too.
+    if (isPanicLocked(db, userId)) return
+    // `device` is as it was when the push was built, and a queued one may
+    // be sent a while later: a device signed out since gets nothing. (One
+    // that registered another push token meanwhile still gets the push at
+    // the old one, with the fixed text only: currentKey below.)
+    if (!db.prepare("SELECT 1 FROM devices WHERE id=? AND user_id=? AND kind='client'").get(device.id, userId)) return
     // Badge must reflect unread state as of the moment we actually transmit,
     // not whenever the push was built/scheduled — a coalesced or trailing
     // push can sit queued for up to `coalesceMs`, during which more events
@@ -316,6 +327,8 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
   // `noHold` is internal: resumeHeldConsent's own, already-waited send.
   function onAppend(userId, event, originDeviceId, pushHint, { noHold = false } = {}) {
     if (!apnsClient) return
+    // A panic-locked account: nothing pushed (doSend), nothing queued.
+    if (isPanicLocked(db, userId)) return
     const convo = db.prepare('SELECT id, title, parent_convo_id FROM conversations WHERE id=? AND owner_user_id=?').get(event.convo_id, userId)
     if (!convo) return
     // Silent children: a subagent's child conversation is exempt from APNs

@@ -1,11 +1,13 @@
 // Panic lock (docs/protocol.md "Panic lock"): an external watcher holding a
 // panic token bound to one account locks that account with one request.
-// The journal signs out every client device of the account, turns the
+// The journal signs out every client device of the account (but one that
+// holds an approval key, which is frozen instead), turns the
 // Coordinator's consent switches off, refuses new sign-ins and device links
 // for it, refuses to deliver new work to its boxes, and tells every bridge
 // of the account to lock. The token can only lock (and read whether the
 // account is locked); the lock is cleared on the journal host
-// (`matron-admin panic clear <user>`).
+// (`matron-admin panic clear <user>`), or by a frozen device with a
+// statement signed by its approval key (POST /panic/unlock).
 //
 // This module is the state and its checks, imported by every path that
 // refuses while locked; the lock itself and the routes are in
@@ -15,7 +17,8 @@
 // with `cleared_at` NULL. Every check reads the database (a primary-key
 // lookup), never memory, so the CLI's clear takes effect at once for the
 // refusals and a journal restart cannot forget a lock.
-import { signOutOwnedDevice } from './auth.js'
+import { signOutOwnedDevice, tokenReplaced } from './auth.js'
+import { activeKeysOfDevice } from './approval-keys.js'
 import { FEED_TOKEN_RE, deviceTarget } from './security-log.js'
 
 export const PANIC_TEXT_MAX = 200
@@ -31,9 +34,46 @@ export function panicLock(db, userId) {
 }
 export const isPanicLocked = (db, userId) => !!panicLock(db, userId)
 
+// Which approval keys count under a lock: one enrolled (its enrolment, not
+// when it was last attached to a device) at least this long before the
+// lock began. A key added shortly before a lock may be the intruder's own,
+// so it neither keeps its device signed in nor clears the lock.
+export const PANIC_UNLOCK_KEY_AGE_MS = 24 * 60 * 60000
+export const keyUnlocks = (key, lock) => !!lock && key.revoked_at == null && key.created_at <= lock.since - PANIC_UNLOCK_KEY_AGE_MS
+// The device's attached, active keys that count under `lock`.
+export const unlockKeysOfDevice = (db, userId, deviceId, lock) => (deviceId == null || !lock ? []
+  : activeKeysOfDevice(db, userId, deviceId).filter((k) => keyUnlocks(k, lock)))
+
+// A frozen device: a client device with such a key attached to it. The
+// lock does not sign it out; every route and frame refuses it with
+// `unlock: true` but the two it needs to clear the lock with a statement
+// signed by that key (POST /approvals/nonce, POST /panic/unlock). Read at
+// every check, against the lock: a device whose key has gone since is
+// signed out as any other.
+export const isFrozenDevice = (db, userId, deviceId, lock) => unlockKeysOfDevice(db, userId, deviceId, lock).length > 0
+
+// Whether a lock of the account ended after `at` (ms): it was open at some
+// moment since then, whether it began before `at` or after, and is cleared
+// now. Whatever a client authenticated at `at` used a token that existed
+// at that lock, and no such token outlives it. (After, not at or after: a
+// request made with the new token in the millisecond of the clear is not
+// refused; one made in that millisecond with an old token finds its device
+// gone or its token replaced, below.)
+export const lockEndedSince = (db, userId, at) =>
+  !!db.prepare('SELECT 1 FROM panic_locks WHERE user_id=? AND cleared_at IS NOT NULL AND cleared_at>?').get(userId, at)
+
+// A client request or socket authenticated at `at` with `token` that must
+// not act any more: the device's token has been replaced since (an unlock
+// gave it a new one), or a lock of the account has ended since. A device
+// that is gone is not this check's: the caller's own does that.
+export const clientAuthDead = (db, { userId, deviceId, token, at }) => tokenReplaced(db, deviceId, token) || lockEndedSince(db, userId, at)
+
 // Every account_locked refusal's body (HTTP 423, and the error frames):
-// the reason and since when.
-export const lockedBody = (lock) => ({ error: ACCOUNT_LOCKED, since: lock?.since ?? null })
+// the reason and since when; `unlock: true` to a frozen device.
+export const lockedBody = (lock, frozen = false) => ({ error: ACCOUNT_LOCKED, since: lock?.since ?? null, ...(frozen ? { unlock: true } : {}) })
+// The control error a client socket of a locked account gets (`extra`: the
+// refused frame's ref and request_id).
+export const lockedError = (lock, frozen = false, extra = {}) => ({ kind: 'control', op: 'error', code: ACCOUNT_LOCKED, ...extra, since: lock.since, ...(frozen ? { unlock: true } : {}) })
 
 // The refusal of an approval (a consent answer) while locked, in the
 // shape the answer paths give a user-only refusal: {ok:false, status,
@@ -103,6 +143,31 @@ export function closeLockedSocket(ws, lock) {
   } catch { /* already closing */ }
 }
 
+// A frozen device's sockets at the lock: told the account is locked and
+// that it can unlock it, then an ordinary close. The device stays.
+export function closeFrozenSocket(ws, lock) {
+  try {
+    ws.send(JSON.stringify({ ...clientPanicFrame(lock), unlock: true }))
+    ws.send(JSON.stringify(lockedError(lock, true)))
+    ws.close()
+  } catch { /* already closing */ }
+}
+export function closeFrozenSockets(hub, userId, deviceIds, lock) {
+  const ids = new Set(deviceIds)
+  for (const c of hub.connsOf(userId)) {
+    if (c.kind === 'client' && ids.has(c.deviceId) && c.ws.readyState === 1) closeFrozenSocket(c.ws, lock)
+  }
+}
+
+// A client device of a locked account met at a check (a request, a hello,
+// a frame): frozen → true, and it is left as it is; otherwise it is signed
+// out (below) → false.
+export function refuseLockedClient(ctx, userId, deviceId, lock) {
+  if (isFrozenDevice(ctx.db, userId, deviceId, lock)) return true
+  signOutLockedClient(ctx, userId, deviceId, lock)
+  return false
+}
+
 // Sign out one client device of a locked account that still had a working
 // token (a race, or a device made by a path the lock missed): the row goes
 // as a self sign-out's does (approval keys detached, not revoked), its
@@ -114,8 +179,8 @@ export function signOutLockedClient({ db, hub, securityLog }, userId, deviceId, 
   return true
 }
 
-// Clear the account's lock (matron-admin panic clear). Nothing else is
-// restored. → true when there was a lock to clear.
+// Clear the account's lock (matron-admin panic clear, POST /panic/unlock).
+// Nothing else is restored. → true when there was a lock to clear.
 export function clearPanic(db, userId, now = Date.now()) {
   return db.prepare('UPDATE panic_locks SET cleared_at=? WHERE user_id=? AND cleared_at IS NULL').run(now, userId).changes > 0
 }

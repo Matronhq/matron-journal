@@ -128,3 +128,11 @@ export function forgetEnrolmentFailures(s) {
   s.db.prepare('DELETE FROM approval_enrol_failures').run()
   s.db.prepare('DELETE FROM approval_enrol_locks').run()
 }
+
+// A panic lock freezes a device, and lets it unlock, only with a key
+// enrolled at least a day before the lock (src/panic.js). Move every key's
+// enrolment (or one key's) back by `ms`.
+export function backdateApprovalKeys(s, { keyId = null, ms = 25 * 60 * 60000 } = {}) {
+  if (keyId) s.db.prepare('UPDATE approval_keys SET created_at = created_at - ? WHERE key_id=?').run(ms, keyId)
+  else s.db.prepare('UPDATE approval_keys SET created_at = created_at - ?').run(ms)
+}
