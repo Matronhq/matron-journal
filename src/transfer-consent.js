@@ -15,8 +15,9 @@ import { CONSENT_LABEL, codeSpan, fenced } from './consent-items.js'
 import { sanitizePeerText, PEER_NAME_CAP, plainText as plain } from './peer-text.js'
 import { appendAndBroadcast } from './journal.js'
 import { participantConvoIds } from './participants.js'
-import { recordAndAnnounce } from './consent-answer.js'
+import { recordAndAnnounce, guardedApprove, CONFLICT } from './consent-answer.js'
 import { wakeIfOffline } from './wake.js'
+import { consentStepUp, consentApproval, approvalColumn, storedApproval } from './consent-subject.js'
 import { getTransfer, setTransferState, deleteTransferFiles, forgetChunks, transferRecipients, isTransferId, parseFindings } from './transfers.js'
 
 // "by the user." or "by the Coordinator: <reason>", for the decline's
@@ -118,8 +119,12 @@ export function fileTransferConsentItem({ db, hub }, row) {
   try {
     const fields = transferConsentItemFields(row, transferNames(db, row))
     const item = db.transaction(() => {
+      // Sent to a protected box: the item says the approval needs a
+      // signature, and over what (src/consent-subject.js).
+      const su = consentStepUp(db, row.user_id, 'transfer', row)
       const { item } = createItem(db, {
         userId: row.user_id, kind: 'question', ...fields, actions: [...TRANSFER_ACTIONS], awaiting: 'user', position: 'top',
+        stepUp: !!su, subject: su?.subject ?? null,
         originConvoId: row.from_convo_id, originDeviceId: row.sender_device_id, createdBy: 'agent', consent: 'transfer',
         idemKey: `consent:transfer:${row.id}`,
       })
@@ -183,12 +188,16 @@ export function closeTransferConsentItem({ db, hub }, id, { outcome, decidedBy =
 // What a recipient bridge needs to fetch and file a released transfer: the
 // `ready` frame's `transfer` and each row of GET /transfers?for=me.
 // `reason` is the sender's note as stored at create (the text the card
-// shows), or null when there was none.
+// shows), or null when there was none. `approval` is the user's signed
+// approval ({statement, signature}, exactly as the app sent it) when the
+// transfer went to a protected box (src/consent-subject.js), for the box to
+// check itself; absent otherwise.
 export function readyTransferView(db, row) {
   return {
     id: row.id, room_id: row.room_id, name: row.name, size: row.size, sha256: row.sha256, content_type: row.content_type,
     from_name: name(db.prepare('SELECT name FROM devices WHERE id=?').get(row.sender_device_id)?.name), from_convo_id: row.from_convo_id,
     reason: row.reason || null,
+    ...storedApproval(row.approval),
   }
 }
 
@@ -227,8 +236,12 @@ const awaiting = (row) => row.consent === 'awaiting_user' && row.phase === 'open
 // Coordinator's answer. `decidedBy` is {kind: 'user', deviceId} or
 // {kind: 'coordinator', deviceId, convoId, reason}. Everything up to the
 // guarded state change is synchronous, so two answers cannot both win:
-// the loser gets 409 and changes nothing. → {status, body}.
-export function answerTransferAsk(ctx, { userId, transferId, decision, decidedBy }) {
+// the loser gets 409 and changes nothing. `approval` is the user's signed
+// approval, needed to approve a transfer to a protected box once the
+// account has a key (src/consent-subject.js): checked in the same
+// transaction as the state change, stored on the row and forwarded with the
+// release; ignored on a decline. → {status, body}.
+export function answerTransferAsk(ctx, { userId, transferId, decision, decidedBy, approval = null }) {
   const { db, hub, mediaDir } = ctx
   const row = isTransferId(transferId) ? getTransfer(db, transferId) : null
   if (!row || row.user_id !== userId) return { status: 404, body: { error: 'not_found' } }
@@ -255,7 +268,16 @@ export function answerTransferAsk(ctx, { userId, transferId, decision, decidedBy
     console.log(`journal: transfer declined id=${transferId} by=${stamp.decided_by}`)
     return { status: 200, body: { ok: true } }
   }
-  if (!setTransferState(db, transferId, { consent: 'approved', ...stamp, approved_at: now })) return { status: 409, body: { error: 'conflict' } }
+  const refused = guardedApprove(db,
+    () => {
+      // Re-read inside the transaction: an ask answered meanwhile is the
+      // 409 a lost race gives, before any signature is looked at.
+      const now = getTransfer(db, transferId)
+      if (!now || !awaiting(now)) return CONFLICT
+      return consentApproval(ctx, userId, decidedBy, 'transfer', now, approval)
+    },
+    (signed) => setTransferState(db, transferId, { consent: 'approved', ...stamp, approved_at: now, ...(signed ? { approval: approvalColumn(signed) } : {}) }))
+  if (refused) return refused
   closeTransferConsentItem({ db, hub }, transferId, { outcome: 'approved', decidedBy })
   recordAndAnnounce({ db, hub }, { userId, kind: 'transfer', askId: transferId, decision, decidedBy, convoId: row.from_convo_id, payload: { transfer_id: transferId } })
   console.log(`journal: transfer approved id=${transferId} by=${stamp.decided_by}`)
@@ -266,11 +288,11 @@ export function answerTransferAsk(ctx, { userId, transferId, decision, decidedBy
 // A tap on the card (POST /items/:id/comments with `action`). The row is
 // checked before the label, so a tap on a card whose ask is no longer
 // waiting is 409 whatever it says.
-export function transferTapAnswer(ctx, who, item, action) {
+export function transferTapAnswer(ctx, who, item, action, approval = null) {
   const row = ctx.db.prepare('SELECT * FROM transfers WHERE item_id=? AND user_id=?').get(item.id, who.userId)
   if (!row || !awaiting(row)) return staleTransferTap(row)
   if (!TRANSFER_ACTIONS.includes(action)) return { status: 400, body: { error: 'unknown_action' } }
-  const r = answerTransferAsk(ctx, { userId: who.userId, transferId: row.id, decision: action === 'Decline' ? 'decline' : 'approve', decidedBy: { kind: 'user', deviceId: who.deviceId } })
+  const r = answerTransferAsk(ctx, { userId: who.userId, transferId: row.id, decision: action === 'Decline' ? 'decline' : 'approve', decidedBy: { kind: 'user', deviceId: who.deviceId }, approval })
   return r.status === 409 ? staleTransferTap(getTransfer(ctx.db, row.id)) : r
 }
 

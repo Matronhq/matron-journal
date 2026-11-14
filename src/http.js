@@ -2,9 +2,9 @@ import { makeAgentCommentLimiter } from './agent-comment-limiter.js'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { pipeline } from 'node:stream/promises'
-import { checkPassword, makeRateLimiter, makeKeyedQueue, authToken, changePassword, revokeOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
+import { checkPassword, makeRateLimiter, makeKeyedQueue, authToken, clientIdleExpired, preparePasswordChange, applyPasswordChange, revokeOwnedDevice, signOutOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL, byLastMessageThenId } from './journal.js'
-import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, isPrivateDevice, deviceStatuses } from './db.js'
+import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, isPrivateDevice, deviceStatuses, setDeviceProtected } from './db.js'
 import { receiveBlob } from './media.js'
 import { readBlobTranscript, isTranscribableType, transcriptWaitS } from './blob-transcripts.js'
 import { imageSizeFromFile } from './image-size.js'
@@ -18,6 +18,7 @@ import { parseCitation, verifySaid } from './said.js'
 import { serveHelp } from './help.js'
 import { wakeIfOffline, isWakeableDevice } from './wake.js'
 import { handleItemsRoute } from './items-http.js'
+import { restampConsentItems } from './consent-subject.js'
 import { handleMissionsRoute } from './missions-http.js'
 import { ORIGIN_SIEVE } from './missions.js'
 import { handleSharingRoute } from './sharing-http.js'
@@ -32,6 +33,8 @@ import { handleLookupRoute } from './lookup-http.js'
 import { handleUsersRoute } from './users-http.js'
 import { handlePasswordResetRoute, handleAccountEmailRoute } from './password-reset-http.js'
 import { handleTwoFactorLogin, handleTwoFactorRoute, twoFactorRequiredNow } from './two-factor-http.js'
+import { handleApprovalKeysRoute, announceKey, confirmPasswordAndTotp, callerSignedIn, announceRestamped as announceRestampedItems } from './approval-keys-http.js'
+import { activeKeysOfDevice, guardedAccountAction, hasActiveKey, refuse, boundedSubject } from './approval-keys.js'
 import { isTwoFactorEnabled, makeTwoFactorTickets } from './two-factor.js'
 import { PLAIN_BOX } from './token-box.js'
 import { githubAccountView } from './github-accounts.js'
@@ -120,13 +123,16 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, agentCommentLimiter = makeAgentCommentLimiter(), blobTranscripts = null, github = null, handleWellKnown = () => false, handleFederation = async () => false, federationOutbox = null, federationContacts = null, federationGrants = null, federationContribute = null, federationMedia = null, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, agentCommentLimiter = makeAgentCommentLimiter(), blobTranscripts = null, github = null, handleWellKnown = () => false, handleFederation = async () => false, federationOutbox = null, federationContacts = null, federationGrants = null, federationContribute = null, federationMedia = null, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null, journalHost = null, clientIdleMs, clientIdleClock = Date.now }) {
   // Two-factor sign-in (src/two-factor-http.js). The server passes its own;
   // the defaults keep a bare handler (tests) working the same way.
   const twoFactorBox = tokenBox || PLAIN_BOX
   const signInTickets = tickets || makeTwoFactorTickets()
   const codeLimiter = twoFactorLimiter || makeRateLimiter({ max: 10 })
   const passwordChecks = makeKeyedQueue()
+  // Consent items restamped reach the user's apps as an `updated` marker
+  // (approval-keys-http.js announceRestamped).
+  const announceRestamped = (who, ids) => announceRestampedItems({ db, hub, pushPipeline, waker }, who, ids)
   // Forgot/reset password: their own per-IP budget, a few asks per quarter hour.
   const passwordResetLimiter = resetLimiter || makeRateLimiter({ max: 5, windowMs: 15 * 60000 })
   // Alertmanager webhook (src/alerts-http.js): built once so its in-flight
@@ -319,12 +325,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       // Disabled, it declines and the request meets the chain below exactly
       // as an unknown path would.
       if (await handleAlerts(req, res, url, { rejectEarly })) return
-      const who = bearer(req) && authToken(db, bearer(req))
+      const who = bearer(req) && authToken(db, bearer(req), { now: clientIdleClock(), clientIdleMs })
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       // The tracker's own surface (src/items-http.js) — mounted first so
       // its /items* paths never collide with the chain below, and inside the
       // outer try/catch so readBody's 400/413 map like every other route's.
-      if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription, agentCommentLimiter, broker, spawnStartTimeoutMs, spawnWakeWaitMs, mediaDir, federationContacts, federationGrants, federationContribute }, req, res, url, who)) return
+      if (await handleItemsRoute({ db, hub, pushPipeline, waker, itemTranscription, agentCommentLimiter, broker, spawnStartTimeoutMs, spawnWakeWaitMs, mediaDir, federationContacts, federationGrants, federationContribute, journalHost }, req, res, url, who)) return
       if (await handleFederationRoute({ db, outbox: federationOutbox }, req, res, url, who)) return
       // Ahead of the missions routes: /missions/:id/shares is its own surface.
       if (await handleSharingRoute({ db, hub, pushPipeline, waker, broker, spawnStartTimeoutMs, spawnWakeWaitMs, federationContacts, federationGrants }, req, res, url, who)) return
@@ -358,9 +364,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         console.log(`journal: said check convo=${cited.convoId} seq=${cited.seq} device=${who.deviceId} verified=${out.body.verified}${out.body.verified ? '' : ` reason=${out.body.reason}`}`)
         return json(res, 200, out.body)
       }
-      if (await handleUsersRoute({ db, links }, req, res, url, who)) return
+      if (await handleUsersRoute({ db, links, journalHost }, req, res, url, who)) return
       if (await handleAccountEmailRoute({ db, mailer, loginGuard, passwordChecks }, req, res, url, who)) return
-      if (await handleTwoFactorRoute({ db, tokenBox: twoFactorBox, loginGuard }, req, res, url, who)) return
+      if (await handleTwoFactorRoute({ db, tokenBox: twoFactorBox, loginGuard, journalHost }, req, res, url, who)) return
+      // Approval keys (src/approval-keys-http.js). `journalHost` is the host of
+      // the configured public URL, null while approval keys are off.
+      if (await handleApprovalKeysRoute({ db, hub, pushPipeline, tokenBox: twoFactorBox, loginGuard, journalHost, passwordChecks }, req, res, url, who)) return
       // Cloud speech for voice mode (src/tts-http.js): client devices only.
       if (await handleTtsRoute({ tts }, req, res, url, who)) return
       if (req.method === 'GET' && url.pathname === '/me') {
@@ -372,7 +381,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           github_linking: { enabled: !!(github && github.enabled), web_flow: !!(github && github.webFlow), device_flow: !!(github && github.deviceFlow) },
         })
       }
-      if (await handleCoordinatorRoute({ db, hub }, req, res, url, who)) return
+      if (await handleCoordinatorRoute({ db, hub, journalHost }, req, res, url, who)) return
       if (await handleNotifyRoute({ db, hub }, req, res, url, who)) return
       if (await handleDefaultsRoute({ db, hub }, req, res, url, who)) return
       // Per-box defaults (src/box-defaults-http.js): GET/PUT /devices/:id/defaults,
@@ -445,7 +454,8 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // Self-service change, client devices only — an agent (the bridge)
         // never holds/knows a user's password.
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
-        const { old_password, new_password, sign_out_others } = await readBody(req)
+        const body = await readBody(req)
+        const { old_password, new_password, sign_out_others } = body
         if (typeof old_password !== 'string' || !old_password) return json(res, 400, { error: 'bad_request' })
         if (sign_out_others !== undefined && typeof sign_out_others !== 'boolean') return json(res, 400, { error: 'bad_request' })
         if (typeof new_password !== 'string' || new_password.length < 8) return json(res, 400, { error: 'weak_password' })
@@ -457,10 +467,29 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           const user = db.prepare('SELECT name FROM users WHERE id=?').get(who.userId)
           const gate = loginGuard.check(user.name)
           if (!gate.allowed) return { locked: Math.ceil(gate.retryAfterMs / 1000) }
-          const out = await changePassword(db, who.userId, {
-            oldPassword: old_password, newPassword: new_password,
-            deviceId: who.deviceId, signOutOthers: sign_out_others === true,
+          const prepared = await preparePasswordChange(db, who.userId, { oldPassword: old_password, newPassword: new_password })
+          // An account action: once the account has an approval key the
+          // change is signed too ({op:'change_password'}), on top of the
+          // current password, which is checked first so a wrong one never
+          // spends the nonce. A change that loses its compare-and-swap is
+          // refused inside the transaction, so it does not spend it either.
+          // A caller signed out during the hashing is today's 401 before any
+          // signature is looked at.
+          let out = null
+          const g = prepared && guardedAccountAction({ db, journalHost }, who, body, { op: 'change_password' }, {
+            check: () => {
+              if (db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(who.deviceId, who.userId)) return
+              out = { ok: false, revoked: true }
+              refuse(401, { error: 'unauthenticated' })
+            },
+            write: () => {
+              out = applyPasswordChange(db, who.userId, prepared, { deviceId: who.deviceId, signOutOthers: sign_out_others === true })
+              if (!out.ok) refuse(401, { error: 'bad_password' })
+            },
           })
+          // The guard refused (the write never ran): no count either way.
+          if (prepared && !out) return { refused: g }
+          out ??= { ok: false }
           if (out.ok) { loginGuard.ok(user.name); signInTickets.dropUser(who.userId) }
           else if (!out.revoked) loginGuard.fail(user.name)
           return out
@@ -469,6 +498,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           res.setHeader('Retry-After', r.locked)
           return json(res, 429, { error: 'locked_out', retry_after: r.locked })
         }
+        if (r.refused) return json(res, r.refused.status, r.refused.body)
         if (r.revoked) return json(res, 401, { error: 'unauthenticated' })
         if (!r.ok) return json(res, 401, { error: 'bad_password' })
         return json(res, 200, { ok: true, signed_out: r.signedOut })
@@ -488,8 +518,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // defaults: each agent box's stored defaults for new sessions
         // (src/box-defaults.js), nulls when unset; absent on client devices.
         const boxDefaults = boxDefaultsByDevice(db, who.userId)
+        const idleNow = clientIdleClock()
         const devices = listDevices(db, who.userId).map((d) => ({
-          ...d, is_self: d.device_id === who.deviceId, connected: live.has(d.device_id),
+          ...d, idle_expired: clientIdleExpired(d, idleNow, clientIdleMs), is_self: d.device_id === who.deviceId, connected: live.has(d.device_id),
           ...(statuses.has(d.device_id) ? { status: statuses.get(d.device_id) } : {}),
           ...(boxDefaults.has(d.device_id) ? { defaults: boxDefaults.get(d.device_id) } : {}),
         }))
@@ -616,7 +647,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // The answer itself lives in src/consent-answer.js, shared with the
         // Coordinator's route: a tap and a Coordinator decision do exactly
         // the same thing, with the deny masked as a peer refusal either way.
-        const r = answerChatAsk({ db, hub, waker }, { userId: who.userId, roomId: room_id, targetDeviceId: target_device_id, decision: decision === 'deny' ? 'decline' : 'approve', decidedBy: { kind: 'user', deviceId: who.deviceId } })
+        // `approval`: the signed approval an invite to a protected box needs
+        // once the account has a key (src/consent-subject.js).
+        const r = answerChatAsk({ db, hub, waker, journalHost }, { userId: who.userId, roomId: room_id, targetDeviceId: target_device_id, decision: decision === 'deny' ? 'decline' : 'approve', decidedBy: { kind: 'user', deviceId: who.deviceId }, approval: body.approval ?? null })
         return json(res, r.status, r.body)
       }
       if (req.method === 'POST' && url.pathname === '/agent-spawn/answer') {
@@ -635,7 +668,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // Shared with the Coordinator's route (src/consent-answer.js): the
         // claim, the off-cycle orchestration and the wake-before-spawn are
         // one code path whoever answered.
-        const r = answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs }, { userId: who.userId, requestId: request_id, decision: decision === 'deny' ? 'decline' : 'approve', decidedBy: { kind: 'user', deviceId: who.deviceId } })
+        // `approval`: the signed approval a spawn onto a protected box needs
+        // once the account has a key (src/consent-subject.js).
+        const r = answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs, journalHost }, { userId: who.userId, requestId: request_id, decision: decision === 'deny' ? 'decline' : 'approve', decidedBy: { kind: 'user', deviceId: who.deviceId }, approval: body.approval ?? null })
         return json(res, r.status, r.body)
       }
       if (req.method === 'GET' && url.pathname === '/search') {
@@ -737,11 +772,89 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // revocation"): HTTP 401s on the next call, WS closes next-frame or
         // via the ≤60s sweep. Not-owned and nonexistent are indistinguishable.
         const revokedId = Number(dm[1])
-        if (!revokeOwnedDevice(db, who.userId, revokedId)) return json(res, 404, { error: 'not_found' })
+        // Once the account has an approval key, a revoke must not be a way
+        // back to an account without one. Signing YOURSELF out needs no
+        // signature and leaves your keys enrolled, detached, for the app to
+        // re-attach after signing in again (auth.js signOutOwnedDevice).
+        // Revoking ANOTHER device (a client or a bridge) is an account
+        // action, {op:'revoke_device', device}, and revokes its keys with
+        // it. An account with no key: today's unsigned revoke.
+        if (revokedId === who.deviceId && hasActiveKey(db, who.userId)) {
+          if (!signOutOwnedDevice(db, who.userId, revokedId)) return json(res, 404, { error: 'not_found' })
+          return json(res, 200, { ok: true })
+        }
+        let keys
+        if (hasActiveKey(db, who.userId)) {
+          const body = await readBody(req)
+          // Or the password and a TOTP code, as for removing a key
+          // (approval-keys-http.js confirmPasswordAndTotp: never a recovery
+          // code, one attempt at a time, the same enrolment lock): so a
+          // user whose only keyed phone is stolen can sign it out from a
+          // device with no key.
+          if (body.approval === undefined && (body.password !== undefined || body.code !== undefined)) {
+            if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(revokedId, who.userId)) return json(res, 404, { error: 'not_found' })
+            const pwCtx = { db, hub, pushPipeline, tokenBox: twoFactorBox, loginGuard, journalHost, passwordChecks }
+            if (!(await confirmPasswordAndTotp(pwCtx, res, who, { password: body.password, code: body.code }))) return
+            // Signed out while the password was being checked: nothing.
+            if (!callerSignedIn(db, who)) return json(res, 401, { error: 'unauthenticated' })
+            keys = activeKeysOfDevice(db, who.userId, revokedId)
+            if (!revokeOwnedDevice(db, who.userId, revokedId)) return json(res, 404, { error: 'not_found' })
+          } else {
+            const g = guardedAccountAction({ db, journalHost }, who, body, { op: 'revoke_device', device: String(revokedId) }, {
+              // Not owned and nonexistent are the same 404, before any
+              // signature is looked at (anti-enumeration, as below).
+              check: () => { if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(revokedId, who.userId)) refuse(404, { error: 'not_found' }) },
+              write: () => {
+                const live = activeKeysOfDevice(db, who.userId, revokedId)
+                if (!revokeOwnedDevice(db, who.userId, revokedId)) refuse(404, { error: 'not_found' })
+                return live
+              },
+            })
+            if (!g.ok) return json(res, g.status, g.body)
+            keys = g.value
+          }
+        } else {
+          // Its approval keys are revoked with it (auth.js), each with a notice.
+          keys = activeKeysOfDevice(db, who.userId, revokedId)
+          if (!revokeOwnedDevice(db, who.userId, revokedId)) return json(res, 404, { error: 'not_found' })
+        }
+        for (const key of keys) announceKey({ db, hub, pushPipeline }, who.userId, key, { added: false, how: 'with the device it was on' })
         // Room membership goes with it, via the convo_agents cascade in
         // db.js — not a call here. This route used to do the cleanup itself,
         // which left `matron-admin device revoke` quietly not doing it.
         return json(res, 200, { ok: true })
+      }
+      const pd = url.pathname.match(/^\/devices\/(\d+)\/protected$/)
+      if (req.method === 'POST' && pd) {
+        // Mark one of the user's own boxes protected, or not
+        // (src/consent-subject.js): its consent asks become the user's alone
+        // and, once the account has an approval key, need a signature; its
+        // sessions are out of the Coordinator's session control. Client
+        // tokens only, an agent box only (anything else is 404, as for a
+        // device that is not there). An account action: with an active key
+        // the account statement {op:'protect_device', device, on} is
+        // required (guardedAccountAction), checked in the write's transaction.
+        // The user-only flag is left as it is.
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const body = await readBody(req)
+        if (typeof body.on !== 'boolean') return json(res, 400, { error: 'bad_request' })
+        const deviceId = Number(pd[1])
+        if (!db.prepare("SELECT 1 FROM devices WHERE id=? AND user_id=? AND kind='agent'").get(deviceId, who.userId)) return json(res, 404, { error: 'not_found' })
+        const g = guardedAccountAction({ db, journalHost }, who, body, { op: 'protect_device', device: String(deviceId), on: String(body.on) }, {
+          write: () => {
+            // A write that changes nothing (the device is gone) is the 404,
+            // never a success; refused, so a nonce the check spent is rolled
+            // back. (The check above runs in the same synchronous step, so
+            // this is a backstop.)
+            if (!setDeviceProtected(db, deviceId, body.on)) refuse(404, { error: 'not_found' })
+            // Open consent items aimed at the box now say whether they need
+            // a signature, and over what.
+            return restampConsentItems(db, who.userId)
+          },
+        })
+        if (!g.ok) return json(res, g.status, g.body)
+        announceRestamped(who, g.value)
+        return json(res, 200, { ok: true, device_id: deviceId, protected: body.on })
       }
       const rn = url.pathname.match(/^\/devices\/(\d+)\/rename$/)
       if (req.method === 'POST' && rn) {
@@ -758,6 +871,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         if (!clean || clean.length > DEVICE_NAME_MAX) return json(res, 400, { error: 'bad_request' })
         const renamedId = Number(rn[1])
         if (!renameOwnedDevice(db, who.userId, renamedId, clean)) return json(res, 404, { error: 'not_found' })
+        // A consent ask aimed at a protected box names it in its subject
+        // (src/consent-subject.js): open consent items follow the new name.
+        announceRestamped(who, restampConsentItems(db, who.userId))
         // The frame carries the standing tag too — device_meta is "here is
         // this device's current meta", not a name-only delta, so a roster
         // built from frames alone never loses the letter.
@@ -808,19 +924,30 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       }
       if (req.method === 'POST' && url.pathname === '/pair/approve') {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
-        const { pair_code, agent_name, tag_char } = await readBody(req)
+        const body = await readBody(req)
+        const { pair_code, agent_name, tag_char } = body
         if (typeof pair_code !== 'string' || !pair_code ||
             typeof agent_name !== 'string' || !agent_name ||
             (tag_char != null && typeof tag_char !== 'string')) {
           return json(res, 400, { error: 'bad_request' })
         }
-        const r = pairs.approve(pair_code, { userId: who.userId, agentName: agent_name, tagChar: tagChar(tag_char) })
+        // An account action: with an approval key, signed over the code and
+        // the name as sent ({op:'pair_bridge', code, name}; a value over 200
+        // characters as its hash). The in-memory approve is the transaction's
+        // last step; a code it cannot approve is refused there, so the nonce
+        // is not spent.
         // conflict (already approved) is distinguishable — the caller is
         // authenticated, so this leaks nothing exploitable and tells a
         // double-tapping user the truth. Unknown and expired stay merged
         // into 404, same anti-enumeration stance as everywhere else.
-        if (r === 'conflict') return json(res, 409, { error: 'conflict' })
-        if (r === 'not_found') return json(res, 404, { error: 'not_found' })
+        const g = guardedAccountAction({ db, journalHost }, who, body, boundedSubject({ op: 'pair_bridge', code: pair_code, name: agent_name }), {
+          write: () => {
+            const r = pairs.approve(pair_code, { userId: who.userId, agentName: agent_name, tagChar: tagChar(tag_char) })
+            if (r === 'conflict') refuse(409, { error: 'conflict' })
+            if (r === 'not_found') refuse(404, { error: 'not_found' })
+          },
+        })
+        if (!g.ok) return json(res, g.status, g.body)
         return json(res, 200, { status: 'approved' })
       }
       if (req.method === 'POST' && url.pathname === '/pair/preview') {
@@ -862,13 +989,21 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       }
       if (req.method === 'POST' && url.pathname === '/link/approve') {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
-        const { link_code } = await readBody(req)
+        const body = await readBody(req)
+        const { link_code } = body
         if (typeof link_code !== 'string' || !link_code) return json(res, 400, { error: 'bad_request' })
-        const r = links.approve(who.deviceId, link_code)
+        // An account action: with an approval key, signed over the code as
+        // sent ({op:'link_device', code}), as /pair/approve.
         // conflict = "nothing claimed yet, or already resolved" — the caller
         // is the authenticated starter, so the truth leaks nothing.
-        if (r === 'conflict') return json(res, 409, { error: 'conflict' })
-        if (r === 'not_found') return json(res, 404, { error: 'not_found' })
+        const g = guardedAccountAction({ db, journalHost }, who, body, boundedSubject({ op: 'link_device', code: link_code }), {
+          write: () => {
+            const r = links.approve(who.deviceId, link_code)
+            if (r === 'conflict') refuse(409, { error: 'conflict' })
+            if (r === 'not_found') refuse(404, { error: 'not_found' })
+          },
+        })
+        if (!g.ok) return json(res, g.status, g.body)
         return json(res, 200, { status: 'approved' })
       }
       if (req.method === 'POST' && url.pathname === '/link/deny') {

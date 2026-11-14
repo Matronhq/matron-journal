@@ -21,6 +21,7 @@ import { setRoomItem, getPersonRoom, guestSees, expirePersonRoomAsks } from './p
 import {
   OWNER_TALK_ACTIONS, CHOICE, guestChoices, contactPending, completeTalkStart, failTalkStart, expireTalkAsks, TALK_GUEST_TTL_MS,
 } from './talk-requests.js'
+import { isProtectedDevice } from './consent-subject.js'
 
 const JOURNAL = 'journal'
 const DAYS = Math.round(TALK_GUEST_TTL_MS / (24 * 60 * 60 * 1000))
@@ -234,12 +235,18 @@ export async function issueTalkStart(ctx, l, target) {
   let convoId = null
   try {
     if (!broker) code = 'unavailable'
+    // A protected box (src/consent-subject.js) starts a session only on a
+    // signed approval, which a talk's start does not carry: refused before
+    // anything is sent to it.
+    else if (isProtectedDevice(db, l.guest_user_id, target.deviceId)) code = 'protected_device'
     else {
       if (spawnWakeWaitMs > 0) {
         let waking = false
         try { waking = wakeIfOffline(ctx, l.guest_user_id, target.deviceId) === true } catch (err) { console.error('talk request: wake threw', err) }
         if (waking) await hub.waitForDevice(l.guest_user_id, target.deviceId, spawnWakeWaitMs)
       }
+      // Checked again after the wait: a box protected meanwhile gets no start.
+      if (isProtectedDevice(db, l.guest_user_id, target.deviceId)) return { convoId: null, code: 'protected_device' }
       const r = await broker.issue(hub, l.guest_user_id, target.deviceId, 'start', { workdir: '', talk: true, prompt: talkTask(l), agent: 'claude' }, { timeoutMs: spawnStartTimeoutMs })
       const id = r.ok ? r.result?.convo_id : null
       if (typeof id === 'string' && id && id.length <= CONVO_ID_MAX_CHARS && sanitizePeerText(id, CONVO_ID_MAX_CHARS) === id) convoId = id

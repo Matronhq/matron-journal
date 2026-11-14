@@ -36,7 +36,8 @@ import { fedRoomsOf, getFedRoom, fedRoomOfRoom, fedRoomRow, listFedRooms } from 
 
 const forbidden = (res) => { json(res, 403, { error: 'forbidden' }); return true }
 const SHARE_CONFLICTS = new Set(['private_session', 'not_contact', 'pending', 'too_many_asks', 'not_pending', 'not_active'])
-const ROOM_CONFLICTS = new Set(['not_pending', 'not_available'])
+// protected_device: the guest box is protected (person-rooms.js inviteGuest).
+const ROOM_CONFLICTS = new Set(['not_pending', 'not_available', 'protected_device'])
 const DECISIONS = new Set(['approve', 'accept', 'decline'])
 // A talk request guest's accept names where their side talks.
 function talkTargetOf(body) {

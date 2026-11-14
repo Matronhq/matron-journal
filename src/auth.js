@@ -12,8 +12,10 @@ export async function createUser(db, name, password) {
   return { id: r.lastInsertRowid, name }
 }
 
+export const hashPassword = (password) => argon2.hash(password, { type: argon2.argon2id })
+
 export async function setPassword(db, name, password) {
-  const hash = await argon2.hash(password, { type: argon2.argon2id })
+  const hash = await hashPassword(password)
   const r = db.prepare('UPDATE users SET password_hash=? WHERE name=?').run(hash, name)
   if (r.changes === 0) throw new Error(`no such user: ${name}`)
 }
@@ -34,17 +36,32 @@ export async function setPassword(db, name, password) {
 // awaits leave room for another device to change the password (and sign
 // this one out) first, and a stale check must not then overwrite it.
 // { ok:false, revoked:true } means the caller was signed out meanwhile.
+//
+// In two halves for a caller that must check more in the write's own
+// transaction (POST /password's approval-key guard): the async
+// preparePasswordChange (verify and hash; null on a bad old password) and
+// the synchronous applyPasswordChange (the transaction, which nests inside
+// the caller's).
 export async function changePassword(db, userId, { oldPassword, newPassword, deviceId, signOutOthers = false }) {
+  const prepared = await preparePasswordChange(db, userId, { oldPassword, newPassword })
+  if (!prepared) return { ok: false }
+  return applyPasswordChange(db, userId, prepared, { deviceId, signOutOthers })
+}
+
+export async function preparePasswordChange(db, userId, { oldPassword, newPassword }) {
   const user = db.prepare('SELECT password_hash FROM users WHERE id=?').get(userId)
   // Defensive only: Bearer auth (authToken) already guarantees a devices row
   // whose user_id references a real users row — this should be unreachable.
-  if (!user) return { ok: false }
+  if (!user) return null
   const verified = await argon2.verify(user.password_hash, oldPassword)
-  if (!verified) return { ok: false }
-  const hash = await argon2.hash(newPassword, { type: argon2.argon2id })
+  if (!verified) return null
+  return { oldHash: user.password_hash, newHash: await argon2.hash(newPassword, { type: argon2.argon2id }) }
+}
+
+export function applyPasswordChange(db, userId, { oldHash, newHash }, { deviceId, signOutOthers = false }) {
   return db.transaction(() => {
     if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(deviceId, userId)) return { ok: false, revoked: true }
-    const swapped = db.prepare('UPDATE users SET password_hash=? WHERE id=? AND password_hash=?').run(hash, userId, user.password_hash).changes
+    const swapped = db.prepare('UPDATE users SET password_hash=? WHERE id=? AND password_hash=?').run(newHash, userId, oldHash).changes
     if (!swapped) return { ok: false }
     const signedOut = signOutOthers
       ? db.prepare("DELETE FROM devices WHERE user_id=? AND kind='client' AND id<>?").run(userId, deviceId).changes
@@ -122,23 +139,77 @@ export function createClientDevice(db, userId, name) {
   return issueDevice(db, userId, 'client', name)
 }
 
-export function authToken(db, token) {
+// Client (app) tokens idle out: unused for this long, the token stops
+// working and the device signs in again. Agent (bridge) tokens never do.
+// The row stays, so the device list can show it as signed out, idle, and the
+// account's approval key stays enrolled for the app to re-attach.
+export const DEFAULT_CLIENT_IDLE_DAYS = 30
+export const DEFAULT_CLIENT_IDLE_MS = DEFAULT_CLIENT_IDLE_DAYS * 24 * 60 * 60 * 1000
+// Using a token keeps the device alive, but the clock is only written when it
+// is this stale, so a busy client costs one write an hour, not one a request.
+const SEEN_REFRESH_MS = 60 * 60 * 1000 // clamped to half a short idle limit in touchDevice
+
+export function clientIdleExpired(row, now = Date.now(), clientIdleMs = DEFAULT_CLIENT_IDLE_MS) {
+  return row.kind === 'client' && clientIdleMs > 0 && now - (row.last_seen_at ?? row.created_at) > clientIdleMs
+}
+
+// Any authenticated use of a device (HTTP request, WebSocket hello, frame or
+// sweep tick): false when it has idled out (never refreshed after that, so an
+// expired token cannot come back), otherwise refresh last_seen_at if stale.
+export function touchDevice(db, row, { now = Date.now(), clientIdleMs = DEFAULT_CLIENT_IDLE_MS } = {}) {
+  if (clientIdleExpired(row, now, clientIdleMs)) return false
+  const refreshMs = clientIdleMs > 0 ? Math.min(SEEN_REFRESH_MS, clientIdleMs / 2) : SEEN_REFRESH_MS
+  if (row.last_seen_at == null || now - row.last_seen_at >= refreshMs) {
+    db.prepare('UPDATE devices SET last_seen_at=? WHERE id=?').run(now, row.id)
+  }
+  return true
+}
+
+export function authToken(db, token, opts) {
   const row = db.prepare(
-    'SELECT id, user_id, kind, name FROM devices WHERE token_hash=?'
+    'SELECT id, user_id, kind, name, created_at, last_seen_at FROM devices WHERE token_hash=?'
   ).get(sha256(token))
   if (!row) return null
-  db.prepare('UPDATE devices SET last_seen_at=? WHERE id=?').run(Date.now(), row.id)
+  if (!touchDevice(db, row, opts)) return null
   return { deviceId: row.id, userId: row.user_id, kind: row.kind, name: row.name }
 }
 
+// Revoking a device revokes its approval keys (src/approval-keys.js) in the
+// same transaction. Only these two explicit revokes do: a password change or
+// reset, a device signing itself out and the lockdown after invalid
+// approvals delete device rows too, but there the key stays enrolled,
+// detached (db.js devices_approval_detach), for the app to re-attach after
+// signing in (signOutOwnedDevice).
+const revokeDeviceKeys = (db, deviceId) =>
+  db.prepare('UPDATE approval_keys SET revoked_at=? WHERE device_id=? AND revoked_at IS NULL').run(Date.now(), deviceId)
+
 export function revokeDevice(db, deviceId) {
-  db.prepare('DELETE FROM devices WHERE id=?').run(deviceId)
+  db.transaction(() => {
+    revokeDeviceKeys(db, deviceId)
+    db.prepare('DELETE FROM devices WHERE id=?').run(deviceId)
+  })()
 }
 
-// Owner-scoped revocation for POST /devices/:id/revoke. One atomic DELETE
-// (no TOCTOU window): the WHERE clause is the ownership check, and the
-// boolean lets the handler 404 nonexistent and not-owned identically.
+// Owner-scoped revocation for POST /devices/:id/revoke. One transaction (no
+// TOCTOU window): the ownership check, the keys, the row. The boolean lets
+// the handler 404 nonexistent and not-owned identically.
 export function revokeOwnedDevice(db, userId, deviceId) {
+  return db.transaction(() => {
+    if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(deviceId, userId)) return false
+    revokeDeviceKeys(db, deviceId)
+    db.prepare('DELETE FROM devices WHERE id=?').run(deviceId)
+    return true
+  })()
+}
+
+// Owner-scoped sign-out that keeps the device's approval keys enrolled:
+// the row goes, its keys are left attached to no device (db.js
+// devices_approval_detach) for the app to re-attach after signing in again.
+// For a device signing itself out, and for the lockdown after invalid
+// approvals (src/approval-keys.js): neither may take the account's keys
+// away, or either would be a way back to an account with none. Same
+// boolean as revokeOwnedDevice.
+export function signOutOwnedDevice(db, userId, deviceId) {
   return db.prepare('DELETE FROM devices WHERE id=? AND user_id=?').run(deviceId, userId).changes > 0
 }
 

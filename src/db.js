@@ -1290,6 +1290,76 @@ export function openDb(path) {
   if (!deviceCols.some((c) => c.name === 'consent_user_only')) {
     db.exec('ALTER TABLE devices ADD COLUMN consent_user_only INTEGER NOT NULL DEFAULT 0')
   }
+  // Approval keys (src/approval-keys.js): a P-256 key per client device
+  // that signs statements for dangerous actions. A key belongs to the
+  // account, not the sign-in: only an explicit revoke (revoked_at) ends it.
+  // device_id is the client device that may sign with it; NULL while it is
+  // attached to none. enrolled_via 'password' (password and TOTP) or
+  // 'device' (approved by enrolled_by, the key_id that signed for it).
+  // approval_nonces are single use (used_at) for five minutes;
+  // approval_key_requests are a new device's asks, ten minutes each.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS approval_keys(
+      id           INTEGER PRIMARY KEY,
+      user_id      INTEGER NOT NULL REFERENCES users(id),
+      key_id       TEXT NOT NULL UNIQUE,
+      public_key   TEXT NOT NULL,
+      alg          TEXT NOT NULL,
+      name         TEXT NOT NULL,
+      device_id    INTEGER,
+      enrolled_via TEXT NOT NULL,
+      enrolled_by  TEXT,
+      created_at   INTEGER NOT NULL,
+      revoked_at   INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_approval_keys_user ON approval_keys(user_id, revoked_at);
+    CREATE INDEX IF NOT EXISTS idx_approval_keys_device ON approval_keys(device_id);
+    CREATE TABLE IF NOT EXISTS approval_nonces(
+      nonce      TEXT PRIMARY KEY,
+      user_id    INTEGER NOT NULL,
+      device_id  INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      used_at    INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_approval_nonces_created ON approval_nonces(created_at);
+    CREATE TABLE IF NOT EXISTS approval_key_requests(
+      id         TEXT PRIMARY KEY,
+      user_id    INTEGER NOT NULL,
+      device_id  INTEGER NOT NULL,
+      public_key TEXT NOT NULL,
+      name       TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_approval_key_requests_user ON approval_key_requests(user_id, created_at);
+  `)
+  // Whatever deletes a device row (a revoke, a password change or reset
+  // signing the others out) takes its nonces and key requests with it, and
+  // leaves its live keys attached to no device: device ids can be handed out
+  // again (auth.js issueDevice), and a key must never follow an id to a new
+  // sign-in. The key itself stays enrolled until the app re-attaches it
+  // (POST /approval-keys/attach); an explicit revoke (auth.js) revokes it
+  // before the row goes. Revoked keys lose the id too, so the key list never
+  // names a later device that was given it.
+  //
+  // A database made with the earlier body (which left a revoked key's id in
+  // place) gets this one, in one transaction so no delete runs between the
+  // drop and the create; and a key still naming a device that is gone loses
+  // the id.
+  const detachSql = `CREATE TRIGGER devices_approval_detach AFTER DELETE ON devices
+    BEGIN
+      UPDATE approval_keys SET device_id = NULL WHERE device_id = OLD.id;
+      DELETE FROM approval_nonces WHERE device_id = OLD.id;
+      DELETE FROM approval_key_requests WHERE device_id = OLD.id;
+    END`
+  db.transaction(() => {
+    const current = db.prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='devices_approval_detach'").get()?.sql
+    if (current !== detachSql) {
+      db.exec('DROP TRIGGER IF EXISTS devices_approval_detach')
+      db.exec(detachSql)
+    }
+    db.exec(`UPDATE approval_keys SET device_id = NULL
+      WHERE device_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.id = approval_keys.device_id)`)
+  })()
   // An APNs token names a physical app install, so at most one device row may
   // hold it. Re-pairing creates a NEW device row, and until setApnsRegistration
   // learned to claim the token, every superseded row kept it: on one deployment one Mac
@@ -1725,6 +1795,26 @@ export function openDb(path) {
   // when its session_state last entered and last left 'running'. All NULL
   // until the first such write. Placed after the notice rebuild, like
   // filed_convo_id.
+  // Approval keys (src/approval-keys.js): an agent marks an item, or one
+  // comment's buttons, as needing a signed tap. `step_up` is 0/1 and `subject`
+  // the JSON text of a flat string map the key's owner is shown; a comment's
+  // `approval` is the JSON {statement, signature} of the signed tap that
+  // answered it. All inert (0 / NULL) on every row from before the columns.
+  if (!itemHandoverCols.some((c) => c.name === 'step_up')) {
+    db.exec('ALTER TABLE items ADD COLUMN step_up INTEGER NOT NULL DEFAULT 0')
+  }
+  if (!itemHandoverCols.some((c) => c.name === 'subject')) {
+    db.exec('ALTER TABLE items ADD COLUMN subject TEXT')
+  }
+  if (!commentActionCols.some((c) => c.name === 'step_up')) {
+    db.exec('ALTER TABLE item_comments ADD COLUMN step_up INTEGER NOT NULL DEFAULT 0')
+  }
+  if (!commentActionCols.some((c) => c.name === 'subject')) {
+    db.exec('ALTER TABLE item_comments ADD COLUMN subject TEXT')
+  }
+  if (!commentActionCols.some((c) => c.name === 'approval')) {
+    db.exec('ALTER TABLE item_comments ADD COLUMN approval TEXT')
+  }
   if (!itemHandoverCols.some((c) => c.name === 'turn_requested_at')) {
     db.exec('ALTER TABLE items ADD COLUMN turn_requested_at INTEGER')
   }
@@ -1960,6 +2050,8 @@ export function openDb(path) {
   addTransferRecipient(db)
   addTransferConsentSetting(db)
   addPeerFailingSince(db)
+  addProtectedDevices(db)
+  addApprovalLockdown(db)
   // A routine's envelope (JSON): the bounds on what an ask born of one of
   // its fires may do — how many spawns per fire, whether chats, which boxes.
   // NULL = no envelope, the value for every routine predating the column.
@@ -2362,7 +2454,7 @@ export function pruneApnsToken(db, deviceId, apnsToken, apnsEnv) {
 // registered token, for the push pipeline to fan a journal event out to.
 export function clientDevicesForPush(db, userId) {
   return db.prepare(
-    "SELECT id, apns_token, apns_env, cursor, push_level, sync_scope, push_key FROM devices WHERE user_id=? AND kind='client' AND apns_token IS NOT NULL"
+    "SELECT id, kind, created_at, last_seen_at, apns_token, apns_env, cursor, push_level, sync_scope, push_key FROM devices WHERE user_id=? AND kind='client' AND apns_token IS NOT NULL"
   ).all(userId)
 }
 
@@ -2380,12 +2472,38 @@ export function unreadBadge(db, userId) {
 // Roster for GET /devices — same devices+user_seq read as buildMetrics
 // (src/metrics.js), plus name/created_at, which metrics deliberately omits.
 // token_hash and user_id never leave this function.
-export function listDevices(db, userId) {
+export function listDevices(db, userId, now = Date.now()) {
   const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)
   const headSeq = head ? head.seq : 0
   return db.prepare(
-    'SELECT id AS device_id, kind, name, tag_char, created_at, cursor, last_seen_at FROM devices WHERE user_id=? ORDER BY id'
-  ).all(userId).map((d) => ({ ...d, lag: headSeq - d.cursor }))
+    'SELECT id AS device_id, kind, name, tag_char, created_at, cursor, last_seen_at, protected, locked FROM devices WHERE user_id=? ORDER BY id'
+  ).all(userId).map((d) => ({ ...d, protected: d.protected === 1, locked: storedLocked(d.locked, now), lag: headSeq - d.cursor }))
+}
+
+// A box's locked mode as its bridge reports it (hello, status, box_status):
+// {on: boolean, until: non-negative integer ms | null}, normalised, or
+// undefined when `raw` is not that shape.
+export function parseLocked(raw) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw) || typeof raw.on !== 'boolean') return undefined
+  const until = raw.until ?? null
+  if (until !== null && !(Number.isSafeInteger(until) && until >= 0)) return undefined
+  return { on: raw.on, until }
+}
+
+// The bridge's report for its own device: kept while on, cleared by on:false
+// (or, at hello, by a hello that reports nothing). A malformed report is
+// ignored: the caller passes only what parseLocked accepted.
+export function setDeviceLocked(db, deviceId, locked) {
+  db.prepare('UPDATE devices SET locked=? WHERE id=?').run(locked?.on ? JSON.stringify(locked) : null, deviceId)
+}
+
+// What the device list shows: the stored report, or null when there is
+// none or its `until` has passed.
+const storedLocked = (text, now) => {
+  if (text == null) return null
+  let v
+  try { v = parseLocked(JSON.parse(text)) } catch { return null }
+  return v && (v.until == null || v.until > now) ? v : null
 }
 
 // Box status (spec: 2026-09-21 "usage and allowances live in the journal").
@@ -2444,6 +2562,12 @@ export function isPrivateDevice(db, deviceId) {
 
 export function setDeviceConsentUserOnly(db, deviceId, on) {
   db.prepare('UPDATE devices SET consent_user_only=? WHERE id=?').run(on ? 1 : 0, deviceId)
+}
+
+// The protected flag (src/consent-subject.js). Leaves consent_user_only as
+// it is: protected implies user-only while it is set, on its own.
+export function setDeviceProtected(db, deviceId, on) {
+  return db.prepare('UPDATE devices SET protected=? WHERE id=?').run(on ? 1 : 0, deviceId).changes > 0
 }
 
 // matron-admin's write: sets the value AND takes ownership (pin). Both
@@ -2570,6 +2694,66 @@ export function addTransferConsentSetting(db) {
 export function addTransferRecipient(db) {
   const cols = db.prepare('PRAGMA table_info(transfers)').all()
   if (!cols.some((c) => c.name === 'recipient_device_id')) db.exec('ALTER TABLE transfers ADD COLUMN recipient_device_id INTEGER')
+}
+
+// Protected boxes (src/consent-subject.js): devices.protected marks a box
+// whose consent asks are the user's alone and, once the account has an
+// approval key, need a signed approval. The approval the user's answer
+// carried ({statement, signature} as JSON, exactly as received) is kept on
+// the ask's row until it is forwarded to the box: the spawn's `start`, the
+// chat invite (delivered later, on the box's hello, when it is asleep) and
+// the released transfer. NULL for every other answer. Idempotent.
+export function addProtectedDevices(db) {
+  const has = (table, col) => db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === col)
+  if (!has('devices', 'protected')) db.exec('ALTER TABLE devices ADD COLUMN protected INTEGER NOT NULL DEFAULT 0')
+  if (!has('agent_spawn_requests', 'approval')) db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN approval TEXT')
+  if (!has('convo_agents', 'approval')) db.exec('ALTER TABLE convo_agents ADD COLUMN approval TEXT')
+  if (!has('transfers', 'approval')) db.exec('ALTER TABLE transfers ADD COLUMN approval TEXT')
+}
+
+// Lockdown after failures and locked boxes (src/approval-keys.js).
+// approval_failures: every invalid approval a client device sent, with the
+// reason and the device's name at the time, kept seven days for review;
+// two within ten minutes sign the device out. device_id goes NULL when the
+// device row goes (ids are handed out again, auth.js issueDevice): what an
+// old sign-in sent never counts against a new one. approval_enrol_failures: a
+// wrong password or code on the password-and-code path (bootstrap
+// enrolment, revoke by password); approval_enrol_locks: the account's
+// current or last lock of that path, its escalation level and when it
+// ends. devices.locked: the {on, until} a bridge last reported for its own
+// box (JSON), NULL when not locked or never reported. Idempotent.
+export function addApprovalLockdown(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS approval_failures(
+      id          INTEGER PRIMARY KEY,
+      user_id     INTEGER NOT NULL,
+      device_id   INTEGER,
+      device_name TEXT NOT NULL,
+      reason      TEXT NOT NULL,
+      at          INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_approval_failures_device ON approval_failures(device_id, at);
+    CREATE INDEX IF NOT EXISTS idx_approval_failures_at ON approval_failures(at);
+    CREATE TABLE IF NOT EXISTS approval_enrol_failures(
+      id        INTEGER PRIMARY KEY,
+      user_id   INTEGER NOT NULL,
+      device_id INTEGER,
+      outcome   TEXT NOT NULL,
+      at        INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_approval_enrol_failures_user ON approval_enrol_failures(user_id, at);
+    CREATE TABLE IF NOT EXISTS approval_enrol_locks(
+      user_id   INTEGER PRIMARY KEY,
+      level     INTEGER NOT NULL,
+      locked_at INTEGER NOT NULL,
+      until     INTEGER NOT NULL
+    );
+  `)
+  db.exec(`CREATE TRIGGER IF NOT EXISTS devices_approval_failures_detach AFTER DELETE ON devices
+    BEGIN
+      UPDATE approval_failures SET device_id = NULL WHERE device_id = OLD.id;
+    END`)
+  if (!db.prepare('PRAGMA table_info(devices)').all().some((c) => c.name === 'locked')) db.exec('ALTER TABLE devices ADD COLUMN locked TEXT')
 }
 
 // When deliveries to a peer journal started failing (src/federation-outbox.js):

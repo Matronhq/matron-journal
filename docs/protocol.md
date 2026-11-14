@@ -533,8 +533,13 @@ the machine-checkable version of this page.
   as `not_allowed` against the device and logged, and never goes upstream.
 - `GET /devices` (Bearer, client devices only — agents get 403
   `{error:'forbidden'}`) -> `{devices: [{device_id, kind, name, created_at,
-  cursor, lag, last_seen_at, is_self, connected, status?, defaults?}]}`. The
+  cursor, lag, last_seen_at, protected, locked, idle_expired, is_self,
+  connected, status?, defaults?}]}`. The
   caller's own user's devices only; `is_self` marks the requesting device.
+  `protected` (boolean), `locked` (`{on, until}` or `null`) and
+  `idle_expired` (boolean) are on every device: see *Approval keys
+  (step-up)* → *Protected boxes*, *Locked boxes* and *Client-token idle
+  expiry*. `last_seen_at` is written at most once an hour.
   `status` (agent devices, omitted until the box has reported) is the box's
   last capacity report — `{reported_at, activity?, limits?, disk?,
   account?}`, see "Box status" under the spawn section — so a client sees a
@@ -954,6 +959,11 @@ Rows from before the stamp carry neither, and don't count.
   `box_defaults` (agents only, always present for them) is the connecting
   box's own `{default_agent, default_model, default_effort}`, nulls when
   unset (see *Box defaults*).
+  An agent's `hello` may carry `locked: {on, until}` (its box's locked
+  mode; absent clears it), and every journal frame an agent receives from a
+  user carries `approval_key_id`, replayed ones as `null`: see *Approval
+  keys (step-up)* → *Locked boxes*. An idle-expired client token is refused
+  like an unknown one (`code:'auth'`).
   If the replay gap (`head_seq - cursor`) exceeds `MATRON_MAX_REPLAY`
   (default 50000), the server sends `{kind:'control', op:'snapshot_required'}`
   instead of replaying and closes the socket with code `4009` — the client
@@ -1702,7 +1712,11 @@ plays no part in.
   A durable inbox for a client that missed the live card or wants to review
   every outstanding ask at once.
 - **`POST /agent-chat/answer`** `{room_id, target_device_id, decision:
-  "approve"|"deny"}` — `room_id`/`target_device_id` must
+  "approve"|"deny", approval?}` — `approval` is the signed `consent`
+  statement an approval of an invite to a **protected** box needs once the
+  account has an approval key; the invite then reaches that box with
+  `approval` on its `request` / `join_request` frame (see *Approval keys
+  (step-up)* → *Protected boxes*). `room_id`/`target_device_id` must
   resolve to a **row belonging to the caller's own user**
   (`conversations.owner_user_id`); an unknown room and one owned by another
   user are indistinguishable (`404 {error:'not_found'}`, never `403` — same
@@ -1963,7 +1977,7 @@ Like agent-chat cards, this is a **client-only event** excluded from agent deliv
 
 **Model.** `model` is optional and names which Claude model the child session should run — an alias like `opus` or a full model id like `claude-opus-4-20250514`. The vocabulary is the **target bridge's**, not the journal's: this is a length bound (`SPAWN_MODEL_MAX_CHARS`, 64) and the usual peer-text sanitisation only, never an allowlist, so a bridge that learns a new alias keeps working against an older journal. It is stored on the spawn row and relayed to the target in the `start` RPC params **only when non-empty** — a request that names no model produces the exact params a pre-`model` journal sent, and the consent card omits the key rather than carrying an empty one. An unrecognised model is the target's business to reject (its `start` error surfaces as the usual `failed` outcome).
 
-**Agent and effort.** `agent` (`claude` | `codex`) and `effort` follow the same rule: stored on the row (`agent_spawn_requests.agent`, `.effort`) and relayed in the `start` params only when the ask named them, so the target bridge otherwise starts its own box default. The `start` params are `{workdir, prompt, spawn_id, room_id?, from_name?, model?, mission_num?, effort?, agent?}`; `spawn_id` is the request id, which the child's bridge names on its opening turn's cause (*The Coordinator's own asks*).
+**Agent and effort.** `agent` (`claude` | `codex`) and `effort` follow the same rule: stored on the row (`agent_spawn_requests.agent`, `.effort`) and relayed in the `start` params only when the ask named them, so the target bridge otherwise starts its own box default. The `start` params are `{workdir, prompt, spawn_id, room_id?, from_name?, model?, mission_num?, effort?, agent?, approval?}`; `spawn_id` is the request id, which the child's bridge names on its opening turn's cause (*The Coordinator's own asks*). `approval` is the user's signed approval of a spawn onto a **protected** box, `{statement, signature}` exactly as the app sent it, for the box to check against its pinned keys; it covers `spawn_id`, the box, `workdir` and the hash of `prompt`, nothing else (see *Approval keys (step-up)* → *Protected boxes*). Absent on every other spawn.
 
 **What will run (`*_source`).** The card says which agent, model and effort the child will actually get (`predictSpawnRun` in `src/spawn-model.js`). A value the ask named is carried with `<field>_source: "explicit"`. One it did not name is predicted from the target's box defaults — its last reported `defaults` block, else the journal's stored values (see *Box defaults*) — and carried with `<field>_source: "box_default"`; with neither, the key is omitted as before. The box's model and effort belong to its default agent, so an ask that names a *different* agent gets neither predicted. A Codex child never carries the Fable fallback below; a box-default model other than Fable suppresses it like a named one. **Claude model on a Codex box.** When the ask names no `agent`, the target's default agent is codex, and the ask names a Claude model — an alias (`opus`, `opus[1m]`, `sonnet`, `sonnet[1m]`, `haiku`, `opusplan`, `fable`, `default`) or anything starting `claude-` (`isClaudeModel` in `src/spawn-model.js`, mirroring the bridge) — the target bridge drops that model, and a Claude-only effort (`max`), and runs Codex on its box defaults. The card then carries `agent: "codex"` (`box_default`), the box's model and effort as `box_default` (omitted when the box has none), and `dropped_model` / `dropped_effort` naming what will be ignored; an effort both agents share stays `explicit`. The item body adds "Model `opus` is ignored: this box runs Codex" (and the same for the effort). Naming `agent` explicitly turns this off: the ask runs as named. The consent item's body reads e.g. "Agent: Codex (box default)", "Model: `gpt-5.1-codex` (box default)", and `GET /consent/pending` carries the same `agent`/`model`/`effort`, `*_source` and `dropped_*` keys on each spawn row, predicted again at list time.
 
@@ -1978,6 +1992,7 @@ The card sits in one conversation's timeline and is easy to lose; the Decisions 
 - `kind: 'question'`, `awaiting: 'user'`, `created_by: 'agent'`, origin = the parent conversation and device (so it inherits the parent's mission like any item filed there), placed at the **top** of the open list.
 - `title`: `Approve spawn on <target_name> — <topic, or the head of the task>`; `labels: ['consent']`; `links: [{url: 'matron://consent/spawn/<request_id>', title}]` — the link is how a client that learns to embed the card in item detail finds the ask; until then the item's origin chip is the way back to the conversation holding the card.
 - `actions: ['Approve', 'Decline']` — the item's own buttons, which answer the ask exactly as the card does (see *Answering on the item* below).
+- `step_up: true` and `subject` when the ask is aimed at a **protected** box and the account has an approval key: the Approve tap then carries `approval`, a `consent` statement over that `subject` (see *Approval keys (step-up)* → *Protected boxes*). `step_up: false`, `subject: null` otherwise. The same holds for chat and file-transfer consent items.
 - `body`: who asks, the box, the workdir, the model and the room flag when present, the task **verbatim**, and how to answer (tap Approve or Decline on the item, or on the card in the named conversation; 24 h expiry). Peer strings arrive single-line from the card, but the body is **markdown** — the first place another agent's words meet a renderer — so the task sits in a fenced code block (a fence closes only at the start of a line, which a single-line task cannot reach; the fence is one backtick longer than the task's longest backtick run, so the task itself is never altered), device and conversation names have markup characters stripped, and a backtick in a workdir is stripped rather than let close its code span.
 - Its `created` marker is written under the **asking agent's device** (same sender as the card), carries `consent: 'spawn'` (client-only, see below), and is **quiet**: no push (the card's own `permission_request` push already rang the pocket), no wake, and **no old-client fallback text** (`emitMarker`'s `fallback: false`) — a fallback `text` would overwrite the card's `🤝 Agent spawn request` snippet and count a second unread for one ask. Connected clients still learn of the item live from the marker.
 
@@ -2009,7 +2024,7 @@ Because items are user-wide, the parent's task text is readable through `GET /it
 
 ### Answering
 
-**`POST /agent-spawn/answer`** `{request_id, decision: "approve"|"deny"}` — client-only (`403` for agent tokens). `request_id` must resolve to a **row belonging to the caller's own user**; an unknown row and one owned by another user are indistinguishable (`404 {error:'not_found'}`, never `403` — anti-enumeration). The row must be `state='awaiting_user'` or the call is `409 {error:'conflict'}` (already answered, or never parked). A body carrying `always_allow` at all — any value — is `400 {error:'bad_request'}`.
+**`POST /agent-spawn/answer`** `{request_id, decision: "approve"|"deny", approval?}` — client-only (`403` for agent tokens). A spawn onto a **protected** box is the user's alone to approve and, once the account has an approval key, needs `approval`: a `consent` statement over the subject published on the ask's tracker item (`403 approval_required`, `400 approval_invalid`; see *Approval keys (step-up)* → *Protected boxes*). A decline never needs one. `request_id` must resolve to a **row belonging to the caller's own user**; an unknown row and one owned by another user are indistinguishable (`404 {error:'not_found'}`, never `403` — anti-enumeration). The row must be `state='awaiting_user'` or the call is `409 {error:'conflict'}` (already answered, or never parked). A body carrying `always_allow` at all — any value — is `400 {error:'bad_request'}`.
 
 - **`deny`** flips the row to `denied` and sends the parent `{kind:'spawn', event:'outcome', request_id, outcome:'declined'}` (if reachable).
 - **`approve`** flips the row to `approved` and then, **for a linked row only** (`link` was `true` on the ask), creates a new `conversations` row owned by the parent and joins the target as a participant — room-first, same ordering rule as agent-chat, so a room-creation failure never leaves a live agent spawned on another box with no channel and no provenance. The room is titled the way a bridge titles its own agent-chat rooms (`D:ab ↔️ E:cd — topic`, see matron-bridge `lib/agent-chat.js` and this repo's `src/room-title.js`): each side is the box letter derived from the parent-visible roster (tag_char honoured) plus the session short the owning bridge baked into that session's title, and a side with no short yet falls back to the device name. At creation the child has no title, so its side is the bare target name; when the child's bridge later publishes a title (`convo_upsert` with `title`), the journal retitles the room with the child's tag and fans a `convo_meta` (`refreshSpawnRoomTitle`, `src/spawns.js`). That short is learned once and frozen on the row (`child_short`), so a later child rename — even one carrying a different short, or none — changes nothing, the same way a bridge room freezes its peer short at creation. Before the `start` RPC is issued, `session_status` and `convo_meta` journal events are broadcast into the new room — the same two frames `convo_upsert` fans for a fresh conversation — so live clients learn the room exists immediately, and they fan to the target agent too, since it is already a joined participant by this point. A **detached row** (the default) mints no room and writes no epitaph on failure: the outcome frame is its whole story. Only then does the journal issue the `start` RPC to the target with `params: {prompt: <task>, workdir: <workdir>, room_id?: <new room id, linked rows only>, from_name?: <parent device's sanitised name>, model?: <the requested model>}`. `from_name` gives the target's opening turn the parent's identity without a separate lookup; it is omitted rather than sent empty if the parent device row is gone by approval time. `model` follows the same omit-when-absent rule — a row that named no model, including any row written before the column existed, sends no key at all. The parent hears one of: `outcome:'started'` (with `child_convo_id`, plus `room_id` for a linked row), `outcome:'failed'` (with `error_code`), or times out to `failed/timeout` if the target never answers.
@@ -2192,6 +2207,18 @@ plus the sender's note (`reason`), if any, in a fenced block. Unanswered, the ca
 
 **A transfer the Coordinator had another session send** — one whose `causes` show a carry-on, room message or spawn of the Coordinator's behind it, exactly as for a relayed spawn or chat ask (a turn that could hide such a relay is treated as one) — depends on the user's switch *Let the Coordinator approve file transfers* (`user_settings.coordinator_transfer_consent`, `PUT /coordinator {transfer_consent}`, clients only, or `matron-admin coordinator transfers <user> on|off`; default **off**). Off, the approval answers `403 {detail:'own_ask_unverified', why}` and the file is the user's to approve. On, it is answered like any other transfer, and its decision row records `cause_kind 'setting'`, `cause_ref 'transfer_consent'`. The switch covers transfers alone: a relayed spawn or chat ask keeps the own-ask rule below, and a flagged file, a user-only box and the Coordinator's own sends stay the user's either way.
 
+**A transfer to a protected box.** A transfer whose recipient (or sender)
+is a protected box is user-only, like a user-only box's. When the
+recipient is protected and the account has an approval key, the card has
+`step_up: true` and a `subject`, and the user's Approve tap must carry
+`approval`, a `consent` statement over it (`{op:'transfer', ask:
+<transfer id>, box, file_sha256, size, decision:'approve'}`). That
+statement is forwarded to the recipient as `transfer.approval` on its
+`ready` frame and as `approval` on its `GET /transfers?for=me` row, for the
+box to check against its pinned keys; it covers the id, box, sha256 and
+size, not the name, type, room, sender or note. See *Approval keys
+(step-up)* → *Protected boxes*.
+
 **Transfer cap.** The Coordinator's transfer approvals are counted apart from its chat and spawn approvals: at most `MATRON_COORDINATOR_TRANSFER_DAILY_CAP` (default 100; `0` is no cap) per rolling 24 h, past which an approval is `409 {detail:'daily_cap', cap}`. They do not count toward the daily cap on chats and spawns.
 
 **Private devices.** A transfer involves a private device when the sending box or any receiving box is private, or the room or the conversation it was sent from is owned by a private box. An ordinary (non-private) Coordinator neither sees such a transfer in `GET /consent/pending` nor is nudged about it, and answering it — approve or decline — is the same `404` as an unknown id; the user answers it, or a private Coordinator does. Only a transfer still waiting for the user counts, so an answered one gets its usual `409` whatever boxes it involves.
@@ -2202,7 +2229,7 @@ Every transfer event sent to a live device takes the shape `{kind:'transfer', ev
 
 | event | to | when |
 |---|---|---|
-| `ready` | the recipient device | released — carries `transfer_id` like every transfer frame, and the whole `transfer` object (`id, room_id, name, size, sha256, content_type, from_name, from_convo_id, reason`; `id` repeats `transfer_id`, and `reason` is the sender's note from `POST /transfers`, the text the card shows, or `null` when there was none) so a bridge can file its own card without a follow-up request; an offline recipient box is woken |
+| `ready` | the recipient device | released — carries `transfer_id` like every transfer frame, and the whole `transfer` object (`id, room_id, name, size, sha256, content_type, from_name, from_convo_id, reason, approval?`; `id` repeats `transfer_id`, and `reason` is the sender's note from `POST /transfers`, the text the card shows, or `null` when there was none) so a bridge can file its own card without a follow-up request; an offline recipient box is woken. `approval` is present only for a transfer to a protected box approved with a signature (below) |
 | `declined` | the sender | the user or Coordinator declined |
 | `failed` | the sender | the uploaded bytes didn't match the declared sha256 (`reason:'sha256_mismatch'`), or a recipient could not save the file (`reason:'receiver: <its reason>'`, from `POST /transfers/:id/failed`) |
 | `delivered` | the sender | a recipient verified its own copy |
@@ -2259,9 +2286,9 @@ degrade path for clients predating the tracker, not a second timeline.
 | `GET /items` | `convo, kind (one or several, comma-separated), state=open\|closed\|done, awaiting, label, sort=rank\|updated\|acted, since, limit≤500, cursor, scope=mine\|shared (shared: kind/state/awaiting/limit/cursor only, and not state=done; rows carry owner{user_id,name,github_login} and repo)`. `state=done` is For you's Done view: closed items, plus open agent-filed ones with a `last_user_input_at` that are not awaiting the user (answered, waiting on their agent). `sort=acted` orders by the user's last action on the item (`last_user_input_at`), falling back to `closed_at`, then `updated_at`; newest first | `{items:[…], next_cursor}` |
 | `GET /items/:id` | `:id` = `it_…` or `#num` (URL-encode `#`) | `{item, comments:[…]}` |
 | `GET /items/:id` (shared) | `:id` = `it_…` of a colleague's item visible under *Shared visibility* | `{item, comments}` with `item.owner`; any other method or sub-route on it is **403 `forbidden`** |
-| `POST /items` | `{kind, title, body?, labels?, links?, attachments?, actions?, awaiting?, position?, after?, before?, convo_id, supersedes?, on_behalf_of?:'user' (agent callers only), private?: boolean (an owner-only item — see *Sharing between people → What a grantee reads*)}` + optional `Idempotency-Key`; `position` is **exclusive** of `after`/`before` (given together is 400); `after`/`before` may be given alone or together (a midpoint between the two, consistent with `/rank`; none means bottom) | 201 `{item}` (200 on replay) |
-| `PATCH /items/:id` | `{title?, body?, labels?, links?, awaiting?, actions?, mission?: id \| "#num" \| null}` — `attachments` is **400** (create-only in v1; it used to be dropped silently, which told a client its blob had landed), and a patch carrying neither a field nor `mission` is **400**. `mission` moves the item to that mission, or detaches it when `null`; it is an explicit move only, never inferred. Fields and the move are one write with one `updated_at`. | `{item}`. **404** if `mission` names a mission that does not exist **or** is invisible to the caller — the same sieve `GET /missions/:id` applies (see *Missions & milestones → Visibility*), never a 403, so a hidden mission is not an existence oracle here either. **409** only for `awaiting` on a closed item (clearing it with `null` is fine); a **closed mission is not refused** as a move target in v1 — closing a mission blocks on open items precisely so they can be moved, and a finished mission must stay correctable. |
-| `POST /items/:id/comments` | `{body?, attachments?, action?, reply_to?, replaces?, actions?, as_convo_id?}` (body or attachments required, unless `action` is given) + optional `Idempotency-Key` | 201 `{item, comment}` (200 on replay); `action` from an agent is **403 `forbidden`**, one not among the current `actions` of what it answers (the item, or the comment `reply_to` names) is **400 `unknown_action`** — see *Action buttons*; `actions` from a client is **403 `forbidden`**, on a closed item **409 `conflict`** — see *Comment action buttons* |
+| `POST /items` | `{kind, title, body?, labels?, links?, attachments?, actions?, step_up?, subject?, awaiting?, position?, after?, before?, convo_id, supersedes?, on_behalf_of?:'user' (agent callers only), private?: boolean (an owner-only item — see *Sharing between people → What a grantee reads*)}` + optional `Idempotency-Key`; `position` is **exclusive** of `after`/`before` (given together is 400); `after`/`before` may be given alone or together (a midpoint between the two, consistent with `/rank`; none means bottom) | 201 `{item}` (200 on replay) |
+| `PATCH /items/:id` | `{title?, body?, labels?, links?, awaiting?, actions?, step_up?, subject?, mission?: id \| "#num" \| null}` — `attachments` is **400** (create-only in v1; it used to be dropped silently, which told a client its blob had landed), and a patch carrying neither a field nor `mission` is **400**. `mission` moves the item to that mission, or detaches it when `null`; it is an explicit move only, never inferred. Fields and the move are one write with one `updated_at`. | `{item}`. **404** if `mission` names a mission that does not exist **or** is invisible to the caller — the same sieve `GET /missions/:id` applies (see *Missions & milestones → Visibility*), never a 403, so a hidden mission is not an existence oracle here either. **409** only for `awaiting` on a closed item (clearing it with `null` is fine); a **closed mission is not refused** as a move target in v1 — closing a mission blocks on open items precisely so they can be moved, and a finished mission must stay correctable. |
+| `POST /items/:id/comments` | `{body?, attachments?, action?, reply_to?, replaces?, approval?, actions?, step_up?, subject?, as_convo_id?}` (body or attachments required, unless `action` is given; `step_up`/`subject` with an agent's `actions` only) + optional `Idempotency-Key` | 201 `{item, comment}` (200 on replay); `action` from an agent is **403 `forbidden`**, one not among the current `actions` of what it answers (the item, or the comment `reply_to` names) is **400 `unknown_action`** — see *Action buttons*; `actions` from a client is **403 `forbidden`**, on a closed item **409 `conflict`** — see *Comment action buttons* |
 | `PATCH /items/:id/comments/:cid` | `{blob_ref, transcript}` — agent only, else 403 | `{comment}` |
 | `POST /items/:id/close` | `{resolution, comment?, as_convo_id?}` | `{item, comment}`; 409 if already closed |
 | `POST /items/:id/reopen` | `{comment?, as_convo_id?}` | `{item, comment}`; 409 if already open |
@@ -2272,7 +2299,7 @@ title, body, labels[], links[{url,title?}], supersedes, origin_convo_id,
 origin_device_id, created_by, created_at, updated_at, closed_at,
 comment_count, last_comment_at, last_user_input_at, attachments[], has_image,
 mission_id,
-mission_num, consent, actions[], chosen_action, origin_convo_title, device_name, working}`.
+mission_num, consent, actions[], chosen_action, step_up, subject, origin_convo_title, device_name, working}`.
 `device_name` is the name of the box whose session filed an agent's item —
 the writer of the item's own first post, named the way a comment's
 `device_name` names its writer — so a thread can head the body with it. A
@@ -2307,7 +2334,20 @@ spawn and agent-chat consent cards — are invisible to every agent caller
 here is the item **body**'s attachments (set at create only, v1) — a
 comment's own attachments live on the comment. Comment shape:
 `{id, item_id, author, device_id, kind:'comment'|'status', body,
-created_at, attachments[{blob_ref,mime,name,size,width?,height?,transcript?,transcript_status?}], meta, action, reply_to, actions, chosen_action, device_name, convo_id, convo_title}`.
+created_at, attachments[{blob_ref,mime,name,size,width?,height?,transcript?,transcript_status?}], meta, action, reply_to, actions, chosen_action, step_up, subject, approval, device_name, convo_id, convo_title}`.
+**Step-up.** `step_up` (boolean) marks an item, or a comment's buttons, as
+needing a tap signed with an approval key; `subject` (a flat object of
+strings, or `null`) is what the user is shown and signs over; a comment's
+`approval` (`{statement, signature}` or `null`, owner's reads only) is the
+signed approval its tap was accepted with. A tap on a step-up item, or on a
+step-up comment's buttons, carries `approval` once the account has a key
+(`403 approval_required`, `400 approval_invalid`), and its `commented`
+marker's `comment` gains `signed: true` and `key_id`. An owner with no key
+gets an ordinary item and `step_up_ignored: true` in the reply. On a
+step-up item of an account with a key only a client's signed patch lowers
+the mark, and no one changes its subject; another person's view shows `step_up: false`,
+`subject: null`. Validation (`invalid_subject`, `invalid_actions`) and the
+rules are in *Approval keys (step-up)* → *Step-up items and comments*.
 **Comment author.** `device_name`, `convo_id` and `convo_title` say who wrote
 an agent's comment: the name of the box (`device_id`'s device) and the
 conversation its session writes from, so a thread several sessions post in
@@ -2580,6 +2620,11 @@ is unique per `(user_id, idem_key)` in the schema, not per item.
                  "attachments": [ … ] } } }
 ```
 
+A tap accepted with an approval key's signature adds `"signed": true` and
+`"key_id": "<64 hex>"` to `comment`, beside `action` and `reply_to`; both
+are absent on every other comment, and the statement itself is never on a
+marker (see *Approval keys (step-up)* → *Step-up items and comments*).
+
 `actions` and `chosen_action` are the item's action buttons at the moment of
 the marker (see *Action buttons*), on every marker; `comment.action` is the
 tapped label when the comment is an action tap, else `null`; `comment.created_at`
@@ -2644,7 +2689,7 @@ bridge agrees which one it is.
 | Route | Who | Body | Returns |
 |---|---|---|---|
 | `GET /coordinator` | client or agent | | 200 `{convo_id: string\|null, consent: boolean, transfer_consent: boolean}`. An ordinary agent reads `null` when the Coordinator is a private-owned conversation. `consent` is the *Consent approval* switch below (default `true`); `transfer_consent` is *Let the Coordinator approve file transfers* (default `false`, see *File transfers*). |
-| `PUT /coordinator` | client only (agent → **403** `forbidden`) | `{convo_id?: string\|null, consent?: boolean, transfer_consent?: boolean}` — at least one | 200 `{convo_id, consent, transfer_consent}`. **404** for a conversation the user does not own; **400** when no key is present, `convo_id` is not a string/null, empty or over the id cap, or `consent` or `transfer_consent` is not a boolean. `convo_id: null` clears. An unchanged value is a 200 no-op. |
+| `PUT /coordinator` | client only (agent → **403** `forbidden`) | `{convo_id?: string\|null, consent?: boolean, transfer_consent?: boolean, approval?}` — at least one | 200 `{convo_id, consent, transfer_consent}`. **404** for a conversation the user does not own; **400** when no key is present, `convo_id` is not a string/null, empty or over the id cap, or `consent` or `transfer_consent` is not a boolean. `convo_id: null` clears. An unchanged value is a 200 no-op. Once the account has an approval key each change is a signed account action (`set_coordinator`, `set_consent`) and a request makes one change only (**400** `{error:'bad_request', detail:'one_change_per_approval'}`); see *Approval keys (step-up)* → *Account actions*. |
 
 On a change the journal appends a `coordinator` event — payload
 `{role: "assigned"}` into the conversation that gained the role,
@@ -2777,7 +2822,10 @@ frame: agent connection (`forbidden`); registered (`not_ready`);
 (`not_found`) **and** the user's Coordinator (`forbidden`, detail
 `not_coordinator`); `target_convo_id` exists, same user, top-level, has an
 `agent_device_id`, and its box is not a private device hidden from an
-ordinary caller — all indistinguishable `not_found`. Then the target box:
+ordinary caller — all indistinguishable `not_found`; and its box is not
+**protected** (`forbidden`, detail `protected_device`, whether or not the
+account has an approval key; see *Approval keys (step-up)* → *Protected
+boxes*). Then the target box:
 offline and unwakeable → `agent_unreachable`; otherwise the op is acked at
 once with `{kind:'session_control', event:'sent', request_id, target_waking?}`
 and, off the socket's message loop, the box is woken if needed and waited
@@ -2883,7 +2931,7 @@ whatever matches now, records untouched.
 | `POST /routines` | client, or the Coordinator | `{name, title, schedule \| trigger, prompt, tz?, enabled?, envelope?, convo_id?, causes?}` | 201 `{routine}`; **403** `routine_write_unverified`; **409** `{error:'conflict', blocked_by:'name' \| 'cap'}` |
 | `PATCH /routines/:key` | client, or the Coordinator | `{title?, schedule?, trigger?, tz?, prompt?, enabled?, envelope? (null clears), convo_id?, causes?}` — at least one; `name` is not editable | 200 `{routine}`; **403** `routine_write_unverified` |
 | `DELETE /routines/:key` | client, or the Coordinator | `{convo_id?, causes?}` | 200 `{ok:true}` |
-| `POST /routines/:key/run` | client, or the Coordinator | `{convo_id?, causes?}` | 202 `{accepted:true}`, or `{delivered:false, reason:'no_coordinator'\|'busy'}`; **403** `routine_write_unverified` |
+| `POST /routines/:key/run` | client, or the Coordinator | `{convo_id?, causes?}` | 202 `{accepted:true}`, or `{delivered:false, reason:'no_coordinator'\|'protected_device'\|'busy'}`; **403** `routine_write_unverified` |
 
 **The Coordinator gate** on agent writes is the one project close/merge
 use (`closingConvo`, required): the agent names its own conversation in
@@ -2930,7 +2978,9 @@ restart mid-delivery never fires the same occurrence twice. A fire more
 than 6 hours late (measured from `retry_at` for a retry, `next_at`
 otherwise) is recorded as `last_outcome: 'missed'` and not delivered; a
 routine paused between the due query and its advance is not fired. Delivery is the Alertmanager relay's path: resolve the
-Coordinator and its box (none → `no_coordinator`), `wakeIfOffline`, wait
+Coordinator and its box (none → `no_coordinator`; a protected box →
+`protected_device`, not sent and never retried, see *Approval keys
+(step-up)* → *Protected boxes*), `wakeIfOffline`, wait
 for the box to attach (`MATRON_SPAWN_WAKE_WAIT_MS`) when a wake was fired,
 then issue the journal-originated RPC
 (`MATRON_SESSION_CONTROL_TIMEOUT_MS`):
@@ -3275,6 +3325,11 @@ rows `user_only: true` (absent otherwise); `POST /consent/answer` refuses a
 Coordinator approval of one with **403** `user_only` before any state
 changes, and still accepts a decline. The user's own tap is unaffected. This is for a box that handles something
 only the user should sign off on, such as one that reads their private mail.
+A **protected** box (`devices.protected`, see *Approval keys (step-up)* →
+*Protected boxes*) is user-only too, for chats, spawns and transfers alike,
+and once the account has an approval key an ask aimed at one adds
+`step_up: true` and the `subject` the user's signature covers to its
+`GET /consent/pending` row (absent otherwise).
 
 **What an answer does** is exactly what the tap does — one code path
 (`src/consent-answer.js`) behind `/agent-chat/answer`, `/agent-spawn/answer`
@@ -3343,6 +3398,8 @@ one). On, it is mounted **ahead of** the device Bearer auth:
 - otherwise always **202** — Alertmanager retries only on 5xx:
   `{delivered:false, reason:'no_coordinator'}` when the user has no
   Coordinator or its conversation has no box; `{delivered:false,
+  reason:'protected_device'}` when that box is protected (*Approval keys
+  (step-up)* → *Protected boxes*); `{delivered:false,
   reason:'busy'}` when 4 deliveries are already in flight in this journal
   process; else `{accepted:true}`. The delivery then runs off the request:
   the Coordinator's box is woken if asleep and waited for
@@ -3606,7 +3663,10 @@ A verify ticket cannot be used on these routes, nor an enrol ticket at
 dead once the user has two-factor on (enrolled elsewhere meanwhile), so it
 can never replace an active secret. Existing sessions stay
 signed in. While it is required, `/2fa/disable` is 409
-`two_factor_required`.
+`two_factor_required`. For an account with an approval key both enrolment
+steps are `403 {error:'approval_required'}` and write nothing: two-factor
+is then set up from a signed-in device, with a signature (see *Approval
+keys (step-up)* → *Account actions*).
 
 **Exempt users.** The operator can exempt an account from the requirement
 (`matron-admin user 2fa-exempt <name> on`, stored as
@@ -3631,7 +3691,11 @@ an exempt user, `GET /2fa` and `GET /me` report `required:false`;
 | `PUT /2fa/policy` | `{required}` (admins only) | `{required}`; 503 when the token key is not set |
 
 A wrong password is 401 `bad_password`, a wrong code 403 `bad_code`; both
-count toward the username's lockout. `GET /me` carries
+count toward the username's lockout. Once the account has an approval key,
+`setup`, `enable`, `disable` and `recovery-codes` also need `approval`, an
+`account` statement over `{op:'two_factor', action}`, checked after the
+password and code (see *Approval keys (step-up)* → *Account actions*).
+`GET /me` carries
 `two_factor: {enabled, required}`.
 
 `otpauth_uri` is `otpauth://totp/Matron:<name>@<host>?secret=…&issuer=Matron&algorithm=SHA1&digits=6&period=30`;
@@ -3648,6 +3712,1097 @@ the host is the request's `X-Forwarded-Host` or `Host`, without a port.
 - `matron-admin user 2fa-exempt <name> on|off` — exempt one account from
   the requirement (above).
 - `matron-admin two-factor require on|off`.
+
+## Approval keys (step-up)
+
+An approval key is a P-256 key pair held by one of the user's client
+devices, its private half kept in the device's secure hardware and unlocked
+by the user. For a dangerous action the device signs a short statement
+naming exactly what is being approved; the journal checks the signature
+before it acts and, for an ask aimed at a *protected* box, forwards the
+signed statement unchanged so the box can check it against keys pinned on
+the box itself. A stolen password or session token is then not enough to
+approve a step-up question, release work onto a protected box, or widen
+access to the account.
+
+What a key guards, once the account has one:
+
+- a tap on an item or follow-up question an agent marked `step_up`
+  (*Step-up items and comments*);
+- the user's approval of a spawn, chat invite or file transfer aimed at a
+  protected box, and a client's own `start` on one (*Protected boxes*);
+- account changes that widen access: password, pairing, device links, the
+  Coordinator and its consent switches, two-factor, revoking another
+  device, the protected flag, an admin's changes to an account, the admin
+  flag and every user an admin creates (*Account actions*);
+- a client lowering the mark on a step-up item (*Step-up items and
+  comments*);
+- adding and removing keys (*Keys and enrolment*).
+
+What it does not cover: typed replies, chat messages, voice notes and files
+(a box in *locked mode* deals with those, below); the free text that
+travels with a tap; the `unlock`, `lock` and `clear_lockdown` RPCs, which
+the journal forwards without checking (the bridge checks them); host-level
+access (`matron-admin`, the loopback `POST /link/preapprove`); the password
+reset by email. The journal's check is not the gate for a protected box:
+the box's own check against its pinned keys is, and a box must never trust
+the journal's word that a statement was valid. The journal's nonce gives
+freshness; it checks `signed_at` only loosely (no more than a minute before
+the nonce was issued, nor more than a minute ahead of its own clock, so a
+skewed device clock is caught here rather than at the box); a box checks it
+against its own window.
+
+**An account with no active approval key behaves exactly as before.**
+Every guard below lets the request through unsigned; an `approval` sent
+anyway is ignored (not verified, stored or forwarded, and no nonce is
+touched); a write that asks for `step_up` is stored as an ordinary item or
+comment and its reply adds `step_up_ignored: true`. The `protected` flag is
+the one thing that has effects without a key (see *Protected boxes*). An
+account has a key while at least one of its keys is not revoked, whether or
+not that key is attached to a device.
+
+**Enabled.** Approval keys need the journal's public URL
+(`MATRON_PUBLIC_URL`). A statement names the journal by that URL's host,
+lowercased, with the port when it has one and the scheme's default port
+dropped (`journal.example`, `journal.example:8443`;
+`https://journal.example:443/` is `journal.example`). `GET /approval-keys`
+gives that host as `journal`, so an app need not derive it. Without a public
+URL, `GET /approval-keys` says `enabled: false, journal: null` and the
+nonce, enrolment, approve and attach routes answer
+`409 {error:'approval_keys_disabled'}`. Revoking a key with the password and
+a code still works, as does revoking another device with them (*Device
+revocation*), so an account is never stuck with keys it cannot use. An
+account that already has keys when the URL is taken away fails closed,
+never through unsigned: a guarded request with no `approval` is
+`403 approval_required`, one with an `approval` is `400 approval_invalid` /
+`mismatch`, and since a client cannot get a nonce
+(`409 approval_keys_disabled`) no signed request can pass until the URL is
+back.
+
+### Encodings
+
+| What | Encoding |
+|---|---|
+| Algorithm | ES256: ECDSA on P-256 with SHA-256. Keys carry `alg: "ES256"` |
+| `public_key` | base64url without padding of the 65-byte uncompressed point `0x04 ‖ X ‖ Y`. The point must be on the curve; anything else is `400 {error:'bad_public_key'}`. The journal stores and returns it re-encoded as unpadded base64url |
+| `key_id` | lowercase hex SHA-256 of those 65 bytes (64 characters). Its first 8 characters are the short fingerprint the journal's notices show; apps show it on both devices during enrolment so the user can compare |
+| `signature` | base64url without padding of the ASN.1 DER ECDSA signature (`SEQUENCE {r, s}`, the X9.62 form), never the 64-byte raw `r ‖ s` |
+| signed bytes | the UTF-8 bytes of the statement string |
+| `approval` | `{"statement": "<canonical statement string>", "signature": "<base64url DER>"}`: exactly these two keys, both strings. Any other shape is `approval_invalid` / `bad_statement` |
+
+**Canonical JSON.** The statement is a JSON object serialised by RFC 8785
+(JCS): no whitespace, object keys sorted by UTF-16 code units, strings and
+numbers written exactly as ECMAScript's `JSON.stringify` writes them. A
+statement holds only strings, integers and (in `item.reply_to`) `null`; a
+string with a lone surrogate or a Unicode noncharacter is refused. The
+journal parses the string it receives and refuses it (`bad_statement`)
+unless serialising the parsed object again gives back the very same
+string, so a client sends the canonical string it signed, as a string. That
+string is the statement from then on: the journal checks the signature over
+it, stores it and forwards it byte for byte, and nothing re-serialises it.
+A verifier verifies over the string as received.
+
+**Nonce.** `POST /approvals/nonce` gives `{nonce, expires_at}`: 32 random
+bytes as base64url (43 characters), issued to the calling device for this
+user, good for one statement for five minutes (`expires_at`, ms). It is
+spent as the very last step of a check that has otherwise passed, inside
+the transaction of the write it guards: a refused request, or one whose
+write then fails (a 404, a 409, a lost race), leaves it unspent, and the
+same statement can be sent again. Only the device it was issued to can
+spend it. Expired nonces are swept when the next one is issued.
+
+**Subject.** A flat JSON object of at most 12 keys; every key at most 200
+characters, every value a string of at most 200 characters (empty
+allowed; lengths count UTF-16 code units). Numbers and booleans are written as strings (`"on": "true"`,
+`"device": "12"`, `"size": "2048"`). Subjects the journal builds follow one
+more rule: a value that can be long (a box name, a working directory, a
+code, a conversation id) is, when it is over 200 characters, replaced by
+the lowercase hex SHA-256 of its UTF-8 bytes under the key `<name>_sha256`.
+A 300-character workdir is signed as `workdir_sha256`, never as a shortened
+`workdir`. Free texts are always hashed, whatever their length:
+`task_sha256`, `message_sha256`, `prompt_sha256`, `email_sha256`. Where
+the journal publishes a subject (a step-up item or comment, a consent
+item), a client signs that object exactly as published and does not
+rebuild it from display names; for an account action it builds the subject
+from *Account actions* and the values it is about to send.
+
+### The statement
+
+```json
+{
+  "v": 1,
+  "type": "item_tap",
+  "journal": "journal.example",
+  "user": "alice",
+  "key_id": "7734f909e9f544078132cf4d9007db7ffc0b4a36a266f3e0488477995ee3552f",
+  "nonce": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq8k",
+  "signed_at": 1790000000000,
+  "subject": { "box": "box-a" },
+  "item": { "id": "it_abc123", "num": 7, "reply_to": null },
+  "action": "Approve",
+  "prompt_digest": "ed21b0d465a1c26c16a5800898c5e792473adf2eb04fd99cdbe015cd80200702"
+}
+```
+
+(Spaced and ordered for reading; what is signed and sent is the canonical
+string, below.)
+
+| Field | Type | Meaning |
+|---|---|---|
+| `v` | `1` | Format version. Anything else is `bad_statement` |
+| `type` | `"item_tap"` \| `"consent"` \| `"account"` | What is approved: a button on an item, an ask aimed at a protected box, an account action |
+| `journal` | non-empty string | The journal's host (see *Enabled*) |
+| `user` | non-empty string | The account's name, as signed in with (`users.name`) |
+| `key_id` | non-empty string | The signing key |
+| `nonce` | non-empty string | From `POST /approvals/nonce`, issued to the signing device |
+| `signed_at` | safe integer, ms | When the device signed, by its clock. The journal refuses it (`mismatch`) when it is more than 60 seconds before the nonce was issued or more than 60 seconds ahead of the journal's clock (*Checking an approval*); a box checks it against its own window |
+| `subject` | flat object | What the action is about (above). Required on every type; may be `{}` |
+| `item` | `{id, num, reply_to}` | `item_tap` only, exactly these three keys: the item's `it_…` id (string), its `#num` (integer), and the id of the comment whose button was tapped, or `null` for the item's own buttons |
+| `action` | non-empty string | `item_tap` only: the button label, as the tap sends it |
+| `prompt_digest` | string | `item_tap` only: the hash of the question's words (below) |
+
+`consent` and `account` statements carry exactly the eight common fields
+(`v`, `type`, `journal`, `user`, `key_id`, `nonce`, `signed_at`,
+`subject`); `item_tap` carries those and the three tap fields. A missing
+field, an extra key or a tap field on another type is `bad_statement`.
+
+**`prompt_digest`** is the lowercase hex SHA-256 of the UTF-8 bytes of the
+canonical JSON of the words the user was shown:
+
+- a tap on the item's own buttons (`reply_to: null`): `{"body": <item
+  body>, "title": <item title>}`;
+- a tap on a follow-up question's buttons (`reply_to: <comment id>`),
+  including the journal's own "Hand this item over?" question:
+  `{"body": <that comment's body>}`.
+
+Both texts are the **stored** text (an empty body is `""`), read when the
+tap is checked, so an edit to the title or body between the user reading it
+and tapping is a `mismatch`: re-read and sign again. An app that does not
+send `X-Matron-Item-Inline: attachments` on its `/items` requests is shown
+bodies with every inline attachment ref rewritten to its caption (see
+*Items*), and a digest over that text will not match: a signing client
+sends the header and hashes the bodies exactly as returned. Only the
+title and body count: the buttons on offer, the item's `labels`, its
+attachments and anything else on the item are not covered.
+
+**Worked examples.** `test/fixtures/approval-vectors.json` holds a throwaway
+test key (`key_id 7734f909…3552f`, its private key included, for tests
+only), one signed statement of each type and a tap on a follow-up
+question's button (`item_tap_reply`). Their subjects are ones the journal
+really builds: the `consent` statement's is a spawn's subject exactly as
+*Protected boxes* builds it (`consent_ask_example` holds the ask:
+`sp_1` onto `box-a`, workdir `/home/alice/project`, task
+`Run the test suite and report.`), and the `account` statement's is
+`{op:'link_device', code:'BCDF2345'}`. The digest example:
+
+```
+{"body":"Roll out the new build?","title":"Deploy box-a"}
+→ ed21b0d465a1c26c16a5800898c5e792473adf2eb04fd99cdbe015cd80200702
+```
+
+and the `item_tap` statement as signed (one line, no spaces):
+
+```
+{"action":"Approve","item":{"id":"it_abc123","num":7,"reply_to":null},"journal":"journal.example","key_id":"7734f909e9f544078132cf4d9007db7ffc0b4a36a266f3e0488477995ee3552f","nonce":"q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq8k","prompt_digest":"ed21b0d465a1c26c16a5800898c5e792473adf2eb04fd99cdbe015cd80200702","signed_at":1790000000000,"subject":{"box":"box-a"},"type":"item_tap","user":"alice","v":1}
+```
+
+with the signature
+`MEQCIFaRPTnhu8ClJxt8R8usnO-gMazAXPMSi8pFMtB8ZMyJAiAQzhUFk2wAweZI6owHu6evq2YY29kgFOrc_olu0Wsguw`.
+A follow-up comment whose body is `Rotate the staging credentials?` has
+`prompt_digest` `b433cef943063e09fe67140575a6012897118d3306f202abfd28c800a24b2b37`
+(the hash of `{"body":"Rotate the staging credentials?"}`). The fixture's
+follow-up tap answers the comment `cm_def456` on item `#7`, whose body is
+`Also restart the service?`, with `Yes`:
+
+```
+{"action":"Yes","item":{"id":"it_abc123","num":7,"reply_to":"cm_def456"},"journal":"journal.example","key_id":"7734f909e9f544078132cf4d9007db7ffc0b4a36a266f3e0488477995ee3552f","nonce":"q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq8k","prompt_digest":"3b4138bc5f9e4d49f9eb9ca5640a6dd12589651e605f13d7086e42a8509819ef","signed_at":1790000000000,"subject":{"box":"box-a"},"type":"item_tap","user":"alice","v":1}
+```
+
+### Keys and enrolment
+
+| Route | Who | Body | Answer |
+|---|---|---|---|
+| `GET /approval-keys` | any token | — | `{enabled, journal, keys:[key…], requests:[request…]}` |
+| `POST /approvals/nonce` | client | — | `{nonce, expires_at}` |
+| `POST /approval-keys` | client | `{public_key, name, password, code}` | `{key}` |
+| `POST /approval-keys/requests` | client | `{public_key, name}` | `{id}` |
+| `POST /approval-keys/requests/:id/approve` | client, holding an enrolled key | `{approval}`: `account`, `{op:'enrol_key', key_id:<the requested key's id>}` | `{key}` |
+| `POST /approval-keys/:key_id/revoke` | client | `{approval}`: `account`, `{op:'revoke_key', key_id}`; or `{password, code}` | `{key}`, `revoked_at` set |
+| `POST /approval-keys/attach` | client, holding the key | `{approval}`: `account`, `{op:'attach_key', key_id:<the signing key's own id>}` | `{key}` |
+
+An agent token may read `GET /approval-keys` (a box may show the account's
+keys, but verifies against the keys pinned on it, never these); every other
+request from an agent on these paths, any method other than that `GET`
+(`GET /approvals/nonce` included), is `403 {error:'forbidden'}`. For a
+client token, any method other than the ones listed is `404`. `journal` is
+the host statements must name (*Enabled*), `null` while approval keys are
+off.
+
+A key: `{key_id, public_key, alg, name, device_id, enrolled_via,
+created_at, revoked_at}`. `device_id` is the client device that may sign
+with it, `null` while it is attached to none; `enrolled_via` is
+`'password'` (password and code) or `'device'` (approved by an enrolled
+key); `revoked_at` is `null` while it is live. `keys` lists every key of
+the account, revoked ones included, oldest first. A request:
+`{id, key_id, name, created_at}`; `requests` lists only the ones under ten
+minutes old. `name` (both) is a label for the apps, sanitised like other
+peer text and 1–40 characters after that (`400 {error:'bad_request'}`
+otherwise). A `public_key` already enrolled on any account, revoked keys
+included, is `409 {error:'key_exists'}`: the same answer whichever account
+has it, and on `POST /approval-keys` only once the password and code have
+passed, so a caller learns nothing about a key before that. A revoked key
+can never be enrolled again, on any account: an app whose key was revoked
+creates a new key.
+
+**`POST /approval-keys {public_key, name, password, code}`** enrols the
+calling device's key with the password and a two-factor code: the first
+key on an account, and the way back when no enrolled device is left (it
+works while the account has keys too). Two-factor must be on and `code`
+must be a TOTP code. In order: `409 approval_keys_disabled`; `400
+bad_public_key`; `400 bad_request` (name); `429 enrolment_locked` (below);
+`409 {error:'two_factor_required'}` when two-factor is off;
+`400 {error:'totp_required'}` for a recovery code (refused before it could
+be spent, and before the password is checked); then the password and code
+exactly as the two-factor settings check them (`429 locked_out`,
+`400 bad_request`, `401 bad_password`, `403 bad_code`,
+`503 two_factor_unavailable`); then `409 key_exists`; and
+`401 {error:'unauthenticated'}` if the calling device was signed out while
+the password was being checked. The key is attached to the calling device,
+`enrolled_via: 'password'`.
+
+**Second and later devices.** The new device, signed in, posts its key to
+`POST /approval-keys/requests {public_key, name}` and gets `{id}`
+(`kr_` and 24 hex digits). The request is live for ten minutes and is
+listed in `GET /approval-keys` with the new key's `key_id`. On a device
+that already has a key, the user compares that fingerprint with the one the
+new device shows and signs `{op:'enrol_key', key_id}` for it;
+`POST /approval-keys/requests/:id/approve {approval}` then adds the key,
+attached to the **requesting** device, `enrolled_via: 'device'`, and
+deletes the request, in one transaction. `404 not_found` for an unknown,
+expired or other user's request; `409 key_exists`; then the approval check
+(*Checking an approval*). The new device learns of it from
+`GET /approval-keys` or the notice.
+
+**Revoke.** `POST /approval-keys/:key_id/revoke`, `:key_id` 64 lowercase
+hex digits. The body is read first (one that is not a JSON object is
+`400 bad_request`); then a key that is not a live key of the caller's
+account is `404 not_found`, before anything else. With an `approval` in the
+body: the signed path,
+`{op:'revoke_key', key_id}`, signed by a key attached to the calling device
+(a key may revoke itself); check and revoke are one transaction. With no
+`approval` but a `password` or `code`: the password-and-code path, exactly
+as enrolment's (two-factor on, a TOTP code, the same errors and the same
+lock), and `401 {error:'unauthenticated'}`, nothing revoked, if the calling
+device was signed out while the password was being checked. With neither: `403 approval_required`. Revoking the account's last
+live key puts it back to "no key".
+
+**Attach.** A key belongs to the account, not to a sign-in. When a device
+signs out by itself, is signed out by a password change or reset, or is
+signed out by the lockdown below, its row goes but its key stays enrolled,
+attached to no device; when a client token idles out, the key stays on the
+old, dead device row. After signing in again the app proves it still holds
+the key: it fetches a nonce on the new sign-in, signs
+`{op:'attach_key', key_id:<its own key_id>}` with that key and posts it to
+`POST /approval-keys/attach`. The subject must name the signing key (only a
+key can attach itself); the key may be attached to another device or to
+none (the `wrong_device` check is skipped here, and only here); it must
+not be revoked (`revoked_key`) and must be the account's (`unknown_key`).
+The key moves to the calling device, and the notice
+`Approval key attached: <name> <first 8 of key_id>` is filed (once per key
+and device).
+
+**Attach before signing anything else.** Until the attach, the key is not
+on the calling device, so any other statement it signs is refused
+`wrong_device`, a reason that counts towards a sign-out (two within ten
+minutes sign the device out, *Lockdown*). An app checks `device_id` for
+its key in `GET /approval-keys` after every sign-in, and attaches first
+when it is not the calling device's id.
+
+**Notices.** Each of these files a notice item (*Notice items*) in the
+user's People conversation, awaiting the user, pushed to every device that
+takes pushes:
+
+| When | Title |
+|---|---|
+| a key is enrolled, either way | `Approval key added: <name> <first 8 of key_id>` |
+| a key is attached to the calling device | `Approval key attached: <name> <first 8 of key_id>` |
+| a key is revoked: signed, by password, with the device it was on, or from the host | `Approval key removed: <name> <first 8 of key_id>` |
+| a device is signed out for invalid approvals (*Lockdown*) | `Signed out <device name>: invalid approval signatures` |
+| the password-and-code path locks | `Approval key enrolment locked until YYYY-MM-DD HH:MM UTC` |
+
+The added notice says the key can now approve dangerous actions and to
+remove it and change the password if that was not the user. Adding the
+account's first key or removing its last also restamps open consent items,
+each with an `updated` marker (*Protected boxes*). `matron-admin device
+revoke` and `matron-admin approval-key revoke` file the removed notice (and
+restamp) too, but cannot push it or announce it live (the CLI has no
+connection to the running journal): the apps see it on their next read.
+
+**From the host.** A key outlives its device's sign-in (a reset, a password
+change, a lockdown or a sign-out leaves it attached to no device), and once
+the authenticator is lost too nothing in the apps can remove it. The
+operator can:
+
+- `matron-admin approval-key list <username>`: one line per key,
+  `<key_id> name=<name> device=<id|none> via=<password|device>
+  created=<ISO time> active|revoked=<ISO time>`;
+- `matron-admin approval-key revoke <username> <key_id|--all>`: revokes
+  that live key, or every live key of the account, each with the removed
+  notice. An unknown, revoked or other account's key is an error.
+
+**The enrolment lock.** A wrong password (`401 bad_password`) or wrong code
+(`403 bad_code`) on `POST /approval-keys`, on the password revoke of a key,
+or on the password revoke of another device (*Device revocation*) counts
+against the account; three within an hour lock all three for the
+account. A malformed request, a recovery code (`totp_required`),
+`two_factor_required`, `locked_out` and a 503 do not count. While locked
+both answer `429 {error:'enrolment_locked', retry_at:<ms>}` with a
+`Retry-After` header in seconds, before two-factor, the password or the
+code is looked at (on enrolment, after the key and name checks; on a key
+revoke, after the key lookup; on a device revoke, after the device
+lookup). A lock lasts 1 hour, then 6
+hours, then 24 hours for the third and every later one; the level goes back
+to 1 once the previous lock ended seven days ago or more, and failures from
+before the last lock ended never count towards the next. Each lock files
+the notice above. The lock is kept in the database, so a restart does not
+clear it. Approving a new key from an enrolled device, and a signed revoke,
+work as usual while it lasts. Attempts for one account are taken one at a
+time, start to finish (the same queue `POST /password` uses), so requests
+sent together cannot each get a guess in before the lock. Wrong passwords
+and codes also count towards the username's sign-in lockout, as everywhere.
+Anyone holding one of the account's client tokens can send three wrong
+codes and so re-arm the lock, keeping the password-and-code path shut;
+adding a key approved from a device that has one, and every signed revoke,
+are unaffected, and the host's commands always work.
+
+### Checking an approval
+
+Every guarded route takes the approval as `approval` in its JSON body (the
+direct `start` RPC as `params.approval`). For an account with no active key
+the route behaves as before. Otherwise the checks run in this order, the
+first failure being the answer:
+
+| Answer | When | Counts towards a sign-out |
+|---|---|---|
+| `403 {error:'approval_required'}` | no `approval`, or `null` | never recorded |
+| `400 {error:'approval_invalid', reason:'bad_statement'}` | `approval` is not exactly `{statement, signature}` (two strings), or `statement` is not the canonical string of a well-formed statement | yes |
+| `… reason:'mismatch'` | `journal` is not this journal's host (or the journal has no public URL), or `user` is not the account's name | no |
+| `… reason:'unknown_key'` | `key_id` is not one of this account's keys | yes |
+| `… reason:'revoked_key'` | the key has been revoked | no |
+| `… reason:'wrong_device'` | the key is not attached to the calling device (not checked on *attach*) | yes |
+| `… reason:'mismatch'` | `type`, `subject` (the same keys and values, no more, no fewer) or, for a tap, `item`, `action` or `prompt_digest` differ from what this request needs | no |
+| `… reason:'mismatch'` | `signed_at` is more than 60 seconds before the nonce was issued, or more than 60 seconds ahead of the journal's clock (a device whose clock is wrong; a box would refuse it as stale) | no |
+| `… reason:'signature'` | the signature does not verify under the key | yes |
+| `… reason:'nonce'` | the nonce is unknown, over five minutes old, issued to another device, or already spent | no |
+
+Only when all of these pass is the nonce spent, together with the guarded
+write. A refusal writes nothing and leaves the nonce for another try. Every
+`approval_invalid` sent from an account with a key is recorded against the
+calling client device with its reason (kept seven days); the ones marked
+"yes" count towards *Lockdown after invalid approvals*. `mismatch`,
+`nonce` and `revoked_key` can come from an honest app (an agent edited the
+question while the user was signing, a slow network, a key revoked from
+another device meanwhile); the others only from a forged or broken request.
+An honest client that gets `mismatch` re-reads (and checks its clock) and
+signs again with a new nonce; on `nonce` it fetches a new one and signs
+again.
+
+**Retries.** Only a tap has an idempotent replay (*Step-up items and
+comments*). A consent answer sent again after its answer was lost finds the
+ask no longer waiting: `409` before the signature is looked at, nothing
+spent or recorded; the app reads the ask's state (the consent item, the
+card's outcome) to learn what happened. An account action sent again with
+the same statement is `nonce` (not counted), and the first request's write
+may already have happened: the app re-reads what it changed (the device
+list, the Coordinator, two-factor, the key list) before signing anew.
+
+Where a route also makes its own checks, the order is: the request's shape
+(400s); the checks it made before approval keys (a password, a code, a
+lockout); the approval; then the write's own refusals (404, 409), which
+still leave the nonce unspent. The exceptions are noted with each route;
+among them, these answer before the signature is looked at: the protected
+toggle's `404` for anything but one of the caller's own boxes, a device
+revoke's `404` for a device not the caller's, the admin routes' `403
+forbidden` (no longer an admin) and `404` (no such user), a step-up patch's
+`403 forbidden` for an agent and `400 invalid_subject` for a client, and a
+consent answer's `409`.
+
+### Step-up items and comments
+
+Items and comments carry two more fields, and a comment a third:
+
+- `step_up` (boolean, always present): a tap on this item's buttons, or on
+  this comment's buttons, needs a signature;
+- `subject` (object or `null`): the flat subject the user is shown with
+  the question and signs over, `null` when none was given;
+- `approval` (comments only, `{statement, signature}` or `null`): the
+  signed approval a tap comment was accepted with, exactly as the client
+  sent it. Only the owner's own reads carry it (client or agent tokens of
+  the account, on `GET /items/:id` and in write replies).
+
+All three are the owner's: another person's view of the item and its
+comments (*Shared visibility*, a granted mission) shows `step_up: false`,
+`subject: null` and `approval: null` (that person cannot tap the buttons
+anyway), and copies to another journal carry none of the three fields.
+
+**Setting them.** `POST /items` and `PATCH /items/:id` take
+`step_up?: boolean` and `subject?: object`, from whoever may create or
+patch the item: the user's clients and the user's agents. Raising the mark
+is open to all of them; lowering it, or changing the subject, on a step-up
+item is not (*Lowering the mark*, below). An **agent's**
+`POST /items/:id/comments` with `actions` may add `step_up: true` and a
+`subject`, marking that follow-up question's buttons. Errors, all 400:
+
+- `step_up` not a boolean: `bad_request`;
+- a `subject` that is not a valid subject (above): `invalid_subject`;
+- a `subject` without `step_up: true` on a create or comment, a `subject`
+  on a patch when neither the patch nor the stored item is step-up, or a
+  `subject` with `step_up: false`: `invalid_subject`;
+- `step_up: true` on a notice: `invalid_actions` (a notice's one button
+  is the user's acknowledgement, nothing to sign);
+- `step_up: true` on a comment without a non-empty `actions`:
+  `invalid_actions` (and a client's comment cannot carry `actions`).
+
+`step_up` without a `subject` is allowed (the subject signed is then
+`{}`); `PATCH {step_up:false}` clears `subject`. For an owner with no active
+key a `step_up: true` is dropped, the item or comment is stored as an
+ordinary one, and the reply (201, or 200 for a patch) adds
+`step_up_ignored: true`; a patch whose only field was `step_up: true`
+answers `200 {item, step_up_ignored: true}` with the item unchanged. An
+item marked while the account had a key stays marked when the last key is
+revoked, but then its taps need no signature.
+
+**Lowering the mark.** On a step-up item of an account with an active key,
+a `PATCH /items/:id` that lowers the mark (`step_up: false`) or sends a
+`subject` is restricted, because a token that could clear the mark could
+then tap unsigned:
+
+- **no agent** may do either: every agent token gets
+  `403 {error:'forbidden'}`, the box that filed the item included. An
+  item's origin box can move on a hand-over, and a filing agent can be
+  asked to lower its own mark by whoever holds a client token; so only the
+  user's signature lowers it. An agent that marked an item by mistake
+  closes it and files a new one;
+- a **client** never changes a step-up item's subject
+  (`400 {error:'invalid_subject'}`, `step_up: true` with a new subject
+  included: lower the mark, then raise it again with the new subject), and
+  lowers the mark only as an account action, an `account` statement over
+  `{op:'item_step_up', item:<the item's it_ id>, on:'false'}` in
+  `approval`: `403 approval_required` without one, `400 approval_invalid`
+  for a bad one.
+
+These rules are decided on the item as the patch's own write transaction
+reads it, not as it stood when the request arrived: a patch whose body is
+still arriving when an agent raises the item meets the raised mark. A
+refused patch changes nothing, its other fields and a mission move
+included, and spends no nonce.
+
+Raising the mark (`step_up: true` with no subject, on any item) stays open,
+and an account with no key patches as before. Past this, the mark is
+advisory: it is the filing agent's statement that the question needs the
+user's signature. That agent cannot lower it or change its subject, but it
+can still re-word the question or change its buttons (a re-worded question
+no longer matches a signature made over the old words). What the journal guarantees is that a tap on a
+question marked when the user tapped carries the user's signature over that
+question; a box that must not act without one checks the signed tap itself
+(*Verifying on a box*). A comment's mark cannot be changed once posted: a
+comment is never patched (but for a voice note's transcript).
+
+**Taps.** A tap is `POST /items/:id/comments {action, reply_to?, body?,
+approval?}` from a client (*Action buttons*, *Comment action buttons*). For
+an account with an active key it needs `approval` when the item is
+`step_up` (the mark covers every button in its thread: the item's own,
+every follow-up question's, and the journal's "Hand this item over?"
+question), or when the comment it answers is `step_up`. The statement:
+
+- `type: "item_tap"`;
+- `item: {id: <the item's it_ id>, num: <its #num>, reply_to: <the tap's
+  reply_to, or null>}`;
+- `action`: the tapped label (trimmed, as the tap sends it);
+- `prompt_digest`: over the item's title and body, or over the answered
+  comment's body (above);
+- `subject`: the answered comment's own `subject` when that comment is
+  `step_up`, otherwise the item's `subject`, and `{}` when that is `null`.
+  For the hand-over question, which is never itself step-up, that is the
+  item's.
+
+The check runs inside the comment's own write, on the rows as that
+transaction reads them, after the idempotent-replay answer and the label
+check: a label that is not among the current buttons is still
+`400 unknown_action` before any signature is looked at. A refusal records
+nothing (no comment, no chosen button, no hand-over answer) and spends no
+nonce. An `approval` on a tap of an item and comment that are not step-up is
+checked the same way and stored when valid, and refuses the tap when
+invalid. A typed reply (no `action`) is never a tap: any `approval` on it is
+ignored. Consent items are answered with a `consent` statement, never an
+`item_tap` one (*Protected boxes*).
+
+What is attested is the label, the item, the question's words and the
+subject. A tap's free-text `body` (an empty one reads as the label) is
+stored and delivered but **not covered** by the signature. The button list
+is not covered either: if the agent changes the other buttons but keeps
+the tapped label, the signed tap still counts.
+
+**Replays.** A tap repeated with the same `Idempotency-Key` answers `200`
+with the original comment, as any replay does, without checking the
+approval again or spending a nonce, and emits no second marker. The same
+statement sent again without the key, or with a new one, is `nonce`. The
+journal's "Hand this item over?" question is the exception: once its offer
+is settled, any tap on it, a replay with the same key included, is
+`409 {error:'handover_settled'}`, answered before the replay lookup. That
+tap's free-text `body` is not stored either: its comment's body is the
+label.
+
+**The marker.** The `commented` marker of a signed tap carries two more
+fields in `payload.comment`, next to `action` and `reply_to`:
+`signed: true` and `key_id` (the key that signed). Both are absent on every
+other comment, so an unsigned marker is unchanged. The statement itself is
+never put on a marker; a box that wants it reads the comment from
+`GET /items/:id`. A copy of the marker sent to a contributor's conversation
+(another person) carries neither field.
+
+### Protected boxes
+
+`devices.protected` marks one of the user's agent boxes as one whose work
+needs the user's own approval, signed once the account has a key.
+
+- `POST /devices/:id/protected {on: boolean, approval?}` (Bearer, client
+  devices only; an agent gets `403 forbidden`) →
+  `200 {ok:true, device_id, protected}`. `on` not a boolean is
+  `400 bad_request`; anything but one of the caller's own agent devices is
+  `404 not_found`, before any signature is looked at. With a key this is
+  an account action, `{op:'protect_device',
+  device:'<id>', on:'true'|'false'}`. Open consent items whose subject
+  changes are restamped and get an `updated` marker. The user-only flag
+  is left as it is.
+- `matron-admin device protected <device_id> on|off` does the same from the
+  host, unsigned (the marker is written but not sent live; apps see the
+  change on their next read).
+  `matron-admin device list` adds ` protected` to the line.
+- `GET /devices` carries `protected: boolean` on every device.
+
+**With or without a key**, a protected box:
+
+- is **user-only** for consent (*Consent approval*, *User-only boxes*): an
+  ask it takes part in (spawn target or asker; chat invitee, joiner, asker
+  or room owner; transfer sender or recipient) is listed with
+  `user_only: true` and the Coordinator cannot approve it (`403
+  {detail:'user_only'}`); an item hand-over to or from it needs the user's
+  tap;
+- is out of reach of the journal paths that would start or invite a
+  session on it with no signature to forward:
+
+| Path | Refusal |
+|---|---|
+| Coordinator `session_control` aimed at a session on it | `{kind:'control', op:'error', code:'forbidden', ref:'session_control', request_id, detail:'protected_device'}` (after the existing ownership, role and target checks) |
+| the journal's own `session_control` to a Coordinator whose conversation is on it: a routine's fire (scheduled, triggered or `POST /routines/:key/run`) and an Alertmanager alert | not sent. The routine's `last_outcome` (and its `fired` marker's `outcome`) is `protected_device`, never retried, and `run` answers `202 {delivered:false, reason:'protected_device'}`; `POST /alerts/alertmanager` answers `202 {delivered:false, reason:'protected_device'}`. Choosing such a Coordinator (`PUT /coordinator`) is not refused |
+| a mission hand-over's session start (`start_session`, including **New session** on a protected Coordinator box) | `start_session: {status:'refused', reason:'protected_device'}`; the hand-over itself still goes through and the copy is made |
+| a talk request's **New session** on it | no start is sent; the guest's card reads "Couldn't start a session: protected_device. Pick another option." and the request waits for the guest again |
+| inviting a guest box on accepting a person-room ask or a talk request (on one journal or across journals) | `409 {error:'conflict', blocked_by:'protected_device'}`; nothing changes and the ask stays as it was |
+
+Where the journal first wakes an asleep box and waits for it (a routine, an
+alert, a hand-over's or a talk's session start), it checks again once the
+wait is over: a box protected meanwhile gets nothing, with the same outcome
+as above.
+
+**With a key**, an ask **aimed at** a protected box needs a signed
+`consent` statement to be approved. Aimed at means: a spawn's target box; a
+chat ask's box the invite is delivered to (the invitee; for a join request,
+the room's owner); any recipient box of a file transfer. (An ask a
+protected box only *makes* is user-only but needs no signature.) A decline
+never needs one, and an `approval` sent with a decline, or with an approval
+of an ask not aimed at a protected box, is ignored.
+
+**Where the subject is published.** For such an ask, and only while the
+account has a key:
+
+- `GET /consent/pending` (the Coordinator's list; agent tokens only, so
+  not a client's source) adds `step_up: true` and `subject` to the row;
+- the ask's consent item (`consent: 'spawn' | 'chat' | 'transfer'`, read
+  with `GET /items/:id`) has `step_up: true` and the same `subject`.
+
+The client signs that `subject`, read from the consent item. From a card:
+a spawn card's item is the open item with `consent: 'spawn'` whose `links`
+carry `matron://consent/spawn/<request_id>`; a chat card's has
+`consent: 'chat'` and the link `matron://consent/chat/<room_id>/<target_device_id>`,
+and its `created` marker carries `consent_ask: '<room_id>/<target_device_id>'`;
+a file transfer's has `consent: 'transfer'`, and its `created` marker
+carries `consent_ask: <transfer id>`. Filing the item is best-effort, so
+when there is none the client builds the subject itself from the table
+below, from the card's fields (the spawn's `request_id`, `workdir` and
+`task`; the chat's room, target device and `justification`; the
+transfer's `id`, `sha256` and `size`) and the box's name exactly as
+`GET /devices` lists it (the stored name, not a display label). Items are restamped when the box is
+protected or unprotected, renamed, or when the account's first key is
+added or last key removed. Each changed item's `updated_at` moves (so
+`GET /items?since=` returns it) and an `updated` marker is appended for it;
+from the host (`matron-admin`) the marker is not sent live, and an app sees
+it on its next read. The pending list and the answer check always work
+from the ask as it is now, so the item is a convenience: a rename between
+reading and signing is a `mismatch`.
+
+**Subjects.** All values strings, built with the `<name>_sha256` rule;
+`box` is the box's stored device name (for a legacy transfer to several
+boxes, their names joined with `", "` in device id order).
+
+| Ask | `subject` |
+|---|---|
+| spawn | `{op:'spawn', ask:<request_id>, box:<target box>, workdir, task_sha256:<sha256 of the task>, decision:'approve'}` |
+| chat invite or join request | `{op:'chat', ask:'<room_id>/<target_device_id>', box:<the box the invite goes to>, message_sha256:<sha256 of the justification>, decision:'approve'}` |
+| file transfer | `{op:'transfer', ask:<transfer_id>, box:<recipient box>, file_sha256:<the transfer's sha256>, size:<bytes>, decision:'approve'}` |
+
+`ask` for a chat is the pending row's `id`, the pair the consent link
+`matron://consent/chat/<room>/<device>` and `POST /agent-chat/answer`
+carry: the room and the row's device (the invitee, or for a join the
+joiner). For example, a spawn onto `box-a`:
+
+```json
+{ "op": "spawn", "ask": "0d6f2c1e-8a3b-4c5d-9e7f-1a2b3c4d5e6f", "box": "box-a",
+  "workdir": "~/app", "decision": "approve",
+  "task_sha256": "a25400641734a8a4ec570337327a4a3f0cd9934ccf2dd04a50addf5c26730fa5" }
+```
+
+for the task `Run the test suite and report failures`.
+
+**Answering.** All three of the user's answer routes take `approval`:
+
+- `POST /agent-spawn/answer {request_id, decision, approval?}`;
+- `POST /agent-chat/answer {room_id, target_device_id, decision, approval?}`;
+- a tap on the consent item, `POST /items/:id/comments {action:'Approve',
+  approval?}` (spawn, chat and file transfer items alike).
+
+The check and the state change are one transaction. An ask no longer
+waiting is the usual `409 conflict` (on the item, `409 {error:'conflict',
+reason:'already_answered', message}`), before any signature is looked at;
+then `403 approval_required` or `400 approval_invalid`; a refusal leaves
+the ask waiting and the nonce unspent. A decision by anything but the
+user's own answer is refused `403 {error:'forbidden', detail:'user_only'}`
+(the Coordinator's route has already refused it as user-only; this is the
+backstop).
+
+**What is forwarded.** The approval is stored with the ask and forwarded
+to the box as `approval: {statement, signature}`, the two strings exactly
+as the client sent them, and only when the user's approval carried a
+checked one; every other request is byte for byte what it was before.
+
+| Ask | Where the box finds it |
+|---|---|
+| spawn | the journal's `start` RPC (`from_device_id: 0`): `params.approval`, beside `workdir, prompt, spawn_id, room_id?, from_name?, model?, mission_num?, effort?, agent?` |
+| chat | the delivered invite frame, top level: `{kind:'invite', event:'request', room_id, …, approval}` or `{kind:'invite', event:'join_request', room_id, from_device_id, from_name, justification, approved_by?, approval}`, delivered at once or on the box's next `hello` |
+| transfer | the `ready` frame's `transfer.approval`, and `approval` on the row in `GET /transfers?for=me` |
+
+A box rebuilds the subject from what it is about to act on and compares:
+for a spawn `ask` = `params.spawn_id`, `workdir` = `params.workdir`,
+`task_sha256` = SHA-256 of `params.prompt`; for a chat `ask` =
+`<room_id>/<its own device id>` on a `request` and
+`<room_id>/<from_device_id>` on a `join_request`, `message_sha256` =
+SHA-256 of `justification`; for a
+transfer `ask` = `transfer.id`, `file_sha256` = `transfer.sha256` (which the
+bytes it downloads must match), `size` = `transfer.size`; and in every case
+`box` is its own name. **Not covered** by the signature, so a box must not
+treat them as approved by the user: for a spawn `room_id`, `from_name`,
+`model`, `mission_num`, `effort` and `agent`; for a chat `topic`,
+`from_name`, `from_device_id` (but for its part in a join request's
+`ask`), `from_convo_id`, `target_convo_id`, `person` and `approved_by`;
+for a transfer `name`, `content_type`, `room_id`, `from_name`,
+`from_convo_id` and `reason`. The journal has
+already spent the statement's nonce, but a box keeps its own ledger
+(*Verifying on a box*). An invite approved with `matron-admin agent-chat
+approve` carries no `approval`: a protected box refuses it.
+
+**A client's own `start`.** An `agent_request` with `method: 'start'` to a
+protected box of an account with a key is an account action: `params`
+must be an object whose `workdir` and `prompt` are strings or absent
+(else `{kind:'control', op:'error', code:'bad_request', ref:'agent_request',
+request_id, detail:'bad params'}`), and `params.approval` must be an
+`account` statement over
+
+```json
+{ "op": "start", "box": "box-a", "workdir": "~/app",
+  "prompt_sha256": "69ee4ed03967748aac3e91b0bb1e54bdd92b0bd93f52f18584b7f5fe508de0ba" }
+```
+
+(`workdir` is `""` and `prompt_sha256` the hash of `""` when absent; here
+the prompt was `Check the deploy logs`). A refusal is
+`{kind:'control', op:'error', code:'approval_required' | 'approval_invalid',
+ref:'agent_request', request_id, detail?:<reason>}`. The check and the
+delivery are one transaction: a refusal, or a box with no live socket
+(the usual `agent_unreachable`, with a wake), leaves the nonce unspent. The
+`params` reach the box unchanged, `approval` included; `browser`,
+`room_id`, `from_name`, `model` and any other parameter are not covered.
+Other methods, unprotected boxes and accounts with no key are unchanged.
+
+### Account actions
+
+With an active key, these need an `account` statement over the subject
+shown, signed by a key on the calling device, sent as `approval` in the
+body; each request's checks, guard and write run in one transaction, so a
+refused request changes nothing and spends no code or nonce. Codes, names
+and addresses are signed **exactly as sent**, not normalised
+(`ABCD-1234` and `abcd1234` are different subjects), and a value over 200
+characters follows the `<name>_sha256` rule (a 250-character agent name is
+signed as `name_sha256`). All routes here but the item patch were already
+client-only (`403 forbidden` for an agent); on the item patch an agent may
+not lower the mark at all (*Lowering the mark*).
+
+| Route | `subject` | Notes |
+|---|---|---|
+| `POST /password` | `{op:'change_password'}` | `old_password` is still needed and checked first: a wrong one is `401 bad_password` and spends no nonce. A change that loses its race is the usual `401 bad_password`, nonce unspent |
+| `POST /pair/approve` | `{op:'pair_bridge', code:<pair_code>, name:<agent_name>}` | `tag_char` is not covered. The approval is checked before the code is looked up: an unknown code with no approval is `approval_required`; with a valid one `404`, an approved one `409`, nonce unspent |
+| `POST /link/approve` | `{op:'link_device', code:<link_code>}` | as `/pair/approve`; `409` before the claim, nonce unspent |
+| `PUT /coordinator {convo_id}` | `{op:'set_coordinator', convo:<convo_id, or "" for null>}` | a conversation not the user's is `404`, nonce unspent |
+| `PUT /coordinator {consent}` | `{op:'set_consent', which:'spawns', on:'true'\|'false'}` | |
+| `PUT /coordinator {transfer_consent}` | `{op:'set_consent', which:'transfers', on:'true'\|'false'}` | |
+| `POST /2fa/setup` | `{op:'two_factor', action:'setup'}` | password, then the old code when two-factor is on, then the approval |
+| `POST /2fa/enable` | `{op:'two_factor', action:'enable'}` | the pending code is checked first; a refusal leaves the setup pending |
+| `POST /2fa/disable` | `{op:'two_factor', action:'disable'}` | password and code first |
+| `POST /2fa/recovery-codes` | `{op:'two_factor', action:'recovery_codes'}` | password and code first |
+| `POST /devices/:id/protected` | `{op:'protect_device', device:'<id>', on:'true'\|'false'}` | *Protected boxes* |
+| `POST /devices/:id/revoke`, another device | `{op:'revoke_device', device:'<id>'}` | *Device revocation*. Not the caller's own device. Or `{password, code}` instead of `approval` |
+| `PATCH /items/:id {step_up:false}`, a step-up item, from a client | `{op:'item_step_up', item:<the item's it_ id>, on:'false'}` | *Lowering the mark*. A client never changes a step-up item's `subject` |
+| `POST /users` (admin) | `{op:'admin_create_user', user:<the new name>, admin:'true'\|'false'}` | every creation by an admin with a key, admin or not; the name, password and taken-name checks come first (a taken name is `409`, nonce unspent) |
+| `PATCH /users/:id` (admin) | `{op:'admin_set_admin', user:<target's name>, admin:'true'\|'false'}` | promotion and demotion alike; the last-admin `409 {error:'conflict', reason:'last_admin'}` is the write's, nonce unspent |
+| `POST /users/:id/password` (admin) | `{op:'admin_set_password', user:<target's name>}` | |
+| `PUT /users/:id/email` (admin) | `{op:'admin_set_reset_email', user, email_sha256:<sha256 of "email" as sent, of "" for null>}` | |
+| `DELETE /users/:id/two-factor` (admin) | `{op:'admin_reset_two_factor', user}` | the body (with `approval`) is now read |
+| `POST /users/:id/link-code` (admin) | `{op:'admin_link_code', user}` | |
+| `agent_request start` on a protected box | `{op:'start', box, workdir, prompt_sha256}` | *Protected boxes* |
+| key routes | `{op:'enrol_key'\|'revoke_key'\|'attach_key', key_id}` | *Keys and enrolment*; these need a signature whether or not the account had one before |
+
+**One change per request.** With a key, `PUT /coordinator` makes one
+change per request: a body with more than one of `convo_id`, `consent` and
+`transfer_consent` is `400 {error:'bad_request',
+detail:'one_change_per_approval'}`, with or without an approval, and
+nothing changes. Setting a value it already has still needs a signature.
+Accounts with no key may still combine fields.
+
+**Admin routes.** The admin signs with the admin's own key: the subject
+names the target account by name, and `user` in the statement is the
+admin's. An admin with no key cannot change an account that has one (its
+password, reset address, two-factor, a link code, its admin flag):
+`403 {error:'approval_required'}`, whatever is sent (that account's
+protection is not a web admin's to lift; `matron-admin` on the host still
+can). A creation has no account yet whose key could refuse: an admin with
+no key creates users as before, and an admin with a key signs every one, so
+a keyed admin's stolen token cannot mint a keyless admin to act for it.
+When neither has a key, the routes are as before. Before the signature: a
+caller no longer an admin is `403 forbidden` and an unknown target `404`.
+The admin check is made again inside the write.
+
+**Sign-in-time two-factor enrolment.** For an account with a key,
+`POST /login/2fa/setup` and `POST /login/2fa/enable` with an enrolment
+ticket are `403 {error:'approval_required'}` and write nothing (`/login`
+still issues the ticket). Otherwise the password alone could buy a new
+authenticator, and password plus code can remove every key. Two-factor is
+set up from a signed-in device instead (the signed `/2fa/setup` and
+`/2fa/enable`), or the operator signs a device in from the host
+(`matron-admin link-code`).
+
+**What stays unsigned:** the password reset by email (it signs every client
+out, which detaches their keys but removes none); `PUT /account/email`
+(the user's own reset address, password-checked); `POST /devices/:id/rename`
+and `/tag`; signing the calling device itself out; the admin's
+`DELETE /users/:id/github-link` (it narrows what the account reaches) and
+`PUT /2fa/policy` (journal-wide: it turns no account's own two-factor off);
+the loopback `POST /link/preapprove`; and every `matron-admin` command.
+
+### Lockdown after invalid approvals
+
+A genuine app never sends a bad signature. Two `approval_invalid` answers
+with a counted reason — `signature`, `bad_statement`, `unknown_key` or
+`wrong_device` — to one client device within ten minutes sign that device
+out:
+
+- its row goes, so its token stops working at once over HTTP, and an open
+  socket is closed with `revoked` (`4001`) at its next frame or the next
+  sweep (*Device revocation*);
+- its keys are **not** revoked: they stay enrolled, attached to no device,
+  so the lockdown is never a way back to an account with no key. Signing in
+  on that device again and re-attaching (*Attach*) restores it;
+- the notice `Signed out <device name>: invalid approval signatures` is
+  filed and pushed to the devices the user has left. It names what the
+  device sent ("a signature that does not verify", "a malformed
+  statement", "a key this account does not have", "a key that belongs to
+  another of your devices") and the fingerprints of its keys.
+
+`mismatch`, `nonce` and `revoked_key` are recorded but never count;
+`approval_required` is not recorded at all; nor is anything for an account
+with no active key. Every guarded route counts, the key routes and the
+`start` RPC included, and the count is kept even though the refused
+request's own transaction rolls back. The second request still gets its
+own `400 approval_invalid`; other devices are not affected. Records name a
+device by its id only while that sign-in lasts, so a new sign-in that is
+handed the same device id starts with none.
+
+The password-and-code path has its own lock (*The enrolment lock*, above).
+
+### Locked boxes
+
+A bridge can run a box in **locked mode**, where it starts a turn from
+outside only during an unlock window the user opened with a signed
+statement. The journal's part is to report the mode, to stamp who sent
+each user event, and to carry the unlock requests; the gate is the
+bridge's.
+
+**`approval_key_id`.** Every journal frame an agent connection receives
+whose `sender` is `user:<name>` carries a top-level
+`approval_key_id`: the `key_id` of the live key attached to the client
+device that sent it, as the journal's own tables say (the newest, if a
+device somehow has two), or `null` when that device has none or the
+journal cannot say which device sent it. That covers a client's `send`
+(text, file and image, so voice notes too), `prompt_reply` and
+`read_marker`, and the `item` markers and fallback text of the user's item
+writes (filing, taps, comments, close, reopen, a voice reply's
+transcription follow-up). Every other user event an agent receives (a copy of another
+person's room message, a mission or memory marker, events replayed on
+`hello`) carries `approval_key_id: null`. Frames delivered over HTTP
+(history reads) carry no such field, and absent means the same as `null`.
+Frames to clients and frames from agents are unchanged. A client's
+forwarded `agent_request` carries it too, beside `from_device_id`:
+`{kind:'rpc', request:{request_id, from_device_id, approval_key_id, method,
+params}}`. The journal always builds this field itself and sets it last: a
+client can never supply it. A client's own `payload.approval_key_id`, if it
+sent one, is part of its message and is left as it is.
+
+```json
+{ "kind": "journal", "seq": 812, "convo_id": "c1", "ts": 1790000000000,
+  "sender": "user:alice", "type": "text", "payload": { "body": "deploy it" },
+  "sender_device_id": 3,
+  "approval_key_id": "7734f909e9f544078132cf4d9007db7ffc0b4a36a266f3e0488477995ee3552f" }
+```
+
+**`locked`.** A bridge reports its box's mode as `locked: {on: boolean,
+until: <ms> | null}` (`until` a non-negative integer or absent/`null`;
+other keys are dropped) on `hello`, on `box_status` and on `status`, for
+its own device only (a `device_id` in the frame is ignored; clients cannot
+set it). On `hello`, an absent `locked` clears the mode (a bridge restarted
+without it is not locked); a malformed one is ignored and the hello goes on.
+On `box_status` and `status` an absent or malformed one changes nothing
+(`status` applies it before its own checks); `{on:false}` clears it. A
+`box_status` whose only valid content is `locked` is accepted silently;
+one with nothing valid is `bad_request` (`no valid status block`).
+`GET /devices` shows `locked: {on: true, until} | null` on every device
+(`null` for clients, for a box not locked, and once `until` has passed).
+No live frame announces a change; `/roster` does not carry it.
+
+**Unlock, lock, clear lockdown.** There is no journal route: the app sends
+an ordinary `agent_request` with `method: 'unlock' | 'lock' |
+'clear_lockdown'` and the statement in `params` (for example
+`params: {approval}`), and the journal forwards it like any RPC — `params`
+unchanged, `approval_key_id` stamped, no check, no nonce spent. The bridge
+verifies it. The statements it is expected to require, both `type:
+"account"` (the bridge's contract, not the journal's: these subjects are
+provisional until the bridge's own documentation confirms them, and an app
+should follow the bridge where the two differ):
+
+- `unlock`: `{op:'unlock_box', box:<the box's name>, minutes:'<n>'}`,
+  which opens a window bound to the signing key: during it the bridge
+  accepts user instructions only from frames whose `approval_key_id` is that
+  key;
+- `clear_lockdown`: `{op:'clear_lockdown', box:<the box's name>}`, the only
+  way out of the bridge's own lockdown early;
+- `lock` ends a window and needs no signature.
+
+The nonce still comes from `POST /approvals/nonce` (a statement needs
+one), but since the journal never spends it here, the box's own nonce
+ledger is the only thing that stops a replay. These subjects, the window
+length and the box's lockdown rules are the bridge's to define and
+enforce; the journal checks none of it.
+
+### Verifying on a box
+
+A box that acts on a signed approval checks it itself, against keys
+**pinned on the box**: a keys file installed by configuration management,
+not writable by the user the agent runs as. It must **never** use keys
+fetched from the journal (`GET /approval-keys`) or taken from the approval
+itself: a journal that can name the key can sign anything. Pin keys from
+the fingerprint shown on the user's device, not from a list the journal
+serves. The checks:
+
+1. the statement is the canonical string of a well-formed statement (as
+   above);
+2. its `key_id` is in the pinned file, and the pinned `public_key` hashes
+   to that `key_id`;
+3. the signature verifies over the statement string as received;
+4. `journal` is the journal the box is paired with, `user` the account it
+   serves, `type` the one the action needs, and `subject` exactly the
+   subject the box computes from the request in front of it (the same keys,
+   the same values); for a tap the item, the button and the question it
+   answered (`item.reply_to`) too;
+5. `signed_at` is recent (not older than the box's window, not more than a
+   minute in the future);
+6. the nonce has never been seen before: the box records it in its own
+   ledger, ideally in the same transaction as the action. The journal's
+   nonce is no protection for the box.
+
+Choose the freshness window per kind of request: an approved spawn may
+reach a sleeping box only after it has been woken (up to
+`MATRON_SPAWN_WAKE_WAIT_MS`, four minutes by default), an approved invite
+to a box that is off is delivered at its next `hello`, and a transfer is
+released only once its upload completes, so a forwarded consent can be
+minutes to hours old. The reference tool's five-minute default suits taps
+and unlocks only; the caller picks the window for each kind. The journal's
+own bound on `signed_at` is a check on the device's clock, not a freshness
+window: it takes a statement while its nonce is under five minutes old and
+`signed_at` is no more than a minute before the nonce was issued, so a tap
+the journal accepts can already be up to six minutes past its `signed_at`
+when it is forwarded. A box with a shorter window refuses such a tap as
+`stale`.
+
+**Notes for a bridge.**
+
+- **Its own name.** `box` in a subject is the box's stored device name, the
+  `name` in its `hello_ok`. A rename while the box is connected is not
+  pushed to it, so until it reconnects it compares against the old name and
+  sees `mismatch` on `box`: a known limitation. On a `mismatch` of `box`
+  alone, a bridge reconnects (or otherwise refreshes its name from a new
+  `hello_ok`) and checks again.
+- **Refuse what comes unsigned.** A protected box with pinned keys refuses
+  every `start`, invite and transfer that arrives without `approval`
+  (an operator's `matron-admin agent-chat approve`, an ask approved before
+  the account had a key, an unprotected moment).
+- **`approval_key_id` is not on the journal's own requests.** The
+  journal's `start` RPC (`from_device_id: 0`) carries no `approval_key_id`;
+  only a client's forwarded `agent_request` does.
+- **Not covered.** The signature does not cover `room_id`, `agent`,
+  `model`, `effort`, `mission_num` or `browser` (nor the other fields listed
+  under *What is forwarded*): a box treats them as the journal's word, not
+  the user's.
+
+**`tools/approval-verify.mjs`** is a reference verifier a box can vendor:
+one dependency-free file (Node 20 or later, only `node:crypto` and
+`node:fs`, its own JCS serialiser). It keeps no state; the nonce ledger is
+the caller's.
+
+- API: `verifyApproval(approval, {keys, expect, now?, maxAgeMs?})` →
+  `{ok:true, statement}` or `{ok:false, reason}`. `keys` is the pinned
+  file's content, `{"keys":[{"key_id", "public_key", "name"}]}`; an entry
+  whose `public_key` does not hash to its `key_id` is ignored. `expect` is
+  `{journal, user, type, subject, item_num?, action?, reply_to?,
+  prompt_digest?, item_id?}`: `journal`, `user`, `type` and `subject` are
+  always required (`subject` may be `{}`). For `item_tap`, `item_num` (an
+  integer), `action` (the label) and `reply_to` are required as well:
+  `reply_to` is the id of the follow-up comment whose buttons were tapped,
+  or `null` for the item's own buttons, so a "Yes" on a follow-up never
+  passes for the item's own button; `prompt_digest` (lowercase hex) and
+  `item_id` (the item's `it_` id) are optional and compared when given. A
+  bridge should always pass `prompt_digest` for a tap, computed from the
+  words it asked: without it, a statement signed for the same item, button
+  and `reply_to` still verifies after the question's words have changed (one
+  the journal refused as a `mismatch` and could forward anyway), as long as
+  its nonce is new to the box and `signed_at` is within `maxAgeMs`. For
+  the other types all five must be absent. Any other key is a `TypeError`,
+  as is a malformed `expect`, `now` or `maxAgeMs`. A bad approval or bad
+  keys never throw. `maxAgeMs` defaults to five minutes; `signed_at` more
+  than 60 seconds ahead of `now` is refused too.
+- Reasons, first failure wins: `bad_statement`, `unknown_key`,
+  `signature`, `mismatch` (journal, user, type, subject, or a tap's item
+  number, label, `reply_to`, and `prompt_digest` and item id when given),
+  `stale`.
+- CLI: `node tools/approval-verify.mjs --keys FILE --expect JSON
+  [--max-age-ms N] < approval.json`, `--expect` the same object as JSON
+  and `--max-age-ms` at least 1. Exit 0 with the statement string, as
+  signed, on stdout; exit 1 with the reason on stderr; exit 2 with a usage
+  line for bad arguments (a tap's `--expect` without `reply_to` included)
+  or an unreadable keys file. It never touches the network.
+
+`test/fixtures/approval-vectors.json` is the shared test vector set for
+other implementations (the apps, the bridge, another verifier): a throwaway
+key with its private key, `key_id`, two `prompt_digest` examples, one signed
+statement of each type with subjects the journal really builds, and a tap
+on a follow-up question. Never use that key for anything real.
+
+### Client-token idle expiry
+
+A client (app) token that has not been used for
+`MATRON_CLIENT_IDLE_DAYS` days (default 30; fractions allowed; `0` turns the
+expiry off; an invalid value warns at boot and uses the default) stops
+working. Agent tokens never expire this way. Idle is measured from the
+device's `last_seen_at`, or its `created_at` if it was never seen. An
+expired token gets `401 {error:'unauthenticated'}` over HTTP and
+`{kind:'control', op:'error', code:'auth'}` on a `hello`. Any use of a
+live token keeps it alive, and an open socket counts as use (the
+revocation sweep refreshes it every minute), so a device that stays
+connected does not idle out.
+The device row stays, with its key still attached: `GET /devices` shows it
+with `idle_expired: true` (always present, `false` for agents and live
+clients), and it gets no pushes. The app signs in again (a new device row)
+and re-attaches its key (*Attach*); the old row can then be removed
+(after the attach, so that revoking it does not revoke the key too).
+
+`last_seen_at` is now written at most once an hour per device (or every
+half of the idle limit, when that is shorter), not on every request, so it
+can lag by up to an hour in `GET /devices`, `/roster` and `/metrics`.
+
+### For client implementers
+
+**First key.** Turn two-factor on; check `GET /approval-keys` says
+`enabled: true` (and take `journal` from it for every statement); create
+the key on the device; `POST /approval-keys
+{public_key, name, password, code}` with a TOTP code. Handle
+`429 enrolment_locked` (`retry_at`) and `409 key_exists`.
+
+**Second device.** On the new device, signed in: create its key;
+`POST /approval-keys/requests {public_key, name}` → `{id}`; show its
+fingerprint. On an enrolled device: read the request from
+`GET /approval-keys` (`requests`), show the same fingerprint, then
+`POST /approvals/nonce`, sign `{type:'account', subject:{op:'enrol_key',
+key_id}}`, `POST /approval-keys/requests/:id/approve {approval}`. Within ten
+minutes. The new device sees its key in `GET /approval-keys`.
+
+**A signed tap.** Read the item with `X-Matron-Item-Inline: attachments`;
+if the item (or the comment whose buttons were tapped) is `step_up`, work
+out `subject` (the comment's own when it is step-up, else the item's, else
+`{}`) and `prompt_digest` (item title and body, or the comment's body);
+show the user the question, the label and the subject; `POST
+/approvals/nonce`; sign `{v:1, type:'item_tap', journal, user, key_id,
+nonce, signed_at, subject, item:{id, num, reply_to}, action,
+prompt_digest}` as its canonical string; `POST /items/:id/comments {action,
+reply_to?, approval}` with an `Idempotency-Key`. On `mismatch` re-read and
+start again; on `nonce` get a new nonce and sign again; to retry a request
+whose answer was lost, send the same body with the same `Idempotency-Key`.
+
+**A signed consent answer.** For an ask whose consent item has `step_up:
+true`, copy the item's `subject`; `POST /approvals/nonce`; sign
+`{type:'consent', subject}`; send it as `approval` with the Approve tap on
+the item, or with `POST /agent-spawn/answer` / `POST /agent-chat/answer`. A
+decline needs nothing.
+
+**An account action.** If the account has a key (any key in
+`GET /approval-keys` with `revoked_at: null`): build the subject from the
+table in *Account actions* with the values about to be sent, exactly as
+they will be sent; `POST /approvals/nonce`; sign `{type:'account',
+subject}`; send the request with `approval` in the body. One change per
+`PUT /coordinator`.
+
+**After signing in again** (a sign-out, a password change or reset, an
+idle-expired token, a lockdown): if the device still holds its key, `POST
+/approvals/nonce` on the new sign-in, sign `{type:'account', subject:{op:
+'attach_key', key_id:<its own key_id>}}`, `POST /approval-keys/attach
+{approval}`. Until then its signatures are refused `wrong_device`, which
+counts towards a sign-out: attach before signing anything else (check
+`device_id` in `GET /approval-keys`). A key the account no longer has
+(`revoked_at` set, or missing) cannot be attached or enrolled again
+(`409 key_exists`): create a new key and enrol it.
+
+**If the only keyed phone is lost or stolen.** From another device signed
+in to the account, with no key:
+
+1. `POST /devices/:id/revoke {password, code}` (a TOTP code) signs the
+   phone out and revokes its key at once (*Device revocation*);
+2. or `POST /approval-keys/:key_id/revoke {password, code}` removes the key
+   and leaves the phone signed in (sign it out too);
+3. with no device signed in, the password reset by email signs every
+   client out (keys detached, not removed, and the phone's device row gone,
+   so 1 answers `404`); sign in again and do 2;
+4. with the authenticator lost as well, the operator runs
+   `matron-admin approval-key revoke <user> <key_id|--all>` on the host
+   (and `matron-admin user 2fa-reset <user>` if needed).
+
+Whoever holds the phone's token can keep the password-and-code path locked
+(three wrong codes re-arm *The enrolment lock*), so 1 and 2 may answer
+`429 enrolment_locked`; adding a key approved from another keyed device is
+unaffected, and 4 always works.
 
 ## User settings
 
@@ -4509,6 +5664,17 @@ Unknown `:id` is `404 not_found`. Self-service stays on the existing
 routes: `GET /devices`, `POST /devices/:id/revoke`, `POST /devices/:id/rename`,
 `POST /password`.
 
+**Approval keys.** `POST /users`, `PATCH /users/:id`,
+`POST /users/:id/password`, `PUT /users/:id/email`,
+`DELETE /users/:id/two-factor` and `POST /users/:id/link-code` are account
+actions: an admin with an approval key signs each with that key
+(`admin_create_user`, `admin_set_admin`, `admin_set_password`,
+`admin_set_reset_email`, `admin_reset_two_factor`, `admin_link_code`,
+naming the target by name), and an admin with no key gets
+`403 {error:'approval_required'}` for a target account that has one (a
+creation has no target, so a keyless admin creates as before). See
+*Approval keys (step-up)* → *Account actions*.
+
 ## Password reset by email
 
 "Forgot password?" on a sign-in screen. Off unless the journal can send
@@ -5033,6 +6199,7 @@ The answer carries `start_session`, at once:
 | `{status:'starting', device_id}` | the start was sent |
 | `{status:'refused', reason:'not_your_box'}` | `device_id` is not an agent box of the recipient's |
 | `{status:'refused', reason:'no_coordinator'}` | **New session**, but no Coordinator box is available any more |
+| `{status:'refused', reason:'protected_device'}` | the box named, or the Coordinator's box for **New session**, is protected (see *Approval keys (step-up)* → *Protected boxes*) |
 | `{status:'unavailable', reason:'no_spawner'}` | this journal cannot start sessions |
 
 None of these undoes the accept: the copy is made. A start that fails later
@@ -5196,7 +6363,11 @@ had a twin is never re-invited (`conflict`). Its old twin stays a twin.
    into it, and the invite is delivered as a normal
    `{kind:'invite', event:'request', room_id:<twin>, target_convo_id,
    from_name:<owner person>, person:{name}}` — never the owner's box name
-   or conversation id.
+   or conversation id. A guest box that is **protected** is never invited
+   this way: Bob's accept is `409 {error:'conflict',
+   blocked_by:'protected_device'}` and nothing changes (the same for a talk
+   request accepted onto one, and across journals; see *Approval keys
+   (step-up)* → *Protected boxes*).
 4. Bob's agent answers on the twin with `agent_invite_ack` /
    `agent_invite_answer`. The owner agent gets the matching `ack` /
    `answer` frame **on its own room id**, with `peer_device_id` (Bob's
@@ -6463,6 +7634,36 @@ nonexistent ids are indistinguishable (404 `{error:'not_found'}`).
 Self-revocation is allowed and acts as a logout. WS enforcement is the
 same next-frame-or-≤60s-sweep described above.
 
+**With approval keys** (see *Approval keys (step-up)*). Revoking a device
+revokes its approval keys with it, each with an "Approval key removed"
+notice (`matron-admin device revoke` revokes them too, and files the
+notice without a push). Once the account has an active key:
+
+- **revoking another device** (a client or a box) is an account action:
+  the body carries `approval`, an `account` statement over
+  `{op:'revoke_device', device:'<id>'}`; not-owned and nonexistent ids are
+  the same `404` before any signature is looked at; then
+  `403 approval_required` / `400 approval_invalid`, which change nothing.
+  Or, instead of `approval`, the body carries `{password, code}`: the
+  password and a TOTP code, never a recovery code, exactly as the key
+  routes' password path (*Keys and enrolment*: `409
+  two_factor_required`, `400 totp_required`, `401 bad_password`, `403
+  bad_code`, one attempt at a time, and the same enrolment lock, `429
+  enrolment_locked`), after the same `404`; a caller signed out while the
+  password was being checked gets `401 {error:'unauthenticated'}` and
+  nothing is revoked. That is how a user whose only
+  keyed phone is lost or stolen signs it out, and revokes its key, from a
+  device with no key;
+- **signing yourself out** (`:id` is the caller's own device) needs no
+  signature, and the body is not read. It does **not** revoke the device's
+  keys: they stay enrolled, attached to no device, for the app to re-attach
+  after signing in again (`POST /approval-keys/attach`). `200 {ok:true}`.
+
+A password change or reset, the lockdown after invalid approvals and
+`POST /2fa/enable {sign_out_others:true}` also delete client rows; those
+keys are detached the same way, never revoked. An account with no active
+key revokes exactly as described above.
+
 `POST /devices/:id/rename` (Bearer, client devices only — agents get 403)
 renames a device, body `{name}`, 200 `{ok:true, device:{device_id, name}}`.
 The name is sanitised (control characters flattened, whitespace collapsed,
@@ -6513,7 +7714,11 @@ its token file — no human ever sees it. Nothing durable exists until
 claim: approve only flips the in-memory pair's state, and the `devices`
 row is created by the claim response itself. The approve→claim regret
 window (≤ TTL) is accepted in v1; once claimed, the agent appears in
-`GET /devices` and is revocable instantly.
+`GET /devices` and is revocable instantly. Once the account has an approval
+key, `pair/approve` also carries `approval` over
+`{op:'pair_bridge', code, name}`, and `link/approve` over
+`{op:'link_device', code}`, codes exactly as sent (see *Approval keys
+(step-up)* → *Account actions*).
 
 ## Device link (QR sign-in)
 
@@ -6610,10 +7815,21 @@ typing text commands into the control conversation.
   requests draw `not_ready` (nothing forwarded; re-send verbatim after
   replay). `cursor: null` hellos register synchronously and never see it.
 - Delivery to the agent: `{kind:'rpc', request:{request_id, from_device_id,
-  method, params}}` — to exactly ONE socket, the device's most recently
+  approval_key_id, method, params}}` — to exactly ONE socket, the device's most recently
   registered live connection (single-consumer: reconnect overlap must not
   double-execute a non-idempotent `start`). `from_device_id` is stamped
-  server-side.
+  server-side, and so is `approval_key_id`: the approval key attached to
+  the calling client device, or `null` (see *Approval keys (step-up)* →
+  *Locked boxes*). A value the client sends is never used.
+- **Approval keys.** A `start` to a **protected** box, from an account with
+  an approval key, must carry `params.approval`, an `account` statement over
+  `{op:'start', box, workdir, prompt_sha256}`; a refusal is the error frame
+  with `code` `approval_required` or `approval_invalid` (`detail` the
+  reason), and `params` reach the box unchanged, `approval` included. The
+  locked-mode methods `unlock`, `lock` and `clear_lockdown` are ordinary
+  RPCs here: forwarded unchanged, their statements checked only by the
+  bridge. See *Approval keys (step-up)* → *Protected boxes* and *Locked
+  boxes*.
 - Agent op: `agent_response {request_id, to_device_id, ok, result?, error?}`
   (agent connections only). For a reply to a client-relayed request,
   `to_device_id` must be a client device of the same user (else `not_found`);

@@ -32,6 +32,7 @@
 import crypto from 'node:crypto'
 import { json, readBody } from './http-body.js'
 import { coordinatorDevice } from './consent.js'
+import { isProtectedDevice } from './consent-subject.js'
 import { wakeIfOffline } from './wake.js'
 import { sanitizePeerText } from './peer-text.js'
 import { isAlertmanagerPayload, formatAlertMessage, alertName } from './alerts.js'
@@ -107,6 +108,13 @@ export function makeAlertsHandler({ db, hub, broker, waker = null, rateLimiter =
       json(res, 202, { delivered: false, reason: 'no_coordinator' })
       return true
     }
+    // A protected box is out of the Coordinator's session control
+    // (src/session-control.js), the journal's own included.
+    if (isProtectedDevice(db, user.id, coord.deviceId)) {
+      console.log(`alerts: ${label} not delivered: the Coordinator's box is protected, for ${username}`)
+      json(res, 202, { delivered: false, reason: 'protected_device' })
+      return true
+    }
     if (inflight >= ALERT_MAX_INFLIGHT) {
       console.log(`alerts: ${label} not delivered: ${ALERT_MAX_INFLIGHT} deliveries already in flight`)
       json(res, 202, { delivered: false, reason: 'busy' })
@@ -123,9 +131,14 @@ export function makeAlertsHandler({ db, hub, broker, waker = null, rateLimiter =
       try {
         const waking = wakeIfOffline({ db, hub, waker }, user.id, coord.deviceId)
         if (waking && wakeWaitMs > 0) await hub.waitForDevice(user.id, coord.deviceId, wakeWaitMs)
-        const r = await broker.issue(hub, user.id, coord.deviceId, 'session_control', params, { timeoutMs })
-        // The reply is the bridge's text: sieved before it reaches the log.
-        outcome = r.ok ? `applied ${sanitizePeerText(r.result?.applied, 20) || '?'}` : `failed ${sanitizePeerText(r.error?.code, 40) || 'unknown'}`
+        // Checked again after the wait: a box protected meanwhile gets nothing.
+        if (isProtectedDevice(db, user.id, coord.deviceId)) {
+          outcome = 'not delivered: the Coordinator\'s box is protected'
+        } else {
+          const r = await broker.issue(hub, user.id, coord.deviceId, 'session_control', params, { timeoutMs })
+          // The reply is the bridge's text: sieved before it reaches the log.
+          outcome = r.ok ? `applied ${sanitizePeerText(r.result?.applied, 20) || '?'}` : `failed ${sanitizePeerText(r.error?.code, 40) || 'unknown'}`
+        }
         if (waking) outcome += ' (after wake)'
       } catch (err) {
         outcome = `failed internal (${err?.message || err})`

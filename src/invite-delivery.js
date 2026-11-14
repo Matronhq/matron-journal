@@ -1,4 +1,5 @@
 import { undeliveredInvites, markDelivered } from './participants.js'
+import { storedApproval } from './consent-subject.js'
 
 // One delivery mechanism for approved agent-chat invites, no matter who
 // approved (HTTP endpoint, matron-admin) or when the target comes online.
@@ -31,9 +32,13 @@ export function deliverPendingInvites(db, hub, { deviceId = null } = {}) {
     // coordinator consent), so the receiving bridge can say so rather than
     // "your user approved this". Omitted for a tap (the pre-field shape).
     const approvedBy = row.answered_by === 'coordinator' ? { approved_by: 'coordinator' } : {}
+    // approval: the user's signed approval of an invite to a protected box
+    // ({statement, signature} as the app sent it, src/consent-subject.js),
+    // for the box to check itself. Omitted for every other invite.
+    const signed = storedApproval(row.approval)
     const frame = isJoin
       ? { kind: 'invite', event: 'join_request', room_id: row.convo_id,
-          from_device_id: row.initiator_device_id, from_name: from?.name ?? '', justification: row.justification, ...approvedBy }
+          from_device_id: row.initiator_device_id, from_name: from?.name ?? '', justification: row.justification, ...approvedBy, ...signed }
       : { kind: 'invite', event: 'request', room_id: row.convo_id, ...approvedBy,
           from_device_id: row.initiator_device_id, from_name: from?.name ?? '',
           topic: row.topic, justification: row.justification,
@@ -49,7 +54,8 @@ export function deliverPendingInvites(db, hub, { deviceId = null } = {}) {
           // instead of opening a second room in the other direction. Same
           // omitted-not-null discipline as target_convo_id.
           ...(row.initiator_convo_id ? { from_convo_id: row.initiator_convo_id } : {}),
-          ...(person ? { person: { name: person.name } } : {}) }
+          ...(person ? { person: { name: person.name } } : {}),
+          ...signed }
     if (hub.sendRpcRequest(row.owner_user_id, recipient, frame)) {
       markDelivered(db, { convoId: row.convo_id, agentDeviceId: row.agent_device_id })
       sent += 1

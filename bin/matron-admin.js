@@ -4,7 +4,7 @@ import os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import qrcode from 'qrcode-terminal'
 import QRCode from 'qrcode'
-import { openDb, pinDevicePrivate, unpinDevicePrivate, setDeviceConsentUserOnly } from '../src/db.js'
+import { openDb, pinDevicePrivate, unpinDevicePrivate, setDeviceConsentUserOnly, setDeviceProtected } from '../src/db.js'
 import { createUser, setPassword, createAgent, revokeDevice } from '../src/auth.js'
 import { resolveMediaDir } from '../src/media.js'
 import { resolvePreapproveKeyPath } from '../src/preapprove-key.js'
@@ -13,6 +13,9 @@ import { listAwaiting, answerParkedInvite } from '../src/participants.js'
 import { closeChatConsentItem } from '../src/consent-items.js'
 import { normaliseEmail, setUserEmail } from '../src/password-reset.js'
 import { setTransferConsentEnabled } from '../src/consent.js'
+import { restampConsentItems } from '../src/consent-subject.js'
+import { announceKey, announceRestamped, asUser } from '../src/approval-keys-http.js'
+import { activeKeysOfDevice } from '../src/approval-keys.js'
 import { resolveFederationConfig, storedFederationKeyInfo } from '../src/federation-identity.js'
 import { formatFingerprint } from '../src/federation-envelope.js'
 import { makeTokenBox } from '../src/token-box.js'
@@ -39,6 +42,9 @@ const USAGE = `usage:
   matron-admin device revoke <device_id>
   matron-admin device private <device_id> on|off|auto
   matron-admin device consent <device_id> user-only|any
+  matron-admin device protected <device_id> on|off
+  matron-admin approval-key list <username>
+  matron-admin approval-key revoke <username> <key_id|--all>
   matron-admin coordinator transfers <username> on|off
   matron-admin link-code <username> --server-url <url> [--port <n>] [--expires <30m|24h>] [--png <path>]
   matron-admin offload [--days N]
@@ -136,6 +142,14 @@ function loadAwaitingRow(db, roomId, deviceId) {
     WHERE ca.convo_id=? AND ca.agent_device_id=?
   `).get(roomId, deviceId)
 }
+
+// The notices this CLI files: it has no connection to the running server,
+// so nothing is broadcast or pushed; the apps see the item on their next
+// fetch, as for the tracker writes below.
+const NO_HUB = { broadcastJournal() {}, sendToClients() {} }
+const cliCtx = (db) => ({ db, hub: NO_HUB, pushPipeline: null })
+const keyRowOf = (db, keyId) => db.prepare('SELECT * FROM approval_keys WHERE key_id=?').get(keyId)
+const BY_ADMIN = 'by the journal administrator'
 
 export async function runAdmin(db, argv, deps = {}) {
   const renderPng = deps.renderPng ?? ((uri) => QRCode.toBuffer(uri, { type: 'png', scale: 8 }))
@@ -308,12 +322,13 @@ export async function runAdmin(db, argv, deps = {}) {
     if (!username) throw new Error(USAGE)
     const user = db.prepare('SELECT id FROM users WHERE name=?').get(username)
     if (!user) throw new Error(`no such user: ${username}`)
-    const devices = db.prepare('SELECT id, kind, name, cursor, last_seen_at, private, private_pinned, consent_user_only FROM devices WHERE user_id=? ORDER BY id').all(user.id)
+    const devices = db.prepare('SELECT id, kind, name, cursor, last_seen_at, private, private_pinned, consent_user_only, protected FROM devices WHERE user_id=? ORDER BY id').all(user.id)
     if (devices.length === 0) return `no devices for ${username}`
     return devices.map((d) =>
       `${d.id} kind=${d.kind} name=${d.name} cursor=${d.cursor} last_seen_at=${d.last_seen_at ?? 'never'}` +
       ` private=${d.private ? 'yes' : 'no'}${d.private_pinned ? ' (pinned)' : ''}` +
-      (d.consent_user_only ? ' consent=user-only' : '')
+      (d.consent_user_only ? ' consent=user-only' : '') +
+      (d.protected ? ' protected' : '')
     ).join('\n')
   }
   // Spec §8: "Revocation: delete the device/agent row; its socket is closed
@@ -323,10 +338,48 @@ export async function runAdmin(db, argv, deps = {}) {
   if (a === 'device' && b === 'revoke') {
     const deviceId = Number(argv[2])
     if (!Number.isInteger(deviceId)) throw new Error(USAGE)
-    const existing = db.prepare('SELECT id FROM devices WHERE id=?').get(deviceId)
+    const existing = db.prepare('SELECT id, user_id FROM devices WHERE id=?').get(deviceId)
     if (!existing) throw new Error(`no such device: ${deviceId}`)
+    // Its approval keys go with it (auth.js revokeDevice): each one's
+    // removal is announced, as from the device list in the apps.
+    const keys = activeKeysOfDevice(db, existing.user_id, deviceId)
     revokeDevice(db, deviceId)
+    for (const key of keys) announceKey(cliCtx(db), existing.user_id, keyRowOf(db, key.key_id), { added: false, how: BY_ADMIN })
     return `device ${deviceId} revoked`
+  }
+  // Approval keys from the host. A key outlives its device's sign-in
+  // (detached by a reset, a password change, a lockdown or a sign-out), and
+  // once the authenticator is lost too nothing in the apps can remove it:
+  // this can. Each removal files the usual notice; the CLI cannot push.
+  if (a === 'approval-key' && b === 'list') {
+    if (!argv[2]) throw new Error(USAGE)
+    const user = requireUser(db, argv[2])
+    const keys = db.prepare('SELECT * FROM approval_keys WHERE user_id=? ORDER BY id').all(user.id)
+    if (keys.length === 0) return `no approval keys for ${argv[2]}`
+    const iso = (ms) => new Date(ms).toISOString()
+    return keys.map((k) => `${k.key_id} name=${k.name} device=${k.device_id ?? 'none'} via=${k.enrolled_via} created=${iso(k.created_at)} `
+      + (k.revoked_at == null ? 'active' : `revoked=${iso(k.revoked_at)}`)).join('\n')
+  }
+  if (a === 'approval-key' && b === 'revoke') {
+    const [, , username, which] = argv
+    if (!username || !which) throw new Error(USAGE)
+    const user = requireUser(db, username)
+    const all = which === '--all'
+    const keys = all
+      ? db.prepare('SELECT * FROM approval_keys WHERE user_id=? AND revoked_at IS NULL ORDER BY id').all(user.id)
+      : db.prepare('SELECT * FROM approval_keys WHERE user_id=? AND key_id=? AND revoked_at IS NULL').all(user.id, which)
+    if (keys.length === 0) {
+      if (all) return `no active approval keys for ${username}`
+      throw new Error(`no active approval key ${which} for ${username}`)
+    }
+    const now = Date.now()
+    db.transaction(() => {
+      for (const k of keys) db.prepare('UPDATE approval_keys SET revoked_at=? WHERE id=? AND revoked_at IS NULL').run(now, k.id)
+    })()
+    for (const k of keys) announceKey(cliCtx(db), user.id, keyRowOf(db, k.key_id), { added: false, how: BY_ADMIN })
+    return all
+      ? `revoked ${keys.length} approval key${keys.length === 1 ? '' : 's'} for ${username}`
+      : `revoked approval key ${keys[0].key_id.slice(0, 8)} (${keys[0].name}) for ${username}`
   }
   // Visibility flag override (spec: agent visibility & privacy). on/off PIN
   // the flag — the bridge's per-hello MATRON_AGENT_PRIVATE assertion is
@@ -360,6 +413,29 @@ export async function runAdmin(db, argv, deps = {}) {
     return mode === 'user-only'
       ? `device ${deviceId} consent=user-only — only the user's tap approves its asks; the Coordinator may still decline`
       : `device ${deviceId} consent=any — the Coordinator may approve its asks again`
+  }
+  // A protected box (src/consent-subject.js; also POST /devices/:id/protected
+  // from the user's own app, which needs a signature once the account has an
+  // approval key — this is host-level access and does not): its consent
+  // asks are the user's alone and, with a key, need a signed approval; the
+  // Coordinator's session control cannot reach it. The user-only flag is
+  // left as it is. Open consent items aimed at it are restamped here, their
+  // updated_at moved and an `updated` marker written; the apps see it on
+  // their next read (the CLI cannot send anything live).
+  if (a === 'device' && b === 'protected') {
+    const deviceId = Number(argv[2])
+    const mode = argv[3]
+    if (!Number.isInteger(deviceId) || !['on', 'off'].includes(mode)) throw new Error(USAGE)
+    const existing = db.prepare('SELECT id, user_id FROM devices WHERE id=?').get(deviceId)
+    if (!existing) throw new Error(`no such device: ${deviceId}`)
+    const restamped = db.transaction(() => {
+      setDeviceProtected(db, deviceId, mode === 'on')
+      return restampConsentItems(db, existing.user_id)
+    })()
+    announceRestamped(cliCtx(db), asUser(existing.user_id), restamped)
+    return mode === 'on'
+      ? `device ${deviceId} protected — its consent asks are the user's alone, signed once the account has an approval key`
+      : `device ${deviceId} not protected`
   }
   // The user's switch "Let the Coordinator approve file transfers" (also
   // PUT /coordinator transfer_consent from the user's own app): while on,

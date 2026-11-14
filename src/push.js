@@ -1,4 +1,5 @@
 import { snippetOf } from './journal.js'
+import { clientIdleExpired } from './auth.js'
 import { clientDevicesForPush, pruneApnsToken, unreadBadge } from './db.js'
 import { getCoordinatorConvoId } from './coordinator.js'
 import { wakesForYou } from './sync-scope.js'
@@ -163,7 +164,7 @@ function isDeadToken({ status, reason }) {
 // as a test seam — production callers never override it — so a test can
 // exercise a hypothetical future `cls.kind` the settings don't know
 // about without reaching into module internals.
-export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COALESCE_MS, consentHoldMs = CONSENT_HOLD_MS, resumeSlackMs = CONSENT_RESUME_SLACK_MS, backgroundWakeMs = 0, now = Date.now, classify: classifyEvent = classify } = {}) {
+export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COALESCE_MS, consentHoldMs = CONSENT_HOLD_MS, resumeSlackMs = CONSENT_RESUME_SLACK_MS, backgroundWakeMs = 0, now = Date.now, clientIdleMs, classify: classifyEvent = classify } = {}) {
   const counters = { sent: 0, failed: 0, pruned: 0, byReason: {} }
 
   // Coalescing state lives in memory only, keyed by `${deviceId}:${convoId}`.
@@ -324,7 +325,9 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     // so stale app versions stay silent for children too.
     if (convo.parent_convo_id != null) return
     // kind='client' only — agent devices are never pushed to.
-    const devices = clientDevicesForPush(db, userId)
+    // A client that has idled out is signed out: no pushes until it signs in again.
+    const pushNow = now()
+    const devices = clientDevicesForPush(db, userId).filter((d) => !clientIdleExpired(d, pushNow, clientIdleMs))
     if (devices.length === 0) return
     // Badge is no longer captured here — doSend recomputes it fresh at
     // actual send time (see doSend), so a coalesced/deferred push never

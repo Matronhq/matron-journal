@@ -53,6 +53,7 @@ import {
   OWNER_TALK_ACTIONS, CHOICE, TALK_GUEST_TTL_MS, TALK_START_STUCK_MS, guestChoices, coordinatorTarget, pickableSessions, sessionLabels, isTalkTarget,
 } from './talk-requests.js'
 import { guestQuestion, issueTalkStart, talkQuestionActions, recordFollowUpTap } from './talk-requests-events.js'
+import { isProtectedDevice } from './consent-subject.js'
 
 export const INVITE_OP = 'room.invite'
 export const ANSWER_OP = 'room.answer'
@@ -418,6 +419,9 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
       const cur = reread(db, r.id)
       if (!['awaiting_guest', 'starting'].includes(cur.state)) fail('not_pending')
       if (!isTalkTarget(db, cur.user_id, target.convoId, target.deviceId)) fail('not_available')
+      // As on one journal (person-rooms.js inviteGuest): no invite into a
+      // protected box without a signed approval.
+      if (isProtectedDevice(db, cur.user_id, target.deviceId)) fail('protected_device')
       if (!contactLive(db, cur)) {
         setState(db, cur.id, 'withdrawn', at, ", ended_by='contact_removed'")
         return 'unavailable'
@@ -525,7 +529,7 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
     if (!target) return { status: 409, body: { error: 'conflict', blocked_by: 'not_available' } }
     let out
     try { out = acceptOnto(r, target, at) } catch (err) {
-      if (err.message === 'not_available' || err.message === 'not_pending') return { status: 409, body: { error: 'conflict', blocked_by: err.message } }
+      if (['not_available', 'not_pending', 'protected_device'].includes(err.message)) return { status: 409, body: { error: 'conflict', blocked_by: err.message } }
       throw err
     }
     const closed = afterAccepted(ctx, who, r, out)

@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
+import { setDeviceProtected } from '../src/db.js'
 import { makeWsClient } from './helpers.js'
 import { world, post } from './federation-world.js'
 
@@ -195,6 +196,20 @@ test('a journal that does not take rooms yet: the ask ends with a notice', async
   assert.match(n.body, /does not take rooms with other journals yet/)
   const answer = await w.ws.alice.waitFor((f) => f.kind === 'invite' && f.event === 'answer' && f.room_id === 'room')
   assert.equal(answer.accept, false)
+})
+
+test('a talk across journals onto a protected box is refused protected_device and nothing reaches it', async (t) => {
+  const w = await rooms(t)
+  const bobBoxId = w.b.db.prepare("SELECT id FROM devices WHERE name='bob-box'").get().id
+  setDeviceProtected(w.b.db, bobBoxId, true)
+  await askAndSend(w)
+  const card = await roomItem(w.phones.bob)
+  const pick = await w.phones.bob(`/items/${card.id}/comments`, post({ action: 'Pick a session' }))
+  const chose = await w.phones.bob(`/items/${card.id}/comments`, post({ action: 'Bob Q3', reply_to: pick.json.comment.id }))
+  assert.deepEqual([chose.status, chose.json.blocked_by], [409, 'protected_device'])
+  await tick()
+  assert.equal(w.ws.bob.frames.some((f) => f.kind === 'invite'), false)
+  assert.equal(half(w.b).state, 'awaiting_guest')
 })
 
 test('New session: bob\'s Coordinator box starts a session for the talk, and it joins', async (t) => {

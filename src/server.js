@@ -4,7 +4,8 @@ import path from 'node:path'
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
-import { makeLoginGuard, makeRateLimiter } from './auth.js'
+import { installApprovalLockdown } from './approval-keys-http.js'
+import { makeLoginGuard, makeRateLimiter, DEFAULT_CLIENT_IDLE_DAYS, DEFAULT_CLIENT_IDLE_MS } from './auth.js'
 import { makeTwoFactorTickets, isTwoFactorRequired } from './two-factor.js'
 import { makeHttpHandler } from './http.js'
 import { ensurePreapproveKey } from './preapprove-key.js'
@@ -39,7 +40,7 @@ import { makeOutbox, pruneOutbox } from './federation-outbox.js'
 import { makeConfiguredFederationClient } from './federation-client.js'
 import { makeWaker, markWakeRefused, clearWakeRefused } from './wake.js'
 import { makeConfiguredTranscriber } from './cloud-transcribe.js'
-import { makeConfiguredMailer } from './mailer.js'
+import { makeConfiguredMailer, parsePublicUrl } from './mailer.js'
 import { makeConfiguredSummariser } from './summarise.js'
 import { makeBlobTranscripts } from './blob-transcripts.js'
 import { makeConfiguredTts, resolveTtsCacheDir } from './cloud-tts.js'
@@ -71,6 +72,22 @@ const RETENTION_INITIAL_DELAY_MS = 2 * 60 * 1000 // let the reconnect burst afte
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
 const DEFAULT_TOOL_LOG_TTL_HOURS = 24
 const DEFAULT_VOICE_NOTE_TTL_DAYS = 7 // audio goes a week after its transcript
+
+// MATRON_CLIENT_IDLE_DAYS / the clientIdleDays option: days a client (app)
+// token may sit unused before it stops working (agent tokens never expire).
+// A non-negative number, fractions allowed; 0 turns the expiry off; anything
+// else warns and falls back to the default. Returns milliseconds (0 = off).
+export function resolveClientIdleMs(override) {
+  const fromEnv = override === undefined || override === null
+  const raw = fromEnv ? process.env.MATRON_CLIENT_IDLE_DAYS : override
+  if (raw === undefined || raw === '') return DEFAULT_CLIENT_IDLE_MS
+  const n = typeof raw === 'string' && raw.trim() === '' ? NaN : Number(raw)
+  if (!Number.isFinite(n) || n < 0) {
+    console.warn(`auth: ${fromEnv ? 'MATRON_CLIENT_IDLE_DAYS' : 'clientIdleDays'}=${JSON.stringify(raw)} is invalid — using the default of ${DEFAULT_CLIENT_IDLE_DAYS} days`)
+    return DEFAULT_CLIENT_IDLE_MS
+  }
+  return n * 24 * 60 * 60 * 1000
+}
 
 // Shared validator for small numeric env knobs that guard a size/gap check
 // (`size > mediaMaxBytes`, `gap > maxReplay`): an unset var is the normal,
@@ -477,6 +494,8 @@ export function startServer({
   // from the daily cap above. 0 = no cap.
   consentTransferDailyCap = resolveZeroableEnv('MATRON_COORDINATOR_TRANSFER_DAILY_CAP', process.env.MATRON_COORDINATOR_TRANSFER_DAILY_CAP, CONSENT_TRANSFER_DAILY_CAP_DEFAULT),
   agentCommentClock = Date.now,
+  // Client-token idle expiry (resolveClientIdleMs); the clock is a test seam.
+  clientIdleDays, clientIdleClock = Date.now,
   // Approvals of the Coordinator's own routine-born asks per rolling 24 h
   // (src/consent-own-ask.js), on top of the daily cap. 0 = no cap.
   consentRoutineCap = resolveZeroableEnv('MATRON_COORDINATOR_ROUTINE_CAP', process.env.MATRON_COORDINATOR_ROUTINE_CAP, CONSENT_ROUTINE_CAP_DEFAULT),
@@ -503,6 +522,11 @@ export function startServer({
   // seam, {federation, publicUrl}; env (MATRON_FEDERATION,
   // MATRON_PUBLIC_URL) otherwise. Off unless turned on.
   federationEnv, federationOps, federationClient, federationLimits,
+  // The journal's public URL for approval keys (src/approval-keys.js): a
+  // signed statement names its host, so without one they are off. The
+  // option is the test seam (`null` forces it off); MATRON_PUBLIC_URL
+  // otherwise.
+  publicUrl,
   // Alertmanager webhook (src/alerts-http.js): {token, username}. The
   // option is the test seam; env otherwise. Off unless both are usable.
   alertWebhook,
@@ -619,7 +643,10 @@ export function startServer({
     ...(toolStreamOpts || {}),
   })
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
-  const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient, backgroundWakeMs: BACKGROUND_WAKE_MS })
+  const clientIdleMs = resolveClientIdleMs(clientIdleDays)
+  const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient, backgroundWakeMs: BACKGROUND_WAKE_MS, clientIdleMs, now: clientIdleClock })
+  // A device signed out for invalid approval signatures: its notice and push.
+  installApprovalLockdown({ db, hub, pushPipeline })
   // A consent-card push whose 30 s hold a restart swallowed still goes out.
   try { pushPipeline.resumeHeldConsent() } catch (err) { console.error('push: consent resume failed', err) }
   // Voice notes are transcribed here when the journal has a transcriber: a
@@ -715,6 +742,8 @@ export function startServer({
   if (resolvedAlertWebhook) warnAlertWebhookConfig(db, resolvedAlertWebhook)
   const resolvedSummariser = summariser !== undefined ? summariser : makeConfiguredSummariser()
   const resolvedMailer = mailer !== undefined ? mailer : makeConfiguredMailer()
+  const approvalBaseUrl = parsePublicUrl(publicUrl !== undefined ? publicUrl : process.env.MATRON_PUBLIC_URL)
+  const journalHost = approvalBaseUrl ? new URL(approvalBaseUrl).host.toLowerCase() : null
   // Unified search's similar tier (spec 2026-10-12 §5). `semantic.store`/
   // `.embedder` start null — /search/all answers `semantic: 'off'` until
   // (if ever) the embedder loads and the first index pass finishes, below.
@@ -737,6 +766,7 @@ export function startServer({
     agentCommentLimiter: makeAgentCommentLimiter({ now: agentCommentClock }),
     github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, federationGrants, federationContribute, federationMedia, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
+    journalHost, clientIdleMs, clientIdleClock,
   })))
   // A reverse proxy in front of the journal keeps its connections to it open
   // and reuses them. Node closes an idle connection after 5 s by default,
@@ -758,6 +788,7 @@ export function startServer({
     // spawnStartTimeoutMs rides along so the orphan sweep's TTL can never
     // undercut a configured start timeout (attachWs derives the TTL).
     broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, sessionControlTimeoutMs, waker: resolvedWaker,
+    journalHost, clientIdleMs, clientIdleClock,
   })
   let retentionInterval = null
   let walCheckpointInterval = null

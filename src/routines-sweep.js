@@ -13,6 +13,7 @@
 // fire, never a double. Deliveries are bounded process-wide; a routine
 // that does not get a slot stays due for the next sweep untouched.
 import { coordinatorDevice } from './consent.js'
+import { isProtectedDevice } from './consent-subject.js'
 import { wakeIfOffline } from './wake.js'
 import { sanitizePeerText } from './peer-text.js'
 import { dueRoutines, advanceRoutine, recordOutcome, routineRow } from './routines.js'
@@ -23,6 +24,8 @@ export const ROUTINES_SWEEP_INTERVAL_MS = 60_000
 export const ROUTINES_TRIGGER_INTERVAL_MS = 5 * 60_000
 export const ROUTINE_MAX_INFLIGHT = 4
 export const ROUTINE_FROM_NAME = 'Routines'
+// A Coordinator on a protected box: not sent, never retried.
+const PROTECTED = 'protected_device'
 // Failures the next attempt might cure: the box was asleep or slow, the
 // socket dropped. A bridge's refusal (bad_request, not_coordinator, gone)
 // is final for this fire.
@@ -51,6 +54,16 @@ export function makeRoutineFirer({ db, hub, broker, waker = null, wakeWaitMs = 0
       log.log(`routines: ${label} not delivered: no Coordinator (or it has no box)`)
       return 'no_coordinator'
     }
+    // A protected box is out of the Coordinator's session control
+    // (src/session-control.js authorizeSessionControl), the journal's own
+    // included: a Coordinator living on one gets no routine turn.
+    if (isProtectedDevice(db, routine.user_id, coord.deviceId)) {
+      if (onOutcome) onOutcome(PROTECTED, false)
+      else recordOutcome(db, routine.id, { outcome: PROTECTED, retryable: false, retry, now })
+      finish(routine, PROTECTED)
+      log.log(`routines: ${label} not delivered: the Coordinator's box is protected`)
+      return PROTECTED
+    }
     const params = {
       convo_id: coord.convoId, action: 'routine', routine_id: routine.id, name: routine.name, title: routine.title,
       message: message ?? routine.prompt, fired_at: new Date(now).toISOString(), tz: routine.tz, from_name: ROUTINE_FROM_NAME,
@@ -62,13 +75,18 @@ export function makeRoutineFirer({ db, hub, broker, waker = null, wakeWaitMs = 0
     try {
       waking = wakeIfOffline({ db, hub, waker }, routine.user_id, coord.deviceId)
       if (waking && wakeWaitMs > 0) await hub.waitForDevice(routine.user_id, coord.deviceId, wakeWaitMs)
-      const r = await broker.issue(hub, routine.user_id, coord.deviceId, 'session_control', params, { timeoutMs })
-      if (r.ok) {
-        outcome = `applied ${sanitizePeerText(r.result?.applied, 20) || 'now'}`
+      // Checked again after the wait: a box protected meanwhile gets nothing.
+      if (isProtectedDevice(db, routine.user_id, coord.deviceId)) {
+        outcome = PROTECTED
       } else {
-        const code = sanitizePeerText(r.error?.code, 40) || 'unknown'
-        outcome = `failed ${code}`
-        retryable = RETRYABLE.has(code)
+        const r = await broker.issue(hub, routine.user_id, coord.deviceId, 'session_control', params, { timeoutMs })
+        if (r.ok) {
+          outcome = `applied ${sanitizePeerText(r.result?.applied, 20) || 'now'}`
+        } else {
+          const code = sanitizePeerText(r.error?.code, 40) || 'unknown'
+          outcome = `failed ${code}`
+          retryable = RETRYABLE.has(code)
+        }
       }
     } catch (err) {
       outcome = 'failed internal'

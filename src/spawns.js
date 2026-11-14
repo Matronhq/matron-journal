@@ -19,6 +19,7 @@ import { MISSION_EVENT_TYPE, missionMarkerPayload } from './missions-marker.js'
 import { markerTitleAllowed, privateOwnedConvo } from './privacy.js'
 import { startReplyFallback } from './spawn-model.js'
 import { recordSpawnStart } from './cause-hops.js'
+import { storedApproval, approvalColumn } from './consent-subject.js'
 
 // `model` is the optional Claude model the child session should run — an
 // alias ('opus') or a full model id, defaulted to '' like topic so a caller
@@ -91,10 +92,14 @@ export function denySpawn(db, id, now = Date.now(), { answeredBy = null, answerR
 // The approve tap CLAIMS the row — state-scoped so exactly one caller wins
 // and everything expensive (room, live agent on another box) starts at most
 // once. The loser's zero row-count is the 409 the failure table promises.
-export function claimApprove(db, id, now = Date.now(), { answeredBy = null, answerReason = null } = {}) {
+// `approval` is the user's signed approval of a spawn onto a protected box
+// ({statement, signature}, src/consent-subject.js), stored exactly as
+// received for approveSpawn to forward in the `start` params; null for
+// every other answer.
+export function claimApprove(db, id, now = Date.now(), { answeredBy = null, answerReason = null, approval = null } = {}) {
   return db.prepare(
-    "UPDATE agent_spawn_requests SET state='approved', answered_at=?, answered_by=?, answer_reason=? WHERE id=? AND state='awaiting_user'"
-  ).run(now, answeredBy, answerReason, id).changes > 0
+    "UPDATE agent_spawn_requests SET state='approved', answered_at=?, answered_by=?, answer_reason=?, approval=? WHERE id=? AND state='awaiting_user'"
+  ).run(now, answeredBy, answerReason, approvalColumn(approval), id).changes > 0
 }
 
 export function markStarted(db, id, { roomId, childConvoId, now = Date.now() }) {
@@ -499,6 +504,9 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
         // And agent: only when the requester named one; otherwise the
         // target's own box default decides (docs/specs/box-defaults.md).
         ...(row.agent ? { agent: row.agent } : {}),
+        // The user's signed approval of a spawn onto a protected box, as
+        // the app sent it, for the box to check itself; absent otherwise.
+        ...storedApproval(row.approval),
       },
       { timeoutMs: startTimeoutMs })
     // Bridge-returned convo_id, capped the same as every other externally-

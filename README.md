@@ -52,6 +52,9 @@ node itself; on Linux that is what always happens.
     MATRON_DB=./matron.db npx matron-admin device list alice
     MATRON_DB=./matron.db npx matron-admin device revoke <device_id>
     MATRON_DB=./matron.db npx matron-admin device private <device_id> on
+    MATRON_DB=./matron.db npx matron-admin device protected <device_id> on|off
+    MATRON_DB=./matron.db npx matron-admin approval-key list alice
+    MATRON_DB=./matron.db npx matron-admin approval-key revoke alice <key_id>|--all
     MATRON_DB=./matron.db npx matron-admin offload [--days N]
     MATRON_DB=./matron.db npx matron-admin expire-logs [--hours N]
     MATRON_DB=./matron.db npx matron-admin status
@@ -78,6 +81,24 @@ has set two-factor up is still asked for their code.
 `user 2fa-reset` is the way back in for someone who has lost both their app
 and their recovery codes. Details are in [docs/protocol.md](docs/protocol.md),
 "Two-factor sign-in".
+
+Approval keys (step-up): an app can enrol a device-held P-256 key (first
+with the password and a two-factor code, later devices approved from one
+that already has a key). Once an account has one, the journal asks for a
+statement signed with it before a tap on a question an agent marked
+`step_up`, before approving a spawn, chat invite or file transfer aimed at
+a box marked protected (`device protected`), and before account changes
+that widen access (password, pairing, device links, two-factor, the
+Coordinator's switches, revoking another device). For a protected box the
+signed statement is forwarded to the box, which checks it against keys
+pinned on the box (`tools/approval-verify.mjs` is a reference verifier;
+`test/fixtures/approval-vectors.json` holds test vectors). It needs
+`MATRON_PUBLIC_URL`; an account without a key works as before, except that
+a box marked protected stays the user's own: the Coordinator cannot
+approve its asks or control its sessions, and the journal's own routines,
+alerts, hand-over and talk sessions do not reach it. App tokens left unused
+for `MATRON_CLIENT_IDLE_DAYS` (default 30) stop working. Details are in [docs/protocol.md](docs/protocol.md), "Approval
+keys (step-up)".
 
 Next steps: install [matron-bridge](https://github.com/Matronhq/matron-bridge)
 on each dev box, then sign in from an app with your journal URL + username.
@@ -146,7 +167,8 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_VERIFIER_TIMEOUT_MS` | `60000` | Bound on the whole verifier call; a timeout fails closed (the approval is refused and the card waits for the user) |
 | `MATRON_RESEND_API_KEY` / `MATRON_RESEND_API_KEY_FILE` | unset (off) | [Resend](https://resend.com) API key, inline or read from a file, for password reset by email ("Forgot password?"). A sending-only key is enough. Needs `MATRON_MAIL_FROM` and `MATRON_PUBLIC_URL` too; without all three the feature is off and the apps hide it. Users need an address on file: `matron-admin user email <name> <address>`, the web admin page, or their own Settings |
 | `MATRON_MAIL_FROM` | unset | From address for reset emails, on a domain verified with Resend, e.g. `Matron <no-reply@example.com>` |
-| `MATRON_PUBLIC_URL` | unset | This journal's public `https://` origin, e.g. `https://journal.example.com`. Reset links point at `<origin>/app/reset-password` (served by `MATRON_WEB_DIR`). Required, because building links from a request's `Host` header would let anyone have the journal mail out a link to their own site |
+| `MATRON_PUBLIC_URL` | unset | This journal's public `https://` origin, e.g. `https://journal.example.com`. Reset links point at `<origin>/app/reset-password` (served by `MATRON_WEB_DIR`). Required, because building links from a request's `Host` header would let anyone have the journal mail out a link to their own site. Approval keys need it too: a signed statement names the journal by this URL's host, and without it they are off |
+| `MATRON_CLIENT_IDLE_DAYS` | `30` | Days an app (client) token may go unused before it stops working and the app must sign in again; fractions allowed, `0` turns the expiry off, an invalid value warns and uses the default. Agent (bridge) tokens never expire. The device keeps its row and its approval key, and the device list marks it `idle_expired` |
 | `MATRON_APNS_KEY_FILE` / `_KEY_ID` / `_TEAM_ID` / `_TOPIC` | unset | All four set = push enabled; otherwise push is an inert no-op |
 | `MATRON_PUSH_GATEWAY_URL` | unset | Push relay URL when you have no APNs key — see Push relay section |
 | `MATRON_RELAY_PORT` / `MATRON_RELAY_BIND` | `9821` / `127.0.0.1` | matron-push-relay only |
@@ -211,7 +233,8 @@ on each dev box, then sign in from an app with your journal URL + username.
   blob files on a schedule, and a TTL pass deletes those blobs after
   `MATRON_TOOL_LOG_TTL_HOURS` (default 24); journal rows are never deleted.
 - **Ops** — `/metrics` endpoint, `matron-admin` CLI (`user add`/`passwd`,
-  `agent add`, `device list`/`revoke`/`private on|off|auto`, `link-code`,
+  `agent add`, `device list`/`revoke`/`private on|off|auto`,
+  `approval-key list`/`revoke`, `link-code`,
   `offload`, `expire-logs`, `agent-chat pending|approve|deny`,
   `status`), systemd unit in `deploy/`, WAL checkpoint tuning
   ([measured](docs/wal-checkpoint-profile.md)).

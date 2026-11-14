@@ -22,6 +22,7 @@ import {
 } from './routines.js'
 import { emitRoutineMarker } from './routines-marker.js'
 import { coordinatorDevice } from './consent.js'
+import { isProtectedDevice } from './consent-subject.js'
 import { currentSubjects, fireMessage } from './routines-triggers.js'
 import { causesFromFrame } from './ask-causes.js'
 import { resolveAskCause } from './ask-cause.js'
@@ -98,9 +99,10 @@ export async function handleRoutinesRoute(ctx, req, res, url, who) {
     if (ctx.routineFirer.busy()) { json(res, 202, { delivered: false, reason: 'busy' }); return true }
     // Resolve the Coordinator here so the body can say so: the firer records
     // the same outcome either way.
-    if (!coordinatorDevice(db, who.userId)) {
+    const coord = coordinatorDevice(db, who.userId)
+    if (!coord || isProtectedDevice(db, who.userId, coord.deviceId)) {
       await ctx.routineFirer.fire(row)
-      json(res, 202, { delivered: false, reason: 'no_coordinator' })
+      json(res, 202, { delivered: false, reason: coord ? 'protected_device' : 'no_coordinator' })
       return true
     }
     markRun(db, routine.id)

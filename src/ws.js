@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { WebSocketServer } from 'ws'
-import { authToken, authorizeAgentWrite } from './auth.js'
+import { authToken, touchDevice, authorizeAgentWrite } from './auth.js'
 import { getBoxDefaults, boxDefaultsByDevice, effectiveBoxDefaults, normaliseAgent } from './box-defaults.js'
-import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses, setDeviceSyncScope } from './db.js'
+import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses, setDeviceSyncScope, parseLocked, setDeviceLocked } from './db.js'
 import { parseSyncScope } from './sync-scope.js'
 import { settingsView } from './settings.js'
 import { eventsAfter, scopedEventsAfter, scopedReplayCount, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, agentTargetsFor, CONVO_ID_MAX_CHARS } from './journal.js'
@@ -13,6 +13,9 @@ import { deliverPendingInvites } from './invite-delivery.js'
 import { countPendingAsks, createSpawnRequest, inheritedSpawnMission, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, sanitizeBoxDefaults, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem, reconcileConsentItems } from './consent-items.js'
 import { nudgeCoordinator, chatAskId } from './consent.js'
+import { isProtectedDevice, consentSubject } from './consent-subject.js'
+import { hasActiveKey, requireApproval, approvalKeyIdOfDevice, refuse, ApprovalRefused } from './approval-keys.js'
+import { agentJournalFrame } from './hub.js'
 import { expireContactAsks } from './contacts.js'
 import { expireInviteAsks, onInviteAskExpired } from './federation-invite-asks.js'
 import { expireGrantAsks } from './grants.js'
@@ -272,6 +275,7 @@ export function attachWs({
   replayBackpressureBytes = REPLAY_BACKPRESSURE_BYTES, maxReplay = DEFAULT_MAX_REPLAY,
   revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES, inviteTtlMs = 1800000,
   broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null,
+  journalHost = null, clientIdleMs, clientIdleClock = Date.now,
 }) {
   // Derived, never raw: the orphan sweep must always outlast a live `start`
   // RPC still in flight (see APPROVED_ORPHAN_TTL_FLOOR_MS's comment) — and,
@@ -281,7 +285,13 @@ export function attachWs({
   const statusCache = makeStatusCache()
   // Prepared once, reused for the per-frame revocation recheck below — one
   // cheap SELECT per inbound frame, not a fresh db.prepare() call each time.
-  const deviceExistsStmt = db.prepare('SELECT 1 FROM devices WHERE id=?')
+  const deviceRowStmt = db.prepare('SELECT id, kind, created_at, last_seen_at FROM devices WHERE id=?')
+  // Alive = the row exists and, for a client, it has not idled out. A live
+  // check is also a use of the device, so an open socket keeps it signed in.
+  const deviceAlive = (id) => {
+    const row = deviceRowStmt.get(id)
+    return !!row && touchDevice(db, row, { now: clientIdleClock(), clientIdleMs })
+  }
   const interval = setInterval(() => {
     const now = Date.now()
     for (const ws of wss.clients) {
@@ -429,12 +439,13 @@ export function attachWs({
       const conns = hub.allConns()
       if (conns.length === 0) return
       const ids = [...new Set(conns.map((c) => c.deviceId))]
-      const existing = new Set(
-        db.prepare(`SELECT id FROM devices WHERE id IN (${ids.map(() => '?').join(',')})`)
-          .all(...ids).map((r) => r.id)
-      )
+      const rows = db.prepare(`SELECT id, kind, created_at, last_seen_at FROM devices WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids)
+      const now = clientIdleClock()
+      // Gone or idled out: both close the socket as revoked. A live one is
+      // in use, so its clock is kept fresh (at most hourly, see touchDevice).
+      const alive = new Set(rows.filter((r) => touchDevice(db, r, { now, clientIdleMs })).map((r) => r.id))
       for (const c of conns) {
-        if (existing.has(c.deviceId)) continue
+        if (alive.has(c.deviceId)) continue
         if (c.ws.readyState !== 1) continue // already closing; its 'close' handler unregisters it
         c.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
         c.ws.close(4001)
@@ -475,7 +486,7 @@ export function attachWs({
       try {
         if (!conn) {
           if (msg.op !== 'hello') { ws.close(); return }
-          const who = msg.token && authToken(db, msg.token)
+          const who = msg.token && authToken(db, msg.token, { now: clientIdleClock(), clientIdleMs })
           if (!who) {
             ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'auth' }))
             ws.close()
@@ -507,6 +518,13 @@ export function attachWs({
           // Absent field = asserts visible: an unpinned flag follows the env
           // var exactly, including its removal (admin pin is the override).
           if (who.kind === 'agent') applyBridgePrivate(db, who.deviceId, msg.private === true)
+          // Locked mode (a bridge setting, src/db.js parseLocked): the box's
+          // own report, kept for the device list. A hello without it says
+          // the box is not locked; a malformed one changes nothing.
+          if (who.kind === 'agent') {
+            const locked = msg.locked === undefined ? null : parseLocked(msg.locked)
+            if (locked !== undefined) setDeviceLocked(db, who.deviceId, locked)
+          }
           // Optional client sync scope (src/sync-scope.js). Same reject shape
           // as a bad cursor. Agents' delivery is already scoped by
           // membership, so they ignore it.
@@ -625,7 +643,9 @@ export function attachWs({
                 // replay-path half of that guarantee; fanOut below is the
                 // live half.
                 if (who.kind === 'agent' && isClientOnlyEvent(e.type, e.payload)) continue
-                ws.send(JSON.stringify(journalFrame(e)))
+                // History does not say which device sent it: a user's event
+                // replays to an agent with approval_key_id null.
+                ws.send(JSON.stringify(who.kind === 'agent' ? agentJournalFrame(journalFrame(e)) : journalFrame(e)))
               }
               if (batch.length < 500) break
               cursor = batch[batch.length - 1].seq
@@ -699,7 +719,7 @@ export function attachWs({
         // (hello itself already does the equivalent check via authToken's
         // token-hash lookup, so this must only run post-hello or a revoked
         // token's hello would get checked twice for no benefit).
-        if (!deviceExistsStmt.get(conn.deviceId)) {
+        if (!deviceAlive(conn.deviceId)) {
           conn.ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
           conn.ws.close(4001)
           return
@@ -709,7 +729,7 @@ export function attachWs({
         // reserialization, which JSON.parse's whitespace-stripping would
         // shrink. `data` is a Buffer here (ws delivers text frames as
         // Buffers), so .length is the byte count.
-        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker })
+        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker, journalHost })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -765,12 +785,23 @@ export function notifyStale(db, hub, entry, reason = 'stale') {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null }) {
+export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null, journalHost = null }) {
   const fail = (code, detail) => {
     conn.ws.send(JSON.stringify({
       kind: 'control', op: 'error', code, ref: msg.op,
       ...roomIdEcho(msg), ...requestIdEcho(msg), ...(detail ? { detail } : {}),
     }))
+  }
+  // A bridge's locked-mode report on a later frame (box_status, status), for
+  // its own device only: absent or malformed changes nothing, on:false
+  // clears it (src/db.js parseLocked).
+  // → whether it applied one.
+  const applyLocked = () => {
+    if (conn.kind !== 'agent' || msg.locked === undefined) return false
+    const locked = parseLocked(msg.locked)
+    if (locked === undefined) return false
+    setDeviceLocked(db, conn.deviceId, locked)
+    return true
   }
   // Invite ops: validate a room id + load the row. Rooms are top-level
   // conversations of this conn's user; children (sub-chats) are silenced
@@ -832,7 +863,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
     // stored in the event row, so consumers must fall back to sender-name
     // matching for replayed history.
     frame.sender_device_id = conn.deviceId
-    hub.broadcastJournal(conn.userId, frame, targets)
+    // A user's event reaches an agent stamped with the approval key of the
+    // client device that sent it (hub.js agentJournalFrame).
+    const keyIdOf = conn.kind === 'client' ? () => approvalKeyIdOfDevice(db, conn.userId, conn.deviceId) : null
+    hub.broadcastJournal(conn.userId, frame, targets, keyIdOf)
     try {
       pushPipeline.onAppend(conn.userId, frame, conn.deviceId, pushHint)
     } catch (err) {
@@ -1089,12 +1123,49 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // indistinguishable — anti-enumeration, same stance as the HTTP 404s.
         const target = db.prepare('SELECT user_id, kind FROM devices WHERE id=?').get(msg.agent_device_id)
         if (!target || target.user_id !== conn.userId || target.kind !== 'agent') return failRpc('not_found')
-        // Single-consumer delivery (see hub.sendRpcRequest): false means no
-        // live socket — no queueing, the client hears it immediately.
-        const delivered = hub.sendRpcRequest(conn.userId, msg.agent_device_id, {
+        // approval_key_id: the approval key attached to the calling client
+        // device, or null, stamped from the journal's own tables like a
+        // user's journal event (hub.js agentJournalFrame); never the
+        // client's. A locked box binds its unlock window to it.
+        const send = () => hub.sendRpcRequest(conn.userId, msg.agent_device_id, {
           kind: 'rpc',
-          request: { request_id: rid, from_device_id: conn.deviceId, method: msg.method, params: msg.params ?? null },
+          request: {
+            request_id: rid, from_device_id: conn.deviceId, approval_key_id: approvalKeyIdOfDevice(db, conn.userId, conn.deviceId),
+            method: msg.method, params: msg.params ?? null,
+          },
         })
+        // A direct `start` on a protected box (src/consent-subject.js) is an
+        // account action once the account has an approval key: the client
+        // signs {op:'start', box, workdir, prompt_sha256} and sends it as
+        // params.approval; the params go to the box unchanged, approval
+        // included, for the box to check itself. Checked and sent in one
+        // transaction: a refusal, or a box with no live socket, leaves the
+        // nonce unspent. Every other request, and every request of an
+        // account with no key, is today's.
+        let delivered
+        if (msg.method === 'start' && isProtectedDevice(db, conn.userId, msg.agent_device_id) && hasActiveKey(db, conn.userId)) {
+          const p = msg.params
+          const isText = (v) => v === undefined || typeof v === 'string'
+          if (p === null || typeof p !== 'object' || Array.isArray(p) || !isText(p.workdir) || !isText(p.prompt)) return failRpc('bad_request', 'bad params')
+          const box = db.prepare('SELECT name FROM devices WHERE id=?').get(msg.agent_device_id).name
+          const subject = consentSubject('start', { box, workdir: p.workdir ?? '', prompt: p.prompt ?? '' })
+          try {
+            delivered = db.transaction(() => {
+              const g = requireApproval({ db, journalHost }, conn, { approval: p.approval }, { type: 'account', subject })
+              if (!g.ok) refuse(g.status, g.body)
+              if (!send()) throw new Error('undelivered')
+              return true
+            })()
+          } catch (err) {
+            if (err instanceof ApprovalRefused) return failRpc(err.refusal.body.error, err.refusal.body.reason)
+            if (err?.message !== 'undelivered') throw err
+            delivered = false
+          }
+        } else {
+          // Single-consumer delivery (see hub.sendRpcRequest): false means no
+          // live socket — no queueing, the client hears it immediately.
+          delivered = send()
+        }
         if (!delivered) {
           // Still refused — no RPC queueing — but the box starts booting, so
           // the caller's retry lands on a live bridge.
@@ -2331,7 +2402,13 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // sanitisers as the recent_folders capacity blocks, so a bridge
         // sends the one payload for both.
         if (conn.kind !== 'agent') return fail('forbidden')
+        // `locked` (the box's locked mode) rides here too, kept on the
+        // device row apart from the report: a report without it leaves it,
+        // a malformed one is ignored. A valid `locked` alone is a report;
+        // a frame with nothing valid in it is the bad_request it always was.
+        const lockedOk = applyLocked()
         const status = sanitizeBoxStatus(msg)
+        if (!status && lockedOk) break
         if (!status) return fail('bad_request', 'no valid status block')
         const reportedAt = Date.now()
         upsertDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt })
@@ -2401,6 +2478,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // a size-capped object, so the bridge can evolve the shape without
         // a server deploy.
         if (conn.kind !== 'agent') return fail('forbidden')
+        // The box's locked mode, as on box_status: about the device, not the
+        // conversation, so applied whatever the rest of the frame says.
+        applyLocked()
         if (typeof msg.status !== 'object' || msg.status === null) return fail('bad_request')
         if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) return fail('forbidden')
         let encoded
