@@ -147,7 +147,7 @@ export const DEFAULT_CLIENT_IDLE_DAYS = 30
 export const DEFAULT_CLIENT_IDLE_MS = DEFAULT_CLIENT_IDLE_DAYS * 24 * 60 * 60 * 1000
 // Using a token keeps the device alive, but the clock is only written when it
 // is this stale, so a busy client costs one write an hour, not one a request.
-const SEEN_REFRESH_MS = 60 * 60 * 1000
+const SEEN_REFRESH_MS = 60 * 60 * 1000 // clamped to half a short idle limit in touchDevice
 
 export function clientIdleExpired(row, now = Date.now(), clientIdleMs = DEFAULT_CLIENT_IDLE_MS) {
   return row.kind === 'client' && clientIdleMs > 0 && now - (row.last_seen_at ?? row.created_at) > clientIdleMs
@@ -158,7 +158,8 @@ export function clientIdleExpired(row, now = Date.now(), clientIdleMs = DEFAULT_
 // expired token cannot come back), otherwise refresh last_seen_at if stale.
 export function touchDevice(db, row, { now = Date.now(), clientIdleMs = DEFAULT_CLIENT_IDLE_MS } = {}) {
   if (clientIdleExpired(row, now, clientIdleMs)) return false
-  if (row.last_seen_at == null || now - row.last_seen_at >= SEEN_REFRESH_MS) {
+  const refreshMs = clientIdleMs > 0 ? Math.min(SEEN_REFRESH_MS, clientIdleMs / 2) : SEEN_REFRESH_MS
+  if (row.last_seen_at == null || now - row.last_seen_at >= refreshMs) {
     db.prepare('UPDATE devices SET last_seen_at=? WHERE id=?').run(now, row.id)
   }
   return true

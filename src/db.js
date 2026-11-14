@@ -2353,7 +2353,7 @@ export function pruneApnsToken(db, deviceId, apnsToken, apnsEnv) {
 // registered token, for the push pipeline to fan a journal event out to.
 export function clientDevicesForPush(db, userId) {
   return db.prepare(
-    "SELECT id, apns_token, apns_env, cursor, push_level, sync_scope, push_key FROM devices WHERE user_id=? AND kind='client' AND apns_token IS NOT NULL"
+    "SELECT id, kind, created_at, last_seen_at, apns_token, apns_env, cursor, push_level, sync_scope, push_key FROM devices WHERE user_id=? AND kind='client' AND apns_token IS NOT NULL"
   ).all(userId)
 }
 

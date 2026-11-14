@@ -29,12 +29,14 @@ test('a client token works at 29 days idle and is refused at 31; the row stays',
 })
 
 test('using a client token at day 29 resets the clock', async (t) => {
-  const { s, token, deviceId } = await startApprovalServer(t)
-  age(s, deviceId, 29)
+  let now = Date.now()
+  const { s, token } = await startApprovalServer(t, { clientIdleClock: () => now })
+  now += 29 * DAY
   assert.equal((await s.http('/devices', { token })).status, 200)
-  assert.ok(Date.now() - seen(s, deviceId) < 5000)
-  s.db.prepare('UPDATE devices SET last_seen_at=? WHERE id=?').run(Date.now() - 20 * DAY, deviceId)
+  now += 2 * DAY
   assert.equal((await s.http('/devices', { token })).status, 200)
+  now += 31 * DAY
+  assert.equal((await s.http('/devices', { token })).status, 401)
 })
 
 test('use refreshes last_seen_at at most once an hour; an expired token never refreshes it', async (t) => {
@@ -76,14 +78,27 @@ test('MATRON_CLIENT_IDLE_DAYS=0 disables the expiry; a fraction sets it; the inj
 })
 
 test('the setting parses like its neighbours: default 30 days, invalid warns and falls back', (t) => {
+  const savedEnv = process.env.MATRON_CLIENT_IDLE_DAYS
+  delete process.env.MATRON_CLIENT_IDLE_DAYS
+  t.after(() => { if (savedEnv === undefined) delete process.env.MATRON_CLIENT_IDLE_DAYS; else process.env.MATRON_CLIENT_IDLE_DAYS = savedEnv })
   const warns = []
   t.mock.method(console, 'warn', (m) => warns.push(m))
   assert.equal(resolveClientIdleMs(undefined), 30 * DAY)
+  assert.equal(resolveClientIdleMs(null), 30 * DAY)
   assert.equal(resolveClientIdleMs(0), 0)
   assert.equal(resolveClientIdleMs('7'), 7 * DAY)
   assert.equal(warns.length, 0)
   for (const bad of ['abc', '-1', 'NaN', 'Infinity']) assert.equal(resolveClientIdleMs(bad), 30 * DAY)
   assert.equal(warns.length, 4)
+})
+
+test('a short idle limit still refreshes: the hourly throttle is clamped to half the limit', async (t) => {
+  let now = Date.now()
+  const { s, token } = await startApprovalServer(t, { clientIdleDays: 1 / 24, clientIdleClock: () => now }) // 1 hour
+  for (let i = 0; i < 6; i++) {
+    now += 40 * 60 * 1000
+    assert.equal((await s.http('/devices', { token })).status, 200, `use ${i}`)
+  }
 })
 
 test('the device list marks an idle-expired client and nothing else', async (t) => {

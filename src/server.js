@@ -75,7 +75,7 @@ const DEFAULT_VOICE_NOTE_TTL_DAYS = 7 // audio goes a week after its transcript
 // A non-negative number, fractions allowed; 0 turns the expiry off; anything
 // else warns and falls back to the default. Returns milliseconds (0 = off).
 export function resolveClientIdleMs(override) {
-  const fromEnv = override === undefined
+  const fromEnv = override === undefined || override === null
   const raw = fromEnv ? process.env.MATRON_CLIENT_IDLE_DAYS : override
   if (raw === undefined || raw === '') return DEFAULT_CLIENT_IDLE_MS
   const n = typeof raw === 'string' && raw.trim() === '' ? NaN : Number(raw)
@@ -599,7 +599,8 @@ export function startServer({
     ...(toolStreamOpts || {}),
   })
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
-  const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient, backgroundWakeMs: BACKGROUND_WAKE_MS })
+  const clientIdleMs = resolveClientIdleMs(clientIdleDays)
+  const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient, backgroundWakeMs: BACKGROUND_WAKE_MS, clientIdleMs, now: clientIdleClock })
   // A consent-card push whose 30 s hold a restart swallowed still goes out.
   try { pushPipeline.resumeHeldConsent() } catch (err) { console.error('push: consent resume failed', err) }
   // Voice notes are transcribed here when the journal has a transcriber: a
@@ -709,7 +710,6 @@ export function startServer({
   let semanticTimer = null
   let indexingNow = false
   let semanticInFlight = Promise.resolve()
-  const clientIdleMs = resolveClientIdleMs(clientIdleDays)
   const server = http.createServer(makeHttpHandler({
     db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
