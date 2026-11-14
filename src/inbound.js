@@ -118,7 +118,7 @@ const stripHidden = (s) => s.replace(/\r\n?/g, '\n').replace(/[\u0000-\u0008\u00
 // backtick run in the same paragraph is all prose (a renderer may pair
 // that run with one further down), and a fence opens only at the start of
 // a line.
-const dropImages = (s) => s.replace(/!(?=\[)/g, '')
+const dropImages = (s) => s.replace(/!+(?=\[)/g, '')
 const escapeTags = (s) => s.replace(/<(?=[A-Za-z/!?])/g, '&lt;')
 function defuseLine(line, state) {
   if (!line.trim()) state.open = false

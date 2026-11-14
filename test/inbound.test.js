@@ -87,6 +87,7 @@ test('buildReport: text only', () => {
   assert.equal(buildReport({ body: 'just this' }).text, 'just this')
   // Images become links and raw HTML is shown as typed; code is left alone.
   assert.equal(defuseMarkdown('see ![chart](https://example.com/p.png) <img src=x> a<b 1 < 2'), 'see [chart](https://example.com/p.png) &lt;img src=x> a&lt;b 1 < 2')
+  assert.equal(defuseMarkdown('wow!![c](https://example.com/p.png) !!![d][e]'), 'wow[c](https://example.com/p.png) [d][e]')
   assert.equal(defuseMarkdown('use `<b>` and `![x](y)` here'), 'use `<b>` and `[x](y)` here')
   assert.equal(defuseMarkdown('```html\n<script>![a](b)</script>\n```\n<script>'), '```html\n<script>[a](b)</script>\n```\n&lt;script>')
   // What only looks like code is prose: a run of another length does not
@@ -328,6 +329,9 @@ test('a long reply about a long report keeps the report; the user\'s words are c
   const quoted = quotedReport({ name: 'Scout' }, report)
   assert.match(quoted, /\(Cut here\./)
   assert.ok(quoted.length <= QUOTED_REPORT_MAX + 600)
+  assert.ok(quoted.split('\n').filter((l) => l === '> a').length > 6000)
+  assert.match(quotedReport({ name: 'Scout' }, 'b'.repeat(QUOTED_REPORT_MAX + 5)), /\n> b{1000,}\n\n\(Cut here\./)
+  assert.equal(quotedReport({ name: 'Scout' }, 'one\ntwo').endsWith('> one\n> two'), true)
   const w = await world(t)
   assert.equal((await w.report({ body: report })).status, 201)
   w.ws.phone.send({ op: 'send', convo_id: w.source.convo_id, type: 'text', payload: { body: 'w'.repeat(30000) } })
