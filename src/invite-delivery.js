@@ -1,9 +1,21 @@
 import { undeliveredInvites, markDelivered, answerInvite } from './participants.js'
 import { storedApproval } from './consent-subject.js'
 import { isPanicLocked } from './panic.js'
-import { isGuestRoom, onGuestAgentAnswer } from './person-rooms.js'
-import { onGuestAnswered } from './person-rooms-events.js'
-import { isFedGuestRoom, fedRoomsOf } from './federation-rooms.js'
+
+// Who else hears that an invite was refused for a lock: the rooms with
+// another person's agent (src/person-rooms-events.js, on one journal;
+// src/federation-rooms.js, across journals) register here when they load,
+// rather than this module importing them, which import it. Each hook gets
+// ({db, hub}, row) for every refused row and acts only on its own rooms.
+// Kept on a hoisted function, so registering works whatever order the
+// modules load in.
+function refusalHooks() {
+  refusalHooks.list ??= []
+  return refusalHooks.list
+}
+export function onInviteRefusedForLock(hook) {
+  refusalHooks().push(hook)
+}
 
 // An approved invite that never reached its box, finished as refused
 // because its account was panic-locked (src/panic.js): nothing approved
@@ -16,11 +28,12 @@ function refuseInvite({ db, hub }, row) {
   hub.sendToDevice(row.owner_user_id, row.initiator_device_id, {
     kind: 'invite', event: 'answer', room_id: row.convo_id, peer_device_id: row.agent_device_id, accept: false, reason: 'refused',
   })
-  try {
-    if (isGuestRoom(db, row.convo_id)) onGuestAnswered({ db, hub }, onGuestAgentAnswer(db, { guestRoomId: row.convo_id, accept: false }), false, 'refused')
-    if (isFedGuestRoom(db, row.convo_id)) fedRoomsOf(db)?.onGuestAgentAnswer(row.convo_id, false)
-  } catch (err) {
-    console.error('panic: telling another person\'s agent of a refused invite failed', err)
+  for (const hook of refusalHooks()) {
+    try {
+      hook({ db, hub }, row)
+    } catch (err) {
+      console.error('panic: telling another person\'s agent of a refused invite failed', err)
+    }
   }
   return true
 }

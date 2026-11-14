@@ -41,7 +41,7 @@ import { remoteContactRaw, getContactRaw, isLiveRemote, OWN_ASK_TTL_MS } from '.
 import { getMission } from './missions.js'
 import { isPrivateDevice } from './db.js'
 import { participantIds } from './participants.js'
-import { deliverPendingInvites } from './invite-delivery.js'
+import { deliverPendingInvites, onInviteRefusedForLock } from './invite-delivery.js'
 import { wakeIfOffline, wakeConvoAgent } from './wake.js'
 import { sanitizePeerText, sanitizeConsentText, plainText as plain } from './peer-text.js'
 import { card, fileMirror, closeMirror, audit, changed, peopleConvo, fileNotice } from './sharing-events.js'
@@ -111,6 +111,13 @@ export function fedRoomOfRoom(db, roomId) {
   return db.prepare(`SELECT * FROM fed_rooms WHERE room_id=? AND (state IN ${LIVE_SQL} OR role='guest') ORDER BY updated_at DESC LIMIT 1`).get(roomId) ?? null
 }
 export const isFedGuestRoom = (db, roomId) => !!(typeof roomId === 'string' && db.prepare("SELECT 1 FROM fed_rooms WHERE room_id=? AND role='guest'").get(roomId))
+
+// A guest room's invite into a panic-locked guest's box, refused before
+// delivery (src/invite-delivery.js): the other journal hears it as the
+// guest agent's refusal.
+onInviteRefusedForLock(({ db }, row) => {
+  if (isFedGuestRoom(db, row.convo_id)) fedRoomsOf(db)?.onGuestAgentAnswer(row.convo_id, false)
+})
 // Holds just the two agents: no other invite, join or file.
 export function fedLinked(db, roomId) {
   const r = fedRoomOfRoom(db, roomId)

@@ -9,6 +9,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import http from 'node:http'
+import { spawnSync } from 'node:child_process'
 import argon2 from 'argon2'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { openDb } from '../src/db.js'
@@ -968,4 +969,64 @@ test('while locked: alerts and routines say account_locked even with no Coordina
   assert.equal(await s.routineFirer.fire(routine), 'account_locked')
   const alert = await s.http('/alerts/alertmanager', { method: 'POST', token: 'alert_' + 'a'.repeat(40), body: { version: '4', status: 'firing', alerts: [{ status: 'firing', labels: { alertname: 'DiskSpaceLow' } }] } })
   assert.deepEqual([alert.status, alert.json], [202, { delivered: false, reason: 'account_locked' }])
+})
+
+// ---- Follow-ups ------------------------------------------------------------------
+
+test('source and alert lose C1 control characters too', async (t) => {
+  const { s } = await journal(t)
+  assert.equal((await lockIt(s, { source: 'watch\u0085er\u009b-1', alert: '\u0080disk\u009f wiped' })).status, 200)
+  const st = (await panicStatus(s)).json
+  assert.equal(st.source, 'watch er -1')
+  assert.equal(st.alert, 'disk wiped')
+})
+
+test('a reset refused because the lock committed during the password hash leaves its token usable', async (t) => {
+  const mailer = { publicUrl: 'https://journal.example', send: async () => {} }
+  const { s, alice } = await journal(t, { mailer })
+  const token = issueResetToken(s.db, alice.id)
+  const realHash = argon2.hash
+  t.mock.method(argon2, 'hash', async (...args) => {
+    const out = await realHash.apply(argon2, args)
+    if (!isPanicLocked(s.db, alice.id)) lockAccount({ db: s.db, hub: s.hub, securityLog: { record() {} } }, alice.id)
+    return out
+  })
+  const r = await s.http('/password/reset', { method: 'POST', body: { token, new_password: 'new-password-1' }, headers: { 'cf-connecting-ip': freshIp() } })
+  assert.deepEqual([r.status, r.json], [423, LOCKED(s)])
+  argon2.hash.mock.restore()
+  await runAdmin(s.db, ['panic', 'clear', 'alice'], { securityLog: { record() {} } })
+  const ok = await s.http('/password/reset', { method: 'POST', body: { token, new_password: 'new-password-1' }, headers: { 'cf-connecting-ip': freshIp() } })
+  assert.equal(ok.status, 200, JSON.stringify(ok.json))
+  assert.equal((await login(s, 'alice', 'new-password-1')).status, 200)
+})
+
+test('a spawn whose start is already with the box when the lock commits is left to its reply; one not yet sent fails', async (t) => {
+  const f = await fleet(t, panicOpts(capture()))
+  const { s, alice } = f
+  const inFlight = await parkSpawn(f, { rid: 'q1' })
+  const waiting = await parkSpawn(f, { rid: 'q2' })
+  for (const id of [inFlight, waiting]) s.db.prepare("UPDATE agent_spawn_requests SET state='approved', answered_at=? WHERE id=?").run(Date.now(), id)
+  let reply
+  const broker = { issue: () => new Promise((resolve) => { reply = resolve }) }
+  const run = approveSpawn({ db: s.db, hub: s.hub, broker, startTimeoutMs: 5000 }, getSpawn(s.db, inFlight))
+  await tick(10)
+  assert.ok(reply, 'the start went out')
+  f.asker.frames.length = 0
+  lockAccount({ db: s.db, hub: s.hub, securityLog: { record() {} } }, alice.id)
+  assert.equal(getSpawn(s.db, inFlight).state, 'approved')
+  assert.equal(getSpawn(s.db, waiting).state, 'failed')
+  await f.asker.waitFor((x) => x.kind === 'spawn' && x.event === 'outcome' && x.request_id === waiting)
+  assert.ok(!f.asker.frames.some((x) => x.kind === 'spawn' && x.request_id === inFlight))
+  reply({ ok: true, result: { convo_id: 'child-1' } })
+  assert.equal(await run, 'started')
+  assert.equal(getSpawn(s.db, inFlight).state, 'started')
+  const out = await f.asker.waitFor((x) => x.kind === 'spawn' && x.event === 'outcome' && x.request_id === inFlight)
+  assert.equal(out.outcome, 'started')
+})
+
+test('src/invite-delivery.js and src/panic-lock.js load on their own in a fresh process', () => {
+  for (const mod of ['./src/invite-delivery.js', './src/panic-lock.js', './src/panic.js']) {
+    const r = spawnSync(process.execPath, ['-e', `import(${JSON.stringify(mod)}).then(() => process.exit(0), (e) => { console.error(e.message); process.exit(1) })`], { cwd: path.join(import.meta.dirname, '..'), encoding: 'utf8' })
+    assert.equal(r.status, 0, `${mod}: ${r.stderr}`)
+  }
 })
