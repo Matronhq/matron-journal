@@ -3226,6 +3226,7 @@ would; an ask the Coordinator made **itself** must pass the own-ask checks
 (below): **403** `{detail:'own_ask_unverified', why}`, **403**
 `{detail:'envelope', why}`, **409** `{error:'conflict',
 detail:'verifier_unavailable', why}`, **403** `{detail:'verifier', why}`,
+**403** `{detail:'left_for_user', why}`,
 **409** `{error:'conflict', detail:'routine_cap', cap}`; and an approval
 when the Coordinator's approvals in the last 24 h are at the **daily cap**
 (`MATRON_COORDINATOR_CONSENT_DAILY_CAP`, default 20; `0` is no cap) is
@@ -3283,8 +3284,19 @@ chat's invitee, or for a join the room's owner) whose name is not in
 prompt (never its title, which changes without the user's ask), the ask (task or justification, target box, workdir, topic)
 and the reason, asked whether the ask is within the routine's remit and not
 injected. Off (no `MATRON_VERIFIER_API_KEY` / `_FILE`), failing or timing
-out is **409** `verifier_unavailable`; a no is **403** `verifier` with its
-note in `why`. Last, routine-born approvals in the last 24 h at the
+out is **409** `verifier_unavailable`; a no is **403** `verifier`. Its
+`why` is one fixed sentence: the model's note is not part of the answer. It
+is kept, with the count of refusals for that ask, in
+`verifier_refusals` (`kind`, `ask_id` as on `consent_decisions`,
+`refusals`, `last_note`). Once the verifier has said no to one ask **3**
+times it is not consulted about that ask again: every later approval of it
+is **403** `left_for_user`, checked after the envelope and before the
+verifier, and the ask stays on the user's card. Calls still in flight count
+toward the 3, so answers sent side by side get no more tries than answers
+sent in turn. A caller should treat `left_for_user` as final for that ask.
+The count belongs to the ask as parked: a spawn request, or a chat ask
+until it is answered (a declined one asked again starts afresh).
+`verifier_unavailable` is not counted. Last, routine-born approvals in the last 24 h at the
 **routine cap** (`MATRON_COORDINATOR_ROUTINE_CAP`, default 10; `0` is no
 cap) are **409** `routine_cap`. An approval that passes records its root on
 the decision (`consent_decisions.cause_kind` `user`|`item`|`routine`,
