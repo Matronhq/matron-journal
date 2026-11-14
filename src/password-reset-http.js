@@ -32,9 +32,10 @@ export async function handlePasswordResetRoute(ctx, req, res, url, { rejectEarly
     if (!mailer) { json(res, 503, { error: 'unavailable' }); return true }
     const target = findResetTarget(db, identifier)
     // Asked for an account that exists, whether or not it has an address
-    // (the security log); the answer below stays the same either way.
+    // (the security log; anyone may ask, so no one is named as deciding);
+    // the answer below stays the same either way.
     const account = target ?? (identifier.includes('@') ? null : db.prepare('SELECT id FROM users WHERE name=?').get(identifier.trim()))
-    if (account) securityLogOf(ctx).record(account.id, 'password_reset_requested', { decidedBy: 'user' })
+    if (account) securityLogOf(ctx).record(account.id, 'password_reset_requested', {})
     const token = target && issueResetToken(db, target.id)
     if (token) {
       const link = `${mailer.publicUrl}/app/reset-password#token=${token}`

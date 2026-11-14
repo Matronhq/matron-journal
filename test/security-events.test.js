@@ -320,7 +320,7 @@ test('password_changed: /password once, a wrong old password records nothing; th
   const known = await s.http('/password/forgot', { method: 'POST', body: { identifier: 'alice' }, headers: { 'cf-connecting-ip': IP } })
   assert.deepEqual([known.status, known.json], [unknown.status, unknown.json])
   const req = one(cap, 'password_reset_requested', from)
-  assert.deepEqual(pick(req), { account: 'alice', device_id: null, device_name: null, target: null, decided_by: 'user' })
+  assert.deepEqual(pick(req), { account: 'alice', device_id: null, device_name: null, target: null, decided_by: null })
   assert.equal(req.source_ip, IP)
   await tick(10)
   const token = sent.at(-1).text.match(/#token=([A-Za-z0-9_-]+)/)[1]
@@ -467,9 +467,11 @@ test('approval keys: enrolled, attached, revoked, invalid, signed out, locked; d
   secrets.push(spare.token)
   from = cap.lines.length
   const garbage = { statement: 'not a statement', signature: 'AAAA' }
-  assert.equal((await s.http(`/devices/${tablet.deviceId}/revoke`, { method: 'POST', token: spare.token, body: { approval: garbage } })).status, 400)
+  assert.equal((await s.http(`/devices/${tablet.deviceId}/revoke`, { method: 'POST', token: spare.token, body: { approval: garbage }, headers: { 'cf-connecting-ip': IP } })).status, 400)
   await tick()
   assert.deepEqual(cap.all().slice(from).map(pick), [{ account: 'alice', device_id: spare.deviceId, device_name: 'spare', target: 'bad_statement', decided_by: null }])
+  // Recorded after the refused request's transaction, still with its address.
+  assert.equal(cap.all().at(-1).source_ip, IP)
   const forged = await signAccount(s, { token: spare.token, key: generateApprovalKey(), subject: { op: 'change_password' } })
   assert.equal((await s.http('/password', { method: 'POST', token: spare.token, body: { old_password: TEST_PASSWORD, new_password: 'never-applied-1', approval: forged } })).status, 400)
   await tick()
