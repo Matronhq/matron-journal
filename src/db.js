@@ -2084,6 +2084,7 @@ export function openDb(path) {
   addPeerFailingSince(db)
   addProtectedDevices(db)
   addApprovalLockdown(db)
+  addVerifierRefusals(db)
   addSecurityEvents(db)
   addPanicLocks(db)
   // A routine's envelope (JSON): the bounds on what an ask born of one of
@@ -2760,6 +2761,28 @@ export function addProtectedDevices(db) {
   if (!has('agent_spawn_requests', 'approval')) db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN approval TEXT')
   if (!has('convo_agents', 'approval')) db.exec('ALTER TABLE convo_agents ADD COLUMN approval TEXT')
   if (!has('transfers', 'approval')) db.exec('ALTER TABLE transfers ADD COLUMN approval TEXT')
+}
+
+// The verifier's refusals of one parked ask (src/consent-own-ask.js): how
+// many times it said no to the Coordinator's approval of that ask, and what
+// it last said. ask_id is the spawn's request id or the chat ask's
+// '<room>/<device>' pair, as on consent_decisions; ask_created_at tells a
+// chat ask renewed in place from the one the count was kept for. The note
+// stays here: it is not part of any answer to the Coordinator.
+export function addVerifierRefusals(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS verifier_refusals(
+      user_id        INTEGER NOT NULL,
+      kind           TEXT NOT NULL,
+      ask_id         TEXT NOT NULL,
+      ask_created_at INTEGER NOT NULL,
+      refusals       INTEGER NOT NULL,
+      last_note      TEXT,
+      updated_at     INTEGER NOT NULL,
+      PRIMARY KEY(user_id, kind, ask_id)
+    );
+    CREATE INDEX IF NOT EXISTS verifier_refusals_age ON verifier_refusals(updated_at);
+  `)
 }
 
 // Lockdown after failures and locked boxes (src/approval-keys.js).

@@ -13,8 +13,8 @@
 // offline, unwakeable box is 409 target_offline; an approval of the
 // Coordinator's OWN ask — or of another session's ask the Coordinator had
 // it make — is refused unless its cause checks out
-// (src/consent-own-ask.js: own_ask_unverified, envelope, verifier,
-// verifier_unavailable, routine_cap); approvals at the rolling 24 h cap are
+// (src/consent-own-ask.js: own_ask_unverified, envelope, left_for_user,
+// verifier, verifier_unavailable, routine_cap); approvals at the rolling 24 h cap are
 // 409 daily_cap (a cap of 0 is no cap). Declines skip every approval check.
 // An ordinary (non-private) Coordinator neither lists nor answers an ask a
 // private device takes part in: such an ask is left out of the list and is
