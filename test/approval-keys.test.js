@@ -1,5 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { openDb } from '../src/db.js'
 import { createAgent, createUser, revokeDevice } from '../src/auth.js'
 import { hasActiveKey, activeKeyFor, issueNonce, consumeNonce, requireApproval, NONCE_TTL_MS } from '../src/approval-keys.js'
 import {
@@ -355,6 +359,33 @@ test('requireApproval: an item tap must match item, action and prompt digest', a
 
 // ---- Revocation ----------------------------------------------------------
 
+test('a database from before: the detach trigger is replaced, and a key naming a device that is gone loses the id', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'approval-keys-db-'))
+  const file = path.join(dir, 'j.db')
+  let db = openDb(file)
+  // The earlier trigger body, and a revoked key left naming a deleted device.
+  db.exec(`DROP TRIGGER devices_approval_detach;
+    CREATE TRIGGER devices_approval_detach AFTER DELETE ON devices BEGIN
+      UPDATE approval_keys SET device_id = NULL WHERE device_id = OLD.id AND revoked_at IS NULL;
+      DELETE FROM approval_nonces WHERE device_id = OLD.id;
+      DELETE FROM approval_key_requests WHERE device_id = OLD.id;
+    END`)
+  const u = db.prepare("INSERT INTO users(name, password_hash, created_at) VALUES('alice','x',1)").run().lastInsertRowid
+  const k = generateApprovalKey()
+  db.prepare(`INSERT INTO approval_keys(user_id, key_id, public_key, alg, name, device_id, enrolled_via, enrolled_by, created_at, revoked_at)
+    VALUES(?,?,?,'ES256','old',4242,'password',NULL,1,2)`).run(u, k.keyId, k.publicKey)
+  db.close()
+  db = openDb(file)
+  try {
+    assert.deepEqual(db.prepare('SELECT device_id FROM approval_keys WHERE key_id=?').get(k.keyId), { device_id: null })
+    const body = db.prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='devices_approval_detach'").get().sql
+    assert.doesNotMatch(body, /revoked_at IS NULL/)
+  } finally {
+    db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('revoke by a signed statement, with a notice', async (t) => {
   const { s, alice, token, key } = await startWithKey(t)
   const unsigned = await s.http(`/approval-keys/${key.keyId}/revoke`, { method: 'POST', token, body: {} })
@@ -413,6 +444,9 @@ test('revoking a device revokes its key; a sign-out that deletes the row only de
   // The admin's revoke.
   revokeDevice(s.db, laptop.deviceId)
   assert.equal(activeKeyFor(s.db, alice.id, laptopKey.keyId), null)
+  // A revoked key loses its device id too: the id may be handed out again,
+  // and the key list must not name another device.
+  assert.deepEqual(s.db.prepare('SELECT device_id FROM approval_keys WHERE key_id=?').get(laptopKey.keyId), { device_id: null })
 
   // The user's revoke of one of their devices, from another: signed, once
   // the account has a key (test/approval-lockdown.test.js has the rest).
@@ -423,6 +457,7 @@ test('revoking a device revokes its key; a sign-out that deletes the row only de
   assert.equal(r.status, 200)
   assert.equal(activeKeyFor(s.db, alice.id, tabletKey.keyId), null)
   assert.equal(notices(s, alice.id).at(-1).title, `Approval key removed: tablet ${tabletKey.keyId.slice(0, 8)}`)
+  assert.equal((await keysOf(s, token)).keys.find((k) => k.key_id === tabletKey.keyId).device_id, null)
 
   // A password change signing the others out: the phone's key stays enrolled,
   // with no device until the phone signs in again and attaches it. (The

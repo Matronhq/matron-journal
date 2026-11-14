@@ -1253,13 +1253,21 @@ export function openDb(path) {
   // again (auth.js issueDevice), and a key must never follow an id to a new
   // sign-in. The key itself stays enrolled until the app re-attaches it
   // (POST /approval-keys/attach); an explicit revoke (auth.js) revokes it
-  // before the row goes.
-  db.exec(`CREATE TRIGGER IF NOT EXISTS devices_approval_detach AFTER DELETE ON devices
+  // before the row goes. Revoked keys lose the id too, so the key list never
+  // names a later device that was given it.
+  //
+  // Dropped and created afresh on every open: an earlier body (which left a
+  // revoked key's id in place) is replaced, and a key still naming a device
+  // that is gone loses the id.
+  db.exec(`DROP TRIGGER IF EXISTS devices_approval_detach;
+    CREATE TRIGGER devices_approval_detach AFTER DELETE ON devices
     BEGIN
-      UPDATE approval_keys SET device_id = NULL WHERE device_id = OLD.id AND revoked_at IS NULL;
+      UPDATE approval_keys SET device_id = NULL WHERE device_id = OLD.id;
       DELETE FROM approval_nonces WHERE device_id = OLD.id;
       DELETE FROM approval_key_requests WHERE device_id = OLD.id;
-    END`)
+    END;
+    UPDATE approval_keys SET device_id = NULL
+     WHERE device_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.id = approval_keys.device_id);`)
   // An APNs token names a physical app install, so at most one device row may
   // hold it. Re-pairing creates a NEW device row, and until setApnsRegistration
   // learned to claim the token, every superseded row kept it: on one deployment one Mac
