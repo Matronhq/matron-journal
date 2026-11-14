@@ -5,6 +5,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
+import argon2 from 'argon2'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent, createClientDevice } from '../src/auth.js'
 import { openDb, setApnsRegistration } from '../src/db.js'
@@ -13,11 +14,13 @@ import { makePushPipeline } from '../src/push.js'
 import { setNotifyPrefs, NOTIFY_EVENTS } from '../src/notify.js'
 import { upsertConversation, append } from '../src/journal.js'
 import { getConsentEnabled, getTransferConsentEnabled } from '../src/consent.js'
-import { isPanicLocked, clearPanic } from '../src/panic.js'
+import { isPanicLocked, clearPanic, PANIC_UNLOCK_KEY_AGE_MS } from '../src/panic.js'
 import { lockAccount } from '../src/panic-lock.js'
+import { isTwoFactorEnabled } from '../src/two-factor.js'
 import { runAdmin } from '../bin/matron-admin.js'
 import {
-  generateApprovalKey, enableTwoFactor, enrolKeyByPassword, signAccount, TEST_PASSWORD, TEST_TOKEN_KEY, TEST_PUBLIC_URL,
+  generateApprovalKey, enableTwoFactor, enrolKeyByPassword, signAccount, totpCode, backdateApprovalKeys,
+  TEST_PASSWORD, TEST_TOKEN_KEY, TEST_PUBLIC_URL,
 } from './approval-helpers.js'
 
 const PANIC_TOKEN = 'panic_' + 'p'.repeat(40)
@@ -66,7 +69,7 @@ function delayedPost(s, path, token, body, beforeBody) {
 }
 
 // A journal with the panic token and approval keys on; alice with a phone
-// that holds an approval key, and bob.
+// that holds an approval key enrolled over a day ago, and bob.
 async function journal(t, extra = {}) {
   const cap = capture()
   const s = await startTestServer({
@@ -79,10 +82,13 @@ async function journal(t, extra = {}) {
   const phone = createClientDevice(s.db, alice.id, 'phone')
   const { secret } = await enableTwoFactor(s, phone.token)
   const key = await enrolKeyByPassword(s, { token: phone.token, userId: alice.id, secret })
-  // Another client device of alice with a key of its own.
-  const keyed = async (name) => {
+  backdateApprovalKeys(s)
+  // Another client device of alice with a key of its own, enrolled over a
+  // day ago too unless `fresh`.
+  const keyed = async (name, { fresh = false } = {}) => {
     const d = createClientDevice(s.db, alice.id, name)
     const k = await enrolKeyByPassword(s, { token: d.token, userId: alice.id, secret, name })
+    if (!fresh) backdateApprovalKeys(s, { keyId: k.keyId })
     return { ...d, key: k }
   }
   return { s, cap, alice, bob, phone, key, secret, keyed }
@@ -158,7 +164,9 @@ test('a statement over an earlier lock\'s since does not clear a later lock', as
   const { s, alice, phone, key } = await journal(t)
   assert.equal((await lockIt(s)).status, 200)
   const first = lockedSince(s)
-  await runAdmin(s.db, ['panic', 'clear', 'alice'])
+  const u = await unlock(s, phone.token, { approval: await signUnlock(s, phone, key) })
+  assert.equal(u.status, 200)
+  phone.token = u.json.token
   await tick(5)
   assert.equal((await lockIt(s)).status, 200)
   assert.notEqual(lockedSince(s), first)
@@ -172,10 +180,15 @@ test('a statement over an earlier lock\'s since does not clear a later lock', as
 
 // ---- What a frozen device sees --------------------------------------------------------
 
-test('frozen over HTTP: 423 with unlock:true on every route, the token still valid; the nonce route works', async (t) => {
+test('frozen over HTTP: 423 with unlock:true on account, key, media and transfer routes alike, the token still valid; the nonce route works; a socket gets no RPC through', async (t) => {
   const { s, alice, phone } = await journal(t)
+  const box = createAgent(s.db, alice.id, 'box-a')
   assert.equal((await lockIt(s)).status, 200)
-  for (const [path, opts] of [['/me', {}], ['/devices', {}], ['/settings', { method: 'PATCH', body: { notices: false } }], ['/approval-keys', {}], ['/no-such-route', {}]]) {
+  for (const [path, opts] of [
+    ['/me', {}], ['/devices', {}], ['/settings', { method: 'PATCH', body: { notices: false } }], ['/approval-keys', {}], ['/no-such-route', {}],
+    ['/media/' + 'a'.repeat(32), {}], ['/media', { method: 'POST', body: { x: 1 } }], ['/transfers/tr_' + 'a'.repeat(24), {}],
+    ['/transfers', { method: 'POST', body: { room_id: 'r' } }], ['/convos', {}], ['/items', {}],
+  ]) {
     const r = await s.http(path, { token: phone.token, ...opts })
     assert.deepEqual([r.status, r.json], [423, FROZEN(s)], path)
   }
@@ -186,6 +199,12 @@ test('frozen over HTTP: 423 with unlock:true on every route, the token still val
   // Only the POST: any other method on those two paths is refused.
   assert.equal((await s.http('/approvals/nonce', { token: phone.token })).status, 423)
   assert.equal((await s.http('/panic/unlock', { token: phone.token })).status, 423)
+  // A socket: the hello is refused, and an RPC sent behind it goes nowhere.
+  const w = await makeWsClient(s.base, { token: phone.token, cursor: null })
+  const wClosed = closed(w)
+  try { w.send({ op: 'agent_request', request_id: 'r1', agent_device_id: box.deviceId, method: 'spawn_targets', params: {} }) } catch { /* closed already */ }
+  await wClosed
+  assert.deepEqual(w.frames, [{ kind: 'control', op: 'error', code: 'account_locked', since: lockedSince(s), unlock: true }])
   assert.deepEqual(clientIds(s, alice.id), [phone.deviceId])
 })
 
@@ -235,10 +254,11 @@ test('a frame on a frozen device\'s socket that was still open is refused with u
   const p = await socket(s, phone.token)
   const pClosed = closed(p.w)
   // A lock this socket was not closed for (written past the journal).
-  s.db.prepare('INSERT INTO panic_locks(user_id, since, source, alert, cleared_at) VALUES(?,?,NULL,NULL,NULL)').run(alice.id, 1234)
+  const since = Date.now()
+  s.db.prepare('INSERT INTO panic_locks(user_id, since, source, alert, cleared_at) VALUES(?,?,NULL,NULL,NULL)').run(alice.id, since)
   p.w.send({ op: 'agent_request', request_id: 'r1', agent_device_id: box.deviceId, method: 'spawn_targets', params: {} })
   const err = await p.w.waitFor((f) => f.op === 'error')
-  assert.deepEqual(err, { kind: 'control', op: 'error', code: 'account_locked', ref: 'agent_request', request_id: 'r1', since: 1234, unlock: true })
+  assert.deepEqual(err, { kind: 'control', op: 'error', code: 'account_locked', ref: 'agent_request', request_id: 'r1', since, unlock: true })
   assert.notEqual(await pClosed, 4001)
   assert.equal(p.w.frames.some((f) => f.code === 'revoked'), false)
   assert.equal(deviceExists(s, phone.deviceId), true)
@@ -270,7 +290,7 @@ test('a frozen device gets no push while the account is locked, and gets them ag
   setApnsRegistration(db, phone.deviceId, { apnsToken: 'phone-token', apnsEnv: 'prod' })
   const k = generateApprovalKey()
   db.prepare(`INSERT INTO approval_keys(user_id, key_id, public_key, alg, name, device_id, enrolled_via, enrolled_by, created_at)
-    VALUES(?,?,?,'ES256','phone',?,'password',NULL,?)`).run(alice.id, k.keyId, k.publicKey, phone.deviceId, Date.now())
+    VALUES(?,?,?,'ES256','phone',?,'password',NULL,?)`).run(alice.id, k.keyId, k.publicKey, phone.deviceId, Date.now() - PANIC_UNLOCK_KEY_AGE_MS - 1000)
   const say = async (body) => {
     const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:box-a', type: 'text', payload: { body } })
     pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:box-a', type: 'text', payload: { body } }, null)
@@ -294,6 +314,7 @@ test('a signed unlock clears the lock, signs out every other client device, tell
   const a = await socket(s, box.token)
   const bobPhone = createClientDevice(s.db, bob.id, 'phone')
   t.after(() => a.w.close())
+  setApnsRegistration(s.db, phone.deviceId, { apnsToken: 'phone-apns', apnsEnv: 'prod' })
   const locked = await lockIt(s)
   assert.equal(locked.json.devices_frozen, 2)
   await a.w.waitFor((f) => f.kind === 'panic' && f.on === true)
@@ -301,8 +322,18 @@ test('a signed unlock clears the lock, signs out every other client device, tell
   const from = cap.lines.length
   const approval = await signUnlock(s, phone, key)
   const r = await unlock(s, phone.token, { approval })
-  assert.deepEqual([r.status, r.json], [200, { ok: true, locked: false, devices_revoked: 1 }])
+  assert.equal(r.status, 200)
+  const fresh = r.json.token
+  assert.deepEqual(r.json, { ok: true, locked: false, devices_revoked: 1, token: fresh })
+  assert.match(fresh, /^[0-9a-f]{64}$/)
+  assert.notEqual(fresh, phone.token)
   assert.equal(isPanicLocked(s.db, alice.id), false)
+  // The token the device had at the lock is dead; the new one is the same
+  // device, with its key and its push registration.
+  assert.equal((await s.http('/me', { token: phone.token })).status, 401)
+  assert.equal((await unlock(s, phone.token)).status, 401)
+  assert.equal(s.db.prepare('SELECT apns_token FROM devices WHERE id=?').get(phone.deviceId).apns_token, 'phone-apns')
+  phone.token = fresh
   // The other frozen device is signed out, its key detached, not revoked.
   assert.deepEqual(clientIds(s, alice.id), [phone.deviceId])
   assert.equal((await s.http('/me', { token: tablet.token })).status, 401)
@@ -344,7 +375,7 @@ test('an unlock closes the other devices\' sockets as a revoked device\'s are, w
   const lClosed = closed(l.w)
   s.db.prepare('UPDATE panic_locks SET cleared_at=NULL WHERE user_id=?').run(alice.id)
   const r = await unlock(s, phone.token, { approval: await signUnlock(s, phone, key) })
-  assert.deepEqual([r.status, r.json], [200, { ok: true, locked: false, devices_revoked: 1 }])
+  assert.deepEqual([r.status, r.json.devices_revoked], [200, 1])
   assert.equal(await lClosed, 4001)
   assert.deepEqual(lockFrames(l.w), [{ kind: 'control', op: 'error', code: 'revoked' }])
   assert.equal(deviceExists(s, late.deviceId), false)
@@ -381,7 +412,9 @@ test('an unlock signed over another lock\'s since is a mismatch; a statement is 
   // happens to have the same since.
   const approval = await signUnlock(s, phone, key)
   const since = lockedSince(s)
-  assert.equal((await unlock(s, phone.token, { approval })).status, 200)
+  const ok = await unlock(s, phone.token, { approval })
+  assert.equal(ok.status, 200)
+  phone.token = ok.json.token
   lockAccount({ db: s.db, hub: s.hub, securityLog: { record() {} } }, alice.id, { now: since })
   assert.equal(lockedSince(s), since)
   const replay = await unlock(s, phone.token, { approval })
@@ -423,32 +456,165 @@ test('the unlock route is there with no panic token configured', async (t) => {
   lockAccount({ db: s.db, hub: s.hub, securityLog: { record() {} } }, alice.id, {})
   assert.deepEqual((await s.http('/me', { token: phone.token })).json, FROZEN(s))
   const r = await unlock(s, phone.token, { approval: await signUnlock(s, phone, key) })
-  assert.deepEqual([r.status, r.json], [200, { ok: true, locked: false, devices_revoked: 0 }])
-  assert.equal((await s.http('/me', { token: phone.token })).status, 200)
+  assert.deepEqual([r.status, r.json.devices_revoked], [200, 0])
+  assert.equal((await s.http('/me', { token: r.json.token })).status, 200)
 })
 
-test('a lock that commits while the unlock\'s body is on its way: the signed unlock still goes through', async (t) => {
-  const { s, alice, phone, key } = await journal(t)
-  assert.equal((await lockIt(s)).status, 200)
-  const approval = await signUnlock(s, phone, key)
-  const r = await delayedPost(s, '/panic/unlock', phone.token, { approval }, async () => {})
-  assert.equal(r.status, 200)
-  assert.equal(isPanicLocked(s.db, alice.id), false)
+test('a lock that commits while an unlock\'s body is on its way: the request meets that lock, and unsigned it clears nothing', async (t) => {
+  const { s, alice, phone } = await journal(t)
+  const r = await delayedPost(s, '/panic/unlock', phone.token, {}, () => lockIt(s))
+  assert.deepEqual([r.status, r.json], [403, { error: 'approval_required' }])
+  assert.equal(isPanicLocked(s.db, alice.id), true)
+  assert.equal(deviceExists(s, phone.deviceId), true)
+})
+
+// ---- Which keys count -------------------------------------------------------------------
+
+test('a key enrolled under a day before the lock does not freeze its device: it is signed out like a keyless one', async (t) => {
+  const { s, alice, phone, key, keyed } = await journal(t)
+  assert.equal(PANIC_UNLOCK_KEY_AGE_MS, 24 * 60 * 60000)
+  const tablet = await keyed('tablet', { fresh: true })
+  backdateApprovalKeys(s, { keyId: tablet.key.keyId, ms: 60 * 60000 })
+  const approval = await signUnlock(s, tablet, tablet.key, 1)
+  const r = await lockIt(s)
+  assert.deepEqual([r.json.devices_revoked, r.json.devices_frozen], [1, 1])
+  assert.deepEqual(clientIds(s, alice.id), [phone.deviceId])
+  assert.equal((await unlock(s, tablet.token, { approval })).status, 401)
+  assert.deepEqual(s.db.prepare('SELECT device_id, revoked_at FROM approval_keys WHERE key_id=?').get(tablet.key.keyId), { device_id: null, revoked_at: null })
+  // The enrolment time decides, not when the key was attached: the old
+  // key moved to a new device today still freezes it.
+  const u = await unlock(s, phone.token, { approval: await signUnlock(s, phone, key) })
+  assert.equal(u.status, 200)
+  const moved = createClientDevice(s.db, alice.id, 'tablet again')
+  s.db.prepare('UPDATE approval_keys SET device_id=?, created_at=? WHERE key_id=?').run(moved.deviceId, Date.now() - PANIC_UNLOCK_KEY_AGE_MS - 60000, tablet.key.keyId)
+  assert.equal((await lockIt(s)).json.devices_frozen, 2)
+  // Exactly a day before the lock counts; a millisecond less does not.
+  const since = lockedSince(s)
+  s.db.prepare('UPDATE approval_keys SET created_at=? WHERE key_id=?').run(since - PANIC_UNLOCK_KEY_AGE_MS, tablet.key.keyId)
+  assert.deepEqual((await s.http('/me', { token: moved.token })).json, FROZEN(s))
+  s.db.prepare('UPDATE approval_keys SET created_at=? WHERE key_id=?').run(since - PANIC_UNLOCK_KEY_AGE_MS + 1, tablet.key.keyId)
+  assert.deepEqual((await s.http('/me', { token: moved.token })).json, LOCKED(s))
+  assert.equal(deviceExists(s, moved.deviceId), false)
+})
+
+test('an intruder with the password and second factor who enrols the first key on a keyless account does not survive the lock, and cannot clear it', async (t) => {
+  const cap = capture()
+  const s = await startTestServer({ securityLog: { out: cap.out, file: null }, panic: { token: PANIC_TOKEN, account: 'alice' }, tokenKey: TEST_TOKEN_KEY, publicUrl: TEST_PUBLIC_URL })
+  t.after(() => s.close())
+  const alice = await createUser(s.db, 'alice', TEST_PASSWORD)
+  const phone = createClientDevice(s.db, alice.id, 'phone')
+  const { secret } = await enableTwoFactor(s, phone.token)
+  // The intruder signs in and enrols a key: the account's first.
+  const intruder = createClientDevice(s.db, alice.id, 'laptop')
+  const key = await enrolKeyByPassword(s, { token: intruder.token, userId: alice.id, secret, name: 'laptop' })
+  const early = await signAccount(s, { token: intruder.token, key, subject: { op: 'clear_panic', since: String(Date.now()) } })
+  const r = await lockIt(s)
+  assert.deepEqual(r.json, { ok: true, locked: true, already_locked: false, devices_revoked: 2, devices_frozen: 0, bridges_notified: 0 })
+  assert.deepEqual(clientIds(s, alice.id), [])
+  for (const token of [intruder.token, phone.token]) {
+    assert.equal((await s.http('/me', { token })).status, 401)
+    assert.equal((await s.http('/approvals/nonce', { method: 'POST', token })).status, 401)
+    assert.equal((await unlock(s, token, { approval: early })).status, 401)
+  }
+  // Signing in again is refused, so the key cannot be re-attached either.
+  const again = await s.http('/login', { method: 'POST', body: { username: 'alice', password: TEST_PASSWORD, device_name: 'laptop' }, headers: { 'cf-connecting-ip': '192.0.2.77' } })
+  assert.equal(again.status, 423)
+  assert.equal(isPanicLocked(s.db, alice.id), true)
+  // A device the lock missed with that key attached: signed out on use.
+  const late = createClientDevice(s.db, alice.id, 'late')
+  s.db.prepare('UPDATE approval_keys SET device_id=? WHERE key_id=?').run(late.deviceId, key.keyId)
+  const u = await unlock(s, late.token, { approval: early })
+  assert.deepEqual([u.status, u.json], [423, LOCKED(s)])
+  assert.equal(deviceExists(s, late.deviceId), false)
+  assert.equal(isPanicLocked(s.db, alice.id), true)
+})
+
+test('a device with an old key and a young one is frozen by the old one; only the old one unlocks', async (t) => {
+  const { s, alice, phone, key, secret } = await journal(t)
+  const young = await enrolKeyByPassword(s, { token: phone.token, userId: alice.id, secret, name: 'second' })
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM approval_keys WHERE device_id=? AND revoked_at IS NULL').get(phone.deviceId).n, 2)
+  assert.equal((await lockIt(s)).json.devices_frozen, 1)
+  const r = await unlock(s, phone.token, { approval: await signUnlock(s, phone, young) })
+  assert.deepEqual([r.status, r.json], [403, { error: 'approval_required' }])
+  assert.equal(isPanicLocked(s.db, alice.id), true)
+  assert.equal(deviceExists(s, phone.deviceId), true)
+  // Not an invalid approval: it does not count towards the lockdown.
+  await tick(10)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM approval_failures').get().n, 0)
+  assert.equal((await unlock(s, phone.token, { approval: await signUnlock(s, phone, key) })).status, 200)
+})
+
+// ---- A lock that commits while a request is waiting ------------------------------------
+
+test('a lock that commits while a frozen device\'s request waits on the password hash: 423, nothing written; cleared again by then: 401', async (t) => {
+  const { s, alice, phone, key, secret } = await journal(t)
+  const realVerify = argon2.verify
+  let during = () => {}
+  t.mock.method(argon2, 'verify', async (...args) => {
+    const ok = await realVerify.apply(argon2, args)
+    during()
+    return ok
+  })
+  const lockNow = () => { if (!isPanicLocked(s.db, alice.id)) lockAccount({ db: s.db, hub: s.hub, securityLog: { record() {} } }, alice.id) }
+  const hashOf = () => s.db.prepare('SELECT password_hash FROM users WHERE id=?').get(alice.id).password_hash
+  const before = hashOf()
+  const attempts = [
+    ['/2fa/disable', () => ({ password: TEST_PASSWORD, code: totpCode(s, alice.id, secret) })],
+    ['/password', () => ({ old_password: TEST_PASSWORD, new_password: 'a-new-password-1' })],
+    [`/approval-keys/${key.keyId}/revoke`, () => ({ password: TEST_PASSWORD, code: totpCode(s, alice.id, secret) })],
+    ['/approval-keys', () => ({ public_key: generateApprovalKey().publicKey, name: 'another', password: TEST_PASSWORD, code: totpCode(s, alice.id, secret) })],
+    ['/2fa/recovery-codes', () => ({ password: TEST_PASSWORD, code: totpCode(s, alice.id, secret) })],
+  ]
+  for (const [path, body] of attempts) {
+    during = lockNow
+    const r = await s.http(path, { method: 'POST', token: phone.token, body: body() })
+    assert.deepEqual([r.status, r.json], [423, FROZEN(s)], path)
+    during = () => {}
+    clearPanic(s.db, alice.id)
+  }
+  assert.equal(hashOf(), before)
+  assert.equal(isTwoFactorEnabled(s.db, alice.id), true)
+  assert.deepEqual(s.db.prepare('SELECT device_id, revoked_at FROM approval_keys WHERE key_id=?').get(key.keyId), { device_id: phone.deviceId, revoked_at: null })
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM approval_keys').get().n, 1)
+  // Locked and cleared again while the hash ran: the token is one that
+  // existed at a lock, so the request is refused as unauthenticated.
+  await tick(5)
+  during = () => { lockNow(); clearPanic(s.db, alice.id) }
+  const r = await s.http('/password', { method: 'POST', token: phone.token, body: { old_password: TEST_PASSWORD, new_password: 'a-new-password-1' } })
+  assert.deepEqual([r.status, r.json], [401, { error: 'unauthenticated' }])
+  assert.equal(hashOf(), before)
 })
 
 // ---- The host's clear ------------------------------------------------------------------
 
-test('matron-admin panic clear with a frozen device: it works again, nobody is signed out', async (t) => {
-  const { s, alice, phone, keyed } = await journal(t)
+test('matron-admin panic clear signs out the frozen devices too: every client token that existed at the lock is dead', async (t) => {
+  const { s, alice, phone, key, keyed } = await journal(t)
   const tablet = await keyed('tablet')
+  const box = createAgent(s.db, alice.id, 'box-a')
   assert.equal((await lockIt(s)).json.devices_frozen, 2)
   const out = await runAdmin(s.db, ['panic', 'clear', 'alice'])
   assert.match(out, /panic lock cleared/)
+  assert.match(out, /2 client devices signed out/)
   assert.equal(isPanicLocked(s.db, alice.id), false)
-  assert.deepEqual(clientIds(s, alice.id), [phone.deviceId, tablet.deviceId])
-  assert.equal((await s.http('/me', { token: phone.token })).status, 200)
-  assert.equal((await s.http('/me', { token: tablet.token })).status, 200)
-  const p = await socket(s, phone.token)
-  p.w.close()
-  assert.deepEqual((await unlock(s, phone.token)).json, { error: 'not_locked' })
+  assert.deepEqual(clientIds(s, alice.id), [])
+  for (const d of [phone, tablet]) {
+    assert.equal((await s.http('/me', { token: d.token })).status, 401)
+    assert.equal((await unlock(s, d.token)).status, 401)
+  }
+  // Keys detached, not revoked; the box stays.
+  for (const k of [key, tablet.key]) {
+    assert.deepEqual(s.db.prepare('SELECT device_id, revoked_at FROM approval_keys WHERE key_id=?').get(k.keyId), { device_id: null, revoked_at: null })
+  }
+  assert.equal(deviceExists(s, box.deviceId), true)
+  const feed = (await s.http('/security-events?since=0', { token: FEED_TOKEN })).json.events
+  const mine = feed.filter((e) => e.decided_by === 'admin_cli').map((e) => [e.event, e.target, e.device_id])
+  assert.deepEqual(mine, [
+    ['panic_cleared', null, null],
+    ['device_revoked', `device:${phone.deviceId}`, null],
+    ['device_revoked', `device:${tablet.deviceId}`, null],
+  ])
+  // Nothing to clear: nothing signed out.
+  const fresh = createClientDevice(s.db, alice.id, 'fresh')
+  assert.match(await runAdmin(s.db, ['panic', 'clear', 'alice']), /not locked/)
+  assert.equal((await s.http('/me', { token: fresh.token })).status, 200)
 })

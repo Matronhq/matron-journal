@@ -56,13 +56,13 @@ import { handleTransferRoute } from './transfers-http.js'
 import { handleTtsRoute } from './tts-http.js'
 import { answerChatAsk, answerSpawnAsk } from './consent-answer.js'
 import { coordinatorFor } from './coordinator.js'
-import { json, readBody, AFTER_BODY } from './http-body.js'
+import { json, readBody, AFTER_BODY, RECHECK, recheckCaller } from './http-body.js'
 import { parsePushKey } from './push-box.js'
 import { convoStatuses } from './convo-status.js'
 import { makeAlertsHandler } from './alerts-http.js'
 import { handleSummariseRoute } from './summarise-http.js'
 import { securityLogFor, withRequestScope, handleSecurityFeed, deviceTarget, keyTarget } from './security-log.js'
-import { panicLock, lockedBody, refuseLockedClient } from './panic.js'
+import { panicLock, lockedBody, refuseLockedClient, lockedSince } from './panic.js'
 import { handlePanic, handlePanicUnlock } from './panic-lock.js'
 
 // A device name on its way to a client: same sieve and cap the live consent
@@ -368,6 +368,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       // The panic lock (src/panic.js): its own Bearer token, bound to one
       // account, that can only lock it and read whether it is locked. Off, 404.
       if (await handlePanic({ db, hub, panic, json, rateLimiter, securityLog, signInTickets, mediaDir, pairs, links }, req, res, url, { rejectEarly })) return
+      const authAt = Date.now()
       const who = bearer(req) && authToken(db, bearer(req), { now: clientIdleClock(), clientIdleMs })
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       // A client token of a panic-locked account still working (a race, or
@@ -389,9 +390,20 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         if (locked) return rejectEarly(req, res, 423, locked)
         // Locked while the body was on its way: refused the same way once it
         // has arrived, before the route acts on it (src/http-body.js).
+        // Locked and cleared again meanwhile: the token is one that existed
+        // at a lock, and no such token outlives it.
+        const unauthenticated = () => Object.assign(new Error('unauthenticated'), { statusCode: 401, body: { error: 'unauthenticated' } })
         req[AFTER_BODY] = () => {
           const late = refusal()
           if (late) throw Object.assign(new Error('account_locked'), { statusCode: 423, body: late })
+          if (!lockOf(who.userId) && lockedSince(db, who.userId, authAt)) throw unauthenticated()
+        }
+        // And for a route that waits on something else before it writes
+        // (a password hash, an upload, another server): the same, and the
+        // device still signed in (src/http-body.js recheckCaller).
+        req[RECHECK] = () => {
+          if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(who.deviceId, who.userId)) throw unauthenticated()
+          req[AFTER_BODY]()
         }
       }
       // The signed clear of the lock by a frozen device (src/panic-lock.js).
@@ -547,9 +559,13 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           let out = null
           const g = prepared && guardedAccountAction({ db, journalHost }, who, body, { op: 'change_password' }, {
             check: () => {
-              if (db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(who.deviceId, who.userId)) return
-              out = { ok: false, revoked: true }
-              refuse(401, { error: 'unauthenticated' })
+              if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(who.deviceId, who.userId)) {
+                out = { ok: false, revoked: true }
+                refuse(401, { error: 'unauthenticated' })
+              }
+              // Or its account locked during the hashing (a frozen device
+              // is still signed in): 423, nothing changed.
+              recheckCaller(req)
             },
             write: () => {
               out = applyPasswordChange(db, who.userId, prepared, { deviceId: who.deviceId, signOutOthers: sign_out_others === true })
@@ -828,6 +844,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           query: q, limit, kinds, excludePrivateOwned: filtered, excludeConsent,
           similar: semanticStatus === 'ready' ? { store: semantic.store, embedder: semantic.embedder } : null,
         })
+        recheckCaller(req)
         if (r.badQuery) return json(res, 400, { error: 'bad_request' })
         const out = { results: r.results, semantic: semanticStatus }
         if (url.searchParams.get('chats') !== '0') {
@@ -870,7 +887,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
             if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(revokedId, who.userId)) return json(res, 404, { error: 'not_found' })
             const pwCtx = { db, hub, pushPipeline, tokenBox: twoFactorBox, loginGuard, journalHost, passwordChecks, securityLog }
             if (!(await confirmPasswordAndTotp(pwCtx, res, who, { password: body.password, code: body.code }))) return
-            // Signed out while the password was being checked: nothing.
+            // Signed out, or the account locked, while the password was
+            // being checked: nothing.
+            recheckCaller(req)
             if (!callerSignedIn(db, who)) return json(res, 401, { error: 'unauthenticated' })
             keys = activeKeysOfDevice(db, who.userId, revokedId)
             if (!revokeOwnedDevice(db, who.userId, revokedId)) return json(res, 404, { error: 'not_found' })
@@ -1224,6 +1243,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           if (e.code === 'too_large') throw Object.assign(new Error('too large'), { statusCode: 413 })
           throw e
         }
+        // Signed out, or the account locked, while the bytes arrived (this
+        // body is not readBody's): nothing is kept.
+        try { recheckCaller(req) } catch (e) { await fs.promises.unlink(received.diskPath).catch(() => {}); throw e }
         if (usedBytes + received.size > mediaUserQuotaBytes) {
           // Body is fully consumed by now (receiveBlob resolved), so a plain
           // json() reject is right — no keep-alive desync concern. Delete the
@@ -1282,6 +1304,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           ? await blobTranscripts.wait(blob.id, waitS * 1000, gone.signal)
           : readBlobTranscript(db, blob.id)
         if (gone.signal.aborted && !res.writable) return
+        recheckCaller(req)
         return json(res, 200, out)
       }
       if (req.method === 'POST' && mt) {
@@ -1310,6 +1333,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           ? await blobTranscripts.wait(blob.id, waitS * 1000, gone.signal)
           : readBlobTranscript(db, blob.id)
         if (gone.signal.aborted && !res.writable) return
+        recheckCaller(req)
         return json(res, 200, out)
       }
       const mm = url.pathname.match(/^\/media\/([^/]+)$/)
@@ -1379,6 +1403,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       }
       if (e.statusCode === 400) return json(res, 400, { error: 'bad_request' })
       if (e.statusCode === 423) return json(res, 423, e.body)
+      if (e.statusCode === 401 && e.body) return json(res, 401, e.body)
       // Never leak e.message to the client (could echo internals like a SQL
       // error) — log it server-side instead.
       console.error('http handler error:', e)

@@ -32,6 +32,14 @@ export const json = (res, status, obj) => {
 // may have committed while the body was on its way). It throws to refuse,
 // with a statusCode and a body for http.js's catch.
 export const AFTER_BODY = Symbol('afterBody')
+// The same for a route that waits on something else between the request's
+// checks and its write (a password hash, an upload, another server): the
+// caller checked again, right before the write. Set by src/http.js on a
+// client's request; throws to refuse (the device signed out meanwhile →
+// 401, its account locked → 423), with a statusCode and a body for
+// http.js's catch. Call it after the last await, before the write.
+export const RECHECK = Symbol('recheck')
+export const recheckCaller = (req) => { req[RECHECK]?.() }
 const afterBody = (req, value) => {
   req[AFTER_BODY]?.()
   return value

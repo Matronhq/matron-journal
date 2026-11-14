@@ -3,7 +3,7 @@
 // Bearer auth with their own per-IP budget. "Forgot" answers the same
 // whether or not the account exists or has an address, and mails
 // in the background so the reply time says nothing either.
-import { json, readBody } from './http-body.js'
+import { json, readBody, recheckCaller } from './http-body.js'
 import { normaliseEmail, setUserEmail, getUserEmail, findResetTarget, issueResetToken, resetPassword, resetTokenOwner, resetEmail, EMAIL_MAX } from './password-reset.js'
 import { panicLock, lockedBody } from './panic.js'
 import { verifyUserPassword } from './auth.js'
@@ -102,6 +102,8 @@ export async function handleAccountEmailRoute(ctx, req, res, url, who) {
     const gate = loginGuard.check(user.name)
     if (!gate.allowed) return { gate }
     if (!(await verifyUserPassword(db, who.userId, password))) { loginGuard.fail(user.name); return { badPassword: true } }
+    // Signed out, or the account locked, while the password was checked.
+    recheckCaller(req)
     return setUserEmail(db, who.userId, clean)
   })
   if (r.gate) return lockedOut(res, r.gate)

@@ -324,8 +324,11 @@ export function makeContactFederation({ db, hub = null, pushPipeline = null, fed
   }
 
   // POST /contacts/invites/accept: the user's tap. → the row, pending_out.
-  async function accept(userId, link) {
+  // `beforeSave` runs once the other journal has answered, before anything
+  // is written (the route's check that the caller may still act).
+  async function accept(userId, link, { beforeSave = () => {} } = {}) {
     const { inv, wk, user, address } = await inspect(userId, link)
+    beforeSave()
     const at = clock()
     const { row, cut } = db.transaction(() => {
       const cur = remoteContactRaw(db, userId, inv.user, inv.host)

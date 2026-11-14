@@ -14,7 +14,7 @@
 //   POST /2fa/disable        {password, code}
 //   POST /2fa/recovery-codes {password, code}
 //   PUT  /2fa/policy         {required}     (admins only)
-import { json, readBody } from './http-body.js'
+import { json, readBody, recheckCaller } from './http-body.js'
 import { verifyUserPassword, createClientDevice } from './auth.js'
 import { panicLock, lockedBody } from './panic.js'
 import { isAdmin } from './users-http.js'
@@ -244,6 +244,8 @@ export async function handleTwoFactorRoute(ctx, req, res, url, who) {
     // from the old one (or a recovery code) as well as the password.
     const enabled = twoFactorState(db, who.userId).enabled
     if (!(await confirmPassword(ctx, res, who, password))) return true
+    // Signed out, or the account locked, while the password was checked.
+    recheckCaller(req)
     const g = guardedTwoFactor(ctx, res, who, body, 'setup', {
       check: enabled ? codeCheck(ctx, who, code) : undefined,
       write: () => {
@@ -300,6 +302,8 @@ export async function handleTwoFactorRoute(ctx, req, res, url, who) {
     if (!twoFactorState(db, who.userId).enabled) { json(res, 409, { error: 'not_enabled' }); return true }
     if (twoFactorRequiredNow(db, tokenBox, who.userId)) { json(res, 409, { error: 'two_factor_required' }); return true }
     if (!(await confirmPassword(ctx, res, who, password))) return true
+    // Signed out, or the account locked, while the password was checked.
+    recheckCaller(req)
     const g = guardedTwoFactor(ctx, res, who, body, 'disable', { check: codeCheck(ctx, who, code), write: () => disableTwoFactor(db, who.userId) })
     if (!g.ok) return true
     recordChange(ctx, who.userId, 'disable', who)
@@ -312,6 +316,8 @@ export async function handleTwoFactorRoute(ctx, req, res, url, who) {
     const { password, code } = body
     if (!twoFactorState(db, who.userId).enabled) { json(res, 409, { error: 'not_enabled' }); return true }
     if (!(await confirmPassword(ctx, res, who, password))) return true
+    // Signed out, or the account locked, while the password was checked.
+    recheckCaller(req)
     const g = guardedTwoFactor(ctx, res, who, body, 'recovery_codes', { check: codeCheck(ctx, who, code), write: () => regenerateRecoveryCodes(db, who.userId) })
     if (!g.ok) return true
     recordChange(ctx, who.userId, 'recovery_codes', who)
