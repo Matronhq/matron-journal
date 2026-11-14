@@ -92,7 +92,7 @@ export function deviceState({ db, hub, waker }, userId, deviceId) {
 // for a box that handles something only the user should sign off on, such
 // as one that reads their private mail. A protected device
 // (devices.protected, src/consent-subject.js) is user-only while it is set.
-function userOnlyDevice(db, userId, deviceId) {
+export function userOnlyDevice(db, userId, deviceId) {
   if (!Number.isInteger(deviceId)) return false
   return !!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=? AND (consent_user_only=1 OR protected=1)').get(deviceId, userId)
 }

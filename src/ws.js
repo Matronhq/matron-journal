@@ -40,7 +40,7 @@ import { emitMarker } from './items-http.js'
 import { withdrawForQueuedCancel } from './withdrawn-comments.js'
 import { getMission } from './missions.js'
 import { sanitizeConvoStatus, upsertConvoStatus } from './convo-status.js'
-import { validateSessionControl, authorizeSessionControl, sessionControlResultFrame } from './session-control.js'
+import { validateSessionControl, authorizeSessionControl, sessionControlResultFrame, sessionControlUserOnly } from './session-control.js'
 import { validRanges, addSeenRanges, markDeviceUsesRanges, legacyReadAsSeen, markItemSeen } from './seen.js'
 import { panicLock, isPanicLocked, panicHelloField, panicAnnounced, panicOnFrame, PANIC_OFF_FRAME, announcePanicClears, clientAuthDead, refuseLockedClient, isFrozenDevice, signOutLockedClient, lockedError, closeLockedSocket, closeFrozenSocket, markPanicTold, ACCOUNT_LOCKED } from './panic.js'
 
@@ -2613,10 +2613,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           let frame
           try {
             if (waking && spawnWakeWaitMs > 0) await hub.waitForDevice(conn.userId, target.device_id, spawnWakeWaitMs)
-            // Locked, or the box protected, while it was being woken:
-            // nothing is sent.
+            // Locked, or the box protected (or, for a carry-on, made
+            // user-only), while it was being woken: nothing is sent.
             const refusal = isPanicLocked(db, conn.userId) ? ACCOUNT_LOCKED
-              : isProtectedDevice(db, conn.userId, target.device_id) ? 'protected_device' : null
+              : isProtectedDevice(db, conn.userId, target.device_id) ? 'protected_device'
+                : sessionControlUserOnly(db, conn.userId, target.device_id, v.params.action) ? 'user_only' : null
             let r
             if (refusal) r = { ok: false, error: { code: 'forbidden', detail: refusal } }
             else {

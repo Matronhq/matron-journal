@@ -4,6 +4,7 @@ import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { setCoordinatorConvoId } from '../src/coordinator.js'
 import { validateSessionControl } from '../src/session-control.js'
+import { setDeviceConsentUserOnly, setDeviceProtected } from '../src/db.js'
 
 // Coordinator session control (spec: matron-bridge
 // 2026-09-29-coordinator-session-control-design.md, "Decisions"): the
@@ -164,4 +165,71 @@ test('session_control: at most 8 requests in flight per connection', async (t) =
   const req9 = await target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'session_control' && !reqs.includes(f.request.request_id))
   target.send({ op: 'agent_response', request_id: req9.request.request_id, to_device_id: 0, ok: true, result: { applied: 'now' } })
   await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'result' && f.request_id === 'c9')
+})
+
+// A user-only box (devices.consent_user_only) takes new work only on the
+// user's own say: a carry-on, whose message becomes a turn in the session,
+// is refused there. set_model and compact carry no turn text and still go.
+test('session_control: a carry-on into a session on a user-only box is refused user_only, now or after a limit reset', async (t) => {
+  const { s, parent, target, targetDev } = await fleet(t)
+  setDeviceConsentUserOnly(s.db, targetDev.deviceId, true)
+  for (const [rid, when] of [['u1', undefined], ['u2', 'now'], ['u3', 'after_limit_reset']]) {
+    parent.send({ op: 'session_control', request_id: rid, from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'carry_on', message: 'carry on', ...(when ? { when } : {}) })
+    const err = await errorFrame(parent, rid)
+    assert.deepEqual([err.code, err.detail], ['forbidden', 'user_only'])
+  }
+  // Nothing reached the box, nothing was acked, and no carry-on is on record.
+  assert.equal(target.frames.some((f) => f.kind === 'rpc'), false)
+  assert.equal(parent.frames.some((f) => f.kind === 'session_control'), false)
+  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM cause_hops WHERE key LIKE 'carry_on:%'").get().n, 0)
+})
+
+test('session_control: set_model and compact still reach a session on a user-only box', async (t) => {
+  const { s, parent, target, targetDev } = await fleet(t)
+  setDeviceConsentUserOnly(s.db, targetDev.deviceId, true)
+  const sends = [
+    ['m1', { action: 'compact', reason: 'context at 92%' }],
+    ['m2', { action: 'set_model', model: 'sonnet', effort: 'high' }],
+  ]
+  for (const [rid, extra] of sends) {
+    target.frames.length = 0
+    parent.send({ op: 'session_control', request_id: rid, from_convo_id: 'parent-convo', target_convo_id: 'tgt', ...extra })
+    const req = await target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'session_control')
+    assert.deepEqual(req.request.params, { convo_id: 'tgt', ...extra, from_convo_id: 'parent-convo', from_name: 'box-6' })
+    target.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { applied: 'now' } })
+    const res = await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'result' && f.request_id === rid)
+    assert.equal(res.ok, true)
+  }
+})
+
+test('session_control: the user-only rule looks at the target box only; a carry-on to another box is unaffected', async (t) => {
+  const { s, parent, target, parentDev } = await fleet(t)
+  // The Coordinator's own box being user-only does not stop it reaching an
+  // ordinary one.
+  setDeviceConsentUserOnly(s.db, parentDev.deviceId, true)
+  parent.send({ op: 'session_control', request_id: 'a1', from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'carry_on', message: 'carry on' })
+  const req = await target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'session_control')
+  assert.equal(req.request.params.message, 'carry on')
+  assert.match(req.request.params.carry_on_id, /^co_[0-9a-f]{16}$/)
+})
+
+test('session_control: a protected box is refused protected_device for every action, user-only or not', async (t) => {
+  const { s, parent, target, targetDev } = await fleet(t)
+  setDeviceProtected(s.db, targetDev.deviceId, true)
+  setDeviceConsentUserOnly(s.db, targetDev.deviceId, true)
+  const sends = [['p1', { action: 'carry_on', message: 'carry on' }], ['p2', { action: 'compact' }], ['p3', { action: 'set_model', model: 'sonnet' }]]
+  for (const [rid, extra] of sends) {
+    parent.send({ op: 'session_control', request_id: rid, from_convo_id: 'parent-convo', target_convo_id: 'tgt', ...extra })
+    const err = await errorFrame(parent, rid)
+    assert.deepEqual([err.code, err.detail], ['forbidden', 'protected_device'])
+  }
+  assert.equal(target.frames.some((f) => f.kind === 'rpc'), false)
+})
+
+test('session_control: a non-Coordinator learns nothing about a user-only target', async (t) => {
+  const { s, parent, targetDev } = await fleet(t, { coordinator: false })
+  setDeviceConsentUserOnly(s.db, targetDev.deviceId, true)
+  parent.send({ op: 'session_control', request_id: 'n1', from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'carry_on', message: 'carry on' })
+  const err = await errorFrame(parent, 'n1')
+  assert.deepEqual([err.code, err.detail], ['forbidden', 'not_coordinator'])
 })

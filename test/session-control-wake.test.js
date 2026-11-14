@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { startTestServer, makeWsClient } from './helpers.js'
+import { setDeviceConsentUserOnly } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { setCoordinatorConvoId } from '../src/coordinator.js'
 
@@ -73,4 +74,21 @@ test('session_control: a wake that never completes relays agent_unreachable as t
   await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'sent' && f.request_id === 'w2')
   const res = await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'result' && f.request_id === 'w2', 3000)
   assert.deepEqual(res, { kind: 'session_control', event: 'result', request_id: 'w2', ok: false, error: { code: 'agent_unreachable' } })
+})
+
+test('session_control: a box made user-only while it is being woken gets no carry-on; a compact still goes', async (t) => {
+  const waker = { enabled: true, wake: () => true }
+  const { s, parent, targetDev } = await fleet(t, { connectTarget: false, serverOpts: { waker, spawnWakeWaitMs: 5000 } })
+  parent.send({ op: 'session_control', request_id: 'k1', from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'carry_on', message: 'carry on' })
+  parent.send({ op: 'session_control', request_id: 'k2', from_convo_id: 'parent-convo', target_convo_id: 'tgt', action: 'compact' })
+  await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'sent' && f.request_id === 'k2')
+  setDeviceConsentUserOnly(s.db, targetDev.deviceId, true)
+  const target = await makeWsClient(s.base, { token: targetDev.token, cursor: null })
+  t.after(() => target.close())
+  await target.waitFor((f) => f.op === 'hello_ok')
+  const res = await parent.waitFor((f) => f.kind === 'session_control' && f.event === 'result' && f.request_id === 'k1', 4000)
+  assert.deepEqual(res, { kind: 'session_control', event: 'result', request_id: 'k1', ok: false, error: { code: 'forbidden', detail: 'user_only' } })
+  const req = await target.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'session_control', 4000)
+  assert.equal(req.request.params.action, 'compact')
+  assert.equal(target.frames.filter((f) => f.kind === 'rpc').length, 1)
 })

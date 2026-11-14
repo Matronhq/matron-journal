@@ -11,6 +11,7 @@ import { getCoordinatorConvoId } from './coordinator.js'
 import { isPrivateDevice } from './db.js'
 import { causesFromFrame } from './ask-causes.js'
 import { isProtectedDevice } from './consent-subject.js'
+import { userOnlyDevice } from './consent.js'
 import { panicLock } from './panic.js'
 
 export const SESSION_CONTROL_ACTIONS = new Set(['set_model', 'compact', 'carry_on'])
@@ -98,6 +99,8 @@ export function validateSessionControl(msg) {
 //   - a protected box (src/consent-subject.js) is out of the Coordinator's
 //     reach, whether or not the account has an approval key: forbidden /
 //     protected_device.
+//   - a carry-on into a session on a user-only box (src/consent.js):
+//     forbidden / user_only. See sessionControlUserOnly below.
 //   - an account under a panic lock (src/panic.js): forbidden /
 //     account_locked, with since.
 export function authorizeSessionControl(db, conn, msg) {
@@ -110,10 +113,22 @@ export function authorizeSessionControl(db, conn, msg) {
   const dev = db.prepare("SELECT id AS device_id, name FROM devices WHERE id=? AND user_id=? AND kind='agent'").get(tgt.agent_device_id, conn.userId)
   if (!dev) return { code: 'not_found' }
   if (isProtectedDevice(db, conn.userId, dev.device_id)) return { code: 'forbidden', detail: 'protected_device' }
+  if (sessionControlUserOnly(db, conn.userId, dev.device_id, msg.action)) return { code: 'forbidden', detail: 'user_only' }
   // A panic-locked account (src/panic.js): no box of it gets new work.
   const lock = panicLock(db, conn.userId)
   if (lock) return { code: 'forbidden', detail: 'account_locked', since: lock.since }
   return { target: dev }
+}
+
+// A user-only box (devices.consent_user_only) takes new work only on the
+// user's own say. A carry-on's message becomes a turn in the target session,
+// now or after a limit reset, so it is held to that rule: the Coordinator
+// cannot send one there. set_model and compact stay allowed: the journal
+// relays no turn text for them, only a model, agent and effort name (short,
+// sanitised settings) and the optional reason, which the target bridge
+// shows as a notice in the session's chat.
+export function sessionControlUserOnly(db, userId, deviceId, action) {
+  return action === 'carry_on' && userOnlyDevice(db, userId, deviceId)
 }
 
 // The result frame relayed to the Coordinator's bridge, from the broker's

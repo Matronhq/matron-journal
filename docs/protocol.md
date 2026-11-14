@@ -2839,7 +2839,13 @@ frame: agent connection (`forbidden`); registered (`not_ready`);
 ordinary caller — all indistinguishable `not_found`; and its box is not
 **protected** (`forbidden`, detail `protected_device`, whether or not the
 account has an approval key; see *Approval keys (step-up)* → *Protected
-boxes*). Then the target box:
+boxes*); and, for a `carry_on` (either `when`), its box is not
+**user-only** (`forbidden`, detail `user_only`; see *Consent approval* →
+*User-only boxes*): a carry-on's `message` becomes a turn in the target
+session, which on such a box is the user's alone to start. `set_model` and
+`compact` are not refused there: the journal relays no turn text for them,
+only the model, agent and effort names and the optional `reason`, which the
+target bridge shows as a notice in the session's chat. Then the target box:
 offline and unwakeable → `agent_unreachable`; otherwise the op is acked at
 once with `{kind:'session_control', event:'sent', request_id, target_waking?}`
 and, off the socket's message loop, the box is woken if needed and waited
@@ -3339,6 +3345,9 @@ rows `user_only: true` (absent otherwise); `POST /consent/answer` refuses a
 Coordinator approval of one with **403** `user_only` before any state
 changes, and still accepts a decline. The user's own tap is unaffected. This is for a box that handles something
 only the user should sign off on, such as one that reads their private mail.
+The Coordinator cannot tell a session on such a box to carry on either: a
+`session_control` `carry_on` aimed at one is refused `forbidden`, detail
+`user_only` (*Session control*); `set_model` and `compact` still go.
 A **protected** box (`devices.protected`, see *Approval keys (step-up)* →
 *Protected boxes*) is user-only too, for chats, spawns and transfers alike,
 and once the account has an approval key an ask aimed at one adds
@@ -4417,7 +4426,8 @@ alert, a hand-over's or a talk's session start, a Coordinator's
 `session_control`), it checks again once the wait is over: a box protected
 meanwhile gets nothing, with the same outcome as above (for
 `session_control`, the result frame with `error: {code:'forbidden',
-detail:'protected_device'}`).
+detail:'protected_device'}`; a box made user-only meanwhile gets no
+carry-on, with `detail:'user_only'` in the same frame).
 
 **With a key**, an ask **aimed at** a protected box needs a signed
 `consent` statement to be approved. Aimed at means: a spawn's target box; a
