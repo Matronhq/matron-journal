@@ -31,7 +31,7 @@ import { inlineRefsToText, knowsInlineRefs, strayInlineRef } from './inline-refs
 import { presentWithdrawn } from './withdrawn-comments.js'
 import { handleHandoverRoute, approvalQuestionOf, handleApprovalTap, withdrawOnClose } from './item-handover-http.js'
 import { getReplicaItem, getReplicaMission } from './federation-replica.js'
-import { requireApproval, hasActiveKey } from './approval-keys.js'
+import { requireApproval, hasActiveKey, guardedAccountAction, refuse } from './approval-keys.js'
 import { promptDigest } from './approvals.js'
 
 const forbiddenReply = (res) => { json(res, 403, { error: 'forbidden' }); return true }
@@ -476,6 +476,24 @@ async function handlePatch(ctx, req, res, who, item) {
   // stored one); a notice never is one.
   if (fields.subject !== undefined && !(fields.step_up ?? item.step_up)) return badFields(res, { error: 'invalid_subject' })
   if (item.kind === 'notice' && fields.step_up === true) return badFields(res, { error: 'invalid_actions' })
+  // Lowering the mark, or changing what it shows, on a step-up item of an
+  // account with an approval key: otherwise any token that can patch the
+  // item could switch the signature off and tap unsigned. An agent must be
+  // the box that filed the item (its origin device); a client never changes
+  // the subject (lower, then raise with the new one) and lowers only with a
+  // signed {op:'item_step_up', item, on:'false'}, checked in the write's
+  // transaction below. Raising stays open to anyone who can patch.
+  const lowering = fields.step_up === false
+  const resubject = fields.subject !== undefined
+  let lowerSubject = null
+  if (item.step_up && (lowering || resubject) && hasActiveKey(db, who.userId)) {
+    if (who.kind === 'agent') {
+      if (who.deviceId !== item.origin_device_id) { json(res, 403, { error: 'forbidden' }); return true }
+    } else {
+      if (resubject) return badFields(res, { error: 'invalid_subject' })
+      lowerSubject = { op: 'item_step_up', item: item.id, on: 'false' }
+    }
+  }
   let stepUpIgnored = false
   if (fields.step_up === true) {
     const su = resolveStepUp(db, who.userId, fields)
@@ -521,7 +539,16 @@ async function handlePatch(ctx, req, res, who, item) {
   // Fields and the mission move are ONE write with ONE `updated_at` (final
   // review minor): they used to be two statements in two transactions, so a
   // `{title, mission}` patch could half-apply and stamped two timestamps.
-  const result = updateItem(db, { userId: who.userId, itemId: item.id, fields, missionId: missionTarget })
+  const write = () => updateItem(db, { userId: who.userId, itemId: item.id, fields, missionId: missionTarget })
+  let result
+  if (lowerSubject) {
+    // An item gone meanwhile refuses inside the transaction: the nonce stays.
+    const g = guardedAccountAction({ db, journalHost: ctx.journalHost }, who, body, lowerSubject, { write: () => write() ?? refuse(404, { error: 'not_found' }) })
+    if (!g.ok) { json(res, g.status, g.body); return true }
+    result = g.value
+  } else {
+    result = write()
+  }
   // Only reachable if the item vanished between the read and the write.
   if (!result) return notFound(res)
   // Every mutating route appends a marker, this one included: a retitle or a
