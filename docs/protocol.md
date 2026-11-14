@@ -4311,7 +4311,7 @@ needs the user's own approval, signed once the account has a key.
 | Coordinator `session_control` aimed at a session on it | `{kind:'control', op:'error', code:'forbidden', ref:'session_control', request_id, detail:'protected_device'}` (after the existing ownership, role and target checks) |
 | the journal's own `session_control` to a Coordinator whose conversation is on it: a routine's fire (scheduled, triggered or `POST /routines/:key/run`) and an Alertmanager alert | not sent. The routine's `last_outcome` (and its `fired` marker's `outcome`) is `protected_device`, never retried, and `run` answers `202 {delivered:false, reason:'protected_device'}`; `POST /alerts/alertmanager` answers `202 {delivered:false, reason:'protected_device'}`. Choosing such a Coordinator (`PUT /coordinator`) is not refused |
 | a mission hand-over's session start (`start_session`, including **New session** on a protected Coordinator box) | `start_session: {status:'refused', reason:'protected_device'}`; the hand-over itself still goes through and the copy is made |
-| a talk request's **New session** on it | no start is sent; the guest's card reads "Couldn't start a session: protected_device. Pick another option." and the request waits for the guest again |
+| a talk request's **New session** on it | no start is sent; the guest's card reads "Couldn't start a session: protected_device. Pick another option." and the request waits for the guest again. A box protected while the start is with it: the session it reports is not invited, and the talk goes back to the guest the same way |
 | inviting a guest box on accepting a person-room ask or a talk request (on one journal or across journals) | `409 {error:'conflict', blocked_by:'protected_device'}`; nothing changes and the ask stays as it was |
 
 Where the journal first wakes an asleep box and waits for it (a routine, an
@@ -5061,7 +5061,11 @@ the account:
   the room a notice, and it is never released or used to wake a box.
 
 The delivery pump and the transfer release do the same whenever they meet
-such work of a locked account.
+such work of a locked account. Pairs approved and links approved or
+pre-approved for the account (a starter's link, a claimed pre-approved
+code, or an unused one from `matron-admin link-code`, `/link/preapprove` or
+`/users/:id/link-code`) are dropped, so a box or a claimant that holds back
+until after the clear gets `404 not_found`, never a device.
 
 It is idempotent. A call while the account is locked keeps the lock as it
 is (its `since`, `source` and `alert`), answers the same shape with
@@ -5118,7 +5122,8 @@ clear. Agents may keep sending their own events.
   (no `source`), then closes it as a revoked device's socket is closed:
   `{"kind":"control","op":"error","code":"revoked"}` and close code 4001.
   A socket still replaying its history when the lock commits gets the same
-  as soon as its replay ends.
+  before its next batch of history (a device signed out meanwhile gets the
+  revoked close the same way).
 - Any HTTP request made with a client token of a locked account (a race,
   or a device created by a path that slipped through) answers
   `423 {"error":"account_locked","since":<ms>}`, and the device is signed
@@ -5165,7 +5170,7 @@ it, the lock is checked again after the wait.
 | a routine's fire (scheduled, triggered or `POST /routines/:key/run`) | not sent, never retried; `last_outcome` (and the `fired` marker's `outcome`) is `account_locked`, and `run` answers `202 {"delivered":false,"reason":"account_locked"}`. The lock is checked first, ahead of `no_coordinator` and `protected_device` |
 | `POST /alerts/alertmanager` | `202 {"delivered":false,"reason":"account_locked"}`, not sent; checked first, ahead of `no_coordinator` and `protected_device` |
 | a mission hand-over's session start | `start_session: {"status":"refused","reason":"account_locked"}`; the hand-over itself still goes through |
-| a talk request's **New session** | no start is sent; the guest's card reads "Couldn't start a session: account_locked. Pick another option." |
+| a talk request's **New session** | no start is sent; the guest's card reads "Couldn't start a session: account_locked. Pick another option." A lock that commits while the start is with the box: the session it reports is not invited, and the talk goes back to the guest's choice with the same line |
 | inviting a guest box of the account on accepting a person-room ask or a talk request (on one journal or across journals) | `409 {"error":"conflict","blocked_by":"account_locked"}`; the ask stays as it was |
 
 `POST /password/forgot` is left as it is, so its answer for a locked
@@ -8079,7 +8084,8 @@ keys are detached the same way, never revoked. An account with no active
 key revokes exactly as described above.
 
 `POST /devices/:id/rename` (Bearer, client devices only — agents get 403)
-renames a device, body `{name}`, 200 `{ok:true, device:{device_id, name}}`.
+renames a device, body `{name}`, 200 `{ok:true, device:{device_id, name,
+tag_char, locked}}` (the device's current meta, as `device_meta` carries it).
 The name is sanitised (control characters flattened, whitespace collapsed,
 trimmed) and then capped at 40 characters — over the cap is rejected with
 400 `{error:'bad_request'}`, never truncated, as is an empty or non-string
@@ -8093,7 +8099,7 @@ boxes) or from `GET /devices` (any kind, client devices included) — see
 
 `POST /devices/:id/tag` (Bearer, client devices only — agents get 403) sets
 the device's roster tag character, body `{tag_char}`, 200 `{ok:true,
-device:{device_id, name, tag_char}}`. The tag is the one-character label
+device:{device_id, name, tag_char, locked}}`. The tag is the one-character label
 clients show beside a box; when it is null clients derive a letter from the
 device name — journal-held so the same character shows on every one of the
 user's devices. Input goes through the device-name sieve and then only the
@@ -8105,7 +8111,8 @@ render as nothing) also sieves to null. `null`, empty, whitespace-only, and
 those sieved-out inputs all clear back to automatic (stored NULL); an absent
 key or non-string non-null value is 400 `{error:'bad_request'}`.
 Owner-scoping, 404 merging, and the `device_meta` fan-out all match rename
-exactly; rename's own 200 body carries the standing `tag_char` too. Note the
+exactly; rename's own 200 body carries the standing `tag_char` and
+`locked` too. Note the
 recovery split matches names: a client-kind device's tag is only in
 `GET /devices` — `/snapshot`'s `agents` list carries tags for agent boxes.
 

@@ -723,6 +723,20 @@ export function attachWs({
               // finishing the replay and registering would insert a permanently-dead
               // conn into the hub that nothing ever prunes. Bail out instead.
               if (conn.closed) return
+              // Locked (a client's account) or signed out while the loop
+              // yielded: no more history. Closed as the lock or a revoke
+              // closes a registered socket, before the next batch.
+              const replayLock = who.kind === 'client' ? panicLock(db, who.userId) : null
+              if (replayLock) {
+                signOutLockedClient({ db, hub, securityLog }, who.userId, who.deviceId, replayLock)
+                if (ws.readyState === 1) closeLockedSocket(ws, replayLock)
+                return
+              }
+              if (!deviceAlive(who.deviceId)) {
+                ws.send(JSON.stringify({ kind: 'control', op: 'error', code: 'revoked' }))
+                ws.close(4001)
+                return
+              }
             }
           }
           // INVARIANT (live-event gap): no yield between the final eventsAfter call (the

@@ -342,12 +342,8 @@ test('while locked: sign-in, two-factor sign-in, link and pair are 423 before an
   const { secret } = await enableTwoFactor(s, phone.token)
   const ticket = (await login(s, 'alice', TEST_PASSWORD)).json.two_factor_ticket
   assert.ok(ticket)
-  const pair = (await s.http('/pair/start', { method: 'POST', body: {}, headers: { 'cf-connecting-ip': freshIp() } })).json
-  assert.equal((await s.http('/pair/approve', { method: 'POST', token: phone.token, body: { pair_code: pair.pair_code, agent_name: 'box-z' } })).status, 200)
   const preKey = { 'x-preapprove-key': s.preapproveKey }
   const minted = async () => (await s.http('/link/preapprove', { method: 'POST', body: { username: 'alice' }, headers: preKey })).json.link_code
-  const claimedEarly = (await s.http('/link/claim', { method: 'POST', body: { link_code: await minted(), device_name: 'tablet' }, headers: { 'cf-connecting-ip': freshIp() } })).json
-  const unclaimed = await minted()
 
   assert.equal((await lockIt(s)).status, 200)
   // The right password and a wrong one: the same 423, none counted.
@@ -365,6 +361,13 @@ test('while locked: sign-in, two-factor sign-in, link and pair are 423 before an
   s.db.prepare('UPDATE panic_locks SET cleared_at=1').run()
   const late = (await login(s, 'alice', TEST_PASSWORD)).json.two_factor_ticket
   assert.ok(late)
+  // ... and a pair approved, a link claimed and a code minted in that gap.
+  const phone2 = createClientDevice(s.db, alice.id, 'phone-2')
+  const pair = (await s.http('/pair/start', { method: 'POST', body: {}, headers: { 'cf-connecting-ip': freshIp() } })).json
+  assert.equal((await s.http('/pair/approve', { method: 'POST', token: phone2.token, body: { pair_code: pair.pair_code, agent_name: 'box-z' } })).status, 200)
+  const claimedEarly = (await s.http('/link/claim', { method: 'POST', body: { link_code: await minted(), device_name: 'tablet' }, headers: { 'cf-connecting-ip': freshIp() } })).json
+  const unclaimed = await minted()
+  s.db.prepare('DELETE FROM devices WHERE id=?').run(phone2.deviceId)
   s.db.prepare('UPDATE panic_locks SET cleared_at=NULL').run()
   assert.equal(lockedSince(s), since)
   for (const code of [totpCode(s, alice.id, secret), '000000']) {
@@ -1029,4 +1032,66 @@ test('src/invite-delivery.js and src/panic-lock.js load on their own in a fresh 
     const r = spawnSync(process.execPath, ['-e', `import(${JSON.stringify(mod)}).then(() => process.exit(0), (e) => { console.error(e.message); process.exit(1) })`], { cwd: path.join(import.meta.dirname, '..'), encoding: 'utf8' })
     assert.equal(r.status, 0, `${mod}: ${r.stderr}`)
   }
+})
+
+// ---- Review round --------------------------------------------------------------
+
+test('the start-up warning for a panic account that is no user prints nothing read from the environment', async (t) => {
+  const warns = []
+  const warn = t.mock.method(console, 'warn', (m) => warns.push(String(m)))
+  const s = await startTestServer({ panic: { token: PANIC_TOKEN, account: 'nobody-here-x' } })
+  warn.mock.restore()
+  t.after(() => s.close())
+  const mine = warns.filter((w) => w.startsWith('panic:'))
+  assert.equal(mine.length, 1)
+  assert.ok(mine.every((w) => !w.includes('nobody-here-x') && !w.includes(PANIC_TOKEN)), mine[0])
+})
+
+test('a pair or link approved before the lock cannot be claimed after the clear; a pre-approved code minted before it is void', async (t) => {
+  const { s, alice } = await journal(t)
+  const phone = createClientDevice(s.db, alice.id, 'phone')
+  const pair = (await s.http('/pair/start', { method: 'POST', body: {}, headers: { 'cf-connecting-ip': freshIp() } })).json
+  assert.equal((await s.http('/pair/approve', { method: 'POST', token: phone.token, body: { pair_code: pair.pair_code, agent_name: 'box-z' } })).status, 200)
+  const preKey = { 'x-preapprove-key': s.preapproveKey }
+  const minted = async () => (await s.http('/link/preapprove', { method: 'POST', body: { username: 'alice' }, headers: preKey })).json.link_code
+  const claimed = (await s.http('/link/claim', { method: 'POST', body: { link_code: await minted(), device_name: 'tablet' }, headers: { 'cf-connecting-ip': freshIp() } })).json
+  const unclaimed = await minted()
+  // The box and the claimant hold back while the account is locked.
+  assert.equal((await lockIt(s)).status, 200)
+  await runAdmin(s.db, ['panic', 'clear', 'alice'], { securityLog: { record() {} } })
+  assert.equal((await s.http('/pair/claim', { method: 'POST', body: { poll_token: pair.poll_token } })).status, 404)
+  assert.equal((await s.http('/link/poll', { method: 'POST', body: { claim_token: claimed.claim_token } })).status, 404)
+  assert.equal((await s.http('/link/claim', { method: 'POST', body: { link_code: unclaimed, device_name: 'tablet' }, headers: { 'cf-connecting-ip': freshIp() } })).status, 404)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM devices WHERE user_id=?').get(alice.id).n, 0)
+  // Another account's pending pair and codes are untouched.
+  const bob = s.db.prepare("SELECT id FROM users WHERE name='bob'").get()
+  const bobPhone = createClientDevice(s.db, bob.id, 'phone')
+  const bobPair = (await s.http('/pair/start', { method: 'POST', body: {}, headers: { 'cf-connecting-ip': freshIp() } })).json
+  assert.equal((await s.http('/pair/approve', { method: 'POST', token: bobPhone.token, body: { pair_code: bobPair.pair_code, agent_name: 'box-b' } })).status, 200)
+  assert.equal((await lockIt(s)).status, 200)
+  assert.equal((await s.http('/pair/claim', { method: 'POST', body: { poll_token: bobPair.poll_token } })).json.status, 'approved')
+})
+
+test('a client socket replaying a long history stops getting it as soon as the lock commits, not only when it registers', async (t) => {
+  const { s, alice } = await journal(t)
+  const laptop = createClientDevice(s.db, alice.id, 'laptop')
+  const box = createAgent(s.db, alice.id, 'box-a')
+  upsertConversation(s.db, { id: 'c1', ownerUserId: alice.id, title: 'C1', agentDeviceId: box.deviceId })
+  const total = 1300
+  s.db.transaction(() => { for (let i = 0; i < total; i++) append(s.db, { userId: alice.id, convoId: 'c1', sender: 'agent:box-a', type: 'text', payload: { body: `m${i}` } }) })()
+  // Lock while the first batch is being read: after hello_ok, before the
+  // replay's first yield.
+  const realPrepare = s.db.prepare.bind(s.db)
+  let armed = true
+  t.mock.method(s.db, 'prepare', (sql) => {
+    const stmt = realPrepare(sql)
+    if (!armed || !sql.startsWith('SELECT * FROM events WHERE user_id=? AND seq>?')) return stmt
+    armed = false
+    return { all: (...args) => { const rows = stmt.all(...args); lockAccount({ db: s.db, hub: s.hub, securityLog: { record() {} } }, alice.id); return rows } }
+  })
+  const c = await makeWsClient(s.base, { token: laptop.token, cursor: 0 })
+  assert.equal(await closed(c), 4001)
+  const got = c.frames.filter((x) => x.kind === 'journal').length
+  assert.ok(got <= 500, `${got} journal frames after the lock`)
+  assert.deepEqual(c.frames.filter((x) => x.kind === 'panic' || x.op === 'error'), [{ kind: 'panic', on: true, since: lockedSince(s) }, { kind: 'control', op: 'error', code: 'revoked' }])
 })

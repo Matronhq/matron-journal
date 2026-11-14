@@ -303,6 +303,25 @@ test('New session that fails to start: bob is told why and offered the other cho
   assert.equal(req.target_convo_id, 'bobcoord')
 })
 
+test('New session whose guest account is panic-locked before the start returns: back to the guest\'s choice with account_locked, no invite sent', async (t) => {
+  const w = await world(t)
+  await makeContacts(w)
+  await askAndSend(w)
+  const theirs = await guestItem(w)
+  assert.equal((await w.bobPhone(`/items/${theirs.id}/comments`, post({ action: 'New session' }))).status, 200)
+  const rpc = await w.ws.bobCoord.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start')
+  w.s.db.prepare('INSERT INTO panic_locks(user_id, since) VALUES(?,?)').run(w.bob.id, Date.now())
+  w.ws.bobCoord.send({ op: 'agent_response', request_id: rpc.request.request_id, to_device_id: 0, ok: true, result: { convo_id: 'talk-child' } })
+  await settle(200)
+  const row = talkRow(w)
+  assert.equal(row.state, 'awaiting_guest')
+  assert.equal(row.spawn_id, null)
+  const last = w.s.db.prepare("SELECT body, meta FROM item_comments WHERE item_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(theirs.id)
+  assert.equal(last.body, 'Couldn\'t start a session: account_locked. Pick another option.')
+  assert.equal(w.ws.bobCoord.frames.some((f) => f.kind === 'invite' && f.event === 'request'), false)
+  assert.equal(w.s.db.prepare('SELECT COUNT(*) n FROM convo_agents WHERE agent_device_id=?').get(w.bobCoordId).n, 0)
+})
+
 test('a protected Coordinator box: New session sends it nothing and bob is offered the rest; My Coordinator is refused protected_device', async (t) => {
   const w = await world(t)
   await makeContacts(w)

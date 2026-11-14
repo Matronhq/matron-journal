@@ -30,7 +30,7 @@ const clip = (s) => {
 // keeps the lock as it is, signs out any client device that has appeared
 // since, turns a switch that was turned back on off again, and sends the
 // frame again. → {alreadyLocked, devicesRevoked, bridgesNotified}.
-export function lockAccount({ db, hub, securityLog, signInTickets = null, mediaDir = null }, userId, { source = null, alert = null, now = Date.now() } = {}) {
+export function lockAccount({ db, hub, securityLog, signInTickets = null, mediaDir = null, pairs = null, links = null }, userId, { source = null, alert = null, now = Date.now() } = {}) {
   let alreadyLocked = false
   let revoked = []
   const switched = []
@@ -60,7 +60,12 @@ export function lockAccount({ db, hub, securityLog, signInTickets = null, mediaD
   // (the asker can ask again): approved invites not delivered are refused,
   // approved spawns not started fail, approved transfers not released are
   // declined. Each pump that meets a locked owner later does the same.
+  // Pairs and links approved (or pre-approved) before the lock are dropped
+  // too: a box or a claimant that holds back until after the clear gets no
+  // device.
   for (const [what, step] of [
+    ['pairs', () => pairs?.dropApproved(userId)],
+    ['links', () => links?.dropUser(userId)],
     ['invites', () => refuseLockedInvites({ db, hub }, userId)],
     ['spawns', () => failApprovedSpawns(db, hub, userId, ACCOUNT_LOCKED)],
     ['transfers', () => declineApprovedTransfers({ db, hub, mediaDir }, userId)],
@@ -85,7 +90,7 @@ export function lockAccount({ db, hub, securityLog, signInTickets = null, mediaD
 // token is checked first and is never refused for the budget, so bad
 // guesses from an address cannot keep its watcher from locking. The token is bound to one account and does
 // nothing but lock it and read whether it is locked. → true when it answered.
-export async function handlePanic({ db, hub, panic, json, rateLimiter = null, securityLog, signInTickets = null, mediaDir = null }, req, res, url, { rejectEarly }) {
+export async function handlePanic({ db, hub, panic, json, rateLimiter = null, securityLog, signInTickets = null, mediaDir = null, pairs = null, links = null }, req, res, url, { rejectEarly }) {
   if (url.pathname !== '/panic' || (req.method !== 'GET' && req.method !== 'POST')) return false
   if (!panic) { rejectEarly(req, res, 404, { error: 'not_found' }); return true }
   // The token first, so the right one is never starved: only a failure is
@@ -109,7 +114,7 @@ export async function handlePanic({ db, hub, panic, json, rateLimiter = null, se
   const body = await readBody(req)
   const text = (v) => v === undefined || v === null || typeof v === 'string'
   if (!text(body.source) || !text(body.alert)) { json(res, 400, { error: 'bad_request' }); return true }
-  const r = lockAccount({ db, hub, securityLog, signInTickets, mediaDir }, user.id, { source: clip(body.source), alert: clip(body.alert) })
+  const r = lockAccount({ db, hub, securityLog, signInTickets, mediaDir, pairs, links }, user.id, { source: clip(body.source), alert: clip(body.alert) })
   json(res, 200, { ok: true, locked: true, already_locked: r.alreadyLocked, devices_revoked: r.devicesRevoked, bridges_notified: r.bridgesNotified })
   return true
 }

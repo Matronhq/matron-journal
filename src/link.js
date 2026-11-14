@@ -95,6 +95,16 @@ export function makeLinkStore({ ttlMs = 120000, claimExtensionMs = 60000, maxPen
         .run(userId, hashCode(code), now + ttl, now, by)
       return { linkCode: `${code.slice(0, 4)}-${code.slice(4)}`, expiresIn: Math.floor(ttl / 1000) }
     },
+    // A panic lock (src/panic-lock.js): every link of the user is dropped,
+    // a starter's (waiting, claimed or approved) and a pre-approved code's,
+    // claimed or still in the database, so none mints a device after the
+    // clear. → how many.
+    dropUser(userId) {
+      let n = 0
+      for (const [k, s] of sessions) if (s.userId === userId) { sessions.delete(k); n += 1 }
+      if (db) n += db.prepare('DELETE FROM link_preapprovals WHERE user_id=?').run(userId).changes
+      return n
+    },
     // The account a code that claim() would accept belongs to, without
     // claiming it (a waiting starter's code, or a pre-approved one that has
     // not expired); null otherwise. For the panic lock's refusal
