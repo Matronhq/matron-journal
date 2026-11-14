@@ -4803,8 +4803,9 @@ the file named by `MATRON_SECURITY_LOG` (when set):
   that account after it, never reused and never skipped. It is allocated in
   the same database transaction as the event's row, so the journal and
   `matron-admin` on the same database never hand out the same number, and
-  it survives a restart. Rows are kept 30 days; the counter is kept apart
-  from them, so the sweep never lets a number come back.
+  it survives a restart. Rows are kept 30 days (swept by the retention
+  schedule, `MATRON_RETENTION_DAYS` or not); the counter is kept apart from
+  them, so the sweep never lets a number come back.
 - `ts`: when it was recorded, ms since the epoch.
 - `account`: the user's name.
 - `device_id`, `device_name`: the acting device, the one whose token made
@@ -4813,13 +4814,18 @@ the file named by `MATRON_SECURITY_LOG` (when set):
   email reset request, a sign-in before its device exists), `matron-admin`,
   the journal itself. For `device_linked` and `bridge_paired` it is the
   device that approved the link or pair (the new device's own request
-  carries no token); for `client_signin` it is the device the sign-in
-  created; for `device_signed_out_bad_signatures` the device signed out.
+  carries no token), while `source_ip` is the NEW device's address (the
+  claim or poll that minted it); for `client_signin` it is the device the
+  sign-in created; for `device_signed_out_bad_signatures` the device signed
+  out. The name is the device's current one when the event is recorded.
 - `source_ip`: the request's client address, the same one `/login` limits
   by (`cf-connecting-ip` when the journal sits behind the tunnel, else the
   socket's). Null for WebSocket frames, `matron-admin` and the journal's own
   work.
-- `target`: a short identifier of what was acted on, never free text:
+- `target`: a short identifier of what was acted on, never free text
+  other than a box's name: `box:<device name>` for the box a session starts
+  on, a spawn targets or a chat invites (its name when the event is
+  recorded), `transfer:<id>` for a file transfer,
   `device:<id>` for a device (`device:<id>:on|off` for its protection),
   `key:<first 8 hex of key_id>` for an approval key, `convo:<id>` for a
   conversation, `spawns` or `transfers` for a Coordinator consent switch,
@@ -4829,7 +4835,8 @@ the file named by `MATRON_SECURITY_LOG` (when set):
 - `decided_by`: `user`, `coordinator`, `admin` (the web admin acting on an
   account, `/users/*`), `admin_cli` (`matron-admin`, or a pre-approved link
   code from it) or `journal` (the journal's own lockdown); null when it does
-  not apply.
+  not apply, and for a `device_linked` from a pre-approved code minted
+  before the journal recorded who minted it.
 
 A line never carries message or task text, passwords, codes, tokens,
 statements, signatures or public keys. Recording never fails the request
@@ -4837,9 +4844,12 @@ that caused it: a file that cannot be written is reported once on stderr and
 the event still goes to the database and stdout.
 
 An event is recorded once per real occurrence, after the change it
-describes has committed: a refused or rolled-back request records nothing.
-The one exception is `approval_invalid`, which describes the refusal itself
-and is recorded although its request rolled back.
+describes has committed: a refused or rolled-back request records nothing,
+and a request that changes nothing (a switch set to the value it has)
+records nothing either. The exceptions are `approval_invalid` and what may
+follow it (`device_signed_out_bad_signatures`, `enrolment_locked`): they
+describe the refusal itself and are recorded although its request rolled
+back.
 
 ### Events
 
@@ -4847,17 +4857,18 @@ and is recorded although its request rolled back.
 |---|---|---|---|
 | `client_signin` | A sign-in that creates a client device: `/login`, `/login/2fa`, `/login/2fa/enable`. | `device:<new id>` | `user` |
 | `device_linked` | A link code approved and claimed: `/link/poll` mints the new client device. A pre-approved code too. | `device:<new id>` | `user` for an approve tap (the starter device named); for a pre-approved code `admin_cli` (`/link/preapprove`, `matron-admin link-code`) or `admin` (`/users/:id/link-code`), no device |
-| `bridge_paired` | A pairing approved and claimed: `/pair/claim` mints the new agent device. | `device:<new id>` | `user` (the approving device named) |
-| `device_revoked` | `POST /devices/:id/revoke` (another device, or signing yourself out), `matron-admin device revoke`. Not the lockdown's sign-out, which is its own event. | `device:<id>` | `user`, `admin_cli` |
+| `bridge_paired` | A pairing approved and claimed: `/pair/claim` mints the new agent device; `matron-admin agent add`. | `device:<new id>` | `user` (the approving device named), `admin_cli` |
+| `device_revoked` | `POST /devices/:id/revoke` (another device, or signing yourself out), `matron-admin device revoke`; and one per client device signed out by `POST /password` or `POST /2fa/enable` with `sign_out_others` (the asking device named) or by a completed `/password/reset` (no device). Not the lockdown's sign-out, which is its own event. | `device:<id>` | `user`, `admin_cli` |
 | `password_changed` | `POST /password`; the web admin's `POST /users/:id/password` (recorded on the target account, the admin's device named); a completed `/password/reset`; `matron-admin user passwd`. | null | `user`, `admin`, `admin_cli` |
 | `two_factor_changed` | `/2fa/setup`, `/2fa/enable`, `/2fa/recovery-codes`, `/2fa/disable`; `/login/2fa/setup` and `/login/2fa/enable` at sign-in (no device yet); the web admin's `DELETE /users/:id/two-factor`; `matron-admin user 2fa-reset` when it turned two-factor off. | `setup`, `enable`, `recovery_codes`, `disable`, `reset` | `user`, `admin`, `admin_cli` |
-| `password_reset_requested` | `POST /password/forgot` naming an account that exists (by name, or by its address). The answer is the same either way. | null | null |
+| `password_reset_requested` | `POST /password/forgot` naming an account that exists (by name, or by its address). The answer is the same either way, and the event is recorded after it has been sent. | null | null |
 | `coordinator_changed` | `PUT /coordinator` setting or clearing the Coordinator conversation, when it changes. | `convo:<id>`, null when cleared | `user` |
 | `consent_switch_changed` | `PUT /coordinator` turning `consent` or `transfer_consent`, when it changes; `matron-admin coordinator transfers`. | `spawns`, `transfers` | `user`, `admin_cli` |
-| `device_protection_changed` | `POST /devices/:id/protected`, `matron-admin device protected`. | `device:<id>:on`, `device:<id>:off` | `user`, `admin_cli` |
-| `spawn_approved` | An approve of a spawn consent ask (the card, the item's button, the Coordinator's `POST /consent/answer`). Not a decline. | `device:<target box>` | `user`, `coordinator` |
-| `chat_approved` | An approve of an agent-chat consent ask (as above), `matron-admin agent-chat approve`. | `device:<target box>` | `user`, `coordinator`, `admin_cli` |
-| `session_started_direct` | A client's `agent_request` with `method: 'start'` forwarded to a box. | `device:<box>` | `user` |
+| `device_protection_changed` | `POST /devices/:id/protected`, `matron-admin device protected`, when it changes. | `device:<id>:on`, `device:<id>:off` | `user`, `admin_cli` |
+| `spawn_approved` | An approve of a spawn consent ask (the card, the item's button, the Coordinator's `POST /consent/answer`). Not a decline. | `box:<name of the target box>` | `user`, `coordinator` |
+| `chat_approved` | An approve of an agent-chat consent ask (as above), `matron-admin agent-chat approve`. | `box:<name of the invited box>` | `user`, `coordinator`, `admin_cli` |
+| `transfer_approved` | An approve of a file-transfer consent ask (the card's button, the Coordinator's `POST /consent/answer`). Not a decline. | `transfer:<id>` | `user`, `coordinator` |
+| `session_started_direct` | A client's `agent_request` with `method: 'start'` forwarded to a box. | `box:<name of the box>` | `user` |
 | `coordinator_carry_on` | A Coordinator `session_control` `carry_on` the journal accepted (`sent`). | `convo:<target session>` | `coordinator` |
 | `approval_key_enrolled` | A key enrolled by the password and a TOTP code, or approved by an enrolled key (the approving device named). | `key:<8>` | `user` |
 | `approval_key_revoked` | `POST /approval-keys/:key_id/revoke` (signed or by password); each key revoked with its device by `POST /devices/:id/revoke` or `matron-admin device revoke`; `matron-admin approval-key revoke`. | `key:<8>` | `user`, `admin_cli` |
@@ -4882,10 +4893,14 @@ Events are recorded for every account; only the feed is bound to one.
   `bad_request`.
 - `last_seq` is the account's latest sequence number (0 when it has none),
   whether or not it is in the page.
-- A missing or wrong token is **401** `unauthenticated`. The token is bound
+- A missing or wrong token is **401** `unauthenticated`, and counts against
+  the caller address's budget, the one `/login` and the alerts webhook
+  share; once it is spent, every request from that address is **429**
+  `rate_limited`, the right token included. The token is bound
   to one account and only ever returns that account's events. It is not a
   device token: it authenticates nothing else, and a device token cannot
   read the feed. Compared in constant time.
+- `last_seq` and the rows are read in one transaction.
 - With the feed off the path answers **404** `not_found`, as an unknown path
   does; with the configured account not (yet) a user, also **404**.
 
