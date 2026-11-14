@@ -1,3 +1,4 @@
+import { makeWebPushClient, webPushConfigFromEnv } from './webpush.js'
 import http from 'node:http'
 import { makeAgentCommentLimiter } from './agent-comment-limiter.js'
 import path from 'node:path'
@@ -485,8 +486,15 @@ function warnIfBindTrustsSpoofableIp(bind) {
   }
 }
 
+// Injected clients belong to the caller; configured clients belong to the server.
+export function resolveWebPushClient(injected) {
+  if (injected) return { client: injected, owned: false }
+  const config = webPushConfigFromEnv(process.env)
+  return config ? { client: makeWebPushClient(config), owned: true } : { client: undefined, owned: false }
+}
+
 export function startServer({
-  dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, apnsClient, replayBackpressureBytes,
+  dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, apnsClient, webPushClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, retentionInitialDelayMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
   toolLogTtlHours, voiceNoteTtlDays, deviceRetention, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
   // How long an approved spawn waits for a woken target box to attach
@@ -569,6 +577,8 @@ export function startServer({
   backgroundDelayMs = resolveZeroableEnv('MATRON_BACKGROUND_DELAY_MS', process.env.MATRON_BACKGROUND_DELAY_MS, 30000),
   backgroundPace = resolveZeroableEnv('MATRON_BACKGROUND_PACE', process.env.MATRON_BACKGROUND_PACE, 1),
 } = {}) {
+  const { client: resolvedWebPushClient, owned: ownsWebPushClient } = resolveWebPushClient(webPushClient)
+  if (!resolvedWebPushClient) console.info('web push: off')
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
   const db = openDb(resolvedDbPath)
@@ -663,7 +673,7 @@ export function startServer({
   })
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
   const clientIdleMs = resolveClientIdleMs(clientIdleDays)
-  const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient, backgroundWakeMs: BACKGROUND_WAKE_MS, clientIdleMs, now: clientIdleClock })
+  const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient, webPushClient: resolvedWebPushClient, backgroundWakeMs: BACKGROUND_WAKE_MS, clientIdleMs, now: clientIdleClock })
   // A device signed out for invalid approval signatures: its notice and push.
   installApprovalLockdown({ db, hub, pushPipeline })
   // The security event log, one per journal: handed to the HTTP and
@@ -799,7 +809,7 @@ export function startServer({
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     // transferChunkBytes: tests only (small chunks); production uses TRANSFER_CHUNK_BYTES.
     transferMaxBytes: resolvedTransferMaxBytes, transferUserQuotaBytes: resolvedTransferUserQuotaBytes, transferMaxAwaitingPerSender: resolvedTransferMaxAwaiting, transferChunkBytes,
-    hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
+    hub, pushPipeline, webPushClient: resolvedWebPushClient, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentTransferDailyCap, consentRoutineCap, verifier,
     agentCommentLimiter: makeAgentCommentLimiter({ now: agentCommentClock }),
     github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, federationGrants, federationContribute, federationMedia, handleStatic, tokenBox,
@@ -1005,6 +1015,7 @@ export function startServer({
             for (const c of wss.clients) c.terminate()
             pushPipeline.close()
             if (ownsApnsClient) resolvedApnsClient.close()
+            if (ownsWebPushClient) resolvedWebPushClient.close()
             // The transcription queue touches the DB between awaits: abort its
             // child and let it drain before the handle closes.
             const transcriptionDone = Promise.all([itemTranscription.close(), blobTranscripts.close()])
