@@ -3493,7 +3493,7 @@ journal writes one line in the source's conversation saying reports over the
 limit are being refused. A panic-locked account takes no reports.
 
 **Both routes** are mounted ahead of the device Bearer auth and take the key
-as `Authorization: Bearer <key>` (or `X-Api-Key: <key>`). With no source in
+as `Authorization: Bearer <key>`. With no source in
 the journal they decline, and the paths answer as any unknown path does.
 Otherwise a missing, wrong or disabled key is **401** `unauthenticated` and
 is charged to the caller address's unauthenticated budget (the one `/login`

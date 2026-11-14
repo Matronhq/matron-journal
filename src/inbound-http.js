@@ -1,5 +1,5 @@
 // The two doors an inbound source (src/inbound.js) posts through. Both take
-// the source's own key, `Authorization: Bearer <key>` (or `X-Api-Key`), and
+// the source's own key, `Authorization: Bearer <key>`, and
 // both end in the same acceptReport.
 //
 //   POST /inbound/reports   {title?, body, links?}
@@ -76,7 +76,7 @@ export function makeInboundHandler({ db, hub = null, pushPipeline = null, rateLi
     }
     const ip = req.headers['cf-connecting-ip'] || req.socket.remoteAddress || 'unknown'
     if (rateLimiter?.blocked?.(ip)) { rejectEarly(req, res, 429, { error: 'rate_limited' }); return true }
-    const given = /^Bearer (.+)$/.exec(req.headers.authorization || '')?.[1] ?? (typeof req.headers['x-api-key'] === 'string' ? req.headers['x-api-key'] : null)
+    const given = /^Bearer (.+)$/.exec(req.headers.authorization || '')?.[1]
     const source = given ? sourceForKey(db, given.trim()) : null
     if (!source) {
       rateLimiter?.allow(ip)

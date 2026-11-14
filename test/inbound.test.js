@@ -147,8 +147,7 @@ test('keys: missing, wrong, a device token, disabled; wrong keys spend the calle
   const wrong = await w.mcp({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, { key: w.key + 'x' })
   assert.equal(wrong.status, 401)
   assert.equal(wrong.headers.get('www-authenticate'), 'Bearer')
-  // X-Api-Key carries the key as well.
-  assert.equal((await w.report({ body: 'by header' }, { key: null, headers: { 'x-api-key': w.key } })).status, 201)
+  assert.equal((await w.report({ body: 'by bearer' })).status, 201)
   setSourceEnabled(w.s.db, w.source.id, false)
   assert.equal((await w.report({ body: 'x' })).status, 401)
   setSourceEnabled(w.s.db, w.source.id, true)
