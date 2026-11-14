@@ -703,6 +703,25 @@ test('the admin CLI: device revoke, protection, chat approve, password, two-fact
   assertNoSecrets(cap, ['cli-password-1'])
 })
 
+test('the admin CLI: protection and the transfer switch record one event per real change', async (t) => {
+  const cap = capture()
+  const f = await fleet(t, serverOpts(capture()))
+  const { s } = f
+  const securityLog = makeSecurityLog({ db: s.db, out: cap.out, file: null })
+  const admin = (...argv) => runAdmin(s.db, argv, { securityLog })
+  const id = String(f.targetDev.deviceId)
+  await admin('device', 'protected', id, 'on')
+  await admin('device', 'protected', id, 'on')
+  assert.equal(cap.of('device_protection_changed').length, 1)
+  await admin('device', 'protected', id, 'off')
+  assert.deepEqual(cap.of('device_protection_changed').map((e) => e.target), [`device:${id}:on`, `device:${id}:off`])
+  await admin('coordinator', 'transfers', 'alice', 'on')
+  await admin('coordinator', 'transfers', 'alice', 'on')
+  assert.equal(cap.of('consent_switch_changed').length, 1)
+  await admin('coordinator', 'transfers', 'alice', 'off')
+  assert.equal(cap.of('consent_switch_changed').length, 2)
+})
+
 test("the admin CLI's own log, on a second connection to the journal's file: no stdout line, the line in MATRON_SECURITY_LOG, the event in the feed", async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'security-cli-'))
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
