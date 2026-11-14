@@ -232,7 +232,7 @@ test('POST /inbound/mcp: initialize, tools/list, tools/call post_report', async 
   assert.equal(note.status, 202)
   assert.deepEqual((await w.mcp({ jsonrpc: '2.0', id: 'p', method: 'ping' })).json, { jsonrpc: '2.0', id: 'p', result: {} })
   const list = await w.mcp({ jsonrpc: '2.0', id: 2, method: 'tools/list' })
-  assert.deepEqual(list.json.result.tools.map((x) => x.name), ['post_report'])
+  assert.deepEqual(list.json.result.tools.map((x) => x.name), ['post_report', 'request_upload'])
   assert.deepEqual(list.json.result.tools[0].inputSchema.required, ['body'])
   const call = await w.mcp({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'post_report', arguments: { title: 'T', body: 'From the tool.' } } })
   assert.deepEqual(call.json, { jsonrpc: '2.0', id: 3, result: { content: [{ type: 'text', text: 'Posted.' }], isError: false } })

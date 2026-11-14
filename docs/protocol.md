@@ -3444,7 +3444,8 @@ peer-text sanitised on its own, so nothing in a label can add a line.
 
 ### Inbound sources (`POST /inbound/reports`, `POST /inbound/mcp`)
 
-(`src/inbound.js`, `src/inbound-http.js`, `src/inbound-replies.js`.) An
+(`src/inbound.js`, `src/inbound-files.js`, `src/inbound-http.js`,
+`src/inbound-replies.js`.) An
 inbound source is an outside tool the user lets post reports into Matron: a
 hosted assistant, a scheduled job, a workflow service. It has a name, a key
 and one conversation of its own, and each report is one message there.
@@ -3488,6 +3489,43 @@ It counts as unread and is pushed like any message. What it may contain:
   dropped.
 - `links` (optional): at most 10, each an `http(s)` address of at most 2000
   characters or `{title, url}`, appended as a list.
+- `files` (optional): at most 4 ids of files uploaded first (below).
+
+**Files.** A source's own files (a chart it drew, a PDF it wrote) usually
+sit behind its user's sign-in there, so a link is no use here and the bytes
+must come. A file is uploaded on its own and shown when a report names it:
+after the report's `text` event, each file is one `image` or `file` event
+from the same sender, with the usual media payload `{blob_ref, name,
+content_type, size, width?, height?}` plus `from` and `source` as above.
+
+- **Types:** PNG, JPEG, GIF, WebP and PDF, decided by the file's own first
+  bytes. The type the sender claims and the name's ending are ignored, and
+  the stored name is made plain and given the ending that fits.
+- **Size and number:** at most 10 MiB each (or the journal's media cap, if
+  lower), 4 per report, and per source four times its report caps in files
+  an hour and a day. The bytes count against the user's media quota.
+- **Unshown files:** a file no report names within an hour can no longer be
+  named, and the media reaper deletes it as it does any unreferenced blob.
+- **Reading:** the user's own apps fetch it with `GET /media/:id` like any
+  attachment. An agent device is 404, as it is for the conversation.
+
+There are two ways to upload, both taking the raw bytes as the body and
+answering **201** `{file_id, name, content_type, size}`:
+
+- `POST /inbound/files?name=<file name>` with the key.
+- `PUT` (or `POST`) to a one-file upload address, with no key. The address
+  comes from the `request_upload` tool below, holds 256 random bits (only
+  their hash is stored), takes one file and lasts 15 minutes. It exists for
+  an assistant that reaches the journal through a connector: the connector
+  holds the key and the assistant never sees it, but it can still send a
+  file from wherever it runs commands. A wrong, used or expired address is
+  **404**, charged to the caller address's unauthenticated budget like a
+  wrong key.
+
+Either way: **400** `empty`, **413** `too_large` or `quota_exceeded`,
+**415** `unsupported_type`, **429** `rate_limited` over the file cap,
+**403** `account_locked`. Over the size cap the journal answers without
+reading the body.
 
 **Caps, per source:** 10 reports an hour and 40 a day by default (1 to 1000
 each). A report identical to one accepted in the last 24 hours is dropped
@@ -3498,13 +3536,13 @@ limit are being refused. A panic-locked account takes no reports.
 **Both routes** are mounted ahead of the device Bearer auth and take the key
 as `Authorization: Bearer <key>`. With no source in
 the journal they decline, and the paths answer as any unknown path does.
-Otherwise a missing, wrong or disabled key is **401** `unauthenticated` and
+(So do the two upload routes.) Otherwise a missing, wrong or disabled key is **401** `unauthenticated` and
 is charged to the caller address's unauthenticated budget (the one `/login`
 and the Alertmanager webhook use); once that is spent every request from the
 address is **429** `rate_limited`, a right key included. A method other than
 POST is **405**. The request body is at most 192 KiB (**413** over).
 
-`POST /inbound/reports` `{title?, body, links?}`:
+`POST /inbound/reports` `{title?, body, links?, files?}`:
 
 | Status | Body | |
 |---|---|---|
@@ -3520,13 +3558,18 @@ for assistants that connect to tools by address: stateless, one JSON-RPC
 message per POST, JSON replies, no stream. It answers `initialize`
 (protocol versions `2025-06-18`, `2025-03-26`, `2024-11-05`), `ping`,
 `tools/list` and `tools/call`; a notification gets **202**; any other method
-is `-32601`. Its one tool, `post_report {title?, body, links?}`, ends in the
-same code as the route above and answers with one line of text (`Posted.`,
-already posted, or why not), `isError` set for anything but those two. It
-offers nothing to read.
+is `-32601`. It has two tools. `post_report {title?, body, links?, files?}`
+ends in the same code as the route above and answers with one line of text
+(`Posted.`, already posted, or why not), `isError` set for anything but
+those two. `request_upload {name?}` answers with a line of JSON, `{file_id,
+upload_url, method: 'PUT', expires_in_seconds}`: the caller sends the file
+to `upload_url` and then names `file_id` in `post_report`. The address is
+built from the journal's configured public host when it has one, else from
+the request. The server offers nothing to read.
 
-**The log** has one line per post: the source id, the outcome and the size.
-Never the text.
+**The log** has one line per post, upload and upload address: the source id,
+the outcome, and the size and type. Never the text, a file's name or an
+upload address.
 
 **What the user types there.** A `send` of `type: 'text'` into a source's
 conversation is stored and, as in the People conversation, passed to the

@@ -1081,6 +1081,22 @@ CREATE TABLE IF NOT EXISTS inbound_posts(
   bytes     INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_inbound_posts_source ON inbound_posts(source_id, ts);
+-- A file an inbound source sends with a report (src/inbound-files.js): a
+-- place made first, filled by an upload, shown when a report names it.
+-- secret_hash is the hash of a one-file upload address's secret.
+CREATE TABLE IF NOT EXISTS inbound_files(
+  id           TEXT PRIMARY KEY,
+  source_id    TEXT NOT NULL,
+  secret_hash  TEXT UNIQUE,
+  name         TEXT NOT NULL,
+  created_at   INTEGER NOT NULL,
+  blob_id      TEXT,
+  content_type TEXT,
+  size         INTEGER,
+  used_at      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_inbound_files_source ON inbound_files(source_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_inbound_files_blob ON inbound_files(blob_id) WHERE blob_id IS NOT NULL;
 `
 
 // Rebuild the parent with FK actions disabled: dropping it with enforcement
