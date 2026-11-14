@@ -2237,6 +2237,15 @@ export function openDb(path) {
     );
     CREATE INDEX IF NOT EXISTS password_reset_sends_user ON password_reset_sends(user_id, sent_at);
   `)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS web_push_subscriptions(
+      device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+      endpoint TEXT NOT NULL UNIQUE,
+      p256dh TEXT NOT NULL,
+      auth TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+  `)
   // One-time title cleanup (spec: agent box rename). Gated on user_version
   // inside, so this is a cheap pragma read on every subsequent open.
   healBakedTitles(db, { log: (m) => console.log(m) })
@@ -2457,11 +2466,37 @@ export function pruneApnsToken(db, deviceId, apnsToken, apnsEnv) {
     .run(deviceId, apnsToken, apnsEnv).changes > 0
 }
 
+// Claim an endpoint atomically so a browser moved to another account stops
+// receiving the previous account's notifications.
+export function setWebPushSubscription(db, deviceId, { endpoint, p256dh, auth }) {
+  db.transaction(() => {
+    db.prepare('DELETE FROM web_push_subscriptions WHERE endpoint=? AND device_id<>?').run(endpoint, deviceId)
+    db.prepare(`INSERT INTO web_push_subscriptions(device_id, endpoint, p256dh, auth, created_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(device_id) DO UPDATE SET endpoint=excluded.endpoint,
+        p256dh=excluded.p256dh, auth=excluded.auth, created_at=excluded.created_at
+      WHERE endpoint IS NOT excluded.endpoint OR p256dh IS NOT excluded.p256dh OR auth IS NOT excluded.auth`)
+      .run(deviceId, endpoint, p256dh, auth, Date.now())
+  })()
+}
+
+export function clearWebPushSubscription(db, deviceId) {
+  db.prepare('DELETE FROM web_push_subscriptions WHERE device_id=?').run(deviceId)
+}
+
+export function pruneWebPushSubscription(db, deviceId, endpoint) {
+  return db.prepare('DELETE FROM web_push_subscriptions WHERE device_id=? AND endpoint=?').run(deviceId, endpoint).changes > 0
+}
+
 // Client devices (never agent — agents are never pushed to) with a
 // registered token, for the push pipeline to fan a journal event out to.
 export function clientDevicesForPush(db, userId) {
   return db.prepare(
-    "SELECT id, kind, created_at, last_seen_at, apns_token, apns_env, cursor, push_level, sync_scope, push_key FROM devices WHERE user_id=? AND kind='client' AND apns_token IS NOT NULL"
+    `SELECT d.id, d.kind, d.created_at, d.last_seen_at, d.apns_token, d.apns_env,
+      d.cursor, d.push_level, d.sync_scope, d.push_key,
+      w.endpoint AS wp_endpoint, w.p256dh AS wp_p256dh, w.auth AS wp_auth
+      FROM devices d LEFT JOIN web_push_subscriptions w ON w.device_id=d.id
+      WHERE d.user_id=? AND d.kind='client' AND (d.apns_token IS NOT NULL OR w.device_id IS NOT NULL)`
   ).all(userId)
 }
 

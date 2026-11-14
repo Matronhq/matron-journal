@@ -1,10 +1,11 @@
+import { checkEndpoint } from './webpush.js'
 import { makeAgentCommentLimiter } from './agent-comment-limiter.js'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { pipeline } from 'node:stream/promises'
 import { checkPassword, makeRateLimiter, makeKeyedQueue, authToken, clientIdleExpired, preparePasswordChange, applyPasswordChange, revokeOwnedDevice, signOutOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL, byLastMessageThenId } from './journal.js'
-import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, isPrivateDevice, deviceStatuses, setDeviceProtected, deviceLocked } from './db.js'
+import { insertBlob, getBlob, setApnsRegistration, setWebPushSubscription, clearWebPushSubscription, listDevices, userBlobBytes, isPrivateDevice, deviceStatuses, setDeviceProtected, deviceLocked } from './db.js'
 import { receiveBlob } from './media.js'
 import { readBlobTranscript, isTranscribableType, transcriptWaitS } from './blob-transcripts.js'
 import { imageSizeFromFile } from './image-size.js'
@@ -126,7 +127,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, agentCommentLimiter = makeAgentCommentLimiter(), blobTranscripts = null, github = null, handleWellKnown = () => false, handleFederation = async () => false, federationOutbox = null, federationContacts = null, federationGrants = null, federationContribute = null, federationMedia = null, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null, journalHost = null, clientIdleMs, clientIdleClock = Date.now, securityLog = securityLogFor(db), securityFeed = null, panic = null }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, webPushClient, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, agentCommentLimiter = makeAgentCommentLimiter(), blobTranscripts = null, github = null, handleWellKnown = () => false, handleFederation = async () => false, federationOutbox = null, federationContacts = null, federationGrants = null, federationContribute = null, federationMedia = null, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null, journalHost = null, clientIdleMs, clientIdleClock = Date.now, securityLog = securityLogFor(db), securityFeed = null, panic = null }) {
   // Two-factor sign-in (src/two-factor-http.js). The server passes its own;
   // the defaults keep a bare handler (tests) working the same way.
   const twoFactorBox = tokenBox || PLAIN_BOX
@@ -492,6 +493,39 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // private agent caller sees the full list, unchanged.
         const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
         return json(res, 200, buildMetrics(db, { hub, pushPipeline, dbPath, userId: who.userId, excludePrivateDevices: filtered, summariser }))
+      }
+      if (req.method === 'GET' && url.pathname === '/push/web/vapid-key') {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        if (!webPushClient) return json(res, 404, { error: 'web_push_disabled' })
+        return json(res, 200, { public_key: webPushClient.publicKey })
+      }
+      if (req.method === 'POST' && url.pathname === '/push/web/register') {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const body = await readBody(req)
+        if (body?.endpoint === null) {
+          clearWebPushSubscription(db, who.deviceId)
+          return json(res, 200, { ok: true })
+        }
+        if (!webPushClient) return json(res, 404, { error: 'web_push_disabled' })
+        const endpoint = body?.endpoint
+        const p256dh = body?.keys?.p256dh
+        const auth = body?.keys?.auth
+        let stored
+        try {
+          // Stored as the parsed form, so two spellings of one host are one endpoint.
+          const checked = checkEndpoint(endpoint)
+          if (!checked.ok) throw new Error('endpoint')
+          stored = checked.url.href
+          if (typeof p256dh !== 'string' || !/^[A-Za-z0-9_-]+$/.test(p256dh)
+            || typeof auth !== 'string' || !/^[A-Za-z0-9_-]+$/.test(auth)) throw new Error('keys')
+          const point = Buffer.from(p256dh, 'base64url')
+          if (point.length !== 65 || point[0] !== 4 || Buffer.from(auth, 'base64url').length !== 16) throw new Error('keys')
+          const validator = crypto.createECDH('prime256v1')
+          validator.generateKeys()
+          validator.computeSecret(point)
+        } catch { return json(res, 400, { error: 'bad_request' }) }
+        setWebPushSubscription(db, who.deviceId, { endpoint: stored, p256dh, auth })
+        return json(res, 200, { ok: true })
       }
       if (req.method === 'POST' && url.pathname === '/push/register') {
         // Only client devices carry push tokens — agents run on the dev box

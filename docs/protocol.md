@@ -8607,3 +8607,70 @@ Agent-to-agent file transfers have their own always-on sweep, with no env
 knob — see "Agent-to-agent file transfers" → "Retention" above. In short:
 a collected copy is deleted an hour after receipt, and an uncollected one
 is marked `expired` and deleted a week after it was created.
+
+## Web Push
+
+Browser notifications require HTTPS and a Push API subscription for each
+browser. Web Push uses the same notification settings, viewing and read-state
+filters as APNs. It sends visible notifications only, without silent wakes or
+read-marker pushes. A device with both registrations receives both transports.
+
+Both endpoints require a client device's bearer token; agent devices receive
+403. `GET /push/web/vapid-key` returns `{ "public_key": "<base64url>" }`, the
+uncompressed P-256 application server key to use when subscribing.
+
+`POST /push/web/register` accepts:
+
+```json
+{
+  "endpoint": "https://push.example.com/send/browser",
+  "keys": { "p256dh": "<base64url P-256 point>", "auth": "<base64url 16-byte secret>" }
+}
+```
+
+Success returns `{ "ok": true }`. Repeating a registration preserves its creation
+time; a changed subscription replaces it. An endpoint is held by one device at
+a time. `{ "endpoint": null }` unregisters, even when sending is disabled.
+Invalid endpoints or keys return 400 `{ "error": "bad_request" }`. Endpoints
+must use public HTTPS on port 443 without credentials. Private and reserved
+addresses are blocked at registration and after DNS resolution when sending;
+redirects are never followed.
+
+When the sender is off, key discovery and registration return 404
+`{ "error": "web_push_disabled" }`. Generate a deployment key with
+`node tools/webpush-vapid-keygen.js <out.pem>`; the tool refuses to overwrite a
+file, writes the private key with mode 0600, and prints only its public key.
+Keep the private key outside source control. Set both
+`MATRON_WEBPUSH_VAPID_KEY_FILE` (PEM P-256 private key) and
+`MATRON_WEBPUSH_SUBJECT` (a `mailto:` or `https:` contact URL). With neither,
+Web Push is off; an incomplete pair or invalid key fails startup.
+`MATRON_WEBPUSH_DISABLED=1` or `true` disables it regardless of configuration.
+
+The decrypted RFC 8291 `aes128gcm` payload is bounded JSON, optionally followed
+by whitespace padding:
+
+```json
+{
+  "v": 1,
+  "title": "Conversation title",
+  "body": "Your agent needs you",
+  "convo_id": "conversation-one",
+  "seq": 42,
+  "kind": "attention"
+}
+```
+
+`kind` is `attention`, `done`, or `activity`. Optional `subtitle` and `item`
+fields follow the sealed notification content schema (`item` has `id`, `num`,
+`kind`, `actions`, and optional `reply_to`). Web Push encryption protects the
+content directly; no additional HPKE box wraps it. If content cannot fit, the
+sender uses fixed notification text with the version, conversation, sequence
+and kind fields. Urgency is high for attention and done, normal for activity;
+TTL is 24 hours or one hour respectively. A hashed conversation or item topic
+collapses related notifications.
+
+A push service's 404 or 410 response prunes the subscription only if that device
+still holds the failed endpoint. Other failures preserve it for later sends.
+`GET /metrics` includes global `push.web` counters: `sent`, `failed`, `pruned`,
+and `by_reason`. These remain zero when Web Push is off and do not include
+APNs sends.
