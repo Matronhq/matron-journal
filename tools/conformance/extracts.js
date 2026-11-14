@@ -10,6 +10,7 @@ import path from 'node:path'
 import { CONFORMANCE_DIR } from './schema.js'
 import { bootFixtureServer } from './server.js'
 import { replayFixture } from './coordinator.js'
+import { createActor, MODEL_CAPABILITIES } from './actor.js'
 
 export const PAYLOADS_DIR = path.join(CONFORMANCE_DIR, 'payloads')
 
@@ -93,7 +94,13 @@ async function mapLimit(items, limit, fn) {
 }
 
 export async function generateExtracts(fixtureDir = CONFORMANCE_DIR, { only } = {}) {
-  const files = fs.readdirSync(fixtureDir).filter((f) => f.endsWith('.json') && (!only || only.includes(f))).sort()
+  // A fixture whose muting is the app's own write (set_app_state with `muted`) makes the
+  // journal push frames only the app's settings call causes, so only an app can replay
+  // it; the notify frame itself is shown by 21_notify_settings_push.json (plain HTTP).
+  const needsApp = (f) => JSON.parse(fs.readFileSync(path.join(fixtureDir, f), 'utf8')).steps.some((s) => s.kind === 'set_app_state' && 'muted' in s)
+  const all = fs.readdirSync(fixtureDir).filter((f) => f.endsWith('.json') && (!only || only.includes(f))).sort()
+  for (const f of all.filter(needsApp)) console.error(`extracts: skipping ${f} (its muting is an app's own write)`)
+  const files = all.filter((f) => !needsApp(f))
   // Replay every fixture (side by side, each against its own server), then
   // fold the observations in file order so the output does not depend on timing.
   const runs = await mapLimit(files, 3, async (file) => {
@@ -102,7 +109,20 @@ export async function generateExtracts(fixtureDir = CONFORMANCE_DIR, { only } = 
     const collect = {}
     let result
     try {
-      result = await replayFixture({ fixture, base: booted.base, bindings: booted.bindings, control: booted.control, collect })
+      // The client lane runs on the Node actor; a step about an app's own model
+      // (set_app_state, expect_model, expect_notification) has no app here and
+      // passes: the frames around it are what the extracts are made from.
+      const actor = createActor({ base: booted.base })
+      const runner = {
+        capabilities: new Set([...actor.capabilities, ...MODEL_CAPABILITIES]),
+        run: async (step, bindings, info) => (MODEL_CAPABILITIES.includes(step.kind) ? { bindings: {}, observed: undefined } : actor.run(step, bindings, info)),
+        close: () => actor.close(),
+      }
+      try {
+        result = await replayFixture({ fixture, base: booted.base, bindings: booted.bindings, control: booted.control, collect, runner, play: ['client'] })
+      } finally {
+        await actor.close()
+      }
     } finally {
       await booted.close()
     }
