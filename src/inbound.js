@@ -25,7 +25,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { append, broadcastAppended, toEventShape } from './journal.js'
 import { sanitizeConsentText, plainText } from './peer-text.js'
 import { isPanicLocked } from './panic.js'
-import { takeFiles, markFilesUsed, FILES_PER_REPORT_MAX } from './inbound-files.js'
+import { takeFiles, fileSums, markFilesUsed, dropUploadAddresses, FILES_PER_REPORT_MAX } from './inbound-files.js'
 
 export const INBOUND_SYSTEM_PREFIX = 'inbound:'
 export const INBOUND_SENDER_PREFIX = 'source:'
@@ -95,6 +95,8 @@ export function setSourceEnabled(db, id, enabled) {
 // A new key for the same source; the old one stops working at once.
 export function rotateSourceKey(db, id) {
   const key = INBOUND_KEY_PREFIX + randomBytes(32).toString('base64url')
+  // Upload addresses made under the old key go with it.
+  dropUploadAddresses(db, id)
   return db.prepare('UPDATE inbound_sources SET token_hash=? WHERE id=?').run(sha256(key), id).changes > 0 ? key : null
 }
 
@@ -256,11 +258,14 @@ export function acceptReport(ctx, source, input, { now = Date.now() } = {}) {
     source = getSource(db, source.id)
     // ...or its key may have been replaced.
     if (!source || !source.enabled || source.token_hash !== keyHash) return { status: 'bad_request', detail: 'the source is no longer enabled, or its key changed' }
+    // The same words with other files are another report. A report sent
+    // again names files that were already shown, so the duplicate check
+    // comes before the files are checked for that.
+    const sums = fileSums(db, source, built.files)
+    const hash = sums ? sha256([built.text, ...sums].join('\n')) : null
+    if (hash && db.prepare('SELECT 1 FROM inbound_posts WHERE source_id=? AND body_hash=? AND ts>?').get(source.id, hash, now - DAY)) return { status: 'duplicate' }
     const taken = takeFiles(db, source, built.files, { now })
     if (!taken.ok) return { status: 'bad_request', detail: taken.detail }
-    // The same words with other files are another report.
-    const hash = sha256([built.text, ...taken.files.map((f) => f.sha256)].join('\n'))
-    if (db.prepare('SELECT 1 FROM inbound_posts WHERE source_id=? AND body_hash=? AND ts>?').get(source.id, hash, now - DAY)) return { status: 'duplicate' }
     const count = (windowMs) => db.prepare('SELECT COUNT(*) AS n FROM inbound_posts WHERE source_id=? AND ts>?').get(source.id, now - windowMs).n
     if (count(HOUR) >= source.hourly_max) return refuseOverCap(db, fan, source, { windowMs: HOUR, max: source.hourly_max, per: 'an hour', now })
     if (count(DAY) >= source.daily_max) return refuseOverCap(db, fan, source, { windowMs: DAY, max: source.daily_max, per: 'a day', now })

@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { createSource, setSourceEnabled } from '../src/inbound.js'
+import { createSource, setSourceEnabled, rotateSourceKey } from '../src/inbound.js'
 import { sniffType, cleanFileName, FILE_MAX_BYTES, FILE_ATTACH_MS, UPLOAD_TICKET_MS } from '../src/inbound-files.js'
 
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64')
@@ -68,6 +68,10 @@ test('a file uploaded with the key and named by a report follows it as a message
   assert.equal(got.status, 200)
   assert.equal(got.headers.get('content-type'), 'image/png')
   assert.deepEqual(Buffer.from(await got.arrayBuffer()), PNG)
+  // The same report sent again is a duplicate, not a refusal, and shows nothing.
+  const again = await w.report({ title: 'T', body: 'With a chart.', files: [up.json.file_id, doc.json.file_id] })
+  assert.deepEqual([again.status, again.json], [200, { accepted: false, duplicate: true }])
+  assert.equal(w.events().length, 4)
   // A file is shown once; the same words with no file are another report.
   assert.equal((await w.report({ body: 'Again.', files: [up.json.file_id] })).status, 400)
   assert.equal((await w.report({ title: 'T', body: 'With a chart.' })).status, 201)
@@ -135,7 +139,11 @@ test('an upload address that waited too long, or whose source was disabled, is g
   const late = JSON.parse((await w.tool('request_upload', {})).content[0].text)
   w.s.db.prepare('UPDATE inbound_files SET created_at=? WHERE id=?').run(Date.now() - UPLOAD_TICKET_MS - 1000, late.file_id)
   assert.equal((await fetch(late.upload_url, { method: 'PUT' })).status, 404)
-  const off = JSON.parse((await w.tool('request_upload', {})).content[0].text)
+  // A replaced key takes its waiting addresses with it.
+  const old = JSON.parse((await w.tool('request_upload', {})).content[0].text)
+  const key = rotateSourceKey(w.s.db, w.source.id)
+  assert.equal((await fetch(old.upload_url, { method: 'PUT' })).status, 404)
+  const off = JSON.parse((await w.json('/inbound/mcp', { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'request_upload', arguments: {} } }, key)).json.result.content[0].text)
   setSourceEnabled(w.s.db, w.source.id, false)
   assert.equal((await fetch(off.upload_url, { method: 'PUT' })).status, 404)
   assert.equal(w.s.db.prepare('SELECT COUNT(*) n FROM blobs').get().n, 0)
@@ -152,4 +160,17 @@ test('files have their own cap, and count against the user\'s media quota', asyn
   const asked = await w.tool('request_upload', {})
   assert.equal(asked.isError, true)
   assert.match(asked.content[0].text, /over its limit for files/)
+})
+
+test('a locked account takes no file and hands out no upload address', async (t) => {
+  const w = await world(t)
+  const before = JSON.parse((await w.tool('request_upload', {})).content[0].text)
+  w.s.db.prepare('INSERT INTO panic_locks(user_id, since) VALUES(?,?)').run(w.alice.id, Date.now())
+  assert.equal((await w.upload(PNG)).status, 403)
+  const asked = await w.tool('request_upload', {})
+  assert.equal(asked.isError, true)
+  assert.match(asked.content[0].text, /the account is locked/)
+  assert.equal((await fetch(before.upload_url, { method: 'PUT', body: PNG })).status, 403)
+  assert.equal(w.s.db.prepare('SELECT COUNT(*) n FROM inbound_files').get().n, 1)
+  assert.equal(w.s.db.prepare('SELECT COUNT(*) n FROM blobs').get().n, 0)
 })

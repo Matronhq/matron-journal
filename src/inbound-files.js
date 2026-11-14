@@ -117,3 +117,18 @@ export function takeFiles(db, source, ids, { now = Date.now() } = {}) {
 }
 export const markFilesUsed = (db, files, now) => { for (const f of files) db.prepare('UPDATE inbound_files SET used_at=? WHERE id=?').run(now, f.id) }
 export const isInboundFileBlob = (db, blobId) => !!db.prepare('SELECT 1 FROM inbound_files WHERE blob_id=?').get(blobId)
+
+// The sha256 of each file a report names, shown already or not, in the
+// order takeFiles gives them. Null when one is not this source's uploaded file.
+export function fileSums(db, source, ids) {
+  const sums = []
+  for (const id of new Set(ids)) {
+    const f = db.prepare('SELECT b.sha256 FROM inbound_files f JOIN blobs b ON b.id = f.blob_id WHERE f.id=? AND f.source_id=?').get(id, source.id)
+    if (!f) return null
+    sums.push(f.sha256)
+  }
+  return sums
+}
+
+// Places still waiting for their bytes: withdrawn when the key is replaced.
+export const dropUploadAddresses = (db, sourceId) => db.prepare('DELETE FROM inbound_files WHERE source_id=? AND blob_id IS NULL').run(sourceId).changes

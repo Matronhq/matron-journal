@@ -181,6 +181,7 @@ export function makeInboundHandler({ db, hub = null, pushPipeline = null, rateLi
       return true
     }
     if (files) {
+      if (isPanicLocked(db, source.user_id)) { answer(req, res, 403, { error: 'account_locked' }, rejectEarly); return true }
       const place = reserveFile(db, source, { name: url.searchParams.get('name') ?? '' })
       if (place.status !== 'ok') {
         res.setHeader('retry-after', String(place.retryAfter))
@@ -226,11 +227,13 @@ export function makeInboundHandler({ db, hub = null, pushPipeline = null, rateLi
       json(res, 200, rpcResult(id, { tools: [TOOL, UPLOAD_TOOL] }))
     } else if (method === 'tools/call') {
       if (params?.name === UPLOAD_TOOL.name) {
-        const place = reserveFile(db, source, { name: params.arguments?.name ?? '', ticket: true })
+        // A panic-locked account (src/panic.js) hands out no addresses.
+        const place = isPanicLocked(db, source.user_id) ? { status: 'account_locked' } : reserveFile(db, source, { name: params.arguments?.name ?? '', ticket: true })
         log(`inbound: ${source.id} upload ${place.status === 'ok' ? 'offered' : place.status}`)
         const text = place.status === 'ok'
           ? JSON.stringify({ file_id: place.id, upload_url: `${baseUrl(req)}${INBOUND_UPLOADS_PREFIX}${place.secret}`, method: 'PUT', expires_in_seconds: UPLOAD_TICKET_MS / 1000 })
-          : `No upload address: this source is over its limit for files. Try again in ${place.retryAfter} seconds.`
+          : place.status === 'account_locked' ? 'No upload address: the account is locked.'
+            : `No upload address: this source is over its limit for files. Try again in ${place.retryAfter} seconds.`
         json(res, 200, rpcResult(id, { content: [{ type: 'text', text }], isError: place.status !== 'ok' }))
         return true
       }

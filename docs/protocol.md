@@ -3489,7 +3489,9 @@ It counts as unread and is pushed like any message. What it may contain:
   dropped.
 - `links` (optional): at most 10, each an `http(s)` address of at most 2000
   characters or `{title, url}`, appended as a list.
-- `files` (optional): at most 4 ids of files uploaded first (below).
+- `files` (optional): at most 4 ids of files uploaded first (below). The
+  same words with other files are another report; the same report sent
+  again, files and all, is a duplicate.
 
 **Files.** A source's own files (a chart it drew, a PDF it wrote) usually
 sit behind its user's sign-in there, so a link is no use here and the bytes
@@ -3518,7 +3520,9 @@ answering **201** `{file_id, name, content_type, size}`:
   their hash is stored), takes one file and lasts 15 minutes. It exists for
   an assistant that reaches the journal through a connector: the connector
   holds the key and the assistant never sees it, but it can still send a
-  file from wherever it runs commands. A wrong, used or expired address is
+  file from wherever it runs commands. `inbound rotate` withdraws the
+  addresses still waiting, and a panic-locked account hands out none. A
+  wrong, used or expired address is
   **404**, charged to the caller address's unauthenticated budget like a
   wrong key.
 
