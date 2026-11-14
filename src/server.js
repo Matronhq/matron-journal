@@ -776,7 +776,7 @@ export function startServer({
     account: process.env.MATRON_PANIC_ACCOUNT || null,
   })
   if (resolvedPanic && !db.prepare('SELECT 1 FROM users WHERE name=?').get(resolvedPanic.account)) {
-    console.warn(`panic: MATRON_PANIC_ACCOUNT ${JSON.stringify(resolvedPanic.account)} is not a user; /panic answers 404 until it exists`)
+    console.warn('panic: MATRON_PANIC_ACCOUNT names no user; /panic answers 404 until it exists')
   }
   const resolvedSummariser = summariser !== undefined ? summariser : makeConfiguredSummariser()
   const resolvedMailer = mailer !== undefined ? mailer : makeConfiguredMailer()

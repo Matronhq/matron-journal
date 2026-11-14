@@ -121,9 +121,15 @@ test('POST /devices/:id/rename: renames, sanitises, caps, owner-scoped, client-g
   // happy path
   const ok = await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', token, body: { name: 'dev-y' } })
   assert.equal(ok.status, 200)
-  assert.deepEqual(ok.json, { ok: true, device: { device_id: agent.deviceId, name: 'dev-y', tag_char: null } })
+  assert.deepEqual(ok.json, { ok: true, device: { device_id: agent.deviceId, name: 'dev-y', tag_char: null, locked: null } })
   const roster = await s.http('/devices', { token })
   assert.equal(roster.json.devices.find((d) => d.device_id === agent.deviceId).name, 'dev-y')
+  // The body carries the box's standing locked report, as device_meta does.
+  const locked = { on: false, until: 4102444800000, lockdown_until: null }
+  s.db.prepare('UPDATE devices SET locked=? WHERE id=?').run(JSON.stringify(locked), agent.deviceId)
+  const again = await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', token, body: { name: 'dev-y' } })
+  assert.deepEqual(again.json.device.locked, locked)
+  s.db.prepare('UPDATE devices SET locked=NULL WHERE id=?').run(agent.deviceId)
 
   // a client device (including self) may be renamed too
   const self = await s.http(`/devices/${login.json.device_id}/rename`, { method: 'POST', token, body: { name: 'Alice Mac' } })
@@ -209,7 +215,7 @@ test('POST /devices/:id/tag: sets, clears, keeps one grapheme, owner-scoped, cli
   // happy path — the response echoes the device's current name alongside
   const ok = await s.http(`/devices/${agent.deviceId}/tag`, { method: 'POST', token, body: { tag_char: 'a' } })
   assert.equal(ok.status, 200)
-  assert.deepEqual(ok.json, { ok: true, device: { device_id: agent.deviceId, name: 'dev-a', tag_char: 'a' } })
+  assert.deepEqual(ok.json, { ok: true, device: { device_id: agent.deviceId, name: 'dev-a', tag_char: 'a', locked: null } })
   const roster = await s.http('/devices', { token })
   assert.equal(roster.json.devices.find((d) => d.device_id === agent.deviceId).tag_char, 'a')
 

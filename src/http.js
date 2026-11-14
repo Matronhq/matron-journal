@@ -367,7 +367,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       if (handleSecurityFeed({ db, feed: securityFeed, json, rateLimiter }, req, res, url, { rejectEarly })) return
       // The panic lock (src/panic.js): its own Bearer token, bound to one
       // account, that can only lock it and read whether it is locked. Off, 404.
-      if (await handlePanic({ db, hub, panic, json, rateLimiter, securityLog, signInTickets, mediaDir }, req, res, url, { rejectEarly })) return
+      if (await handlePanic({ db, hub, panic, json, rateLimiter, securityLog, signInTickets, mediaDir, pairs, links }, req, res, url, { rejectEarly })) return
       const who = bearer(req) && authToken(db, bearer(req), { now: clientIdleClock(), clientIdleMs })
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       // A client token of a panic-locked account still working (a race, or
@@ -971,9 +971,10 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
             c.ws.send(JSON.stringify({ kind: 'device_meta', device_id: renamedId, name: clean, tag_char: renamedTag, locked: deviceLocked(db, renamedId) }))
           }
         }
-        // The 200 body carries the trio like the frame does — device_meta is
-        // "current meta", and rename's own response shouldn't disagree.
-        return json(res, 200, { ok: true, device: { device_id: renamedId, name: clean, tag_char: renamedTag } })
+        // The 200 body carries what the frame does (name, tag_char, locked) —
+        // device_meta is "current meta", and rename's own response shouldn't
+        // disagree.
+        return json(res, 200, { ok: true, device: { device_id: renamedId, name: clean, tag_char: renamedTag, locked: deviceLocked(db, renamedId) } })
       }
       const tg = url.pathname.match(/^\/devices\/(\d+)\/tag$/)
       if (req.method === 'POST' && tg) {
@@ -995,7 +996,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
             c.ws.send(JSON.stringify({ kind: 'device_meta', device_id: taggedId, name: taggedName, tag_char: cleanTag, locked: deviceLocked(db, taggedId) }))
           }
         }
-        return json(res, 200, { ok: true, device: { device_id: taggedId, name: taggedName, tag_char: cleanTag } })
+        return json(res, 200, { ok: true, device: { device_id: taggedId, name: taggedName, tag_char: cleanTag, locked: deviceLocked(db, taggedId) } })
       }
       if (req.method === 'POST' && url.pathname === '/pair/approve') {
         if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
