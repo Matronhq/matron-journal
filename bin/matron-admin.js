@@ -21,6 +21,7 @@ import { formatFingerprint } from '../src/federation-envelope.js'
 import { makeTokenBox } from '../src/token-box.js'
 import { makeSecurityLog, deviceTarget, keyTarget, boxTarget } from '../src/security-log.js'
 import { panicLock, clearPanic } from '../src/panic.js'
+import { createSource, listSources, getSource, setSourceCaps, rotateSourceKey, setSourceEnabled, DEFAULT_HOURLY_MAX, DEFAULT_DAILY_MAX } from '../src/inbound.js'
 import {
   disableTwoFactor, twoFactorState, isTwoFactorRequired, setTwoFactorRequired, isTwoFactorExempt, setTwoFactorExempt,
 } from '../src/two-factor.js'
@@ -53,6 +54,11 @@ const USAGE = `usage:
   matron-admin link-code <username> --server-url <url> [--port <n>] [--expires <30m|24h>] [--png <path>]
   matron-admin offload [--days N]
   matron-admin expire-logs [--hours N]
+  matron-admin inbound add <username> <source-name> [--hourly N] [--daily N]
+  matron-admin inbound list <username>
+  matron-admin inbound limits <source_id> --hourly N --daily N
+  matron-admin inbound rotate <source_id>
+  matron-admin inbound disable|enable <source_id>
   matron-admin agent-chat pending <username>
   matron-admin agent-chat approve <username> <room_id> <device_id>
   matron-admin agent-chat deny <username> <room_id> <device_id>
@@ -329,6 +335,37 @@ export async function runAdmin(db, argv, deps = {}) {
     const { token, deviceId } = createAgent(db, user.id, agentName)
     adminEvent(user.id, 'bridge_paired', deviceTarget(deviceId))
     return `agent ${agentName} token: ${token}\n(store in the bridge credentials file; it is not shown again)`
+  }
+  // Inbound sources (src/inbound.js): an outside tool's write-only key and
+  // the conversation its reports land in.
+  if (a === 'inbound') {
+    const num = (name, dflt) => { const v = flag(argv, name); return v == null ? dflt : Number(v) }
+    if (b === 'add') {
+      const [, , username, sourceName] = argv
+      if (!username || !sourceName) throw new Error(USAGE)
+      const user = requireUser(db, username)
+      const { source, key } = createSource(db, user.id, sourceName, { hourlyMax: num('--hourly', DEFAULT_HOURLY_MAX), dailyMax: num('--daily', DEFAULT_DAILY_MAX) })
+      return `source ${source.id} "${source.name}" for ${username}: at most ${source.hourly_max} reports an hour, ${source.daily_max} a day\nkey: ${key}\n(give it to the tool that posts; it can only post reports, and it is not shown again)`
+    }
+    if (b === 'list') {
+      if (!argv[2]) throw new Error(USAGE)
+      const rows = listSources(db, requireUser(db, argv[2]).id)
+      if (rows.length === 0) return `no inbound sources for ${argv[2]}`
+      return rows.map((r) => `${r.id} name=${JSON.stringify(r.name)} ${r.enabled ? 'enabled' : 'disabled'} hourly=${r.hourly_max} daily=${r.daily_max} last_post_at=${r.last_post_at ?? 'never'}`).join('\n')
+    }
+    const id = argv[2]
+    if (!id || !getSource(db, id)) throw new Error(id ? `no such source: ${id}` : USAGE)
+    if (b === 'limits') {
+      setSourceCaps(db, id, { hourlyMax: num('--hourly', NaN), dailyMax: num('--daily', NaN) })
+      const r = getSource(db, id)
+      return `source ${id}: at most ${r.hourly_max} reports an hour, ${r.daily_max} a day`
+    }
+    if (b === 'rotate') return `source ${id} new key: ${rotateSourceKey(db, id)}\n(the old key no longer works; this one is not shown again)`
+    if (b === 'disable' || b === 'enable') {
+      setSourceEnabled(db, id, b === 'enable')
+      return `source ${id} is ${b}d`
+    }
+    throw new Error(USAGE)
   }
   if (a === 'device' && b === 'list') {
     const username = argv[2]
