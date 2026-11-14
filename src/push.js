@@ -210,6 +210,11 @@ export function makePushPipeline({ db, hub, apnsClient, coalesceMs = ROUTINE_COA
     // to clear the lock. Checked at the send, so a push queued before the
     // lock is dropped too.
     if (isPanicLocked(db, userId)) return
+    // `device` is as it was when the push was built, and a queued one may
+    // be sent a while later: a device signed out since gets nothing. (One
+    // that registered another push token meanwhile still gets the push at
+    // the old one, with the fixed text only: currentKey below.)
+    if (!db.prepare("SELECT 1 FROM devices WHERE id=? AND user_id=? AND kind='client'").get(device.id, userId)) return
     // Badge must reflect unread state as of the moment we actually transmit,
     // not whenever the push was built/scheduled — a coalesced or trailing
     // push can sit queued for up to `coalesceMs`, during which more events
