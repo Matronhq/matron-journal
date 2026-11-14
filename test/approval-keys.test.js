@@ -320,7 +320,7 @@ test('requireApproval: each check fails with its own reason, in order', async (t
   assert.deepEqual(check('junk'), invalid('bad_statement'))
   assert.deepEqual(check({ statement: good.statement }), invalid('bad_statement'))
   assert.deepEqual(check({ ...good, extra: 'x' }), invalid('bad_statement'))
-  assert.deepEqual(check({ statement: good.statement.replace('{', '{ '), signature: good.signature }), invalid('bad_statement'))
+  assert.deepEqual(check({ statement: `${good.statement.slice(0, 1)} ${good.statement.slice(1)}`, signature: good.signature }), invalid('bad_statement'))
 
   assert.deepEqual(check(await signAccount(s, { token, key, subject: expect.subject, journal: 'other.example' })), invalid('mismatch'))
   assert.deepEqual(check(await signAccount(s, { token, key, subject: expect.subject, user: 'bob' })), invalid('mismatch'))
