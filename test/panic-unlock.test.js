@@ -7,8 +7,13 @@ import assert from 'node:assert/strict'
 import http from 'node:http'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent, createClientDevice } from '../src/auth.js'
+import { openDb, setApnsRegistration } from '../src/db.js'
+import { makeHub } from '../src/hub.js'
+import { makePushPipeline } from '../src/push.js'
+import { setNotifyPrefs, NOTIFY_EVENTS } from '../src/notify.js'
+import { upsertConversation, append } from '../src/journal.js'
 import { getConsentEnabled, getTransferConsentEnabled } from '../src/consent.js'
-import { isPanicLocked } from '../src/panic.js'
+import { isPanicLocked, clearPanic } from '../src/panic.js'
 import { lockAccount } from '../src/panic-lock.js'
 import { runAdmin } from '../bin/matron-admin.js'
 import {
@@ -250,6 +255,34 @@ test('a key revoked while its device is frozen: the next request signs the devic
   assert.equal(deviceExists(s, phone.deviceId), false)
   assert.equal((await s.http('/me', { token: phone.token })).status, 401)
   assert.equal((await lockIt(s)).json.devices_frozen, 0)
+})
+
+test('a frozen device gets no push while the account is locked, and gets them again after the clear', async (t) => {
+  const db = openDb(':memory:')
+  const hub = makeHub()
+  const calls = []
+  const pipeline = makePushPipeline({ db, hub, apnsClient: { send: (o) => { calls.push(o); return Promise.resolve({ status: 200, reason: null }) } } })
+  t.after(() => pipeline.close())
+  const alice = await createUser(db, 'alice', TEST_PASSWORD)
+  setNotifyPrefs(db, alice.id, { mode: 'custom', events: Object.fromEntries(NOTIFY_EVENTS.map((k) => [k, true])) })
+  upsertConversation(db, { id: 'c1', ownerUserId: alice.id, title: 'convo one' })
+  const phone = createClientDevice(db, alice.id, 'phone')
+  setApnsRegistration(db, phone.deviceId, { apnsToken: 'phone-token', apnsEnv: 'prod' })
+  const k = generateApprovalKey()
+  db.prepare(`INSERT INTO approval_keys(user_id, key_id, public_key, alg, name, device_id, enrolled_via, enrolled_by, created_at)
+    VALUES(?,?,?,'ES256','phone',?,'password',NULL,?)`).run(alice.id, k.keyId, k.publicKey, phone.deviceId, Date.now())
+  const say = async (body) => {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:box-a', type: 'text', payload: { body } })
+    pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:box-a', type: 'text', payload: { body } }, null)
+    await new Promise((res) => setImmediate(res))
+  }
+  const r = lockAccount({ db, hub, securityLog: { record() {} } }, alice.id, {})
+  assert.equal(r.devicesFrozen, 1)
+  await say('while locked')
+  assert.equal(calls.length, 0)
+  clearPanic(db, alice.id)
+  await say('after the clear')
+  assert.equal(calls.length, 1)
 })
 
 // ---- POST /panic/unlock -----------------------------------------------------------------
