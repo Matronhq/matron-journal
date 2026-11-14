@@ -4030,11 +4030,11 @@ takes pushes:
 
 The added notice says the key can now approve dangerous actions and to
 remove it and change the password if that was not the user. Adding the
-account's first key or removing its last also restamps open consent items
-(*Protected boxes*). `matron-admin device revoke` and `matron-admin
-approval-key revoke` file the removed notice too, but cannot push it or
-announce it live (the CLI has no connection to the running journal): the
-apps see it on their next read.
+account's first key or removing its last also restamps open consent items,
+each with an `updated` marker (*Protected boxes*). `matron-admin device
+revoke` and `matron-admin approval-key revoke` file the removed notice (and
+restamp) too, but cannot push it or announce it live (the CLI has no
+connection to the running journal): the apps see it on their next read.
 
 **From the host.** A key outlives its device's sign-in (a reset, a password
 change, a lockdown or a sign-out leaves it attached to no device), and once
@@ -4274,7 +4274,8 @@ needs the user's own approval, signed once the account has a key.
   changes are restamped and get an `updated` marker. The user-only flag
   is left as it is.
 - `matron-admin device protected <device_id> on|off` does the same from the
-  host, unsigned (no marker; apps see the change on their next read).
+  host, unsigned (the marker is written but not sent live; apps see the
+  change on their next read).
   `matron-admin device list` adds ` protected` to the line.
 - `GET /devices` carries `protected: boolean` on every device.
 
@@ -4326,9 +4327,10 @@ below, from the card's fields (the spawn's `request_id`, `workdir` and
 transfer's `id`, `sha256` and `size`) and the box's name exactly as
 `GET /devices` lists it (the stored name, not a display label). Items are restamped when the box is
 protected or unprotected, renamed, or when the account's first key is
-added or last key removed; the toggle and the rename send an `updated`
-marker for each changed item, a key change and the CLI do not (an app sees
-it on its next read). The pending list and the answer check always work
+added or last key removed. Each changed item's `updated_at` moves (so
+`GET /items?since=` returns it) and an `updated` marker is appended for it;
+from the host (`matron-admin`) the marker is not sent live, and an app sees
+it on its next read. The pending list and the answer check always work
 from the ask as it is now, so the item is a convenience: a rename between
 reading and signing is a `mismatch`.
 

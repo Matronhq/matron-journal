@@ -130,16 +130,20 @@ export function storedApproval(text) {
 export const approvalColumn = (approval) => (approval == null ? null : JSON.stringify({ statement: approval.statement, signature: approval.signature }))
 
 // Set every open consent item's step_up and subject from its ask as it
-// stands now — after a box is protected or unprotected. → the ids of the
-// items that changed.
-export function restampConsentItems(db, userId) {
+// stands now — after a box is protected or unprotected or renamed, or the
+// account's first key is added or its last removed. A changed item's
+// updated_at moves too, so an app reading `GET /items?since=` sees what it
+// must now sign; the caller announces each with an `updated` marker
+// (approval-keys-http.js announceRestamped). → the ids of the items that
+// changed.
+export function restampConsentItems(db, userId, now = Date.now()) {
   const changed = []
   const stamp = (itemId, kind, row) => {
     if (!itemId) return
     const su = consentStepUp(db, userId, kind, row)
     const subject = su ? JSON.stringify(su.subject) : null
-    const r = db.prepare("UPDATE items SET step_up=?, subject=? WHERE id=? AND user_id=? AND state='open' AND (step_up IS NOT ? OR subject IS NOT ?)")
-      .run(su ? 1 : 0, subject, itemId, userId, su ? 1 : 0, subject)
+    const r = db.prepare("UPDATE items SET step_up=?, subject=?, updated_at=? WHERE id=? AND user_id=? AND state='open' AND (step_up IS NOT ? OR subject IS NOT ?)")
+      .run(su ? 1 : 0, subject, now, itemId, userId, su ? 1 : 0, subject)
     if (r.changes) changed.push(itemId)
   }
   for (const row of db.prepare("SELECT * FROM agent_spawn_requests WHERE user_id=? AND state='awaiting_user' AND item_id IS NOT NULL").all(userId)) stamp(row.item_id, 'spawn', row)

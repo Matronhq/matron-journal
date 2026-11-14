@@ -41,6 +41,8 @@ import { isTwoFactorEnabled, classifyCode } from './two-factor.js'
 import { fileNotice } from './sharing-events.js'
 import { sanitizePeerText, plainText } from './peer-text.js'
 import { restampConsentItems } from './consent-subject.js'
+import { emitMarker } from './items-http.js'
+import { getItem } from './items.js'
 
 // A key's name is a label in the apps, like a device name (http.js).
 const KEY_NAME_MAX = 40
@@ -51,6 +53,20 @@ const keyView = (r) => ({
 })
 
 const keyRow = (db, keyId) => db.prepare('SELECT * FROM approval_keys WHERE key_id=?').get(keyId)
+
+// Consent items restamped (src/consent-subject.js restampConsentItems: a
+// box protected or renamed, the account's first key added or its last
+// removed) reach the user's apps as an `updated` marker. `who` is the
+// request's caller, or the user's own name when the journal or the host
+// restamps (a client `who` with no device). From the host (matron-admin,
+// whose hub is a stub) the marker is written but not sent live.
+export function announceRestamped(ctx, who, ids) {
+  for (const id of ids) {
+    const item = getItem(ctx.db, who.userId, id)
+    if (item) emitMarker(ctx, who, { item, action: 'updated', fallback: false })
+  }
+}
+export const asUser = (userId) => ({ userId, kind: 'client', deviceId: null })
 
 // A key added to or removed from the account: a notice in the user's For
 // you list, pushed to every device. Once per key and direction.
@@ -70,7 +86,7 @@ export function announceKey(ctx, userId, key, { added, how }) {
   // first key added or its last removed changes that. Best-effort; the
   // answer path decides afresh either way.
   try {
-    restampConsentItems(ctx.db, userId)
+    announceRestamped(ctx, asUser(userId), restampConsentItems(ctx.db, userId))
   } catch (err) {
     console.error('approval keys: restamping consent items failed', err)
   }

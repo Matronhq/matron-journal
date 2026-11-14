@@ -84,6 +84,12 @@ async function world(t, { withKey = true } = {}) {
 const spawnSubject = (w, id) => ({ op: 'spawn', ask: id, box: 'box-b', workdir: WORKDIR, task_sha256: sha(TASK), decision: 'approve' })
 const invalid = (r, reason) => assert.deepEqual([r.status, r.json], [400, { error: 'approval_invalid', reason }])
 const required = (r) => assert.deepEqual([r.status, r.json], [403, { error: 'approval_required' }])
+// A restamp reaches an app that syncs by `GET /items?since=` (the item's
+// updated_at moves) and one that follows the journal (an `updated` marker).
+const tick = () => new Promise((r) => setTimeout(r, 5))
+const sinceIds = async (w, since) => (await w.user(`/items?label=consent&since=${since}`)).json.items.map((i) => i.id)
+const updatedMarkers = (db, itemId) => db.prepare("SELECT payload FROM events WHERE type='item'").all()
+  .map((r) => JSON.parse(r.payload)).filter((p) => p.action === 'updated' && p.item_id === itemId).length
 const nonces = (w) => w.s.db.prepare('SELECT COUNT(*) n FROM approval_nonces WHERE used_at IS NOT NULL').get().n
 
 test('consentSubject: the four shapes; a value over 200 characters goes in as <name>_sha256', () => {
@@ -383,11 +389,19 @@ test('protecting a box restamps the open consent items aimed at it', async (t) =
   const itemId = getSpawn(w.s.db, id).item_id
   const stamp = () => w.s.db.prepare('SELECT step_up, subject FROM items WHERE id=?').get(itemId)
   assert.equal(stamp().step_up, 0)
+  await tick()
+  let since = Date.now()
   await w.protect()
   assert.equal(stamp().step_up, 1)
   assert.deepEqual(JSON.parse(stamp().subject), spawnSubject(w, id))
+  assert.deepEqual(await sinceIds(w, since), [itemId])
+  assert.equal(updatedMarkers(w.s.db, itemId), 1)
+  await tick()
+  since = Date.now()
   await w.protect(false)
   assert.deepEqual(stamp(), { step_up: 0, subject: null })
+  assert.deepEqual(await sinceIds(w, since), [itemId])
+  assert.equal(updatedMarkers(w.s.db, itemId), 2)
 })
 
 test('the account\'s first approval key restamps the open consent items aimed at a protected box', async (t) => {
@@ -397,11 +411,37 @@ test('the account\'s first approval key restamps the open consent items aimed at
   const itemId = getSpawn(w.s.db, id).item_id
   assert.equal(w.s.db.prepare('SELECT step_up FROM items WHERE id=?').get(itemId).step_up, 0)
   const { secret } = await enableTwoFactor(w.s, w.token)
-  await enrolKeyByPassword(w.s, { token: w.token, userId: w.alice.id, secret })
+  await tick()
+  const since = Date.now()
+  const key = await enrolKeyByPassword(w.s, { token: w.token, userId: w.alice.id, secret })
   const item = (await w.user(`/items/${itemId}`)).json.item
   assert.equal(item.step_up, true)
   assert.deepEqual(item.subject, spawnSubject(w, id))
+  assert.ok((await sinceIds(w, since)).includes(itemId), 'an app syncing by since sees the new mark')
+  assert.equal(updatedMarkers(w.s.db, itemId), 1)
   required(await w.spawnAnswer(id, 'approve'))
+  // The last key removed: back to unsigned, and said so the same way.
+  await tick()
+  const since2 = Date.now()
+  const approval = await signAccount(w.s, { token: w.token, key, subject: { op: 'revoke_key', key_id: key.keyId } })
+  assert.equal((await w.user(`/approval-keys/${key.keyId}/revoke`, { method: 'POST', body: { approval } })).status, 200)
+  const after = (await w.user(`/items/${itemId}`)).json.item
+  assert.deepEqual([after.step_up, after.subject], [false, null])
+  assert.ok((await sinceIds(w, since2)).includes(itemId))
+  assert.equal(updatedMarkers(w.s.db, itemId), 2)
+})
+
+test('matron-admin device protected restamps the open consent items, moving their updated_at and filing the marker', async (t) => {
+  const w = await world(t)
+  const id = await w.parkSpawn()
+  const itemId = getSpawn(w.s.db, id).item_id
+  await tick()
+  const since = Date.now()
+  await runAdmin(w.s.db, ['device', 'protected', String(w.target.deviceId), 'on'])
+  const item = (await w.user(`/items/${itemId}`)).json.item
+  assert.equal(item.step_up, true)
+  assert.deepEqual(await sinceIds(w, since), [itemId])
+  assert.equal(updatedMarkers(w.s.db, itemId), 1)
 })
 
 test('an item hand-over to or from a protected box needs the user\'s tap, as for a user-only one', async () => {
