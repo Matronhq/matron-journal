@@ -3747,9 +3747,10 @@ access (`matron-admin`, the loopback `POST /link/preapprove`); the password
 reset by email. The journal's check is not the gate for a protected box:
 the box's own check against its pinned keys is, and a box must never trust
 the journal's word that a statement was valid. The journal's nonce gives
-freshness; it checks `signed_at` only loosely (within a minute of the
-nonce's issue and of its own clock, so a skewed device clock is caught
-here rather than at the box); a box checks it against its own window.
+freshness; it checks `signed_at` only loosely (no more than a minute before
+the nonce was issued, nor more than a minute ahead of its own clock, so a
+skewed device clock is caught here rather than at the box); a box checks it
+against its own window.
 
 **An account with no active approval key behaves exactly as before.**
 Every guard below lets the request through unsigned; an `approval` sent
@@ -3854,7 +3855,7 @@ string, below.)
 | `user` | non-empty string | The account's name, as signed in with (`users.name`) |
 | `key_id` | non-empty string | The signing key |
 | `nonce` | non-empty string | From `POST /approvals/nonce`, issued to the signing device |
-| `signed_at` | safe integer, ms | When the device signed. Not checked by the journal; a box checks it |
+| `signed_at` | safe integer, ms | When the device signed, by its clock. The journal refuses it (`mismatch`) when it is more than 60 seconds before the nonce was issued or more than 60 seconds ahead of the journal's clock (*Checking an approval*); a box checks it against its own window |
 | `subject` | flat object | What the action is about (above). Required on every type; may be `{}` |
 | `item` | `{id, num, reply_to}` | `item_tap` only, exactly these three keys: the item's `it_…` id (string), its `#num` (integer), and the id of the comment whose button was tapped, or `null` for the item's own buttons |
 | `action` | non-empty string | `item_tap` only: the button label, as the tap sends it |
@@ -4640,7 +4641,13 @@ reach a sleeping box only after it has been woken (up to
 to a box that is off is delivered at its next `hello`, and a transfer is
 released only once its upload completes, so a forwarded consent can be
 minutes to hours old. The reference tool's five-minute default suits taps
-and unlocks only; the caller picks the window for each kind.
+and unlocks only; the caller picks the window for each kind. The journal's
+own bound on `signed_at` is a check on the device's clock, not a freshness
+window: it takes a statement while its nonce is under five minutes old and
+`signed_at` is no more than a minute before the nonce was issued, so a tap
+the journal accepts can already be up to six minutes past its `signed_at`
+when it is forwarded. A box with a shorter window refuses such a tap as
+`stale`.
 
 **Notes for a bridge.**
 
@@ -4678,7 +4685,12 @@ the caller's.
   `reply_to` is the id of the follow-up comment whose buttons were tapped,
   or `null` for the item's own buttons, so a "Yes" on a follow-up never
   passes for the item's own button; `prompt_digest` (lowercase hex) and
-  `item_id` (the item's `it_` id) are optional and compared when given. For
+  `item_id` (the item's `it_` id) are optional and compared when given. A
+  bridge should always pass `prompt_digest` for a tap, computed from the
+  words it asked: without it, a statement signed for the same item, button
+  and `reply_to` still verifies after the question's words have changed (one
+  the journal refused as a `mismatch` and could forward anyway), as long as
+  its nonce is new to the box and `signed_at` is within `maxAgeMs`. For
   the other types all five must be absent. Any other key is a `TypeError`,
   as is a malformed `expect`, `now` or `maxAgeMs`. A bad approval or bad
   keys never throw. `maxAgeMs` defaults to five minutes; `signed_at` more
@@ -4781,7 +4793,8 @@ in to the account, with no key:
 2. or `POST /approval-keys/:key_id/revoke {password, code}` removes the key
    and leaves the phone signed in (sign it out too);
 3. with no device signed in, the password reset by email signs every
-   client out (keys detached, not removed); sign in again and do 1 or 2;
+   client out (keys detached, not removed, and the phone's device row gone,
+   so 1 answers `404`); sign in again and do 2;
 4. with the authenticator lost as well, the operator runs
    `matron-admin approval-key revoke <user> <key_id|--all>` on the host
    (and `matron-admin user 2fa-reset <user>` if needed).

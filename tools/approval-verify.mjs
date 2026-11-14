@@ -39,6 +39,13 @@
 //   stale          signed_at is older than maxAgeMs (default 5 minutes) or
 //                  more than 60 seconds in the future
 //
+// Freshness: pick maxAgeMs per kind of request. The five-minute default
+// suits taps and unlocks only. The journal forwards a consent approval (a
+// spawn, a chat invite, a file transfer) when the box can take it: after a
+// wake, at the box's next hello, once an upload completes, so it can be
+// minutes to hours old when it arrives. A window too short for the kind
+// refuses genuine approvals as stale.
+//
 // Single use is the CALLER's job. This file keeps no state: after a successful
 // verify, record statement.nonce in your own ledger (inside the same
 // transaction as the action, ideally) and refuse a nonce seen before.
@@ -55,7 +62,10 @@
 // comment whose buttons were tapped, or null for the item's own buttons (a
 // follow-up's "Yes" must not pass for the item's). prompt_digest (lowercase
 // hex, the digest of the question's words as the box asked them) and
-// item_id (the item's id string) are optional and compared when given. For
+// item_id (the item's id string) are optional and compared when given; a
+// bridge should always pass prompt_digest for a tap, or a statement signed
+// for the same item, button and reply_to verifies after the question's words
+// changed (while its nonce is new to you and signed_at in the window). For
 // consent and account all five must be absent. Any other key in expect (a
 // misspelling, say) is a TypeError.
 //
