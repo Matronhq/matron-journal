@@ -6,7 +6,7 @@
 import { json, readBody } from './http-body.js'
 import { normaliseEmail, setUserEmail, getUserEmail, findResetTarget, issueResetToken, resetPassword, resetEmail, EMAIL_MAX } from './password-reset.js'
 import { verifyUserPassword } from './auth.js'
-import { securityLogOf } from './security-log.js'
+import { securityLogOf, deviceTarget } from './security-log.js'
 
 const PASSWORD_MIN = 8
 const clientIp = (req) => req.headers['cf-connecting-ip'] || req.socket.remoteAddress || 'unknown'
@@ -32,10 +32,17 @@ export async function handlePasswordResetRoute(ctx, req, res, url, { rejectEarly
     if (!mailer) { json(res, 503, { error: 'unavailable' }); return true }
     const target = findResetTarget(db, identifier)
     // Asked for an account that exists, whether or not it has an address
-    // (the security log; anyone may ask, so no one is named as deciding);
-    // the answer below stays the same either way.
-    const account = target ?? (identifier.includes('@') ? null : db.prepare('SELECT id FROM users WHERE name=?').get(identifier.trim()))
-    if (account) securityLogOf(ctx).record(account.id, 'password_reset_requested', {})
+    // (the security log; anyone may ask, so no one is named as deciding):
+    // looked up and recorded after the answer, so an existing account and
+    // an unknown one take the same time to answer.
+    setImmediate(() => {
+      try {
+        const account = target ?? (identifier.includes('@') ? null : db.prepare('SELECT id FROM users WHERE name=?').get(identifier.trim()))
+        if (account) securityLogOf(ctx).record(account.id, 'password_reset_requested', {})
+      } catch (err) {
+        log.error(`security log: password_reset_requested not recorded (${err?.message || err})`)
+      }
+    })
     const token = target && issueResetToken(db, target.id)
     if (token) {
       const link = `${mailer.publicUrl}/app/reset-password#token=${token}`
@@ -58,6 +65,8 @@ export async function handlePasswordResetRoute(ctx, req, res, url, { rejectEarly
     // Nor may a two-factor sign-in started with the old password finish.
     signInTickets.dropUser(r.userId)
     securityLogOf(ctx).record(r.userId, 'password_changed', { decidedBy: 'user' })
+    // Every client it signed out, by no device.
+    for (const id of r.signedOutIds ?? []) securityLogOf(ctx).record(r.userId, 'device_revoked', { deviceId: null, target: deviceTarget(id), decidedBy: 'user' })
     json(res, 200, { ok: true, signed_out: r.signedOut })
     return true
   }

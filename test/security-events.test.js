@@ -12,10 +12,10 @@ import { startTestServer, makeWsClient } from './helpers.js'
 import { openDb } from '../src/db.js'
 import { createUser, createAgent, createClientDevice } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
-import { issueNonce } from '../src/approval-keys.js'
+import { recordJoined } from '../src/participants.js'
 import { base32Decode, hotp, totpStep, setTwoFactorRequired } from '../src/two-factor.js'
 import {
-  makeSecurityLog, readSecurityEvents, resolveSecurityFeed, SECURITY_EVENT_KEEP_MS,
+  makeSecurityLog, readSecurityEvents, resolveSecurityFeed, sweepSecurityEvents, SECURITY_EVENT_KEEP_MS,
 } from '../src/security-log.js'
 import { runAdmin } from '../bin/matron-admin.js'
 import {
@@ -38,7 +38,7 @@ function capture() {
     of: (event) => lines.map((l) => JSON.parse(l)).filter((e) => e.event === event),
   }
 }
-const serverOpts = (cap, extra = {}) => ({ securityLog: { out: cap.out }, securityFeed: { token: FEED_TOKEN, account: 'alice' }, ...extra })
+const serverOpts = (cap, extra = {}) => ({ securityLog: { out: cap.out, file: null }, securityFeed: { token: FEED_TOKEN, account: 'alice' }, ...extra })
 const feed = (s, query = '', token = FEED_TOKEN) => s.http(`/security-events${query}`, { token })
 
 async function journal(t, extra = {}) {
@@ -54,6 +54,20 @@ function one(cap, name, from = 0) {
   const hits = cap.all().slice(from).filter((e) => e.event === name)
   assert.equal(hits.length, 1, `${name}: ${JSON.stringify(cap.all().slice(from))}`)
   return hits[0]
+}
+// No secret in any line: every field that is not a number (a 6-digit code
+// may well turn up among the digits of a timestamp or an id).
+const TEXT_FIELDS = ['kind', 'event', 'account', 'device_name', 'source_ip', 'target', 'decided_by']
+function assertNoSecrets(cap, secrets) {
+  const list = secrets.filter((x) => typeof x === 'string' && x.length > 0)
+  assert.ok(list.length > 0)
+  for (const e of cap.all()) {
+    for (const f of TEXT_FIELDS) {
+      const v = e[f]
+      if (v == null) continue
+      for (const x of list) assert.ok(!String(v).includes(x), `${e.event}.${f} carries a secret: ${v}`)
+    }
+  }
 }
 const pick = (e) => ({ account: e.account, device_id: e.device_id, device_name: e.device_name, target: e.target, decided_by: e.decided_by })
 
@@ -106,9 +120,9 @@ test('seq survives a restart on the same database file, and the 30-day sweep nev
   log = makeSecurityLog({ db, out: cap.out, file: null })
   log.record(alice.id, 'two_factor_changed', { target: 'enable' })
   assert.deepEqual(cap.all().map((e) => e.seq), [3])
-  // The sweep the approval nonces get removes the month-old rows, keeps the
-  // counter: the next number is 4, and the feed's last_seq still says 3.
-  issueNonce(db, { userId: alice.id, deviceId: createClientDevice(db, alice.id, 'phone').deviceId })
+  // The 30-day sweep removes the month-old rows and keeps the counter: the
+  // next number is 4, and the feed's last_seq still says 3.
+  sweepSecurityEvents(db)
   assert.deepEqual(db.prepare('SELECT seq FROM security_events WHERE user_id=? ORDER BY seq').all(alice.id).map((r) => r.seq), [3])
   db.prepare('DELETE FROM security_events').run()
   assert.equal(readSecurityEvents(db, alice.id).last_seq, 3)
@@ -142,19 +156,46 @@ test('the file sink appends each line; an unwritable path warns once and recordi
   db.close()
 })
 
-test('an event recorded inside a transaction that rolls back is still recorded, once it has rolled back', async () => {
+test('inside a transaction: a failure event marked to survive is kept though it rolls back; any other event goes with it', async () => {
   const db = openDb(':memory:')
   const alice = await createUser(db, 'alice', 'pw-alice-1')
   const cap = capture()
   const log = makeSecurityLog({ db, out: cap.out, file: null })
   assert.throws(() => db.transaction(() => {
-    log.record(alice.id, 'approval_invalid', { target: 'signature' })
+    log.record(alice.id, 'approval_invalid', { target: 'signature' }, { evenIfRolledBack: true })
+    log.record(alice.id, 'password_changed', { decidedBy: 'user' })
     throw new Error('refused')
   })())
   await tick(0)
   assert.deepEqual(cap.all().map((e) => [e.seq, e.event, e.target]), [[1, 'approval_invalid', 'signature']])
-  assert.equal(readSecurityEvents(db, alice.id).events.length, 1)
+  // A success event in a transaction that commits: recorded once, its line
+  // only after the commit.
+  db.transaction(() => {
+    log.record(alice.id, 'password_changed', { decidedBy: 'user' })
+    assert.equal(cap.lines.length, 1)
+  })()
+  await tick(0)
+  assert.deepEqual(cap.all().map((e) => [e.seq, e.event]), [[1, 'approval_invalid'], [2, 'password_changed']])
+  assert.deepEqual(readSecurityEvents(db, alice.id).events, cap.all())
   db.close()
+})
+
+test('the retention schedule sweeps rows past 30 days on a journal with no approval keys; numbers are never reused', async (t) => {
+  const cap = capture()
+  const s = await startTestServer(serverOpts(cap, { retentionIntervalMs: 40 }))
+  t.after(() => s.close())
+  const alice = await createUser(s.db, 'alice', TEST_PASSWORD)
+  const old = Date.now() - SECURITY_EVENT_KEEP_MS - DAY
+  makeSecurityLog({ db: s.db, out: () => {}, file: null, now: () => old }).record(alice.id, 'client_signin', {})
+  const count = () => s.db.prepare('SELECT COUNT(*) n FROM security_events WHERE user_id=?').get(alice.id).n
+  assert.equal(count(), 1)
+  const t0 = Date.now()
+  while (count() > 0 && Date.now() - t0 < 3000) await tick(20)
+  assert.equal(count(), 0)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM approval_nonces').get().n, 0)
+  createClientDevice(s.db, alice.id, 'phone')
+  assert.equal((await s.http('/login', { method: 'POST', body: { username: 'alice', password: TEST_PASSWORD } })).status, 200)
+  assert.deepEqual(cap.all().map((e) => [e.seq, e.event]), [[2, 'client_signin']])
 })
 
 // ---- The feed -------------------------------------------------------------------
@@ -227,6 +268,17 @@ test('feed: since, limit, last_seq, one account only; bad tokens, device tokens 
   assert.equal((await s.http('/snapshot', { token: FEED_TOKEN })).status, 401)
 })
 
+test('feed: bad tokens spend the per-address budget /login and the alerts webhook share; once spent, the right token is refused too', async (t) => {
+  const { s } = await journal(t)
+  for (let i = 0; i < 5; i++) assert.equal((await feed(s, '', 'wrong-' + 'y'.repeat(40))).status, 401)
+  assert.equal((await feed(s, '', 'wrong-' + 'y'.repeat(40))).status, 429)
+  assert.equal((await feed(s)).status, 429)
+  // From another address the budget is untouched, and the right token alone
+  // never spends it.
+  const other = (token) => s.http('/security-events', { token, headers: { 'cf-connecting-ip': IP } })
+  for (let i = 0; i < 8; i++) assert.equal((await other(FEED_TOKEN)).status, 200)
+})
+
 // ---- Events at their sites -----------------------------------------------------
 
 test('client_signin: a password sign-in and a two-factor sign-in, each once, naming the new device and the caller address', async (t) => {
@@ -255,13 +307,16 @@ test('client_signin: a password sign-in and a two-factor sign-in, each once, nam
 test('two_factor_changed: setup, enable, recovery codes, disable from a device; enable at sign-in; admin reset', async (t) => {
   const { s, cap, alice } = await journal(t, { tokenKey: 'ab'.repeat(32) })
   const phone = createClientDevice(s.db, alice.id, 'phone')
-  const { secret } = await enableTwoFactor(s, phone.token)
+  const { secret, recoveryCodes } = await enableTwoFactor(s, phone.token)
+  const secrets = [TEST_PASSWORD, phone.token, secret, ...recoveryCodes]
   let tf = cap.of('two_factor_changed')
   assert.deepEqual(tf.map(pick), ['setup', 'enable'].map((target) => ({ account: 'alice', device_id: phone.deviceId, device_name: 'phone', target, decided_by: 'user' })))
   // A wrong code changes nothing and records nothing.
   assert.equal((await s.http('/2fa/recovery-codes', { method: 'POST', token: phone.token, body: { password: TEST_PASSWORD, code: '000000' } })).status, 403)
   assert.equal(cap.of('two_factor_changed').length, 2)
-  assert.equal((await s.http('/2fa/recovery-codes', { method: 'POST', token: phone.token, body: { password: TEST_PASSWORD, code: totpCode(s, alice.id, secret) } })).status, 200)
+  const codes = await s.http('/2fa/recovery-codes', { method: 'POST', token: phone.token, body: { password: TEST_PASSWORD, code: totpCode(s, alice.id, secret) } })
+  assert.equal(codes.status, 200)
+  secrets.push(...codes.json.recovery_codes)
   assert.equal((await s.http('/2fa/disable', { method: 'POST', token: phone.token, body: { password: TEST_PASSWORD, code: totpCode(s, alice.id, secret) } })).status, 200)
   tf = cap.of('two_factor_changed')
   assert.deepEqual(tf.map((e) => e.target), ['setup', 'enable', 'recovery_codes', 'disable'])
@@ -274,8 +329,10 @@ test('two_factor_changed: setup, enable, recovery codes, disable from a device; 
   assert.equal(login.json.error, 'two_factor_enrolment_required')
   const setup = await s.http('/login/2fa/setup', { method: 'POST', body: { ticket: login.json.two_factor_ticket } })
   assert.equal(setup.status, 200)
-  const en = await s.http('/login/2fa/enable', { method: 'POST', body: { ticket: login.json.two_factor_ticket, code: hotp(base32Decode(setup.json.secret), totpStep()) } })
+  const enrolCode = hotp(base32Decode(setup.json.secret), totpStep())
+  const en = await s.http('/login/2fa/enable', { method: 'POST', body: { ticket: login.json.two_factor_ticket, code: enrolCode } })
   assert.equal(en.status, 200)
+  secrets.push(login.json.two_factor_ticket, setup.json.secret, enrolCode, en.json.token, ...en.json.recovery_codes)
   const after = cap.all().slice(from)
   assert.deepEqual(after.map((e) => [e.event, e.target, e.device_id, e.decided_by]), [
     ['two_factor_changed', 'setup', null, 'user'],
@@ -290,6 +347,27 @@ test('two_factor_changed: setup, enable, recovery codes, disable from a device; 
   const at = cap.lines.length
   assert.equal((await s.http(`/users/${alice.id}/two-factor`, { method: 'DELETE', token: desk.token, body: {} })).status, 200)
   assert.deepEqual(pick(one(cap, 'two_factor_changed', at)), { account: 'alice', device_id: desk.deviceId, device_name: 'desk', target: 'reset', decided_by: 'admin' })
+  secrets.push(desk.token, 'pw-root-123')
+  assertNoSecrets(cap, secrets)
+})
+
+test('two-factor enabled with sign_out_others: a device_revoked for each client signed out, naming the device that asked', async (t) => {
+  const { s, cap, alice } = await journal(t, { tokenKey: 'ab'.repeat(32) })
+  const phone = createClientDevice(s.db, alice.id, 'phone')
+  const tablet = createClientDevice(s.db, alice.id, 'tablet')
+  const laptop = createClientDevice(s.db, alice.id, 'laptop')
+  createAgent(s.db, alice.id, 'box-a')
+  const st = await s.http('/2fa/setup', { method: 'POST', token: phone.token, body: { password: TEST_PASSWORD } })
+  const code = hotp(base32Decode(st.json.secret), totpStep())
+  const en = await s.http('/2fa/enable', { method: 'POST', token: phone.token, body: { code, sign_out_others: true } })
+  assert.equal(en.status, 200)
+  assert.equal(en.json.signed_out, 2)
+  assert.deepEqual(cap.all().slice(1).map((e) => [e.event, e.device_id, e.device_name, e.target, e.decided_by]), [
+    ['two_factor_changed', phone.deviceId, 'phone', 'enable', 'user'],
+    ['device_revoked', phone.deviceId, 'phone', `device:${tablet.deviceId}`, 'user'],
+    ['device_revoked', phone.deviceId, 'phone', `device:${laptop.deviceId}`, 'user'],
+  ])
+  assertNoSecrets(cap, [TEST_PASSWORD, phone.token, tablet.token, st.json.secret, code, ...en.json.recovery_codes])
 })
 
 test('password_changed: /password once, a wrong old password records nothing; the web admin on the target account; a completed email reset', async (t) => {
@@ -297,12 +375,22 @@ test('password_changed: /password once, a wrong old password records nothing; th
   const mailer = { publicUrl: 'https://journal.example', async send(m) { sent.push(m) } }
   const { s, cap, alice } = await journal(t, { mailer })
   const phone = createClientDevice(s.db, alice.id, 'phone')
+  const tablet = createClientDevice(s.db, alice.id, 'tablet')
+  const laptop = createClientDevice(s.db, alice.id, 'laptop')
+  createAgent(s.db, alice.id, 'box-a')
+  const secrets = [TEST_PASSWORD, 'not-the-password', 'new-password-1', 'admin-set-pw-1', 'reset-password-1', phone.token, tablet.token]
   assert.equal((await s.http('/password', { method: 'POST', token: phone.token, body: { old_password: 'not-the-password', new_password: 'new-password-1' } })).status, 401)
   assert.equal(cap.lines.length, 0)
-  assert.equal((await s.http('/password', { method: 'POST', token: phone.token, body: { old_password: TEST_PASSWORD, new_password: 'new-password-1' }, headers: { 'cf-connecting-ip': IP } })).status, 200)
+  const changed = await s.http('/password', { method: 'POST', token: phone.token, body: { old_password: TEST_PASSWORD, new_password: 'new-password-1', sign_out_others: true }, headers: { 'cf-connecting-ip': IP } })
+  assert.equal(changed.status, 200)
+  assert.equal(changed.json.signed_out, 2)
   const e = one(cap, 'password_changed')
   assert.deepEqual(pick(e), { account: 'alice', device_id: phone.deviceId, device_name: 'phone', target: null, decided_by: 'user' })
   assert.equal(e.source_ip, IP)
+  // The other clients it signed out, one event each; the box stays.
+  assert.deepEqual(cap.of('device_revoked').map((r) => [r.device_id, r.target, r.decided_by, r.source_ip]), [
+    [phone.deviceId, `device:${tablet.deviceId}`, 'user', IP], [phone.deviceId, `device:${laptop.deviceId}`, 'user', IP],
+  ])
 
   const root = await createUser(s.db, 'root', 'pw-root-123')
   s.db.prepare('UPDATE users SET is_admin=1 WHERE id=?').run(root.id)
@@ -319,16 +407,27 @@ test('password_changed: /password once, a wrong old password records nothing; th
   assert.equal(cap.lines.length, from)
   const known = await s.http('/password/forgot', { method: 'POST', body: { identifier: 'alice' }, headers: { 'cf-connecting-ip': IP } })
   assert.deepEqual([known.status, known.json], [unknown.status, unknown.json])
+  // Recorded once the answer has gone, so it takes no time of the request.
+  await tick(10)
   const req = one(cap, 'password_reset_requested', from)
   assert.deepEqual(pick(req), { account: 'alice', device_id: null, device_name: null, target: null, decided_by: null })
   assert.equal(req.source_ip, IP)
   await tick(10)
   const token = sent.at(-1).text.match(/#token=([A-Za-z0-9_-]+)/)[1]
+  secrets.push(token)
+  const spare = createClientDevice(s.db, alice.id, 'spare')
   from = cap.lines.length
   assert.equal((await s.http('/password/reset', { method: 'POST', body: { token: 'not-a-token', new_password: 'reset-password-1' } })).status, 400)
   assert.equal(cap.lines.length, from)
-  assert.equal((await s.http('/password/reset', { method: 'POST', body: { token, new_password: 'reset-password-1' } })).status, 200)
-  assert.deepEqual(pick(one(cap, 'password_changed', from)), { account: 'alice', device_id: null, device_name: null, target: null, decided_by: 'user' })
+  const reset = await s.http('/password/reset', { method: 'POST', body: { token, new_password: 'reset-password-1' } })
+  assert.equal(reset.status, 200)
+  // A reset signs every client out: each one recorded, by no device.
+  assert.deepEqual(cap.all().slice(from).map((x) => [x.event, x.device_id, x.target, x.decided_by]), [
+    ['password_changed', null, null, 'user'],
+    ['device_revoked', null, `device:${phone.deviceId}`, 'user'],
+    ['device_revoked', null, `device:${spare.deviceId}`, 'user'],
+  ])
+  assertNoSecrets(cap, secrets)
 })
 
 test('device_linked and bridge_paired: once each when the new device is minted, naming the approving device and the new one', async (t) => {
@@ -367,6 +466,11 @@ test('device_linked and bridge_paired: once each when the new device is minted, 
   const pc = await s.http('/pair/claim', { method: 'POST', body: { poll_token: pair.json.poll_token } })
   assert.equal(pc.json.status, 'approved')
   assert.deepEqual(pick(one(cap, 'bridge_paired', from)), { account: 'alice', device_id: phone.deviceId, device_name: 'phone', target: `device:${pc.json.device_id}`, decided_by: 'user' })
+  const codes = [start.json.link_code, pre.json.link_code, code.json.link_code, pair.json.pair_code]
+  assertNoSecrets(cap, [
+    ...codes, ...codes.map((c) => c.replace('-', '')), claim.json.claim_token, c2.json.claim_token, c3.json.claim_token, pair.json.poll_token,
+    phone.token, desk.token, poll.json.token, p2.json.token, p3.json.token, pc.json.token, s.preapproveKey,
+  ])
 })
 
 test('coordinator_changed, consent_switch_changed, device_protection_changed: once per real change', async (t) => {
@@ -389,9 +493,13 @@ test('coordinator_changed, consent_switch_changed, device_protection_changed: on
   assert.equal((await put({ consent: false })).status, 200)
   assert.equal((await put({ transfer_consent: true })).status, 200)
   assert.deepEqual(cap.of('consent_switch_changed').map((e) => [e.target, e.device_id, e.decided_by]), [['spawns', phone.deviceId, 'user'], ['transfers', phone.deviceId, 'user']])
-  assert.equal((await s.http(`/devices/${box.deviceId}/protected`, { method: 'POST', token: phone.token, body: { on: true } })).status, 200)
-  assert.equal((await s.http('/devices/99999/protected', { method: 'POST', token: phone.token, body: { on: true } })).status, 404)
-  assert.deepEqual(cap.of('device_protection_changed').map(pick), [{ account: 'alice', device_id: phone.deviceId, device_name: 'phone', target: `device:${box.deviceId}:on`, decided_by: 'user' }])
+  const protect = (on, id = box.deviceId) => s.http(`/devices/${id}/protected`, { method: 'POST', token: phone.token, body: { on } })
+  assert.equal((await protect(true)).status, 200)
+  assert.equal((await protect(true)).status, 200)
+  assert.equal((await protect(true, 99999)).status, 404)
+  assert.equal((await protect(false)).status, 200)
+  assert.deepEqual(cap.of('device_protection_changed').map(pick), ['on', 'off'].map((state) => (
+    { account: 'alice', device_id: phone.deviceId, device_name: 'phone', target: `device:${box.deviceId}:${state}`, decided_by: 'user' })))
 })
 
 test('device_revoked without a key: another device and yourself, once each; a device that is not yours records nothing', async (t) => {
@@ -500,12 +608,7 @@ test('approval keys: enrolled, attached, revoked, invalid, signed out, locked; d
   // Every line: the contract's shape, and nothing secret anywhere in it.
   const page = (await feed(s, '?since=0&limit=500')).json
   assert.deepEqual(page.events, cap.all())
-  for (const line of cap.lines) {
-    for (const x of secrets) assert.ok(!line.includes(x), `a line carries a secret: ${line}`)
-    const e = JSON.parse(line)
-    for (const v of [e.device_name, e.source_ip, e.target, e.decided_by, e.account]) assert.ok(v == null || !secrets.some((x) => String(v).includes(x)))
-    assert.ok(!line.includes('wrong-password') && !line.includes('never-applied'))
-  }
+  assertNoSecrets(cap, [...secrets, secret, 'wrong-password', 'never-applied-1', garbage.statement, forged.statement, forged.signature])
 })
 
 test('spawn_approved and chat_approved: by the user and by the Coordinator, once each; a decline or a lost race records nothing', async (t) => {
@@ -517,20 +620,22 @@ test('spawn_approved and chat_approved: by the user and by the Coordinator, once
   const spawnId = await parkSpawn(f)
   assert.equal((await f.s.http('/agent-spawn/answer', { method: 'POST', token: f.clientToken, body: { request_id: spawnId, decision: 'approve' } })).status, 200)
   assert.equal((await f.s.http('/agent-spawn/answer', { method: 'POST', token: f.clientToken, body: { request_id: spawnId, decision: 'approve' } })).status, 409)
-  assert.deepEqual(cap.of('spawn_approved').map(pick), [{ account: 'alice', device_id: clientDevice, device_name: 'mac', target: `device:${f.targetDev.deviceId}`, decided_by: 'user' }])
+  // The target box by its name at the time of the answer.
+  assert.deepEqual(cap.of('spawn_approved').map(pick), [{ account: 'alice', device_id: clientDevice, device_name: 'mac', target: 'box:opal', decided_by: 'user' }])
   await parkInviteAsk(f)
   assert.equal((await f.s.http('/agent-chat/answer', { method: 'POST', token: f.clientToken, body: { room_id: 'room', target_device_id: f.targetDev.deviceId, decision: 'deny' } })).status, 200)
   assert.equal(cap.of('chat_approved').length, 0)
 
-  // The Coordinator's answer.
+  // The Coordinator's answer, after the box was renamed.
+  assert.equal((await f.s.http(`/devices/${f.targetDev.deviceId}/rename`, { method: 'POST', token: f.clientToken, body: { name: 'opal-2' } })).status, 200)
   assert.equal((await f.s.http('/coordinator', { method: 'PUT', token: f.clientToken, body: { consent: true } })).status, 200)
   await parkInviteAsk(f)
   const r = await answer(f, f.coordDev.token, { kind: 'chat', id: `room/${f.targetDev.deviceId}`, decision: 'approve', reason: 'a review between two sessions' })
   assert.equal(r.status, 200)
-  assert.deepEqual(cap.of('chat_approved').map(pick), [{ account: 'alice', device_id: f.coordDev.deviceId, device_name: 'coord-box', target: `device:${f.targetDev.deviceId}`, decided_by: 'coordinator' }])
+  assert.deepEqual(cap.of('chat_approved').map(pick), [{ account: 'alice', device_id: f.coordDev.deviceId, device_name: 'coord-box', target: 'box:opal-2', decided_by: 'coordinator' }])
   const s2 = await parkSpawn(f, { rid: 'q2' })
   assert.equal((await answer(f, f.coordDev.token, { kind: 'spawn', id: s2, decision: 'approve', reason: 'the asker needs a hand' })).status, 200)
-  assert.deepEqual(cap.of('spawn_approved').map((e) => [e.device_id, e.decided_by]), [[clientDevice, 'user'], [f.coordDev.deviceId, 'coordinator']])
+  assert.deepEqual(cap.of('spawn_approved').map((e) => [e.device_id, e.target, e.decided_by]), [[clientDevice, 'box:opal', 'user'], [f.coordDev.deviceId, 'box:opal-2', 'coordinator']])
   assert.ok(cap.all().every((e) => !JSON.stringify(e).includes('fix the flaky test') && !JSON.stringify(e).includes('need eyes on the diff')))
 })
 
@@ -538,19 +643,24 @@ test('session_started_direct and coordinator_carry_on: from the WebSocket, once 
   const cap = capture()
   const f = await fleet(t, serverOpts(cap, { sessionControlTimeoutMs: 300 }))
   const clientDevice = cap.of('client_signin')[0].device_id
+  // Renamed after their sockets said hello: the lines carry today's names.
+  const rename = (id, name) => f.s.http(`/devices/${id}/rename`, { method: 'POST', token: f.clientToken, body: { name } })
+  assert.equal((await rename(f.targetDev.deviceId, 'opal-2')).status, 200)
+  assert.equal((await rename(clientDevice, 'mac-2')).status, 200)
+  assert.equal((await rename(f.coordDev.deviceId, 'coord-2')).status, 200)
   f.client.send({ op: 'agent_request', request_id: 'r1', agent_device_id: f.targetDev.deviceId, method: 'start', params: { workdir: '/w', prompt: 'a secret prompt' } })
   await f.target.waitFor((x) => x.kind === 'rpc' && x.request?.request_id === 'r1')
   f.client.send({ op: 'agent_request', request_id: 'r2', agent_device_id: f.targetDev.deviceId, method: 'recent_folders' })
   await f.target.waitFor((x) => x.kind === 'rpc' && x.request?.request_id === 'r2')
   const e = one(cap, 'session_started_direct')
-  assert.deepEqual(pick(e), { account: 'alice', device_id: clientDevice, device_name: 'mac', target: `device:${f.targetDev.deviceId}`, decided_by: 'user' })
+  assert.deepEqual(pick(e), { account: 'alice', device_id: clientDevice, device_name: 'mac-2', target: 'box:opal-2', decided_by: 'user' })
   assert.equal(e.source_ip, null)
 
   f.coord.send({ op: 'session_control', request_id: 'c1', from_convo_id: 'coord', target_convo_id: 'ask', action: 'carry_on', message: 'carry on quietly' })
   await f.coord.waitFor((x) => x.kind === 'session_control' && x.event === 'sent')
   f.coord.send({ op: 'session_control', request_id: 'c2', from_convo_id: 'coord', target_convo_id: 'ask', action: 'compact' })
   await f.coord.waitFor((x) => x.kind === 'session_control' && x.event === 'sent' && x.request_id === 'c2')
-  assert.deepEqual(pick(one(cap, 'coordinator_carry_on')), { account: 'alice', device_id: f.coordDev.deviceId, device_name: 'coord-box', target: 'convo:ask', decided_by: 'coordinator' })
+  assert.deepEqual(pick(one(cap, 'coordinator_carry_on')), { account: 'alice', device_id: f.coordDev.deviceId, device_name: 'coord-2', target: 'convo:ask', decided_by: 'coordinator' })
   assert.ok(cap.lines.every((l) => !l.includes('secret prompt') && !l.includes('carry on quietly')))
   await f.coord.waitFor((x) => x.kind === 'session_control' && x.event === 'result' && x.request_id === 'c2', 3000)
 })
@@ -576,8 +686,11 @@ test('the admin CLI: device revoke, protection, chat approve, password, two-fact
   s.db.prepare("INSERT INTO two_factor(user_id, secret, enabled_at) VALUES(?, 'sealed', ?) ON CONFLICT(user_id) DO UPDATE SET secret='sealed'").run(alice.id, Date.now())
   await admin('user', '2fa-reset', 'alice')
   await admin('user', '2fa-reset', 'alice')
+  await admin('device', 'protected', String(f.targetDev.deviceId), 'on')
+  await admin('agent', 'add', 'alice', 'box-b')
+  const boxB = s.db.prepare("SELECT id FROM devices WHERE name='box-b'").get().id
   assert.deepEqual(cap.all().map((e) => [e.account, e.event, e.target, e.device_id, e.device_name, e.source_ip, e.decided_by]), [
-    ['alice', 'chat_approved', `device:${f.targetDev.deviceId}`, null, null, null, 'admin_cli'],
+    ['alice', 'chat_approved', 'box:opal', null, null, null, 'admin_cli'],
     ['alice', 'device_protection_changed', `device:${f.targetDev.deviceId}:on`, null, null, null, 'admin_cli'],
     ['alice', 'consent_switch_changed', 'transfers', null, null, null, 'admin_cli'],
     ['alice', 'password_changed', null, null, null, null, 'admin_cli'],
@@ -585,6 +698,81 @@ test('the admin CLI: device revoke, protection, chat approve, password, two-fact
     ['alice', 'device_revoked', `device:${phone.deviceId}`, null, null, null, 'admin_cli'],
     ['alice', 'approval_key_revoked', 'key:abababab', null, null, null, 'admin_cli'],
     ['alice', 'two_factor_changed', 'reset', null, null, null, 'admin_cli'],
+    ['alice', 'bridge_paired', `device:${boxB}`, null, null, null, 'admin_cli'],
   ])
-  assert.ok(cap.lines.every((l) => !l.includes('cli-password-1')))
+  assertNoSecrets(cap, ['cli-password-1'])
+})
+
+test("the admin CLI's own log, on a second connection to the journal's file: no stdout line, the line in MATRON_SECURITY_LOG, the event in the feed", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'security-cli-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const cap = capture()
+  const s = await startTestServer(serverOpts(cap, { dbPath: path.join(dir, 'journal.db') }))
+  t.after(() => s.close())
+  const alice = await createUser(s.db, 'alice', TEST_PASSWORD)
+  createClientDevice(s.db, alice.id, 'phone')
+  assert.equal((await s.http('/login', { method: 'POST', body: { username: 'alice', password: TEST_PASSWORD } })).status, 200)
+  const box = createAgent(s.db, alice.id, 'box-a')
+  const file = path.join(dir, 'security.log')
+  const saved = process.env.MATRON_SECURITY_LOG
+  process.env.MATRON_SECURITY_LOG = file
+  t.after(() => { if (saved === undefined) delete process.env.MATRON_SECURITY_LOG; else process.env.MATRON_SECURITY_LOG = saved })
+  const db2 = openDb(path.join(dir, 'journal.db'))
+  t.after(() => db2.close())
+  const written = []
+  const write = t.mock.method(process.stdout, 'write', function (chunk, ...rest) { written.push(String(chunk)); return true })
+  let out
+  try {
+    out = await runAdmin(db2, ['device', 'protected', String(box.deviceId), 'on'])
+  } finally {
+    write.mock.restore()
+  }
+  assert.match(out, /protected/)
+  assert.ok(!written.some((w) => w.includes('matron_security')))
+  const lines = fs.readFileSync(file, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+  assert.deepEqual(lines.map((e) => [e.seq, e.event, e.target, e.decided_by]), [[2, 'device_protection_changed', `device:${box.deviceId}:on`, 'admin_cli']])
+  // The journal's counter and feed see it: one sequence for both writers.
+  const page = (await feed(s, '?since=0')).json
+  assert.deepEqual(page.events.map((e) => e.event), ['client_signin', 'device_protection_changed'])
+  assert.deepEqual(page.events[1], lines[0])
+})
+
+test('transfer_approved: an approve of a file-transfer ask by the user and by the Coordinator, once each; a decline records nothing', async (t) => {
+  const cap = capture()
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'security-transfer-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const s = await startTestServer(serverOpts(cap, { dbPath: path.join(dir, 'journal.db'), transferMaxBytes: 100, transferUserQuotaBytes: 1000, transferChunkBytes: 10 }))
+  t.after(() => s.close())
+  const alice = await createUser(s.db, 'alice', TEST_PASSWORD)
+  const a = createAgent(s.db, alice.id, 'box-a')
+  const b = createAgent(s.db, alice.id, 'box-b')
+  const coord = createAgent(s.db, alice.id, 'coord-box')
+  const phone = createClientDevice(s.db, alice.id, 'phone')
+  const convo = (id, deviceId) => upsertConversation(s.db, { id, ownerUserId: alice.id, title: id, agentDeviceId: deviceId })
+  convo('room', a.deviceId); convo('sess-a', a.deviceId); convo('sess-b', b.deviceId); convo('coord', coord.deviceId)
+  recordJoined(s.db, { convoId: 'room', agentDeviceId: b.deviceId, initiatorDeviceId: a.deviceId })
+  assert.equal((await s.http('/coordinator', { method: 'PUT', token: phone.token, body: { convo_id: 'coord' } })).status, 200)
+  const create = async () => {
+    const r = await s.http('/transfers', { method: 'POST', token: a.token, body: {
+      room_id: 'room', from_convo_id: 'sess-a', name: 'notes.txt', size: 25, sha256: 'a'.repeat(64),
+      content_type: 'text/plain', reason: 'the notes you asked for', scan: { verdict: 'clean', findings: [] },
+    } })
+    assert.equal(r.status, 201, JSON.stringify(r.json))
+    return r.json.transfer_id
+  }
+  const itemOf = (id) => s.db.prepare('SELECT item_id FROM transfers WHERE id=?').get(id).item_id
+  const tap = (id, action) => s.http(`/items/${itemOf(id)}/comments`, { method: 'POST', token: phone.token, body: { action } })
+  const t1 = await create()
+  assert.equal((await tap(t1, 'Approve')).status, 200)
+  assert.equal((await tap(t1, 'Approve')).status, 409)
+  const t2 = await create()
+  assert.equal((await tap(t2, 'Decline')).status, 200)
+  const t3 = await create()
+  const r = await s.http('/consent/answer', { method: 'POST', token: coord.token, body: { convo_id: 'coord', kind: 'transfer', id: t3, decision: 'approve', reason: 'notes between my sessions' } })
+  assert.equal(r.status, 200, JSON.stringify(r.json))
+  assert.deepEqual(cap.of('transfer_approved').map(pick), [
+    { account: 'alice', device_id: phone.deviceId, device_name: 'phone', target: `transfer:${t1}`, decided_by: 'user' },
+    { account: 'alice', device_id: coord.deviceId, device_name: 'coord-box', target: `transfer:${t3}`, decided_by: 'coordinator' },
+  ])
+  assertNoSecrets(cap, ['notes.txt', 'the notes you asked for', 'notes between my sessions', a.token, phone.token])
 })

@@ -17,7 +17,7 @@ import { appendAndBroadcast } from './journal.js'
 import { recordConsentDecision, CONSENT_DECISION_EVENT_TYPE } from './consent.js'
 import { consentApproval, chatAskRow, approvalColumn } from './consent-subject.js'
 import { ApprovalRefused } from './approval-keys.js'
-import { securityLogOf, deviceTarget } from './security-log.js'
+import { securityLogOf, boxTarget } from './security-log.js'
 
 // Approvals of an ask aimed at a protected box (src/consent-subject.js):
 // the signature check and the state change it guards run in ONE
@@ -45,11 +45,12 @@ export function guardedApprove(db, check, apply) {
 const byCoordinator = (decidedBy) => decidedBy?.kind === 'coordinator'
 
 // An approval that has committed (the security log): by the user's tap or
-// the Coordinator's answer, from the device that sent it, for the box it
-// lets in.
-function recordApproved(ctx, userId, event, decidedBy, boxId) {
+// the Coordinator's answer, from the device that sent it. `target` names
+// what it lets through: the box by its current name (box:<name>), or the
+// transfer (transfer:<id>). Exported for the transfer kind.
+export function recordApproved(ctx, userId, event, decidedBy, target) {
   securityLogOf(ctx).record(userId, event, {
-    deviceId: decidedBy?.deviceId ?? null, target: deviceTarget(boxId), decidedBy: byCoordinator(decidedBy) ? 'coordinator' : 'user',
+    deviceId: decidedBy?.deviceId ?? null, target, decidedBy: byCoordinator(decidedBy) ? 'coordinator' : 'user',
   })
 }
 const stamp = (decidedBy) => (byCoordinator(decidedBy) ? { answeredBy: 'coordinator', answerReason: decidedBy.reason } : {})
@@ -114,7 +115,7 @@ export function answerChatAsk({ db, hub, waker, journalHost = null, securityLog 
     },
     (signed) => answerParkedInvite(db, { convoId: roomId, agentDeviceId: targetDeviceId, approve: true, ...stamp(decidedBy), approval: approvalColumn(signed) }))
   if (refused) return refused
-  recordApproved({ db, securityLog }, userId, 'chat_approved', decidedBy, targetDeviceId)
+  recordApproved({ db, securityLog }, userId, 'chat_approved', decidedBy, boxTarget(db, targetDeviceId))
   closeChatConsentItem({ db, hub }, roomId, targetDeviceId, { outcome: 'approved', answeredByDeviceId })
   recordAndAnnounce({ db, hub }, { userId, kind: 'chat', askId: `${roomId}/${targetDeviceId}`, decision, decidedBy, convoId: roomId, payload: { room_id: roomId, target_device_id: targetDeviceId } })
   // Join requests self-target (row.initiator_device_id === targetDeviceId,
@@ -166,7 +167,7 @@ export function answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, sp
     },
     (signed) => claimApprove(db, requestId, Date.now(), { ...stamp(decidedBy), approval: signed }))
   if (refused) return refused
-  recordApproved({ db, securityLog }, userId, 'spawn_approved', decidedBy, row.target_device_id)
+  recordApproved({ db, securityLog }, userId, 'spawn_approved', decidedBy, boxTarget(db, row.target_device_id))
   // The ask stopped waiting at the claim, so its tracker item closes now —
   // not at the outcome, which can be minutes away when the target box has
   // to be woken first. Left open, the item sits in the user's Decisions

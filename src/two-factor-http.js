@@ -278,12 +278,14 @@ export async function handleTwoFactorRoute(ctx, req, res, url, who) {
       // signed in with the password alone. Boxes (agent devices) are never
       // touched — they were paired from a signed-in client, not a password.
       write: () => (sign_out_others
-        ? db.prepare("DELETE FROM devices WHERE user_id=? AND kind='client' AND id<>?").run(who.userId, who.deviceId).changes
-        : 0),
+        ? db.prepare("DELETE FROM devices WHERE user_id=? AND kind='client' AND id<>? RETURNING id").all(who.userId, who.deviceId).map((d) => d.id).sort((a, b) => a - b)
+        : []),
     })
     if (!g.ok) return true
     recordChange(ctx, who.userId, 'enable', who)
-    json(res, 200, { recovery_codes: r.recoveryCodes, signed_out: g.value })
+    // Each client it signed out (the security log).
+    for (const id of g.value) securityLogOf(ctx).record(who.userId, 'device_revoked', { deviceId: who.deviceId, deviceName: who.name, target: deviceTarget(id), decidedBy: 'user' })
+    json(res, 200, { recovery_codes: r.recoveryCodes, signed_out: g.value.length })
     return true
   }
 

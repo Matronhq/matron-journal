@@ -94,8 +94,9 @@ export async function resetPassword(db, token, newPassword, now = Date.now()) {
     if (!user || accountState(db, row.user_id) !== row.account_state) return { ok: false }
     db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hash, row.user_id)
     db.prepare('DELETE FROM password_resets WHERE user_id=?').run(row.user_id)
-    const signedOut = db.prepare("DELETE FROM devices WHERE user_id=? AND kind='client'").run(row.user_id).changes
-    return { ok: true, userId: row.user_id, name: user.name, signedOut }
+    // The ids too, for the security log's device_revoked per device.
+    const signedOutIds = db.prepare("DELETE FROM devices WHERE user_id=? AND kind='client' RETURNING id").all(row.user_id).map((r) => r.id).sort((a, b) => a - b)
+    return { ok: true, userId: row.user_id, name: user.name, signedOut: signedOutIds.length, signedOutIds }
   })()
 }
 

@@ -5,7 +5,7 @@ import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { openDb } from './db.js'
 import { installApprovalLockdown } from './approval-keys-http.js'
-import { makeSecurityLog, installSecurityLog, resolveSecurityFeed } from './security-log.js'
+import { makeSecurityLog, installSecurityLog, resolveSecurityFeed, sweepSecurityEvents } from './security-log.js'
 import { makeLoginGuard, makeRateLimiter, DEFAULT_CLIENT_IDLE_DAYS, DEFAULT_CLIENT_IDLE_MS } from './auth.js'
 import { makeTwoFactorTickets, isTwoFactorRequired } from './two-factor.js'
 import { makeHttpHandler } from './http.js'
@@ -332,6 +332,14 @@ function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionInterval
       if (r.deleted > 0 || r.expired > 0) console.log(`retention: transfers — ${r.deleted} copy/copies deleted, ${r.expired} expired after 7 days uncollected`)
     } catch (err) {
       console.error('retention: transfer expiry run failed', err)
+    }
+    yield
+    // Security events past their 30 days (src/security-log.js), always on
+    // like the transfers: the per-account numbers stay, never reused.
+    try {
+      sweepSecurityEvents(db)
+    } catch (err) {
+      console.error('retention: security event sweep failed', err)
     }
   }
   // The first pass waits retentionInitialDelayMs (a restart is when every

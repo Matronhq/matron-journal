@@ -343,7 +343,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       if (await handleAlerts(req, res, url, { rejectEarly })) return
       // The security event feed: its own read-only Bearer token, bound to one
       // account, never a device token, so ahead of `who` too. Off, 404.
-      if (handleSecurityFeed({ db, feed: securityFeed, json }, req, res, url, { rejectEarly })) return
+      if (handleSecurityFeed({ db, feed: securityFeed, json, rateLimiter }, req, res, url, { rejectEarly })) return
       const who = bearer(req) && authToken(db, bearer(req), { now: clientIdleClock(), clientIdleMs })
       if (!who) return rejectEarly(req, res, 401, { error: 'unauthenticated' })
       // The tracker's own surface (src/items-http.js) — mounted first so
@@ -521,6 +521,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         if (r.revoked) return json(res, 401, { error: 'unauthenticated' })
         if (!r.ok) return json(res, 401, { error: 'bad_password' })
         securityLog.record(who.userId, 'password_changed', { deviceId: who.deviceId, deviceName: who.name, decidedBy: 'user' })
+        for (const id of r.signedOutIds ?? []) securityLog.record(who.userId, 'device_revoked', { deviceId: who.deviceId, deviceName: who.name, target: deviceTarget(id), decidedBy: 'user' })
         return json(res, 200, { ok: true, signed_out: r.signedOut })
       }
       if (req.method === 'GET' && url.pathname === '/devices') {
@@ -866,8 +867,10 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         if (typeof body.on !== 'boolean') return json(res, 400, { error: 'bad_request' })
         const deviceId = Number(pd[1])
         if (!db.prepare("SELECT 1 FROM devices WHERE id=? AND user_id=? AND kind='agent'").get(deviceId, who.userId)) return json(res, 404, { error: 'not_found' })
+        let changed = false
         const g = guardedAccountAction({ db, journalHost }, who, body, { op: 'protect_device', device: String(deviceId), on: String(body.on) }, {
           write: () => {
+            changed = !!db.prepare('SELECT protected FROM devices WHERE id=?').get(deviceId)?.protected !== body.on
             // A write that changes nothing (the device is gone) is the 404,
             // never a success; refused, so a nonce the check spent is rolled
             // back. (The check above runs in the same synchronous step, so
@@ -879,7 +882,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           },
         })
         if (!g.ok) return json(res, g.status, g.body)
-        securityLog.record(who.userId, 'device_protection_changed', { deviceId: who.deviceId, deviceName: who.name, target: `${deviceTarget(deviceId)}:${body.on ? 'on' : 'off'}`, decidedBy: 'user' })
+        if (changed) securityLog.record(who.userId, 'device_protection_changed', { deviceId: who.deviceId, deviceName: who.name, target: `${deviceTarget(deviceId)}:${body.on ? 'on' : 'off'}`, decidedBy: 'user' })
         announceRestamped(who, g.value)
         return json(res, 200, { ok: true, device_id: deviceId, protected: body.on })
       }

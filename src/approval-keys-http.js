@@ -147,7 +147,7 @@ function countEnrolmentFailure(ctx, res, who, now) {
   const lock = recordEnrolmentFailure(ctx.db, who, outcome, now)
   if (!lock) return
   const hours = ENROL_LOCK_MS[Math.min(lock.level, ENROL_LOCK_MS.length) - 1] / 3600000
-  securityLogOf(ctx).record(who.userId, 'enrolment_locked', { deviceId: who.deviceId, deviceName: who.name, target: `${hours}h`, decidedBy: 'journal' })
+  securityLogOf(ctx).record(who.userId, 'enrolment_locked', { deviceId: who.deviceId, deviceName: who.name, target: `${hours}h`, decidedBy: 'journal' }, { evenIfRolledBack: true })
   fileNotice(ctx, {
     userId: who.userId,
     title: `Approval key enrolment locked until ${shortTime(lock.until)}`,

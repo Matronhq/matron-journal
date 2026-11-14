@@ -10,7 +10,7 @@
 import crypto from 'node:crypto'
 import { parseStatement, verifySignature } from './approvals.js'
 import { signOutOwnedDevice } from './auth.js'
-import { sweepSecurityEvents, securityLogFor, deviceTarget } from './security-log.js'
+import { securityLogFor, deviceTarget } from './security-log.js'
 
 export const ALG = 'ES256'
 export const NONCE_TTL_MS = 5 * 60000
@@ -82,14 +82,11 @@ export function issueNonce(db, who, now = Date.now()) {
 }
 
 // Device failures after their review week; enrolment failures out of the
-// hour; locks that ended more than a week ago (their level has reset);
-// security events after their 30 days (src/security-log.js, which keeps the
-// per-account numbers apart from the rows).
+// hour; locks that ended more than a week ago (their level has reset).
 function sweepLockdownCounters(db, now) {
   db.prepare('DELETE FROM approval_failures WHERE at <= ?').run(now - FAILURE_KEEP_MS)
   db.prepare('DELETE FROM approval_enrol_failures WHERE at <= ?').run(now - ENROL_FAILURE_WINDOW_MS)
   db.prepare('DELETE FROM approval_enrol_locks WHERE until <= ?').run(now - ENROL_LEVEL_RESET_MS)
-  sweepSecurityEvents(db, now)
 }
 
 // The approval key a user's event is stamped with when the journal delivers
@@ -135,7 +132,7 @@ export function recordApprovalFailure(db, who, reason, now = Date.now()) {
   if (out) {
     securityLogFor(db).record(who.userId, 'device_signed_out_bad_signatures', {
       deviceId: out.device.id, deviceName: out.device.name, target: deviceTarget(out.device.id), decidedBy: 'journal',
-    })
+    }, { evenIfRolledBack: true })
     signedOutListeners.get(db)?.(who.userId, out)
   }
   return out
@@ -155,7 +152,7 @@ function noteInvalid(ctx, who, reason) {
   const { db } = ctx
   const now = ctx.now ?? Date.now()
   const run = () => {
-    securityLogFor(db).record(who.userId, 'approval_invalid', { deviceId: who.deviceId ?? null, target: reason })
+    securityLogFor(db).record(who.userId, 'approval_invalid', { deviceId: who.deviceId ?? null, target: reason }, { evenIfRolledBack: true })
     try {
       recordApprovalFailure(db, who, reason, now)
     } catch (err) {

@@ -15,7 +15,7 @@ import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem, reconc
 import { nudgeCoordinator, chatAskId } from './consent.js'
 import { isProtectedDevice, consentSubject } from './consent-subject.js'
 import { hasActiveKey, requireApproval, approvalKeyIdOfDevice, refuse, ApprovalRefused } from './approval-keys.js'
-import { securityLogFor, deviceTarget, convoTarget } from './security-log.js'
+import { securityLogFor, boxTarget, convoTarget } from './security-log.js'
 import { agentJournalFrame } from './hub.js'
 import { expireContactAsks } from './contacts.js'
 import { expireInviteAsks, onInviteAskExpired } from './federation-invite-asks.js'
@@ -1176,7 +1176,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // A session started on a box directly, not through a consent ask:
         // once it has gone to the box (the security log).
         if (msg.method === 'start') {
-          securityLog.record(conn.userId, 'session_started_direct', { deviceId: conn.deviceId, deviceName: conn.name, target: deviceTarget(msg.agent_device_id), decidedBy: 'user' })
+          securityLog.record(conn.userId, 'session_started_direct', { deviceId: conn.deviceId, target: boxTarget(db, msg.agent_device_id), decidedBy: 'user' })
         }
         break
       }
@@ -2446,7 +2446,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         conn.ws.send(JSON.stringify({ kind: 'session_control', event: 'sent', request_id: v.rid, ...(waking ? { target_waking: true } : {}) }))
         // Accepted (the security log): a carry-on names its target session.
         if (v.params.action === 'carry_on') {
-          securityLog.record(conn.userId, 'coordinator_carry_on', { deviceId: conn.deviceId, deviceName: conn.name, target: convoTarget(msg.target_convo_id), decidedBy: 'coordinator' })
+          securityLog.record(conn.userId, 'coordinator_carry_on', { deviceId: conn.deviceId, target: convoTarget(msg.target_convo_id), decidedBy: 'coordinator' })
         }
         const fromName = sanitizePeerText(db.prepare('SELECT name FROM devices WHERE id=?').get(conn.deviceId)?.name || '', PEER_NAME_CAP) || 'coordinator'
         const params = { ...v.params, from_convo_id: msg.from_convo_id, from_name: fromName }

@@ -10,15 +10,15 @@
 // convo:<id>, spawns, transfers, a two-factor action, a lock length, a
 // refusal reason), never free text.
 import fs from 'node:fs'
-import crypto from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { sharedTokenMatches } from './auth.js'
 
 export const SECURITY_EVENTS = Object.freeze([
   'client_signin', 'device_linked', 'bridge_paired', 'device_revoked', 'password_changed', 'two_factor_changed',
   'password_reset_requested', 'coordinator_changed', 'consent_switch_changed', 'device_protection_changed',
   'spawn_approved', 'chat_approved', 'session_started_direct', 'coordinator_carry_on',
   'approval_key_enrolled', 'approval_key_revoked', 'approval_key_attached', 'approval_invalid',
-  'device_signed_out_bad_signatures', 'enrolment_locked',
+  'device_signed_out_bad_signatures', 'enrolment_locked', 'transfer_approved',
 ])
 const KNOWN = new Set(SECURITY_EVENTS)
 export const DECIDERS = Object.freeze(['user', 'coordinator', 'admin', 'admin_cli', 'journal'])
@@ -35,6 +35,13 @@ export const FEED_TOKEN_RE = /^[A-Za-z0-9_-]{32,128}$/
 export const deviceTarget = (id) => `device:${id}`
 export const keyTarget = (keyId) => `key:${String(keyId).slice(0, 8)}`
 export const convoTarget = (id) => `convo:${id}`
+export const transferTarget = (id) => `transfer:${id}`
+// A box by its name as it is now (looked up when the event is recorded);
+// null for a device that is gone.
+export function boxTarget(db, deviceId) {
+  const name = deviceId == null ? null : db.prepare('SELECT name FROM devices WHERE id=?').get(deviceId)?.name
+  return name == null ? null : `box:${name}`
+}
 
 // The request a recording happens under: its client address, the way
 // src/http.js derives it (cf-connecting-ip behind the tunnel, else the
@@ -66,11 +73,14 @@ export function makeSecurityLog({ db, out = (line) => process.stdout.write(line 
   const deviceName = db.prepare('SELECT name FROM devices WHERE id=?')
   let fileFailed = false
 
-  const write = (userId, event, fields) => {
-    let line
+  // The row: its number and the row in one transaction (a savepoint when
+  // the caller's is open), the counter bumped under the write lock, so two
+  // writers (the server and the admin CLI on the same file) never get the
+  // same one. → {row, account}, or null when not recorded.
+  const insertRow = (userId, event, fields) => {
     try {
       const account = userName.get(userId)?.name
-      if (account == null) return
+      if (account == null) return null
       const row = {
         ts: now(), event,
         device_id: fields.deviceId ?? null,
@@ -79,18 +89,22 @@ export function makeSecurityLog({ db, out = (line) => process.stdout.write(line 
         target: strOrNull(fields.target),
         decided_by: KNOWN_DECIDERS.has(fields.decidedBy) ? fields.decidedBy : null,
       }
-      // The number and the row in one transaction: the counter is bumped
-      // under the write lock, so two writers (the server and the admin
-      // CLI on the same file) never get the same one.
       db.transaction(() => {
         row.seq = allocate.get(userId).seq
         insert.run(userId, row.seq, row.ts, row.event, row.device_id, row.device_name, row.source_ip, row.target, row.decided_by)
       })()
-      line = JSON.stringify(lineOf(row, account))
+      return { row, account }
     } catch (err) {
       console.error(`security log: ${event} not recorded (${err?.message || err})`)
-      return
+      return null
     }
+  }
+  const stillThere = db.prepare(`SELECT 1 FROM security_events WHERE user_id=? AND seq=? AND ts=? AND event=?
+    AND device_id IS ? AND target IS ?`)
+
+  // The line: stdout, then the file.
+  const emit = ({ row, account }) => {
+    const line = JSON.stringify(lineOf(row, account))
     try { out(line) } catch (err) { console.error(`security log: writing a line failed (${err?.message || err})`) }
     if (!file) return
     try {
@@ -104,16 +118,20 @@ export function makeSecurityLog({ db, out = (line) => process.stdout.write(line 
   }
 
   return {
-    // One event for the account `userId`. Never throws. Called inside a
-    // database transaction, the event waits for a microtask: by then the
-    // transaction (synchronous, better-sqlite3) has committed or rolled
-    // back, and the event is written either way, in its own transaction.
-    // So an event describing something that happened even though its
-    // request rolled back (an invalid approval) is not lost; an event for
-    // a change is recorded by its caller once the change has committed.
-    // `deviceName` defaults to the device's current name; `sourceIp` to
-    // the request's.
-    record(userId, event, fields = {}) {
+    // One event for the account `userId`. Never throws. `deviceName`
+    // defaults to the device's current name; `sourceIp` to the request's.
+    //
+    // Outside a database transaction it is written at once. Inside one:
+    // - an event for a change (the default) is written in that
+    //   transaction, so it goes if the change rolls back; its line goes
+    //   out a microtask later (by then the synchronous better-sqlite3
+    //   transaction has committed or rolled back), only if its row is
+    //   there;
+    // - an event that describes the refusal itself (`evenIfRolledBack`:
+    //   an invalid approval, the lockdown after it, the enrolment lock)
+    //   waits for that microtask and is written in its own transaction, so
+    //   the rollback of the request that caused it cannot lose it.
+    record(userId, event, fields = {}, { evenIfRolledBack = false } = {}) {
       try {
         if (!KNOWN.has(event)) throw new Error(`unknown security event ${JSON.stringify(event)}`)
         const resolved = { ...fields }
@@ -121,8 +139,27 @@ export function makeSecurityLog({ db, out = (line) => process.stdout.write(line 
         // out) and the request are still there.
         if (resolved.deviceName === undefined) resolved.deviceName = resolved.deviceId == null ? null : deviceName.get(resolved.deviceId)?.name ?? null
         if (resolved.sourceIp === undefined) resolved.sourceIp = requestScope.getStore()?.sourceIp ?? null
-        if (db.inTransaction) queueMicrotask(() => write(userId, event, resolved))
-        else write(userId, event, resolved)
+        if (!db.inTransaction) {
+          const r = insertRow(userId, event, resolved)
+          if (r) emit(r)
+        } else if (evenIfRolledBack) {
+          queueMicrotask(() => {
+            const r = insertRow(userId, event, resolved)
+            if (r) emit(r)
+          })
+        } else {
+          const r = insertRow(userId, event, resolved)
+          if (r) {
+            queueMicrotask(() => {
+              try {
+                const { row } = r
+                if (stillThere.get(userId, row.seq, row.ts, row.event, row.device_id, row.target)) emit(r)
+              } catch (err) {
+                console.error(`security log: ${event}: ${err?.message || err}`)
+              }
+            })
+          }
+        }
       } catch (err) {
         console.error(`security log: ${err?.message || err}`)
       }
@@ -134,16 +171,20 @@ export function makeSecurityLog({ db, out = (line) => process.stdout.write(line 
 // The feed's page for one account: events with seq > `since` (ascending,
 // the first `limit`), or with `since` null the newest `limit` (still
 // ascending). `last_seq` is the account's latest number, 0 when none.
+// One read transaction, so `last_seq` and the rows are of the same moment.
 export function readSecurityEvents(db, userId, { since = null, limit = FEED_LIMIT_DEFAULT } = {}) {
-  const account = db.prepare('SELECT name FROM users WHERE id=?').get(userId)?.name ?? null
-  const lastSeq = db.prepare('SELECT seq FROM security_event_seqs WHERE user_id=?').get(userId)?.seq ?? 0
-  const rows = since == null
-    ? db.prepare('SELECT * FROM security_events WHERE user_id=? ORDER BY seq DESC LIMIT ?').all(userId, limit).reverse()
-    : db.prepare('SELECT * FROM security_events WHERE user_id=? AND seq > ? ORDER BY seq LIMIT ?').all(userId, since, limit)
-  return { account, last_seq: lastSeq, events: rows.map((r) => lineOf(r, account)) }
+  return db.transaction(() => {
+    const account = db.prepare('SELECT name FROM users WHERE id=?').get(userId)?.name ?? null
+    const lastSeq = db.prepare('SELECT seq FROM security_event_seqs WHERE user_id=?').get(userId)?.seq ?? 0
+    const rows = since == null
+      ? db.prepare('SELECT * FROM security_events WHERE user_id=? ORDER BY seq DESC LIMIT ?').all(userId, limit).reverse()
+      : db.prepare('SELECT * FROM security_events WHERE user_id=? AND seq > ? ORDER BY seq LIMIT ?').all(userId, since, limit)
+    return { account, last_seq: lastSeq, events: rows.map((r) => lineOf(r, account)) }
+  })()
 }
 
-// Rows past their 30 days. The counter rows stay.
+// Rows past their 30 days (the retention schedule, src/server.js). The
+// counter rows stay.
 export function sweepSecurityEvents(db, now = Date.now()) {
   db.prepare('DELETE FROM security_events WHERE ts <= ?').run(now - SECURITY_EVENT_KEEP_MS)
 }
@@ -176,18 +217,24 @@ export function resolveSecurityFeed({ token, account } = {}, { warn = console.wa
   return { token, account }
 }
 
-// Constant time, hashed first so a wrong length tells nothing either.
-const digest = (s) => crypto.createHash('sha256').update(String(s)).digest()
-export const feedTokenMatches = (expected, given) => crypto.timingSafeEqual(digest(expected), digest(given ?? ''))
-
 // GET /security-events?since=&limit= with the feed's own Bearer token,
 // ahead of device authentication (src/http.js). Off (feed null): 404, as
-// any unknown path. → true when it answered.
-export function handleSecurityFeed({ db, feed, json }, req, res, url, { rejectEarly }) {
+// any unknown path. A wrong or missing token is charged to the per-address
+// budget /login and the alerts webhook share (`rateLimiter`), and once it is
+// spent every request from that address is refused, the right token
+// included, as the webhook does (src/alerts-http.js). The token is compared
+// in constant time, by the webhook's helper (auth.js). → true when it answered.
+export function handleSecurityFeed({ db, feed, json, rateLimiter = null }, req, res, url, { rejectEarly }) {
   if (url.pathname !== '/security-events' || req.method !== 'GET') return false
   if (!feed) { json(res, 404, { error: 'not_found' }); return true }
+  const ip = requestSourceIp(req) || 'unknown'
+  if (rateLimiter?.blocked?.(ip)) { rejectEarly(req, res, 429, { error: 'rate_limited' }); return true }
   const given = /^Bearer (.+)$/.exec(req.headers.authorization || '')?.[1]
-  if (!given || !feedTokenMatches(feed.token, given)) { rejectEarly(req, res, 401, { error: 'unauthenticated' }); return true }
+  if (!given || !sharedTokenMatches(feed.token, given)) {
+    rateLimiter?.allow(ip)
+    rejectEarly(req, res, 401, { error: 'unauthenticated' })
+    return true
+  }
   const user = db.prepare('SELECT id FROM users WHERE name=?').get(feed.account)
   if (!user) { json(res, 404, { error: 'not_found' }); return true }
   const int = (name) => {

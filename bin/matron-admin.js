@@ -19,7 +19,7 @@ import { activeKeysOfDevice } from '../src/approval-keys.js'
 import { resolveFederationConfig, storedFederationKeyInfo } from '../src/federation-identity.js'
 import { formatFingerprint } from '../src/federation-envelope.js'
 import { makeTokenBox } from '../src/token-box.js'
-import { makeSecurityLog, deviceTarget, keyTarget } from '../src/security-log.js'
+import { makeSecurityLog, deviceTarget, keyTarget, boxTarget } from '../src/security-log.js'
 import {
   disableTwoFactor, twoFactorState, isTwoFactorRequired, setTwoFactorRequired, isTwoFactorExempt, setTwoFactorExempt,
 } from '../src/two-factor.js'
@@ -323,7 +323,8 @@ export async function runAdmin(db, argv, deps = {}) {
     if (!username || !agentName) throw new Error(USAGE)
     const user = db.prepare('SELECT id FROM users WHERE name=?').get(username)
     if (!user) throw new Error(`no such user: ${username}`)
-    const { token } = createAgent(db, user.id, agentName)
+    const { token, deviceId } = createAgent(db, user.id, agentName)
+    adminEvent(user.id, 'bridge_paired', deviceTarget(deviceId))
     return `agent ${agentName} token: ${token}\n(store in the bridge credentials file; it is not shown again)`
   }
   if (a === 'device' && b === 'list') {
@@ -443,11 +444,12 @@ export async function runAdmin(db, argv, deps = {}) {
     if (!Number.isInteger(deviceId) || !['on', 'off'].includes(mode)) throw new Error(USAGE)
     const existing = db.prepare('SELECT id, user_id FROM devices WHERE id=?').get(deviceId)
     if (!existing) throw new Error(`no such device: ${deviceId}`)
+    const changed = !!db.prepare('SELECT protected FROM devices WHERE id=?').get(deviceId).protected !== (mode === 'on')
     db.transaction(() => {
       setDeviceProtected(db, deviceId, mode === 'on')
       restampConsentItems(db, existing.user_id)
     })()
-    adminEvent(existing.user_id, 'device_protection_changed', `${deviceTarget(deviceId)}:${mode}`)
+    if (changed) adminEvent(existing.user_id, 'device_protection_changed', `${deviceTarget(deviceId)}:${mode}`)
     return mode === 'on'
       ? `device ${deviceId} protected — its consent asks are the user's alone, signed once the account has an approval key`
       : `device ${deviceId} not protected`
@@ -689,7 +691,7 @@ export async function runAdmin(db, argv, deps = {}) {
     if (!answerParkedInvite(db, { convoId: roomId, agentDeviceId: deviceId, approve: true })) {
       throw new Error(`room ${roomId} device ${deviceId} is not awaiting approval (already answered, or never parked)`)
     }
-    adminEvent(user.id, 'chat_approved', deviceTarget(deviceId))
+    adminEvent(user.id, 'chat_approved', boxTarget(db, deviceId))
     // No hub here: the tracker mirror is closed in the table; live clients
     // see it at their next /items (spec: 2026-09-22 consent-items).
     closeChatConsentItem({ db, hub: null }, roomId, deviceId, { outcome: 'approved' })
