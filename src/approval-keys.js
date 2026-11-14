@@ -195,6 +195,19 @@ function matchesExpect(st, expect) {
     && st.action === expect.action && st.prompt_digest === expect.prompt_digest
 }
 
+// signed_at is the device's clock, which a box checks against its own
+// window (tools/approval-verify.mjs): a statement signed more than a minute
+// before its nonce was issued, or more than a minute ahead of the journal's
+// clock, would pass here and fail there as stale. Refused here instead, as
+// a mismatch (a skewed clock is an honest app's, so it does not count). A
+// nonce that is not this device's is left to the nonce check.
+export const SIGNED_AT_SKEW_MS = 60000
+function signedInTime(db, who, st, now) {
+  if (st.signed_at > now + SIGNED_AT_SKEW_MS) return false
+  const issued = db.prepare('SELECT created_at FROM approval_nonces WHERE nonce=? AND user_id=? AND device_id=?').get(st.nonce, who.userId, who.deviceId)
+  return !issued || st.signed_at >= issued.created_at - SIGNED_AT_SKEW_MS
+}
+
 const required = { ok: false, status: 403, body: { error: 'approval_required' } }
 const invalid = (reason) => ({ ok: false, status: 400, body: { error: 'approval_invalid', reason } })
 
@@ -205,8 +218,9 @@ const invalid = (reason) => ({ ok: false, status: 400, body: { error: 'approval_
 // calling device, where the key's own signature is the proof.
 //
 // Order: statement parses; journal and user; key known, live, on this
-// device; expected fields; signature; the nonce last, so a failed attempt
-// does not spend it. On success `approval` is {statement, signature} as
+// device; expected fields; signed_at within a minute of the nonce's issue
+// and of now; signature; the nonce last, so a failed attempt does not
+// spend it. On success `approval` is {statement, signature} as
 // received, byte for byte, and `keyId` the key that signed.
 //
 // Every approval_invalid answer to an account with an active key is also
@@ -236,6 +250,7 @@ function check(ctx, who, approval, expect, { anyDevice = false } = {}) {
   if (key.revoked_at != null) return invalid('revoked_key')
   if (!anyDevice && key.device_id !== who.deviceId) return invalid('wrong_device')
   if (!matchesExpect(st, expect)) return invalid('mismatch')
+  if (!signedInTime(db, who, st, now)) return invalid('mismatch')
   if (!verifySignature(key.public_key, approval.statement, approval.signature)) return invalid('signature')
   if (!consumeNonce(db, who, st.nonce, now)) return invalid('nonce')
   return { ok: true, approval: { statement: approval.statement, signature: approval.signature }, keyId: key.key_id }

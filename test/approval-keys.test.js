@@ -273,6 +273,28 @@ test('requireApproval: an expired nonce fails with reason nonce', async (t) => {
   assert.deepEqual(late, invalid('nonce'))
 })
 
+test('requireApproval: signed_at more than a minute before the nonce was issued, or a minute ahead, is a mismatch that does not count', async (t) => {
+  const { s, alice, token, deviceId, key } = await startWithKey(t)
+  const who = client(alice.id, deviceId)
+  const expect = { type: 'account', subject: { op: 'test' } }
+  const at = async (offset) => {
+    const n = await s.http('/approvals/nonce', { method: 'POST', token })
+    const issued = s.db.prepare('SELECT created_at FROM approval_nonces WHERE nonce=?').get(n.json.nonce).created_at
+    const approval = signForTest(key.privateKeyPem, {
+      v: 1, type: 'account', journal: TEST_JOURNAL, user: 'alice', key_id: key.keyId, nonce: n.json.nonce, signed_at: offset(issued), subject: expect.subject,
+    })
+    return { approval, issued }
+  }
+  const run = ({ approval, issued }, now = issued + 1000) => requireApproval(ctxOf(s, now), who, { approval }, expect)
+  assert.deepEqual(run(await at((i) => i - 60001)), invalid('mismatch'), 'a clock a minute behind')
+  assert.deepEqual(run(await at((i) => i + 61001)), invalid('mismatch'), 'a clock a minute ahead')
+  assert.equal(run(await at((i) => i - 60000)).ok, true)
+  assert.equal(run(await at((i) => i + 61000)).ok, true, 'up to a minute after the check')
+  // Mismatches never count towards a sign-out: the device is still signed in.
+  assert.equal((await s.http('/approval-keys', { token })).status, 200)
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM approval_failures WHERE reason='mismatch'").get().n, 2)
+})
+
 // ---- requireApproval -----------------------------------------------------
 
 test('requireApproval: a user without an active key passes with no approval, whatever is sent', async (t) => {
