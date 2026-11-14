@@ -20,6 +20,7 @@ import { resolveFederationConfig, storedFederationKeyInfo } from '../src/federat
 import { formatFingerprint } from '../src/federation-envelope.js'
 import { makeTokenBox } from '../src/token-box.js'
 import { makeSecurityLog, deviceTarget, keyTarget, boxTarget } from '../src/security-log.js'
+import { panicLock, clearPanic } from '../src/panic.js'
 import {
   disableTwoFactor, twoFactorState, isTwoFactorRequired, setTwoFactorRequired, isTwoFactorExempt, setTwoFactorExempt,
 } from '../src/two-factor.js'
@@ -47,6 +48,8 @@ const USAGE = `usage:
   matron-admin approval-key list <username>
   matron-admin approval-key revoke <username> <key_id|--all>
   matron-admin coordinator transfers <username> on|off
+  matron-admin panic status <username>
+  matron-admin panic clear <username>
   matron-admin link-code <username> --server-url <url> [--port <n>] [--expires <30m|24h>] [--png <path>]
   matron-admin offload [--days N]
   matron-admin expire-logs [--hours N]
@@ -472,6 +475,29 @@ export async function runAdmin(db, argv, deps = {}) {
     return mode === 'on'
       ? `${username}: the Coordinator may approve file transfers, including ones it had another session send (flagged files and user-only boxes stay the user's)`
       : `${username}: file transfers the Coordinator had another session send are the user's to approve again`
+  }
+  // The panic lock (src/panic.js): an external watcher locks an account
+  // with its panic token; only the host clears it. This writes the
+  // database; the running journal reads the lock there on every check, so
+  // sign-in works again at once, and its periodic sweep tells the
+  // account's connected bridges within a minute. Nothing else is restored:
+  // the client devices stay signed out and the Coordinator's consent
+  // switches stay off until the owner turns them on again.
+  if (a === 'panic' && (b === 'status' || b === 'clear')) {
+    const username = argv[2]
+    if (!username || argv.length !== 3) throw new Error(USAGE)
+    const user = requireUser(db, username)
+    const lock = panicLock(db, user.id)
+    if (b === 'status') {
+      if (!lock) return `${username}: not locked`
+      return `${username}: locked since ${new Date(lock.since).toISOString()} (source: ${JSON.stringify(lock.source)}, alert: ${JSON.stringify(lock.alert)})`
+    }
+    if (!lock || !clearPanic(db, user.id)) return `${username}: not locked; nothing to clear`
+    adminEvent(user.id, 'panic_cleared')
+    return [
+      `${username}: panic lock cleared — sign-in works again now; the running journal tells the account's connected bridges within a minute.`,
+      'nothing else is restored: client devices sign in again, and the Coordinator\'s consent switches stay off until the owner turns them on.',
+    ].join('\n')
   }
   if (a === 'link-code') {
     const username = argv[1]
