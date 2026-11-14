@@ -14,12 +14,14 @@ import {
   PANIC_TEXT_MAX, ACCOUNT_LOCKED, panicLock, isPanicLocked, panicOnFrame, panicAnnounced, sendToAgents, closeDeviceSockets,
 } from './panic.js'
 
-// The watcher's text as stored: control, bidi and other format characters
-// stripped and whitespace collapsed by the peer-text sieve, then at most
-// PANIC_TEXT_MAX characters (whole code points); null when nothing is left.
+// The watcher's text as stored: control characters (C0 and, here only, C1),
+// bidi and other format characters stripped and whitespace collapsed by
+// the peer-text sieve, then at most PANIC_TEXT_MAX characters (whole code
+// points); null when nothing is left. The shared sieve is left as it is: it
+// mirrors the bridge's copy.
 const clip = (s) => {
   if (s == null) return null
-  const clean = Array.from(sanitizeConsentText(s, Infinity)).slice(0, PANIC_TEXT_MAX).join('').trim()
+  const clean = Array.from(sanitizeConsentText(String(s).replace(/[\u0080-\u009f]/g, ' '), Infinity)).slice(0, PANIC_TEXT_MAX).join('').trim()
   return clean || null
 }
 

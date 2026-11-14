@@ -75,10 +75,6 @@ export function issueResetToken(db, userId, now = Date.now()) {
   })()
 }
 
-// Spend a token: { ok:true, userId, name, signedOut } or { ok:false } for a
-// token that is unknown, used or expired (one answer for all three). The
-// token row is consumed before the slow hash, so a second use of the same
-// link fails even while the first is still hashing.
 // The account a token would reset, without spending it: a token that is
 // known, unexpired and of the account as it was; else null.
 export function resetTokenOwner(db, token, now = Date.now()) {
@@ -87,21 +83,30 @@ export function resetTokenOwner(db, token, now = Date.now()) {
   return r && r.expires_at > now && r.account_state === accountState(db, r.user_id) ? r.user_id : null
 }
 
-// `refuse(userId)`: checked again in the write's transaction (after the
-// slow hash); truthy refuses the write with {ok:false, refused}.
+// Spend a token: { ok:true, userId, name, signedOut } or { ok:false } for a
+// token that is unknown, used or expired (one answer for all three).
+// `refuse(userId)`: checked in the write's transaction (after the slow
+// hash); truthy refuses the write with {ok:false, refused} and leaves the
+// token as it was, usable later.
+//
+// The token is spent in the write's transaction, together with the new
+// password, after it is checked again there: of two uses racing through
+// the hash, the first to write wins and the second finds it gone; a token
+// replaced meanwhile (a newer link) is gone too.
 export async function resetPassword(db, token, newPassword, now = Date.now(), { refuse = null } = {}) {
   if (typeof token !== 'string' || !token || token.length > 128) return { ok: false }
-  const row = db.transaction(() => {
+  const valid = () => {
     const r = db.prepare('SELECT user_id, expires_at, account_state FROM password_resets WHERE token_hash=?').get(sha256(token))
-    if (!r) return null
-    db.prepare('DELETE FROM password_resets WHERE token_hash=?').run(sha256(token))
-    return r.expires_at > now && r.account_state === accountState(db, r.user_id) ? r : null
-  })()
+    return r && r.expires_at > now && r.account_state === accountState(db, r.user_id) ? r : null
+  }
+  const row = valid()
   if (!row) return { ok: false }
   const hash = await argon2.hash(newPassword, { type: argon2.argon2id })
   return db.transaction(() => {
+    const again = valid()
+    if (!again || again.user_id !== row.user_id) return { ok: false }
     const user = db.prepare('SELECT name FROM users WHERE id=?').get(row.user_id)
-    if (!user || accountState(db, row.user_id) !== row.account_state) return { ok: false }
+    if (!user) return { ok: false }
     const refused = refuse?.(row.user_id)
     if (refused) return { ok: false, refused }
     db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hash, row.user_id)
