@@ -1054,6 +1054,33 @@ CREATE TABLE IF NOT EXISTS transfer_chunks(
   size        INTEGER NOT NULL,
   PRIMARY KEY(transfer_id, n)
 );
+-- Inbound sources (src/inbound.js): an outside tool the user lets post
+-- reports into one conversation of its own. token_hash is the sha256 of a
+-- key that can do nothing else. inbound_posts holds one row per accepted
+-- report for the caps and the duplicate check: a hash and a size, never
+-- the text.
+CREATE TABLE IF NOT EXISTS inbound_sources(
+  id                TEXT PRIMARY KEY,
+  user_id           INTEGER NOT NULL REFERENCES users(id),
+  name              TEXT NOT NULL,
+  token_hash        TEXT NOT NULL UNIQUE,
+  convo_id          TEXT NOT NULL,
+  enabled           INTEGER NOT NULL DEFAULT 1,
+  hourly_max        INTEGER NOT NULL,
+  daily_max         INTEGER NOT NULL,
+  announced         INTEGER NOT NULL DEFAULT 0,
+  limit_notified_at INTEGER,
+  last_post_at      INTEGER,
+  created_at        INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_inbound_sources_name ON inbound_sources(user_id, name COLLATE NOCASE);
+CREATE TABLE IF NOT EXISTS inbound_posts(
+  source_id TEXT NOT NULL,
+  ts        INTEGER NOT NULL,
+  body_hash TEXT NOT NULL,
+  bytes     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_inbound_posts_source ON inbound_posts(source_id, ts);
 `
 
 // Rebuild the parent with FK actions disabled: dropping it with enforcement
