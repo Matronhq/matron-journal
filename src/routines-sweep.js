@@ -13,6 +13,7 @@
 // fire, never a double. Deliveries are bounded process-wide; a routine
 // that does not get a slot stays due for the next sweep untouched.
 import { coordinatorDevice } from './consent.js'
+import { isProtectedDevice } from './consent-subject.js'
 import { wakeIfOffline } from './wake.js'
 import { sanitizePeerText } from './peer-text.js'
 import { dueRoutines, advanceRoutine, recordOutcome, routineRow } from './routines.js'
@@ -26,6 +27,7 @@ export const ROUTINE_FROM_NAME = 'Routines'
 // Failures the next attempt might cure: the box was asleep or slow, the
 // socket dropped. A bridge's refusal (bad_request, not_coordinator, gone)
 // is final for this fire.
+const PROTECTED = 'protected_device'
 const RETRYABLE = new Set(['agent_unreachable', 'timeout', 'send_failed', 'internal'])
 
 // One firer per journal process (server.js): the sweep and the run route
@@ -50,6 +52,16 @@ export function makeRoutineFirer({ db, hub, broker, waker = null, wakeWaitMs = 0
       finish(routine, 'no_coordinator')
       log.log(`routines: ${label} not delivered: no Coordinator (or it has no box)`)
       return 'no_coordinator'
+    }
+    // A protected box is out of the Coordinator's session control
+    // (src/session-control.js authorizeSessionControl), the journal's own
+    // included: a Coordinator living on one gets no routine turn.
+    if (isProtectedDevice(db, routine.user_id, coord.deviceId)) {
+      if (onOutcome) onOutcome(PROTECTED, false)
+      else recordOutcome(db, routine.id, { outcome: PROTECTED, retryable: false, retry, now })
+      finish(routine, PROTECTED)
+      log.log(`routines: ${label} not delivered: the Coordinator's box is protected`)
+      return PROTECTED
     }
     const params = {
       convo_id: coord.convoId, action: 'routine', routine_id: routine.id, name: routine.name, title: routine.title,

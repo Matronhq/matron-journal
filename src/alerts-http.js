@@ -32,6 +32,7 @@
 import crypto from 'node:crypto'
 import { json, readBody } from './http-body.js'
 import { coordinatorDevice } from './consent.js'
+import { isProtectedDevice } from './consent-subject.js'
 import { wakeIfOffline } from './wake.js'
 import { sanitizePeerText } from './peer-text.js'
 import { isAlertmanagerPayload, formatAlertMessage, alertName } from './alerts.js'
@@ -105,6 +106,13 @@ export function makeAlertsHandler({ db, hub, broker, waker = null, rateLimiter =
     if (!coord) {
       console.log(`alerts: ${label} not delivered: no Coordinator (or it has no box) for ${username}`)
       json(res, 202, { delivered: false, reason: 'no_coordinator' })
+      return true
+    }
+    // A protected box is out of the Coordinator's session control
+    // (src/session-control.js), the journal's own included.
+    if (isProtectedDevice(db, user.id, coord.deviceId)) {
+      console.log(`alerts: ${label} not delivered: the Coordinator's box is protected, for ${username}`)
+      json(res, 202, { delivered: false, reason: 'protected_device' })
       return true
     }
     if (inflight >= ALERT_MAX_INFLIGHT) {

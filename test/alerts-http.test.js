@@ -5,6 +5,7 @@ import { createUser, createAgent } from '../src/auth.js'
 import { setCoordinatorConvoId } from '../src/coordinator.js'
 import { alertTokenMatches, ALERT_MAX_INFLIGHT } from '../src/alerts-http.js'
 import { formatAlertMessage } from '../src/alerts.js'
+import { setDeviceProtected } from '../src/db.js'
 
 // POST /alerts/alertmanager (src/alerts-http.js): Alertmanager's webhook,
 // authenticated by a shared secret, delivered to the user's Coordinator as
@@ -97,6 +98,14 @@ test('202 no_coordinator when none is set or its conversation has no box', async
   s.db.prepare("INSERT INTO conversations(id, owner_user_id, title, session_state, last_seq, unread_count, snippet, created_at) VALUES('boxless', ?, 'x', 'waiting', 0, 0, '', 1)").run(alice.id)
   setCoordinatorConvoId(s.db, alice.id, 'boxless')
   assert.deepEqual(await post(s), { status: 202, json: { delivered: false, reason: 'no_coordinator' } })
+})
+
+test('202 protected_device when the Coordinator is on a protected box: nothing is sent to it', async (t) => {
+  const { s, coord, coordDev } = await fleet(t)
+  setDeviceProtected(s.db, coordDev.deviceId, true)
+  assert.deepEqual(await post(s), { status: 202, json: { delivered: false, reason: 'protected_device' } })
+  await new Promise((r) => setTimeout(r, 100))
+  assert.equal(coord.frames.filter((f) => f.kind === 'rpc' && f.request?.method === 'session_control').length, 0)
 })
 
 test('happy path: the Coordinator box receives session_control {convo_id, action:alert, message, from_name}', async (t) => {
