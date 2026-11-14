@@ -222,11 +222,13 @@ function matchesExpect(st, expect) {
 }
 
 // signed_at is the device's clock, which a box checks against its own
-// window (tools/approval-verify.mjs): a statement signed more than a minute
-// before its nonce was issued, or more than a minute ahead of the journal's
-// clock, would pass here and fail there as stale. Refused here instead, as
-// a mismatch (a skewed clock is an honest app's, so it does not count). A
-// nonce that is not this device's is left to the nonce check.
+// window (tools/approval-verify.mjs). The journal's bound is a check on that
+// clock, not a freshness window (the nonce's five minutes are): signed_at
+// must be no more than a minute before its nonce was issued (it was signed
+// after) and no more than a minute ahead of the journal's clock, or a box
+// would see a wrong age. Refused as a mismatch (a skewed clock is an honest
+// app's, so it does not count). A nonce that is not this device's is left
+// to the nonce check.
 export const SIGNED_AT_SKEW_MS = 60000
 function signedInTime(db, who, st, now) {
   if (st.signed_at > now + SIGNED_AT_SKEW_MS) return false
@@ -244,8 +246,8 @@ const invalid = (reason) => ({ ok: false, status: 400, body: { error: 'approval_
 // calling device, where the key's own signature is the proof.
 //
 // Order: statement parses; journal and user; key known, live, on this
-// device; expected fields; signed_at within a minute of the nonce's issue
-// and of now; signature; the nonce last, so a failed attempt does not
+// device; expected fields; signed_at no more than a minute before the
+// nonce's issue nor a minute ahead of now; signature; the nonce last, so a failed attempt does not
 // spend it. On success `approval` is {statement, signature} as
 // received, byte for byte, and `keyId` the key that signed.
 //

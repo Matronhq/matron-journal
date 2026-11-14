@@ -42,6 +42,8 @@ import { fileNotice } from './sharing-events.js'
 import { sanitizePeerText, plainText } from './peer-text.js'
 import { restampConsentItems } from './consent-subject.js'
 import { securityLogOf, keyTarget } from './security-log.js'
+import { emitMarker } from './items-http.js'
+import { getItem } from './items.js'
 
 // A key's name is a label in the apps, like a device name (http.js).
 const KEY_NAME_MAX = 40
@@ -52,6 +54,20 @@ const keyView = (r) => ({
 })
 
 const keyRow = (db, keyId) => db.prepare('SELECT * FROM approval_keys WHERE key_id=?').get(keyId)
+
+// Consent items restamped (src/consent-subject.js restampConsentItems: a
+// box protected or renamed, the account's first key added or its last
+// removed) reach the user's apps as an `updated` marker. `who` is the
+// request's caller, or the user's own name when the journal or the host
+// restamps (a client `who` with no device). From the host (matron-admin,
+// whose hub is a stub) the marker is written but not sent live.
+export function announceRestamped(ctx, who, ids) {
+  for (const id of ids) {
+    const item = getItem(ctx.db, who.userId, id)
+    if (item) emitMarker(ctx, who, { item, action: 'updated', fallback: false })
+  }
+}
+export const asUser = (userId) => ({ userId, kind: 'client', deviceId: null })
 
 // A key added to or removed from the account: a notice in the user's For
 // you list, pushed to every device. Once per key and direction.
@@ -71,7 +87,7 @@ export function announceKey(ctx, userId, key, { added, how }) {
   // first key added or its last removed changes that. Best-effort; the
   // answer path decides afresh either way.
   try {
-    restampConsentItems(ctx.db, userId)
+    announceRestamped(ctx, asUser(userId), restampConsentItems(ctx.db, userId))
   } catch (err) {
     console.error('approval keys: restamping consent items failed', err)
   }
@@ -202,6 +218,10 @@ export function confirmPasswordAndTotp(ctx, res, who, { password, code }) {
   })
 }
 
+// The calling device still signed in (its row not deleted), checked after an
+// await on the password path.
+export const callerSignedIn = (db, who) => !!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(who.deviceId, who.userId)
+
 const keyExists = (res) => { json(res, 409, { error: 'key_exists' }); return true }
 const disabled = (res) => { json(res, 409, { error: 'approval_keys_disabled' }); return true }
 const notFound = (res) => { json(res, 404, { error: 'not_found' }); return true }
@@ -297,19 +317,27 @@ export async function handleApprovalKeysRoute(ctx, req, res, url, who) {
     if (!enabled) return disabled(res)
     // One transaction: the request, the signature check (which spends the
     // nonce) and the new key stand or fall together.
-    const out = db.transaction(() => {
-      const now = Date.now()
-      const rq = liveRequest(db, who.userId, approve[1], now)
-      if (!rq) return { ok: false, status: 404, body: { error: 'not_found' } }
-      const keyId = keyIdOf(rq.public_key)
-      if (keyRow(db, keyId)) return { ok: false, status: 409, body: { error: 'key_exists' } }
-      const r = checkApproval({ db, journalHost, now }, who, approval, { type: 'account', subject: { op: 'enrol_key', key_id: keyId } })
-      if (!r.ok) return r
-      db.prepare(`INSERT INTO approval_keys(user_id, key_id, public_key, alg, name, device_id, enrolled_via, enrolled_by, created_at)
-        VALUES(?,?,?,?,?,?,'device',?,?)`).run(who.userId, keyId, rq.public_key, ALG, rq.name, rq.device_id, r.keyId, now)
-      db.prepare('DELETE FROM approval_key_requests WHERE id=?').run(rq.id)
-      return { ok: true, row: keyRow(db, keyId), signer: r.keyId }
-    })()
+    let out
+    try {
+      out = db.transaction(() => {
+        const now = Date.now()
+        const rq = liveRequest(db, who.userId, approve[1], now)
+        if (!rq) return { ok: false, status: 404, body: { error: 'not_found' } }
+        const keyId = keyIdOf(rq.public_key)
+        if (keyRow(db, keyId)) return { ok: false, status: 409, body: { error: 'key_exists' } }
+        const r = checkApproval({ db, journalHost, now }, who, approval, { type: 'account', subject: { op: 'enrol_key', key_id: keyId } })
+        if (!r.ok) return r
+        db.prepare(`INSERT INTO approval_keys(user_id, key_id, public_key, alg, name, device_id, enrolled_via, enrolled_by, created_at)
+          VALUES(?,?,?,?,?,?,'device',?,?)`).run(who.userId, keyId, rq.public_key, ALG, rq.name, rq.device_id, r.keyId, now)
+        db.prepare('DELETE FROM approval_key_requests WHERE id=?').run(rq.id)
+        return { ok: true, row: keyRow(db, keyId), signer: r.keyId }
+      })()
+    } catch (err) {
+      // The unique key_id refused the insert (enrolled meanwhile), as on
+      // the password path: rolled back, the nonce with it.
+      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') return keyExists(res)
+      throw err
+    }
     if (!out.ok) return send(res, out)
     record('approval_key_enrolled', out.row.key_id)
     announceKey(ctx, who.userId, out.row, { added: true, how: `approved with the key \`${out.signer.slice(0, 8)}\`` })
@@ -357,6 +385,9 @@ export async function handleApprovalKeysRoute(ctx, req, res, url, who) {
       how = `with a signature from the key \`${out.signer.slice(0, 8)}\``
     } else if (password !== undefined || code !== undefined) {
       if (!(await confirmPasswordAndTotp(ctx, res, who, { password, code }))) return true
+      // As on enrolment: a caller signed out while the password was being
+      // checked changes nothing (no await between this and the revoke).
+      if (!callerSignedIn(db, who)) { json(res, 401, { error: 'unauthenticated' }); return true }
       if (!revokeNow()) return notFound(res)
       how = BY_PASSWORD
     } else {

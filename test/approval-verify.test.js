@@ -4,12 +4,16 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { verifyApproval, canonicalize as toolCanonicalize } from '../tools/approval-verify.mjs'
 import { canonicalize } from '../src/federation-jcs.js'
 import { generateApprovalKey, signForTest } from './approval-helpers.js'
 
 const fx = JSON.parse(fs.readFileSync(new URL('./fixtures/approval-vectors.json', import.meta.url), 'utf8'))
-const TOOL = new URL('../tools/approval-verify.mjs', import.meta.url).pathname
+// A file path for fs and the CLI (a URL's pathname keeps %-escapes, so a
+// checkout under a path with a space would not be found), the URL to import.
+const TOOL_URL = new URL('../tools/approval-verify.mjs', import.meta.url)
+const TOOL = fileURLToPath(TOOL_URL)
 const keys = { keys: [{ key_id: fx.key_id, public_key: fx.public_key, name: 'phone' }] }
 const T0 = 1790000000000
 const base = { journal: 'journal.example', user: 'alice' }
@@ -259,7 +263,7 @@ test('CLI: bad arguments exit 2 with usage', () => {
 })
 
 test('importing the module does not run the CLI', () => {
-  const r = spawnSync(process.execPath, ['-e', `import(${JSON.stringify(TOOL)}).then(() => console.log('imported'))`], { encoding: 'utf8', input: '' })
+  const r = spawnSync(process.execPath, ['-e', `import(${JSON.stringify(TOOL_URL.href)}).then(() => console.log('imported'))`], { encoding: 'utf8', input: '' })
   assert.equal(r.status, 0, r.stderr)
   assert.match(r.stdout, /imported/)
 })

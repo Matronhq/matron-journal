@@ -245,6 +245,8 @@ export async function issueTalkStart(ctx, l, target) {
         try { waking = wakeIfOffline(ctx, l.guest_user_id, target.deviceId) === true } catch (err) { console.error('talk request: wake threw', err) }
         if (waking) await hub.waitForDevice(l.guest_user_id, target.deviceId, spawnWakeWaitMs)
       }
+      // Checked again after the wait: a box protected meanwhile gets no start.
+      if (isProtectedDevice(db, l.guest_user_id, target.deviceId)) return { convoId: null, code: 'protected_device' }
       const r = await broker.issue(hub, l.guest_user_id, target.deviceId, 'start', { workdir: '', talk: true, prompt: talkTask(l), agent: 'claude' }, { timeoutMs: spawnStartTimeoutMs })
       const id = r.ok ? r.result?.convo_id : null
       if (typeof id === 'string' && id && id.length <= CONVO_ID_MAX_CHARS && sanitizePeerText(id, CONVO_ID_MAX_CHARS) === id) convoId = id

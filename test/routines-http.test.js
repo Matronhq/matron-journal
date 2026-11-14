@@ -326,6 +326,26 @@ test('a Coordinator on a protected box gets no routine: the run and the sweep re
   assert.equal(coord.frames.filter((f) => f.kind === 'rpc' && f.request?.method === 'session_control').length, 0)
 })
 
+test('a Coordinator box protected while it is being woken gets no routine: protected_device, not retried', async (t) => {
+  const waker = { enabled: true, wake: () => true }
+  const { s, alice, client, coordDev } = await fleet(t, { connect: false, waker, serverOpts: { spawnWakeWaitMs: 5000 } })
+  const { id } = (await s.http('/routines', { method: 'POST', token: client, body: body() })).json.routine
+  const now = Date.now()
+  s.db.prepare('UPDATE routines SET next_at=? WHERE id=?').run(now - 1000, id)
+  // The fire is now waiting for the box; it is protected meanwhile, then attaches.
+  const run = s.routinesSweep.run(now)
+  setDeviceProtected(s.db, coordDev.deviceId, true)
+  const coord = await makeWsClient(s.base, { token: coordDev.token, cursor: null })
+  t.after(() => coord.close())
+  await coord.waitFor((f) => f.op === 'hello_ok')
+  assert.deepEqual(await run, { fired: 1, missed: 0 })
+  const row = getRoutine(s.db, alice.id, id)
+  assert.equal(row.last_outcome, 'protected_device')
+  assert.equal(s.db.prepare('SELECT retry_at FROM routines WHERE id=?').get(id).retry_at, null, 'not retried')
+  await new Promise((r) => setTimeout(r, 100))
+  assert.equal(coord.frames.filter((f) => f.kind === 'rpc' && f.request?.method === 'session_control').length, 0)
+})
+
 test('the sweep: fires what is due, advances before delivering, wakes an asleep box, retries an unreachable one once, bounds in-flight deliveries', async (t) => {
   const calls = []
   const waker = { enabled: true, wake: (name) => { calls.push(name); return true } }

@@ -17,8 +17,7 @@ import { canReadConvo, canReadBlob } from './visibility.js'
 import { parseCitation, verifySaid } from './said.js'
 import { serveHelp } from './help.js'
 import { wakeIfOffline, isWakeableDevice } from './wake.js'
-import { handleItemsRoute, emitMarker } from './items-http.js'
-import { getItem } from './items.js'
+import { handleItemsRoute } from './items-http.js'
 import { restampConsentItems } from './consent-subject.js'
 import { handleMissionsRoute } from './missions-http.js'
 import { ORIGIN_SIEVE } from './missions.js'
@@ -34,7 +33,7 @@ import { handleLookupRoute } from './lookup-http.js'
 import { handleUsersRoute } from './users-http.js'
 import { handlePasswordResetRoute, handleAccountEmailRoute } from './password-reset-http.js'
 import { handleTwoFactorLogin, handleTwoFactorRoute, twoFactorRequiredNow } from './two-factor-http.js'
-import { handleApprovalKeysRoute, announceKey, confirmPasswordAndTotp } from './approval-keys-http.js'
+import { handleApprovalKeysRoute, announceKey, confirmPasswordAndTotp, callerSignedIn, announceRestamped as announceRestampedItems } from './approval-keys-http.js'
 import { activeKeysOfDevice, guardedAccountAction, hasActiveKey, refuse, boundedSubject } from './approval-keys.js'
 import { isTwoFactorEnabled, makeTwoFactorTickets } from './two-factor.js'
 import { PLAIN_BOX } from './token-box.js'
@@ -132,14 +131,9 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
   const signInTickets = tickets || makeTwoFactorTickets()
   const codeLimiter = twoFactorLimiter || makeRateLimiter({ max: 10 })
   const passwordChecks = makeKeyedQueue()
-  // Consent items restamped (src/consent-subject.js restampConsentItems: a
-  // box protected or renamed) reach the user's apps as an `updated` marker.
-  const announceRestamped = (who, ids) => {
-    for (const id of ids) {
-      const item = getItem(db, who.userId, id)
-      if (item) emitMarker({ db, hub, pushPipeline, waker }, who, { item, action: 'updated', fallback: false })
-    }
-  }
+  // Consent items restamped reach the user's apps as an `updated` marker
+  // (approval-keys-http.js announceRestamped).
+  const announceRestamped = (who, ids) => announceRestampedItems({ db, hub, pushPipeline, waker }, who, ids)
   // Forgot/reset password: their own per-IP budget, a few asks per quarter hour.
   const passwordResetLimiter = resetLimiter || makeRateLimiter({ max: 5, windowMs: 15 * 60000 })
   // Alertmanager webhook (src/alerts-http.js): built once so its in-flight
@@ -820,6 +814,8 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
             if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(revokedId, who.userId)) return json(res, 404, { error: 'not_found' })
             const pwCtx = { db, hub, pushPipeline, tokenBox: twoFactorBox, loginGuard, journalHost, passwordChecks, securityLog }
             if (!(await confirmPasswordAndTotp(pwCtx, res, who, { password: body.password, code: body.code }))) return
+            // Signed out while the password was being checked: nothing.
+            if (!callerSignedIn(db, who)) return json(res, 401, { error: 'unauthenticated' })
             keys = activeKeysOfDevice(db, who.userId, revokedId)
             if (!revokeOwnedDevice(db, who.userId, revokedId)) return json(res, 404, { error: 'not_found' })
           } else {

@@ -93,9 +93,11 @@ Coordinator's switches, revoking another device). For a protected box the
 signed statement is forwarded to the box, which checks it against keys
 pinned on the box (`tools/approval-verify.mjs` is a reference verifier;
 `test/fixtures/approval-vectors.json` holds test vectors). It needs
-`MATRON_PUBLIC_URL`; an account without a key works exactly as before.
-App tokens left unused for `MATRON_CLIENT_IDLE_DAYS` (default 30) stop
-working. Details are in [docs/protocol.md](docs/protocol.md), "Approval
+`MATRON_PUBLIC_URL`; an account without a key works as before, except that
+a box marked protected stays the user's own: the Coordinator cannot
+approve its asks or control its sessions, and the journal's own routines,
+alerts, hand-over and talk sessions do not reach it. App tokens left unused
+for `MATRON_CLIENT_IDLE_DAYS` (default 30) stop working. Details are in [docs/protocol.md](docs/protocol.md), "Approval
 keys (step-up)".
 
 Next steps: install [matron-bridge](https://github.com/Matronhq/matron-bridge)

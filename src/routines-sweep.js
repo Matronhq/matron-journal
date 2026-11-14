@@ -75,13 +75,18 @@ export function makeRoutineFirer({ db, hub, broker, waker = null, wakeWaitMs = 0
     try {
       waking = wakeIfOffline({ db, hub, waker }, routine.user_id, coord.deviceId)
       if (waking && wakeWaitMs > 0) await hub.waitForDevice(routine.user_id, coord.deviceId, wakeWaitMs)
-      const r = await broker.issue(hub, routine.user_id, coord.deviceId, 'session_control', params, { timeoutMs })
-      if (r.ok) {
-        outcome = `applied ${sanitizePeerText(r.result?.applied, 20) || 'now'}`
+      // Checked again after the wait: a box protected meanwhile gets nothing.
+      if (isProtectedDevice(db, routine.user_id, coord.deviceId)) {
+        outcome = PROTECTED
       } else {
-        const code = sanitizePeerText(r.error?.code, 40) || 'unknown'
-        outcome = `failed ${code}`
-        retryable = RETRYABLE.has(code)
+        const r = await broker.issue(hub, routine.user_id, coord.deviceId, 'session_control', params, { timeoutMs })
+        if (r.ok) {
+          outcome = `applied ${sanitizePeerText(r.result?.applied, 20) || 'now'}`
+        } else {
+          const code = sanitizePeerText(r.error?.code, 40) || 'unknown'
+          outcome = `failed ${code}`
+          retryable = RETRYABLE.has(code)
+        }
       }
     } catch (err) {
       outcome = 'failed internal'

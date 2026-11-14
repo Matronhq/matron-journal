@@ -14,7 +14,7 @@ import { closeChatConsentItem } from '../src/consent-items.js'
 import { normaliseEmail, setUserEmail } from '../src/password-reset.js'
 import { setTransferConsentEnabled, getTransferConsentEnabled } from '../src/consent.js'
 import { restampConsentItems } from '../src/consent-subject.js'
-import { announceKey } from '../src/approval-keys-http.js'
+import { announceKey, announceRestamped, asUser } from '../src/approval-keys-http.js'
 import { activeKeysOfDevice } from '../src/approval-keys.js'
 import { resolveFederationConfig, storedFederationKeyInfo } from '../src/federation-identity.js'
 import { formatFingerprint } from '../src/federation-envelope.js'
@@ -436,8 +436,9 @@ export async function runAdmin(db, argv, deps = {}) {
   // approval key — this is host-level access and does not): its consent
   // asks are the user's alone and, with a key, need a signed approval; the
   // Coordinator's session control cannot reach it. The user-only flag is
-  // left as it is. Open consent items aimed at it are restamped here; the
-  // apps see that on their next read (the CLI sends no live marker).
+  // left as it is. Open consent items aimed at it are restamped here, their
+  // updated_at moved and an `updated` marker written; the apps see it on
+  // their next read (the CLI cannot send anything live).
   if (a === 'device' && b === 'protected') {
     const deviceId = Number(argv[2])
     const mode = argv[3]
@@ -445,10 +446,11 @@ export async function runAdmin(db, argv, deps = {}) {
     const existing = db.prepare('SELECT id, user_id FROM devices WHERE id=?').get(deviceId)
     if (!existing) throw new Error(`no such device: ${deviceId}`)
     const changed = !!db.prepare('SELECT protected FROM devices WHERE id=?').get(deviceId).protected !== (mode === 'on')
-    db.transaction(() => {
+    const restamped = db.transaction(() => {
       setDeviceProtected(db, deviceId, mode === 'on')
-      restampConsentItems(db, existing.user_id)
+      return restampConsentItems(db, existing.user_id)
     })()
+    announceRestamped(cliCtx(db), asUser(existing.user_id), restamped)
     if (changed) adminEvent(existing.user_id, 'device_protection_changed', `${deviceTarget(deviceId)}:${mode}`)
     return mode === 'on'
       ? `device ${deviceId} protected — its consent asks are the user's alone, signed once the account has an approval key`

@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { openDb } from '../src/db.js'
-import { createAgent, createUser, revokeDevice } from '../src/auth.js'
+import { createAgent, createUser, revokeDevice, signOutOwnedDevice } from '../src/auth.js'
 import { hasActiveKey, activeKeyFor, issueNonce, consumeNonce, requireApproval, NONCE_TTL_MS } from '../src/approval-keys.js'
 import {
   generateApprovalKey, signForTest, startApprovalServer, startWithKey, enableTwoFactor, enrolKeyByPassword,
@@ -212,6 +212,23 @@ test('a second key enrols by request, approved with a statement signed by the fi
   assert.equal(notices(s, alice.id).at(-1).title, `Approval key added: laptop ${second.keyId.slice(0, 8)}`)
 })
 
+test('a request approved while its key is enrolled under it is key_exists, not a 500, and spends nothing', async (t) => {
+  const { s, alice, token, key } = await startWithKey(t)
+  const laptop = signIn(s, alice.id, 'laptop')
+  const second = generateApprovalKey()
+  const { id } = (await s.http('/approval-keys/requests', { method: 'POST', token: laptop.token, body: { public_key: second.publicKey, name: 'laptop' } })).json
+  // The same key lands first, inside the approval's own insert: the row the
+  // unique key_id refuses.
+  s.db.exec(`CREATE TEMP TRIGGER enrolled_meanwhile BEFORE INSERT ON approval_keys WHEN NEW.enrolled_via = 'device' BEGIN
+    INSERT INTO approval_keys(user_id, key_id, public_key, alg, name, device_id, enrolled_via, created_at)
+      VALUES(NEW.user_id, NEW.key_id, NEW.public_key, NEW.alg, NEW.name, NEW.device_id, 'password', NEW.created_at);
+  END`)
+  const approval = await signAccount(s, { token, key, subject: { op: 'enrol_key', key_id: second.keyId } })
+  const r = await s.http(`/approval-keys/requests/${id}/approve`, { method: 'POST', token, body: { approval } })
+  assert.deepEqual([r.status, r.json], [409, { error: 'key_exists' }])
+  assert.equal(s.db.prepare('SELECT used_at FROM approval_nonces WHERE nonce=?').get(JSON.parse(approval.statement).nonce).used_at, null)
+})
+
 test('an approval signed for a different key_id is a mismatch, and does not burn the nonce', async (t) => {
   const { s, alice, token, key } = await startWithKey(t)
   const laptop = signIn(s, alice.id, 'laptop')
@@ -320,7 +337,7 @@ test('requireApproval: each check fails with its own reason, in order', async (t
   assert.deepEqual(check('junk'), invalid('bad_statement'))
   assert.deepEqual(check({ statement: good.statement }), invalid('bad_statement'))
   assert.deepEqual(check({ ...good, extra: 'x' }), invalid('bad_statement'))
-  assert.deepEqual(check({ statement: good.statement.replace('{', '{ '), signature: good.signature }), invalid('bad_statement'))
+  assert.deepEqual(check({ statement: `${good.statement.slice(0, 1)} ${good.statement.slice(1)}`, signature: good.signature }), invalid('bad_statement'))
 
   assert.deepEqual(check(await signAccount(s, { token, key, subject: expect.subject, journal: 'other.example' })), invalid('mismatch'))
   assert.deepEqual(check(await signAccount(s, { token, key, subject: expect.subject, user: 'bob' })), invalid('mismatch'))
@@ -422,6 +439,35 @@ test('revoke by password and TOTP; a recovery code is refused', async (t) => {
   assert.equal(r.status, 200, JSON.stringify(r.json))
   assert.equal(hasActiveKey(s.db, alice.id), false)
   assert.equal(notices(s, alice.id).at(-1).title, `Approval key removed: phone ${key.keyId.slice(0, 8)}`)
+})
+
+// Sign `deviceId` out while its request's password is being checked: after
+// the request was let in, before anything it writes.
+function signOutDuringPasswordCheck(s, userId, deviceId) {
+  const prepare = s.db.prepare
+  s.db.prepare = function (sql) {
+    if (sql === 'SELECT password_hash FROM users WHERE id=?') {
+      s.db.prepare = prepare
+      signOutOwnedDevice(s.db, userId, deviceId)
+    }
+    return prepare.call(this, sql)
+  }
+}
+
+test('a device signed out while its password is checked revokes nothing: 401, by key or by device', async (t) => {
+  const { s, alice, deviceId, secret, key } = await startWithKey(t)
+  const laptop = signIn(s, alice.id, 'laptop')
+  const body = () => ({ password: TEST_PASSWORD, code: totpCode(s, alice.id, secret) })
+  signOutDuringPasswordCheck(s, alice.id, laptop.deviceId)
+  const r = await s.http(`/approval-keys/${key.keyId}/revoke`, { method: 'POST', token: laptop.token, body: body() })
+  assert.deepEqual([r.status, r.json], [401, { error: 'unauthenticated' }])
+  assert.equal(activeKeyFor(s.db, alice.id, key.keyId)?.device_id, deviceId, 'the key stays')
+  const tablet = signIn(s, alice.id, 'tablet')
+  signOutDuringPasswordCheck(s, alice.id, tablet.deviceId)
+  const d = await s.http(`/devices/${deviceId}/revoke`, { method: 'POST', token: tablet.token, body: body() })
+  assert.deepEqual([d.status, d.json], [401, { error: 'unauthenticated' }])
+  assert.ok(s.db.prepare('SELECT 1 FROM devices WHERE id=?').get(deviceId), 'the phone stays signed in')
+  assert.equal(hasActiveKey(s.db, alice.id), true)
 })
 
 test('the last key revoked, and only then, the account is back to no key', async (t) => {

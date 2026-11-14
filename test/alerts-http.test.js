@@ -137,6 +137,18 @@ test('an asleep Coordinator box is woken and the alert goes out once it attaches
   coord.send({ op: 'agent_response', request_id: req.request.request_id, to_device_id: 0, ok: true, result: { applied: 'deferred' } })
 })
 
+test('a box protected while it is being woken gets no alert once it attaches', async (t) => {
+  const waker = { enabled: true, wake: () => true }
+  const { s, coordDev } = await fleet(t, { connect: false, serverOpts: { waker, spawnWakeWaitMs: 5000 } })
+  assert.deepEqual(await post(s), { status: 202, json: { accepted: true } })
+  setDeviceProtected(s.db, coordDev.deviceId, true)
+  const coord = await makeWsClient(s.base, { token: coordDev.token, cursor: null })
+  t.after(() => coord.close())
+  await coord.waitFor((f) => f.op === 'hello_ok')
+  await new Promise((r) => setTimeout(r, 200))
+  assert.equal(coord.frames.filter((f) => f.kind === 'rpc' && f.request?.method === 'session_control').length, 0)
+})
+
 test(`at most ${ALERT_MAX_INFLIGHT} deliveries in flight; the next is 202 busy`, async (t) => {
   const { s, coord } = await fleet(t)
   for (let i = 0; i < ALERT_MAX_INFLIGHT; i++) assert.deepEqual((await post(s)).json, { accepted: true })

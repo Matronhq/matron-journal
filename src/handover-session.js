@@ -132,14 +132,18 @@ async function startHandoverSession(ctx, { g, copy, target, itemId }) {
       try { waking = wakeIfOffline(ctx, userId, target.deviceId) === true } catch (err) { console.error('hand-over session: wake threw', err) }
       if (waking) await hub.waitForDevice(userId, target.deviceId, spawnWakeWaitMs)
     }
-    const params = {
-      workdir: target.workdir ?? '', ...(target.workdir ? {} : { talk: true }),
-      prompt: handoverTask(g, copy), agent: 'claude', mission_num: copy.num,
+    // Checked again after the wait: a box protected meanwhile gets no start.
+    if (isProtectedDevice(db, userId, target.deviceId)) code = 'protected_device'
+    else {
+      const params = {
+        workdir: target.workdir ?? '', ...(target.workdir ? {} : { talk: true }),
+        prompt: handoverTask(g, copy), agent: 'claude', mission_num: copy.num,
+      }
+      const r = await broker.issue(hub, userId, target.deviceId, 'start', params, { timeoutMs: spawnStartTimeoutMs })
+      const id = r.ok ? r.result?.convo_id : null
+      if (typeof id === 'string' && id && id.length <= CONVO_ID_MAX_CHARS && sanitizePeerText(id, CONVO_ID_MAX_CHARS) === id) convoId = id
+      else code = r.ok ? 'bad_start_reply' : sanitizePeerText(r.error?.code, 64) || 'unknown'
     }
-    const r = await broker.issue(hub, userId, target.deviceId, 'start', params, { timeoutMs: spawnStartTimeoutMs })
-    const id = r.ok ? r.result?.convo_id : null
-    if (typeof id === 'string' && id && id.length <= CONVO_ID_MAX_CHARS && sanitizePeerText(id, CONVO_ID_MAX_CHARS) === id) convoId = id
-    else code = r.ok ? 'bad_start_reply' : sanitizePeerText(r.error?.code, 64) || 'unknown'
   } catch (err) {
     console.error('hand-over session: start threw', err)
     code = 'internal'

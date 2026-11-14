@@ -3747,9 +3747,10 @@ access (`matron-admin`, the loopback `POST /link/preapprove`); the password
 reset by email. The journal's check is not the gate for a protected box:
 the box's own check against its pinned keys is, and a box must never trust
 the journal's word that a statement was valid. The journal's nonce gives
-freshness; it checks `signed_at` only loosely (within a minute of the
-nonce's issue and of its own clock, so a skewed device clock is caught
-here rather than at the box); a box checks it against its own window.
+freshness; it checks `signed_at` only loosely (no more than a minute before
+the nonce was issued, nor more than a minute ahead of its own clock, so a
+skewed device clock is caught here rather than at the box); a box checks it
+against its own window.
 
 **An account with no active approval key behaves exactly as before.**
 Every guard below lets the request through unsigned; an `approval` sent
@@ -3854,7 +3855,7 @@ string, below.)
 | `user` | non-empty string | The account's name, as signed in with (`users.name`) |
 | `key_id` | non-empty string | The signing key |
 | `nonce` | non-empty string | From `POST /approvals/nonce`, issued to the signing device |
-| `signed_at` | safe integer, ms | When the device signed. Not checked by the journal; a box checks it |
+| `signed_at` | safe integer, ms | When the device signed, by its clock. The journal refuses it (`mismatch`) when it is more than 60 seconds before the nonce was issued or more than 60 seconds ahead of the journal's clock (*Checking an approval*); a box checks it against its own window |
 | `subject` | flat object | What the action is about (above). Required on every type; may be `{}` |
 | `item` | `{id, num, reply_to}` | `item_tap` only, exactly these three keys: the item's `it_…` id (string), its `#num` (integer), and the id of the comment whose button was tapped, or `null` for the item's own buttons |
 | `action` | non-empty string | `item_tap` only: the button label, as the tap sends it |
@@ -3991,7 +3992,8 @@ body: the signed path,
 (a key may revoke itself); check and revoke are one transaction. With no
 `approval` but a `password` or `code`: the password-and-code path, exactly
 as enrolment's (two-factor on, a TOTP code, the same errors and the same
-lock). With neither: `403 approval_required`. Revoking the account's last
+lock), and `401 {error:'unauthenticated'}`, nothing revoked, if the calling
+device was signed out while the password was being checked. With neither: `403 approval_required`. Revoking the account's last
 live key puts it back to "no key".
 
 **Attach.** A key belongs to the account, not to a sign-in. When a device
@@ -4030,11 +4032,11 @@ takes pushes:
 
 The added notice says the key can now approve dangerous actions and to
 remove it and change the password if that was not the user. Adding the
-account's first key or removing its last also restamps open consent items
-(*Protected boxes*). `matron-admin device revoke` and `matron-admin
-approval-key revoke` file the removed notice too, but cannot push it or
-announce it live (the CLI has no connection to the running journal): the
-apps see it on their next read.
+account's first key or removing its last also restamps open consent items,
+each with an `updated` marker (*Protected boxes*). `matron-admin device
+revoke` and `matron-admin approval-key revoke` file the removed notice (and
+restamp) too, but cannot push it or announce it live (the CLI has no
+connection to the running journal): the apps see it on their next read.
 
 **From the host.** A key outlives its device's sign-in (a reset, a password
 change, a lockdown or a sign-out leaves it attached to no device), and once
@@ -4274,7 +4276,8 @@ needs the user's own approval, signed once the account has a key.
   changes are restamped and get an `updated` marker. The user-only flag
   is left as it is.
 - `matron-admin device protected <device_id> on|off` does the same from the
-  host, unsigned (no marker; apps see the change on their next read).
+  host, unsigned (the marker is written but not sent live; apps see the
+  change on their next read).
   `matron-admin device list` adds ` protected` to the line.
 - `GET /devices` carries `protected: boolean` on every device.
 
@@ -4296,6 +4299,11 @@ needs the user's own approval, signed once the account has a key.
 | a mission hand-over's session start (`start_session`, including **New session** on a protected Coordinator box) | `start_session: {status:'refused', reason:'protected_device'}`; the hand-over itself still goes through and the copy is made |
 | a talk request's **New session** on it | no start is sent; the guest's card reads "Couldn't start a session: protected_device. Pick another option." and the request waits for the guest again |
 | inviting a guest box on accepting a person-room ask or a talk request (on one journal or across journals) | `409 {error:'conflict', blocked_by:'protected_device'}`; nothing changes and the ask stays as it was |
+
+Where the journal first wakes an asleep box and waits for it (a routine, an
+alert, a hand-over's or a talk's session start), it checks again once the
+wait is over: a box protected meanwhile gets nothing, with the same outcome
+as above.
 
 **With a key**, an ask **aimed at** a protected box needs a signed
 `consent` statement to be approved. Aimed at means: a spawn's target box; a
@@ -4326,9 +4334,10 @@ below, from the card's fields (the spawn's `request_id`, `workdir` and
 transfer's `id`, `sha256` and `size`) and the box's name exactly as
 `GET /devices` lists it (the stored name, not a display label). Items are restamped when the box is
 protected or unprotected, renamed, or when the account's first key is
-added or last key removed; the toggle and the rename send an `updated`
-marker for each changed item, a key change and the CLI do not (an app sees
-it on its next read). The pending list and the answer check always work
+added or last key removed. Each changed item's `updated_at` moves (so
+`GET /items?since=` returns it) and an `updated` marker is appended for it;
+from the host (`matron-admin`) the marker is not sent live, and an app sees
+it on its next read. The pending list and the answer check always work
 from the ask as it is now, so the item is a convenience: a rename between
 reading and signing is a `mismatch`.
 
@@ -4632,7 +4641,13 @@ reach a sleeping box only after it has been woken (up to
 to a box that is off is delivered at its next `hello`, and a transfer is
 released only once its upload completes, so a forwarded consent can be
 minutes to hours old. The reference tool's five-minute default suits taps
-and unlocks only; the caller picks the window for each kind.
+and unlocks only; the caller picks the window for each kind. The journal's
+own bound on `signed_at` is a check on the device's clock, not a freshness
+window: it takes a statement while its nonce is under five minutes old and
+`signed_at` is no more than a minute before the nonce was issued, so a tap
+the journal accepts can already be up to six minutes past its `signed_at`
+when it is forwarded. A box with a shorter window refuses such a tap as
+`stale`.
 
 **Notes for a bridge.**
 
@@ -4670,7 +4685,12 @@ the caller's.
   `reply_to` is the id of the follow-up comment whose buttons were tapped,
   or `null` for the item's own buttons, so a "Yes" on a follow-up never
   passes for the item's own button; `prompt_digest` (lowercase hex) and
-  `item_id` (the item's `it_` id) are optional and compared when given. For
+  `item_id` (the item's `it_` id) are optional and compared when given. A
+  bridge should always pass `prompt_digest` for a tap, computed from the
+  words it asked: without it, a statement signed for the same item, button
+  and `reply_to` still verifies after the question's words have changed (one
+  the journal refused as a `mismatch` and could forward anyway), as long as
+  its nonce is new to the box and `signed_at` is within `maxAgeMs`. For
   the other types all five must be absent. Any other key is a `TypeError`,
   as is a malformed `expect`, `now` or `maxAgeMs`. A bad approval or bad
   keys never throw. `maxAgeMs` defaults to five minutes; `signed_at` more
@@ -4773,7 +4793,8 @@ in to the account, with no key:
 2. or `POST /approval-keys/:key_id/revoke {password, code}` removes the key
    and leaves the phone signed in (sign it out too);
 3. with no device signed in, the password reset by email signs every
-   client out (keys detached, not removed); sign in again and do 1 or 2;
+   client out (keys detached, not removed, and the phone's device row gone,
+   so 1 answers `404`); sign in again and do 2;
 4. with the authenticator lost as well, the operator runs
    `matron-admin approval-key revoke <user> <key_id|--all>` on the host
    (and `matron-admin user 2fa-reset <user>` if needed).
@@ -7761,7 +7782,9 @@ notice without a push). Once the account has an active key:
   routes' password path (*Keys and enrolment*: `409
   two_factor_required`, `400 totp_required`, `401 bad_password`, `403
   bad_code`, one attempt at a time, and the same enrolment lock, `429
-  enrolment_locked`), after the same `404`. That is how a user whose only
+  enrolment_locked`), after the same `404`; a caller signed out while the
+  password was being checked gets `401 {error:'unauthenticated'}` and
+  nothing is revoked. That is how a user whose only
   keyed phone is lost or stolen signs it out, and revokes its key, from a
   device with no key;
 - **signing yourself out** (`:id` is the caller's own device) needs no
