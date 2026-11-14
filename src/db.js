@@ -2376,8 +2376,30 @@ export function listDevices(db, userId) {
   const head = db.prepare('SELECT seq FROM user_seq WHERE user_id=?').get(userId)
   const headSeq = head ? head.seq : 0
   return db.prepare(
-    'SELECT id AS device_id, kind, name, tag_char, created_at, cursor, last_seen_at, protected FROM devices WHERE user_id=? ORDER BY id'
-  ).all(userId).map((d) => ({ ...d, protected: d.protected === 1, lag: headSeq - d.cursor }))
+    'SELECT id AS device_id, kind, name, tag_char, created_at, cursor, last_seen_at, protected, locked FROM devices WHERE user_id=? ORDER BY id'
+  ).all(userId).map((d) => ({ ...d, protected: d.protected === 1, locked: storedLocked(d.locked), lag: headSeq - d.cursor }))
+}
+
+// A box's locked mode as its bridge reports it (hello, status, box_status):
+// {on: boolean, until: non-negative integer ms | null}, normalised, or
+// undefined when `raw` is not that shape.
+export function parseLocked(raw) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw) || typeof raw.on !== 'boolean') return undefined
+  const until = raw.until ?? null
+  if (until !== null && !(Number.isSafeInteger(until) && until >= 0)) return undefined
+  return { on: raw.on, until }
+}
+
+// The bridge's report for its own device: kept while on, cleared by on:false
+// (or, at hello, by a hello that reports nothing). A malformed report is
+// ignored: the caller passes only what parseLocked accepted.
+export function setDeviceLocked(db, deviceId, locked) {
+  db.prepare('UPDATE devices SET locked=? WHERE id=?').run(locked?.on ? JSON.stringify(locked) : null, deviceId)
+}
+
+const storedLocked = (text) => {
+  if (text == null) return null
+  try { return parseLocked(JSON.parse(text)) ?? null } catch { return null }
 }
 
 // Box status (spec: 2026-09-21 "usage and allowances live in the journal").
@@ -2594,7 +2616,8 @@ export function addProtectedDevices(db) {
 // wrong password or code on the password-and-code path (bootstrap
 // enrolment, revoke by password); approval_enrol_locks: the account's
 // current or last lock of that path, its escalation level and when it
-// ends. Idempotent.
+// ends. devices.locked: the {on, until} a bridge last reported for its own
+// box (JSON), NULL when not locked or never reported. Idempotent.
 export function addApprovalLockdown(db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS approval_failures(
@@ -2626,6 +2649,7 @@ export function addApprovalLockdown(db) {
     BEGIN
       UPDATE approval_failures SET device_id = NULL WHERE device_id = OLD.id;
     END`)
+  if (!db.prepare('PRAGMA table_info(devices)').all().some((c) => c.name === 'locked')) db.exec('ALTER TABLE devices ADD COLUMN locked TEXT')
 }
 
 // When deliveries to a peer journal started failing (src/federation-outbox.js):

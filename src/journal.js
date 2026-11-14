@@ -1,4 +1,5 @@
 import { authorize } from './auth.js'
+import { approvalKeyIdOfDevice } from './approval-keys.js'
 import { isPrivateDevice } from './db.js'
 import { indexableBody } from './search.js'
 import { getMission, ORIGIN_SIEVE } from './missions.js'
@@ -359,11 +360,14 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
 // both deliberate: no sender_device_id (there is no producing connection)
 // and no push pipeline (a journal-authored room line is not an
 // attention-worthy push).
-export function appendAndBroadcast(db, hub, { userId, convoId, sender, type, payload }) {
+// `senderDeviceId`: the client device whose request this is, for a user's
+// event an agent hears as a turn (an item tap or comment): it reaches the
+// agent stamped with that device's approval key (hub.js agentJournalFrame).
+export function appendAndBroadcast(db, hub, { userId, convoId, sender, type, payload, senderDeviceId = null }) {
   const hinted = pinHintBeforeAppend(db, userId, convoId, type)
   const r = append(db, { userId, convoId, sender, type, payload })
   if (r.duplicate) return r
-  broadcastAppended(db, hub, { userId, convoId, seq: r.seq, ts: r.ts, sender, type, payload })
+  broadcastAppended(db, hub, { userId, convoId, seq: r.seq, ts: r.ts, sender, type, payload, senderDeviceId })
   if (hinted) sendPinsFrame(db, hub, userId)
   if (r.unarchived) sendArchiveFrame(hub, userId, [r.unarchived], r.ts)
   return r
@@ -372,10 +376,10 @@ export function appendAndBroadcast(db, hub, { userId, convoId, sender, type, pay
 // The fan-out half of appendAndBroadcast, for callers that must append
 // INSIDE their own transaction (a milestone's marker seq is the row's
 // anchor) and broadcast only after it commits. Same targeting rules.
-export function broadcastAppended(db, hub, { userId, convoId, seq, ts, sender, type, payload }) {
+export function broadcastAppended(db, hub, { userId, convoId, seq, ts, sender, type, payload, senderDeviceId = null }) {
   const frame = { kind: 'journal', ...toEventShape({ seq, convo_id: convoId, ts, sender, type, payload }) }
   const targets = isClientOnlyEvent(type, payload) ? new Set() : agentTargetsFor(db, convoId)
-  hub.broadcastJournal(userId, frame, targets)
+  hub.broadcastJournal(userId, frame, targets, senderDeviceId == null ? null : () => approvalKeyIdOfDevice(db, userId, senderDeviceId))
 }
 
 // The agent devices allowed to see a conversation's traffic — hub's

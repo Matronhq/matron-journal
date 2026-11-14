@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { WebSocketServer } from 'ws'
 import { authToken, touchDevice, authorizeAgentWrite } from './auth.js'
 import { getBoxDefaults, boxDefaultsByDevice, effectiveBoxDefaults, normaliseAgent } from './box-defaults.js'
-import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses, setDeviceSyncScope } from './db.js'
+import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses, setDeviceSyncScope, parseLocked, setDeviceLocked } from './db.js'
 import { parseSyncScope } from './sync-scope.js'
 import { settingsView } from './settings.js'
 import { eventsAfter, scopedEventsAfter, scopedReplayCount, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, agentTargetsFor, CONVO_ID_MAX_CHARS } from './journal.js'
@@ -14,7 +14,8 @@ import { countPendingAsks, createSpawnRequest, inheritedSpawnMission, discardSpa
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem, reconcileConsentItems } from './consent-items.js'
 import { nudgeCoordinator, chatAskId } from './consent.js'
 import { isProtectedDevice, consentSubject } from './consent-subject.js'
-import { hasActiveKey, requireApproval } from './approval-keys.js'
+import { hasActiveKey, requireApproval, approvalKeyIdOfDevice } from './approval-keys.js'
+import { agentJournalFrame } from './hub.js'
 import { expireContactAsks } from './contacts.js'
 import { expireInviteAsks, onInviteAskExpired } from './federation-invite-asks.js'
 import { expireGrantAsks } from './grants.js'
@@ -517,6 +518,13 @@ export function attachWs({
           // Absent field = asserts visible: an unpinned flag follows the env
           // var exactly, including its removal (admin pin is the override).
           if (who.kind === 'agent') applyBridgePrivate(db, who.deviceId, msg.private === true)
+          // Locked mode (a bridge setting, src/db.js parseLocked): the box's
+          // own report, kept for the device list. A hello without it says
+          // the box is not locked; a malformed one changes nothing.
+          if (who.kind === 'agent') {
+            const locked = msg.locked === undefined ? null : parseLocked(msg.locked)
+            if (locked !== undefined) setDeviceLocked(db, who.deviceId, locked)
+          }
           // Optional client sync scope (src/sync-scope.js). Same reject shape
           // as a bad cursor. Agents' delivery is already scoped by
           // membership, so they ignore it.
@@ -630,7 +638,9 @@ export function attachWs({
                 // replay-path half of that guarantee; fanOut below is the
                 // live half.
                 if (who.kind === 'agent' && isClientOnlyEvent(e.type, e.payload)) continue
-                ws.send(JSON.stringify(journalFrame(e)))
+                // History does not say which device sent it: a user's event
+                // replays to an agent with approval_key_id null.
+                ws.send(JSON.stringify(who.kind === 'agent' ? agentJournalFrame(journalFrame(e)) : journalFrame(e)))
               }
               if (batch.length < 500) break
               cursor = batch[batch.length - 1].seq
@@ -777,6 +787,14 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
       ...roomIdEcho(msg), ...requestIdEcho(msg), ...(detail ? { detail } : {}),
     }))
   }
+  // A bridge's locked-mode report on a later frame (box_status, status), for
+  // its own device only: absent or malformed changes nothing, on:false
+  // clears it (src/db.js parseLocked).
+  const applyLocked = () => {
+    if (conn.kind !== 'agent' || msg.locked === undefined) return
+    const locked = parseLocked(msg.locked)
+    if (locked !== undefined) setDeviceLocked(db, conn.deviceId, locked)
+  }
   // Invite ops: validate a room id + load the row. Rooms are top-level
   // conversations of this conn's user; children (sub-chats) are silenced
   // conversations and can never be rooms.
@@ -837,7 +855,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
     // stored in the event row, so consumers must fall back to sender-name
     // matching for replayed history.
     frame.sender_device_id = conn.deviceId
-    hub.broadcastJournal(conn.userId, frame, targets)
+    // A user's event reaches an agent stamped with the approval key of the
+    // client device that sent it (hub.js agentJournalFrame).
+    const keyIdOf = conn.kind === 'client' ? () => approvalKeyIdOfDevice(db, conn.userId, conn.deviceId) : null
+    hub.broadcastJournal(conn.userId, frame, targets, keyIdOf)
     try {
       pushPipeline.onAppend(conn.userId, frame, conn.deviceId, pushHint)
     } catch (err) {
@@ -2356,7 +2377,13 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // sanitisers as the recent_folders capacity blocks, so a bridge
         // sends the one payload for both.
         if (conn.kind !== 'agent') return fail('forbidden')
+        // `locked` (the box's locked mode) rides here too, kept on the
+        // device row apart from the report: a report without it leaves it.
+        // A malformed one is ignored, and a frame with only `locked` is not
+        // an empty report.
+        applyLocked()
         const status = sanitizeBoxStatus(msg)
+        if (!status && msg.locked !== undefined) break
         if (!status) return fail('bad_request', 'no valid status block')
         const reportedAt = Date.now()
         upsertDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt })
@@ -2426,6 +2453,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // a size-capped object, so the bridge can evolve the shape without
         // a server deploy.
         if (conn.kind !== 'agent') return fail('forbidden')
+        // The box's locked mode, as on box_status: about the device, not the
+        // conversation, so applied whatever the rest of the frame says.
+        applyLocked()
         if (typeof msg.status !== 'object' || msg.status === null) return fail('bad_request')
         if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) return fail('forbidden')
         let encoded

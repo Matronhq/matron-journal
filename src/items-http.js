@@ -204,6 +204,9 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
   // marker carries no comment at all (src/withdrawn-comments.js).
   const payload = itemMarkerPayload({ item, action, by: author, comment: presentWithdrawn(comment), extra })
   const sender = senderOf(db, who)
+  // The user's own write reaches the agent stamped with the approval key of
+  // the device that made it (hub.js agentJournalFrame).
+  const senderDeviceId = who.kind === 'client' ? who.deviceId : null
   // A write on an item of a mission someone has been granted: their shared
   // view follows it live (spec 2026-10-02 matron-to-matron sharing), marker
   // or no marker. Never for a consent mirror — the grantee's reads do not
@@ -217,7 +220,7 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
   }
   let r
   try {
-    r = appendAndBroadcast(db, hub, { userId: who.userId, convoId: item.origin_convo_id, sender, type: ITEM_EVENT_TYPE, payload })
+    r = appendAndBroadcast(db, hub, { userId: who.userId, convoId: item.origin_convo_id, sender, type: ITEM_EVENT_TYPE, payload, senderDeviceId })
   } catch (err) {
     // The table write already committed; a marker on a since-deleted
     // conversation must not fail the request (same stance as spawns.js).
@@ -242,7 +245,7 @@ export function emitMarker({ db, hub, pushPipeline, waker }, who, { item, action
     if (text != null) {
       const fbPayload = { body: text, fallback_for: 'item', item_id: item.id, num: item.num, action }
       try {
-        const fr = appendAndBroadcast(db, hub, { userId: who.userId, convoId: item.origin_convo_id, sender, type: 'text', payload: fbPayload })
+        const fr = appendAndBroadcast(db, hub, { userId: who.userId, convoId: item.origin_convo_id, sender, type: 'text', payload: fbPayload, senderDeviceId })
         try {
           pushPipeline.onAppend(who.userId, toEventShape({ seq: fr.seq, convo_id: item.origin_convo_id, ts: fr.ts, sender, type: 'text', payload: fbPayload }), who.deviceId)
         } catch (err) {

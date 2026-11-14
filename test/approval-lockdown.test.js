@@ -293,3 +293,146 @@ test('the lock escalates 1 h, 6 h, 24 h and stays at 24 h; seven days without a 
   now = fourth.until + 7 * 24 * HOUR
   assert.deepEqual(lockAt(now), { level: 1, until: now + 2 + HOUR })
 })
+
+// ---- approval_key_id ---------------------------------------------------------
+
+test('a user\'s event reaches the agent with the sending device\'s key: on a send, an item tap and a comment; null without one; never the client\'s', async (t) => {
+  const w = await world(t)
+  const { s, alice } = w
+  const laptop = signIn(s, alice.id, 'laptop')
+  const phoneWs = await w.clientWs(w.token)
+  const laptopWs = await w.clientWs(laptop.token)
+  const agentGets = (pred) => w.agentWs.waitFor((f) => f.kind === 'journal' && pred(f))
+
+  phoneWs.send({ op: 'send', convo_id: 'c1', approval_key_id: 'forged', payload: { body: 'from the phone' } })
+  const a = await agentGets((f) => f.payload?.body === 'from the phone')
+  assert.equal(a.approval_key_id, w.key.keyId)
+  // The client's own copy is today's frame.
+  const own = await phoneWs.waitFor((f) => f.kind === 'journal' && f.payload?.body === 'from the phone')
+  assert.equal('approval_key_id' in own, false)
+
+  laptopWs.send({ op: 'send', convo_id: 'c1', approval_key_id: w.key.keyId, payload: { body: 'from the laptop' } })
+  const b = await agentGets((f) => f.payload?.body === 'from the laptop')
+  assert.equal(b.approval_key_id, null, 'a device with no key: null, whatever it claims')
+
+  // Taps and comments on an item reach the agent the same way.
+  const item = (await s.http('/items', { method: 'POST', token: w.box.token, body: { convo_id: 'c1', kind: 'question', title: 'Go?', body: 'b', actions: ['Yes', 'No'] } })).json.item
+  assert.equal((await s.http(`/items/${item.id}/comments`, { method: 'POST', token: w.token, body: { action: 'Yes' } })).status, 201)
+  const tap = await agentGets((f) => f.type === 'item' && f.payload?.comment?.action === 'Yes')
+  assert.equal(tap.approval_key_id, w.key.keyId)
+  assert.equal((await s.http(`/items/${item.id}/comments`, { method: 'POST', token: laptop.token, body: { body: 'and another thing' } })).status, 201)
+  const comment = await agentGets((f) => f.type === 'item' && f.payload?.comment?.body === 'and another thing')
+  assert.equal(comment.approval_key_id, null)
+
+  // An agent's own events carry no stamp at all.
+  const created = w.agentWs.frames.find((f) => f.kind === 'journal' && f.type === 'item' && f.payload?.action === 'created')
+  assert.equal('approval_key_id' in created, false)
+
+  // A revoked key stamps nothing.
+  const approval = await signAccount(s, { token: w.token, key: w.key, subject: { op: 'revoke_key', key_id: w.key.keyId } })
+  assert.equal((await s.http(`/approval-keys/${w.key.keyId}/revoke`, { method: 'POST', token: w.token, body: { approval } })).status, 200)
+  phoneWs.send({ op: 'send', convo_id: 'c1', payload: { body: 'after the revoke' } })
+  assert.equal((await agentGets((f) => f.payload?.body === 'after the revoke')).approval_key_id, null)
+
+  // Replayed history cannot say which device sent it: null.
+  const again = await makeWsClient(s.base, { token: w.box.token, cursor: 0 })
+  t.after(() => again.close())
+  const replayed = await again.waitFor((f) => f.kind === 'journal' && f.payload?.body === 'from the phone')
+  assert.equal(replayed.approval_key_id, null)
+})
+
+test('an account with no key: user events reach the agent with approval_key_id null and nothing else changes', async (t) => {
+  const { s, alice, token } = await startApprovalServer(t)
+  const box = createAgent(s.db, alice.id, 'box-a')
+  upsertConversation(s.db, { id: 'c1', ownerUserId: alice.id, title: 'C1', agentDeviceId: box.deviceId })
+  const agent = await makeWsClient(s.base, { token: box.token, cursor: null })
+  const client = await makeWsClient(s.base, { token, cursor: null })
+  t.after(() => { agent.close(); client.close() })
+  await agent.waitFor((f) => f.op === 'hello_ok')
+  await client.waitFor((f) => f.op === 'hello_ok')
+  client.send({ op: 'send', convo_id: 'c1', payload: { body: 'hello' } })
+  const f = await agent.waitFor((x) => x.kind === 'journal' && x.payload?.body === 'hello')
+  const own = await client.waitFor((x) => x.kind === 'journal' && x.payload?.body === 'hello')
+  const { approval_key_id: stamp, ...rest } = f
+  assert.equal(stamp, null)
+  assert.deepEqual(rest, own)
+})
+
+// ---- locked ------------------------------------------------------------------
+
+test('a bridge reports locked in its hello and later updates; the device list shows it; malformed is ignored; only its own device', async (t) => {
+  const { s, alice, token } = await startApprovalServer(t)
+  const box = createAgent(s.db, alice.id, 'box-a')
+  const other = createAgent(s.db, alice.id, 'box-b')
+  const lockedOf = async (deviceId) => (await s.http('/devices', { token })).json.devices.find((d) => d.device_id === deviceId).locked
+  assert.equal(await lockedOf(box.deviceId), null)
+  const agent = await makeWsClient(s.base, { token: box.token, cursor: null, hello: { locked: { on: true, until: null } } })
+  t.after(() => agent.close())
+  await agent.waitFor((f) => f.op === 'hello_ok')
+  assert.deepEqual(await lockedOf(box.deviceId), { on: true, until: null })
+  assert.equal(await lockedOf(other.deviceId), null)
+  assert.equal((await s.http('/devices', { token })).json.devices.find((d) => d.kind === 'client').locked, null)
+
+  const until = Date.now() + 30 * 60000
+  agent.send({ op: 'box_status', locked: { on: true, until }, device_id: other.deviceId })
+  await tick()
+  assert.deepEqual(await lockedOf(box.deviceId), { on: true, until })
+  assert.equal(await lockedOf(other.deviceId), null, 'never another device')
+  for (const bad of ['yes', { on: 'true' }, { on: true, until: -1 }, { on: true, until: 1.5 }, [true], null]) {
+    agent.send({ op: 'box_status', locked: bad })
+  }
+  await tick()
+  assert.deepEqual(await lockedOf(box.deviceId), { on: true, until }, 'malformed reports change nothing')
+  assert.equal(agent.frames.some((f) => f.op === 'error' && f.ref === 'box_status'), false, 'and are not errors either')
+
+  upsertConversation(s.db, { id: 'c1', ownerUserId: alice.id, title: 'C1', agentDeviceId: box.deviceId })
+  agent.send({ op: 'status', convo_id: 'c1', status: { model: 'x' }, locked: { on: true, until: until + 1 } })
+  await tick()
+  assert.deepEqual(await lockedOf(box.deviceId), { on: true, until: until + 1 })
+  agent.send({ op: 'box_status', locked: { on: false, until: null } })
+  await tick()
+  assert.equal(await lockedOf(box.deviceId), null, 'on:false clears it')
+
+  // A client cannot report one, and a hello that is malformed only there
+  // still connects.
+  const client = await makeWsClient(s.base, { token, cursor: null, hello: { locked: { on: true, until: null } } })
+  t.after(() => client.close())
+  await client.waitFor((f) => f.op === 'hello_ok')
+  assert.equal((await s.http('/devices', { token })).json.devices.find((d) => d.kind === 'client').locked, null)
+  const bad = await makeWsClient(s.base, { token: other.token, cursor: null, hello: { locked: 'yes' } })
+  t.after(() => bad.close())
+  await bad.waitFor((f) => f.op === 'hello_ok')
+  assert.equal(await lockedOf(other.deviceId), null)
+})
+
+test('a hello without locked clears what an earlier one reported', async (t) => {
+  const { s, alice, token } = await startApprovalServer(t)
+  const box = createAgent(s.db, alice.id, 'box-a')
+  const lockedOf = async () => (await s.http('/devices', { token })).json.devices.find((d) => d.device_id === box.deviceId).locked
+  const one = await makeWsClient(s.base, { token: box.token, cursor: null, hello: { locked: { on: true, until: 5 } } })
+  await one.waitFor((f) => f.op === 'hello_ok')
+  assert.deepEqual(await lockedOf(), { on: true, until: 5 })
+  one.close()
+  const two = await makeWsClient(s.base, { token: box.token, cursor: null })
+  t.after(() => two.close())
+  await two.waitFor((f) => f.op === 'hello_ok')
+  assert.equal(await lockedOf(), null)
+})
+
+// ---- unlock / lock / clear_lockdown ------------------------------------------
+
+test('unlock, lock and clear_lockdown are ordinary RPCs: forwarded with params unchanged, even to a protected box', async (t) => {
+  const w = await world(t)
+  await w.protect()
+  const phoneWs = await w.clientWs(w.token)
+  const approval = await signAccount(w.s, { token: w.token, key: w.key, subject: { op: 'unlock_box', box: 'box-a', minutes: '30' } })
+  for (const [i, method] of ['unlock', 'lock', 'clear_lockdown'].entries()) {
+    const params = method === 'lock' ? {} : { approval, minutes: 30 }
+    phoneWs.send({ op: 'agent_request', request_id: `u${i}`, agent_device_id: w.box.deviceId, method, params })
+    const got = await w.agentWs.waitFor((f) => f.kind === 'rpc' && f.request?.request_id === `u${i}`)
+    assert.equal(got.request.method, method)
+    assert.deepEqual(got.request.params, params)
+  }
+  // The journal did not check the signature: its nonce is unspent.
+  assert.equal(w.s.db.prepare('SELECT used_at FROM approval_nonces WHERE nonce=?').get(JSON.parse(approval.statement).nonce).used_at, null)
+})
