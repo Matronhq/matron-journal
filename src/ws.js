@@ -14,7 +14,7 @@ import { countPendingAsks, createSpawnRequest, inheritedSpawnMission, discardSpa
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem, reconcileConsentItems } from './consent-items.js'
 import { nudgeCoordinator, chatAskId } from './consent.js'
 import { isProtectedDevice, consentSubject } from './consent-subject.js'
-import { hasActiveKey, requireApproval, approvalKeyIdOfDevice } from './approval-keys.js'
+import { hasActiveKey, requireApproval, approvalKeyIdOfDevice, refuse, ApprovalRefused } from './approval-keys.js'
 import { agentJournalFrame } from './hub.js'
 import { expireContactAsks } from './contacts.js'
 import { expireInviteAsks, onInviteAskExpired } from './federation-invite-asks.js'
@@ -1133,19 +1133,18 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           if (p === null || typeof p !== 'object' || Array.isArray(p) || !isText(p.workdir) || !isText(p.prompt)) return failRpc('bad_request', 'bad params')
           const box = db.prepare('SELECT name FROM devices WHERE id=?').get(msg.agent_device_id).name
           const subject = consentSubject('start', { box, workdir: p.workdir ?? '', prompt: p.prompt ?? '' })
-          let refused = null
           try {
             delivered = db.transaction(() => {
               const g = requireApproval({ db, journalHost }, conn, { approval: p.approval }, { type: 'account', subject })
-              if (!g.ok) { refused = g; return false }
+              if (!g.ok) refuse(g.status, g.body)
               if (!send()) throw new Error('undelivered')
               return true
             })()
           } catch (err) {
+            if (err instanceof ApprovalRefused) return failRpc(err.refusal.body.error, err.refusal.body.reason)
             if (err?.message !== 'undelivered') throw err
             delivered = false
           }
-          if (refused) return failRpc(refused.body.error, refused.body.reason)
         } else {
           // Single-consumer delivery (see hub.sendRpcRequest): false means no
           // live socket — no queueing, the client hears it immediately.

@@ -11,8 +11,7 @@ import { hashPassword } from './auth.js'
 import { deleteGithubAccount } from './github-accounts.js'
 import { disableTwoFactor } from './two-factor.js'
 import { normaliseEmail, setUserEmail } from './password-reset.js'
-import { guardedAccountAction, hasActiveKey, refuse } from './approval-keys.js'
-import { boundedSubject, sha256Hex } from './consent-subject.js'
+import { guardedAccountAction, hasActiveKey, refuse, boundedSubject, sha256Hex } from './approval-keys.js'
 
 // A journal name is a URL path segment in shareable links (/u/<name>/<n>)
 // and a sender prefix (user:<name>), so it is ASCII, starts alphanumeric,

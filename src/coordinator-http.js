@@ -9,8 +9,7 @@ import { filteredAgent } from './privacy.js'
 import { COORDINATOR_EVENT_TYPE, coordinatorFor, setCoordinatorConvoId } from './coordinator.js'
 import { getConsentEnabled, setConsentEnabled, getTransferConsentEnabled, setTransferConsentEnabled } from './consent.js'
 import { seedRoutines } from './routines.js'
-import { guardedAccountAction, hasActiveKey, refuse } from './approval-keys.js'
-import { boundedSubject } from './consent-subject.js'
+import { guardedAccountAction, hasActiveKey, refuse, boundedSubject } from './approval-keys.js'
 
 export async function handleCoordinatorRoute(ctx, req, res, url, who) {
   if (url.pathname !== '/coordinator') return false

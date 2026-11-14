@@ -355,6 +355,9 @@ test('requireApproval: an item tap must match item, action and prompt digest', a
   assert.deepEqual(await check({ action: 'Close' }), invalid('mismatch'))
   assert.deepEqual(await check({ prompt_digest: 'b'.repeat(64) }), invalid('mismatch'))
   assert.equal((await check({})).ok, true)
+  // An expectation that leaves reply_to out means the item's own buttons.
+  const loose = { ...tap, item: { id: 'it_1', num: 7 } }
+  assert.equal(requireApproval(ctxOf(s), who, { approval: await sign() }, loose).ok, true)
 })
 
 // ---- Revocation ----------------------------------------------------------

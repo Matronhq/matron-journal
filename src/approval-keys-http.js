@@ -186,16 +186,15 @@ function readName(res, raw) {
 // /password uses): the lock check, the password and code, and the failure
 // count run start to finish before the next attempt's lock check, so
 // requests sent together cannot each get a guess while the first ones are
-// still being hashed. `ctx.clock` is the test seam for the time.
+// still being hashed.
 const ownQueue = makeKeyedQueue()
 export function confirmPasswordAndTotp(ctx, res, who, { password, code }) {
-  const clock = ctx.clock ?? Date.now
   return (ctx.passwordChecks ?? ownQueue).run(who.userId, async () => {
-    if (enrolmentLocked(ctx, res, who, clock())) return false
+    if (enrolmentLocked(ctx, res, who, Date.now())) return false
     if (!isTwoFactorEnabled(ctx.db, who.userId)) { json(res, 409, { error: 'two_factor_required' }); return false }
     if (classifyCode(code)?.kind === 'recovery') { json(res, 400, { error: 'totp_required' }); return false }
     if (await confirmIdentity(ctx, res, who, { password, code, needCode: true })) return true
-    countEnrolmentFailure(ctx, res, who, clock())
+    countEnrolmentFailure(ctx, res, who, Date.now())
     return false
   })
 }

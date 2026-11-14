@@ -19,7 +19,7 @@ import { serveHelp } from './help.js'
 import { wakeIfOffline, isWakeableDevice } from './wake.js'
 import { handleItemsRoute, emitMarker } from './items-http.js'
 import { getItem } from './items.js'
-import { restampConsentItems, boundedSubject } from './consent-subject.js'
+import { restampConsentItems } from './consent-subject.js'
 import { handleMissionsRoute } from './missions-http.js'
 import { ORIGIN_SIEVE } from './missions.js'
 import { handleSharingRoute } from './sharing-http.js'
@@ -35,7 +35,7 @@ import { handleUsersRoute } from './users-http.js'
 import { handlePasswordResetRoute, handleAccountEmailRoute } from './password-reset-http.js'
 import { handleTwoFactorLogin, handleTwoFactorRoute, twoFactorRequiredNow } from './two-factor-http.js'
 import { handleApprovalKeysRoute, announceKey, confirmPasswordAndTotp } from './approval-keys-http.js'
-import { activeKeysOfDevice, guardedAccountAction, hasActiveKey, refuse } from './approval-keys.js'
+import { activeKeysOfDevice, guardedAccountAction, hasActiveKey, refuse, boundedSubject } from './approval-keys.js'
 import { isTwoFactorEnabled, makeTwoFactorTickets } from './two-factor.js'
 import { PLAIN_BOX } from './token-box.js'
 import { githubAccountView } from './github-accounts.js'
@@ -131,6 +131,14 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
   const signInTickets = tickets || makeTwoFactorTickets()
   const codeLimiter = twoFactorLimiter || makeRateLimiter({ max: 10 })
   const passwordChecks = makeKeyedQueue()
+  // Consent items restamped (src/consent-subject.js restampConsentItems: a
+  // box protected or renamed) reach the user's apps as an `updated` marker.
+  const announceRestamped = (who, ids) => {
+    for (const id of ids) {
+      const item = getItem(db, who.userId, id)
+      if (item) emitMarker({ db, hub, pushPipeline, waker }, who, { item, action: 'updated', fallback: false })
+    }
+  }
   // Forgot/reset password: their own per-IP budget, a few asks per quarter hour.
   const passwordResetLimiter = resetLimiter || makeRateLimiter({ max: 5, windowMs: 15 * 60000 })
   // Alertmanager webhook (src/alerts-http.js): built once so its in-flight
@@ -849,10 +857,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           },
         })
         if (!g.ok) return json(res, g.status, g.body)
-        for (const id of g.value) {
-          const item = getItem(db, who.userId, id)
-          if (item) emitMarker({ db, hub, pushPipeline, waker }, who, { item, action: 'updated', fallback: false })
-        }
+        announceRestamped(who, g.value)
         return json(res, 200, { ok: true, device_id: deviceId, protected: body.on })
       }
       const rn = url.pathname.match(/^\/devices\/(\d+)\/rename$/)
@@ -872,10 +877,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         if (!renameOwnedDevice(db, who.userId, renamedId, clean)) return json(res, 404, { error: 'not_found' })
         // A consent ask aimed at a protected box names it in its subject
         // (src/consent-subject.js): open consent items follow the new name.
-        for (const id of restampConsentItems(db, who.userId)) {
-          const item = getItem(db, who.userId, id)
-          if (item) emitMarker({ db, hub, pushPipeline, waker }, who, { item, action: 'updated', fallback: false })
-        }
+        announceRestamped(who, restampConsentItems(db, who.userId))
         // The frame carries the standing tag too — device_meta is "here is
         // this device's current meta", not a name-only delta, so a roster
         // built from frames alone never loses the letter.

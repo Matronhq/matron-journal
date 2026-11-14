@@ -36,6 +36,23 @@ export const ENROL_LOCK_MS = [1, 6, 24].map((h) => h * 60 * 60000)
 export const ENROL_LEVEL_RESET_MS = 7 * 24 * 60 * 60000
 const FAILURE_KEEP_MS = 7 * 24 * 60 * 60000
 
+// A subject's values are strings of at most 200 characters
+// (src/approvals.js validSubject). boundedSubject builds one from `fields`
+// in order, any value over the limit going in as the lowercase hex SHA-256
+// of its UTF-8 bytes under `<name>_sha256`: the rule for every subject the
+// journal builds (the account actions', src/consent-subject.js's).
+export const SUBJECT_VALUE_MAX = 200
+export const sha256Hex = (text) => crypto.createHash('sha256').update(String(text ?? ''), 'utf8').digest('hex')
+export function boundedSubject(fields) {
+  const out = {}
+  for (const [k, v] of Object.entries(fields)) {
+    const s = String(v ?? '')
+    if (s.length > SUBJECT_VALUE_MAX) out[`${k}_sha256`] = sha256Hex(s)
+    else out[k] = s
+  }
+  return out
+}
+
 export function hasActiveKey(db, userId) {
   return !!db.prepare('SELECT 1 FROM approval_keys WHERE user_id=? AND revoked_at IS NULL').get(userId)
 }
@@ -191,7 +208,7 @@ function matchesExpect(st, expect) {
   if (st.type !== expect.type || !sameSubject(st.subject, expect.subject)) return false
   if (st.type !== 'item_tap') return true
   const it = expect.item
-  return isObj(it) && st.item.id === it.id && st.item.num === it.num && st.item.reply_to === it.reply_to
+  return isObj(it) && st.item.id === it.id && st.item.num === it.num && st.item.reply_to === (it.reply_to ?? null)
     && st.action === expect.action && st.prompt_digest === expect.prompt_digest
 }
 

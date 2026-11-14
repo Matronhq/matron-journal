@@ -31,6 +31,7 @@ import { badRequest } from './http-who.js'
 import { getItem, addComment } from './items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE } from './items-marker.js'
 import { getCoordinatorConvoId } from './coordinator.js'
+import { ApprovalRefused } from './approval-keys.js'
 import {
   HANDOVER_NOTE_MAX, APPROVE_LABEL, KEEP_LABEL, APPROVAL_ROLE,
   offerHandover, answerApproval, acceptHandover, settleHandover, refusedLine, expireHandovers, pendingHandover, getHandover, convoLabel,
@@ -289,7 +290,7 @@ export function handleApprovalTap(ctx, res, who, item, { handoverId, action, rep
       comment = settled.state === 'refused' ? refusedLine(db, { userId, handover: settled }) : tap.comment
     })()
   } catch (err) {
-    if (err?.refusal) { json(res, err.refusal.status, err.refusal.body); return true }
+    if (err instanceof ApprovalRefused) { json(res, err.refusal.status, err.refusal.body); return true }
     if (err?.message === 'unknown_action') { json(res, 400, { error: 'unknown_action' }); return true }
     if (err?.message === 'idem_key_conflict') { json(res, 409, { error: 'conflict' }); return true }
     if (answerError(res, err)) return true

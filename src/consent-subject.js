@@ -15,34 +15,16 @@
 //
 // The subject is a flat object of strings, at most 12 keys of at most 200
 // characters each (src/approvals.js validSubject). A value that can be
-// longer — a box name, a working directory, an ask id — is replaced, when
-// it is over 200 characters, by the lowercase hex SHA-256 of its UTF-8
+// longer — a box name, a working directory, an ask id — is replaced
+// (boundedSubject, src/approval-keys.js), when it is over 200 characters, by the lowercase hex SHA-256 of its UTF-8
 // bytes under the key `<name>_sha256` (so a 300-character workdir is
 // `workdir_sha256`, never a truncated `workdir`). Texts are always hashed:
 // `task_sha256` (the spawn's task), `message_sha256` (a chat ask's opening
 // message, its justification), `prompt_sha256` (a direct start's prompt);
 // `file_sha256` is the transfer's own content hash. `decision` is always
 // "approve": a decline never needs a signature.
-import crypto from 'node:crypto'
-import { hasActiveKey, requireApproval } from './approval-keys.js'
+import { hasActiveKey, requireApproval, boundedSubject, sha256Hex } from './approval-keys.js'
 import { transferRecipients } from './transfers.js'
-
-export const SUBJECT_VALUE_MAX = 200
-
-export const sha256Hex = (text) => crypto.createHash('sha256').update(String(text ?? ''), 'utf8').digest('hex')
-
-// `fields` in order; any value over the limit goes in as its hash. Also the
-// rule for the account actions' subjects (a pair code, an agent name, a
-// conversation id).
-export function boundedSubject(fields) {
-  const out = {}
-  for (const [k, v] of Object.entries(fields)) {
-    const s = String(v ?? '')
-    if (s.length > SUBJECT_VALUE_MAX) out[`${k}_sha256`] = sha256Hex(s)
-    else out[k] = s
-  }
-  return out
-}
 
 // The subject for one ask. `ask` per kind:
 //   spawn:    {id, box, workdir, task}

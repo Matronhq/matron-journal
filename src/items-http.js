@@ -31,7 +31,7 @@ import { inlineRefsToText, knowsInlineRefs, strayInlineRef } from './inline-refs
 import { presentWithdrawn } from './withdrawn-comments.js'
 import { handleHandoverRoute, approvalQuestionOf, handleApprovalTap, withdrawOnClose } from './item-handover-http.js'
 import { getReplicaItem, getReplicaMission } from './federation-replica.js'
-import { requireApproval, hasActiveKey, guardedAccountAction, refuse } from './approval-keys.js'
+import { requireApproval, hasActiveKey, guardedAccountAction, refuse, ApprovalRefused } from './approval-keys.js'
 import { promptDigest } from './approvals.js'
 
 const forbiddenReply = (res) => { json(res, 403, { error: 'forbidden' }); return true }
@@ -653,8 +653,8 @@ export async function handleItemsRoute(ctx, req, res, url, who) {
 // statement commits to the item, the button, the comment it answers, the
 // question's words as they stand (the item's title and body, or that
 // comment's body) and the subject: a step-up comment's own, else the item's,
-// else {}. A refusal throws, so nothing is written; `refusal` is the answer
-// to send. The journal's handover question (handleApprovalTap) is answered
+// else {}. A refusal throws ApprovalRefused, so nothing is written; its
+// `refusal` is the answer to send. The journal's handover question (handleApprovalTap) is answered
 // through the same check.
 const storedSubject = (s) => { try { return s == null ? {} : (JSON.parse(s) ?? {}) } catch { return {} } }
 function tapApprover(ctx, who, approval, action) {
@@ -668,7 +668,7 @@ function tapApprover(ctx, who, approval, action) {
     const r = requireApproval({ db: ctx.db, journalHost: ctx.journalHost }, who, { approval }, {
       type: 'item_tap', item: { id: row.id, num: row.num, reply_to: asked ? asked.id : null }, action, prompt_digest, subject,
     })
-    if (!r.ok) throw Object.assign(new Error('approval_refused'), { refusal: r })
+    if (!r.ok) refuse(r.status, r.body)
     return r.approval
   }
 }
@@ -804,7 +804,7 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
       const approve = action != null ? tapApprover(ctx, who, body.approval, action) : null
       out = addComment(db, { userId: who.userId, itemId: item.id, author, deviceId: who.deviceId, convoId, body: text, attachments, action, replyTo, replaces, actions: v.value.actions ?? [], stepUp: su.stepUp, subject: su.subject, idemKey, keepStatus: item.consent != null, approve })
     } catch (err) {
-      if (err?.refusal) { json(res, err.refusal.status, err.refusal.body); return true }
+      if (err instanceof ApprovalRefused) { json(res, err.refusal.status, err.refusal.body); return true }
       if (answerKnownError(res, err)) return true
       throw err
     }
