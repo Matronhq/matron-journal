@@ -257,6 +257,26 @@ test('what the user types in the source\'s conversation goes to the Coordinator 
   assert.equal((await w.ws.phone.waitFor((f) => f.op === 'error')).code, 'bad_request')
 })
 
+test('posts made with a row loaded earlier announce once and say the limit line once; a message before any report claims none', async (t) => {
+  const w = await world(t, { caps: { hourlyMax: 1, dailyMax: 5 } })
+  // The user can type before any report exists.
+  w.ws.phone.send({ op: 'send', convo_id: w.source.convo_id, type: 'text', payload: { body: 'anything yet?' } })
+  const line = await w.ws.phone.waitFor((f) => f.kind === 'journal' && f.sender === 'journal' && f.type === 'text')
+  assert.match(line.payload.body, /^Sent to your Coordinator: \[#\d+ About a Scout report: anything yet\?\]/)
+  // Two requests that both loaded the source before either wrote.
+  const ctx = { db: w.s.db, hub: null }
+  const stale = w.source
+  assert.equal(acceptReport(ctx, stale, { body: 'one' }).status, 'accepted')
+  assert.equal(acceptReport(ctx, stale, { body: 'two' }).status, 'rate_limited')
+  assert.equal(acceptReport(ctx, stale, { body: 'three' }).status, 'rate_limited')
+  const ev = events(w)
+  assert.equal(ev.filter((e) => e.type === 'convo_meta').length, 1)
+  assert.equal(ev.filter((e) => e.sender === 'journal' && /reached its limit/.test(e.payload.body ?? '')).length, 1)
+  // A source disabled after the row was loaded takes nothing.
+  setSourceEnabled(w.s.db, w.source.id, false)
+  assert.equal(acceptReport(ctx, stale, { body: 'four' }, { now: Date.now() + 2 * 3600000 }).status, 'bad_request')
+})
+
 test('with no Coordinator the conversation says the message went nowhere', async (t) => {
   const w = await world(t, { coordinator: false })
   await w.report({ body: 'A report.' })

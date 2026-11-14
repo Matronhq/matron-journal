@@ -210,6 +210,11 @@ export function acceptReport(ctx, source, input, { now = Date.now() } = {}) {
   const hash = sha256(built.text)
   const fan = []
   const out = db.transaction(() => {
+    // Read again inside the transaction: the caller's row was loaded before
+    // the request body arrived, and another post may have announced the
+    // conversation, said the limit line, or disabled the source since.
+    source = getSource(db, source.id)
+    if (!source || !source.enabled) return { status: 'bad_request', detail: 'the source is no longer enabled' }
     if (db.prepare('SELECT 1 FROM inbound_posts WHERE source_id=? AND body_hash=? AND ts>?').get(source.id, hash, now - DAY)) return { status: 'duplicate' }
     const count = (windowMs) => db.prepare('SELECT COUNT(*) AS n FROM inbound_posts WHERE source_id=? AND ts>?').get(source.id, now - windowMs).n
     if (count(HOUR) >= source.hourly_max) return refuseOverCap(db, fan, source, { windowMs: HOUR, max: source.hourly_max, per: 'an hour', now })

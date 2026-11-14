@@ -52,7 +52,7 @@ export function forwardInboundMessage(ctx, emitMarker, who, { convoId, seq, text
       extra: report ? quotedReport(source, report) : null,
     })
     const body = task
-      ? `Sent to your Coordinator with the latest report: ${linkTo(task)}. No agent reads this conversation.`
+      ? `Sent to your Coordinator${report ? ' with the latest report' : ''}: ${linkTo(task)}. No agent reads this conversation.`
       : 'No agent reads this conversation, and you have no Coordinator set, so this was not passed on. Set a Coordinator, or copy the report into an agent\'s conversation.'
     const payload = { body }
     const r = append(db, { userId: who.userId, convoId, sender: JOURNAL, type: 'text', payload, idemKey: `inbound-send-note:${convoId}:${seq}` })
