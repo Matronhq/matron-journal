@@ -41,7 +41,7 @@ import { emitMarker } from './items-http.js'
 import { withdrawForQueuedCancel } from './withdrawn-comments.js'
 import { getMission } from './missions.js'
 import { sanitizeConvoStatus, upsertConvoStatus } from './convo-status.js'
-import { validateSessionControl, authorizeSessionControl, sessionControlResultFrame } from './session-control.js'
+import { validateSessionControl, authorizeSessionControl, sessionControlResultFrame, carryOnUserOnlyRefused, WHY_CARRY_ON_USER_ONLY } from './session-control.js'
 import { validRanges, addSeenRanges, markDeviceUsesRanges, legacyReadAsSeen, markItemSeen } from './seen.js'
 import { panicLock, isPanicLocked, panicHelloField, panicAnnounced, panicOnFrame, PANIC_OFF_FRAME, announcePanicClears, clientAuthDead, refuseLockedClient, isFrozenDevice, signOutLockedClient, lockedError, closeLockedSocket, closeFrozenSocket, markPanicTold, ACCOUNT_LOCKED } from './panic.js'
 
@@ -2585,8 +2585,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const failRpc = (code, detail, extra = {}) => conn.ws.send(JSON.stringify(
           { kind: 'control', op: 'error', code, ref: msg.op, ...(v.rid ? { request_id: v.rid } : {}), ...(detail ? { detail } : {}), ...extra }))
         if (!v.ok) return failRpc(v.code, v.detail)
-        const auth = authorizeSessionControl(db, conn, msg)
-        if (auth.code) return failRpc(auth.code, auth.detail, auth.since != null ? { since: auth.since } : {})
+        // When the request arrived: a carry-on to a user-only box rests on
+        // a user event recent at this moment (and again after a wake).
+        const arrivedAt = Date.now()
+        const auth = authorizeSessionControl(db, conn, msg, { causes: v.causes, now: arrivedAt })
+        if (auth.code) return failRpc(auth.code, auth.detail, { ...(auth.since != null ? { since: auth.since } : {}), ...(auth.why ? { why: auth.why } : {}) })
         const { target } = auth
         // Each op parks a wake waiter (minutes) and a broker entry; bound
         // them per connection so a looping Coordinator cannot stack them.
@@ -2621,9 +2624,15 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           try {
             if (waking && spawnWakeWaitMs > 0) await hub.waitForDevice(conn.userId, target.device_id, spawnWakeWaitMs)
             // Locked, or the box protected, while it was being woken:
-            // nothing is sent.
+            // nothing is sent. Nor is a carry-on to a box that is user-only
+            // now (made so meanwhile, or all along) unless its causes still
+            // resolve to the user's own message or tap. The age of that
+            // event is measured from when the request arrived, not from
+            // now: the wake can take minutes, and the user's word was
+            // recent when the Coordinator acted on it.
             const refusal = isPanicLocked(db, conn.userId) ? ACCOUNT_LOCKED
-              : isProtectedDevice(db, conn.userId, target.device_id) ? 'protected_device' : null
+              : isProtectedDevice(db, conn.userId, target.device_id) ? 'protected_device'
+                : carryOnUserOnlyRefused(db, conn, { deviceId: target.device_id, action: v.params.action, fromConvoId: msg.from_convo_id, causes: v.causes, at: arrivedAt }) ? 'user_only' : null
             let r
             if (refusal) r = { ok: false, error: { code: 'forbidden', detail: refusal } }
             else {
@@ -2634,7 +2643,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
               if (live) recordCarryOnEvent()
               r = await issued
             }
-            frame = sessionControlResultFrame(rid, r)
+            frame = sessionControlResultFrame(rid, r, refusal === 'user_only' ? WHY_CARRY_ON_USER_ONLY : null)
           } catch (err) {
             console.error(`session_control: ${err?.message || err}`)
             frame = sessionControlResultFrame(rid, { ok: false, error: { code: 'internal' } })
