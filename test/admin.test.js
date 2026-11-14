@@ -205,13 +205,8 @@ test('admin CLI: device list and device revoke', async () => {
   db.close()
 })
 
-// The CLI revoke used to be a bare DELETE on devices while the HTTP route
-// cleaned up convo_agents alongside it, so the same command by a different
-// door left the membership row standing — and `devices.id` is a plain INTEGER
-// PRIMARY KEY, so the next agent created lands on exactly the revoked id and
-// inherited its room. "Retire an agent, register its replacement" is the
-// ordinary sequence that hits this.
-test('admin CLI: device revoke clears room membership, so a reused id inherits nothing', async () => {
+// Revocation must clear membership and leave the replacement a fresh identity.
+test('admin CLI: device revoke clears room membership and never reuses its id', async () => {
   const db = openDb(':memory:')
   const alice = await createUser(db, 'alice', 'pw')
   const owner = createAgent(db, alice.id, 'owner-agent')
@@ -226,7 +221,7 @@ test('admin CLI: device revoke clears room membership, so a reused id inherits n
   assert.equal(getParticipant(db, 'room1', doomed.deviceId), null, 'the membership row goes with the device')
 
   const fresh = createAgent(db, alice.id, 'replacement-agent')
-  assert.equal(fresh.deviceId, doomed.deviceId, 'precondition: SQLite reused the id')
+  assert.ok(fresh.deviceId > doomed.deviceId, 'the replacement gets a new identity')
   assert.equal(authorizeAgentWrite(db, alice.id, fresh.deviceId, 'room1'), false, 'the replacement starts from nothing')
 
   db.close()

@@ -296,6 +296,47 @@ test('prompt_reply requires an integer target_seq (the ref it answers)', async (
   c.close()
 })
 
+test('prompt_reply derives queued_release kind from the stored target without replay', async (t) => {
+  const s = await startTestServer()
+  t.after(() => s.close())
+  const alice = await createUser(s.db, 'alice', 'pw')
+  upsertConversation(s.db, { id: 'c1', ownerUserId: alice.id })
+  upsertConversation(s.db, { id: 'c2', ownerUserId: alice.id })
+  const seed = (type, payload, convoId = 'c1') => append(s.db, {
+    userId: alice.id, convoId, sender: 'agent:a', type, payload,
+  }).seq
+  const release = seed('prompt', { kind: 'queued_release', question: 'Send queued messages?' })
+  const ordinary = seed('prompt', { question: 'Which value?' })
+  const nonPrompt = seed('text', { kind: 'queued_release', body: 'send' })
+  const otherConvo = seed('prompt', { kind: 'queued_release' }, 'c2')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'phone' } })
+  const c = await makeWsClient(s.base, { token: login.json.token, cursor: null })
+  t.after(() => c.close())
+  await c.waitFor((f) => f.op === 'hello_ok')
+  assert.equal(c.journal().length, 0, 'the target cards are not loaded')
+
+  let lastSeq = otherConvo
+  for (const [target, choice, text, kind] of [
+    [release, 'send', null, 'queued_release'],
+    [release, 'cancel:3', null, 'queued_release'],
+    [release, null, 'edited message', 'queued_release'],
+    [ordinary, 'send', null, undefined],
+    [ordinary, null, 'cancel:3', undefined],
+    [nonPrompt, 'send', null, undefined],
+    [otherConvo, 'send', null, undefined],
+    [9999, 'send', null, undefined],
+  ]) {
+    c.send({ op: 'prompt_reply', convo_id: 'c1', target_seq: target, choice, text, kind: 'queued_release' })
+    const reply = await c.waitFor((f) => f.kind === 'journal' && f.type === 'prompt_reply' && f.seq > lastSeq)
+    lastSeq = reply.seq
+    const expected = { target_seq: target, choice, text }
+    if (kind) expected.kind = kind
+    assert.deepEqual(reply.payload, expected)
+    const stored = s.db.prepare('SELECT payload FROM events WHERE user_id=? AND seq=?').get(alice.id, reply.seq)
+    assert.deepEqual(JSON.parse(stored.payload), expected)
+  }
+})
+
 test('read_marker requires up_to_seq to be null or a non-negative integer', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())
@@ -469,6 +510,49 @@ test('snapshot_required: a replay gap at or under MATRON_MAX_REPLAY still replay
   assert.ok(!c.frames.some((f) => f.op === 'snapshot_required'))
   assert.equal(s.hub.connsOf(alice.id).length, 1)
   c.close()
+})
+
+test('hello max_replay: client ceiling, boundaries and compatibility', async (t) => {
+  const cases = [
+    { name: 'lower ceiling requires snapshot', max: 5, snapshot: true },
+    { name: 'equal gap replays', max: 8 },
+    { name: 'cannot raise server ceiling', max: 1000, serverMax: 5, snapshot: true },
+    { name: 'zero with backlog requires snapshot', max: 0, snapshot: true },
+    { name: 'zero at head stays live', max: 0, cursor: 10 },
+    { name: 'null cursor stays live', max: 0, cursor: null },
+    { name: 'omitted cursor stays live', max: 0, cursor: undefined },
+    { name: 'omitted ceiling uses server limit' },
+    ...[-1, 2.5, '3', null, true, [], {}].map((max) => ({ name: `ignores ${JSON.stringify(max)}`, max })),
+    { name: 'agent ignores client ceiling', max: 0, agent: true },
+  ]
+  for (const c of cases) await t.test(c.name, { timeout: 5000 }, async (t) => {
+    const s = await startTestServer({ maxReplay: c.serverMax ?? 100 })
+    t.after(() => s.close())
+    const alice = await createUser(s.db, 'alice', 'pw')
+    upsertConversation(s.db, { id: 'c1', ownerUserId: alice.id })
+    for (let i = 0; i < 10; i++) {
+      append(s.db, { userId: alice.id, convoId: 'c1', sender: 'agent:a', type: 'text', payload: { body: `m${i}` } })
+    }
+    const login = c.agent
+      ? createAgent(s.db, alice.id, 'test')
+      : (await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'test' } })).json
+    const cursor = Object.hasOwn(c, 'cursor') ? c.cursor : 2
+    const client = await makeWsClient(s.base, { token: login.token, cursor, hello: { max_replay: c.max } })
+    t.after(() => client.close())
+    if (c.snapshot) {
+      const code = await new Promise((resolve) => client.ws.once('close', resolve))
+      assert.deepEqual(client.frames.map((f) => f.op), ['hello_ok', 'snapshot_required'])
+      assert.equal(client.frames[0].seq, 10)
+      assert.equal(code, 4009)
+      assert.equal(s.hub.connsOf(alice.id).length, 0)
+    } else {
+      const expected = cursor == null ? [] : Array.from({ length: 10 - cursor }, (_, i) => cursor + i + 1)
+      await client.waitFor((f) => expected.length ? f.kind === 'journal' && f.seq === 10 : f.op === 'hello_ok')
+      assert.deepEqual(client.journal().map((f) => f.seq), expected)
+      assert.equal(client.frames.some((f) => f.op === 'snapshot_required'), false)
+      assert.equal(s.hub.connsOf(alice.id).length, 1)
+    }
+  })
 })
 
 test('revoked device: its next WS frame gets error {code:"revoked"} and closes 4001; the same token also 401s over HTTP', async (t) => {

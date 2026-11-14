@@ -18,7 +18,8 @@ import { makeApnsClient } from './apns.js'
 import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline, BACKGROUND_WAKE_MS } from './push.js'
 import { resolveMediaDir } from './media.js'
-import { runOffload, runExpireLogs, runReapMedia, runExpireVoiceNotes, runExpireDeviceContent, runExpireTransfers } from './retention.js'
+import { offloadPass, expireLogsPass, runReapMedia, runExpireVoiceNotes, runExpireDeviceContent, runExpireTransfers, drainSync, drainAsync } from './retention.js'
+import { startStallLog, timed, logSlowRequests } from './stall-log.js'
 import { backfillSearchIndex, backfillIsDiff } from './search.js'
 import { loadEmbedder } from './embedder.js'
 import { ensureVectorSchema, runVectorIndexer, createVectorStore } from './vector-index.js'
@@ -67,6 +68,7 @@ export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
 export const DEFAULT_MEDIA_USER_QUOTA_BYTES = 2147483648 // 2 GiB
 export const DEFAULT_MAX_REPLAY = 50000
 const DEFAULT_RETENTION_DAYS = 30
+const RETENTION_INITIAL_DELAY_MS = 2 * 60 * 1000 // let the reconnect burst after a restart pass first
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h
 const DEFAULT_TOOL_LOG_TTL_HOURS = 24
 const DEFAULT_VOICE_NOTE_TTL_DAYS = 7 // audio goes a week after its transcript
@@ -252,7 +254,7 @@ export function resolveReapPcts({ mediaReapHighPct, mediaReapLowPct } = {}) {
 // once, here, at boot. The transfer-expiry pass (runExpireTransfers) runs
 // LAST and unconditionally — see the comment at its call site below.
 // Returns the interval handle (for close()).
-function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, deviceRetention }) {
+function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionIntervalMs, retentionInitialDelayMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, deviceRetention }) {
   const days = resolveRetentionDays(retentionDays)
   const ttlHours = resolveToolLogTtlHours(toolLogTtlHours)
   const voiceDays = resolveVoiceNoteTtlDays(voiceNoteTtlDays)
@@ -267,7 +269,10 @@ function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionInterval
   // uncollected one past 7 days), never "everything older than N" against
   // a setting that could be misconfigured — so the schedule always runs,
   // even when every other pass below is off.
-  const run = () => {
+  // One pass, as a generator: `yield*` hands the heavy passes' own yields
+  // through, and a bare `yield` between passes gives the loop a turn there
+  // too. See drainAsync in retention.js for why.
+  function* pass() {
     if (deviceRules !== null) {
       try {
         const r = runExpireDeviceContent(db, { rules: deviceRules })
@@ -278,14 +283,16 @@ function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionInterval
       } catch (err) {
         console.error('retention: device content expiry run failed', err)
       }
+      yield
     }
     if (ttlHours !== null) {
       try {
-        const r = runExpireLogs(db, { hours: ttlHours, mediaDir })
+        const r = yield* expireLogsPass(db, { hours: ttlHours, mediaDir })
         if (r.expired > 0) console.log(`retention: purged ${r.expired} live_log payload(s) older than ${ttlHours}h`)
       } catch (err) {
         console.error('retention: expire-logs run failed', err)
       }
+      yield
     }
     // Voice-note audio before offload/reap, so the reaper sees the user's
     // footprint without recordings whose words have already outlived them.
@@ -296,14 +303,16 @@ function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionInterval
       } catch (err) {
         console.error('retention: voice-note expiry run failed', err)
       }
+      yield
     }
     if (days !== null) {
       try {
-        const r = runOffload(db, { days, mediaDir })
+        const r = yield* offloadPass(db, { days, mediaDir })
         if (r.offloaded > 0) console.log(`retention: offloaded ${r.offloaded} tool_output payload(s) older than ${days}d`)
       } catch (err) {
         console.error('retention: offload run failed', err)
       }
+      yield
     }
     if (reapPcts !== null) {
       try {
@@ -312,6 +321,7 @@ function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionInterval
       } catch (err) {
         console.error('retention: media reap run failed', err)
       }
+      yield
     }
     // Agent-to-agent file transfers: a collected copy past its 1h grace,
     // and an open or released transfer nobody collected within 7 days —
@@ -323,9 +333,42 @@ function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionInterval
       console.error('retention: transfer expiry run failed', err)
     }
   }
-  run()
-  const interval = setInterval(run, retentionIntervalMs ?? RETENTION_INTERVAL_MS)
+  // The first pass waits retentionInitialDelayMs (a restart is when every
+  // client reconnects at once); 0 keeps the synchronous run-at-boot for
+  // programmatic callers and tests. Every pass after boot, the delayed
+  // first one included, yields between batches (drainAsync), so the loop
+  // serves requests while a pass runs; the summary line says how long the pass took end to end and how
+  // long its longest uninterrupted stretch was. A pass still running when
+  // the next is due is not doubled up. stop() (close) ends a pass in flight
+  // at its next yield.
+  let running = false
+  let stopped = false
+  const runAsync = async () => {
+    if (running || stopped) return
+    running = true
+    const start = performance.now()
+    let longest = 0
+    try {
+      await drainAsync(pass(), { shouldStop: () => stopped, onSlice: (ms) => { if (ms > longest) longest = ms } })
+    } catch (err) {
+      console.error('retention: pass failed', err)
+    } finally {
+      running = false
+      const ms = performance.now() - start
+      if (ms >= 1000 || longest >= 500) console.log(`retention: run took ${Math.round(ms)}ms, longest blocking stretch ${Math.round(longest)}ms`)
+    }
+  }
+  const initialDelay = retentionInitialDelayMs ?? RETENTION_INITIAL_DELAY_MS
+  let firstTimer = null
+  if (initialDelay > 0) {
+    firstTimer = setTimeout(runAsync, initialDelay)
+    firstTimer.unref()
+  } else {
+    drainSync(pass())
+  }
+  const interval = setInterval(runAsync, retentionIntervalMs ?? RETENTION_INTERVAL_MS)
   interval.unref()
+  interval.stop = () => { stopped = true; clearTimeout(firstTimer) }
   return interval
 }
 
@@ -343,7 +386,7 @@ const WAL_CHECKPOINT_INTERVAL_MS = 1000
 function scheduleWalCheckpoint(db, walCheckpointIntervalMs) {
   const run = () => {
     try {
-      db.pragma('wal_checkpoint(PASSIVE)')
+      timed('wal_checkpoint(PASSIVE)', () => db.pragma('wal_checkpoint(PASSIVE)'))
     } catch (err) {
       // A failed passive pass is retried by the next tick; log once per tick
       // rather than crash — the DB itself is still healthy (busy/locked are
@@ -366,7 +409,7 @@ function scheduleTtsSweep(tts, ttsSweepIntervalMs) {
   if (!tts) return null
   const run = () => {
     try {
-      const r = tts.sweep()
+      const r = timed('tts sweep', () => tts.sweep())
       if (r.removed > 0) console.log(`tts: removed ${r.removed} cached clip(s) older than 24h`)
     } catch (err) {
       console.error('tts: cache sweep failed', err)
@@ -434,7 +477,7 @@ function warnIfBindTrustsSpoofableIp(bind) {
 
 export function startServer({
   dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, apnsClient, replayBackpressureBytes,
-  retentionDays, retentionIntervalMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
+  retentionDays, retentionIntervalMs, retentionInitialDelayMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
   toolLogTtlHours, voiceNoteTtlDays, deviceRetention, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
   // How long an approved spawn waits for a woken target box to attach
   // before issuing `start` (wake-before-spawn). Sized for a cold VM boot:
@@ -713,7 +756,7 @@ export function startServer({
   let semanticTimer = null
   let indexingNow = false
   let semanticInFlight = Promise.resolve()
-  const server = http.createServer(makeHttpHandler({
+  const server = http.createServer(logSlowRequests(makeHttpHandler({
     db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir: resolvedMediaDir, mediaMaxBytes: resolvedMediaMaxBytes,
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     // transferChunkBytes: tests only (small chunks); production uses TRANSFER_CHUNK_BYTES.
@@ -724,7 +767,7 @@ export function startServer({
     github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, federationGrants, federationContribute, federationMedia, handleStatic, tokenBox,
     sessionControlTimeoutMs, alertWebhook: resolvedAlertWebhook, routineFirer, semantic, summariser: resolvedSummariser, mailer: resolvedMailer, tts: resolvedTts,
     journalHost, clientIdleMs, clientIdleClock,
-  }))
+  })))
   // A reverse proxy in front of the journal keeps its connections to it open
   // and reuses them. Node closes an idle connection after 5 s by default,
   // well before a proxy gives it up, so a request the proxy sent down a
@@ -749,6 +792,7 @@ export function startServer({
   })
   let retentionInterval = null
   let walCheckpointInterval = null
+  let stallLog = null
   let receiptPruneInterval = null
   let githubRefreshInterval = null
   let ttsSweepInterval = null
@@ -757,10 +801,11 @@ export function startServer({
     server.listen(port, bind, () => {
       const startDelay = cancellableDelay(backgroundDelayMs)
       retentionInterval = scheduleRetention(db, {
-        mediaDir: resolvedMediaDir, hub, retentionDays, retentionIntervalMs, toolLogTtlHours, voiceNoteTtlDays,
+        mediaDir: resolvedMediaDir, hub, retentionDays, retentionIntervalMs, retentionInitialDelayMs, toolLogTtlHours, voiceNoteTtlDays,
         mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes, deviceRetention,
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
+      stallLog = startStallLog()
       // Federation receipts are the replay memory for 30 days, then go.
       // What the outbox sent or cancelled goes a week after it ended, with
       // federation on or off (its bodies hold snapshot pages and invite
@@ -892,11 +937,12 @@ export function startServer({
         // open websocket first gets a close frame carrying it, so a client
         // can tell a restart from a network drop, and up to graceMs to
         // acknowledge. Whatever is left is terminated either way.
-        close: ({ closeCode, closeReason, graceMs = 1000 } = {}) => new Promise((r) => {
+        close: ({ closeCode, closeReason, graceMs = 1000, hardCutMs = 5000 } = {}) => new Promise((r) => {
           closing = true
           startDelay.cancel()
-          if (retentionInterval) clearInterval(retentionInterval)
+          if (retentionInterval) { clearInterval(retentionInterval); retentionInterval.stop() }
           if (walCheckpointInterval) clearInterval(walCheckpointInterval)
+          if (stallLog) stallLog.stop()
           if (receiptPruneInterval) clearInterval(receiptPruneInterval)
           // A delivery pass in flight finishes (its requests time out at
           // 30 s) before the db handle closes.
@@ -933,7 +979,16 @@ export function startServer({
             // A POST /tts waiting on Azure would hold server.close() for up to
             // its 20 s timeout: abort it, so the caller gets its 502 now.
             if (resolvedTts) resolvedTts.close()
-            server.close(() => { Promise.all([searchBackfill, isDiffBackfill, imageDimsBackfill, embedderReady.catch(() => {}), transcriptionDone, semanticInFlight, outboxDone]).then(() => { db.close(); r() }) })
+            // A kept-alive socket whose request is still running stays open
+            // after the reply, so server.close() alone can wait out the
+            // keep-alive timeout. Release each one as soon as it is idle;
+            // a request still running at hardCutMs (before the shutdown
+            // watchdog) is cut so a stalled one cannot hold shutdown open.
+            const idleSweep = setInterval(() => server.closeIdleConnections(), 100)
+            idleSweep.unref()
+            const hardCut = setTimeout(() => server.closeAllConnections(), hardCutMs)
+            hardCut.unref()
+            server.close(() => { clearInterval(idleSweep); clearTimeout(hardCut); Promise.all([searchBackfill, isDiffBackfill, imageDimsBackfill, embedderReady.catch(() => {}), transcriptionDone, semanticInFlight, outboxDone]).then(() => { db.close(); r() }) })
           }
           const open = closeCode === undefined ? [] : [...wss.clients].filter((c) => c.readyState === 1)
           if (!open.length) { finish(); return }
@@ -973,7 +1028,7 @@ export function installShutdownHandlers(s, {
       log('matron-journal: shutdown timed out, exiting')
       proc.exit(1)
     }, timeoutMs)
-    s.close({ closeCode: RESTART_CLOSE_CODE, closeReason: RESTART_CLOSE_REASON, graceMs })
+    s.close({ closeCode: RESTART_CLOSE_CODE, closeReason: RESTART_CLOSE_REASON, graceMs, hardCutMs: Math.max(0, timeoutMs - graceMs - 2000) })
       .then(() => { clearTimeout(timer); proc.exit(0) },
         (err) => { console.error('shutdown failed', err); proc.exit(1) })
   }

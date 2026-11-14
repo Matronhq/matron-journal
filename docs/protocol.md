@@ -80,7 +80,9 @@ the machine-checkable version of this page.
   or not — gets `snippet` omitted from every row (it can carry `tool_output`
   text, a credential surface); an ordinary (non-private) agent additionally
   has private-owned conversations excluded entirely — see "Device privacy"
-  below.
+  below. Conversations use the same ordering as `/roster`:
+  `COALESCE(last_ts, created_at) DESC, id DESC`. Status, metadata and
+  read-marker events do not move idle conversations ahead of newer messages.
 - `GET /convo/:id/messages?before_seq&limit` (Bearer) -> `{events}`. `limit`
   is clamped to 1..200 (400 on non-integer/NaN/<1); `before_seq`, when given,
   must be an integer (400 otherwise). Owner-only; missing or not-owned are
@@ -127,7 +129,9 @@ the machine-checkable version of this page.
   another user (or a nonexistent one) yields the same empty result set
   the user-scoping already guarantees for a genuinely-unmatched query —
   there is no separate existence check, so this is not an oracle for
-  "does this convo_id exist." Results are ranked by `sm.is_diff` first (a
+  "does this convo_id exist." For 2–8 whitespace-separated query terms,
+  adjacent, in-order prose matches rank first. Within each tier, results
+  are ranked by `sm.is_diff` (a
   `diff` hit ranks below every prose hit matching the same terms — a code
   change is rarely what "why did we do this" means), then FTS5 `bm25()`
   (best match first), ties broken by `ts DESC`; `snippet` is the FTS5
@@ -138,10 +142,12 @@ the machine-checkable version of this page.
   only read its transcript. `mission_num` is the number of the hit's
   conversation's current mission (same pointer `mode=chats` reports, see
   below), sieved the same way for an ordinary agent caller, or `null` when
-  it isn't on one. `why` is `'words'` when the hit matched every query
-  term, or `'some_words'` when it is part of the fallback described next.
-  Fewer than 5 `'words'` hits, with `q` carrying 2+ terms, runs the same
-  query again matching ANY term (still FTS-quoted, same ordering, same
+  it isn't on one. `why` is `'exact'` for the adjacent prose tier (the same value the tracker tiers report for a phrase match),
+  `'words'` for other hits matching every query term, or `'some_words'`
+  for the fallback described next. Clients should treat an unknown `why`
+  as a plain match. Fewer than 5 combined `'exact'` and `'words'` hits,
+  with `q` carrying 2+ terms, runs the same query again matching ANY term
+  (still FTS-quoted, same ordering, same
   privacy and subagent filters) for up to the remaining `limit`, excluding
   seqs already returned, and tags those `'some_words'` — ranked search
   never goes from a handful of exact hits to nothing just because no
@@ -566,9 +572,13 @@ the machine-checkable version of this page.
   `[{id, title, session_state, last_seq, summary, agent_device_id,
   created_at, last_ts, mission_num, status?}]` — top-level conversations only
   (`parent_convo_id IS NULL`; children are silenced sub-chats, never invite/
-  chat targets), ordered by `last_seq DESC`; `last_ts` is the newest
-  event's timestamp (`null` for an event-less conversation), same
-  derivation as `/snapshot`; `status` is the session's persisted header
+  chat targets), ordered by `COALESCE(last_ts, created_at) DESC, id DESC`:
+  newest last message first, falling back to `created_at` when there are no
+  message events, then immutable id descending for ties. `last_seq` still
+  advances on non-message events and does not determine list order.
+  `last_ts` is the newest message event's timestamp (`null` when there are
+  no message events), same derivation as `/snapshot`; `status` is the
+  session's persisted header
   `{reported_at, model?, context?, stall?, limits?}` (see the agent
   `status` op), present only once the session has reported one;
   `mission_num` is the number of the session's current mission, `null`
@@ -960,6 +970,19 @@ Rows from before the stamp carry neither, and don't count.
   wipes its local store, calls `GET /snapshot`, and reconnects with the
   fresh cursor (spec §6). Journal rows are never deleted, so this is an
   efficiency valve, not a data-loss boundary.
+  Clients may send an optional `hello.max_replay` (non-negative integer) to
+  lower the replay ceiling to `min(MATRON_MAX_REPLAY, max_replay)` for that
+  connection, allowing a snapshot instead of costly per-event replay on
+  mobile devices. It cannot raise the server limit. Zero requests a snapshot
+  whenever replay would carry any events; equality still replays. Omitted
+  or invalid values are ignored, as is the field on agent connections.
+  A very low ceiling can loop on a busy account: events that land between
+  `GET /snapshot` and the reconnect count as a gap, so the reconnect gets
+  `snapshot_required` again. Send `max_replay` on ordinary connects only;
+  on the reconnect straight after a snapshot, omit it (or send a generous
+  value) so that reconnect always replays.
+  Live-only connections (`cursor: null` or omitted) are unaffected. For
+  `for_you`, the lower ceiling applies to the scoped count described below.
 - **Sync scope (`hello.sync`, clients only).** `'everything'` (the default,
   and what a client that sends nothing gets) carries every event of every
   conversation. `'for_you'` is for a phone that follows only the tracker:
@@ -1251,6 +1274,17 @@ Rows from before the stamp carry neither, and don't count.
   `up_to_seq >= last_seq` always resets it to 0. Certain event kinds are
   never counted toward unread: `convo_meta` (a rename), `summary` (TOC metadata),
   and `edit` (not new activity).
+- Silent events: a message-type event (`text`, `prompt`, `file`, …) whose
+  payload carries `silent: true` is content the user can read in the chat
+  but is never told about. It appears in the conversation, replays and
+  fans out like any other event, and its buttons work; but it never
+  increments `unread_count` (at append or in a `read_marker` recompute),
+  never triggers an APNs alert, and is never listed as unseen. Only the
+  literal `true` counts. A bridge sets it on a card that only records
+  something, such as the Send now / Cancel card for a reminder an agent
+  set itself. Clients that count unread or raise notifications themselves
+  apply the same rule to the event: skip the count and the notification,
+  still show the row.
 - `summary` events: agent-publishable message kind carrying `{toc, detail, model}`
   (payload is opaque to the server — no field-level validation or size caps
   enforced; the server only checks the payload is a non-null object; any
@@ -5450,7 +5484,9 @@ when any of these is true:
   or by the prompt's own `payload.prompt_id` (how a bridge settles a card
   itself: a queued message it sent at turn end);
 - it is a prompt whose payload says `blocking: false` (a card nothing
-  waits on, such as a reminder the agent set itself).
+  waits on, such as a reminder the agent set itself);
+- its payload says `silent: true` (see *Unread semantics*). A silent event
+  is also never the conversation's `final` message: the one before it is.
 
 An open, non-consent item is unseen while it has agent content (its creation,
 or an agent comment) newer than what `item_seen` covers, and the user hasn't

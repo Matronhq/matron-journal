@@ -7,7 +7,7 @@ export async function startTestServer(opts = {}) {
   // a test that wants the tier passes its own (e.g. `fakeEmbedder()`).
   // Background work starts at once and runs unpaced, so tests that await
   // it don't sit out the production startup delay.
-  const s = await startServer({ dbPath: ':memory:', port: 0, embedder: null, backgroundDelayMs: 0, backgroundPace: 0, ...opts })
+  const s = await startServer({ dbPath: ':memory:', port: 0, embedder: null, backgroundDelayMs: 0, retentionInitialDelayMs: 0, backgroundPace: 0, ...opts })
   const base = `http://127.0.0.1:${s.port}`
   return {
     ...s,
