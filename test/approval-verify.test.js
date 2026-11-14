@@ -13,14 +13,16 @@ const TOOL = new URL('../tools/approval-verify.mjs', import.meta.url).pathname
 const keys = { keys: [{ key_id: fx.key_id, public_key: fx.public_key, name: 'phone' }] }
 const T0 = 1790000000000
 const base = { journal: 'journal.example', user: 'alice' }
+const SPAWN = JSON.parse(fx.statements.consent.statement).subject
 const EXPECT = {
-  item_tap: { ...base, type: 'item_tap', item_num: 7, action: 'Approve', subject: { box: 'box-a' } },
-  consent: { ...base, type: 'consent', subject: { id: 'sp_1', kind: 'spawn' } },
-  account: { ...base, type: 'account', subject: { device: 'phone', op: 'add_device' } },
+  item_tap: { ...base, type: 'item_tap', item_num: 7, action: 'Approve', reply_to: null, subject: { box: 'box-a' } },
+  item_tap_reply: { ...base, type: 'item_tap', item_num: 7, action: 'Yes', reply_to: 'cm_def456', subject: { box: 'box-a' } },
+  consent: { ...base, type: 'consent', subject: SPAWN },
+  account: { ...base, type: 'account', subject: { op: 'link_device', code: 'BCDF2345' } },
 }
 const ok = (approval, expect, extra = {}) => verifyApproval(approval, { keys, expect, now: T0 + 1000, ...extra })
 
-for (const type of ['item_tap', 'consent', 'account']) {
+for (const type of ['item_tap', 'item_tap_reply', 'consent', 'account']) {
   test(`vector ${type} verifies`, () => {
     const r = ok(fx.statements[type], EXPECT[type])
     assert.equal(r.ok, true)
@@ -54,10 +56,37 @@ test('stale and future signed_at', () => {
 })
 
 test('subject mismatch, extra subject key and missing subject key', () => {
-  assert.equal(ok(fx.statements.consent, { ...EXPECT.consent, subject: { id: 'sp_2', kind: 'spawn' } }).reason, 'mismatch')
-  assert.equal(ok(fx.statements.consent, { ...EXPECT.consent, subject: { id: 'sp_1' } }).reason, 'mismatch')
-  assert.equal(ok(fx.statements.consent, { ...EXPECT.consent, subject: { id: 'sp_1', kind: 'spawn', x: 'y' } }).reason, 'mismatch')
+  const { decision, ...missing } = SPAWN
+  assert.ok(decision)
+  assert.equal(ok(fx.statements.consent, { ...EXPECT.consent, subject: { ...SPAWN, ask: 'sp_2' } }).reason, 'mismatch')
+  assert.equal(ok(fx.statements.consent, { ...EXPECT.consent, subject: missing }).reason, 'mismatch')
+  assert.equal(ok(fx.statements.consent, { ...EXPECT.consent, subject: { ...SPAWN, x: 'y' } }).reason, 'mismatch')
   assert.equal(ok(fx.statements.consent, { ...EXPECT.consent, subject: {} }).reason, 'mismatch')
+})
+
+test('a tap is bound to the question it answered: reply_to is required, prompt_digest and item_id are checked when given', () => {
+  const reply = fx.statements.item_tap_reply
+  const st = JSON.parse(reply.statement)
+  // The follow-up's tap never verifies as the item's own button, nor the reverse.
+  assert.equal(ok(reply, { ...EXPECT.item_tap_reply, reply_to: null }).reason, 'mismatch')
+  assert.equal(ok(reply, { ...EXPECT.item_tap_reply, reply_to: 'cm_other' }).reason, 'mismatch')
+  assert.equal(ok(fx.statements.item_tap, { ...EXPECT.item_tap, reply_to: 'cm_def456' }).reason, 'mismatch')
+  assert.equal(ok(reply, { ...EXPECT.item_tap_reply, prompt_digest: fx.reply_prompt_example.digest }).ok, true)
+  assert.equal(st.prompt_digest, fx.reply_prompt_example.digest)
+  assert.equal(ok(reply, { ...EXPECT.item_tap_reply, prompt_digest: fx.prompt_digest_example.digest }).reason, 'mismatch')
+  assert.equal(ok(reply, { ...EXPECT.item_tap_reply, item_id: 'it_abc123' }).ok, true)
+  assert.equal(ok(reply, { ...EXPECT.item_tap_reply, item_id: 'it_other' }).reason, 'mismatch')
+  const { reply_to, ...noReply } = EXPECT.item_tap_reply
+  assert.ok(reply_to)
+  assert.throws(() => ok(reply, noReply), /reply_to/)
+  for (const bad of [{ reply_to: 5 }, { reply_to: '' }, { reply_to: undefined }, { prompt_digest: 'XYZ' }, { prompt_digest: '' }, { prompt_digest: 5 },
+    { item_id: '' }, { item_id: 7 }]) {
+    assert.throws(() => ok(reply, { ...EXPECT.item_tap_reply, ...bad }), TypeError, JSON.stringify(bad))
+  }
+  for (const k of [{ reply_to: null }, { prompt_digest: fx.reply_prompt_example.digest }, { item_id: 'it_abc123' }]) {
+    assert.throws(() => ok(fx.statements.consent, { ...EXPECT.consent, ...k }), TypeError, JSON.stringify(k))
+    assert.throws(() => ok(fx.statements.account, { ...EXPECT.account, ...k }), TypeError, JSON.stringify(k))
+  }
 })
 
 test('journal, user, type, item_num and action mismatches', () => {
@@ -189,6 +218,17 @@ test('CLI: prints the exact signed statement string', () => {
   const r = cli(['--keys', kf, '--expect', JSON.stringify({ ...base, type: 'account', subject })], JSON.stringify(a))
   assert.equal(r.status, 0, r.stderr)
   assert.equal(r.stdout, a.statement + '\n')
+})
+
+test('CLI: a follow-up tap verifies only with its reply_to in --expect', () => {
+  const inp = JSON.stringify(fx.statements.item_tap_reply)
+  const good = cli(['--keys', keysFile, '--expect', JSON.stringify(EXPECT.item_tap_reply), '--max-age-ms', '99999999999999'], inp)
+  assert.equal(good.status, 0, good.stderr)
+  const item = cli(['--keys', keysFile, '--expect', JSON.stringify({ ...EXPECT.item_tap_reply, reply_to: null }), '--max-age-ms', '99999999999999'], inp)
+  assert.equal(item.status, 1); assert.equal(item.stderr.trim(), 'mismatch')
+  const { reply_to, ...noReply } = EXPECT.item_tap_reply
+  assert.ok(reply_to)
+  assert.equal(cli(['--keys', keysFile, '--expect', JSON.stringify(noReply)], inp).status, 2)
 })
 
 test('CLI: refusals exit 1 with the reason on stderr', () => {

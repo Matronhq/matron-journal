@@ -31,9 +31,11 @@
 //                  most 200 characters)
 //   unknown_key    key_id is not in the pinned file
 //   signature      the signature does not verify under the pinned key
-//   mismatch       journal, user, type, item number, button label or subject
-//                  differ from what the caller expects (see `expect`; subject
-//                  must match exactly, extra or missing keys fail)
+//   mismatch       journal, user, type, subject, or for a tap the item
+//                  number, button label, reply_to (and prompt_digest and
+//                  item id when given) differ from what the caller expects
+//                  (see `expect`; subject must match exactly, extra or
+//                  missing keys fail)
 //   stale          signed_at is older than maxAgeMs (default 5 minutes) or
 //                  more than 60 seconds in the future
 //
@@ -45,13 +47,21 @@
 // {ok:true, statement} or {ok:false, reason}. It never throws on a bad
 // approval or bad keys. A malformed `expect` or option is a bug in the caller
 // and throws TypeError. expect = {journal, user, type, subject, item_num,
-// action}: journal, user, type and subject are always required (subject may
-// be {}); for type item_tap, item_num (integer) and action (the button label)
-// are required too, so a tap can never verify without its item and button
-// being named; for consent and account they must be absent. Any other key in
-// expect (a misspelling, say) is a TypeError.
+// action, reply_to, prompt_digest?, item_id?}: journal, user, type and
+// subject are always required (subject may be {}). For type item_tap,
+// item_num (integer), action (the button label) and reply_to are required
+// too, so a tap can never verify without its item, its button and the
+// question it answered being named: reply_to is the id of the follow-up
+// comment whose buttons were tapped, or null for the item's own buttons (a
+// follow-up's "Yes" must not pass for the item's). prompt_digest (lowercase
+// hex, the digest of the question's words as the box asked them) and
+// item_id (the item's id string) are optional and compared when given. For
+// consent and account all five must be absent. Any other key in expect (a
+// misspelling, say) is a TypeError.
 //
 // CLI: approval-verify.mjs --keys FILE --expect JSON [--max-age-ms N] < approval.json
+// (--expect is the same object as above, as JSON: a tap's must carry
+// "reply_to", null or the follow-up comment's id; --max-age-ms is at least 1.)
 // Exit 0 and the statement as JSON on stdout when valid; exit 1 and the reason
 // on stderr when not; exit 2 and a usage line for bad arguments or an
 // unreadable keys file. It never touches the network.
@@ -64,6 +74,7 @@ const SUBJECT_MAX_KEYS = 12
 const SUBJECT_MAX_LEN = 200
 const COMMON = ['v', 'type', 'journal', 'user', 'key_id', 'nonce', 'signed_at', 'subject']
 const TAP_ONLY = ['item', 'action', 'prompt_digest']
+const TAP_EXPECT = ['item_num', 'action', 'reply_to', 'prompt_digest', 'item_id']
 const DEFAULT_MAX_AGE_MS = 5 * 60 * 1000
 const FUTURE_SKEW_MS = 60 * 1000
 
@@ -173,14 +184,21 @@ function checkExpect(e) {
   if (!isStr(e.journal) || !isStr(e.user)) throw new TypeError('expect.journal and expect.user are required strings')
   if (!TYPES.includes(e.type)) throw new TypeError('expect.type must be item_tap, consent or account')
   if (!validSubject(e.subject)) throw new TypeError('expect.subject is required: a flat object of strings (may be empty)')
-  const known = ['journal', 'user', 'type', 'subject', 'item_num', 'action']
+  const known = ['journal', 'user', 'type', 'subject', ...TAP_EXPECT]
   const unknown = Object.keys(e).find((k) => !known.includes(k))
   if (unknown !== undefined) throw new TypeError(`unknown expect key: ${unknown}`)
   if (e.type === 'item_tap') {
     if (!Number.isSafeInteger(e.item_num)) throw new TypeError('expect.item_num (integer) is required for item_tap')
     if (!isStr(e.action)) throw new TypeError('expect.action (non-empty string) is required for item_tap')
-  } else if (e.item_num !== undefined || e.action !== undefined) {
-    throw new TypeError('expect.item_num and expect.action are only for item_tap')
+    if (!Object.hasOwn(e, 'reply_to') || (e.reply_to !== null && !isStr(e.reply_to))) {
+      throw new TypeError('expect.reply_to (a comment id, or null for the item\'s own buttons) is required for item_tap')
+    }
+    if (e.prompt_digest !== undefined && !(typeof e.prompt_digest === 'string' && /^[0-9a-f]+$/.test(e.prompt_digest))) {
+      throw new TypeError('expect.prompt_digest must be a lowercase hex string')
+    }
+    if (e.item_id !== undefined && !isStr(e.item_id)) throw new TypeError('expect.item_id must be a non-empty string')
+  } else if (TAP_EXPECT.some((k) => Object.hasOwn(e, k))) {
+    throw new TypeError(`expect.${TAP_EXPECT.join(', expect.')} are only for item_tap`)
   }
 }
 
@@ -216,14 +234,21 @@ export function verifyApproval(approval, opts) {
   if (!valid) return fail('signature')
 
   if (st.journal !== expect.journal || st.user !== expect.user || st.type !== expect.type) return fail('mismatch')
-  if (expect.type === 'item_tap' && (st.item.num !== expect.item_num || st.action !== expect.action)) return fail('mismatch')
+  if (expect.type === 'item_tap') {
+    if (st.item.num !== expect.item_num || st.action !== expect.action || st.item.reply_to !== expect.reply_to) return fail('mismatch')
+    if (expect.prompt_digest !== undefined && st.prompt_digest !== expect.prompt_digest) return fail('mismatch')
+    if (expect.item_id !== undefined && st.item.id !== expect.item_id) return fail('mismatch')
+  }
   if (!sameSubject(st.subject, expect.subject)) return fail('mismatch')
 
   if (st.signed_at < now - maxAgeMs || st.signed_at > now + FUTURE_SKEW_MS) return fail('stale')
   return { ok: true, statement: st }
 }
 
-const USAGE = 'usage: approval-verify.mjs --keys FILE --expect JSON [--max-age-ms N] < approval.json'
+const USAGE = 'usage: approval-verify.mjs --keys FILE --expect JSON [--max-age-ms N] < approval.json\n'
+  + '  --expect  {"journal","user","type","subject"}; for item_tap also "item_num", "action" and\n'
+  + '            "reply_to" (null, or the follow-up comment id), optionally "prompt_digest" and "item_id"\n'
+  + '  --max-age-ms  how old signed_at may be, at least 1 (default 300000)'
 
 function main(argv) {
   const usage = (msg) => { process.stderr.write((msg ? msg + '\n' : '') + USAGE + '\n'); return 2 }

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { keyIdOf, parseStatement, promptDigest, verifySignature } from '../src/approvals.js'
 import { canonicalize } from '../src/federation-jcs.js'
+import { consentSubject } from '../src/consent-subject.js'
 import { generateApprovalKey, signForTest } from './approval-helpers.js'
 
 const fx = JSON.parse(fs.readFileSync(new URL('./fixtures/approval-vectors.json', import.meta.url), 'utf8'))
@@ -87,6 +88,17 @@ test('promptDigest', () => {
   const { input, digest } = fx.prompt_digest_example
   assert.equal(promptDigest(input), digest)
   assert.notEqual(promptDigest({ body: input.body }), digest)
+})
+
+test('the vectors carry subjects the journal really builds', () => {
+  const { kind, ask } = fx.consent_ask_example
+  assert.deepEqual(JSON.parse(fx.statements.consent.statement).subject, consentSubject(kind, ask))
+  assert.deepEqual(JSON.parse(fx.statements.account.statement).subject, { op: 'link_device', code: 'BCDF2345' })
+  const reply = JSON.parse(fx.statements.item_tap_reply.statement)
+  assert.equal(reply.item.reply_to, 'cm_def456')
+  assert.equal(reply.prompt_digest, promptDigest(fx.reply_prompt_example.input))
+  assert.equal(fx.reply_prompt_example.digest, promptDigest(fx.reply_prompt_example.input))
+  for (const s of Object.values(fx.statements)) assert.equal(verifySignature(fx.public_key, s.statement, s.signature), true)
 })
 
 test('promptDigest refuses malformed input', () => {
