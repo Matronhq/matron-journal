@@ -913,7 +913,7 @@ carries that message's real `ts`.
 ```json
 { "verified": true, "convo_id": "…", "seq": 120, "cited_seq": 122,
   "ts": 1767225600000, "author": "user:alice", "kind": "voice",
-  "text": "Please find last month's invoice from the printer.",
+  "text": "Please find the notes from last week's planning call.",
   "before": { "seq": 118, "sender": "agent:box-a", "text": "…" } }
 { "verified": false, "convo_id": "…", "seq": 125,
   "sender": "agent:box-a", "reason": "agent_message" }
@@ -6204,7 +6204,8 @@ candidate messages; hitting that sets `truncated`.
 Coordinator. When all of the following hold, it sends one ephemeral frame to
 the Coordinator's bridge:
 
-- UK time is between 07:00 and 22:00;
+- it is between 07:00 and 22:00 in the journal's nudge zone
+  (`MATRON_UNSEEN_NUDGE_TZ`, an IANA name; default `Europe/London`);
 - the last nudge was at least an hour ago;
 - the Coordinator's bridge is connected;
 - there are important, unflagged entries unseen for 2 h or more that no

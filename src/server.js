@@ -490,11 +490,10 @@ export function startServer({
   retentionDays, retentionIntervalMs, retentionInitialDelayMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
   toolLogTtlHours, voiceNoteTtlDays, deviceRetention, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
   // How long an approved spawn waits for a woken target box to attach
-  // before issuing `start` (wake-before-spawn). Sized for a cold VM boot:
-  // incus start + bridge start + journal dial is ~3 minutes on the shared
-  // hosts (the infra's timer_wake_lead_minutes). Only ever waited when a
-  // wake is actually under way, so a journal without MATRON_WAKE_CMD never
-  // pays it.
+  // before issuing `start` (wake-before-spawn). Sized for a cold box boot:
+  // starting the box, then the bridge starting and dialling the journal,
+  // can take a few minutes. Only ever waited when a wake is actually under
+  // way, so a journal without MATRON_WAKE_CMD never pays it.
   spawnWakeWaitMs = resolveNumericEnv('MATRON_SPAWN_WAKE_WAIT_MS', process.env.MATRON_SPAWN_WAKE_WAIT_MS, 240000),
   sessionControlTimeoutMs = resolveNumericEnv('MATRON_SESSION_CONTROL_TIMEOUT_MS', process.env.MATRON_SESSION_CONTROL_TIMEOUT_MS, 30000),
   // Coordinator consent approvals per rolling 24 h (spec: 2026-09-29
@@ -515,7 +514,8 @@ export function startServer({
   stallWakeIntervalMs = null,
   autoArchiveIntervalMs = null,
   autoArchive = process.env.MATRON_AUTO_ARCHIVE !== '0',
-  // The unseen nudge (src/unseen-nudge.js). MATRON_UNSEEN_NUDGE=0 turns it off.
+  // The unseen nudge (src/unseen-nudge.js). MATRON_UNSEEN_NUDGE=0 turns it
+  // off; MATRON_UNSEEN_NUDGE_TZ names the zone its daytime hours are in.
   unseenNudgeIntervalMs = null,
   unseenNudge = process.env.MATRON_UNSEEN_NUDGE !== '0',
   // Coordinator routines (src/routines-sweep.js). MATRON_ROUTINES=0 stops
