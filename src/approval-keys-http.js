@@ -216,6 +216,10 @@ export function confirmPasswordAndTotp(ctx, res, who, { password, code }) {
   })
 }
 
+// The calling device still signed in (its row not deleted), checked after an
+// await on the password path.
+export const callerSignedIn = (db, who) => !!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(who.deviceId, who.userId)
+
 const keyExists = (res) => { json(res, 409, { error: 'key_exists' }); return true }
 const disabled = (res) => { json(res, 409, { error: 'approval_keys_disabled' }); return true }
 const notFound = (res) => { json(res, 404, { error: 'not_found' }); return true }
@@ -374,6 +378,9 @@ export async function handleApprovalKeysRoute(ctx, req, res, url, who) {
       how = `with a signature from the key \`${out.signer.slice(0, 8)}\``
     } else if (password !== undefined || code !== undefined) {
       if (!(await confirmPasswordAndTotp(ctx, res, who, { password, code }))) return true
+      // As on enrolment: a caller signed out while the password was being
+      // checked changes nothing (no await between this and the revoke).
+      if (!callerSignedIn(db, who)) { json(res, 401, { error: 'unauthenticated' }); return true }
       if (!revokeNow()) return notFound(res)
       how = BY_PASSWORD
     } else {

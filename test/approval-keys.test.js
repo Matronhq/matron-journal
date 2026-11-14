@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { openDb } from '../src/db.js'
-import { createAgent, createUser, revokeDevice } from '../src/auth.js'
+import { createAgent, createUser, revokeDevice, signOutOwnedDevice } from '../src/auth.js'
 import { hasActiveKey, activeKeyFor, issueNonce, consumeNonce, requireApproval, NONCE_TTL_MS } from '../src/approval-keys.js'
 import {
   generateApprovalKey, signForTest, startApprovalServer, startWithKey, enableTwoFactor, enrolKeyByPassword,
@@ -439,6 +439,35 @@ test('revoke by password and TOTP; a recovery code is refused', async (t) => {
   assert.equal(r.status, 200, JSON.stringify(r.json))
   assert.equal(hasActiveKey(s.db, alice.id), false)
   assert.equal(notices(s, alice.id).at(-1).title, `Approval key removed: phone ${key.keyId.slice(0, 8)}`)
+})
+
+// Sign `deviceId` out while its request's password is being checked: after
+// the request was let in, before anything it writes.
+function signOutDuringPasswordCheck(s, userId, deviceId) {
+  const prepare = s.db.prepare
+  s.db.prepare = function (sql) {
+    if (sql === 'SELECT password_hash FROM users WHERE id=?') {
+      s.db.prepare = prepare
+      signOutOwnedDevice(s.db, userId, deviceId)
+    }
+    return prepare.call(this, sql)
+  }
+}
+
+test('a device signed out while its password is checked revokes nothing: 401, by key or by device', async (t) => {
+  const { s, alice, deviceId, secret, key } = await startWithKey(t)
+  const laptop = signIn(s, alice.id, 'laptop')
+  const body = () => ({ password: TEST_PASSWORD, code: totpCode(s, alice.id, secret) })
+  signOutDuringPasswordCheck(s, alice.id, laptop.deviceId)
+  const r = await s.http(`/approval-keys/${key.keyId}/revoke`, { method: 'POST', token: laptop.token, body: body() })
+  assert.deepEqual([r.status, r.json], [401, { error: 'unauthenticated' }])
+  assert.equal(activeKeyFor(s.db, alice.id, key.keyId)?.device_id, deviceId, 'the key stays')
+  const tablet = signIn(s, alice.id, 'tablet')
+  signOutDuringPasswordCheck(s, alice.id, tablet.deviceId)
+  const d = await s.http(`/devices/${deviceId}/revoke`, { method: 'POST', token: tablet.token, body: body() })
+  assert.deepEqual([d.status, d.json], [401, { error: 'unauthenticated' }])
+  assert.ok(s.db.prepare('SELECT 1 FROM devices WHERE id=?').get(deviceId), 'the phone stays signed in')
+  assert.equal(hasActiveKey(s.db, alice.id), true)
 })
 
 test('the last key revoked, and only then, the account is back to no key', async (t) => {

@@ -33,7 +33,7 @@ import { handleLookupRoute } from './lookup-http.js'
 import { handleUsersRoute } from './users-http.js'
 import { handlePasswordResetRoute, handleAccountEmailRoute } from './password-reset-http.js'
 import { handleTwoFactorLogin, handleTwoFactorRoute, twoFactorRequiredNow } from './two-factor-http.js'
-import { handleApprovalKeysRoute, announceKey, confirmPasswordAndTotp, announceRestamped as announceRestampedItems } from './approval-keys-http.js'
+import { handleApprovalKeysRoute, announceKey, confirmPasswordAndTotp, callerSignedIn, announceRestamped as announceRestampedItems } from './approval-keys-http.js'
 import { activeKeysOfDevice, guardedAccountAction, hasActiveKey, refuse, boundedSubject } from './approval-keys.js'
 import { isTwoFactorEnabled, makeTwoFactorTickets } from './two-factor.js'
 import { PLAIN_BOX } from './token-box.js'
@@ -795,6 +795,8 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
             if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(revokedId, who.userId)) return json(res, 404, { error: 'not_found' })
             const pwCtx = { db, hub, pushPipeline, tokenBox: twoFactorBox, loginGuard, journalHost, passwordChecks }
             if (!(await confirmPasswordAndTotp(pwCtx, res, who, { password: body.password, code: body.code }))) return
+            // Signed out while the password was being checked: nothing.
+            if (!callerSignedIn(db, who)) return json(res, 401, { error: 'unauthenticated' })
             keys = activeKeysOfDevice(db, who.userId, revokedId)
             if (!revokeOwnedDevice(db, who.userId, revokedId)) return json(res, 404, { error: 'not_found' })
           } else {

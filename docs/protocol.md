@@ -3991,7 +3991,8 @@ body: the signed path,
 (a key may revoke itself); check and revoke are one transaction. With no
 `approval` but a `password` or `code`: the password-and-code path, exactly
 as enrolment's (two-factor on, a TOTP code, the same errors and the same
-lock). With neither: `403 approval_required`. Revoking the account's last
+lock), and `401 {error:'unauthenticated'}`, nothing revoked, if the calling
+device was signed out while the password was being checked. With neither: `403 approval_required`. Revoking the account's last
 live key puts it back to "no key".
 
 **Attach.** A key belongs to the account, not to a sign-in. When a device
@@ -7635,7 +7636,9 @@ notice without a push). Once the account has an active key:
   routes' password path (*Keys and enrolment*: `409
   two_factor_required`, `400 totp_required`, `401 bad_password`, `403
   bad_code`, one attempt at a time, and the same enrolment lock, `429
-  enrolment_locked`), after the same `404`. That is how a user whose only
+  enrolment_locked`), after the same `404`; a caller signed out while the
+  password was being checked gets `401 {error:'unauthenticated'}` and
+  nothing is revoked. That is how a user whose only
   keyed phone is lost or stolen signs it out, and revokes its key, from a
   device with no key;
 - **signing yourself out** (`:id` is the caller's own device) needs no
