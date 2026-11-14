@@ -20,6 +20,7 @@ import { markerTitleAllowed, privateOwnedConvo } from './privacy.js'
 import { startReplyFallback } from './spawn-model.js'
 import { recordSpawnStart } from './cause-hops.js'
 import { storedApproval, approvalColumn } from './consent-subject.js'
+import { isPanicLocked } from './panic.js'
 
 // `model` is the optional Claude model the child session should run — an
 // alias ('opus') or a full model id, defaulted to '' like topic so a caller
@@ -490,6 +491,9 @@ export async function approveSpawn({ db, hub, broker, startTimeoutMs, roomId: ro
       try { waking = wakeTarget() === true } catch (err) { console.error('approveSpawn: wake threw', err) }
       if (waking) await hub.waitForDevice(row.user_id, row.target_device_id, wakeWaitMs)
     }
+    // A panic-locked account (src/panic.js): no start goes to its box, the
+    // approval (or the lock) having come while the box was woken.
+    if (isPanicLocked(db, row.user_id)) return fail('account_locked')
     const r = await broker.issue(hub, row.user_id, row.target_device_id, 'start',
       {
         // spawn_id: the child's bridge names it on the opening turn's cause,

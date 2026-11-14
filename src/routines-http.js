@@ -26,6 +26,7 @@ import { isProtectedDevice } from './consent-subject.js'
 import { currentSubjects, fireMessage } from './routines-triggers.js'
 import { causesFromFrame } from './ask-causes.js'
 import { resolveAskCause } from './ask-cause.js'
+import { isPanicLocked } from './panic.js'
 
 // The PATCH fields that change what a routine does when it fires.
 const GATED_FIELDS = ['prompt', 'schedule', 'trigger', 'envelope']
@@ -100,9 +101,9 @@ export async function handleRoutinesRoute(ctx, req, res, url, who) {
     // Resolve the Coordinator here so the body can say so: the firer records
     // the same outcome either way.
     const coord = coordinatorDevice(db, who.userId)
-    if (!coord || isProtectedDevice(db, who.userId, coord.deviceId)) {
-      await ctx.routineFirer.fire(row)
-      json(res, 202, { delivered: false, reason: coord ? 'protected_device' : 'no_coordinator' })
+    if (!coord || isProtectedDevice(db, who.userId, coord.deviceId) || isPanicLocked(db, who.userId)) {
+      const outcome = await ctx.routineFirer.fire(row)
+      json(res, 202, { delivered: false, reason: outcome })
       return true
     }
     markRun(db, routine.id)

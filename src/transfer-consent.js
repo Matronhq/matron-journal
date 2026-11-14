@@ -20,6 +20,7 @@ import { transferTarget } from './security-log.js'
 import { wakeIfOffline } from './wake.js'
 import { consentStepUp, consentApproval, approvalColumn, storedApproval } from './consent-subject.js'
 import { getTransfer, setTransferState, deleteTransferFiles, forgetChunks, transferRecipients, isTransferId, parseFindings } from './transfers.js'
+import { lockedApprovalRefusal } from './panic.js'
 
 // "by the user." or "by the Coordinator: <reason>", for the decline's
 // room line: the reason flattened to one line, without markdown, capped.
@@ -271,6 +272,9 @@ export function answerTransferAsk(ctx, { userId, transferId, decision, decidedBy
   }
   const refused = guardedApprove(db,
     () => {
+      // A panic-locked account (src/panic.js): no approval, whoever gives it.
+      const locked = lockedApprovalRefusal(db, userId)
+      if (locked) return locked
       // Re-read inside the transaction: an ask answered meanwhile is the
       // 409 a lost race gives, before any signature is looked at.
       const now = getTransfer(db, transferId)

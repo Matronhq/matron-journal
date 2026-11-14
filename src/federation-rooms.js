@@ -54,6 +54,7 @@ import {
 } from './talk-requests.js'
 import { guestQuestion, issueTalkStart, talkQuestionActions, recordFollowUpTap } from './talk-requests-events.js'
 import { isProtectedDevice } from './consent-subject.js'
+import { isPanicLocked } from './panic.js'
 
 export const INVITE_OP = 'room.invite'
 export const ANSWER_OP = 'room.answer'
@@ -422,6 +423,8 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
       // As on one journal (person-rooms.js inviteGuest): no invite into a
       // protected box without a signed approval.
       if (isProtectedDevice(db, cur.user_id, target.deviceId)) fail('protected_device')
+      // Nor into a panic-locked account's (src/panic.js).
+      if (isPanicLocked(db, cur.user_id)) fail('account_locked')
       if (!contactLive(db, cur)) {
         setState(db, cur.id, 'withdrawn', at, ", ended_by='contact_removed'")
         return 'unavailable'
@@ -529,7 +532,7 @@ export function makeRoomFederation({ db, hub = null, pushPipeline = null, waker 
     if (!target) return { status: 409, body: { error: 'conflict', blocked_by: 'not_available' } }
     let out
     try { out = acceptOnto(r, target, at) } catch (err) {
-      if (['not_available', 'not_pending', 'protected_device'].includes(err.message)) return { status: 409, body: { error: 'conflict', blocked_by: err.message } }
+      if (['not_available', 'not_pending', 'protected_device', 'account_locked'].includes(err.message)) return { status: 409, body: { error: 'conflict', blocked_by: err.message } }
       throw err
     }
     const closed = afterAccepted(ctx, who, r, out)

@@ -18,6 +18,7 @@ import { recordConsentDecision, CONSENT_DECISION_EVENT_TYPE } from './consent.js
 import { consentApproval, chatAskRow, approvalColumn } from './consent-subject.js'
 import { ApprovalRefused } from './approval-keys.js'
 import { securityLogOf, boxTarget } from './security-log.js'
+import { lockedApprovalRefusal } from './panic.js'
 
 // Approvals of an ask aimed at a protected box (src/consent-subject.js):
 // the signature check and the state change it guards run in ONE
@@ -107,6 +108,9 @@ export function answerChatAsk({ db, hub, waker, journalHost = null, securityLog 
   }
   const refused = guardedApprove(db,
     () => {
+      // A panic-locked account (src/panic.js): no approval, whoever gives it.
+      const locked = lockedApprovalRefusal(db, userId)
+      if (locked) return locked
       // Re-read inside the transaction: an ask answered meanwhile is the
       // 409 a lost race gives, before any signature is looked at.
       const now = chatAskRow(db, userId, roomId, targetDeviceId)
@@ -159,6 +163,8 @@ export function answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, sp
   // user's signed approval, which the `start` params then carry.
   const refused = guardedApprove(db,
     () => {
+      const locked = lockedApprovalRefusal(db, userId)
+      if (locked) return locked
       // An ask already answered is the 409 a lost claim gives, before any
       // signature is looked at.
       const now = getSpawn(db, requestId)

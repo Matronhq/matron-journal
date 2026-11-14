@@ -1,5 +1,6 @@
 import { undeliveredInvites, markDelivered } from './participants.js'
 import { storedApproval } from './consent-subject.js'
+import { isPanicLocked } from './panic.js'
 
 // One delivery mechanism for approved agent-chat invites, no matter who
 // approved (HTTP endpoint, matron-admin) or when the target comes online.
@@ -19,6 +20,9 @@ export function deliverPendingInvites(db, hub, { deviceId = null } = {}) {
     const recipient = isJoin ? row.room_agent_device_id : row.agent_device_id
     if (recipient == null) continue
     if (deviceId != null && recipient !== deviceId) continue
+    // A panic-locked account (src/panic.js): an invite approved before the
+    // lock waits, undelivered, until it is cleared.
+    if (isPanicLocked(db, row.owner_user_id)) continue
     // The twin of a room with another person (person-rooms.js): the
     // inviter is the other person's agent. Its box name never crosses — the
     // frame names the person instead, and says so with `person`.
