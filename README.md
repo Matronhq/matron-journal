@@ -53,6 +53,8 @@ node itself; on Linux that is what always happens.
     MATRON_DB=./matron.db npx matron-admin device revoke <device_id>
     MATRON_DB=./matron.db npx matron-admin device private <device_id> on
     MATRON_DB=./matron.db npx matron-admin device protected <device_id> on|off
+    MATRON_DB=./matron.db npx matron-admin approval-key list alice
+    MATRON_DB=./matron.db npx matron-admin approval-key revoke alice <key_id>|--all
     MATRON_DB=./matron.db npx matron-admin offload [--days N]
     MATRON_DB=./matron.db npx matron-admin expire-logs [--hours N]
     MATRON_DB=./matron.db npx matron-admin status
@@ -227,7 +229,8 @@ on each dev box, then sign in from an app with your journal URL + username.
   blob files on a schedule, and a TTL pass deletes those blobs after
   `MATRON_TOOL_LOG_TTL_HOURS` (default 24); journal rows are never deleted.
 - **Ops** — `/metrics` endpoint, `matron-admin` CLI (`user add`/`passwd`,
-  `agent add`, `device list`/`revoke`/`private on|off|auto`, `link-code`,
+  `agent add`, `device list`/`revoke`/`private on|off|auto`,
+  `approval-key list`/`revoke`, `link-code`,
   `offload`, `expire-logs`, `agent-chat pending|approve|deny`,
   `status`), systemd unit in `deploy/`, WAL checkpoint tuning
   ([measured](docs/wal-checkpoint-profile.md)).
