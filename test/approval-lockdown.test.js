@@ -447,46 +447,77 @@ test('an account with no key: user events reach the agent with approval_key_id n
 
 // ---- locked ------------------------------------------------------------------
 
-test('a bridge reports locked in its hello and later updates; the device list shows it; malformed is ignored; only its own device', async (t) => {
+test('a bridge reports locked in its hello and later updates; the device list shows it as reported; malformed is ignored; only its own device', async (t) => {
   const { s, alice, token } = await startApprovalServer(t)
   const box = createAgent(s.db, alice.id, 'box-a')
   const other = createAgent(s.db, alice.id, 'box-b')
   const lockedOf = async (deviceId) => (await s.http('/devices', { token })).json.devices.find((d) => d.device_id === deviceId).locked
+  const L = (on, until = null, lockdownUntil = null) => ({ on, until, lockdown_until: lockdownUntil })
   assert.equal(await lockedOf(box.deviceId), null)
+  // A client socket hears each change as device_meta; a box never does.
+  const app = await makeWsClient(s.base, { token, cursor: null })
+  t.after(() => app.close())
+  await app.waitFor((f) => f.op === 'hello_ok')
+  const metas = () => app.frames.filter((f) => f.kind === 'device_meta')
   const agent = await makeWsClient(s.base, { token: box.token, cursor: null, hello: { locked: { on: true, until: null } } })
   t.after(() => agent.close())
   await agent.waitFor((f) => f.op === 'hello_ok')
-  assert.deepEqual(await lockedOf(box.deviceId), { on: true, until: null })
+  assert.deepEqual(await lockedOf(box.deviceId), L(true))
   assert.equal(await lockedOf(other.deviceId), null)
   assert.equal((await s.http('/devices', { token })).json.devices.find((d) => d.kind === 'client').locked, null)
+  await app.waitFor((f) => f.kind === 'device_meta')
+  assert.deepEqual(metas(), [{ kind: 'device_meta', device_id: box.deviceId, name: 'box-a', tag_char: null, locked: L(true) }])
 
+  // An unlock window: on:false with its end, kept as reported.
   const until = Date.now() + 30 * 60000
-  agent.send({ op: 'box_status', locked: { on: true, until }, device_id: other.deviceId })
+  agent.send({ op: 'box_status', locked: { on: false, until }, device_id: other.deviceId })
   await tick()
-  assert.deepEqual(await lockedOf(box.deviceId), { on: true, until })
+  assert.deepEqual(await lockedOf(box.deviceId), L(false, until))
   assert.equal(await lockedOf(other.deviceId), null, 'never another device')
-  const bads = ['yes', { on: 'true' }, { on: true, until: -1 }, { on: true, until: 1.5 }, [true], null]
+  assert.deepEqual(metas().at(-1).locked, L(false, until))
+  // The same report again: nothing changed, no frame.
+  const n = metas().length
+  agent.send({ op: 'box_status', locked: { on: false, until } })
+  await tick()
+  assert.equal(metas().length, n)
+  const bads = ['yes', { on: 'true' }, { on: true, until: -1 }, { on: true, until: 1.5 }, [true], { on: true, lockdown_until: -5 }, { on: true, lockdown_until: 'soon' }, { until: 5 }]
   for (const bad of bads) agent.send({ op: 'box_status', locked: bad })
   await tick()
-  assert.deepEqual(await lockedOf(box.deviceId), { on: true, until }, 'malformed reports change nothing')
+  assert.deepEqual(await lockedOf(box.deviceId), L(false, until), 'malformed reports change nothing')
   assert.equal(agent.frames.filter((f) => f.op === 'error' && f.ref === 'box_status' && f.code === 'bad_request').length, bads.length,
     'and a box_status with nothing valid in it is a bad_request, as before')
+  assert.equal(metas().length, n)
   // A malformed `locked` beside a valid report: the report lands, the lock stays.
   agent.send({ op: 'box_status', locked: 'yes', disk: { free_bytes: 1, total_bytes: 2 } })
   await tick()
-  assert.deepEqual(await lockedOf(box.deviceId), { on: true, until })
+  assert.deepEqual(await lockedOf(box.deviceId), L(false, until))
 
+  // A lockdown, with its end; extra keys are dropped.
+  const lockdownUntil = Date.now() + 3600000
   upsertConversation(s.db, { id: 'c1', ownerUserId: alice.id, title: 'C1', agentDeviceId: box.deviceId })
-  agent.send({ op: 'status', convo_id: 'c1', status: { model: 'x' }, locked: { on: true, until: until + 1 } })
+  agent.send({ op: 'status', convo_id: 'c1', status: { model: 'x' }, locked: { on: true, until: null, lockdown_until: lockdownUntil, reason: 'bad signatures' } })
   await tick()
-  assert.deepEqual(await lockedOf(box.deviceId), { on: true, until: until + 1 })
-  agent.send({ op: 'box_status', locked: { on: false, until: null } })
+  assert.deepEqual(await lockedOf(box.deviceId), L(true, null, lockdownUntil))
+  assert.deepEqual(metas().at(-1).locked, L(true, null, lockdownUntil))
+  // Times in the past are shown as reported: the journal does not expire them.
+  agent.send({ op: 'box_status', locked: { on: false, until: Date.now() - 1 } })
   await tick()
-  assert.equal(await lockedOf(box.deviceId), null, 'on:false clears it')
-  // Once its `until` has passed, the device list no longer shows it.
-  agent.send({ op: 'box_status', locked: { on: true, until: Date.now() - 1 } })
+  assert.equal((await lockedOf(box.deviceId)).until < Date.now(), true)
+  assert.equal((await lockedOf(box.deviceId)).on, false)
+  // An explicit null clears it, on box_status alone (no bad_request) and on status.
+  const errors = agent.frames.filter((f) => f.op === 'error').length
+  agent.send({ op: 'box_status', locked: null })
   await tick()
-  assert.equal(await lockedOf(box.deviceId), null, 'an until in the past reads as null')
+  assert.equal(await lockedOf(box.deviceId), null, 'locked: null clears it')
+  assert.equal(agent.frames.filter((f) => f.op === 'error').length, errors)
+  assert.equal(metas().at(-1).locked, null)
+  agent.send({ op: 'status', convo_id: 'c1', status: { model: 'x' }, locked: { on: true } })
+  await tick()
+  assert.deepEqual(await lockedOf(box.deviceId), L(true))
+  agent.send({ op: 'status', convo_id: 'c1', status: { model: 'x' }, locked: null })
+  await tick()
+  assert.equal(await lockedOf(box.deviceId), null)
+  assert.ok(!agent.frames.some((f) => f.kind === 'device_meta'), 'a box keeps no roster')
 
   // A client cannot report one, and a hello that is malformed only there
   // still connects.
@@ -500,19 +531,22 @@ test('a bridge reports locked in its hello and later updates; the device list sh
   assert.equal(await lockedOf(other.deviceId), null)
 })
 
-test('a hello without locked clears what an earlier one reported', async (t) => {
+test('a hello without locked, or with locked: null, clears what an earlier one reported', async (t) => {
   const { s, alice, token } = await startApprovalServer(t)
   const box = createAgent(s.db, alice.id, 'box-a')
   const lockedOf = async () => (await s.http('/devices', { token })).json.devices.find((d) => d.device_id === box.deviceId).locked
   const until = Date.now() + 60000
-  const one = await makeWsClient(s.base, { token: box.token, cursor: null, hello: { locked: { on: true, until } } })
-  await one.waitFor((f) => f.op === 'hello_ok')
-  assert.deepEqual(await lockedOf(), { on: true, until })
-  one.close()
-  const two = await makeWsClient(s.base, { token: box.token, cursor: null })
-  t.after(() => two.close())
-  await two.waitFor((f) => f.op === 'hello_ok')
-  assert.equal(await lockedOf(), null)
+  for (const hello of [{}, { locked: null }]) {
+    const one = await makeWsClient(s.base, { token: box.token, cursor: null, hello: { locked: { on: false, until } } })
+    await one.waitFor((f) => f.op === 'hello_ok')
+    assert.deepEqual(await lockedOf(), { on: false, until, lockdown_until: null })
+    one.close()
+    const two = await makeWsClient(s.base, { token: box.token, cursor: null, hello })
+    t.after(() => two.close())
+    await two.waitFor((f) => f.op === 'hello_ok')
+    assert.equal(await lockedOf(), null, JSON.stringify(hello))
+    two.close()
+  }
 })
 
 // ---- unlock / lock / clear_lockdown ------------------------------------------

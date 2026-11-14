@@ -188,7 +188,7 @@ test('rename fans out device_meta to client sockets only', async (t) => {
   assert.equal(r.status, 200)
 
   const frame = await client.waitFor((f) => f.kind === 'device_meta')
-  assert.deepEqual(frame, { kind: 'device_meta', device_id: agent.deviceId, name: 'dev-y', tag_char: null })
+  assert.deepEqual(frame, { kind: 'device_meta', device_id: agent.deviceId, name: 'dev-y', tag_char: null, locked: null })
   // agents never receive it (a box has no roster to update), and another
   // user's socket never sees it at all
   await new Promise((res) => setTimeout(res, 150))
@@ -290,7 +290,7 @@ test('tag change fans out device_meta (name + tag_char) to client sockets only',
   assert.equal(r.status, 200)
 
   const frame = await client.waitFor((f) => f.kind === 'device_meta')
-  assert.deepEqual(frame, { kind: 'device_meta', device_id: agent.deviceId, name: 'box-9', tag_char: '9' })
+  assert.deepEqual(frame, { kind: 'device_meta', device_id: agent.deviceId, name: 'box-9', tag_char: '9', locked: null })
   await new Promise((res) => setTimeout(res, 150))
   assert.equal(box.frames.filter((f) => f.kind === 'device_meta').length, 0)
   assert.equal(stranger.frames.filter((f) => f.kind === 'device_meta').length, 0)
@@ -300,7 +300,7 @@ test('tag change fans out device_meta (name + tag_char) to client sockets only',
   const rn = await s.http(`/devices/${agent.deviceId}/rename`, { method: 'POST', token: login.json.token, body: { name: 'dev-y' } })
   assert.equal(rn.status, 200)
   const renamed = await client.waitFor((f) => f.kind === 'device_meta' && f.name === 'dev-y')
-  assert.deepEqual(renamed, { kind: 'device_meta', device_id: agent.deviceId, name: 'dev-y', tag_char: '9' })
+  assert.deepEqual(renamed, { kind: 'device_meta', device_id: agent.deviceId, name: 'dev-y', tag_char: '9', locked: null })
 })
 
 test('rename patches the live socket, so a connected box mints the new name at once', async (t) => {

@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import { pipeline } from 'node:stream/promises'
 import { checkPassword, makeRateLimiter, makeKeyedQueue, authToken, clientIdleExpired, preparePasswordChange, applyPasswordChange, revokeOwnedDevice, signOutOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL, byLastMessageThenId } from './journal.js'
-import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, isPrivateDevice, deviceStatuses, setDeviceProtected } from './db.js'
+import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, isPrivateDevice, deviceStatuses, setDeviceProtected, deviceLocked } from './db.js'
 import { receiveBlob } from './media.js'
 import { readBlobTranscript, isTranscribableType, transcriptWaitS } from './blob-transcripts.js'
 import { imageSizeFromFile } from './image-size.js'
@@ -959,7 +959,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           // client that was offline picks the new name up from its next
           // /snapshot `agents` list. Clients only — an agent keeps no roster.
           if (c.kind === 'client' && c.ws.readyState === 1) {
-            c.ws.send(JSON.stringify({ kind: 'device_meta', device_id: renamedId, name: clean, tag_char: renamedTag }))
+            c.ws.send(JSON.stringify({ kind: 'device_meta', device_id: renamedId, name: clean, tag_char: renamedTag, locked: deviceLocked(db, renamedId) }))
           }
         }
         // The 200 body carries the trio like the frame does — device_meta is
@@ -983,7 +983,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         const taggedName = deviceName(db.prepare('SELECT name FROM devices WHERE id=?').get(taggedId).name)
         for (const c of hub.connsOf(who.userId)) {
           if (c.kind === 'client' && c.ws.readyState === 1) {
-            c.ws.send(JSON.stringify({ kind: 'device_meta', device_id: taggedId, name: taggedName, tag_char: cleanTag }))
+            c.ws.send(JSON.stringify({ kind: 'device_meta', device_id: taggedId, name: taggedName, tag_char: cleanTag, locked: deviceLocked(db, taggedId) }))
           }
         }
         return json(res, 200, { ok: true, device: { device_id: taggedId, name: taggedName, tag_char: cleanTag } })

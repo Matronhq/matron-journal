@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { WebSocketServer } from 'ws'
 import { authToken, touchDevice, authorizeAgentWrite } from './auth.js'
 import { getBoxDefaults, boxDefaultsByDevice, effectiveBoxDefaults, normaliseAgent } from './box-defaults.js'
-import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses, setDeviceSyncScope, parseLocked, setDeviceLocked } from './db.js'
+import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses, setDeviceSyncScope, parseLocked, setDeviceLocked, deviceLocked } from './db.js'
 import { parseSyncScope } from './sync-scope.js'
 import { settingsView } from './settings.js'
 import { eventsAfter, scopedEventsAfter, scopedReplayCount, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, agentTargetsFor, CONVO_ID_MAX_CHARS } from './journal.js'
@@ -44,6 +44,17 @@ import { validRanges, addSeenRanges, markDeviceUsesRanges, legacyReadAsSeen, mar
 import { panicLock, isPanicLocked, panicHelloField, panicAnnounced, panicOnFrame, PANIC_OFF_FRAME, announcePanicClears, signOutLockedClient, closeLockedSocket, ACCOUNT_LOCKED } from './panic.js'
 
 const journalFrame = (e) => ({ kind: 'journal', ...toEventShape(e) })
+
+// A box's locked report changed (hello, status, box_status): the user's
+// client sockets hear it as `device_meta`, the frame that carries a
+// device's full current meta (as a rename or a tag change sends it), so an
+// app need not poll GET /devices. Store first; → whether it changed.
+function applyDeviceLocked(db, hub, userId, deviceId, locked) {
+  if (!setDeviceLocked(db, deviceId, locked)) return false
+  const d = db.prepare('SELECT name, tag_char FROM devices WHERE id=?').get(deviceId)
+  if (d) hub.sendToClients(userId, { kind: 'device_meta', device_id: deviceId, name: sanitizePeerText(d.name, PEER_NAME_CAP), tag_char: d.tag_char, locked: deviceLocked(db, deviceId) })
+  return true
+}
 
 // file/image sends carry a blob_ref pointing at a prior POST /media upload;
 // the payload mirrors the agent-publish shape ({blob_ref, name, content_type,
@@ -542,11 +553,12 @@ export function attachWs({
           // var exactly, including its removal (admin pin is the override).
           if (who.kind === 'agent') applyBridgePrivate(db, who.deviceId, msg.private === true)
           // Locked mode (a bridge setting, src/db.js parseLocked): the box's
-          // own report, kept for the device list. A hello without it says
-          // the box is not locked; a malformed one changes nothing.
+          // own report, kept as sent for the device list. A hello without it,
+          // or with locked: null, says the box is not locked; a malformed one
+          // changes nothing.
           if (who.kind === 'agent') {
             const locked = msg.locked === undefined ? null : parseLocked(msg.locked)
-            if (locked !== undefined) setDeviceLocked(db, who.deviceId, locked)
+            if (locked !== undefined) applyDeviceLocked(db, hub, who.userId, who.deviceId, locked)
           }
           // Optional client sync scope (src/sync-scope.js). Same reject shape
           // as a bad cursor. Agents' delivery is already scoped by
@@ -845,14 +857,14 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
     }))
   }
   // A bridge's locked-mode report on a later frame (box_status, status), for
-  // its own device only: absent or malformed changes nothing, on:false
-  // clears it (src/db.js parseLocked).
-  // → whether it applied one.
+  // its own device only: absent or malformed changes nothing, an object is
+  // stored as sent (on:false too), null clears it (src/db.js parseLocked).
+  // → whether it carried a valid one.
   const applyLocked = () => {
     if (conn.kind !== 'agent' || msg.locked === undefined) return false
     const locked = parseLocked(msg.locked)
     if (locked === undefined) return false
-    setDeviceLocked(db, conn.deviceId, locked)
+    applyDeviceLocked(db, hub, conn.userId, conn.deviceId, locked)
     return true
   }
   // Invite ops: validate a room id + load the row. Rooms are top-level
