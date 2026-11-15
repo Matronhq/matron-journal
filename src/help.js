@@ -225,7 +225,10 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   user-only or protected box, answers 202 \`{pending: 'owner', proposal,
   item: {id, num}}\`: nothing changed, the user was asked on that item, and
   the outcome arrives later as a \`memory_proposal\` event (\`outcome\`:
-  approved|declined|replaced|expired). Do not retry.
+  approved|declined|replaced|expired). Do not retry: a second write for
+  the same name replaces the first with a new item. 409 \`blocked_by:
+  'too_many_asks'\` when 10 from your conversation (50 for the user)
+  already wait.
 - \`GET /routines\` → \`{routines}\` — the user's Coordinator routines: a
   prompt the journal fires into the Coordinator conversation on a
   \`schedule\` (5-field cron in \`tz\`) or when a \`trigger\` trips

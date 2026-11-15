@@ -3171,7 +3171,7 @@ memories are stored and shown in the apps only.
 |---|---|---|
 | `GET /memories` | | 200 `{memories:[…]}` ordered by `name` (≤200 rows, no paging) |
 | `GET /memories/:key` | `:key` = `me_…` or the name | 200 `{memory}`; 404 |
-| `PUT /memories/:name` | `{description, body?, type?, scope?, convo_id?, causes?}` | 201 `{memory}` created / 200 `{memory}` updated; **202** `{pending:'owner', proposal, item}` when an agent's write waits for the user (*Memory proposals* below); 400 `bad_request` (a `scope` outside the three forms, or unusable `causes`, included); 409 `too_many`; 404 |
+| `PUT /memories/:name` | `{description, body?, type?, scope?, convo_id?, causes?}` | 201 `{memory}` created / 200 `{memory}` updated; **202** `{pending:'owner', proposal, item}` when an agent's write waits for the user (*Memory proposals* below); 400 `bad_request` (a `scope` outside the three forms, or unusable `causes`, included); 409 `too_many`; 409 `conflict` `blocked_by:'too_many_asks'` (too many proposals waiting); 404 |
 | `DELETE /memories/:key` | agents may send `{convo_id?, causes?}` | 200 `{memory}` (the deleted row); **202** as for `PUT`; 400; 404 |
 
 `PUT` is the only write and is an **upsert by name**: the same name from
@@ -3292,10 +3292,19 @@ user. A typed reply from the user on it reaches the proposing session as an
 ordinary item turn.
 
 **One pending proposal per (user, name).** A newer proposal for the same
-name from the same box and conversation changes the pending one in place:
-same proposal id, same item, body rewritten, a thread line saying so.
-From anywhere else it replaces it: the older item is closed `cancelled` and
-a new one is filed.
+name — from the same session or any other — replaces the pending one: the
+older proposal becomes `replaced`, its item is closed `cancelled` in the
+same write, its conversation is told, and the new proposal gets a **new**
+item. A pending proposal is never rewritten, so an item always shows the
+change its buttons apply; a tap already on its way to the older item finds
+it closed and answers 409, changing nothing.
+
+**Caps.** At most **10** proposals may wait from one conversation (a write
+that names none counts against its device) and **50** for one user
+(`MAX_PENDING_PER_CONVO`, `MAX_PENDING_PER_USER`). Past either, the write
+answers **409** `{error:'conflict', blocked_by:'too_many_asks'}`, as a parked
+ask does at its cap: nothing is stored and no item is filed. A proposal that
+replaces a pending one for the same name adds nothing and is never refused.
 
 **The user's tap** (`POST /items/:id/comments {action}`, a client's only —
 an agent's `action` is 403 and the item is a 404 to it anyway) is the
@@ -3310,7 +3319,10 @@ answer, applied by the journal:
 - *Decline* / *Keep it*: nothing changes; the item closes `decided`. Closing
   the item by hand is the same "no".
 - 200 `{item, comment, proposal}`; 409 `conflict` when the proposal is no
-  longer pending; 400 `unknown_action` for another label.
+  longer pending; 400 `unknown_action` for another label. The tap settles
+  the proposal in one statement that succeeds only while it is still
+  `pending` and still bound to the tapped item, so of a tap and a
+  replacement (or two taps) exactly one takes effect.
 
 A proposal nobody answers **lapses after 7 days**: the sweep marks it
 `expired` and closes the item `cancelled`.

@@ -88,6 +88,20 @@ function writableConvo(db, who, convoId) {
   return true
 }
 
+// Park an agent's write as a proposal: 202, or 409 when too many of its
+// conversation's proposals (or of the user's) already wait — the answer a
+// parked ask gives at its cap. Nothing is stored then and no item is filed.
+function propose(ctx, res, who, change) {
+  let out
+  try {
+    out = fileProposal(ctx, who, change)
+  } catch (err) {
+    if (err.message === 'too_many_asks') { json(res, 409, { error: 'conflict', blocked_by: 'too_many_asks' }); return true }
+    throw err
+  }
+  return answerPending(res, out)
+}
+
 async function handlePut(ctx, req, res, who, name) {
   const { db } = ctx
   const body = await readBody(req)
@@ -107,7 +121,7 @@ async function handlePut(ctx, req, res, who, name) {
   // An agent's write that is not the user's own ask waits for their answer.
   if (needsUserAnswer(db, who, writer)) {
     if (!existing && db.prepare('SELECT COUNT(*) AS n FROM memories WHERE user_id=?').get(who.userId).n >= MEMORIES_MAX) { json(res, 409, { error: 'too_many' }); return true }
-    return answerPending(res, fileProposal(ctx, who, { name, action: 'save', fields: v.value, memoryId: existing?.id ?? null, convoId }))
+    return propose(ctx, res, who, { name, action: 'save', fields: v.value, memoryId: existing?.id ?? null, convoId })
   }
   let out
   try {
@@ -157,7 +171,7 @@ export async function handleMemoriesRoute(ctx, req, res, url, who) {
     const memory = visibleMemory(db, who, key)
     if (!memory) return notFound(res)
     if (needsUserAnswer(db, who, writer)) {
-      return answerPending(res, fileProposal(ctx, who, { name: memory.name, action: 'delete', memoryId: memory.id, convoId: writer.convoId }))
+      return propose(ctx, res, who, { name: memory.name, action: 'delete', memoryId: memory.id, convoId: writer.convoId })
     }
     const gone = deleteMemory(db, who.userId, memory.id)
     if (!gone) return notFound(res)

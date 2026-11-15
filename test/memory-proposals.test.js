@@ -8,7 +8,7 @@ import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
 import { setCoordinatorConvoId } from '../src/coordinator.js'
 import { sweepMemoryProposals, fencedBlock as fenced, MEMORY_DIRECT_WINDOW_MS, MEMORY_PROPOSAL_EVENT_TYPE } from '../src/memory-proposals-http.js'
-import { PROPOSAL_TTL_MS } from '../src/memory-proposals.js'
+import { PROPOSAL_TTL_MS, MAX_PENDING_PER_CONVO, MAX_PENDING_PER_USER, settleProposal } from '../src/memory-proposals.js'
 
 // box-a is an ordinary box (conversations c1, c2), box-b the Coordinator's
 // (coord), box-c a user-only box (u1), box-d a protected one (d1).
@@ -136,6 +136,8 @@ test('what does not count as the user asking: no causes, a routine, a reminder, 
     const r = await put(s, token, name, body)
     assert.equal(r.status, 202, name); assert.equal(r.json.pending, 'owner', name)
     assert.equal((await memory(s, client, name)).status, 404, name)
+    // Answered as it goes, so the conversation stays under its cap.
+    assert.equal((await tap(s, client, r.json.item.id, 'Decline')).status, 200, name)
   }
   assert.equal(proposals(s).length, Object.keys(cases).length)
   // Just inside the window still counts.
@@ -235,29 +237,88 @@ test('no agent can answer a proposal: not the proposer, not the Coordinator, not
   assert.equal((await memory(s, client, 'avoid-opal')).status, 200)
 })
 
-test('one pending proposal per name: the same session changes it in place, another one replaces it', async (t) => {
+test('one pending proposal per name: a newer one replaces it, whoever sends it — old item cancelled, new item filed', async (t) => {
   const { s, a, client } = await fleet(t)
   const first = await put(s, a.token, 'avoid-opal', { description: 'First wording.', convo_id: 'c1' })
+  // The same session, the same conversation: still a new proposal and a new item.
   const second = await put(s, a.token, 'avoid-opal', { description: 'Second wording.', body: 'More.', convo_id: 'c1' })
   assert.equal(second.status, 202)
-  assert.deepEqual(second.json.item, first.json.item); assert.equal(second.json.proposal.id, first.json.proposal.id)
-  assert.equal(proposals(s).length, 1)
-  let item = (await s.http(`/items/${first.json.item.id}`, { token: client })).json.item
-  assert.ok(item.body.includes(fenced('Second wording.'))); assert.ok(!item.body.includes('First wording.'))
-  assert.equal(item.state, 'open'); assert.equal(item.awaiting, 'user'); assert.deepEqual(item.actions, ['Save it', 'Decline'])
+  assert.notEqual(second.json.item.id, first.json.item.id); assert.notEqual(second.json.proposal.id, first.json.proposal.id)
+  const old = (await s.http(`/items/${first.json.item.id}`, { token: client })).json.item
+  assert.equal(old.state, 'closed'); assert.equal(old.resolution, 'cancelled')
+  // The older item still shows what it asked about, never the newer wording.
+  assert.ok(old.body.includes(fenced('First wording.'))); assert.ok(!old.body.includes('Second wording.'))
+  const fresh = (await s.http(`/items/${second.json.item.id}`, { token: client })).json.item
+  assert.ok(fresh.body.includes(fenced('Second wording.'))); assert.ok(!fresh.body.includes('First wording.'))
+  assert.equal(fresh.state, 'open'); assert.equal(fresh.awaiting, 'user'); assert.deepEqual(fresh.actions, ['Save it', 'Decline'])
+  assert.deepEqual(outcomes(s), [['c1', 'journal', 'avoid-opal', 'save', 'replaced']])
+  // A tap that was on its way to the older item is a conflict and changes nothing.
+  for (const action of ['Save it', 'Decline']) assert.equal((await tap(s, client, first.json.item.id, action)).status, 409)
+  assert.equal((await memory(s, client, 'avoid-opal')).status, 404)
+  assert.deepEqual(proposals(s).map((p) => p.state), ['replaced', 'pending'])
+  assert.deepEqual(events(s, 'memory'), [])
   // Another name is its own question.
   const other = await put(s, a.token, 'avoid-jade', { convo_id: 'c1' })
-  assert.notEqual(other.json.item.id, first.json.item.id)
-  // From another conversation: the older question is set aside and its session told.
+  assert.notEqual(other.json.item.id, second.json.item.id)
+  // From another conversation: the same again, and the older session is told.
   const third = await put(s, a.token, 'avoid-opal', { description: 'Third wording.', convo_id: 'c2' })
-  assert.notEqual(third.json.item.id, first.json.item.id)
-  item = (await s.http(`/items/${first.json.item.id}`, { token: client })).json.item
-  assert.equal(item.state, 'closed'); assert.equal(item.resolution, 'cancelled')
-  assert.deepEqual(outcomes(s), [['c1', 'journal', 'avoid-opal', 'save', 'replaced']])
-  assert.equal((await tap(s, client, first.json.item.id, 'Save it')).status, 409)
+  assert.equal((await s.http(`/items/${second.json.item.id}`, { token: client })).json.item.state, 'closed')
+  assert.deepEqual(outcomes(s), [['c1', 'journal', 'avoid-opal', 'save', 'replaced'], ['c1', 'journal', 'avoid-opal', 'save', 'replaced']])
+  assert.equal((await tap(s, client, second.json.item.id, 'Save it')).status, 409)
   assert.equal((await tap(s, client, third.json.item.id, 'Save it')).status, 200)
   assert.equal((await memory(s, client, 'avoid-opal')).json.memory.description, 'Third wording.')
-  assert.deepEqual(proposals(s).map((p) => [p.name, p.state]), [['avoid-opal', 'replaced'], ['avoid-jade', 'pending'], ['avoid-opal', 'approved']])
+  assert.deepEqual(proposals(s).map((p) => [p.name, p.state]), [['avoid-opal', 'replaced'], ['avoid-opal', 'replaced'], ['avoid-jade', 'pending'], ['avoid-opal', 'approved']])
+})
+
+test('a tap settles only a proposal still pending and still bound to that item', async (t) => {
+  const { s, a, alice, client } = await fleet(t)
+  const r = await put(s, a.token, 'avoid-opal', { description: 'First wording.', convo_id: 'c1' })
+  // The proposal is no longer this item's: the tap applies nothing.
+  s.db.prepare('UPDATE memory_proposals SET item_id=? WHERE id=?').run('it_elsewhere', r.json.proposal.id)
+  assert.equal(settleProposal(s.db, { userId: alice.id, id: r.json.proposal.id, itemId: r.json.item.id, state: 'approved' }), null)
+  assert.equal((await tap(s, client, r.json.item.id, 'Save it')).status, 409)
+  s.db.prepare('UPDATE memory_proposals SET item_id=? WHERE id=?').run(r.json.item.id, r.json.proposal.id)
+  // Settled once: the second writer gets nothing.
+  assert.equal(settleProposal(s.db, { userId: alice.id, id: r.json.proposal.id, itemId: r.json.item.id, state: 'declined' }).state, 'declined')
+  assert.equal(settleProposal(s.db, { userId: alice.id, id: r.json.proposal.id, itemId: r.json.item.id, state: 'approved' }), null)
+  assert.equal((await tap(s, client, r.json.item.id, 'Save it')).status, 409)
+  assert.equal((await memory(s, client, 'avoid-opal')).status, 404)
+})
+
+test('pending proposals are capped per conversation and per user; a replacement is not a new one', async (t) => {
+  const { s, a, b, client } = await fleet(t)
+  const tooMany = { status: 409, json: { error: 'conflict', blocked_by: 'too_many_asks' } }
+  const count = () => s.db.prepare("SELECT COUNT(*) AS n FROM memory_proposals WHERE state='pending'").get().n
+  const items = async () => (await s.http('/items', { token: client })).json.items.length
+  for (let i = 0; i < MAX_PENDING_PER_CONVO; i++) assert.equal((await put(s, a.token, `rule-${i}`, { convo_id: 'c1' })).status, 202)
+  const before = await items()
+  assert.deepEqual(await put(s, a.token, 'one-more', { convo_id: 'c1' }), tooMany)
+  await put(s, client, 'standing', {})
+  assert.deepEqual(await del(s, a.token, 'standing', { convo_id: 'c1' }), tooMany)
+  assert.equal(count(), MAX_PENDING_PER_CONVO); assert.equal(await items(), before) // nothing stored, no item filed
+  assert.equal((await memory(s, client, 'standing')).status, 200)
+  // Replacing one of its own pending proposals adds nothing, so it goes through.
+  assert.equal((await put(s, a.token, 'rule-3', { description: 'Reworded.', convo_id: 'c1' })).status, 202)
+  assert.equal(count(), MAX_PENDING_PER_CONVO)
+  // Another conversation has its own allowance; an answer frees a place.
+  assert.equal((await put(s, a.token, 'one-more', { convo_id: 'c2' })).status, 202)
+  const open = s.db.prepare("SELECT item_id FROM memory_proposals WHERE state='pending' AND from_convo_id='c1' LIMIT 1").get().item_id
+  assert.equal((await tap(s, client, open, 'Decline')).status, 200)
+  assert.equal((await put(s, a.token, 'after-an-answer', { convo_id: 'c1' })).status, 202)
+  // Writes that name no conversation count against their device.
+  for (let i = 0; i < MAX_PENDING_PER_CONVO; i++) assert.equal((await put(s, b.token, `loose-${i}`, {})).status, 202)
+  assert.deepEqual(await put(s, b.token, 'loose-more', {}), tooMany)
+  // The user's cap, across every conversation.
+  const ins = s.db.prepare(`INSERT INTO memory_proposals(id, user_id, name, action, from_device_id, from_convo_id, state, created_at, updated_at, expires_at)
+    VALUES(?,?,?,'save',?,?,'pending',?,?,?)`)
+  const now = Date.now()
+  for (let i = count(); i < MAX_PENDING_PER_USER; i++) ins.run(`mp_fill${i}`, 1, `fill-${i}`, a.deviceId, `other-${i}`, now, now, now + 60000)
+  assert.equal(count(), MAX_PENDING_PER_USER)
+  assert.deepEqual(await put(s, b.token, 'past-the-user-cap', { convo_id: 'coord' }), tooMany)
+  assert.equal((await put(s, b.token, 'fill-49', { convo_id: 'coord' })).status, 202) // replaces a pending one
+  assert.equal(count(), MAX_PENDING_PER_USER)
+  // The user's own writes are never proposals, so never capped.
+  assert.equal((await put(s, client, 'mine', {})).status, 201)
 })
 
 test('a delete is proposed the same way: Delete it / Keep it, the memory shown, gone only on approval', async (t) => {

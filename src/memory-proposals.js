@@ -5,7 +5,9 @@
 //
 //   pending   — waits for the user's tap on its item. At most one per
 //               (user, memory name): a newer proposal for the name replaces
-//               the older one.
+//               the older one and gets a new item of its own. A pending
+//               row is never rewritten, so the item a user is reading
+//               always shows the change its buttons apply.
 //   approved  — the user tapped the approving button; the change was applied
 //               as proposed.
 //   declined  — the user tapped the other button, or closed the item.
@@ -19,6 +21,13 @@ import { randomBytes } from 'node:crypto'
 
 export const PROPOSAL_TTL_MS = 7 * 24 * 60 * 60 * 1000
 export const PROPOSAL_ACTIONS = ['save', 'delete']
+// How many proposals may wait at once: from one conversation (a write that
+// names none counts against its device), and for one user in all. Past
+// either, a new proposal is refused ('too_many_asks') until some are
+// answered. One that replaces a pending proposal for the same name adds
+// nothing and is never refused.
+export const MAX_PENDING_PER_CONVO = 10
+export const MAX_PENDING_PER_USER = 50
 export const SAVE_LABELS = ['Save it', 'Decline']
 export const DELETE_LABELS = ['Delete it', 'Keep it']
 export const labelsFor = (action) => (action === 'delete' ? DELETE_LABELS : SAVE_LABELS)
@@ -48,13 +57,10 @@ export function proposalOfItem(db, userId, itemId) {
 // Record a proposal. `fields` is {description, body, type, scope} for a save
 // (type and scope undefined = keep or default, as on a direct write) and
 // ignored for a delete; `memoryId` is the memory a delete names.
-// Returns { proposal, inPlace, replaced }:
-//  - inPlace: the pending proposal for this name came from the same device
-//    and conversation and its item is still open, so the same row (and the
-//    same item) now carries the new change;
-//  - replaced: an older pending proposal that was set aside instead (another
-//    device or conversation made it, or its item is gone). The caller files a
-//    new item and tells the older one's conversation.
+// Returns { proposal, replaced }: `replaced` is the pending proposal for
+// this name that the new one set aside, whoever made it, or null. The caller
+// files a new item, closes the older one's and tells its conversation.
+// Throws Error('too_many_asks') at a cap; nothing is written then.
 export function recordProposal(db, { userId, name, action, fields = {}, memoryId = null, fromDeviceId, fromConvoId = null, now = Date.now() }) {
   return db.transaction(() => {
     const save = action === 'save'
@@ -64,19 +70,20 @@ export function recordProposal(db, { userId, name, action, fields = {}, memoryId
     }
     const old = pendingProposalFor(db, userId, name)
     if (old) {
-      const itemOpen = old.item_id && db.prepare("SELECT 1 FROM items WHERE id=? AND user_id=? AND state='open'").get(old.item_id, userId)
-      if (itemOpen && old.from_device_id === fromDeviceId && old.from_convo_id === fromConvoId) {
-        db.prepare('UPDATE memory_proposals SET action=?, description=?, body=?, type=?, scope=?, memory_id=?, updated_at=?, expires_at=? WHERE id=?')
-          .run(action, vals.description, vals.body, vals.type, vals.scope, memoryId, now, now + PROPOSAL_TTL_MS, old.id)
-        return { proposal: getProposal(db, userId, old.id), inPlace: true, replaced: null }
-      }
       db.prepare("UPDATE memory_proposals SET state='replaced', updated_at=? WHERE id=?").run(now, old.id)
+    } else {
+      const mine = fromConvoId != null
+        ? db.prepare("SELECT COUNT(*) AS n FROM memory_proposals WHERE user_id=? AND state='pending' AND from_convo_id=?").get(userId, fromConvoId).n
+        : db.prepare("SELECT COUNT(*) AS n FROM memory_proposals WHERE user_id=? AND state='pending' AND from_convo_id IS NULL AND from_device_id=?").get(userId, fromDeviceId).n
+      if (mine >= MAX_PENDING_PER_CONVO) throw new Error('too_many_asks')
+      const all = db.prepare("SELECT COUNT(*) AS n FROM memory_proposals WHERE user_id=? AND state='pending'").get(userId).n
+      if (all >= MAX_PENDING_PER_USER) throw new Error('too_many_asks')
     }
     const id = newId()
     db.prepare(`INSERT INTO memory_proposals(id, user_id, name, action, description, body, type, scope, memory_id, from_device_id, from_convo_id, state, created_at, updated_at, expires_at)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?)`)
       .run(id, userId, name, action, vals.description, vals.body, vals.type, vals.scope, memoryId, fromDeviceId, fromConvoId, now, now, now + PROPOSAL_TTL_MS)
-    return { proposal: getProposal(db, userId, id), inPlace: false, replaced: old ? { ...old, state: 'replaced' } : null }
+    return { proposal: getProposal(db, userId, id), replaced: old ? { ...old, state: 'replaced' } : null }
   })()
 }
 
@@ -84,13 +91,17 @@ export function setProposalItem(db, id, itemId) {
   db.prepare('UPDATE memory_proposals SET item_id=? WHERE id=?').run(itemId, id)
 }
 
-// pending → `state`, once. Returns the row as it now stands, or null when it
-// was not pending (answered, replaced or expired already) or has run out and
-// only waits for the sweep.
-export function settleProposal(db, { userId, id, state, now = Date.now() }) {
+// pending → `state`, once, in one statement: of two writers (a tap and a
+// newer proposal replacing this one, or two taps) exactly one succeeds.
+// Returns the row as it now stands, or null when it was not pending
+// (answered, replaced or expired already) or has run out and only waits for
+// the sweep. `itemId`, when given, must be the item the proposal is bound
+// to: a tap settles only the proposal its own item asks about.
+export function settleProposal(db, { userId, id, state, itemId = null, now = Date.now() }) {
   const live = state === 'expired' ? '' : 'AND expires_at > ?'
-  const args = state === 'expired' ? [state, now, id, userId] : [state, now, id, userId, now]
-  const r = db.prepare(`UPDATE memory_proposals SET state=?, updated_at=? WHERE id=? AND user_id=? AND state='pending' ${live}`).run(...args)
+  const bound = itemId == null ? '' : 'AND item_id = ?'
+  const args = [state, now, id, userId, ...(state === 'expired' ? [] : [now]), ...(itemId == null ? [] : [itemId])]
+  const r = db.prepare(`UPDATE memory_proposals SET state=?, updated_at=? WHERE id=? AND user_id=? AND state='pending' ${live} ${bound}`).run(...args)
   return r.changes ? getProposal(db, userId, id) : null
 }
 

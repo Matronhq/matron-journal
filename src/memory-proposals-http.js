@@ -28,7 +28,7 @@
 import { appendAndBroadcast, toEventShape } from './journal.js'
 import { json } from './http-body.js'
 import { senderOf, conflict } from './http-who.js'
-import { createItem, updateItem, closeItem, addComment, getItem, TITLE_MAX } from './items.js'
+import { createItem, closeItem, getItem, TITLE_MAX } from './items.js'
 import { itemMarkerPayload, ITEM_EVENT_TYPE } from './items-marker.js'
 import { CONSENT_LABEL, fenced } from './consent-items.js'
 import { userOnlyDevice } from './consent.js'
@@ -170,8 +170,11 @@ function closeMirror(ctx, p, { resolution, author, deviceId = 0, comment, sender
 const view = (p) => ({ id: p.id, name: p.name, action: p.action, state: p.state, expires_at: p.expires_at })
 
 // Record an agent's write as a proposal and put the question in front of the
-// user. The proposal and its item are one write; the markers follow it.
-// → { proposal, item }.
+// user. The proposal and its item are one write; the markers follow it. A
+// pending proposal for the same name is set aside, never rewritten: its item
+// closes in that same write and the new proposal gets a new one, so a tap
+// already on its way to the older item finds it closed.
+// → { proposal, item }. Throws Error('too_many_asks') at a cap.
 export function fileProposal(ctx, who, { name, action, fields, memoryId = null, convoId = null }) {
   const { db } = ctx
   const userId = who.userId
@@ -179,26 +182,21 @@ export function fileProposal(ctx, who, { name, action, fields, memoryId = null, 
   const out = db.transaction(() => {
     const r = recordProposal(db, { userId, name, action, fields, memoryId, fromDeviceId: who.deviceId, fromConvoId: convoId })
     const f = proposalItemFields(db, r.proposal)
-    let item
-    let note = null
-    if (r.inPlace) {
-      item = updateItem(db, { userId, itemId: r.proposal.item_id, fields: { title: f.title, body: f.body, actions: f.actions, awaiting: 'user' } })
-      note = addComment(db, { userId, itemId: item.id, author: 'agent', deviceId: 0, body: 'The proposal changed: the item now shows the newer one.', keepStatus: true })?.comment ?? null
-      item = getItem(db, userId, item.id)
-    } else {
-      item = createItem(db, {
-        userId, kind: 'question', title: f.title, body: f.body, labels: [CONSENT_LABEL], actions: f.actions,
-        awaiting: 'user', position: 'top', originConvoId: homeConvo(ctx, userId, convoId), originDeviceId: who.deviceId, createdBy: 'agent', consent: MEMORY_CONSENT,
-      }).item
-      setProposalItem(db, r.proposal.id, item.id)
-    }
-    return { ...r, proposal: { ...r.proposal, item_id: item.id }, item, note }
+    const { item } = createItem(db, {
+      userId, kind: 'question', title: f.title, body: f.body, labels: [CONSENT_LABEL], actions: f.actions,
+      awaiting: 'user', position: 'top', originConvoId: homeConvo(ctx, userId, convoId), originDeviceId: who.deviceId, createdBy: 'agent', consent: MEMORY_CONSENT,
+    })
+    setProposalItem(db, r.proposal.id, item.id)
+    const closed = r.replaced?.item_id
+      ? closeItem(db, { userId, itemId: r.replaced.item_id, resolution: 'cancelled', author: 'agent', deviceId: 0, comment: `Set aside: a newer proposal for this memory took its place (#${item.num}). Nothing was changed.` })
+      : null
+    return { ...r, proposal: { ...r.proposal, item_id: item.id }, item, closed }
   })()
   if (out.replaced) {
-    const closed = closeMirror(ctx, out.replaced, { resolution: 'cancelled', author: 'agent', comment: 'Set aside: a newer proposal for this memory took its place. Nothing was changed.' })
-    tellProposer(ctx, out.replaced, 'replaced', closed?.item ?? null)
+    if (out.closed) itemMarker(ctx, { userId, sender: JOURNAL, item: out.closed.item, action: 'closed', by: 'agent', comment: out.closed.comment })
+    tellProposer(ctx, out.replaced, 'replaced', out.closed?.item ?? null)
   }
-  itemMarker(ctx, { userId, sender, item: out.item, action: out.inPlace ? 'commented' : 'created', by: 'agent', comment: out.note, push: true })
+  itemMarker(ctx, { userId, sender, item: out.item, action: 'created', by: 'agent', push: true })
   return { proposal: out.proposal, item: out.item }
 }
 
@@ -247,7 +245,7 @@ export function handleMemoryProposalTap(ctx, res, who, item, action, replyTo = n
   let applied = null
   try {
     db.transaction(() => {
-      settled = settleProposal(db, { userId: who.userId, id: p.id, state: approve ? 'approved' : 'declined' })
+      settled = settleProposal(db, { userId: who.userId, id: p.id, itemId: item.id, state: approve ? 'approved' : 'declined' })
       if (settled && approve) applied = applyProposal(db, settled)
     })()
   } catch (err) {
@@ -273,7 +271,7 @@ export function declineOnClose(ctx, userId, item) {
   safely('decline on close', () => {
     const p = proposalOfItem(ctx.db, userId, item.id)
     if (!p || p.state !== 'pending') return
-    const settled = settleProposal(ctx.db, { userId: p.user_id, id: p.id, state: 'declined' })
+    const settled = settleProposal(ctx.db, { userId: p.user_id, id: p.id, itemId: item.id, state: 'declined' })
     if (settled) tellProposer(ctx, settled, 'declined', item)
   })
 }
