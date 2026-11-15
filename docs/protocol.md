@@ -302,7 +302,7 @@ the machine-checkable version of this page.
   reads the displayed pixel size from the file's own header (PNG, JPEG with
   EXIF orientation, GIF, WebP, HEIC/HEIF with `irot`) and answers it as
   `width`/`height`; absent when it isn't an image it can size. 400 `{error:'empty'}` on a zero-byte
-  body; 413 `{error:'too_large'}` over `MATRON_MEDIA_MAX_BYTES` (default 50 MB);
+  body; 413 `{error:'too_large'}` over `MATRON_MEDIA_MAX_BYTES` (default 100 MB, 100000000 bytes);
   413 `{error:'quota_exceeded'}` when the user's total blob bytes would exceed
   `MATRON_MEDIA_USER_QUOTA_BYTES` (default 2 GiB) — checked up front (rejected
   before the body streams) when already at the ceiling, and precisely after the

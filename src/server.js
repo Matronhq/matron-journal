@@ -63,7 +63,7 @@ import { warnAlertWebhookConfig } from './alerts-http.js'
 import { throttle, cancellableDelay } from './background.js'
 import { TRANSFER_MAX_BYTES_DEFAULT, TRANSFER_USER_QUOTA_BYTES_DEFAULT, TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT } from './transfers.js'
 
-export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
+export const DEFAULT_MEDIA_MAX_BYTES = 100000000 // 100 MB (decimal bytes)
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
 // user, summed). Unlike tool_output, user-uploaded media has no TTL, so without
 // a ceiling a single valid device token could fill the disk. 2 GiB is ~75x the

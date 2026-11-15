@@ -124,7 +124,7 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_ANDROID_PACKAGE` | unset (404) | Android package name for `/.well-known/assetlinks.json`; needs `MATRON_ANDROID_CERT_SHA256` too |
 | `MATRON_ANDROID_CERT_SHA256` | unset | Comma-separated signing-cert SHA-256 fingerprints (`AA:BB:…`) for assetlinks |
 | `MATRON_MEDIA_DIR` | `<db dir>/media` | Blob storage root |
-| `MATRON_MEDIA_MAX_BYTES` | 50 MiB (`52428800`) | Upload size limit |
+| `MATRON_MEDIA_MAX_BYTES` | 100 MB (`100000000`) | Upload size limit; explicit overrides still apply |
 | `MATRON_STT_AZURE_KEY` | unset (off) | Azure Speech resource key. Set it and every user's voice note, and the audio track of every user's video, is transcribed here on upload (Azure fast transcription), along with voice notes on tracker items; a bridge reads the words instead of running its own whisper, and can ask for a retry (`POST /media/:id/transcript`). Needs `ffmpeg` on `PATH`. With `MATRON_WHISPER_MODEL` set too, whisper is the fallback when the cloud call fails |
 | `MATRON_STT_AZURE_KEY_FILE` | unset | File holding the key, used when `MATRON_STT_AZURE_KEY` is unset; read at boot. Set but unreadable = cloud transcription off, said at boot |
 | `MATRON_STT_AZURE_MODEL` | `MAI-Transcribe-2` | Azure transcription model; the empty string = Azure's standard model |
