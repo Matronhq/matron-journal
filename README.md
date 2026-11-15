@@ -52,6 +52,9 @@ node itself; on Linux that is what always happens.
     MATRON_DB=./matron.db npx matron-admin device list alice
     MATRON_DB=./matron.db npx matron-admin device revoke <device_id>
     MATRON_DB=./matron.db npx matron-admin device private <device_id> on
+    MATRON_DB=./matron.db npx matron-admin device protected <device_id> on|off
+    MATRON_DB=./matron.db npx matron-admin approval-key list alice
+    MATRON_DB=./matron.db npx matron-admin approval-key revoke alice <key_id>|--all
     MATRON_DB=./matron.db npx matron-admin offload [--days N]
     MATRON_DB=./matron.db npx matron-admin expire-logs [--hours N]
     MATRON_DB=./matron.db npx matron-admin status
@@ -59,6 +62,8 @@ node itself; on Linux that is what always happens.
     MATRON_DB=./matron.db npx matron-admin two-factor require on|off
     MATRON_DB=./matron.db npx matron-admin user 2fa-reset alice
     MATRON_DB=./matron.db npx matron-admin user 2fa-exempt demo-review on|off
+    MATRON_DB=./matron.db npx matron-admin panic status alice
+    MATRON_DB=./matron.db npx matron-admin panic clear alice
 
 Passwords come from stdin (`--password-stdin`) or the `MATRON_PASSWORD` env
 var, never from the command line, where any local user could read them via
@@ -79,6 +84,24 @@ has set two-factor up is still asked for their code.
 and their recovery codes. Details are in [docs/protocol.md](docs/protocol.md),
 "Two-factor sign-in".
 
+Approval keys (step-up): an app can enrol a device-held P-256 key (first
+with the password and a two-factor code, later devices approved from one
+that already has a key). Once an account has one, the journal asks for a
+statement signed with it before a tap on a question an agent marked
+`step_up`, before approving a spawn, chat invite or file transfer aimed at
+a box marked protected (`device protected`), and before account changes
+that widen access (password, pairing, device links, two-factor, the
+Coordinator's switches, revoking another device). For a protected box the
+signed statement is forwarded to the box, which checks it against keys
+pinned on the box (`tools/approval-verify.mjs` is a reference verifier;
+`test/fixtures/approval-vectors.json` holds test vectors). It needs
+`MATRON_PUBLIC_URL`; an account without a key works as before, except that
+a box marked protected stays the user's own: the Coordinator cannot
+approve its asks or control its sessions, and the journal's own routines,
+alerts, hand-over and talk sessions do not reach it. App tokens left unused
+for `MATRON_CLIENT_IDLE_DAYS` (default 30) stop working. Details are in [docs/protocol.md](docs/protocol.md), "Approval
+keys (step-up)".
+
 Next steps: install [matron-bridge](https://github.com/Matronhq/matron-bridge)
 on each dev box, then sign in from an app with your journal URL + username.
 
@@ -88,7 +111,9 @@ on each dev box, then sign in from an app with your journal URL + username.
 |---|---|---|
 | `MATRON_DB` | `./matron.db` | Path to the SQLite database file |
 | `MATRON_PORT` | `9810` | Listen port |
+| `MATRON_SQLITE_CACHE_MB` | `64` (or 1/16 of RAM on hosts under 1 GiB, minimum 8) | SQLite page cache per connection, in MiB. Pages are cached as they are touched and never released, so a large value adds that much resident memory after a retention pass or search rebuild, on top of the OS page cache; `matron-admin` opens its own. Raise it on a large host with a busy disk. `0` or an invalid value keeps SQLite's stock cache |
 | `MATRON_BIND` | `127.0.0.1` | Bind address (put a TLS-terminating proxy in front for `wss://`) |
+| `MATRON_STALL_LOG` | on | Set to `0` to turn off the diagnostics that log event-loop stalls (`stall: …`), requests slower than 500 ms (`slow request: …`) and slow maintenance passes. The work itself is unaffected |
 | `MATRON_GITHUB_CLIENT_ID` | Matron's published OAuth App id (`Ov23likaFmqoegaDMTtz`) | GitHub OAuth App client id for account linking (device flow works with the id alone). Set to the empty string to disable linking; set your own app's id, with its secret, for the web flow |
 | `MATRON_GITHUB_CLIENT_SECRET` | unset | Client secret of an OAuth App registered for this journal (callback `https://<journal>/github/callback`). Enables the one-click web flow |
 | `MATRON_GITHUB_DEVICE_FLOW` | on | Set to `0` to turn off the device flow (code entered on GitHub's site). It is always off when a client secret is set, so a journal with the web flow offers only that |
@@ -144,8 +169,18 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_VERIFIER_TIMEOUT_MS` | `60000` | Bound on the whole verifier call; a timeout fails closed (the approval is refused and the card waits for the user) |
 | `MATRON_RESEND_API_KEY` / `MATRON_RESEND_API_KEY_FILE` | unset (off) | [Resend](https://resend.com) API key, inline or read from a file, for password reset by email ("Forgot password?"). A sending-only key is enough. Needs `MATRON_MAIL_FROM` and `MATRON_PUBLIC_URL` too; without all three the feature is off and the apps hide it. Users need an address on file: `matron-admin user email <name> <address>`, the web admin page, or their own Settings |
 | `MATRON_MAIL_FROM` | unset | From address for reset emails, on a domain verified with Resend, e.g. `Matron <no-reply@example.com>` |
-| `MATRON_PUBLIC_URL` | unset | This journal's public `https://` origin, e.g. `https://journal.example.com`. Reset links point at `<origin>/app/reset-password` (served by `MATRON_WEB_DIR`). Required, because building links from a request's `Host` header would let anyone have the journal mail out a link to their own site |
+| `MATRON_PUBLIC_URL` | unset | This journal's public `https://` origin, e.g. `https://journal.example.com`. Reset links point at `<origin>/app/reset-password` (served by `MATRON_WEB_DIR`). Required, because building links from a request's `Host` header would let anyone have the journal mail out a link to their own site. Approval keys need it too: a signed statement names the journal by this URL's host, and without it they are off |
+| `MATRON_CLIENT_IDLE_DAYS` | `30` | Days an app (client) token may go unused before it stops working and the app must sign in again; fractions allowed, `0` turns the expiry off, an invalid value warns and uses the default. Agent (bridge) tokens never expire. The device keeps its row and its approval key, and the device list marks it `idle_expired` |
+| `MATRON_SECURITY_LOG` | unset (stdout only) | A file each security event line is appended to, as well as stdout (docs/protocol.md "Security event feed"). An unwritable file is reported once; the events still go to the database and stdout |
+| `MATRON_SECURITY_FEED_TOKEN` | unset (feed off) | Read-only token for `GET /security-events`, the feed an external watcher reads: 32 to 128 characters of `A-Z a-z 0-9 _ -`. Not a device token: it opens nothing else. Needs `MATRON_SECURITY_FEED_ACCOUNT` |
+| `MATRON_SECURITY_FEED_ACCOUNT` | unset (feed off) | The user name the feed token is bound to: the feed serves that account's events and no other's |
+| `MATRON_PANIC_TOKEN` | unset (panic lock off) | Token for `POST /panic` and `GET /panic`, with which an external watcher locks one account in one request: 32 to 128 characters of `A-Z a-z 0-9 _ -`. It can only lock that account and read whether it is locked; it is unlocked by `matron-admin panic clear` on the journal host, or by one of the account's devices that holds an approval key, with a signed statement. Needs `MATRON_PANIC_ACCOUNT`. See *Panic lock* in `docs/protocol.md` |
+| `MATRON_PANIC_ACCOUNT` | unset (panic lock off) | The user name the panic token is bound to |
 | `MATRON_APNS_KEY_FILE` / `_KEY_ID` / `_TEAM_ID` / `_TOPIC` | unset | All four set = push enabled; otherwise push is an inert no-op |
+| `MATRON_WEBPUSH_VAPID_KEY_FILE` | unset | PEM P-256 private key file for Web Push; set together with the subject |
+| `MATRON_WEBPUSH_SUBJECT` | unset | Web Push contact URL (`mailto:` or `https:`); set together with the key file |
+| `MATRON_WEBPUSH_DISABLED` | unset | `1` or `true` switches Web Push off |
+| `MATRON_WEBPUSH_EXTRA_HOSTS` | unset | Comma-separated extra push-service hosts beyond `fcm.googleapis.com`, `updates.push.services.mozilla.com`, `*.push.apple.com`, and `*.notify.windows.com`; exact hosts or `*.suffix` |
 | `MATRON_PUSH_GATEWAY_URL` | unset | Push relay URL when you have no APNs key — see Push relay section |
 | `MATRON_RELAY_PORT` / `MATRON_RELAY_BIND` | `9821` / `127.0.0.1` | matron-push-relay only |
 
@@ -209,7 +244,8 @@ on each dev box, then sign in from an app with your journal URL + username.
   blob files on a schedule, and a TTL pass deletes those blobs after
   `MATRON_TOOL_LOG_TTL_HOURS` (default 24); journal rows are never deleted.
 - **Ops** — `/metrics` endpoint, `matron-admin` CLI (`user add`/`passwd`,
-  `agent add`, `device list`/`revoke`/`private on|off|auto`, `link-code`,
+  `agent add`, `device list`/`revoke`/`private on|off|auto`,
+  `approval-key list`/`revoke`, `link-code`,
   `offload`, `expire-logs`, `agent-chat pending|approve|deny`,
   `status`), systemd unit in `deploy/`, WAL checkpoint tuning
   ([measured](docs/wal-checkpoint-profile.md)).
@@ -219,6 +255,20 @@ on each dev box, then sign in from an app with your journal URL + username.
 
 Dependencies: `better-sqlite3`, `ws`, `argon2`, `qrcode`, `qrcode-terminal`.
 That's the whole list.
+
+### Web Push
+
+Generate a VAPID key with `node tools/webpush-vapid-keygen.js <out.pem>`, then
+set `MATRON_WEBPUSH_VAPID_KEY_FILE` to that file and `MATRON_WEBPUSH_SUBJECT`
+to a `mailto:` or `https:` contact URL. Web Push is off unless both are set;
+an incomplete pair fails startup. The web app must be served over HTTPS with
+its `sw.js` at the root of its path.
+
+Only `fcm.googleapis.com`, `updates.push.services.mozilla.com`, subdomains of
+`push.apple.com`, and subdomains of `notify.windows.com` are accepted by
+default. Extend this list with `MATRON_WEBPUSH_EXTRA_HOSTS`, a comma-separated
+list of exact hosts or `*.suffix` entries. A wildcard matches subdomains
+only, not the suffix itself.
 
 ## Push relay (self-hosted journals)
 

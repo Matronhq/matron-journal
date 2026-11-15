@@ -10,7 +10,7 @@ import {
   validRanges, addSeenRanges, seenRanges, legacyReadAsSeen, markDeviceUsesRanges, markItemSeen,
   listUnseen, flagRefs, pruneFlags, validRef,
 } from '../src/seen.js'
-import { inNudgeHours, runUnseenNudge } from '../src/unseen-nudge.js'
+import { inNudgeHours, resolveNudgeTz, runUnseenNudge } from '../src/unseen-nudge.js'
 
 async function world() {
   const db = openDb(':memory:')
@@ -164,11 +164,15 @@ test('validRef', () => {
   for (const bad of ['msg:c1', 'msg::1', 'item:x', 'nope', 12, 'msg:c1:1x']) assert.ok(!validRef(bad), String(bad))
 })
 
-test('inNudgeHours: 07:00–22:00 UK', () => {
-  assert.equal(inNudgeHours(Date.UTC(2026, 0, 15, 6, 59)), false) // GMT
-  assert.equal(inNudgeHours(Date.UTC(2026, 0, 15, 7, 0)), true)
-  assert.equal(inNudgeHours(Date.UTC(2026, 6, 15, 6, 0)), true) // 07:00 BST
-  assert.equal(inNudgeHours(Date.UTC(2026, 6, 15, 21, 0)), false) // 22:00 BST
+test('inNudgeHours: 07:00–22:00 in the nudge zone (Europe/London by default)', () => {
+  assert.equal(inNudgeHours(Date.UTC(2026, 0, 15, 6, 59), 'Europe/London'), false) // GMT
+  assert.equal(inNudgeHours(Date.UTC(2026, 0, 15, 7, 0), 'Europe/London'), true)
+  assert.equal(inNudgeHours(Date.UTC(2026, 6, 15, 6, 0), 'Europe/London'), true) // 07:00 BST
+  assert.equal(inNudgeHours(Date.UTC(2026, 6, 15, 21, 0), 'Europe/London'), false) // 22:00 BST
+  assert.equal(inNudgeHours(Date.UTC(2026, 0, 15, 6, 59), 'Europe/Paris'), true) // 07:59 CET
+  assert.equal(inNudgeHours(Date.UTC(2026, 0, 15, 21, 0), 'Europe/Paris'), false) // 22:00 CET
+  assert.equal(resolveNudgeTz(undefined), 'Europe/London')
+  assert.equal(resolveNudgeTz('America/New_York'), 'America/New_York')
 })
 
 test('runUnseenNudge: once per entry, hourly at most, only when the Coordinator is connected', async () => {
@@ -274,4 +278,27 @@ test('listUnseen: a prompt the bridge settled itself (prompt_reply naming its pr
   // A reply naming the same prompt_id in another conversation settles nothing here.
   say('c1', null, 'agent:ang', 'prompt_reply', { kind: 'queued_release', prompt_id: 'pr_2', action: 'send', released: [] })
   assert.deepEqual(listUnseen(db, alice.id, { now: later }).entries.map((e) => [e.convo_id, e.reasons]), [['pc', ['prompt']]])
+})
+
+test('listUnseen: a silent event is never listed, and the message before it stays the "final" one', async () => {
+  const { db, alice, say, later } = await world()
+  const last = say('c1', 'Done, I will check the build again at 18:00')
+  say('c1', null, 'agent:ang', 'prompt', { question: 'The agent set itself reminder #3 for 18:00', options: ['Send now', 'Cancel'], prompt_id: 'timer_3_1', blocking: false, silent: true })
+  say('c2', 'Timer cancelled', 'agent:ang', 'text', { body: 'Timer cancelled', from: 'assistant', silent: true })
+  upsertConversation(db, { id: 'c1', ownerUserId: alice.id, sessionState: 'waiting' })
+  const all = listUnseen(db, alice.id, { now: later, importance: 'all' }).entries
+  assert.deepEqual(all.map((e) => [e.convo_id, e.seq, e.reasons]), [['c1', last, ['final']]])
+  // Only a strict true is silent.
+  say('c2', 'Hello', 'agent:ang', 'text', { body: 'Hello', from: 'assistant', silent: 'yes' })
+  assert.equal(listUnseen(db, alice.id, { now: later, importance: 'all' }).entries.filter((e) => e.convo_id === 'c2').length, 1)
+})
+
+test('addSeenRanges: a silent event in the gap between two ranges does not keep them apart', async () => {
+  const { db, alice, say } = await world()
+  const a = say('c1', 'one')
+  say('c1', null, 'agent:ang', 'prompt', { question: 'Reminder set', options: ['Send now', 'Cancel'], blocking: false, silent: true })
+  const b = say('c1', 'two')
+  addSeenRanges(db, alice.id, 'c1', [[a, a]])
+  addSeenRanges(db, alice.id, 'c1', [[b, b]])
+  assert.deepEqual(seenRanges(db, alice.id, 'c1'), [[a, b]])
 })

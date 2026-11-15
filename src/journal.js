@@ -1,4 +1,5 @@
 import { authorize } from './auth.js'
+import { approvalKeyIdOfDevice } from './approval-keys.js'
 import { isPrivateDevice } from './db.js'
 import { indexableBody } from './search.js'
 import { getMission, ORIGIN_SIEVE } from './missions.js'
@@ -8,11 +9,19 @@ import { sanitizePeerText, PEER_NAME_CAP } from './peer-text.js'
 import { joinedAgentIds, participantConvosByRoom } from './participants.js'
 import { parseRepo } from './repo-identity.js'
 import { autoTitleColumns, convoMetaPayload, recomputeConvoTitle } from './convo-title.js'
-import { MESSAGE_TYPES, MESSAGE_TYPES_SQL } from './message-types.js'
+import { MESSAGE_TYPES, MESSAGE_TYPES_SQL, isSilentEvent, notSilentSql } from './message-types.js'
 import { FOR_YOU_TYPES_SQL } from './sync-scope.js'
 import { pinHintBeforeAppend, sendPinsFrame } from './pins.js'
 import { unarchiveOnMessage, sendArchiveFrame } from './archive.js'
 export { MESSAGE_TYPES, MESSAGE_TYPES_SQL }
+
+// Sort fetched rows so the correlated last_ts query need not run again for
+// ordering. Non-message activity must not change the immutable id tie-break.
+export function byLastMessageThenId(a, b) {
+  const activity = (b.last_ts ?? b.created_at) - (a.last_ts ?? a.created_at)
+  if (activity) return activity
+  return a.id > b.id ? -1 : a.id < b.id ? 1 : 0
+}
 
 // Cap for a convo id wherever one arrives from outside the process —
 // ws.js's parent_convo_id/room_id validation and spawns.js's approveSpawn
@@ -186,12 +195,17 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
   const existing = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
   const prevSessionState = existing ? existing.session_state : undefined
   let metaChanged = false
+  let summaryChanged = false
   if (existing) {
     if (existing.owner_user_id !== ownerUserId) throw new Error('not authorized: convo owned by another user')
     // The journal's own conversations (people-convo.js) are never an
     // agent's to title, adopt or re-state.
     if (existing.system != null) throw new Error('not authorized: system conversation')
     if (title != null && title !== existing.auto_title) metaChanged = true
+    // A summary change is NOT metadata: it is pushed as an ephemeral client
+    // frame (see ws.js) and rides /snapshot, never a stored event. Reconnect
+    // resends must neither emit a frame nor refresh the timestamp.
+    summaryChanged = summary != null && summary !== existing.summary
     if (repoCols && (existing.repo ?? null) !== repoCols.repo) metaChanged = true
     // agent_device_id: last upsert wins — the device currently managing the
     // session owns delivery (see hub.js). An absent agentDeviceId leaves the
@@ -219,8 +233,8 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
       && !!db.prepare('SELECT 1 FROM convo_agents WHERE convo_id=? AND agent_device_id=?').get(id, agentDeviceId)
 
     db.prepare(
-      'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id), session_outcome=COALESCE(?, session_outcome), summary=COALESCE(?, summary) WHERE id=?'
-    ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), sessionOutcome ?? null, summary ?? null, id)
+      'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id), session_outcome=COALESCE(?, session_outcome), summary=COALESCE(?, summary), summary_updated_at=COALESCE(?, summary_updated_at) WHERE id=?'
+    ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), sessionOutcome ?? null, summary ?? null, summaryChanged ? Date.now() : null, id)
     // When the session last entered and last left 'running' — a turn's start
     // and end, for an item thread's working indicator (items.js itemWorking).
     // Stamped on a real transition only: a bridge that repeats a state, or
@@ -247,8 +261,8 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     // non-null mission_id has an active link" must hold from birth.
     db.transaction(() => {
       db.prepare(
-        'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, mission_id, created_at, turn_started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)'
-      ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', inheritedMission, createdAt,
+        'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, summary_updated_at, mission_id, created_at, turn_started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'
+      ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', summary ? createdAt : 0, inheritedMission, createdAt,
         (sessionState || 'running') === 'running' ? createdAt : null)
       db.prepare('UPDATE conversations SET auto_title=@auto_title, session_short=@session_short, title_marker=@title_marker WHERE id=@id')
         .run({ id, ...autoTitleColumns(initialTitle) })
@@ -263,7 +277,7 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
   }
   const convo = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
   if (existing && convo.title !== existing.title) metaChanged = true
-  return { ...convo, metaChanged, prevSessionState }
+  return { ...convo, metaChanged, summaryChanged: summaryChanged || (!existing && !!summary), prevSessionState }
 }
 
 // Fan a convo_meta for each conversation the journal itself retitled — a
@@ -334,7 +348,8 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
       // owner's unread badge (server-side "silent children", mirrored by the
       // push pipeline's short-circuit in push.js). last_seq/snippet still
       // advance — only the unread increment is exempt.
-      const sql = sender.startsWith('user:') || convo.parent_convo_id != null
+      // A silent event (isSilentEvent) is exempt the same way.
+      const sql = sender.startsWith('user:') || convo.parent_convo_id != null || isSilentEvent(payload)
         ? 'UPDATE conversations SET last_seq=?, snippet=? WHERE id=?'
         : 'UPDATE conversations SET last_seq=?, unread_count=unread_count+1, snippet=? WHERE id=?'
       db.prepare(sql).run(seq, snippetOf(type, payload), convoId)
@@ -359,11 +374,14 @@ export function append(db, { userId, convoId, sender, type, payload, blobRef = n
 // both deliberate: no sender_device_id (there is no producing connection)
 // and no push pipeline (a journal-authored room line is not an
 // attention-worthy push).
-export function appendAndBroadcast(db, hub, { userId, convoId, sender, type, payload }) {
+// `senderDeviceId`: the client device whose request this is, for a user's
+// event an agent hears as a turn (an item tap or comment): it reaches the
+// agent stamped with that device's approval key (hub.js agentJournalFrame).
+export function appendAndBroadcast(db, hub, { userId, convoId, sender, type, payload, senderDeviceId = null }) {
   const hinted = pinHintBeforeAppend(db, userId, convoId, type)
   const r = append(db, { userId, convoId, sender, type, payload })
   if (r.duplicate) return r
-  broadcastAppended(db, hub, { userId, convoId, seq: r.seq, ts: r.ts, sender, type, payload })
+  broadcastAppended(db, hub, { userId, convoId, seq: r.seq, ts: r.ts, sender, type, payload, senderDeviceId })
   if (hinted) sendPinsFrame(db, hub, userId)
   if (r.unarchived) sendArchiveFrame(hub, userId, [r.unarchived], r.ts)
   return r
@@ -372,10 +390,10 @@ export function appendAndBroadcast(db, hub, { userId, convoId, sender, type, pay
 // The fan-out half of appendAndBroadcast, for callers that must append
 // INSIDE their own transaction (a milestone's marker seq is the row's
 // anchor) and broadcast only after it commits. Same targeting rules.
-export function broadcastAppended(db, hub, { userId, convoId, seq, ts, sender, type, payload }) {
+export function broadcastAppended(db, hub, { userId, convoId, seq, ts, sender, type, payload, senderDeviceId = null }) {
   const frame = { kind: 'journal', ...toEventShape({ seq, convo_id: convoId, ts, sender, type, payload }) }
   const targets = isClientOnlyEvent(type, payload) ? new Set() : agentTargetsFor(db, convoId)
-  hub.broadcastJournal(userId, frame, targets)
+  hub.broadcastJournal(userId, frame, targets, senderDeviceId == null ? null : () => approvalKeyIdOfDevice(db, userId, senderDeviceId))
 }
 
 // The agent devices allowed to see a conversation's traffic — hub's
@@ -431,7 +449,7 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   const conversations = db.prepare(
     `SELECT id, title, auto_title, session_state, session_outcome, last_seq, unread_count,
             ${omitSnippet ? 'NULL' : 'snippet'} AS snippet,
-            parent_convo_id, summary, repo, created_at, agent_device_id, system,
+            parent_convo_id, summary, summary_updated_at, repo, created_at, agent_device_id, system,
             ${excludePrivateOwned
               ? `(CASE WHEN EXISTS (SELECT 1 FROM missions m WHERE m.id = conversations.mission_id AND ${ORIGIN_SIEVE}) THEN conversations.mission_id END)`
               : 'mission_id'} AS mission_id,
@@ -445,9 +463,9 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
      FROM conversations WHERE owner_user_id=?${excludeSystem ? ' AND system IS NULL' : ''}${excludePrivateOwned
        ? ` AND (agent_device_id IS NULL OR NOT EXISTS(
               SELECT 1 FROM private_devices d WHERE d.id=conversations.agent_device_id))`
-       : ''}
-     ORDER BY last_seq DESC`
+       : ''}`
   ).all(userId)
+  conversations.sort(byLastMessageThenId)
   // archived_at (src/archive.js) only on archived rows, so the wire stays
   // the same for everything else; no key = not archived.
   for (const c of conversations) if (c.archived_at == null) delete c.archived_at
@@ -641,10 +659,11 @@ export function markRead(db, userId, convoId, upToSeq, sender = null) {
     // reader's own messages as unread — and silent children
     // (parent_convo_id set) are skipped entirely, so a partial read_marker
     // can never resurrect a positive count append() would not have made.
+    // Silent events are skipped too, as append() skips them.
     db.prepare(
       `UPDATE conversations SET unread_count=(
          SELECT COUNT(*) FROM events e WHERE e.convo_id=? AND e.seq>? AND e.type IN (${placeholders})
-           AND e.sender NOT LIKE 'user:%'
+           AND e.sender NOT LIKE 'user:%' AND ${notSilentSql('e')}
        ) WHERE id=? AND parent_convo_id IS NULL`
     ).run(convoId, resolvedUpToSeq, ...MESSAGE_TYPES, convoId)
     return { ...r, upToSeq: resolvedUpToSeq }

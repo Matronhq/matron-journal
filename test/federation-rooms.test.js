@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
+import { setDeviceProtected } from '../src/db.js'
 import { makeWsClient } from './helpers.js'
 import { world, post } from './federation-world.js'
 
@@ -197,6 +198,20 @@ test('a journal that does not take rooms yet: the ask ends with a notice', async
   assert.equal(answer.accept, false)
 })
 
+test('a talk across journals onto a protected box is refused protected_device and nothing reaches it', async (t) => {
+  const w = await rooms(t)
+  const bobBoxId = w.b.db.prepare("SELECT id FROM devices WHERE name='bob-box'").get().id
+  setDeviceProtected(w.b.db, bobBoxId, true)
+  await askAndSend(w)
+  const card = await roomItem(w.phones.bob)
+  const pick = await w.phones.bob(`/items/${card.id}/comments`, post({ action: 'Pick a session' }))
+  const chose = await w.phones.bob(`/items/${card.id}/comments`, post({ action: 'Bob Q3', reply_to: pick.json.comment.id }))
+  assert.deepEqual([chose.status, chose.json.blocked_by], [409, 'protected_device'])
+  await tick()
+  assert.equal(w.ws.bob.frames.some((f) => f.kind === 'invite'), false)
+  assert.equal(half(w.b).state, 'awaiting_guest')
+})
+
 test('New session: bob\'s Coordinator box starts a session for the talk, and it joins', async (t) => {
   const w = await rooms(t)
   const coord = createAgent(w.b.db, w.users.bob.id, 'bob-coord')
@@ -221,6 +236,28 @@ test('New session: bob\'s Coordinator box starts a session for the talk, and it 
   await w.settle()
   assert.deepEqual([half(w.a).state, half(w.b).state], ['joined', 'joined'])
   assert.equal(w.b.db.prepare("SELECT title FROM conversations WHERE id='talk-child'").get().title, 'Talk with alice@a.example — Cover editor')
+})
+
+test('New session onto a box whose account is panic-locked before the start returns: the accept is refused account_locked, no invite reaches it, the guest is asked again', async (t) => {
+  const w = await rooms(t)
+  const coord = createAgent(w.b.db, w.users.bob.id, 'bob-coord')
+  upsertConversation(w.b.db, { id: 'bobcoord', ownerUserId: w.users.bob.id, title: 'Coordinator', agentDeviceId: coord.deviceId })
+  assert.equal((await w.phones.bob('/coordinator', { method: 'PUT', body: { convo_id: 'bobcoord' } })).status, 200)
+  const coordWs = await makeWsClient(w.b.base, { token: coord.token, cursor: null })
+  t.after(() => { try { coordWs.close() } catch { /* closed */ } })
+  await coordWs.waitFor((f) => f.op === 'hello_ok')
+  await askAndSend(w)
+  const card = await roomItem(w.phones.bob)
+  assert.equal((await w.phones.bob(`/items/${card.id}/comments`, post({ action: 'New session' }))).status, 200)
+  const rpc = await coordWs.waitFor((f) => f.kind === 'rpc' && f.request?.method === 'start')
+  // Locked while the box was starting the session.
+  w.b.db.prepare('INSERT INTO panic_locks(user_id, since) VALUES(?,?)').run(w.users.bob.id, Date.now())
+  coordWs.send({ op: 'agent_response', request_id: rpc.request.request_id, to_device_id: 0, ok: true, result: { convo_id: 'talk-child' } })
+  await tick()
+  await w.settle()
+  assert.equal(coordWs.frames.some((f) => f.kind === 'invite' && f.event === 'request'), false)
+  assert.equal(half(w.b).state, 'awaiting_guest')
+  assert.equal(w.b.db.prepare("SELECT COUNT(*) n FROM convo_agents WHERE agent_device_id=?").get(coord.deviceId).n, 0)
 })
 
 test('the owner ending the room from their phone ends it on both journals', async (t) => {
@@ -254,4 +291,35 @@ test('a room holding a talk across journals takes no other person; a cancelled a
   const err = await w.ws.alice.waitFor((f) => f.op === 'error' && f.ref === 'agent_invite')
   assert.equal(err.code, 'conflict')
   assert.match(err.message ?? err.detail ?? '', /room_busy/)
+})
+
+// A modified or older remote journal can put anything in an ask. The guest
+// journal applies the consent-card sieve itself rather than trusting the
+// sender: bidi overrides come out of topic and justification, and a
+// justification with nothing left is refused.
+async function askWithRawText(w, { topic, justification }) {
+  w.ws.alice.send({ op: 'publish', convo_id: 'room', type: 'text', payload: { body: 'Hello bob', from: 'agent' } })
+  w.ws.alice.send({ op: 'agent_invite', room_id: 'room', target_person: 'bob@b.example', topic: 'placeholder', justification: 'placeholder', from_convo_id: 'room' })
+  await w.ws.alice.waitFor((f) => f.kind === 'invite' && f.event === 'delivered')
+  await tick()
+  w.a.db.prepare('UPDATE fed_rooms SET topic=?, justification=? WHERE id=?').run(topic, justification, half(w.a).id)
+  const own = await roomItem(w.phones.alice)
+  await w.phones.alice(`/items/${own.id}/comments`, post({ action: 'Send' }))
+  await w.settle()
+}
+
+test('the guest journal strips bidi overrides from a remote ask\'s topic and justification', async (t) => {
+  const w = await rooms(t)
+  await askWithRawText(w, { topic: '‮Cover‬ editor', justification: 'Compare ⁦notes⁩ on the cover' })
+  const g = half(w.b)
+  assert.equal(g.role, 'guest')
+  assert.equal(g.topic, 'Cover editor')
+  assert.equal(g.justification, 'Compare notes on the cover')
+})
+
+test('the guest journal refuses a remote ask whose justification is only invisible characters', async (t) => {
+  const w = await rooms(t)
+  await askWithRawText(w, { topic: 'Cover editor', justification: '​⁠﻿' })
+  assert.equal(w.b.db.prepare("SELECT COUNT(*) AS n FROM fed_rooms WHERE role='guest'").get().n, 0)
+  assert.equal(await roomItem(w.phones.bob), undefined)
 })

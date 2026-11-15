@@ -94,6 +94,36 @@ test('agent devices are never pushed to', async (t) => {
   assert.equal(stub.calls.length, 0)
 })
 
+test('an idle-expired client device gets no push; a live one does', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t)
+  const stale = registerDevice(db, alice.id, 'old-phone')
+  registerDevice(db, alice.id, 'phone')
+  const old = Date.now() - 31 * 24 * 60 * 60 * 1000
+  db.prepare('UPDATE devices SET created_at=?, last_seen_at=? WHERE id=?').run(old, old, stale)
+  const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:bridge', type: 'text', payload: { body: 'hi' } })
+  pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:bridge', type: 'text', payload: { body: 'hi' } }, null)
+  await new Promise((res) => setImmediate(res))
+  await pipeline.close()
+  assert.deepEqual([...new Set(stub.calls.map((c) => c.deviceToken ?? c.token ?? c.apnsToken))], ['phone-token'])
+})
+
+test('a push queued for a device that is signed out before it is sent goes nowhere', async (t) => {
+  const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 40 })
+  const phone = registerDevice(db, alice.id, 'phone')
+  const say = (body) => {
+    const r = append(db, { userId: alice.id, convoId: 'c1', sender: 'agent:bridge', type: 'text', payload: { body } })
+    pipeline.onAppend(alice.id, { seq: r.seq, convo_id: 'c1', ts: r.ts, sender: 'agent:bridge', type: 'text', payload: { body } }, null)
+  }
+  // The first goes at once; the second waits out the window.
+  say('one')
+  say('two')
+  await new Promise((res) => setImmediate(res))
+  assert.equal(stub.calls.length, 1)
+  db.prepare('DELETE FROM devices WHERE id=?').run(phone)
+  await new Promise((res) => setTimeout(res, 120))
+  assert.equal(stub.calls.length, 1, 'nothing sent to a device that is gone')
+})
+
 test('child conversations (parent_convo_id set) are silent: onAppend never pushes', async (t) => {
   const { db, alice, stub, pipeline } = await setup(t, { coalesceMs: 50 })
   registerDevice(db, alice.id, 'phone')
@@ -232,6 +262,10 @@ test('a client "send" (sender user:*) never triggers an alert push, not even to 
 // not double it.
 test('classify: a flagged item fallback text never pushes, even from an agent sender', () => {
   assert.equal(classify('text', { body: '📌 x', fallback_for: 'item' }, 'agent:box-2', undefined), null)
+  // A silent event of any type pushes nothing; only a strict true is silent.
+  assert.equal(classify('prompt', { question: 'Reminder set', options: ['Send now', 'Cancel'], blocking: false, silent: true }, 'agent:box-2', undefined), null)
+  assert.equal(classify('text', { body: 'x', silent: true }, 'agent:box-2', undefined), null)
+  assert.equal(classify('prompt', { question: 'Pick', options: ['A'], silent: 'true' }, 'agent:box-2', undefined).kind, 'attention')
 })
 
 test('origin-device exclusion applies to every push type, not just read_marker (defensive: a push recipient device that is also the event\'s origin is skipped)', async (t) => {
