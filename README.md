@@ -177,6 +177,10 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_PANIC_TOKEN` | unset (panic lock off) | Token for `POST /panic` and `GET /panic`, with which an external watcher locks one account in one request: 32 to 128 characters of `A-Z a-z 0-9 _ -`. It can only lock that account and read whether it is locked; it is unlocked by `matron-admin panic clear` on the journal host, or by one of the account's devices that holds an approval key, with a signed statement. Needs `MATRON_PANIC_ACCOUNT`. See *Panic lock* in `docs/protocol.md` |
 | `MATRON_PANIC_ACCOUNT` | unset (panic lock off) | The user name the panic token is bound to |
 | `MATRON_APNS_KEY_FILE` / `_KEY_ID` / `_TEAM_ID` / `_TOPIC` | unset | All four set = push enabled; otherwise push is an inert no-op |
+| `MATRON_WEBPUSH_VAPID_KEY_FILE` | unset | PEM P-256 private key file for Web Push; set together with the subject |
+| `MATRON_WEBPUSH_SUBJECT` | unset | Web Push contact URL (`mailto:` or `https:`); set together with the key file |
+| `MATRON_WEBPUSH_DISABLED` | unset | `1` or `true` switches Web Push off |
+| `MATRON_WEBPUSH_EXTRA_HOSTS` | unset | Comma-separated extra push-service hosts beyond `fcm.googleapis.com`, `updates.push.services.mozilla.com`, `*.push.apple.com`, and `*.notify.windows.com`; exact hosts or `*.suffix` |
 | `MATRON_PUSH_GATEWAY_URL` | unset | Push relay URL when you have no APNs key — see Push relay section |
 | `MATRON_RELAY_PORT` / `MATRON_RELAY_BIND` | `9821` / `127.0.0.1` | matron-push-relay only |
 
@@ -251,6 +255,20 @@ on each dev box, then sign in from an app with your journal URL + username.
 
 Dependencies: `better-sqlite3`, `ws`, `argon2`, `qrcode`, `qrcode-terminal`.
 That's the whole list.
+
+### Web Push
+
+Generate a VAPID key with `node tools/webpush-vapid-keygen.js <out.pem>`, then
+set `MATRON_WEBPUSH_VAPID_KEY_FILE` to that file and `MATRON_WEBPUSH_SUBJECT`
+to a `mailto:` or `https:` contact URL. Web Push is off unless both are set;
+an incomplete pair fails startup. The web app must be served over HTTPS with
+its `sw.js` at the root of its path.
+
+Only `fcm.googleapis.com`, `updates.push.services.mozilla.com`, subdomains of
+`push.apple.com`, and subdomains of `notify.windows.com` are accepted by
+default. Extend this list with `MATRON_WEBPUSH_EXTRA_HOSTS`, a comma-separated
+list of exact hosts or `*.suffix` entries. A wildcard matches subdomains
+only, not the suffix itself.
 
 ## Push relay (self-hosted journals)
 
