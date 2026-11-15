@@ -1878,6 +1878,42 @@ export function openDb(path) {
   )`)
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_item_handovers_pending ON item_handovers(item_id) WHERE state IN ('awaiting_user','offered')")
   db.exec('CREATE INDEX IF NOT EXISTS idx_item_handovers_state ON item_handovers(state, expires_at)')
+  // Memory proposals (src/memory-proposals.js): a memory save or delete an
+  // agent asked for that waits for the user's answer on a tracker item
+  // (item_id). The row holds the change exactly as proposed. At most one
+  // pending proposal per (user, memory name). For a save, type and scope are
+  // the ones the memory will have (the proposed value, else the memory's at
+  // proposal time, else the default), fixed when the proposal is recorded.
+  // memory_id and base_updated_at are the memory the proposal was made
+  // against and its updated_at then (both NULL: there was none); an
+  // approval applies only while that still holds. told_at is when the
+  // proposing conversation was told the outcome (NULL: not yet).
+  db.exec(`CREATE TABLE IF NOT EXISTS memory_proposals(
+    id             TEXT PRIMARY KEY,
+    user_id        INTEGER NOT NULL,
+    name           TEXT NOT NULL,
+    action         TEXT NOT NULL CHECK(action IN ('save','delete')),
+    description    TEXT NOT NULL DEFAULT '',
+    body           TEXT NOT NULL DEFAULT '',
+    type           TEXT,
+    scope          TEXT,
+    memory_id      TEXT,
+    from_device_id INTEGER NOT NULL,
+    from_convo_id  TEXT,
+    item_id        TEXT,
+    state          TEXT NOT NULL CHECK(state IN ('pending','approved','declined','replaced','expired','stale')),
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    expires_at     INTEGER NOT NULL,
+    base_updated_at INTEGER,
+    told_at        INTEGER
+  )`)
+  const proposalCols = db.prepare('PRAGMA table_info(memory_proposals)').all()
+  if (!proposalCols.some((c) => c.name === 'base_updated_at')) db.exec('ALTER TABLE memory_proposals ADD COLUMN base_updated_at INTEGER')
+  if (!proposalCols.some((c) => c.name === 'told_at')) db.exec('ALTER TABLE memory_proposals ADD COLUMN told_at INTEGER')
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_proposals_pending ON memory_proposals(user_id, name) WHERE state='pending'")
+  db.exec('CREATE INDEX IF NOT EXISTS idx_memory_proposals_state ON memory_proposals(state, expires_at)')
+  db.exec('CREATE INDEX IF NOT EXISTS idx_memory_proposals_item ON memory_proposals(item_id)')
   // Mission status (spec 2026-09-28 missions dashboard §1): one short
   // markdown paragraph agents keep current — who wrote it (status_by), from
   // which conversation (status_convo_id), and when. status_device_id is

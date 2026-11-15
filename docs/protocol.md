@@ -2335,7 +2335,9 @@ state: renaming the conversation does not bump the item's `updated_at`, so a
 `since` delta does not re-deliver the item. A client that also holds the
 conversation list should prefer that list's live title and use this field for
 origins it has not loaded. `consent` is `'spawn'` or `'chat'` on the journal's
-mirror of a consent card (see *Agent-spawned sessions → Tracker item*) and
+mirror of a consent card (see *Agent-spawned sessions → Tracker item*), `'memory'`
+on a memory proposal's question (*Memories* → *Memory proposals*; there is no
+card, the item's own buttons answer it) and
 `null` on every other item; clients may use it to embed the card. `mission_id`/`mission_num` are the mission this item belongs
 to — both `null` when it has none — set by `PATCH /items/:id {mission}` or
 inherited when the item's origin conversation joins a mission (see *Missions
@@ -3169,8 +3171,8 @@ memories are stored and shown in the apps only.
 |---|---|---|
 | `GET /memories` | | 200 `{memories:[…]}` ordered by `name` (≤200 rows, no paging) |
 | `GET /memories/:key` | `:key` = `me_…` or the name | 200 `{memory}`; 404 |
-| `PUT /memories/:name` | `{description, body?, type?, scope?, convo_id?}` | 201 `{memory}` created / 200 `{memory}` updated; 400 `bad_request` (a `scope` outside the three forms included); 409 `too_many`; 404 |
-| `DELETE /memories/:key` | | 200 `{memory}` (the deleted row); 404 |
+| `PUT /memories/:name` | `{description, body?, type?, scope?, convo_id?, causes?}` | 201 `{memory}` created / 200 `{memory}` updated; **202** `{pending:'owner', proposal, item}` when an agent's write waits for the user (*Memory proposals* below); 400 `bad_request` (a `scope` outside the three forms, or unusable `causes`, included); 409 `too_many`; 409 `conflict` `blocked_by:'too_many_asks'` (too many proposals waiting); 404 |
+| `DELETE /memories/:key` | agents may send `{convo_id?, causes?}` | 200 `{memory}` (the deleted row); **202** as for `PUT`; 400; 404 |
 
 `PUT` is the only write and is an **upsert by name**: the same name from
 any device overwrites `description`, `body`, `type` and `scope` and bumps
@@ -3184,7 +3186,14 @@ and the marker lands on that timeline. It clears the gate every
 agent-authored write clears — the conversation is the user's, the agent
 owns or has joined it (`authorizeAgentWrite`), and an ordinary agent may
 not name a private-owned conversation — answering **404** otherwise, never
-403. A client sending `convo_id` is 400.
+403. A client sending `convo_id` is 400. A `DELETE` takes the same optional
+`convo_id` in a JSON body, under the same gate.
+
+`causes` is optional and an **agent's** only (400 from a client): the causes
+of the turn that made the write, in the shape the bridge stamps on a spawn
+or chat ask (*Consent approval* → **Causes**). Absent or `null` is "none"; any
+other value must be a usable list or the write is 400. They decide whether
+an agent's write applies now or becomes a proposal.
 
 **Privacy.** A memory saved from a private agent device is invisible to an
 ordinary (filtered) agent: absent from `GET /memories`, 404 on `GET`, `PUT`
@@ -3220,6 +3229,138 @@ private-owned — the payload carries `memory_id`, `action`, `created` and
 `AGENT_PUBLISH_TYPES` member (a bare publish is `bad_request`), never
 pushes, never wakes, and has no old-client text fallback: a client that
 predates it ignores the type.
+
+### Memory proposals
+
+A memory is a standing rule every later session reads, so an agent's save
+or delete applies at once only when the user asked for it. Otherwise the
+journal keeps the change as a **proposal** (`memory_proposals`,
+`src/memory-proposals.js`, `src/memory-proposals-http.js`) and files a
+question for the user; the change is applied only when they approve it.
+
+**Which writes wait**, in order:
+
+1. A client (the user's own app): never. Its `PUT` and `DELETE` are direct.
+2. An agent on a **user-only** or **protected** box (*User-only boxes*):
+   always, whatever the turn's causes.
+3. Any other agent: unless the write names its conversation (`convo_id`)
+   and its `causes` resolve, by the journal's own record
+   (`src/ask-cause.js`, the resolver the Coordinator's own asks go
+   through), to the **user's own input in that conversation** — a message
+   they typed or spoke there, or their comment or button tap on an item
+   that conversation owns — made no more than **30 minutes** before the
+   write (`MEMORY_DIRECT_WINDOW_MS`). No causes (an older bridge, or a
+   write with no `convo_id`), a routine fire, a reminder, a room message
+   from another session, an alert, a carry-on, a spawn outcome, a cited
+   message that is in another conversation, is not the user's or cannot be
+   found, or input older than the window: a proposal. A turn with several
+   causes follows the resolver's rule: one cause of a kind that cannot
+   carry the user's say makes the whole turn a proposal.
+
+The existing checks come first and are unchanged: a malformed field is 400,
+an unwritable `convo_id` or a memory hidden from the caller is 404, and a
+new name at the cap is 409 `too_many`. Reads are unaffected: the agent
+still lists and reads memories as before, and sees the stored memory, not
+the proposed one, until the user approves.
+
+**The answer to the agent** is `202`:
+
+```json
+{ "pending": "owner",
+  "proposal": { "id": "mp_…", "name": "avoid-opal", "action": "save" | "delete", "state": "pending", "expires_at": 1791154800000 },
+  "item": { "id": "it_…", "num": 41 } }
+```
+
+Nothing has been saved or deleted, and no `memory` event is written.
+
+**The question** is a tracker item on the proposing conversation (the
+Coordinator conversation, else the People conversation, when the write
+named none): kind `question`, awaiting the user, top of the open list, label
+`consent`, `consent: 'memory'`, `actions` `['Save it', 'Decline']` for a save
+and `['Delete it', 'Keep it']` for a delete. Its body names the proposing box
+and conversation, the memory's name, scope and type, the proposed
+description and body, and for an update the current description beside it;
+a delete shows the memory as it stands. The scope and type shown for a save
+are the ones it will have: the proposed value, else the memory's at that
+moment, else the default — fixed and stored when the proposal is recorded,
+and applied as stored. The proposal also records which memory it was made
+against and that memory's `updated_at` (or that there was none). The proposed text is the agent's
+words: each piece is shown verbatim inside its own fenced block (control
+characters dropped, a line that starts with a fence kept from closing it),
+box and conversation names are flattened to plain words, and the buttons
+are the journal's. Like every consent mirror the item is the user's alone:
+404 to every agent — the proposer and the Coordinator included — on read
+and on every mutation, absent from an agent's `GET /items`, and its markers
+are client-only. Its `created` marker pushes like any item filed for the
+user. A typed reply from the user on it reaches the proposing session as an
+ordinary item turn.
+
+**One pending proposal per (user, name).** A newer proposal for the same
+name — from the same session or any other — replaces the pending one: the
+older proposal becomes `replaced`, its item is closed `cancelled` in the
+same write, its conversation is told, and the new proposal gets a **new**
+item. A pending proposal is never rewritten, so an item always shows the
+change its buttons apply; a tap already on its way to the older item finds
+it closed and answers 409, changing nothing.
+
+**Caps.** At most **10** proposals may wait from one conversation (a write
+that names none counts against its device) and **50** for one user
+(`MAX_PENDING_PER_CONVO`, `MAX_PENDING_PER_USER`). Past either, the write
+answers **409** `{error:'conflict', blocked_by:'too_many_asks'}`, as a parked
+ask does at its cap: nothing is stored and no item is filed. A proposal that
+replaces a pending one for the same name adds nothing and is never refused.
+
+**The user's tap** (`POST /items/:id/comments {action}`, a client's only —
+an agent's `action` is 403 and the item is a 404 to it anyway) is the
+answer, applied by the journal:
+
+- *Save it* / *Delete it*, when the memory has **changed since the question
+  was filed** — updated or deleted by anyone, or created where there was
+  none — applies nothing: what the item shows is no longer what would
+  happen. The proposal settles as `stale`, the item closes `cancelled` with
+  a line saying so, the proposer is told and may propose again, and the tap
+  answers **409** `{error:'conflict', blocked_by:'memory_changed', item,
+  comment, proposal}`. A decline is unaffected.
+- *Save it* / *Delete it* otherwise: the change is applied exactly as stored, through
+  the same write a direct `PUT`/`DELETE` makes. A saved memory records the
+  proposing conversation and device as its origin and `created_by` /
+  `updated_by` `agent`; the `memory` event is the usual one, sent as the
+  user, with `by: 'user'` and `proposal: {id, proposed_by: 'agent'}` added.
+  The item closes `decided`. 409 `too_many` leaves the proposal pending.
+- *Decline* / *Keep it*: nothing changes; the item closes `decided`. Closing
+  the item by hand is the same "no".
+- 200 `{item, comment, proposal}`; 409 `conflict` when the proposal is no
+  longer pending; 400 `unknown_action` for another label. The tap settles
+  the proposal in one statement that succeeds only while it is still
+  `pending` and still bound to the tapped item, so of a tap and a
+  replacement (or two taps) exactly one takes effect.
+
+A proposal nobody answers **lapses after 7 days**: the sweep marks it
+`expired` and closes the item `cancelled`.
+
+**One write.** A settlement and the close of its item are one transaction
+— for a tap, a replacement and an expiry alike — so an item is never left
+open on a proposal that is no longer pending, and a tap whose write fails
+leaves the question as it was. A sweep's expiries are all-or-nothing. The
+markers and the proposer's event follow the commit; the row records when
+the proposer was told, and each sweep makes good whatever a settled
+proposal is still owed (an item still open, a proposer not yet told) for a
+day after the settlement.
+
+**Telling the proposer.** Every outcome appends a `memory_proposal` event
+to the proposing conversation, sender `journal`:
+
+```json
+{ "type": "memory_proposal", "sender": "journal",
+  "payload": { "proposal_id": "mp_…", "name": "avoid-opal", "action": "save" | "delete",
+    "outcome": "approved" | "declined" | "replaced" | "expired" | "stale", "item": { "id": "it_…", "num": 41 } } }
+```
+
+It carries the name, never the memory's text. A bridge with the proposals
+update turns it into a turn for the session; `memory_proposal` is not a
+`MESSAGE_TYPES` entry, not an `AGENT_PUBLISH_TYPES` member, never pushes or
+wakes, and a client or bridge that predates it ignores the type. A proposal
+made with no `convo_id` has no conversation to tell.
 
 ### Consent approval (`/consent/pending`, `/consent/answer`)
 
@@ -3388,7 +3529,9 @@ A **protected** box (`devices.protected`, see *Approval keys (step-up)* →
 *Protected boxes*) is user-only too, for chats, spawns and transfers alike,
 and once the account has an approval key an ask aimed at one adds
 `step_up: true` and the `subject` the user's signature covers to its
-`GET /consent/pending` row (absent otherwise).
+`GET /consent/pending` row (absent otherwise). A memory save or delete by an
+agent on a user-only or protected box is always a proposal the user answers
+on a tracker item (*Memories* → *Memory proposals*).
 
 **What an answer does** is exactly what the tap does — one code path
 (`src/consent-answer.js`) behind `/agent-chat/answer`, `/agent-spawn/answer`

@@ -22,6 +22,7 @@ import { expireInviteAsks, onInviteAskExpired } from './federation-invite-asks.j
 import { expireGrantAsks } from './grants.js'
 import { onContactAskExpired, onGrantAskExpired, notifyGrantees } from './sharing-events.js'
 import { sweepExpiredHandovers } from './item-handover-http.js'
+import { sweepMemoryProposals } from './memory-proposals-http.js'
 import { parkPersonRoom, linkOfRoom, isGuestRoom, onGuestAgentAnswer, onGuestInviteExpired, expireSessionShareAsks, LIVE_ROOM_STATES } from './person-rooms.js'
 import { parkTalk } from './talk-requests.js'
 import { fedRoomsOf, fedLinked, isFedGuestRoom } from './federation-rooms.js'
@@ -439,6 +440,12 @@ export function attachWs({
         sweepExpiredHandovers({ db, hub, waker })
       } catch (err) {
         console.error('handover: expiry sweep failed', err)
+      }
+      // Memory proposals nobody answered in 7 days (src/memory-proposals.js).
+      try {
+        sweepMemoryProposals({ db, hub, pushPipeline })
+      } catch (err) {
+        console.error('memory proposals: expiry sweep failed', err)
       }
       // Stranded-'approved' recovery (see spawns.js expireApproved's doc
       // comment): a row a claimApprove won but whose orchestration never

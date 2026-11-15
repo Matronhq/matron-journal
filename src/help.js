@@ -217,7 +217,19 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   updated \`{memory}\`. The same name overwrites — the whole memory, so send
   the body back when updating. 409 \`too_many\` at 200 memories. \`DELETE /memories/:name\` →
   200 \`{memory}\`. Every change lands as a quiet \`memory\` event on your
-  conversation and on the Coordinator's.
+  conversation and on the Coordinator's. An agent's save or delete applies
+  at once only in a turn the user started in that conversation in the last
+  30 minutes (their message, or their reply or tap on one of its items):
+  send \`causes\` (the turn's causes, as on a spawn ask) with \`convo_id\`,
+  on DELETE in a JSON body. Anything else, and every write from a
+  user-only or protected box, answers 202 \`{pending: 'owner', proposal,
+  item: {id, num}}\`: nothing changed, the user was asked on that item, and
+  the outcome arrives later as a \`memory_proposal\` event (\`outcome\`:
+  approved|declined|replaced|expired|stale — stale: the memory changed
+  before the user answered, propose again). Do not retry: a second write for
+  the same name replaces the first with a new item. 409 \`blocked_by:
+  'too_many_asks'\` when 10 from your conversation (50 for the user)
+  already wait.
 - \`GET /routines\` → \`{routines}\` — the user's Coordinator routines: a
   prompt the journal fires into the Coordinator conversation on a
   \`schedule\` (5-field cron in \`tz\`) or when a \`trigger\` trips
