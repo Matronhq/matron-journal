@@ -160,14 +160,15 @@ test("Codex's weekly meter comes from a session's status and is filed under the 
   assert.deepEqual(out.accounts[0].meters.map((m) => [m.id, m.windows[0].unused]), [['codex:codex:secondary', 88]])
 })
 
-test('a box that takes over a removed box\'s id does not inherit its history', async () => {
+test('a removed box\'s history is kept under no box\'s name, apart from a new box\'s', async () => {
   const { db, alice, b, report } = await setup()
   report(b, R0 - D, [week(30, R0)], null)
   recordSessionUsage(db, { userId: alice.id, deviceId: b.deviceId, now: R0 - D, status: { limits: { as_of: R0 - D, lines: [{ id: 'codex:codex:secondary', label: 'Codex · Weekly', percent: 5, resets_at: iso(R0) }] } } })
-  // box-b held the highest id: removing it frees that id for the next box.
+  // A removed box's id is never handed out again, so the next box starts
+  // its own history.
   db.prepare('DELETE FROM devices WHERE id=?').run(b.deviceId)
   const c = createAgent(db, alice.id, 'box-c')
-  assert.equal(c.deviceId, b.deviceId)
+  assert.notEqual(c.deviceId, b.deviceId)
   db.prepare('UPDATE devices SET created_at=? WHERE id=?').run(R0 - 12 * H, c.deviceId)
   report(c, R0 - H, [week(80, R0)], null)
   const out = readUsageHistory(db, alice.id, { now: R0 + H })
