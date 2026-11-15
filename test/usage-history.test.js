@@ -106,6 +106,18 @@ test('an untouched week (0% with no reset time) counts once the weekly rhythm is
   assert.equal(m.average_unused, 83)
 })
 
+test('a late old-week reading leaves the new week\'s hourly sample alone', async () => {
+  const { db, alice, a, b, report } = await setup()
+  // Two readings in one hour, either side of a reset twenty minutes in:
+  // the new week's first, then the old week's arriving late.
+  const m = 60000
+  const R2 = R0
+  report(a, R2 + 30 * m, [week(3, R2 + W + 20 * m)])
+  report(b, R2 + 5 * m, [week(90, R2 + 20 * m)])
+  assert.deepEqual(db.prepare('SELECT percent, reset_at FROM usage_samples WHERE user_id=? AND hour=?').all(alice.id, R2),
+    [{ percent: 3, reset_at: R2 + W }])
+})
+
 test('readings that say nothing about a week are dropped', async () => {
   const { db, alice, a, report } = await setup()
   // Taken after its own reset: last week's text.

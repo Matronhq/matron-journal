@@ -128,7 +128,9 @@ function recordBlock(db, { userId, deviceId, agent, email, limits, now }) {
     db.prepare(
       `INSERT INTO usage_samples(user_id, account_key, line_id, hour, percent, reset_at) VALUES (?,?,?,?,?,?)
        ON CONFLICT(user_id, account_key, line_id, hour) DO UPDATE SET
-         percent = CASE WHEN excluded.reset_at > reset_at THEN excluded.percent ELSE MAX(percent, excluded.percent) END,
+         percent = CASE WHEN excluded.reset_at > reset_at THEN excluded.percent
+                        WHEN excluded.reset_at < reset_at THEN percent
+                        ELSE MAX(percent, excluded.percent) END,
          reset_at = MAX(reset_at, excluded.reset_at)`
     ).run(userId, accountKey, l.id, hour, percent, resetAt)
     written++
