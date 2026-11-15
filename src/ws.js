@@ -41,6 +41,7 @@ import { emitMarker } from './items-http.js'
 import { withdrawForQueuedCancel } from './withdrawn-comments.js'
 import { getMission } from './missions.js'
 import { sanitizeConvoStatus, upsertConvoStatus } from './convo-status.js'
+import { recordBoxUsage, recordSessionUsage } from './usage-history.js'
 import { validateSessionControl, authorizeSessionControl, sessionControlResultFrame, carryOnUserOnlyRefused, WHY_CARRY_ON_USER_ONLY } from './session-control.js'
 import { validRanges, addSeenRanges, markDeviceUsesRanges, legacyReadAsSeen, markItemSeen } from './seen.js'
 import { panicLock, isPanicLocked, panicHelloField, panicAnnounced, panicOnFrame, PANIC_OFF_FRAME, announcePanicClears, clientAuthDead, refuseLockedClient, isFrozenDevice, signOutLockedClient, lockedError, closeLockedSocket, closeFrozenSocket, markPanicTold, ACCOUNT_LOCKED } from './panic.js'
@@ -2569,6 +2570,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!status) return fail('bad_request', 'no valid status block')
         const reportedAt = Date.now()
         upsertDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt })
+        // The same reading, filed in the usage history (best effort: a
+        // failed write must not cost the live report).
+        try { recordBoxUsage(db, { userId: conn.userId, deviceId: conn.deviceId, status, now: reportedAt }) }
+        catch (e) { console.warn(`box_status: usage history write failed: ${e.message}`) }
         hub.sendToClients(conn.userId, { kind: 'box_status', device_id: conn.deviceId, reported_at: reportedAt, ...status })
         break
       }
@@ -2682,6 +2687,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (persisted) {
           try { upsertConvoStatus(db, { userId: conn.userId, convoId: msg.convo_id, status: persisted, reportedAt }) }
           catch (e) { console.warn(`status: persist failed for ${msg.convo_id}: ${e.message}`) }
+          // Codex's weekly meters only arrive on a session's status.
+          try { recordSessionUsage(db, { userId: conn.userId, deviceId: conn.deviceId, status: persisted, now: reportedAt }) }
+          catch (e) { console.warn(`status: usage history write failed: ${e.message}`) }
         }
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id, status: msg.status,
