@@ -97,11 +97,14 @@ const AGENT_PUBLISH_TYPES = new Set([
 // so should start a joined peer whose box is asleep. Status, streams,
 // summaries and prompts are the publishing agent's own bookkeeping.
 const ROOM_WAKE_PUBLISH_TYPES = new Set(['text', 'file', 'image'])
-// A plain `file` frame from an agent into a room would skip the user's
-// approval card. A file reaches a room only through a transfer
-// (POST /transfers): the journal writes the room's `file` event itself on
-// release (transfer-consent.js), never through publish or finalize.
-const ROOM_FILE_REFUSAL = 'a file reaches a room only through an approved file transfer (POST /transfers), not a plain file frame'
+// A plain `file` or `image` frame from an agent into a room would skip the
+// user's approval card (nothing checks that an `image` blob is an image). A
+// file reaches a room only through a transfer (POST /transfers): the journal
+// writes the room's `file` event itself on release (transfer-consent.js),
+// never through publish or finalize.
+const ROOM_FILE_TYPES = new Set(['file', 'image'])
+const ROOM_FILE_REFUSAL = 'a file or image reaches a room only through an approved file transfer (POST /transfers), not a plain file or image frame'
+const PERSON_FILE_REFUSAL = 'files and images do not cross to another person'
 
 // activity op (typing/tool-use indicators, spec §6 ephemeral): the only
 // states a bridge may broadcast. Anything else is bad_request.
@@ -1054,6 +1057,13 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
     if (isGuestRoom(db, roomId) || fedLinked(db, roomId)) return true
     const hit = linkOfRoom(db, roomId)
     return !!hit && LIVE_ROOM_STATES.includes(hit.link.state)
+  }
+  // The detail to refuse an agent's file/image frame into `convoId` with, or
+  // null when the frame may go on. Shared by publish and finalize.
+  const roomFileRefusal = (type, convoId) => {
+    if (!ROOM_FILE_TYPES.has(type)) return null
+    if (personLinked(convoId)) return PERSON_FILE_REFUSAL
+    return hasParticipants(db, convoId) ? ROOM_FILE_REFUSAL : null
   }
   // After an append into a room joined to another person's: their copy.
   const copyOut = (args, r) => {
@@ -2446,10 +2456,8 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) {
           return fail('forbidden', 'not a participant of this conversation')
         }
-        if (msg.type === 'file' && hasParticipants(db, msg.convo_id)) return fail('bad_request', ROOM_FILE_REFUSAL)
-        if (msg.type !== 'text' && ROOM_WAKE_PUBLISH_TYPES.has(msg.type) && personLinked(msg.convo_id)) {
-          return fail('bad_request', 'files and images do not cross to another person')
-        }
+        const publishRefusal = roomFileRefusal(msg.type, msg.convo_id)
+        if (publishRefusal) return fail('bad_request', publishRefusal)
         const publishArgs = {
           userId: conn.userId, convoId: msg.convo_id,
           sender: `agent:${conn.name}`, type: msg.type, payload: msg.payload,
@@ -2719,7 +2727,8 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) {
           return fail('forbidden', 'not a participant of this conversation')
         }
-        if (type === 'file' && hasParticipants(db, msg.convo_id)) return fail('bad_request', ROOM_FILE_REFUSAL)
+        const finalizeRefusal = roomFileRefusal(type, msg.convo_id)
+        if (finalizeRefusal) return fail('bad_request', finalizeRefusal)
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `agent:${conn.name}`, type, payload: msg.payload,
