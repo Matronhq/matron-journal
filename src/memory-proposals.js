@@ -13,11 +13,18 @@
 //   declined  — the user tapped the other button, or closed the item.
 //   replaced  — a newer proposal for the same name took its place.
 //   expired   — nobody answered within PROPOSAL_TTL_MS.
+//   stale     — the user approved it, but the memory it was made against had
+//               changed or gone since (or one had appeared where there was
+//               none): nothing was applied.
 //
-// The row holds the change exactly as proposed. What the user reads on the
-// item is rendered from it, and what an approval applies is read from it, so
-// the two cannot differ.
+// The row holds the change exactly as it will be applied — the scope and
+// type a save ends up with included, fixed when it is recorded — and which
+// memory it was made against (memory_id, base_updated_at). What the user
+// reads on the item is rendered from the row, an approval applies the row,
+// and it applies only while the memory is still as it was then, so what was
+// shown and what is done cannot differ.
 import { randomBytes } from 'node:crypto'
+import { getMemory, DEFAULT_SCOPE, DEFAULT_TYPE } from './memories.js'
 
 export const PROPOSAL_TTL_MS = 7 * 24 * 60 * 60 * 1000
 export const PROPOSAL_ACTIONS = ['save', 'delete']
@@ -39,6 +46,7 @@ const rowToProposal = (r) => (r ? {
   description: r.description, body: r.body, type: r.type, scope: r.scope, memory_id: r.memory_id,
   from_device_id: r.from_device_id, from_convo_id: r.from_convo_id, item_id: r.item_id,
   state: r.state, created_at: r.created_at, updated_at: r.updated_at, expires_at: r.expires_at,
+  base_updated_at: r.base_updated_at ?? null, told_at: r.told_at ?? null,
 } : null)
 
 export function getProposal(db, userId, id) {
@@ -55,8 +63,11 @@ export function proposalOfItem(db, userId, itemId) {
 }
 
 // Record a proposal. `fields` is {description, body, type, scope} for a save
-// (type and scope undefined = keep or default, as on a direct write) and
-// ignored for a delete; `memoryId` is the memory a delete names.
+// and ignored for a delete; `memoryId` is the memory a delete names. The
+// memory the change is made against is read here, in the same write: a
+// save's type and scope are settled now (the proposed value, else that
+// memory's, else the default), and its id and updated_at are kept so an
+// approval can tell whether it still stands (isStale).
 // Returns { proposal, replaced }: `replaced` is the pending proposal for
 // this name that the new one set aside, whoever made it, or null. The caller
 // files a new item, closes the older one's and tells its conversation.
@@ -64,9 +75,10 @@ export function proposalOfItem(db, userId, itemId) {
 export function recordProposal(db, { userId, name, action, fields = {}, memoryId = null, fromDeviceId, fromConvoId = null, now = Date.now() }) {
   return db.transaction(() => {
     const save = action === 'save'
+    const base = getMemory(db, userId, save ? name : memoryId)
     const vals = {
       description: save ? fields.description : '', body: save ? (fields.body ?? '') : '',
-      type: save ? (fields.type ?? null) : null, scope: save ? (fields.scope ?? null) : null,
+      type: save ? (fields.type ?? base?.type ?? DEFAULT_TYPE) : null, scope: save ? (fields.scope ?? base?.scope ?? DEFAULT_SCOPE) : null,
     }
     const old = pendingProposalFor(db, userId, name)
     if (old) {
@@ -80,9 +92,9 @@ export function recordProposal(db, { userId, name, action, fields = {}, memoryId
       if (all >= MAX_PENDING_PER_USER) throw new Error('too_many_asks')
     }
     const id = newId()
-    db.prepare(`INSERT INTO memory_proposals(id, user_id, name, action, description, body, type, scope, memory_id, from_device_id, from_convo_id, state, created_at, updated_at, expires_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?)`)
-      .run(id, userId, name, action, vals.description, vals.body, vals.type, vals.scope, memoryId, fromDeviceId, fromConvoId, now, now, now + PROPOSAL_TTL_MS)
+    db.prepare(`INSERT INTO memory_proposals(id, user_id, name, action, description, body, type, scope, memory_id, base_updated_at, from_device_id, from_convo_id, state, created_at, updated_at, expires_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?)`)
+      .run(id, userId, name, action, vals.description, vals.body, vals.type, vals.scope, base?.id ?? null, base?.updated_at ?? null, fromDeviceId, fromConvoId, now, now, now + PROPOSAL_TTL_MS)
     return { proposal: getProposal(db, userId, id), replaced: old ? { ...old, state: 'replaced' } : null }
   })()
 }
@@ -105,15 +117,35 @@ export function settleProposal(db, { userId, id, state, itemId = null, now = Dat
   return r.changes ? getProposal(db, userId, id) : null
 }
 
-// The sweep: proposals nobody answered in time, each flipped to 'expired'.
+// Is the memory no longer as it was when the proposal was recorded? A save:
+// the name must still hold the same memory with the same updated_at, or
+// still hold none. A delete: the memory must still be there, unchanged.
+export function isStale(db, p) {
+  const now = getMemory(db, p.user_id, p.action === 'delete' ? (p.memory_id ?? '') : p.name)
+  if (p.action === 'delete' && !now) return true
+  return (now?.id ?? null) !== (p.memory_id ?? null) || (now?.updated_at ?? null) !== (p.base_updated_at ?? null)
+}
+
+// The sweep: proposals nobody answered in time, flipped to 'expired' in one
+// statement — all of them or none.
 export function expireProposals(db, now = Date.now()) {
-  const rows = db.prepare("SELECT id, user_id FROM memory_proposals WHERE state='pending' AND expires_at <= ?").all(now)
-  const out = []
-  for (const r of rows) {
-    const p = settleProposal(db, { userId: r.user_id, id: r.id, state: 'expired', now })
-    if (p) out.push(p)
-  }
-  return out
+  return db.prepare("UPDATE memory_proposals SET state='expired', updated_at=? WHERE state='pending' AND expires_at <= ? RETURNING *").all(now, now).map(rowToProposal)
+}
+
+// The proposing conversation has been told how it ended (or there is none).
+export function markTold(db, id, now = Date.now()) {
+  db.prepare('UPDATE memory_proposals SET told_at=? WHERE id=? AND told_at IS NULL').run(now, id)
+}
+
+// Settled proposals with something still owed: the proposer not told, or the
+// item still open. Looked for only for FOLLOW_UP_MS after the settlement; a
+// conversation that is gone is not retried for ever.
+export const FOLLOW_UP_MS = 24 * 60 * 60 * 1000
+export function owedFollowUps(db, now = Date.now()) {
+  return db.prepare(`SELECT p.* FROM memory_proposals p
+    WHERE p.state != 'pending' AND p.updated_at > ?
+      AND (p.told_at IS NULL OR EXISTS (SELECT 1 FROM items i WHERE i.id = p.item_id AND i.state = 'open'))
+    ORDER BY p.updated_at, p.rowid`).all(now - FOLLOW_UP_MS).map(rowToProposal)
 }
 
 // Settled rows are kept a while for the record, then dropped.

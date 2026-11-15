@@ -3280,7 +3280,11 @@ named none): kind `question`, awaiting the user, top of the open list, label
 and `['Delete it', 'Keep it']` for a delete. Its body names the proposing box
 and conversation, the memory's name, scope and type, the proposed
 description and body, and for an update the current description beside it;
-a delete shows the memory as it stands. The proposed text is the agent's
+a delete shows the memory as it stands. The scope and type shown for a save
+are the ones it will have: the proposed value, else the memory's at that
+moment, else the default — fixed and stored when the proposal is recorded,
+and applied as stored. The proposal also records which memory it was made
+against and that memory's `updated_at` (or that there was none). The proposed text is the agent's
 words: each piece is shown verbatim inside its own fenced block (control
 characters dropped, a line that starts with a fence kept from closing it),
 box and conversation names are flattened to plain words, and the buttons
@@ -3310,7 +3314,14 @@ replaces a pending one for the same name adds nothing and is never refused.
 an agent's `action` is 403 and the item is a 404 to it anyway) is the
 answer, applied by the journal:
 
-- *Save it* / *Delete it*: the change is applied exactly as stored, through
+- *Save it* / *Delete it*, when the memory has **changed since the question
+  was filed** — updated or deleted by anyone, or created where there was
+  none — applies nothing: what the item shows is no longer what would
+  happen. The proposal settles as `stale`, the item closes `cancelled` with
+  a line saying so, the proposer is told and may propose again, and the tap
+  answers **409** `{error:'conflict', blocked_by:'memory_changed', item,
+  comment, proposal}`. A decline is unaffected.
+- *Save it* / *Delete it* otherwise: the change is applied exactly as stored, through
   the same write a direct `PUT`/`DELETE` makes. A saved memory records the
   proposing conversation and device as its origin and `created_by` /
   `updated_by` `agent`; the `memory` event is the usual one, sent as the
@@ -3327,13 +3338,22 @@ answer, applied by the journal:
 A proposal nobody answers **lapses after 7 days**: the sweep marks it
 `expired` and closes the item `cancelled`.
 
+**One write.** A settlement and the close of its item are one transaction
+— for a tap, a replacement and an expiry alike — so an item is never left
+open on a proposal that is no longer pending, and a tap whose write fails
+leaves the question as it was. A sweep's expiries are all-or-nothing. The
+markers and the proposer's event follow the commit; the row records when
+the proposer was told, and each sweep makes good whatever a settled
+proposal is still owed (an item still open, a proposer not yet told) for a
+day after the settlement.
+
 **Telling the proposer.** Every outcome appends a `memory_proposal` event
 to the proposing conversation, sender `journal`:
 
 ```json
 { "type": "memory_proposal", "sender": "journal",
   "payload": { "proposal_id": "mp_…", "name": "avoid-opal", "action": "save" | "delete",
-    "outcome": "approved" | "declined" | "replaced" | "expired", "item": { "id": "it_…", "num": 41 } } }
+    "outcome": "approved" | "declined" | "replaced" | "expired" | "stale", "item": { "id": "it_…", "num": 41 } } }
 ```
 
 It carries the name, never the memory's text. A bridge with the proposals

@@ -1881,8 +1881,13 @@ export function openDb(path) {
   // Memory proposals (src/memory-proposals.js): a memory save or delete an
   // agent asked for that waits for the user's answer on a tracker item
   // (item_id). The row holds the change exactly as proposed. At most one
-  // pending proposal per (user, memory name). type and scope are NULL when
-  // the save named none (keep the stored value, or the default on a create).
+  // pending proposal per (user, memory name). For a save, type and scope are
+  // the ones the memory will have (the proposed value, else the memory's at
+  // proposal time, else the default), fixed when the proposal is recorded.
+  // memory_id and base_updated_at are the memory the proposal was made
+  // against and its updated_at then (both NULL: there was none); an
+  // approval applies only while that still holds. told_at is when the
+  // proposing conversation was told the outcome (NULL: not yet).
   db.exec(`CREATE TABLE IF NOT EXISTS memory_proposals(
     id             TEXT PRIMARY KEY,
     user_id        INTEGER NOT NULL,
@@ -1896,11 +1901,16 @@ export function openDb(path) {
     from_device_id INTEGER NOT NULL,
     from_convo_id  TEXT,
     item_id        TEXT,
-    state          TEXT NOT NULL CHECK(state IN ('pending','approved','declined','replaced','expired')),
+    state          TEXT NOT NULL CHECK(state IN ('pending','approved','declined','replaced','expired','stale')),
     created_at     INTEGER NOT NULL,
     updated_at     INTEGER NOT NULL,
-    expires_at     INTEGER NOT NULL
+    expires_at     INTEGER NOT NULL,
+    base_updated_at INTEGER,
+    told_at        INTEGER
   )`)
+  const proposalCols = db.prepare('PRAGMA table_info(memory_proposals)').all()
+  if (!proposalCols.some((c) => c.name === 'base_updated_at')) db.exec('ALTER TABLE memory_proposals ADD COLUMN base_updated_at INTEGER')
+  if (!proposalCols.some((c) => c.name === 'told_at')) db.exec('ALTER TABLE memory_proposals ADD COLUMN told_at INTEGER')
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_proposals_pending ON memory_proposals(user_id, name) WHERE state='pending'")
   db.exec('CREATE INDEX IF NOT EXISTS idx_memory_proposals_state ON memory_proposals(state, expires_at)')
   db.exec('CREATE INDEX IF NOT EXISTS idx_memory_proposals_item ON memory_proposals(item_id)')

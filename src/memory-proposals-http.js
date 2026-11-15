@@ -36,10 +36,10 @@ import { getCoordinatorConvoId } from './coordinator.js'
 import { ensurePeopleConvo, PEOPLE_TITLE, PEOPLE_SYSTEM } from './people-convo.js'
 import { sanitizePeerText, plainText as plain, PEER_NAME_CAP } from './peer-text.js'
 import { resolveAskCause } from './ask-cause.js'
-import { getMemory, upsertMemory, deleteMemory, DEFAULT_SCOPE, DEFAULT_TYPE } from './memories.js'
+import { getMemory, upsertMemory, deleteMemory } from './memories.js'
 import { emitMemoryMarker } from './memories-http.js'
 import {
-  recordProposal, setProposalItem, settleProposal, expireProposals, pruneProposals, proposalOfItem, labelsFor,
+  recordProposal, setProposalItem, settleProposal, expireProposals, pruneProposals, proposalOfItem, labelsFor, isStale, markTold, owedFollowUps,
 } from './memory-proposals.js'
 
 export const MEMORY_CONSENT = 'memory'
@@ -89,7 +89,8 @@ const boxName = (db, userId, deviceId) => db.prepare('SELECT name FROM devices W
 const convoTitle = (db, userId, convoId) => (convoId ? db.prepare('SELECT title FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)?.title ?? '' : '')
 
 // Title, body and buttons of the question, from the proposal row and the
-// memory as it stands now.
+// memory it was made against, read in the write that recorded it. The scope
+// and type shown are the row's own: the ones an approval applies.
 export function proposalItemFields(db, p) {
   const box = t(boxName(db, p.user_id, p.from_device_id), PEER_NAME_CAP)
   const title = t(convoTitle(db, p.user_id, p.from_convo_id))
@@ -109,8 +110,8 @@ export function proposalItemFields(db, p) {
   } else {
     lines.push(`**${box}** proposes to ${current ? 'change' : 'save'} a memory${where}.`, '')
     lines.push(`- **Name:** \`${p.name}\``)
-    lines.push(`- **Scope:** ${p.scope ?? current?.scope ?? DEFAULT_SCOPE}${current && p.scope && p.scope !== current.scope ? ` (now ${current.scope})` : ''}`)
-    lines.push(`- **Type:** ${p.type ?? current?.type ?? DEFAULT_TYPE}${current && p.type && p.type !== current.type ? ` (now ${current.type})` : ''}`)
+    lines.push(`- **Scope:** ${p.scope}${current && p.scope !== current.scope ? ` (now ${current.scope})` : ''}`)
+    lines.push(`- **Type:** ${p.type}${current && p.type !== current.type ? ` (now ${current.type})` : ''}`)
     lines.push('', '**Proposed description:**', '', fencedBlock(p.description))
     if (current) lines.push('', '**Current description:**', '', fencedBlock(current.description))
     lines.push('', '**Proposed body:**', '', fencedBlock(p.body || '(empty)'))
@@ -148,24 +149,29 @@ function itemMarker({ db, hub, pushPipeline }, { userId, sender, item, action, b
   })
 }
 
-// What the proposing conversation hears. `outcome`: approved | declined |
-// replaced | expired. Nothing of the memory's text travels: the name only.
-function tellProposer({ db, hub }, p, outcome, item) {
-  if (!p.from_convo_id) return
-  safely('outcome event', () => appendAndBroadcast(db, hub, {
+// What the proposing conversation hears. `outcome` is the state the proposal
+// settled in: approved | declined | replaced | expired | stale. Nothing of
+// the memory's text travels: the name only. The row is marked told once the
+// event is written (at once when there is no conversation to tell); one that
+// could not be written is tried again by the sweep.
+function tellProposer({ db, hub }, p, item) {
+  const told = !p.from_convo_id || safely('outcome event', () => appendAndBroadcast(db, hub, {
     userId: p.user_id, convoId: p.from_convo_id, sender: JOURNAL, type: MEMORY_PROPOSAL_EVENT_TYPE,
-    payload: { proposal_id: p.id, name: p.name, action: p.action, outcome, item: item ? { id: item.id, num: item.num } : null },
+    payload: { proposal_id: p.id, name: p.name, action: p.action, outcome: p.state, item: item ? { id: item.id, num: item.num } : null },
   }))
+  if (told) safely('told mark', () => markTold(db, p.id))
 }
 
-function closeMirror(ctx, p, { resolution, author, deviceId = 0, comment, sender = JOURNAL }) {
-  if (!p.item_id) return null
-  return safely('item close', () => {
-    const out = closeItem(ctx.db, { userId: p.user_id, itemId: p.item_id, resolution, author, deviceId, comment })
-    if (out) itemMarker(ctx, { userId: p.user_id, sender, item: out.item, action: 'closed', by: author, comment: out.comment })
-    return out
-  })
+// The thread line an item closes with, by how its proposal ended. A close is
+// a database write only (closeItem), so it goes in the same transaction as
+// the settlement; the marker follows the commit (closedMarker).
+const STALE_LINE = 'Not applied: the memory changed after this was asked, so what is shown here is no longer what would happen. Nothing was changed; the agent can propose it again.'
+const EXPIRED_LINE = 'Lapsed: no answer within 7 days. Nothing was changed.'
+function closedMarker(ctx, p, out, { by = 'agent', sender = JOURNAL } = {}) {
+  if (out) itemMarker(ctx, { userId: p.user_id, sender, item: out.item, action: 'closed', by, comment: out.comment })
 }
+const closeAs = (db, p, { resolution, author = 'agent', deviceId = 0, comment }) =>
+  (p.item_id ? closeItem(db, { userId: p.user_id, itemId: p.item_id, resolution, author, deviceId, comment }) : null)
 
 const view = (p) => ({ id: p.id, name: p.name, action: p.action, state: p.state, expires_at: p.expires_at })
 
@@ -194,7 +200,7 @@ export function fileProposal(ctx, who, { name, action, fields, memoryId = null, 
   })()
   if (out.replaced) {
     if (out.closed) itemMarker(ctx, { userId, sender: JOURNAL, item: out.closed.item, action: 'closed', by: 'agent', comment: out.closed.comment })
-    tellProposer(ctx, out.replaced, 'replaced', out.closed?.item ?? null)
+    tellProposer(ctx, out.replaced, out.closed?.item ?? null)
   }
   itemMarker(ctx, { userId, sender, item: out.item, action: 'created', by: 'agent', push: true })
   return { proposal: out.proposal, item: out.item }
@@ -208,21 +214,19 @@ export function answerPending(res, { proposal, item }) {
 
 // --- The user's answer -------------------------------------------------------
 
-// Apply an approved proposal as a direct write would have: the memory records
-// the proposing conversation and device as its origin and the agent as its
-// author; the marker says the user decided it.
+// Apply an approved proposal as a direct write would have, with exactly the
+// row's fields: the memory records the proposing conversation and device as
+// its origin and the agent as its author; the marker says the user decided.
 // → { line, marker }: the thread line, and the marker to emit once the
-// write has committed (null when there was nothing left to delete).
+// write has committed.
 function applyProposal(db, p) {
   const extra = { proposal: { id: p.id, proposed_by: 'agent' } }
   if (p.action === 'delete') {
-    const gone = p.memory_id ? deleteMemory(db, p.user_id, p.memory_id) : null
-    return gone
-      ? { line: 'Deleted.', marker: { memory: gone, action: 'deleted', created: false, writerConvoId: p.from_convo_id, extra } }
-      : { line: 'That memory was already gone; nothing to delete.', marker: null }
+    const gone = deleteMemory(db, p.user_id, p.memory_id)
+    return { line: 'Deleted.', marker: { memory: gone, action: 'deleted', created: false, writerConvoId: p.from_convo_id, extra } }
   }
   const out = upsertMemory(db, {
-    userId: p.user_id, name: p.name, description: p.description, body: p.body, type: p.type ?? undefined, scope: p.scope ?? undefined,
+    userId: p.user_id, name: p.name, description: p.description, body: p.body, type: p.type, scope: p.scope,
     originConvoId: p.from_convo_id, originDeviceId: p.from_device_id, by: 'agent',
   })
   return {
@@ -234,6 +238,11 @@ function applyProposal(db, p) {
 // A tap on a memory proposal's item (POST /items/:id/comments {action}) IS
 // the answer. Client only: items-http refuses an agent's `action` before it
 // gets here, and no agent can see the item at all.
+//
+// One write does all of it: the proposal settles, the memory changes, the
+// item closes. An approval of a proposal whose memory is no longer as it was
+// when the question was filed (isStale) applies nothing: the proposal
+// settles as `stale`, the item closes saying so, and the answer is 409.
 export function handleMemoryProposalTap(ctx, res, who, item, action, replyTo = null) {
   const { db } = ctx
   if (who.kind === 'agent') { json(res, 403, { error: 'forbidden' }); return true }
@@ -241,12 +250,21 @@ export function handleMemoryProposalTap(ctx, res, who, item, action, replyTo = n
   const p = proposalOfItem(db, who.userId, item.id)
   if (!p || p.state !== 'pending' || item.state !== 'open') return conflict(res)
   const approve = action === labelsFor(p.action)[0]
-  let settled
+  let settled = null
   let applied = null
+  let closed = null
   try {
     db.transaction(() => {
-      settled = settleProposal(db, { userId: who.userId, id: p.id, itemId: item.id, state: approve ? 'approved' : 'declined' })
-      if (settled && approve) applied = applyProposal(db, settled)
+      const state = !approve ? 'declined' : (isStale(db, p) ? 'stale' : 'approved')
+      settled = settleProposal(db, { userId: who.userId, id: p.id, itemId: item.id, state })
+      if (!settled) return
+      if (state === 'approved') applied = applyProposal(db, settled)
+      closed = state === 'stale'
+        ? closeAs(db, settled, { resolution: 'cancelled', comment: STALE_LINE })
+        : closeAs(db, settled, {
+          resolution: 'decided', author: 'user', deviceId: who.deviceId,
+          comment: applied ? applied.line : (settled.action === 'delete' ? 'Kept: the memory was not deleted.' : 'Declined: nothing was saved.'),
+        })
     })()
   } catch (err) {
     // At the cap: the proposal stays for the user to answer once there is room.
@@ -254,13 +272,13 @@ export function handleMemoryProposalTap(ctx, res, who, item, action, replyTo = n
     throw err
   }
   if (!settled) return conflict(res)
-  if (applied?.marker) emitMemoryMarker(ctx, who, applied.marker)
-  const closed = closeMirror(ctx, settled, {
-    resolution: 'decided', author: 'user', deviceId: who.deviceId, sender: senderOf(db, who),
-    comment: approve ? applied.line : (settled.action === 'delete' ? 'Kept: the memory was not deleted.' : 'Declined: nothing was saved.'),
-  })
-  tellProposer(ctx, settled, approve ? 'approved' : 'declined', closed?.item ?? item)
-  json(res, 200, { item: closed?.item ?? getItem(db, who.userId, item.id) ?? item, comment: closed?.comment ?? null, proposal: view(settled) })
+  if (applied) emitMemoryMarker(ctx, who, applied.marker)
+  const stale = settled.state === 'stale'
+  closedMarker(ctx, settled, closed, stale ? {} : { by: 'user', sender: senderOf(db, who) })
+  tellProposer(ctx, settled, closed?.item ?? item)
+  const body = { item: closed?.item ?? getItem(db, who.userId, item.id) ?? item, comment: closed?.comment ?? null, proposal: view(settled) }
+  if (stale) json(res, 409, { error: 'conflict', blocked_by: 'memory_changed', ...body })
+  else json(res, 200, body)
   return true
 }
 
@@ -272,7 +290,7 @@ export function declineOnClose(ctx, userId, item) {
     const p = proposalOfItem(ctx.db, userId, item.id)
     if (!p || p.state !== 'pending') return
     const settled = settleProposal(ctx.db, { userId: p.user_id, id: p.id, itemId: item.id, state: 'declined' })
-    if (settled) tellProposer(ctx, settled, 'declined', item)
+    if (settled) tellProposer(ctx, settled, item)
   })
 }
 
@@ -284,11 +302,27 @@ export function proposerOwnsMirror(db, item) {
   return !!p && p.from_convo_id != null && p.from_convo_id === item.origin_convo_id
 }
 
-// The sweep's half (src/ws.js): proposals nobody answered in 7 days.
+// The sweep's half (src/ws.js). Proposals nobody answered in 7 days expire
+// and their items close in one write, all of them or none. Then whatever a
+// settled proposal is still owed is made good: an item left open is closed,
+// a proposer not yet told is told. Each of those is tried again on the next
+// sweep until it is done (for a day), so a failure part-way loses nothing.
+const OWED_LINES = {
+  expired: EXPIRED_LINE, stale: STALE_LINE,
+  replaced: 'Set aside: a newer proposal for this memory took its place. Nothing was changed.',
+  approved: 'Approved.', declined: 'Declined: nothing was changed.',
+}
 export function sweepMemoryProposals(ctx, now = Date.now()) {
-  for (const p of expireProposals(ctx.db, now)) {
-    const closed = closeMirror(ctx, p, { resolution: 'cancelled', author: 'agent', comment: 'Lapsed: no answer within 7 days. Nothing was changed.' })
-    tellProposer(ctx, p, 'expired', closed?.item ?? null)
+  const { db } = ctx
+  const expired = db.transaction(() => expireProposals(db, now).map((p) => ({ p, closed: closeAs(db, p, { resolution: 'cancelled', comment: EXPIRED_LINE }) })))()
+  for (const { p, closed } of expired) closedMarker(ctx, p, closed)
+  for (const p of owedFollowUps(db, now)) {
+    safely('follow-up', () => {
+      const decided = p.state === 'approved' || p.state === 'declined'
+      const closed = closeAs(db, p, { resolution: decided ? 'decided' : 'cancelled', comment: OWED_LINES[p.state] ?? '' })
+      closedMarker(ctx, p, closed)
+      if (p.told_at == null) tellProposer(ctx, p, closed?.item ?? (p.item_id ? getItem(db, p.user_id, p.item_id) : null))
+    })
   }
-  pruneProposals(ctx.db, now)
+  pruneProposals(db, now)
 }

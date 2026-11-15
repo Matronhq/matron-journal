@@ -343,11 +343,126 @@ test('a delete is proposed the same way: Delete it / Keep it, the memory shown, 
   assert.deepEqual(outcomes(s), [['c1', 'journal', 'avoid-opal', 'delete', 'declined'], ['c1', 'journal', 'avoid-opal', 'delete', 'approved']])
   // Nothing to propose deleting: 404 as before.
   assert.equal((await del(s, a.token, 'avoid-opal', { convo_id: 'c1' })).status, 404)
-  // A memory deleted while its delete waited: approving finds nothing to do.
-  await put(s, client, 'short-lived', {})
-  const d = await del(s, a.token, 'short-lived', { convo_id: 'c1' })
-  await del(s, client, 'short-lived')
-  assert.equal((await tap(s, client, d.json.item.id, 'Delete it')).status, 200)
+})
+
+const stale = (r) => [r.status, r.json.error, r.json.blocked_by, r.json.proposal?.state, r.json.item?.state, r.json.item?.resolution]
+const STALE = [409, 'conflict', 'memory_changed', 'stale', 'closed', 'cancelled']
+
+test('the scope and type a save will have are fixed when it is proposed, shown on the item, and applied as shown', async (t) => {
+  const { s, a, client } = await fleet(t)
+  await put(s, client, 'release-flow', { scope: 'repo:web-app', type: 'project' })
+  // The proposal names neither: it keeps the memory's, as they are now.
+  const r = await put(s, a.token, 'release-flow', { description: 'The train merges.', convo_id: 'c1' })
+  const row = s.db.prepare('SELECT scope, type, memory_id, base_updated_at FROM memory_proposals WHERE id=?').get(r.json.proposal.id)
+  const before = (await memory(s, client, 'release-flow')).json.memory
+  assert.deepEqual(row, { scope: 'repo:web-app', type: 'project', memory_id: before.id, base_updated_at: before.updated_at })
+  const item = (await s.http(`/items/${r.json.item.id}`, { token: client })).json.item
+  assert.ok(item.body.split('\n').includes('- **Scope:** repo:web-app')); assert.ok(item.body.split('\n').includes('- **Type:** project'))
+  // The memory's scope moves before the answer: approving would no longer do what the item says.
+  await new Promise((done) => setTimeout(done, 5))
+  assert.equal((await put(s, client, 'release-flow', { scope: 'global' })).status, 200)
+  assert.deepEqual(stale(await tap(s, client, r.json.item.id, 'Save it')), STALE)
+  const kept = (await memory(s, client, 'release-flow')).json.memory
+  assert.deepEqual([kept.scope, kept.description], ['global', 'Never use opal.'])
+  assert.deepEqual(outcomes(s), [['c1', 'journal', 'release-flow', 'save', 'stale']])
+  assert.equal((await tap(s, client, r.json.item.id, 'Save it')).status, 409)
+  // Asked again against the memory as it now is, it applies exactly what it shows.
+  const again = await put(s, a.token, 'release-flow', { description: 'The train merges.', convo_id: 'c1' })
+  assert.ok((await s.http(`/items/${again.json.item.id}`, { token: client })).json.item.body.split('\n').includes('- **Scope:** global'))
+  assert.equal((await tap(s, client, again.json.item.id, 'Save it')).status, 200)
+  const done = (await memory(s, client, 'release-flow')).json.memory
+  assert.deepEqual([done.scope, done.type, done.description], ['global', 'project', 'The train merges.'])
+  // A new memory with nothing named gets the defaults, stored and shown.
+  const fresh = await put(s, a.token, 'brand-new', { convo_id: 'c1' })
+  assert.deepEqual(s.db.prepare('SELECT scope, type, memory_id, base_updated_at FROM memory_proposals WHERE id=?').get(fresh.json.proposal.id), { scope: 'global', type: 'feedback', memory_id: null, base_updated_at: null })
+  // A proposed scope that differs from the memory's shows both.
+  const moved = await put(s, a.token, 'release-flow', { scope: 'coordinator', convo_id: 'c2' })
+  assert.ok((await s.http(`/items/${moved.json.item.id}`, { token: client })).json.item.body.split('\n').includes('- **Scope:** coordinator (now global)'))
+})
+
+test('an approval applies only while the memory is as it was when the question was filed', async (t) => {
+  const { s, a, client } = await fleet(t)
+  const tick = () => new Promise((done) => setTimeout(done, 5))
+  // An update whose target was deleted meanwhile.
+  await put(s, client, 'one', {})
+  const upd = await put(s, a.token, 'one', { description: 'Reworded.', convo_id: 'c1' })
+  await del(s, client, 'one')
+  assert.deepEqual(stale(await tap(s, client, upd.json.item.id, 'Save it')), STALE)
+  assert.equal((await memory(s, client, 'one')).status, 404)
+  // A create where a memory of that name appeared meanwhile.
+  const create = await put(s, a.token, 'two', { description: 'From the agent.', convo_id: 'c1' })
+  await put(s, client, 'two', { description: 'From the user.' })
+  assert.deepEqual(stale(await tap(s, client, create.json.item.id, 'Save it')), STALE)
+  assert.equal((await memory(s, client, 'two')).json.memory.description, 'From the user.')
+  // A delete whose target changed, and one whose target went and came back.
+  await put(s, client, 'three', {})
+  const d1 = await del(s, a.token, 'three', { convo_id: 'c1' })
+  await tick(); await put(s, client, 'three', { description: 'Changed since.' })
+  assert.deepEqual(stale(await tap(s, client, d1.json.item.id, 'Delete it')), STALE)
+  assert.equal((await memory(s, client, 'three')).json.memory.description, 'Changed since.')
+  const d2 = await del(s, a.token, 'three', { convo_id: 'c1' })
+  await del(s, client, 'three'); await put(s, client, 'three', {})
+  assert.deepEqual(stale(await tap(s, client, d2.json.item.id, 'Delete it')), STALE)
+  assert.equal((await memory(s, client, 'three')).status, 200)
+  // A delete whose target is simply gone.
+  await put(s, client, 'four', {})
+  const d3 = await del(s, a.token, 'four', { convo_id: 'c1' })
+  await del(s, client, 'four')
+  assert.deepEqual(stale(await tap(s, client, d3.json.item.id, 'Delete it')), STALE)
+  // The item says why, in the journal's voice; the proposer hears `stale` each time.
+  const thread = (await s.http(`/items/${d3.json.item.id}`, { token: client })).json.comments
+  assert.match(thread.at(-1).body, /^Not applied: the memory changed after this was asked/); assert.equal(thread.at(-1).author, 'agent')
+  assert.deepEqual(outcomes(s).map((o) => o[4]), ['stale', 'stale', 'stale', 'stale', 'stale'])
+  assert.equal(events(s, 'memory').filter((e) => e.payload.proposal).length, 0)
+  // Declining a proposal whose memory changed is still just a decline.
+  await put(s, client, 'five', {})
+  const d4 = await del(s, a.token, 'five', { convo_id: 'c1' })
+  await del(s, client, 'five')
+  const no = await tap(s, client, d4.json.item.id, 'Keep it')
+  assert.equal(no.status, 200); assert.equal(no.json.proposal.state, 'declined')
+})
+
+test('settling and closing are one write; expiry is all-or-nothing; what is still owed is made good by the next sweep', async (t) => {
+  const { s, a, client } = await fleet(t)
+  const ctx = { db: s.db, hub: s.hub, pushPipeline: null }
+  const itemState = async (id) => (await s.http(`/items/${id}`, { token: client })).json.item.state
+  const told = () => s.db.prepare('SELECT name, state, told_at IS NOT NULL AS told FROM memory_proposals ORDER BY created_at, rowid').all().map((r) => [r.name, r.state, r.told])
+  // A close that fails takes the settlement back with it: the question stays answerable.
+  const r = await put(s, a.token, 'one', { convo_id: 'c1' })
+  s.db.exec("CREATE TRIGGER no_close BEFORE UPDATE OF state ON items WHEN NEW.state='closed' BEGIN SELECT RAISE(ABORT, 'no close'); END")
+  assert.equal((await tap(s, client, r.json.item.id, 'Save it')).status, 500)
+  assert.deepEqual(told(), [['one', 'pending', 0]]); assert.equal((await memory(s, client, 'one')).status, 404)
+  // The same for expiry: two run out, the close fails, neither is marked.
+  const r2 = await put(s, a.token, 'two', { convo_id: 'c1' })
+  s.db.prepare('UPDATE memory_proposals SET expires_at=?').run(Date.now() - 1000)
+  assert.throws(() => sweepMemoryProposals(ctx), /no close/)
+  assert.deepEqual(told(), [['one', 'pending', 0], ['two', 'pending', 0]])
+  s.db.exec('DROP TRIGGER no_close')
+  sweepMemoryProposals(ctx)
+  assert.deepEqual(told(), [['one', 'expired', 1], ['two', 'expired', 1]])
+  assert.equal(await itemState(r.json.item.id), 'closed'); assert.equal(await itemState(r2.json.item.id), 'closed')
+  assert.deepEqual(outcomes(s).map((o) => [o[2], o[4]]), [['one', 'expired'], ['two', 'expired']])
+  // A settled proposal whose item is somehow still open, and whose proposer was never told.
+  const r3 = await put(s, a.token, 'three', { convo_id: 'c1' })
+  s.db.prepare("UPDATE memory_proposals SET state='expired', updated_at=? WHERE id=?").run(Date.now(), r3.json.proposal.id)
+  assert.equal(await itemState(r3.json.item.id), 'open')
+  sweepMemoryProposals(ctx)
+  assert.equal(await itemState(r3.json.item.id), 'closed')
+  assert.deepEqual(outcomes(s).at(-1).slice(2), ['three', 'save', 'expired'])
+  // Told once: another sweep adds nothing.
+  sweepMemoryProposals(ctx)
+  assert.equal(outcomes(s).length, 3)
+  // A proposer that cannot be told yet is tried again, not forgotten.
+  const r4 = await put(s, a.token, 'four', { convo_id: 'c2' })
+  s.db.exec("CREATE TRIGGER no_event BEFORE INSERT ON events WHEN NEW.type='memory_proposal' BEGIN SELECT RAISE(ABORT, 'no event'); END")
+  assert.equal((await tap(s, client, r4.json.item.id, 'Decline')).status, 200)
+  assert.deepEqual(told().at(-1), ['four', 'declined', 0])
+  sweepMemoryProposals(ctx)
+  assert.deepEqual(told().at(-1), ['four', 'declined', 0])
+  s.db.exec('DROP TRIGGER no_event')
+  sweepMemoryProposals(ctx)
+  assert.deepEqual(told().at(-1), ['four', 'declined', 1])
+  assert.deepEqual(outcomes(s).at(-1), ['c2', 'journal', 'four', 'save', 'declined'])
 })
 
 // The parts of an item body outside its fenced blocks.
