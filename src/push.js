@@ -226,6 +226,8 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceM
   // and the item still needs the user.
   function holdItem(ms, userId, event, send, what) {
     const key = `${userId}:${event.payload.item_id}`
+    // Seq order, not arrival order: an older marker never displaces a newer one.
+    if ((heldItems.get(key) ?? -Infinity) > event.seq) return
     heldItems.set(key, event.seq)
     hold(ms, () => {
       if (heldItems.get(key) !== event.seq) return
@@ -638,7 +640,7 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceM
   function resumeHeldItems(now = Date.now()) {
     if ((!apnsClient && !webPushClient) || itemHoldMs <= 0) return 0
     const rows = db.prepare(`SELECT user_id, seq, convo_id, ts, sender, type, payload FROM events
-      WHERE type='item' AND ts > ?`).all(now - itemHoldMs - resumeSlackMs)
+      WHERE type='item' AND ts > ? ORDER BY seq`).all(now - itemHoldMs - resumeSlackMs)
     let n = 0
     for (const r of rows) {
       let payload

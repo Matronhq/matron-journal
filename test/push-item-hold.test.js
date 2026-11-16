@@ -134,3 +134,27 @@ test('item hold: the push offers the buttons the item has when it is sent', asyn
   ctx.db.prepare(`UPDATE items SET chosen_action='Wait' WHERE id=?`).run(item.id)
   assert.deepEqual(pushContent(freshItemEvent(ctx.db, ctx.alice.id, event), convo, cls).item.actions, [], 'tapped: no buttons')
 })
+
+test('resumeHeldItems: the newest marker for an item wins, whatever order they are read in', async (t) => {
+  const ctx = await setup(t, { holdMs: 30 })
+  const item = ctx.file()
+  ctx.marker(item)
+  const newer = ctx.marker(item, 'commented')
+  ctx.pipeline.resumeHeldItems()
+  ctx.pipeline.onAppend(ctx.alice.id, ctx.marker(item, 'created'), null) // arrives later with a higher seq
+  ctx.db.prepare('UPDATE devices SET cursor=? WHERE id=?').run(newer.seq, ctx.phone)
+  await wait(80)
+  assert.equal(ctx.stub.calls.length, 1, 'only the highest seq goes out')
+})
+
+test('item hold: an older marker arriving late does not replace a newer held one', async (t) => {
+  const ctx = await setup(t)
+  const item = ctx.file()
+  const older = ctx.marker(item)
+  const newer = ctx.marker(item, 'commented')
+  ctx.pipeline.onAppend(ctx.alice.id, newer, null)
+  ctx.pipeline.onAppend(ctx.alice.id, older, null)
+  ctx.db.prepare('UPDATE devices SET cursor=? WHERE id=?').run(older.seq, ctx.phone)
+  await wait(120)
+  assert.equal(ctx.stub.calls.length, 1, 'the newer one still goes out')
+})
