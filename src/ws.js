@@ -2587,7 +2587,10 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const detail = typeof msg.detail === 'string' ? msg.detail.slice(0, ACTIVITY_DETAIL_MAX_CHARS) : undefined
         // Cached for the catch-up on `viewing`; idle is the absence of an
         // entry. Remembered per agent connection so its close can clear it.
-        if (msg.state === 'idle') activityCache.delete(conn.userId, msg.convo_id)
+        if (msg.state === 'idle') {
+          activityCache.delete(conn.userId, msg.convo_id)
+          conn._activityConvos?.delete(msg.convo_id)
+        }
         else {
           const entry = { state: msg.state, detail }
           activityCache.set(conn.userId, msg.convo_id, entry)

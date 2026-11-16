@@ -1067,8 +1067,9 @@ Rows from before the stamp carry neither, and don't count.
   When both keys are present, `convo_ids` defines the set.
   - The catch-up also carries the conversation's current `activity`: the
     last non-idle `{kind:'ephemeral', convo_id, activity:{state, detail}}`
-    the agent sent (held in memory, dropped when that agent's connection
-    closes), or `activity:{state:'idle'}` when there is none. Activity is
+    the agent sent (held in memory in the same bounded cache as `status`,
+    dropped when that agent's connection closes; best effort, so an entry
+    evicted by the bound replays as idle), or `activity:{state:'idle'}` when there is none. Activity is
     latest-wins and never journaled, so a client that was not viewing (a
     tracker open over the chat, a hidden tab) would otherwise never learn
     that its "thinking" indicator ended. The frame is sent directly, after
