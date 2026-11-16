@@ -1065,6 +1065,17 @@ Rows from before the stamp carry neither, and don't count.
     It still sends the catch-up on every `viewing`, even for the
     conversation already viewed: clients re-send it to force a resync.
   When both keys are present, `convo_ids` defines the set.
+  - The catch-up also carries the conversation's current `activity`: the
+    last non-idle `{kind:'ephemeral', convo_id, activity:{state, detail}}`
+    the agent sent (held in memory, dropped when that agent's connection
+    closes), or `activity:{state:'idle'}` when there is none. Activity is
+    latest-wins and never journaled, so a client that was not viewing (a
+    tracker open over the chat, a hidden tab) would otherwise never learn
+    that its "thinking" indicator ended. The frame is sent directly, after
+    the `status` frame, and after any activity frame still queued for that
+    conversation on the connection is dropped, so it is the last word on
+    the socket. Likewise, an activity frame queued for a conversation when
+    the client stops viewing it is dropped rather than flushed afterwards.
 - Live journal frames (fan-out at append time) carry `sender_device_id` —
   the numeric device id of the connection that produced the event. Device
   names have no unique constraint, so this is the only exact own-echo test

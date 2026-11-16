@@ -248,6 +248,9 @@ export function makeStatusCache(max = STATUS_CACHE_MAX) {
     get(userId, convoId) {
       return map.get(`${userId}:${convoId}`)
     },
+    delete(userId, convoId) {
+      map.delete(`${userId}:${convoId}`)
+    },
   }
 }
 
@@ -307,6 +310,8 @@ export function attachWs({
   const approvedOrphanTtlMs = Math.max(APPROVED_ORPHAN_TTL_FLOOR_MS, (spawnStartTimeoutMs + spawnWakeWaitMs) * 2)
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES })
   const statusCache = makeStatusCache()
+  // Last non-idle activity per convo, replayed on `viewing` (see that case).
+  const activityCache = makeStatusCache()
   // Prepared once, reused for the per-frame revocation recheck below — one
   // cheap SELECT per inbound frame, not a fresh db.prepare() call each time.
   const deviceRowStmt = db.prepare('SELECT id, kind, created_at, last_seen_at FROM devices WHERE id=?')
@@ -869,7 +874,7 @@ export function attachWs({
         // reserialization, which JSON.parse's whitespace-stripping would
         // shrink. `data` is a Buffer here (ws delivers text frames as
         // Buffers), so .length is the byte count.
-        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker, journalHost, securityLog })
+        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, activityCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker, journalHost, securityLog })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -905,6 +910,12 @@ export function attachWs({
       for (const ev of toolStreams.closeForProducer(conn)) {
         notifyStale(db, hub, ev, 'disconnected')
       }
+      // A producer that vanished mid-turn never sends its idle: forget the
+      // activity it left (unless a newer connection has since replaced it),
+      // so a later `viewing` catch-up does not replay a stale indicator.
+      for (const [convoId, entry] of conn._activityConvos ?? []) {
+        if (activityCache.get(conn.userId, convoId) === entry) activityCache.delete(conn.userId, convoId)
+      }
     })
   })
   return wss
@@ -925,7 +936,7 @@ export function notifyStale(db, hub, entry, reason = 'stale') {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null, journalHost = null, securityLog = securityLogFor(db) }) {
+export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), activityCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null, journalHost = null, securityLog = securityLogFor(db) }) {
   const fail = (code, detail) => {
     conn.ws.send(JSON.stringify({
       kind: 'control', op: 'error', code, ref: msg.op,
@@ -1138,7 +1149,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           next = new Set(msg.convo_id == null ? [] : [msg.convo_id])
           prev = new Set()
         }
+        const wasViewing = conn.viewingConvoIds
         conn.viewingConvoIds = next
+        // A coalesced activity frame still pending for a convo no longer on
+        // screen would flush after the client cleared its live state, and
+        // nothing would end it. Drop it; the catch-up below covers re-views.
+        for (const convoId of wasViewing) if (!next.has(convoId)) hub.discardPendingActivity(conn, convoId)
         // Catch-up for live tool-output streams: whoever just started viewing
         // gets full scrollback-so-far, one sync frame per active buffer, sent
         // directly (not via hub coalescing) and synchronously — no append can
@@ -1168,6 +1184,18 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
               kind: 'ephemeral', convo_id: convoId, status: cachedStatus,
             }))
           }
+          // Activity catch-up: activity is latest-wins, so a client that was
+          // not viewing (tracker open, tab hidden) missed the frame that
+          // would have ended or changed its indicator. Send the current
+          // state, or `idle` (the frame clients already treat as "clear the
+          // indicator") when none is cached. Sent directly, after any
+          // still-pending older frame for this convo is dropped, so the
+          // replay is the last word on this socket.
+          hub.discardPendingActivity(conn, convoId)
+          conn.ws.send(JSON.stringify({
+            kind: 'ephemeral', convo_id: convoId,
+            activity: activityCache.get(conn.userId, convoId) ?? { state: 'idle' },
+          }))
         }
         break
       }
@@ -2557,6 +2585,14 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!ACTIVITY_STATES.has(msg.state)) return fail('bad_request')
         if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) return fail('forbidden')
         const detail = typeof msg.detail === 'string' ? msg.detail.slice(0, ACTIVITY_DETAIL_MAX_CHARS) : undefined
+        // Cached for the catch-up on `viewing`; idle is the absence of an
+        // entry. Remembered per agent connection so its close can clear it.
+        if (msg.state === 'idle') activityCache.delete(conn.userId, msg.convo_id)
+        else {
+          const entry = { state: msg.state, detail }
+          activityCache.set(conn.userId, msg.convo_id, entry)
+          ;(conn._activityConvos ??= new Map()).set(msg.convo_id, entry)
+        }
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id,
           activity: { state: msg.state, detail },
