@@ -1163,6 +1163,9 @@ Rows from before the stamp carry neither, and don't count.
   ephemeral frame `{kind: 'summary', convo_id, summary, summary_updated_at}`:
   not journaled, not replayed, no `seq`, no `last_seq` movement. `/snapshot`
   conversation rows carry `summary` and `summary_updated_at` for catch-up.
+  Because summary frames are never replayed, a client that missed any (it
+  was disconnected or backgrounded) should re-read `/snapshot` after each
+  reconnect to pick up the current summaries.
   `summary_updated_at` is Unix milliseconds when the server first observed
   the changed text, including a clear; it is not the producer's generation
   time. It stays unchanged on identical resends or omitted/null summaries.
