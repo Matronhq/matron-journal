@@ -261,6 +261,13 @@ export function recordConsentDecision(db, { userId, kind, askId, decision, convo
     .run(userId, kind, askId, decision, convoId, reason, causeKind, causeRef, verifierNote, now)
 }
 
+export const AUTO_APPROVE_REASON = 'auto-approved (Coordinator)'
+export const AUTO_APPROVE_WINDOW_MS = 60 * 60 * 1000
+export const AUTO_APPROVE_HOURLY_CAP = 60
+export function autoApprovalsSince(db, userId, since) {
+  return db.prepare("SELECT COUNT(*) c FROM consent_decisions WHERE user_id=? AND kind='spawn' AND decision='approve' AND reason=? AND created_at>?").get(userId, AUTO_APPROVE_REASON, since).c
+}
+
 export function coordinatorApprovalsSince(db, userId, since, { kind = null } = {}) {
   // Transfers have a cap of their own: { kind: 'transfer' } counts those,
   // and the default count (chats and spawns) leaves them out.

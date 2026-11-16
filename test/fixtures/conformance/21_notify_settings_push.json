@@ -69,6 +69,7 @@
         "op": "hello_ok",
         "settings": {
           "notices": true,
+          "auto_approve_coordinator_spawns": false,
           "auto_archive_days": 30
         },
         "coordinator_convo_id": null,
