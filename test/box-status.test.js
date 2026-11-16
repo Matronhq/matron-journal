@@ -175,15 +175,17 @@ test('box_status vitals: kept on a full report, and a vitals-only report refresh
   const later = { cpu_pct: 90, ram_pct: 62, sampled_at_ms: 1758460045000 }
   agent.send({ op: 'box_status', vitals: later })
   const live = await client.waitFor((f) => f.kind === 'box_status')
-  // Fanned as it came: vitals only.
+  // Fanned as the merged row: new vitals plus the stored blocks.
   assert.deepEqual(live.vitals, later)
-  assert.equal('limits' in live, false)
+  assert.deepEqual(live.limits, LIMITS)
+  assert.deepEqual(live.disk, DISK)
   // Stored row keeps limits and disk, takes the new vitals.
   const stored = deviceStatuses(s.db, alice.id).get(agDev.deviceId)
   assert.deepEqual(stored.vitals, later)
   assert.deepEqual(stored.limits, LIMITS)
   assert.deepEqual(stored.disk, DISK)
-  assert.equal(stored.reported_at, live.reported_at)
+  assert.equal(stored.reported_at, first.reported_at)
+  assert.equal(live.reported_at, first.reported_at)
   // A client that connects later reads them from /devices and /roster.
   const devs = await s.http('/devices', { token: clientToken })
   const row = devs.json.devices.find((d) => d.device_id === agDev.deviceId)
@@ -224,4 +226,31 @@ test('box_status vitals: a vitals-only report is a valid report on its own, and 
   agent.send({ op: 'box_status', disk: DISK, vitals: { ...VITALS, extra: 'x' } })
   const copied = await client.waitFor((f) => f.kind === 'box_status' && f.vitals)
   assert.deepEqual(copied.vitals, VITALS)
+})
+
+test('box_status vitals: a vitals-only report broadcasts the full merged row and leaves reported_at alone; a full report moves it', async (t) => {
+  const { s, alice, agDev, agent, client } = await fleet(t)
+  agent.send({ op: 'box_status', activity: ACTIVITY, limits: LIMITS, disk: DISK, vitals: VITALS })
+  const full = await client.waitFor((f) => f.kind === 'box_status')
+  client.frames.length = 0
+  await new Promise((r) => setTimeout(r, 15))
+
+  const later = { cpu_pct: 12, ram_pct: 40, sampled_at_ms: 1758460045000 }
+  agent.send({ op: 'box_status', vitals: later })
+  const live = await client.waitFor((f) => f.kind === 'box_status')
+  assert.deepEqual(live.activity, ACTIVITY)
+  assert.deepEqual(live.limits, LIMITS)
+  assert.deepEqual(live.disk, DISK)
+  assert.deepEqual(live.vitals, later)
+  assert.equal(live.reported_at, full.reported_at)
+  const stored = deviceStatuses(s.db, alice.id).get(agDev.deviceId)
+  assert.equal(stored.reported_at, full.reported_at)
+  assert.equal(stored.vitals.sampled_at_ms, later.sampled_at_ms)
+  client.frames.length = 0
+
+  await new Promise((r) => setTimeout(r, 15))
+  agent.send({ op: 'box_status', limits: LIMITS })
+  const next = await client.waitFor((f) => f.kind === 'box_status')
+  assert.ok(next.reported_at > full.reported_at)
+  assert.equal(deviceStatuses(s.db, alice.id).get(agDev.deviceId).reported_at, next.reported_at)
 })

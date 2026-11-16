@@ -2700,14 +2700,21 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const reportedAt = Date.now()
         // A report carrying only `vitals` (the bridge's frequent load sample)
         // refreshes that block and keeps the stored usage, activity and disk
-        // blocks; any other report replaces the row as before.
-        if (Object.keys(status).every((k) => k === 'vitals')) mergeDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt })
-        else upsertDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt })
+        // blocks and the stored reported_at (the vitals carry their own
+        // sampled_at_ms, so older limits do not look freshly reported); the
+        // clients get the merged row, since they replace the whole box row on
+        // each box_status frame. Any other report replaces the row as before.
+        let fan = { reported_at: reportedAt, ...status }
+        if (Object.keys(status).every((k) => k === 'vitals')) {
+          const prior = getDeviceStatus(db, conn.userId, conn.deviceId)
+          mergeDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt: prior ? prior.reported_at : reportedAt })
+          fan = getDeviceStatus(db, conn.userId, conn.deviceId) || fan
+        } else upsertDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt })
         // The same reading, filed in the usage history (best effort: a
         // failed write must not cost the live report).
         try { recordBoxUsage(db, { userId: conn.userId, deviceId: conn.deviceId, status, now: reportedAt }) }
         catch (e) { console.warn(`box_status: usage history write failed: ${e.message}`) }
-        hub.sendToClients(conn.userId, { kind: 'box_status', device_id: conn.deviceId, reported_at: reportedAt, ...status })
+        hub.sendToClients(conn.userId, { kind: 'box_status', device_id: conn.deviceId, ...fan })
         break
       }
       case 'session_control': {
