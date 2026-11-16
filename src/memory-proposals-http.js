@@ -89,7 +89,8 @@ const boxName = (db, userId, deviceId) => db.prepare('SELECT name FROM devices W
 const convoTitle = (db, userId, convoId) => (convoId ? db.prepare('SELECT title FROM conversations WHERE id=? AND owner_user_id=?').get(convoId, userId)?.title ?? '' : '')
 
 // "always", or "on demand, topic: couriers".
-const tierLine = (tier, topic) => (tier === 'on_demand' ? `on demand${topic ? `, topic: ${topic}` : ''}` : `always${topic ? `, topic: ${topic}` : ''}`)
+// The topic is an agent's words: escaped, so it cannot render as a link.
+const tierLine = (tier, topic) => `${tier === 'on_demand' ? 'on demand' : 'always'}${topic ? `, topic: ${plain(topic)}` : ''}`
 
 // Title, body and buttons of the question, from the proposal row and the
 // memory it was made against, read in the write that recorded it. The scope

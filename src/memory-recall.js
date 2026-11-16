@@ -22,7 +22,7 @@
 // ready vector index, `auto` finds nothing and `query` falls back to the
 // word tiers.
 import { searchAll } from './search-all.js'
-import { getMemory, privateOrigin, validScope, MEMORY_TIERS } from './memories.js'
+import { getMemory, privateOrigin, validScope, MEMORY_TIERS, MEMORIES_MAX } from './memories.js'
 
 export const RECALL_TEXT_MAX = 4000
 export const RECALL_QUERY_MAX = 256 // longer query text skips the word tiers
@@ -74,15 +74,20 @@ export async function recallMemories(db, userId, { text, mode, scopes, tier, exc
     && !exclude.has(m.name)
   const out = []
   const seen = new Set()
+  // A hit whose memory was deleted while the search awaited the embedding
+  // reads back as null: skipped by `wanted`, before anything reads it.
   const add = (m, score, why) => {
-    if (out.length >= limit || seen.has(m.id) || !wanted(m)) return
+    if (out.length >= limit || !wanted(m) || seen.has(m.id)) return
     seen.add(m.id)
     out.push({ ...m, score: score == null ? null : Number(score.toFixed(3)), why })
   }
 
   if (mode === 'query' && text.length <= RECALL_QUERY_MAX) {
     const r = await searchAll(db, userId, {
-      query: text, kinds: ['memory'], limit: 50, excludePrivateOwned,
+      // Every matching memory (a user holds at most MEMORIES_MAX), so the
+      // scope, tier and exclude filters below never lose a match to a
+      // result limit applied before them.
+      query: text, kinds: ['memory'], limit: MEMORIES_MAX, excludePrivateOwned,
       similar: ready ? { store: ready.store, embedder: ready.embedder } : null,
     })
     for (const hit of r.results ?? []) add(getMemory(db, userId, hit.id), hit.score ?? null, hit.why)

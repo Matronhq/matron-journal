@@ -122,6 +122,8 @@ test('a proposal records tier and topic; its card shows them; approval past the 
   const { proposal: p2 } = recordProposal(db, { userId: 1, name: 'p2', action: 'save', fields: { description: 'Rule.', body: '' }, fromDeviceId: 1, fromConvoId: 'c1' })
   assert.equal(p2.tier, null, 'not named')
   assert.match(proposalItemFields(db, p2).body, /\*\*Tier:\*\* always/)
+  const { proposal: p4 } = recordProposal(db, { userId: 1, name: 'p4', action: 'save', fields: { description: 'Rule.', body: '', tier: 'on_demand', topic: '[details](https://example.com)' }, fromDeviceId: 1, fromConvoId: 'c1' })
+  assert.doesNotMatch(proposalItemFields(db, p4).body, /\[details\]\(https/, 'a topic cannot render as a link on the card')
   fill(db, 'global', ALWAYS_MAX.global)
   const out = upsertMemory(db, { userId: 1, name: 'p3', description: 'Rule.', body: '', tier: 'always', softCap: true, by: 'agent' })
   assert.deepEqual([out.memory.tier, out.capped], ['on_demand', true])

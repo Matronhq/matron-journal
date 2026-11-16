@@ -159,3 +159,30 @@ test('validateRecall: min_z', () => {
   assert.equal(validateRecall({ text: 'x', min_z: 2 }).value.minZ, 2)
   for (const v of [0.5, 7, '3']) assert.equal(validateRecall({ text: 'x', min_z: v }).ok, undefined)
 })
+
+test('query: filters apply to every match, not to a first page of them', async () => {
+  const db = seed()
+  // 60 always memories all mention vans; one on-demand memory does too.
+  for (let i = 0; i < 60; i++) upsertMemory(db, { userId: 1, name: `van-rule-${i}`, description: `Vans rule ${i}.`, body: '', by: 'agent', softCap: true, tier: 'always' })
+  db.prepare("UPDATE memories SET tier='always'").run()
+  upsertMemory(db, { userId: 1, name: 'zz-van-on-demand', description: 'Vans need booking a week ahead.', body: '', tier: 'on_demand', by: 'agent' })
+  const r = await recallMemories(db, 1, ask({ text: 'vans', tier: 'on_demand' }), { semantic: null })
+  assert.deepEqual(r.memories.map((m) => m.name), ['zz-van-on-demand'])
+})
+
+test('query: a memory deleted while the search runs is skipped, not a crash', async () => {
+  const { db, semantic } = await world()
+  const realEmbed = semantic.embedder.embedQuery
+  semantic.embedder.embedQuery = async (t) => {
+    db.prepare("DELETE FROM memories WHERE name='parcel-courier'").run()
+    return realEmbed(t)
+  }
+  // Two words: the word tiers find it first, then the similar tier's
+  // embedding call deletes it.
+  let deleted = false
+  const before = semantic.embedder.embedQuery
+  semantic.embedder.embedQuery = async (t) => { deleted = true; return before(t) }
+  const r = await recallMemories(db, 1, ask({ text: 'book couriers' }), { semantic })
+  assert.equal(deleted, true)
+  assert.ok(!r.memories.some((m) => m.name === 'parcel-courier'))
+})
