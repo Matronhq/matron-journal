@@ -209,13 +209,26 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   repo). A bridge with the scopes update gives a session only the memories
   whose scope matches it; an older bridge still gives every memory to
   every session, so a stored scope restricts nothing until the bridge is
-  updated. \`GET /memories/:name\` (or the \`me_…\` id) → \`{memory}\`.
+  updated. Each also has a \`tier\`: \`always\` (listed in full in every
+  session of its scope) or \`on_demand\` (named under its \`topic\` and read
+  when the work needs it). \`GET /memories/:name\` (or the \`me_…\` id) →
+  \`{memory}\`.
+- \`POST /memories/recall\` \`{text, mode?: query|auto, scopes?, tier?,
+  exclude?, limit? (≤10, default 3), min_score?, min_z?}\` →
+  \`{memories:[{…, score, why}], semantic}\` — the memories that bear on a
+  text, whole. \`query\` (default) is your own words; \`auto\` is a turn's
+  text, matched by meaning only: similarity ≥ \`min_score\` (default 0.62)
+  and standing out from your other memories (z ≥ \`min_z\`, default 3).
 - \`PUT /memories/:name\` \`{description (≤200 chars, one line), body?
   (markdown ≤8 KB), type?: user|feedback|project|reference, scope?:
   global|coordinator|repo:<name> (global on create, kept on update when
-  omitted), convo_id? (agents: your conversation)}\` → 201 created / 200
-  updated \`{memory}\`. The same name overwrites — the whole memory, so send
-  the body back when updating. 409 \`too_many\` at 200 memories. \`DELETE /memories/:name\` →
+  omitted), tier?: always|on_demand, topic? (≤40 chars), convo_id?
+  (agents: your conversation)}\` → 201 created / 200 updated \`{memory}\`.
+  The same name overwrites — the whole memory, so send the body back when
+  updating; tier and topic are kept when omitted. 409 \`too_many\` at 200
+  memories. The always tier holds at most 25 global, 30 coordinator and 15
+  per repo: a create naming no tier past that lands on_demand (\`capped:
+  true\`), an explicit \`tier: always\` is 409 \`always_full\`. \`DELETE /memories/:name\` →
   200 \`{memory}\`. Every change lands as a quiet \`memory\` event on your
   conversation and on the Coordinator's. An agent's save or delete applies
   at once only in a turn the user started in that conversation in the last

@@ -9,7 +9,8 @@ import { json, readBody } from './http-body.js'
 import { senderOf, badRequest, notFound } from './http-who.js'
 import { filteredAgent, privateOwnedConvo } from './privacy.js'
 import { getCoordinatorConvoId } from './coordinator.js'
-import { validName, validateMemoryFields, getMemory, listMemories, upsertMemory, deleteMemory, privateOrigin, MEMORIES_MAX } from './memories.js'
+import { validName, validateMemoryFields, getMemory, listMemories, upsertMemory, deleteMemory, privateOrigin, alwaysMaxFor, MEMORIES_MAX } from './memories.js'
+import { validateRecall, recallMemories } from './memory-recall.js'
 import { causesFromFrame } from './ask-causes.js'
 import { needsUserAnswer, fileProposal, answerPending } from './memory-proposals-http.js'
 
@@ -131,10 +132,17 @@ async function handlePut(ctx, req, res, who, name) {
     })
   } catch (err) {
     if (err.message === 'too_many') { json(res, 409, { error: 'too_many' }); return true }
+    if (err.message === 'always_full') {
+      const scope = v.value.scope ?? existing?.scope ?? 'global'
+      json(res, 409, { error: 'always_full', scope, max: alwaysMaxFor(scope) })
+      return true
+    }
     throw err
   }
   emitMemoryMarker(ctx, who, { memory: out.memory, action: 'saved', created: out.created, writerConvoId: convoId })
-  json(res, out.created ? 201 : 200, { memory: out.memory })
+  // `capped`: a create that named no tier landed on_demand because its
+  // scope's always tier is full; the writer says so.
+  json(res, out.created ? 201 : 200, { memory: out.memory, ...(out.capped ? { capped: true, max: alwaysMaxFor(out.memory.scope) } : {}) })
   return true
 }
 
@@ -145,6 +153,15 @@ export async function handleMemoriesRoute(ctx, req, res, url, who) {
   if (url.pathname === '/memories') {
     if (req.method !== 'GET') return false
     json(res, 200, { memories: listMemories(db, who.userId, { excludePrivateOwned: filteredAgent(db, who) }) })
+    return true
+  }
+  // POST /memories/recall: the memories that bear on a text (src/memory-recall.js).
+  // No memory is named "recall" by a POST: PUT/GET/DELETE of that name
+  // still reach the routes below.
+  if (url.pathname === '/memories/recall' && req.method === 'POST') {
+    const v = validateRecall(await readBody(req))
+    if (!v.ok) return badRequest(res)
+    json(res, 200, await recallMemories(db, who.userId, v.value, { excludePrivateOwned: filteredAgent(db, who), semantic: ctx.semantic ?? null }))
     return true
   }
   const m = /^\/memories\/([^/]+)$/.exec(url.pathname)

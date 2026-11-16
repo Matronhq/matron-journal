@@ -3170,7 +3170,7 @@ nothing until the bridge is updated; against a bridge older than both the
 memories are stored and shown in the apps only.
 
 ```
-{ id: "me_<16 hex>", name, type, scope, description, body,
+{ id: "me_<16 hex>", name, type, scope, tier, topic, description, body,
   origin_convo_id, origin_device_id, created_by, updated_by, created_at, updated_at }
 ```
 
@@ -3187,6 +3187,23 @@ memories are stored and shown in the apps only.
   it; the **bridge** does the matching at spawn (global always, the repo
   scope of the session's workdir, `coordinator` for the Coordinator) and
   the Coordinator's `memory_list` sees every scope.
+- `tier`: how a session is given the memory — `always` (listed in full,
+  name and description, in every session of its scope; what every memory
+  was before the column existed, and the default on create) or
+  `on_demand` (a bridge with the **tiers update** names it under its
+  `topic` and lets the session read it with `GET /memories/:key` or find
+  it with `POST /memories/recall`). Kept when omitted on update.
+- `topic`: a short label (≤40 characters, one line) that groups on-demand
+  memories in a session's list, e.g. `couriers`. Optional; `""` or `null`
+  clears it; kept when omitted on update.
+- The always tier is **capped per scope**: 25 `global`, 30 `coordinator`,
+  15 per `repo:<name>`. Only a write that would add to a full set is
+  affected: a create that names no `tier` lands `on_demand` (the answer
+  carries `capped: true, max`), while an explicit `tier: "always"`, or a
+  scope change that carries an always memory into a full scope, is 409
+  `always_full` `{scope, max}`. An approved proposal never fails on the
+  cap; it lands `on_demand` and its item says so. Rows already over the
+  cap stay as they are.
 - `description`: 1–200 characters, trimmed, one line (no C0/C1 control
   characters, no U+2028/U+2029). It is the line the Coordinator sees at
   spawn, so it must be the actionable one-liner.
@@ -3205,11 +3222,38 @@ memories are stored and shown in the apps only.
 |---|---|---|
 | `GET /memories` | | 200 `{memories:[…]}` ordered by `name` (≤200 rows, no paging) |
 | `GET /memories/:key` | `:key` = `me_…` or the name | 200 `{memory}`; 404 |
-| `PUT /memories/:name` | `{description, body?, type?, scope?, convo_id?, causes?}` | 201 `{memory}` created / 200 `{memory}` updated; **202** `{pending:'owner', proposal, item}` when an agent's write waits for the user (*Memory proposals* below); 400 `bad_request` (a `scope` outside the three forms, or unusable `causes`, included); 409 `too_many`; 409 `conflict` `blocked_by:'too_many_asks'` (too many proposals waiting); 404 |
+| `POST /memories/recall` | `{text, mode?, scopes?, tier?, exclude?, limit?, min_score?, min_z?}` | 200 `{memories:[{…memory, score, why}], semantic}` (see *Recall* below); 400 |
+| `PUT /memories/:name` | `{description, body?, type?, scope?, tier?, topic?, convo_id?, causes?}` | 201 `{memory}` created / 200 `{memory}` updated (`capped: true, max` when the cap placed a new memory on demand); **202** `{pending:'owner', proposal, item}` when an agent's write waits for the user (*Memory proposals* below); 400 `bad_request` (a `scope` outside the three forms, or unusable `causes`, included); 409 `too_many`; 409 `always_full`; 409 `conflict` `blocked_by:'too_many_asks'` (too many proposals waiting); 404 |
 | `DELETE /memories/:key` | agents may send `{convo_id?, causes?}` | 200 `{memory}` (the deleted row); **202** as for `PUT`; 400; 404 |
 
+### Recall
+
+`POST /memories/recall` answers with the memories that bear on a text,
+whole (the body included), best first. `text` is 1–4000 characters.
+`mode` is `query` (the default: an agent's own words) or `auto` (the text
+of a turn a bridge is about to hand its agent). A `query` of at most 256
+characters runs unified search's tiers over memories (exact, words,
+stemmed, similar, some words), so it works without the vector index; a
+longer one runs the similar pass alone. `auto` runs only the similar pass
+(any-word matching on a whole message would pull in every memory that
+shares a common word), and a match must clear two bars: cosine similarity
+at least `min_score` (0.5–0.95, default 0.62), and a z-score of at least
+`min_z` (1–6, default 3) against the similarity of every memory the caller
+can see — it must stand out from the rest. A small embedding model scores
+most pairs of texts alike, so a fixed floor alone either misses real
+matches or lets in near-misses. With fewer than 20 memories the floor
+alone applies. A memory's `topic` leads its search text, so a topic that
+names the situation (`booking couriers`) helps it be found. Filters: `scopes` (the session's
+audience, up to 20 scope strings), `tier`, and `exclude` (names already
+given to the session, up to 200). `limit` is 1–10, default 3. `semantic`
+reports the vector index: `ready`, `indexing` or `off`; while it is not
+ready, `auto` recalls nothing. The embedding model runs in the journal's
+process, as for search; no text leaves it. An ordinary agent never
+recalls a memory saved from a private device.
+
 `PUT` is the only write and is an **upsert by name**: the same name from
-any device overwrites `description`, `body`, `type` and `scope` and bumps
+any device overwrites `description`, `body`, `type`, `scope`, `tier` and
+`topic` (the last four kept when omitted) and bumps
 `updated_at` / `updated_by`. A `PUT` is the whole memory — an omitted
 `body` on an update **clears** it. Retries are therefore free; there is no
 `Idempotency-Key`. An invalid `:name` is 400, not 404.

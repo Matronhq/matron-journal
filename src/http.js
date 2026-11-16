@@ -430,7 +430,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       if (await handleMissionsRoute({ db, hub, pushPipeline, waker, federationContribute }, req, res, url, who)) return
       if (await handleProjectsRoute({ db, hub }, req, res, url, who)) return
       if (await handleTimelineRoute({ db }, req, res, url, who)) return
-      if (await handleMemoriesRoute({ db, hub }, req, res, url, who)) return
+      if (await handleMemoriesRoute({ db, hub, semantic }, req, res, url, who)) return
       if (await handleRoutinesRoute({ db, hub, routineFirer }, req, res, url, who)) return
       if (await handleBriefingsRoute({ db, hub, routineFirer }, req, res, url, who)) return
       if (await handleSeenRoute({ db }, req, res, url, who)) return
