@@ -423,6 +423,12 @@ the machine-checkable version of this page.
   `caption`) with `blob_ref: null` and `expired: true` — so fresh syncs
   render an "expired" attachment; clients that already hold the event learn
   from the 404 on `GET /media/:id`.
+  Separately from quota pressure, an optional scheduled orphan-blob reaper
+  deletes any blob that nothing references (no `events.blob_ref`, no `blob_ref`
+  anywhere inside an event payload, no item or item-comment attachment) once it
+  is older than `MATRON_ORPHAN_BLOB_GRACE_HOURS`. It is off unless that is set
+  to a positive integer; use a week (168) or more, since a client outbox can
+  resend a pending attachment after a long offline spell.
 - `GET /help` (Bearer, any authenticated device) -> `text/markdown`. A
   hand-maintained digest of this API surface (`src/help.js`), aimed at agent
   callers that arrive with a token and no repo checkout — it names the
