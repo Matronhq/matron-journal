@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { openDb, setApnsRegistration } from '../src/db.js'
 import { makeHub } from '../src/hub.js'
-import { makePushPipeline } from '../src/push.js'
+import { makePushPipeline, pushContent, freshItemEvent } from '../src/push.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation, append } from '../src/journal.js'
 import { createItem } from '../src/items.js'
@@ -110,4 +110,27 @@ test('resumeHeldItems: the startup read uses the partial index, not a full event
   const db = openDb(':memory:')
   const plan = db.prepare("EXPLAIN QUERY PLAN SELECT user_id, seq FROM events WHERE type='item' AND ts > ?").all(0).map((r) => r.detail).join(' ')
   assert.match(plan, /idx_events_item/)
+})
+
+test('item hold: only the newest held push for an item goes out', async (t) => {
+  const ctx = await setup(t)
+  const item = ctx.file()
+  ctx.emit(item)
+  await wait(20)
+  ctx.emit(item, 'commented')
+  await wait(150)
+  assert.equal(ctx.stub.calls.length, 1)
+})
+
+test('item hold: the push offers the buttons the item has when it is sent', async (t) => {
+  const ctx = await setup(t)
+  const item = ctx.file()
+  ctx.db.prepare(`UPDATE items SET actions='["Wait"]' WHERE id=?`).run(item.id)
+  const event = ctx.marker(item)
+  event.payload.actions = ['Ship']
+  const convo = { id: 'work', title: 'Some work' }
+  const cls = { kind: 'attention', question: true }
+  assert.deepEqual(pushContent(freshItemEvent(ctx.db, ctx.alice.id, event), convo, cls).item.actions, ['Wait'])
+  ctx.db.prepare(`UPDATE items SET chosen_action='Wait' WHERE id=?`).run(item.id)
+  assert.deepEqual(pushContent(freshItemEvent(ctx.db, ctx.alice.id, event), convo, cls).item.actions, [], 'tapped: no buttons')
 })

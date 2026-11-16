@@ -166,6 +166,22 @@ function itemStillNeedsUser(db, userId, itemId) {
   return !!db.prepare("SELECT 1 FROM items WHERE id=? AND user_id=? AND state='open' AND awaiting='user'").get(itemId, userId)
 }
 
+// A held item marker as it reads now: the buttons the item and the comment
+// offer at send time, not at filing time, so a notification never offers a
+// button that has already been tapped or replaced.
+export function freshItemEvent(db, userId, event) {
+  const p = event.payload
+  const row = db.prepare('SELECT actions, chosen_action FROM items WHERE id=? AND user_id=?').get(p.item_id, userId)
+  if (!row) return event
+  const parse = (json) => { try { const v = JSON.parse(json); return Array.isArray(v) ? v : [] } catch { return [] } }
+  let comment = p.comment
+  if (comment && typeof comment === 'object' && typeof comment.id === 'string') {
+    const c = db.prepare('SELECT actions, chosen_action FROM item_comments WHERE id=? AND item_id=?').get(comment.id, p.item_id)
+    if (c) comment = { ...comment, actions: c.chosen_action == null ? parse(c.actions) : [] }
+  }
+  return { ...event, payload: { ...p, actions: parse(row.actions), chosen_action: row.chosen_action ?? null, ...(comment !== undefined ? { comment } : {}) } }
+}
+
 // APNs answers that mean the token itself will never be delivered to: 410
 // Unregistered (the app was removed or the token retired) and 400
 // BadDeviceToken (not a token APNs knows in that environment). A
@@ -200,6 +216,23 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceM
   // Consent-card and item pushes waiting out their hold (memory only; see
   // resumeHeldConsent and resumeHeldItems for the restart case).
   const held = new Set()
+
+  // The newest held push per item, `${userId}:${itemId}` -> seq: a later
+  // marker about the same item replaces an earlier one still waiting, so
+  // only the newest goes out (it would replace the older on screen anyway).
+  const heldItems = new Map()
+
+  // Holds an item push, then sends it only if it is still the item's newest
+  // and the item still needs the user.
+  function holdItem(ms, userId, event, send, what) {
+    const key = `${userId}:${event.payload.item_id}`
+    heldItems.set(key, event.seq)
+    hold(ms, () => {
+      if (heldItems.get(key) !== event.seq) return
+      heldItems.delete(key)
+      if (itemStillNeedsUser(db, userId, event.payload.item_id)) send()
+    }, what)
+  }
 
   // Runs `fn` once `ms` have passed, unless close() comes first. Never keeps
   // the process alive, and never lets a throw escape the timer.
@@ -457,9 +490,7 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceM
     // the settings and what each device has already seen are as they are
     // then: a phone that opened the app meanwhile gets nothing.
     if (!noHold && itemHoldMs > 0 && isHeldItem(event, cls)) {
-      hold(itemHoldMs, () => {
-        if (itemStillNeedsUser(db, userId, p.item_id)) onAppend(userId, event, originDeviceId, pushHint, { noHold: true })
-      }, 'held item push')
+      holdItem(itemHoldMs, userId, event, () => onAppend(userId, freshItemEvent(db, userId, event), originDeviceId, pushHint, { noHold: true }), 'held item push')
       return
     }
     sendAlert(userId, event, convo, cls, key, devices, originDeviceId)
@@ -616,9 +647,8 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceM
       const event = { seq: r.seq, convo_id: r.convo_id, ts: r.ts, sender: r.sender, type: r.type, payload }
       const cls = classifyEvent(event.type, payload, event.sender)
       if (!isHeldItem(event, cls) || !itemStillNeedsUser(db, r.user_id, payload.item_id)) continue
-      hold(Math.max(0, r.ts + itemHoldMs - now), () => {
-        if (itemStillNeedsUser(db, r.user_id, payload.item_id)) onAppend(r.user_id, event, null, undefined, { noHold: true })
-      }, 'resumed item push')
+      holdItem(Math.max(0, r.ts + itemHoldMs - now), r.user_id, event,
+        () => onAppend(r.user_id, freshItemEvent(db, r.user_id, event), null, undefined, { noHold: true }), 'resumed item push')
       n += 1
     }
     return n
@@ -631,6 +661,7 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, coalesceM
     coalesceState.clear()
     for (const timer of held) clearTimeout(timer)
     held.clear()
+    heldItems.clear()
   }
 
   // _coalesceState is exposed for tests (eviction assertions) and as a
