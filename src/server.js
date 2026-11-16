@@ -21,7 +21,7 @@ import { makeApnsClient } from './apns.js'
 import { makeGatewayClient } from './gateway.js'
 import { makePushPipeline, BACKGROUND_WAKE_MS } from './push.js'
 import { resolveMediaDir } from './media.js'
-import { offloadPass, expireLogsPass, runReapMedia, runExpireVoiceNotes, runExpireDeviceContent, runExpireTransfers, drainSync, drainAsync } from './retention.js'
+import { offloadPass, expireLogsPass, runReapMedia, reapOrphanBlobsPass, runExpireVoiceNotes, runExpireDeviceContent, runExpireTransfers, drainSync, drainAsync } from './retention.js'
 import { startStallLog, timed, logSlowRequests } from './stall-log.js'
 import { backfillSearchIndex, backfillIsDiff } from './search.js'
 import { loadEmbedder } from './embedder.js'
@@ -159,6 +159,31 @@ const resolveToolLogTtlHours = (override) =>
 const resolveVoiceNoteTtlDays = (override) =>
   resolveWindow(override, { env: 'MATRON_VOICE_NOTE_TTL_DAYS', opt: 'voiceNoteTtlDays', fallback: DEFAULT_VOICE_NOTE_TTL_DAYS, what: 'voice-note expiry' })
 
+// Grace window for the orphan-blob reaper (reapOrphanBlobsPass): how old an
+// unreferenced blob must be before it is deleted. OFF unless configured:
+// `override` is startServer's `orphanBlobGraceHours` opt and beats
+// MATRON_ORPHAN_BLOB_GRACE_HOURS; unset, empty or `0` disables, and so does
+// anything that is not a non-negative integer (with one warn line; this pass
+// deletes data, so fail closed means off). A week or more is sensible: a
+// client outbox can resend a pending attachment days later. Returns hours or
+// null.
+export function resolveOrphanBlobGraceHours(override) {
+  const fromEnv = override === undefined
+  const raw = fromEnv ? process.env.MATRON_ORPHAN_BLOB_GRACE_HOURS : override
+  if (raw === undefined) return null
+  const name = fromEnv ? 'MATRON_ORPHAN_BLOB_GRACE_HOURS' : 'orphanBlobGraceHours'
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 0) {
+    console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid — orphan-blob reaper disabled`)
+    return null
+  }
+  if (n === 0) {
+    console.warn(`retention: ${name}=${JSON.stringify(raw)} resolves to 0 — orphan-blob reaper disabled`)
+    return null
+  }
+  return n
+}
+
 // `override` is startServer's `deviceRetention` opt and beats
 // MATRON_DEVICE_RETENTION, as with the other retention resolvers. The value
 // is a comma-separated list of `<deviceId>:<days>` (e.g. `4:30,9:7`):
@@ -257,11 +282,12 @@ export function resolveReapPcts({ mediaReapHighPct, mediaReapLowPct } = {}) {
 // once, here, at boot. The transfer-expiry pass (runExpireTransfers) runs
 // LAST and unconditionally — see the comment at its call site below.
 // Returns the interval handle (for close()).
-function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionIntervalMs, retentionInitialDelayMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, deviceRetention }) {
+function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionIntervalMs, retentionInitialDelayMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, deviceRetention, orphanBlobGraceHours }) {
   const days = resolveRetentionDays(retentionDays)
   const ttlHours = resolveToolLogTtlHours(toolLogTtlHours)
   const voiceDays = resolveVoiceNoteTtlDays(voiceNoteTtlDays)
   const reapPcts = resolveReapPcts({ mediaReapHighPct, mediaReapLowPct })
+  const orphanGraceHours = resolveOrphanBlobGraceHours(orphanBlobGraceHours)
   const deviceRules = resolveDeviceRetention(deviceRetention)
   if (deviceRules) {
     console.log(`retention: device content expiry on — ${deviceRules.map((r) => `device ${r.deviceId} after ${r.days}d`).join(', ')}`)
@@ -323,6 +349,15 @@ function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionInterval
         if (r.reaped > 0) console.log(`retention: reaped ${r.reaped} attachment blob(s), ${r.bytesFreed} bytes, from user(s) over ${reapPcts.highPct}% of the media quota`)
       } catch (err) {
         console.error('retention: media reap run failed', err)
+      }
+      yield
+    }
+    if (orphanGraceHours !== null) {
+      try {
+        const r = yield* reapOrphanBlobsPass(db, { graceMs: orphanGraceHours * 3600000, mediaDir })
+        if (r.reaped > 0) console.log(`retention: reaped ${r.reaped} orphan blob(s), ${r.bytesFreed} bytes, unreferenced for over ${orphanGraceHours}h`)
+      } catch (err) {
+        console.error('retention: orphan-blob reap run failed', err)
       }
       yield
     }
@@ -533,7 +568,7 @@ export function startServer({
   routinesSweepIntervalMs = null,
   routinesTriggerIntervalMs = null,
   routinesSweep = process.env.MATRON_ROUTINES !== '0',
-  mediaReapHighPct, mediaReapLowPct, waker, transcriber, github, githubRefreshIntervalMs, webDir,
+  mediaReapHighPct, mediaReapLowPct, orphanBlobGraceHours, waker, transcriber, github, githubRefreshIntervalMs, webDir,
   // Cloud speech (src/cloud-tts.js). `tts` is the test seam; `null` forces
   // it off. `ttsCacheDir` overrides where the clips are kept.
   tts, ttsCacheDir, ttsSweepIntervalMs,
@@ -853,6 +888,7 @@ export function startServer({
       retentionInterval = scheduleRetention(db, {
         mediaDir: resolvedMediaDir, hub, retentionDays, retentionIntervalMs, retentionInitialDelayMs, toolLogTtlHours, voiceNoteTtlDays,
         mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes, deviceRetention,
+        orphanBlobGraceHours,
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
       stallLog = startStallLog()

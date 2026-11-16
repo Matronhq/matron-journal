@@ -52,6 +52,13 @@ export async function drainAsync(gen, { shouldStop = () => false, yieldFn = yiel
 // Rows written per uninterrupted stretch by the offload and log-expiry
 // passes (each row is a file write or unlink plus a transaction).
 export const RETENTION_ROW_BATCH = 50
+// Events rows read per stretch by the orphan-blob reference scan.
+// 500, not more: on a cold page cache a 2000-row range took ~1 s.
+export const ORPHAN_SCAN_BATCH_ROWS = 500
+// Orphan blobs deleted per pass. The delete loop cannot yield (see
+// reapOrphanBlobsPass), so a large first-run backlog is worked off over
+// several passes, oldest first, instead of in one long stretch.
+export const ORPHAN_MAX_DELETES_PER_PASS = 500
 
 // Returns true for a payload that already has the offloaded shape
 // ({type, snippet, blob_ref}) even though its row's `blob_ref` column is
@@ -673,6 +680,193 @@ export function runReapMedia(db, { quotaBytes, highPct = 90, lowPct = 70, orphan
     }
   }
   return { reaped, bytesFreed }
+}
+
+// Orphan-blob reaper, a scheduled companion to runReapMedia. runReapMedia
+// only removes orphans (past ORPHAN_GRACE_MS) for a user who is over the
+// quota high-water mark, and only checks the events.blob_ref column and item
+// comments. This pass runs every tick regardless of quota, with a longer
+// grace and a broader reference check, so a blob NOTHING references does not
+// live forever for a user who stays under quota: an upload whose ws send never happened, an item
+// attachment abandoned mid-compose, the blob half of a crashed offload. Blob
+// ids are random (media.js), not content-addressed, so an unreferenced blob
+// can never be re-attached by content — only by an id a client or agent
+// already holds, which is what the grace window is for: an upload sits
+// orphaned between POST /media and the send / item POST that attaches it, so
+// only blobs older than `graceMs` are candidates.
+//
+// "Referenced" is deliberately broad — a false "orphan" deletes user data:
+//   - events.blob_ref (attachments, offloaded / live-log tool_output);
+//   - any `blob_ref` string anywhere inside an event payload, even with the
+//     column NULL: agent publishes that carry blob_ref only in the payload
+//     land that way (file and image rows without the column exist), and item
+//     markers mirror comment attachments under payload.comment.attachments;
+//   - item_comments.attachments (item bodies ride on a synthetic body
+//     comment, so this covers both).
+// References are matched across users on purpose: any reference anywhere
+// keeps the blob.
+//
+// Each reaped blob: re-check the column reference, stage the file aside,
+// delete the row in its own transaction (restoring the file if that fails),
+// unlink the staged file, and log one evidence line. A disk_path outside
+// `mediaDir` is never unlinked and its row is left alone.
+//
+// The payload scan reads every event that mentions a blob_ref (on a large
+// journal, most of the events table), so it runs in rowid ranges of `scanBatchRows` with
+// a yield after each. A row written while the scan is paused is not lost:
+// a new event gets a rowid above the table's max at insert time, and the
+// scan tracks the lowest max it has seen (`floor`). Once the ranges are
+// done, the rows above `floor`, then the item comments (~10k rows), are
+// read again and every delete happens in that same synchronous stretch,
+// so no ws handler can attach a candidate between the last read and the
+// delete. A row an update rewrote mid-scan can only lose references (the
+// passes that rewrite payloads tombstone them), which keeps a blob, never
+// deletes one: offload's new blobs are fresh, far inside the grace window.
+//
+// The pass is off unless MATRON_ORPHAN_BLOB_GRACE_HOURS is set (server.js); a
+// grace of a week or more is sensible, not 24h: the web client's outbox keeps a pending attachment's blob_ref in
+// IndexedDB and resends it on reconnect, so an upload whose send failed can
+// legitimately be attached days later (a tab closed over a weekend).
+export function runReapOrphanBlobs(db, opts) {
+  return drainSync(reapOrphanBlobsPass(db, opts))
+}
+
+export function* reapOrphanBlobsPass(db, { graceMs, mediaDir, now = Date.now(), scanBatchRows = ORPHAN_SCAN_BATCH_ROWS, maxDeletes = ORPHAN_MAX_DELETES_PER_PASS } = {}) {
+  if (!Number.isFinite(graceMs) || graceMs <= 0) {
+    console.warn(`retention: orphan-blob graceMs=${JSON.stringify(graceMs)} is invalid — orphan-blob reap skipped`)
+    return { reaped: 0, bytesFreed: 0 }
+  }
+  if (typeof mediaDir !== 'string' || !mediaDir) {
+    console.warn('retention: orphan-blob reap has no mediaDir — skipped')
+    return { reaped: 0, bytesFreed: 0 }
+  }
+  recoverStagedOrphans(db, mediaDir)
+  const candidates = db.prepare(
+    `SELECT b.id, b.size, b.disk_path, b.content_type, b.created_at FROM blobs b
+     WHERE b.created_at < ? AND NOT EXISTS (SELECT 1 FROM events e WHERE e.blob_ref = b.id)
+     ORDER BY b.created_at ASC`
+  ).all(now - graceMs)
+  if (candidates.length === 0) return { reaped: 0, bytesFreed: 0 }
+
+  const referenced = new Set()
+  const collect = (v) => {
+    if (Array.isArray(v)) { for (const x of v) collect(x); return }
+    if (!v || typeof v !== 'object') return
+    for (const [k, x] of Object.entries(v)) {
+      if (k === 'blob_ref' && typeof x === 'string') referenced.add(x)
+      else collect(x)
+    }
+  }
+  const collectJson = (text) => {
+    try { collect(JSON.parse(text)) } catch {
+      // Unparseable text can still name a blob: keep whatever string follows
+      // a blob_ref key rather than risk deleting a referenced blob.
+      for (const m of String(text).matchAll(/"blob_ref"\s*:\s*"([^"]+)"/g)) referenced.add(m[1])
+    }
+  }
+  const maxRowid = db.prepare('SELECT MAX(rowid) AS m FROM events')
+  const scanRange = db.prepare(`SELECT payload FROM events WHERE rowid > ? AND rowid <= ? AND instr(payload, '"blob_ref"') > 0`)
+  let floor = maxRowid.get().m ?? 0
+  for (let lo = 0; lo < floor; lo += scanBatchRows) {
+    for (const row of scanRange.iterate(lo, Math.min(lo + scanBatchRows, floor))) collectJson(row.payload)
+    yield
+    floor = Math.min(floor, maxRowid.get().m ?? 0)
+  }
+  // From here to the end of the deletes: no yield (see above).
+  for (const row of db.prepare(`SELECT payload FROM events WHERE rowid > ? AND instr(payload, '"blob_ref"') > 0`).iterate(floor)) collectJson(row.payload)
+  for (const row of db.prepare(`SELECT attachments FROM item_comments WHERE instr(attachments, '"blob_ref"') > 0`).iterate()) collectJson(row.attachments)
+
+  const root = path.resolve(mediaDir) + path.sep
+  const stillOrphan = db.prepare('SELECT NOT EXISTS (SELECT 1 FROM events WHERE blob_ref = ?) AS orphan')
+  const deleteBlobRow = db.prepare('DELETE FROM blobs WHERE id=?')
+  let reaped = 0
+  let bytesFreed = 0
+  for (const cand of candidates) {
+    // The rest waits for the next pass (oldest first, see the candidate query).
+    if (reaped >= maxDeletes) break
+    if (referenced.has(cand.id)) continue
+    if (!path.resolve(cand.disk_path).startsWith(root)) {
+      console.warn(`retention: orphan blob ${cand.id} lives outside the media dir (${cand.disk_path}) — left alone`)
+      continue
+    }
+    if (!stillOrphan.get(cand.id).orphan) continue
+    // Stage, delete, then unlink. The file is renamed aside (same directory,
+    // atomic) before the row delete so a failed delete can put it back — the
+    // id then still serves exactly as before and the next pass retries. A
+    // non-ENOENT rename failure keeps row and file for retry and counts
+    // nothing. A crash (or unlink failure) anywhere after staging leaves a
+    // `.reaping` file that recoverStagedOrphans resolves at the top of the
+    // next pass, by whether the row survived.
+    const staged = `${cand.disk_path}.reaping`
+    let hasStaged = true
+    try {
+      fs.renameSync(cand.disk_path, staged)
+    } catch (err) {
+      if (err.code !== 'ENOENT') {
+        console.error(`retention: failed to stage orphan blob ${cand.id} at ${cand.disk_path} — kept for retry`, err)
+        continue
+      }
+      // Already gone — or staged by a pass that crashed before its delete.
+      hasStaged = fs.existsSync(staged)
+    }
+    try {
+      db.transaction(() => { deleteBlobRow.run(cand.id) })()
+    } catch (err) {
+      if (hasStaged) {
+        try { fs.renameSync(staged, cand.disk_path) } catch (e) {
+          console.error(`retention: orphan blob ${cand.id} row delete failed AND restoring ${staged} failed`, e)
+        }
+      }
+      console.error(`retention: failed to delete orphan blob row ${cand.id} — ${hasStaged ? 'file restored, ' : ''}kept for retry`, err)
+      continue
+    }
+    if (hasStaged) {
+      try {
+        fs.unlinkSync(staged)
+      } catch (err) {
+        if (err.code !== 'ENOENT') console.error(`retention: orphan blob ${cand.id} row deleted but ${staged} could not be unlinked`, err)
+      }
+    }
+    // Decision evidence: which blob went, how big, how old.
+    console.log(`retention: reaped orphan blob ${cand.id} (${cand.content_type}, ${cand.size} bytes, ${Math.round((now - cand.created_at) / 3600000)}h old)`)
+    reaped += 1
+    bytesFreed += cand.size
+  }
+  return { reaped, bytesFreed }
+}
+
+// Crash recovery for runReapOrphanBlobs' staging step. A `<id>.reaping` file
+// in a shard directory is a pass interrupted between stage and unlink:
+//   - its blobs row still exists → the delete never committed: put the file
+//     back so the id serves again (a still-orphaned blob is simply re-staged
+//     by the pass that follows);
+//   - no row → the delete committed: finish the unlink.
+// One readdir per shard (at most 256 two-hex directories), so it is cheap to
+// run at the top of every pass rather than only at boot.
+function recoverStagedOrphans(db, mediaDir) {
+  let shards
+  try { shards = fs.readdirSync(mediaDir, { withFileTypes: true }) } catch (err) {
+    if (err.code !== 'ENOENT') console.error(`retention: cannot list media dir ${mediaDir} for staged orphans`, err)
+    return
+  }
+  const rowOf = db.prepare('SELECT disk_path FROM blobs WHERE id=?')
+  for (const shard of shards) {
+    if (!shard.isDirectory() || !/^[0-9a-f]{2}$/.test(shard.name)) continue
+    const dir = path.join(mediaDir, shard.name)
+    let names
+    try { names = fs.readdirSync(dir) } catch { continue }
+    for (const name of names) {
+      if (!name.endsWith('.reaping')) continue
+      const staged = path.join(dir, name)
+      const row = rowOf.get(name.slice(0, -'.reaping'.length))
+      try {
+        if (row) fs.renameSync(staged, row.disk_path)
+        else fs.unlinkSync(staged)
+      } catch (err) {
+        if (err.code !== 'ENOENT') console.error(`retention: could not recover staged orphan ${staged}`, err)
+      }
+    }
+  }
 }
 
 // Per-device content expiry (fifth retention pass). Some agent devices
