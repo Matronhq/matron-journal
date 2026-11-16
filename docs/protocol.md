@@ -8776,6 +8776,26 @@ report that one message as seen (read state, op `seen`). The push relay
 `box` (below), and omits `seq`; a device that opens the box finds the `seq`
 inside it. A client must treat a missing `seq` as "no tap receipt".
 
+### Held pushes
+
+Some alerts wait before they go out, so that an ask settled within seconds
+never buzzes a phone:
+
+- **Items that need the user.** An agent's `created`, `commented` or
+  `reopened` marker that leaves an item awaiting the user is held for
+  `MATRON_PUSH_HOLD_MS` (default 60000; `0` sends at once). When the hold
+  ends, the push goes out only if the item is still `open` and still
+  awaiting the user, and the whole decision is made again then: the
+  notification settings, the devices, and what each device has already
+  received. A phone whose app caught up during the hold gets nothing.
+- **Consent cards.** In Coordinator mode, a spawn or chat card the
+  Coordinator may decide is held for the same time, but never less than
+  30 s, and goes out only if the ask is still waiting.
+
+Silent background wakes are never held. A hold lives in memory; at startup
+the journal re-arms the holds a restart cut short (asks and item markers
+young enough to have been mid-hold), for whatever time each has left.
+
 ### Sealed notification content
 
 A device may register a public key with its push token (`POST
