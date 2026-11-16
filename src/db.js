@@ -2096,6 +2096,8 @@ export function openDb(path) {
   // reads recent permission_request cards; partial, so ordinary appends
   // never touch it.
   db.exec("CREATE INDEX IF NOT EXISTS idx_events_permission_request ON events(ts) WHERE type='permission_request'")
+  // The same for held item pushes (push.js resumeHeldItems).
+  db.exec("CREATE INDEX IF NOT EXISTS idx_events_item ON events(ts) WHERE type='item'")
   for (const table of ['convo_agents', 'agent_spawn_requests']) {
     const cols = db.prepare(`PRAGMA table_info(${table})`).all()
     if (!cols.some((c) => c.name === 'answered_by')) db.exec(`ALTER TABLE ${table} ADD COLUMN answered_by TEXT`)
