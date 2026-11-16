@@ -850,6 +850,7 @@ function recoverStagedOrphans(db, mediaDir) {
     return
   }
   const rowOf = db.prepare('SELECT disk_path FROM blobs WHERE id=?')
+  const root = path.resolve(mediaDir) + path.sep
   for (const shard of shards) {
     if (!shard.isDirectory() || !/^[0-9a-f]{2}$/.test(shard.name)) continue
     const dir = path.join(mediaDir, shard.name)
@@ -859,6 +860,13 @@ function recoverStagedOrphans(db, mediaDir) {
       if (!name.endsWith('.reaping')) continue
       const staged = path.join(dir, name)
       const row = rowOf.get(name.slice(0, -'.reaping'.length))
+      // Same containment rule as the sweep: a stored path outside the media
+      // dir (moved root, edited row) must not be written to. Leave the staged
+      // file where it is.
+      if (row && !path.resolve(row.disk_path).startsWith(root)) {
+        console.warn(`retention: staged orphan ${staged} has a stored path outside the media dir (${row.disk_path}) — left in place`)
+        continue
+      }
       try {
         if (row) fs.renameSync(staged, row.disk_path)
         else fs.unlinkSync(staged)

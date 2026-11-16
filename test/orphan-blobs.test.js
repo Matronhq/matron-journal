@@ -180,6 +180,24 @@ test('a staged file whose row survived is restored even when the blob is no long
   assert.equal(fs.existsSync(`${b.diskPath}.reaping`), false)
 })
 
+test('recovery leaves a staged file in place when its row points outside mediaDir', async (t) => {
+  const warn = t.mock.method(console, 'warn', () => {})
+  t.after(() => warn.mock.restore())
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  const outsideDir = makeTmpDir('matron-outside-')
+  const outside = path.join(outsideDir, 'victim')
+  fs.writeFileSync(outside, 'external')
+  const b = seedAgedBlob(db, mediaDir, { userId: alice.id, bytes: 20, hoursAgo: 48 })
+  fs.renameSync(b.diskPath, `${b.diskPath}.reaping`)
+  db.prepare('UPDATE blobs SET disk_path=? WHERE id=?').run(outside, b.id)
+  runReapOrphanBlobs(db, { graceMs: 24 * HOUR, mediaDir })
+  assert.ok(fs.existsSync(`${b.diskPath}.reaping`), 'staged file left in place')
+  assert.equal(fs.readFileSync(outside, 'utf8'), 'external', 'external file untouched')
+  assert.deepEqual(fs.readdirSync(outsideDir), ['victim'])
+  assert.ok(warn.mock.calls.some((c) => String(c.arguments[0]).includes('outside the media dir')))
+})
+
 test('runReapOrphanBlobs finishes a blob a crashed pass left staged', async () => {
   const { db, alice } = await setup()
   const mediaDir = tmpMediaDir()
