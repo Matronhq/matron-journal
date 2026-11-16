@@ -43,13 +43,14 @@ async function fixture(t) {
   return { db, hub, user, parent, target, targetConn, frames, calls, ctx, request }
 }
 
-for (const scenario of ['default', 'enabled', 'other', 'asleep', 'closed socket', 'consent off', 'user only', 'requester user only', 'no cause', 'unverified cause', 'non-user cause', 'claim failure', 'claim conflict', 'record failure', 'hourly cap']) {
+for (const scenario of ['default', 'enabled', 'other', 'asleep', 'closed socket', 'consent off', 'user only', 'requester user only', 'protected target', 'no cause', 'unverified cause', 'non-user cause', 'claim failure', 'claim conflict', 'record failure', 'hourly cap']) {
   test(`spawn handler: ${scenario}`, async (t) => {
     const f = await fixture(t)
     if (scenario !== 'default') setAutoApproveCoordinatorSpawns(f.db, f.user.id, true)
     if (scenario === 'consent off') setConsentEnabled(f.db, f.user.id, false)
     if (scenario === 'user only') f.db.prepare('UPDATE devices SET consent_user_only=1 WHERE id=?').run(f.target.deviceId)
     if (scenario === 'requester user only') f.db.prepare('UPDATE devices SET consent_user_only=1 WHERE id=?').run(f.parent.deviceId)
+    if (scenario === 'protected target') f.db.prepare('UPDATE devices SET protected=1 WHERE id=?').run(f.target.deviceId)
     if (scenario === 'asleep' || scenario === 'closed socket') {
       if (scenario === 'asleep') f.hub.unregister(f.targetConn)
       else f.targetConn.ws.readyState = 3
