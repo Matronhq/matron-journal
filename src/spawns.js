@@ -669,6 +669,18 @@ export function sanitizeSpawnDisk(raw) {
   return { free_bytes: raw.free_bytes, total_bytes: raw.total_bytes }
 }
 
+// Vitals block: the box's host CPU and RAM use as percentages, with the time
+// of the sample so a client can grey a reading that has gone quiet. All-or-
+// nothing like the other blocks; only these three keys are copied.
+function isPct(v) { return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 100 }
+
+export function sanitizeBoxVitals(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  if (!isPct(raw.cpu_pct) || !isPct(raw.ram_pct)) return null
+  if (!Number.isInteger(raw.sampled_at_ms) || raw.sampled_at_ms <= 0 || raw.sampled_at_ms > AS_OF_MAX_MS) return null
+  return { cpu_pct: raw.cpu_pct, ram_pct: raw.ram_pct, sampled_at_ms: raw.sampled_at_ms }
+}
+
 // A bridge's own box-status report (`box_status` op): the same optional
 // capacity blocks a recent_folders reply may carry, plus the account it
 // burns quota against. Each block is all-or-nothing on its own; a report
@@ -680,6 +692,7 @@ export function sanitizeBoxStatus(raw) {
   const activity = sanitizeSpawnActivity(raw.activity)
   const limits = sanitizeSpawnLimits(raw.limits)
   const disk = sanitizeSpawnDisk(raw.disk)
+  const vitals = sanitizeBoxVitals(raw.vitals)
   const defaults = sanitizeBoxDefaults(raw.defaults)
   let account = null
   if (raw.account && typeof raw.account === 'object' && !Array.isArray(raw.account)
@@ -687,12 +700,13 @@ export function sanitizeBoxStatus(raw) {
     const email = sanitizePeerText(raw.account.email, ACCOUNT_EMAIL_CAP)
     if (email) account = { email }
   }
-  if (!activity && !limits && !disk && !account && !defaults) return null
+  if (!activity && !limits && !disk && !account && !vitals && !defaults) return null
   return {
     ...(activity ? { activity } : {}),
     ...(limits ? { limits } : {}),
     ...(disk ? { disk } : {}),
     ...(account ? { account } : {}),
+    ...(vitals ? { vitals } : {}),
     ...(defaults ? { defaults } : {}),
   }
 }

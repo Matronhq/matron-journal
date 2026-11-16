@@ -2698,7 +2698,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!status && lockedOk) break
         if (!status) return fail('bad_request', 'no valid status block')
         const reportedAt = Date.now()
-        upsertDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt })
+        // A report carrying only `vitals` (the bridge's frequent load sample)
+        // refreshes that block and keeps the stored usage, activity and disk
+        // blocks; any other report replaces the row as before.
+        if (Object.keys(status).every((k) => k === 'vitals')) mergeDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt })
+        else upsertDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt })
         // The same reading, filed in the usage history (best effort: a
         // failed write must not cost the live report).
         try { recordBoxUsage(db, { userId: conn.userId, deviceId: conn.deviceId, status, now: reportedAt }) }
