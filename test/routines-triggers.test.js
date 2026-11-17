@@ -312,6 +312,16 @@ test('allowance_expiring tiers: a window fired before tiers were recorded spends
   assert.match(sweep(7, 60)[0], /tier: 35% unused with 8 h left/)
 })
 
+test('allowance_expiring tiers: a pre-upgrade fire at a tier boundary spends that tier even when the subject rounds its reset later', async () => {
+  const { db, routine, sweep, reset, H } = await tierRig()
+  // The real reset is 25 minutes before the hour the subject rounds it to;
+  // the old fire came exactly 18 h before the real reset.
+  const real = reset - 25 * 60000
+  db.prepare('INSERT INTO routine_trigger_state(routine_id, subject, tripped_at) VALUES(?,?,?)').run(routine.id, `allowance:account:shared@example.com@${new Date(reset).toISOString()}`, real - 18 * H)
+  assert.equal(sweep(17, 40, real).length, 0, 'the 18 h tier fired before the upgrade')
+  assert.match(sweep(7, 60, real)[0], /tier: 35% unused with 8 h left/)
+})
+
 test('allowance_expiring tiers: the next weekly window fires every tier again', async () => {
   const { db, routine, sweep, reset, H } = await tierRig()
   assert.equal(sweep(17, 40).length, 1)

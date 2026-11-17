@@ -302,11 +302,15 @@ function allowanceWindowOpen(subject, now) {
 // one: the 8 h tier firing spends the 18 h tier too, so it never fires
 // after it. A record from before tiers were kept in the subject (no `#`)
 // spends every tier at least as far out as the hours left when it fired.
+// Its reset is rounded to the hour, up to half an hour from the real one,
+// so the hours left are read with that half hour of slack: a fire right
+// at a tier's boundary always spends that tier.
+const ROUNDING_SLACK_MS = 1800000
 function tierSpent(s, known) {
   for (const [k, trippedAt] of known) {
     if (k === s.window) {
       const reset = allowanceReset(k)
-      if (Number.isFinite(reset) && s.tierHours * 3600000 >= reset - trippedAt) return true
+      if (Number.isFinite(reset) && s.tierHours * 3600000 + ROUNDING_SLACK_MS >= reset - trippedAt) return true
     } else if (k.startsWith(`${s.window}#`) && s.tierHours >= Number.parseInt(k.slice(s.window.length + 1), 10)) return true
   }
   return false

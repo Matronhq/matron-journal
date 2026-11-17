@@ -2988,7 +2988,9 @@ the one that fired, and a tier never fires after a more urgent one; an
 allowance subject is remembered until an hour after its reset, not just
 while it matches, so dropping between tiers does not re-arm a spent tier;
 a record from before tiers were in the subject spends the tiers whose
-`hours_left` is at least the hours that were left when it fired), evaluated against `conversation_status` and `device_status` by a
+`hours_left` is at least the hours that were left when it fired, read
+with half an hour of slack because the subject rounds its reset to the
+hour), evaluated against `conversation_status` and `device_status` by a
 sweep every five minutes (`src/routines-triggers.js`), as the Coordinator's
 box may see them (private-owned sessions and private boxes are invisible
 to a Coordinator on an ordinary box). Each matching subject (`convo:<id>`
