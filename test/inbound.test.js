@@ -362,11 +362,22 @@ test('replies are off unless turned on: no tool, no route, nothing handed over',
   assert.deepEqual(rest.json, { error: 'replies_off' })
   assert.deepEqual(readReplies(w.s.db, getSource(w.s.db, w.source.id)), { status: 'replies_off' })
   // Turned on, what was typed before stays unread by the source.
-  assert.equal(setSourceReplies(w.s.db, w.source.id, true, { hub: w.s.hub }), true)
+  assert.equal(setSourceReplies(w.s.db, w.source.id, true), true)
   const line = events(w).at(-1)
   assert.equal(line.sender, 'journal')
   assert.match(line.payload.body, /^Replies are on\. Scout can read what you type in this conversation from now on, and nothing else in Matron\. What you type here leaves Matron and goes to Scout\.$/)
+  // The command that turned it on told no connected app. So is what is
+  // typed before the first read, which sends them the line and hands over
+  // nothing.
+  await say(w, 'Typed before this app was told.', 'a2')
+  assert.equal(getSource(w.s.db, w.source.id).replies_live, 0)
   assert.deepEqual((await w.send('/inbound/replies', {})).json, { replies: [], more: false })
+  const told = await w.ws.phone.waitFor((f) => f.kind === 'journal' && f.convo_id === w.source.convo_id && f.sender === 'journal' && /^Replies are on\./.test(f.payload?.body ?? ''))
+  assert.equal(told.seq, line.seq)
+  assert.equal(getSource(w.s.db, w.source.id).replies_live, 1)
+  assert.deepEqual((await w.send('/inbound/replies', {})).json, { replies: [], more: false })
+  await say(w, 'Typed after.', 'a3')
+  assert.deepEqual((await w.send('/inbound/replies', {})).json.replies.map((r) => r.text), ['Typed after.'])
   assert.equal(setSourceReplies(w.s.db, 'src_nope', true), false)
 })
 
@@ -395,13 +406,22 @@ test('get_replies: the user\'s messages in the source\'s conversation, listed un
   await say(w, 'Typed while the report was being written.', 'b3')
   assert.equal((await w.report({ body: 'Second report, answering.' })).status, 201)
   assert.deepEqual((await w.send('/inbound/replies', {})).json.replies.map((r) => r.text), ['Typed while the report was being written.'])
+  // Nor does a report whose request began before a read mark that read answered.
+  const before = getSource(w.s.db, w.source.id)
+  await say(w, 'Read while a report was on its way.', 'b4')
+  assert.equal((await w.send('/inbound/replies', {})).json.replies.length, 2)
+  assert.equal(acceptReport({ db: w.s.db }, before, { body: 'Sent before that read.' }).status, 'accepted')
+  assert.deepEqual((await w.send('/inbound/replies', {})).json.replies.map((r) => r.text), ['Read while a report was on its way.'])
+  assert.equal((await w.report({ body: 'A report in between.' })).status, 201)
   // A duplicate report answers nothing.
+  await say(w, 'One more.', 'b5')
+  assert.equal((await w.send('/inbound/replies', {})).json.replies.length, 1)
   assert.equal((await w.report({ body: 'Second report, answering.' })).status, 200)
   assert.equal((await w.send('/inbound/replies', {})).json.replies.length, 1)
   assert.equal((await w.report({ body: 'Third report.' })).status, 201)
   assert.deepEqual((await w.send('/inbound/replies', {})).json, { replies: [], more: false })
   // The Coordinator task is still filed for each message.
-  assert.equal(w.s.db.prepare("SELECT COUNT(*) n FROM items WHERE origin_convo_id='coord'").get().n, 3)
+  assert.equal(w.s.db.prepare("SELECT COUNT(*) n FROM items WHERE origin_convo_id='coord'").get().n, 5)
   // Turned off: the tool is gone, and the conversation says so.
   setSourceReplies(w.s.db, w.source.id, false)
   assert.match(events(w).at(-1).payload.body, /^Replies are off\./)
@@ -417,6 +437,7 @@ test('get_replies: the user\'s messages in the source\'s conversation, listed un
 test('get_replies: a page at a time, long messages cut, and a cap on reads', async (t) => {
   const w = await world(t, { coordinator: false })
   setSourceReplies(w.s.db, w.source.id, true)
+  await w.send('/inbound/replies', {})
   const { append } = await import('../src/journal.js')
   for (let i = 0; i < REPLIES_PER_READ_MAX + 2; i++) append(w.s.db, { userId: w.alice.id, convoId: w.source.convo_id, sender: 'user:alice', type: 'text', payload: { body: i === 0 ? 'x'.repeat(REPLY_MAX_CHARS + 50) : `m${i}` } })
   append(w.s.db, { userId: w.alice.id, convoId: w.source.convo_id, sender: 'user:alice', type: 'image', payload: {} })
@@ -428,8 +449,8 @@ test('get_replies: a page at a time, long messages cut, and a cap on reads', asy
   assert.match(told, /^20 messages from the user, oldest first\..* There are more: they follow after that report\.\n\n/)
   assert.equal((await w.report({ body: 'Answering the first page.' })).status, 201)
   assert.deepEqual((await w.send('/inbound/replies', {})).json.replies.map((r) => r.text), [`m${REPLIES_PER_READ_MAX}`, `m${REPLIES_PER_READ_MAX + 1}`])
-  // 30 reads an hour: three so far.
-  for (let i = 0; i < 27; i++) assert.equal((await w.send('/inbound/replies', {})).status, 200)
+  // 30 reads an hour: four so far.
+  for (let i = 0; i < 26; i++) assert.equal((await w.send('/inbound/replies', {})).status, 200)
   const over = await w.send('/inbound/replies', {})
   assert.equal(over.status, 429)
   assert.ok(Number(over.headers.get('retry-after')) > 0)

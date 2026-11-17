@@ -99,7 +99,7 @@ export function makeInboundHandler({ db, hub = null, pushPipeline = null, rateLi
     const recent = (reads.get(source.id) || []).filter((ts) => ts > now - 60 * 60 * 1000)
     let out
     if (recent.length >= REPLY_READS_HOURLY_MAX) out = { status: 'rate_limited', retryAfter: Math.max(1, Math.ceil((recent[0] + 60 * 60 * 1000 - now) / 1000)) }
-    else { recent.push(now); out = readReplies(db, source) }
+    else { recent.push(now); out = readReplies(db, source, { hub }) }
     reads.set(source.id, recent)
     // No content here either: how many, never what.
     log(`inbound: ${source.id} replies ${out.status}${out.replies ? ` n=${out.replies.length}` : ''}`)

@@ -244,6 +244,10 @@ function refuseOverCap(db, fan, source, { windowMs, max, per, now }) {
 export function acceptReport(ctx, source, input, { now = Date.now() } = {}) {
   const { db, hub = null, pushPipeline = null } = ctx
   const keyHash = source.token_hash
+  // The replies this report can have answered are the ones handed over
+  // before it was sent: `source` was loaded before the request body, so a
+  // read that lands while the body is on its way is not marked answered.
+  const answered = source.replies_seen_seq ?? 0
   const built = buildReport(input)
   if (!built.ok) return { status: built.error, detail: built.detail }
   // A panic-locked account (src/panic.js) takes nothing new from outside.
@@ -264,7 +268,7 @@ export function acceptReport(ctx, source, input, { now = Date.now() } = {}) {
     db.prepare('DELETE FROM inbound_posts WHERE source_id=? AND ts<=?').run(source.id, now - 2 * DAY)
     db.prepare('INSERT INTO inbound_posts(source_id, ts, body_hash, bytes) VALUES(?,?,?,?)').run(source.id, now, hash, built.bytes)
     // The report answers every reply the source has been handed.
-    db.prepare('UPDATE inbound_sources SET last_post_at=?, replies_done_seq=replies_seen_seq WHERE id=?').run(now, source.id)
+    db.prepare('UPDATE inbound_sources SET last_post_at=?, replies_done_seq=MAX(replies_done_seq, MIN(replies_seen_seq, ?)) WHERE id=?').run(now, answered, source.id)
     announceOnce(db, fan, source)
     // `from: 'source'` and `source` tell an app this is an outside tool's
     // text, not an agent's and not the user's.
@@ -301,6 +305,11 @@ export function sourceOfConvo(db, userId, convoId) {
 // nothing else. A message stays listed until the source posts its next
 // report: a lost answer costs nothing, and a message typed while a report
 // was being written is not skipped.
+//
+// The switch may be thrown by a command that has no connected apps to tell
+// (matron-admin). Then nothing is handed over until the running journal has
+// sent the "Replies are on" line to them: the first read does that, moves
+// the starting point to that moment and returns nothing.
 
 // Says so in the conversation either way, so the user sees the change where
 // it matters. Returns false for an unknown source.
@@ -315,21 +324,33 @@ export function setSourceReplies(db, id, on, { hub = null } = {}) {
       ? `Replies are on. ${source.name} can read what you type in this conversation from now on, and nothing else in Matron. What you type here leaves Matron and goes to ${source.name}.`
       : `Replies are off. ${source.name} can no longer read what you type in this conversation.` })
     // Nothing typed before this line is ever handed over.
-    db.prepare('UPDATE inbound_sources SET replies=?, replies_seen_seq=?, replies_done_seq=? WHERE id=?').run(on ? 1 : 0, r.seq, r.seq, id)
+    db.prepare('UPDATE inbound_sources SET replies=?, replies_seen_seq=?, replies_done_seq=?, replies_live=? WHERE id=?').run(on ? 1 : 0, r.seq, r.seq, hub ? 1 : 0, id)
     return true
   })()
   if (hub) for (const f of fan) broadcastAppended(db, hub, f)
   return ok
 }
 
-// `source` is a fresh row (sourceForKey). Returns {status: 'ok', replies:
-// [{at, text}], more} | {status: 'replies_off'} | {status: 'account_locked'}.
-export function readReplies(db, source) {
+// `source` is a fresh row (sourceForKey); `hub` is the running journal's.
+// Returns {status: 'ok', replies: [{at, text}], more} | {status:
+// 'replies_off'} | {status: 'account_locked'}.
+export function readReplies(db, source, { hub = null } = {}) {
   if (!source.replies) return { status: 'replies_off' }
   if (isPanicLocked(db, source.user_id)) return { status: 'account_locked' }
-  return db.transaction(() => {
+  const fan = []
+  const out = db.transaction(() => {
     const now = getSource(db, source.id)
     if (!now || !now.enabled || !now.replies || now.token_hash !== source.token_hash) return { status: 'replies_off' }
+    if (!now.replies_live) {
+      // The line saying replies are on (and the conversation's announcement,
+      // when the same command wrote it) has not been sent to connected apps.
+      const lines = db.prepare(`SELECT seq, ts, sender, type, payload FROM events WHERE user_id=? AND convo_id=? AND sender=? AND seq BETWEEN ? AND ?
+        ORDER BY seq`).all(now.user_id, now.convo_id, JOURNAL, now.replies_done_seq - 1, now.replies_done_seq)
+      for (const e of lines) fan.push({ userId: now.user_id, convoId: now.convo_id, seq: e.seq, ts: e.ts, sender: e.sender, type: e.type, payload: JSON.parse(e.payload) })
+      const from = db.prepare('SELECT MAX(seq) AS seq FROM events WHERE user_id=? AND convo_id=?').get(now.user_id, now.convo_id).seq ?? now.replies_done_seq
+      db.prepare('UPDATE inbound_sources SET replies_live=1, replies_seen_seq=?, replies_done_seq=? WHERE id=?').run(from, from, now.id)
+      return { status: 'ok', replies: [], more: false }
+    }
     const rows = db.prepare(`SELECT seq, ts, payload FROM events WHERE user_id=? AND convo_id=? AND seq>? AND type='text' AND sender LIKE 'user:%'
       ORDER BY seq LIMIT ?`).all(now.user_id, now.convo_id, now.replies_done_seq, REPLIES_PER_READ_MAX + 1)
     const more = rows.length > REPLIES_PER_READ_MAX
@@ -343,4 +364,6 @@ export function readReplies(db, source) {
     if (last != null && last > now.replies_seen_seq) db.prepare('UPDATE inbound_sources SET replies_seen_seq=? WHERE id=?').run(last, now.id)
     return { status: 'ok', replies, more }
   })()
+  if (hub) for (const f of fan) broadcastAppended(db, hub, f)
+  return out
 }

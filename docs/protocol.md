@@ -3806,11 +3806,13 @@ writes one line in the source's conversation saying what the source can
 now read, or no longer can. Turned on, the key can read the `text` events
 the user sent into the source's own conversation after that line. Nothing
 typed before it, no other conversation, no item, file or other journal
-data.
+data. The command has no connected apps to tell, so the source's first read
+after the switch sends them that line, returns nothing and starts from
+there: nothing typed before the apps were told is handed over.
 
 A message stays listed until the source's next accepted report: a read
 records the newest message handed over, and an accepted report marks
-everything up to that point answered. So a read whose answer was lost can
+answered what had been handed over when its request arrived. So a read whose answer was lost can
 be repeated, a message typed while a report is being written is handed
 over on the following read, and a duplicate report answers nothing. A read
 returns at most 20 messages, oldest first, each cut at 4000 characters;

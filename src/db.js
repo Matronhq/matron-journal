@@ -1106,7 +1106,8 @@ CREATE TABLE IF NOT EXISTS inbound_sources(
   created_at        INTEGER NOT NULL,
   replies           INTEGER NOT NULL DEFAULT 0,
   replies_seen_seq  INTEGER NOT NULL DEFAULT 0,
-  replies_done_seq  INTEGER NOT NULL DEFAULT 0
+  replies_done_seq  INTEGER NOT NULL DEFAULT 0,
+  replies_live      INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_inbound_sources_name ON inbound_sources(user_id, name COLLATE NOCASE);
 CREATE TABLE IF NOT EXISTS inbound_posts(
@@ -2893,11 +2894,12 @@ export function addTransferRecipient(db) {
 // chat invite (delivered later, on the box's hello, when it is asleep) and
 // the released transfer. NULL for every other answer. Idempotent.
 // Replies (src/inbound.js): whether a source may read what the user types
-// in its conversation, the newest message it has been handed, and the
-// newest one its last report answered. Idempotent.
+// in its conversation, the newest message it has been handed, the newest
+// one its last report answered, and whether connected apps have been sent
+// the line that says replies are on. Idempotent.
 export function addInboundReplies(db) {
   const has = (col) => db.prepare('PRAGMA table_info(inbound_sources)').all().some((c) => c.name === col)
-  for (const col of ['replies', 'replies_seen_seq', 'replies_done_seq']) {
+  for (const col of ['replies', 'replies_seen_seq', 'replies_done_seq', 'replies_live']) {
     if (!has(col)) db.exec(`ALTER TABLE inbound_sources ADD COLUMN ${col} INTEGER NOT NULL DEFAULT 0`)
   }
 }
