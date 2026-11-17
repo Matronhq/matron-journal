@@ -163,8 +163,7 @@ test('validateRecall: min_z', () => {
 test('query: filters apply to every match, not to a first page of them', async () => {
   const db = seed()
   // 60 always memories all mention vans; one on-demand memory does too.
-  for (let i = 0; i < 60; i++) upsertMemory(db, { userId: 1, name: `van-rule-${i}`, description: `Vans rule ${i}.`, body: '', by: 'agent', softCap: true, tier: 'always' })
-  db.prepare("UPDATE memories SET tier='always'").run()
+  for (let i = 0; i < 60; i++) upsertMemory(db, { userId: 1, name: `van-rule-${i}`, description: `Vans rule ${i}.`, body: '', by: 'agent', tier: 'always' })
   upsertMemory(db, { userId: 1, name: 'zz-van-on-demand', description: 'Vans need booking a week ahead.', body: '', tier: 'on_demand', by: 'agent' })
   const r = await recallMemories(db, 1, ask({ text: 'vans', tier: 'on_demand' }), { semantic: null })
   assert.deepEqual(r.memories.map((m) => m.name), ['zz-van-on-demand'])

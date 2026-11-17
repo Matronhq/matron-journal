@@ -9,7 +9,7 @@ import { json, readBody } from './http-body.js'
 import { senderOf, badRequest, notFound } from './http-who.js'
 import { filteredAgent, privateOwnedConvo } from './privacy.js'
 import { getCoordinatorConvoId } from './coordinator.js'
-import { validName, validateMemoryFields, getMemory, listMemories, upsertMemory, deleteMemory, privateOrigin, alwaysMaxFor, MEMORIES_MAX } from './memories.js'
+import { validName, validateMemoryFields, getMemory, listMemories, upsertMemory, deleteMemory, privateOrigin, MEMORIES_MAX } from './memories.js'
 import { validateRecall, recallMemories } from './memory-recall.js'
 import { causesFromFrame } from './ask-causes.js'
 import { needsUserAnswer, fileProposal, answerPending } from './memory-proposals-http.js'
@@ -132,17 +132,10 @@ async function handlePut(ctx, req, res, who, name) {
     })
   } catch (err) {
     if (err.message === 'too_many') { json(res, 409, { error: 'too_many' }); return true }
-    if (err.message === 'always_full') {
-      const scope = v.value.scope ?? existing?.scope ?? 'global'
-      json(res, 409, { error: 'always_full', scope, max: alwaysMaxFor(scope) })
-      return true
-    }
     throw err
   }
   emitMemoryMarker(ctx, who, { memory: out.memory, action: 'saved', created: out.created, writerConvoId: convoId })
-  // `capped`: a create that named no tier landed on_demand because its
-  // scope's always tier is full; the writer says so.
-  json(res, out.created ? 201 : 200, { memory: out.memory, ...(out.capped ? { capped: true, max: alwaysMaxFor(out.memory.scope) } : {}) })
+  json(res, out.created ? 201 : 200, { memory: out.memory })
   return true
 }
 

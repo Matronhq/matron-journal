@@ -1,7 +1,6 @@
 // Memory tiers and topics: `always` memories are listed in full in every
-// session of their scope, `on_demand` ones are named under a topic. The
-// always tier is capped per scope; only a write that would add to a full
-// set is affected.
+// session of their scope, `on_demand` ones are named under a topic. Neither
+// tier has a size limit.
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -10,7 +9,7 @@ import path from 'node:path'
 import Database from 'better-sqlite3'
 import { openDb } from '../src/db.js'
 import { seed } from './search-fixtures.js'
-import { validateMemoryFields, upsertMemory, getMemory, ALWAYS_MAX, alwaysMaxFor } from '../src/memories.js'
+import { validateMemoryFields, upsertMemory, getMemory } from '../src/memories.js'
 import { recordProposal } from '../src/memory-proposals.js'
 import { proposalItemFields } from '../src/memory-proposals-http.js'
 
@@ -48,51 +47,17 @@ test('a new memory is always by default; tier and topic are kept on an update th
   assert.equal(save(db, 'b', { tier: 'always' }).memory.tier, 'always')
 })
 
-test('caps: per scope, repo scopes share one size', () => {
-  assert.equal(alwaysMaxFor('global'), ALWAYS_MAX.global)
-  assert.equal(alwaysMaxFor('coordinator'), ALWAYS_MAX.coordinator)
-  assert.equal(alwaysMaxFor('repo:widgets'), ALWAYS_MAX.repo)
-})
-
-test('a full always tier: an unnamed create lands on_demand (capped), a named one is refused, other scopes are untouched', () => {
+test('no size limit: a scope takes any number of always memories, and a tier is only what the writer names', () => {
   const db = seed()
-  fill(db, 'repo:widgets', ALWAYS_MAX.repo)
-  const r = save(db, 'late', { scope: 'repo:widgets' })
-  assert.equal(r.memory.tier, 'on_demand')
-  assert.equal(r.capped, true)
-  assert.throws(() => save(db, 'insist', { scope: 'repo:widgets', tier: 'always' }), /always_full/)
-  assert.equal(getMemory(db, 1, 'insist'), null, 'nothing written on a refusal')
-  const other = save(db, 'elsewhere', { scope: 'repo:gadgets' })
-  assert.deepEqual([other.memory.tier, other.capped], ['always', false])
-})
-
-test('a full always tier still takes updates to its own members, and frees a place when one moves out', () => {
-  const db = seed()
-  fill(db, 'repo:widgets', ALWAYS_MAX.repo)
-  const u = save(db, 'm-0', { scope: 'repo:widgets', description: 'Reworded.' })
-  assert.deepEqual([u.memory.tier, u.capped], ['always', false])
-  save(db, 'm-0', { tier: 'on_demand' })
-  assert.equal(save(db, 'newcomer', { scope: 'repo:widgets', tier: 'always' }).memory.tier, 'always')
-  assert.throws(() => save(db, 'm-0', { tier: 'always' }), /always_full/, 'moving back in needs a free place')
-})
-
-test('moving an always memory into a full scope is refused unless it goes on_demand', () => {
-  const db = seed()
-  fill(db, 'repo:widgets', ALWAYS_MAX.repo)
+  fill(db, 'global', 80)
+  const r = save(db, 'one-more', { scope: 'global' })
+  assert.equal(r.memory.tier, 'always')
+  assert.equal('capped' in r, false)
+  assert.equal(save(db, 'named', { scope: 'global', tier: 'always' }).memory.tier, 'always')
   save(db, 'mover', { scope: 'repo:gadgets' })
-  assert.throws(() => save(db, 'mover', { scope: 'repo:widgets' }), /always_full/)
-  assert.equal(getMemory(db, 1, 'mover').scope, 'repo:gadgets')
-  const moved = save(db, 'mover', { scope: 'repo:widgets', tier: 'on_demand' }).memory
-  assert.deepEqual([moved.scope, moved.tier], ['repo:widgets', 'on_demand'])
-})
-
-test('rows already over the cap stay as they are', () => {
-  const db = seed()
-  fill(db, 'repo:widgets', ALWAYS_MAX.repo)
-  db.prepare("UPDATE memories SET tier='always'").run()
-  db.prepare("INSERT INTO memories(id, user_id, name, type, scope, description, created_by, updated_by, created_at, updated_at) VALUES('me_x', 1, 'extra', 'feedback', 'repo:widgets', 'x', 'agent', 'agent', 1, 1)").run()
-  assert.equal(getMemory(db, 1, 'extra').tier, 'always')
-  assert.equal(save(db, 'extra', { description: 'still here' }).memory.tier, 'always')
+  assert.deepEqual([save(db, 'mover', { scope: 'global' }).memory.scope, getMemory(db, 1, 'mover').tier], ['global', 'always'])
+  save(db, 'm-0', { tier: 'on_demand' })
+  assert.equal(save(db, 'm-0', { tier: 'always' }).memory.tier, 'always')
 })
 
 test('schema: a pre-tier memories table gets tier (always) and topic in place', () => {
@@ -114,7 +79,7 @@ test('schema: a pre-tier memories table gets tier (always) and topic in place', 
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('a proposal records tier and topic; its card shows them; approval past the cap lands on_demand', async () => {
+test('a proposal records tier and topic; its card shows them', async () => {
   const db = seed()
   const { proposal } = recordProposal(db, { userId: 1, name: 'p1', action: 'save', fields: { description: 'Rule.', body: '', tier: 'on_demand', topic: 'couriers' }, fromDeviceId: 1, fromConvoId: 'c1' })
   assert.deepEqual([proposal.tier, proposal.topic], ['on_demand', 'couriers'])
@@ -124,7 +89,4 @@ test('a proposal records tier and topic; its card shows them; approval past the 
   assert.match(proposalItemFields(db, p2).body, /\*\*Tier:\*\* always/)
   const { proposal: p4 } = recordProposal(db, { userId: 1, name: 'p4', action: 'save', fields: { description: 'Rule.', body: '', tier: 'on_demand', topic: '[details](https://example.com)' }, fromDeviceId: 1, fromConvoId: 'c1' })
   assert.doesNotMatch(proposalItemFields(db, p4).body, /\[details\]\(https/, 'a topic cannot render as a link on the card')
-  fill(db, 'global', ALWAYS_MAX.global)
-  const out = upsertMemory(db, { userId: 1, name: 'p3', description: 'Rule.', body: '', tier: 'always', softCap: true, by: 'agent' })
-  assert.deepEqual([out.memory.tier, out.capped], ['on_demand', true])
 })
