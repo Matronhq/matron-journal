@@ -16,7 +16,7 @@
     "conformance:pack": "node tools/conformance-pack.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "overrides": {
     "sharp": "^0.35.5"
