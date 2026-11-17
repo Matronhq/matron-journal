@@ -214,9 +214,9 @@ test('convo_upsert accepts session_outcome: session_status payload and snapshot 
 test('convo_upsert accepts agent_kind: convo_meta payload and snapshot carry it; mutable and sticky', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())
-  const dan = await createUser(s.db, 'dan', 'pw')
-  const ag = createAgent(s.db, dan.id, 'dev-2')
-  const login = await s.http('/login', { method: 'POST', body: { username: 'dan', password: 'pw', device_name: 'mac' } })
+  const alice = await createUser(s.db, 'alice', 'pw')
+  const ag = createAgent(s.db, alice.id, 'box-2')
+  const login = await s.http('/login', { method: 'POST', body: { username: 'alice', password: 'pw', device_name: 'mac' } })
   const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
   const client = await makeWsClient(s.base, { token: login.json.token, cursor: 0 })
   await agent.waitFor((f) => f.op === 'hello_ok')
@@ -257,8 +257,8 @@ test('convo_upsert accepts agent_kind: convo_meta payload and snapshot carry it;
 test('convo_upsert rejects a malformed agent_kind with bad_request, connection survives', async (t) => {
   const s = await startTestServer()
   t.after(() => s.close())
-  const dan = await createUser(s.db, 'dan', 'pw')
-  const ag = createAgent(s.db, dan.id, 'dev-2')
+  const alice = await createUser(s.db, 'alice', 'pw')
+  const ag = createAgent(s.db, alice.id, 'box-2')
   const agent = await makeWsClient(s.base, { token: ag.token, cursor: null })
   await agent.waitFor((f) => f.op === 'hello_ok')
 
