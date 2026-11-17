@@ -675,25 +675,44 @@ export function sanitizeSpawnDisk(raw) {
 // with no valid block at all is rejected (nothing to store).
 const ACCOUNT_EMAIL_CAP = 254
 
+// `plugins`: the names of the bridge plugins the box has loaded. A short
+// list of short plain strings; all-or-nothing like the other blocks.
+const PLUGINS_MAX = 32
+const PLUGIN_NAME_CAP = 32
+
+export function sanitizeBoxPlugins(raw) {
+  if (!Array.isArray(raw) || raw.length > PLUGINS_MAX) return null
+  const out = []
+  for (const n of raw) {
+    if (typeof n !== 'string' || !n || n.length > PLUGIN_NAME_CAP) return null
+    const name = sanitizePeerText(n, PLUGIN_NAME_CAP)
+    if (!name) return null
+    if (!out.includes(name)) out.push(name)
+  }
+  return out
+}
+
 export function sanitizeBoxStatus(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
   const activity = sanitizeSpawnActivity(raw.activity)
   const limits = sanitizeSpawnLimits(raw.limits)
   const disk = sanitizeSpawnDisk(raw.disk)
   const defaults = sanitizeBoxDefaults(raw.defaults)
+  const plugins = sanitizeBoxPlugins(raw.plugins)
   let account = null
   if (raw.account && typeof raw.account === 'object' && !Array.isArray(raw.account)
     && typeof raw.account.email === 'string' && raw.account.email.length <= ACCOUNT_EMAIL_CAP) {
     const email = sanitizePeerText(raw.account.email, ACCOUNT_EMAIL_CAP)
     if (email) account = { email }
   }
-  if (!activity && !limits && !disk && !account && !defaults) return null
+  if (!activity && !limits && !disk && !account && !defaults && !plugins) return null
   return {
     ...(activity ? { activity } : {}),
     ...(limits ? { limits } : {}),
     ...(disk ? { disk } : {}),
     ...(account ? { account } : {}),
     ...(defaults ? { defaults } : {}),
+    ...(plugins ? { plugins } : {}),
   }
 }
 
