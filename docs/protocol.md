@@ -577,7 +577,7 @@ the machine-checkable version of this page.
   uses; `defaults` is the box's stored `{agent, model, effort}` as on
   `GET /devices` (see *Box defaults*). `conversations`:
   `[{id, title, session_state, last_seq, summary, agent_device_id,
-  created_at, last_ts, mission_num, status?}]` — top-level conversations only
+  agent_kind, created_at, last_ts, mission_num, status?}]` — top-level conversations only
   (`parent_convo_id IS NULL`; children are silenced sub-chats, never invite/
   chat targets), ordered by `COALESCE(last_ts, created_at) DESC, id DESC`:
   newest last message first, falling back to `created_at` when there are no
@@ -1098,7 +1098,7 @@ Rows from before the stamp carry neither, and don't count.
   user or device. Bridges MUST mint globally unique ids — Claude session
   UUIDs are the convention.
 - `convo_upsert` appends a `convo_meta` journal event
-  (`payload:{title, auto_title, parent_convo_id, agent_device_id, repo}`, sender = the agent device, e.g.
+  (`payload:{title, auto_title, parent_convo_id, agent_device_id, agent_kind, repo}`, sender = the agent device, e.g.
   `agent:box-2`) whenever it changes an existing conversation's title or
   `auto_title` (see *Mission-named conversations*), sets
   a non-empty title at creation, or creates a child (`parent_convo_id` set,
@@ -1110,6 +1110,15 @@ Rows from before the stamp carry neither, and don't count.
   connection's own device — the same id `convo_upsert` records on the row —
   so a live client can attribute a brand-new conversation to its box without
   waiting for the next `/snapshot`.
+- `convo_upsert` accepts an optional `agent_kind` (non-empty string, at most
+  16 chars; else `bad_request`): which kind of agent backs the conversation,
+  e.g. `claude` or `codex`. One agent device (a bridge) can host both, so the
+  owning device does not say. The journal does not enumerate the values; a
+  client renders an unrecognised one as no marker. Omitted leaves the stored
+  kind unchanged (`COALESCE`); a later value replaces it, so an agent switch
+  updates it. Served as `agent_kind` (`null` when never set) on each
+  conversation in `GET /snapshot` and `GET /roster`, and carried on the
+  `convo_meta` payload.
 - `convo_upsert` accepts an optional `repo`: the canonical `host/org/name`
   of the session's git remote (lower-cased host and org, e.g.
   `github.com/matronhq/matron-journal`; regex

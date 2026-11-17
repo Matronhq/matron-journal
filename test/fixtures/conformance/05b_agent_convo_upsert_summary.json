@@ -207,6 +207,7 @@
               "agent_device_id": {
                 "$ref": "bridge.device_id"
               },
+              "agent_kind": null,
               "mission_id": null,
               "mission_count": 0,
               "created_at": {

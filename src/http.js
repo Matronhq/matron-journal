@@ -693,7 +693,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           defaults: boxDefaults.get(d.device_id),
         }))
         const rows = db.prepare(
-          `SELECT id, title, session_state, last_seq, summary, agent_device_id, created_at,
+          `SELECT id, title, session_state, last_seq, summary, agent_device_id, agent_kind, created_at,
                   (SELECT m.num FROM missions m WHERE m.id = conversations.mission_id${filtered ? ` AND ${ORIGIN_SIEVE}` : ''}) AS mission_num,
                   (SELECT ts FROM events e WHERE e.convo_id = conversations.id
                    AND e.type IN (${MESSAGE_TYPES_SQL})
