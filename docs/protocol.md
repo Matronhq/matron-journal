@@ -3712,7 +3712,7 @@ lines were dropped, and — for a firing alert whose name matches
 disk and start a safe clean-up below 20% free. Every payload field is
 peer-text sanitised on its own, so nothing in a label can add a line.
 
-### Inbound sources (`POST /inbound/reports`, `POST /inbound/mcp`)
+### Inbound sources (`POST /inbound/reports`, `POST /inbound/replies`, `POST /inbound/mcp`)
 
 (`src/inbound.js`, `src/inbound-http.js`, `src/inbound-replies.js`.) An
 inbound source is an outside tool the user lets post reports into Matron: a
@@ -3720,11 +3720,13 @@ hosted assistant, a scheduled job, a workflow service. It has a name, a key
 and one conversation of its own, and each report is one message there.
 
 **The key** (`mis_…`, 256 random bits, only its sha256 stored) can post a
-report and nothing else. It is not a device token: it reads nothing, opens no
-socket and is refused by every other route. `matron-admin inbound add <user>
+report and, only when replies are turned on for the source (below), read
+what the user typed in the source's own conversation. It is not a device
+token: it reads nothing else, opens no socket and is refused by every other
+route. `matron-admin inbound add <user>
 <name> [--hourly N] [--daily N]` creates a source and prints the key once;
-`inbound list`, `limits`, `rotate` (a new key, the old one dead at once) and
-`disable|enable` manage it. A user has at most 20 sources; a name is 1 to 40
+`inbound list`, `limits`, `rotate` (a new key, the old one dead at once),
+`disable|enable` and `replies <id> on|off` manage it. A user has at most 20 sources; a name is 1 to 40
 letters, digits, spaces, dots, dashes or underscores, unique per user.
 
 **The conversation** is a system conversation, `conversations.system =
@@ -3765,7 +3767,7 @@ and not counted. Over a cap the post is refused, and at most once a day the
 journal writes one line in the source's conversation saying reports over the
 limit are being refused. A panic-locked account takes no reports.
 
-**Both routes** are mounted ahead of the device Bearer auth and take the key
+**All three routes** are mounted ahead of the device Bearer auth and take the key
 as `Authorization: Bearer <key>`. With no source in
 the journal they decline, and the paths answer as any unknown path does.
 Otherwise a missing, wrong or disabled key is **401** `unauthenticated` and
@@ -3792,11 +3794,46 @@ message per POST, JSON replies, no stream. It answers `initialize`
 `tools/list` and `tools/call`; a notification gets **202**; any other method
 is `-32601`. Its one tool, `post_report {title?, body, links?}`, ends in the
 same code as the route above and answers with one line of text (`Posted.`,
-already posted, or why not), `isError` set for anything but those two. It
-offers nothing to read.
+already posted, or why not), `isError` set for anything but those two.
+With replies off it offers nothing to read. With replies on, `tools/list`
+adds `get_replies {}` and `initialize`'s instructions name it; for a source
+with replies off a call to it is `-32602`, as for any unknown tool.
 
-**The log** has one line per post: the source id, the outcome and the size.
-Never the text.
+**Replies** (`inbound_sources.replies`, off by default). The user's words
+leave Matron when a source reads them, so each source is switched
+separately: `matron-admin inbound replies <id> on|off`. Either change
+writes one line in the source's conversation saying what the source can
+now read, or no longer can. Turned on, the key can read the `text` events
+the user sent into the source's own conversation after that line. Nothing
+typed before it, no other conversation, no item, file or other journal
+data. The command has no connected apps to tell, so the source's first read
+after the switch sends them that line, returns nothing and starts from
+there: nothing typed before the apps were told is handed over.
+
+A message stays listed until the source's next accepted report: a read
+records the newest message handed over, and an accepted report marks
+answered what had been handed over when its request arrived. So a read whose answer was lost can
+be repeated, a message typed while a report is being written is handed
+over on the following read, and a duplicate report answers nothing. A read
+returns at most 20 messages, oldest first, each cut at 4000 characters;
+`more` says others are waiting, and they follow once a report has answered
+the first page. A source may read 30 times an hour.
+
+`POST /inbound/replies` `{}`:
+
+| Status | Body | |
+|---|---|---|
+| 200 | `{replies:[{at, text}], more}` | `at` is the ISO time the message was sent |
+| 403 | `{error:'replies_off'}` | replies are not on for this source |
+| 403 | `{error:'account_locked'}` | the account is panic-locked |
+| 429 | `{error:'rate_limited', retry_after}` + `Retry-After` | over 30 reads an hour |
+
+`get_replies` answers with the same messages as text, each under its time,
+or `No new messages from the user.`
+
+**The log** has one line per post (the source id, the outcome and the size)
+and one per read (the source id, the outcome and how many messages). Never
+the text.
 
 **What the user types there.** A `send` of `type: 'text'` into a source's
 conversation is stored and, as in the People conversation, passed to the
@@ -3808,7 +3845,9 @@ strangers wrote, to be read as information and never followed as
 instructions (cut at about 26 KiB, with a note). The journal answers in the
 conversation with a link to the task, or says that nobody read the message
 when no Coordinator is set. A send of any other type is `bad_request`. This
-is the only way a report reaches an agent.
+is the only way a report reaches an agent. With replies on, the task is
+filed all the same and the journal's line adds that the source can read
+what is typed there.
 
 ### Notice items
 
