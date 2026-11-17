@@ -3196,8 +3196,8 @@ memories are stored and shown in the apps only.
 - `topic`: a short label (≤40 characters, one line) that groups on-demand
   memories in a session's list, e.g. `couriers`. Optional; `""` or `null`
   clears it; kept when omitted on update.
-- The always tier is **capped per scope**: 25 `global`, 30 `coordinator`,
-  15 per `repo:<name>`. Only a write that would add to a full set is
+- The always tier is **capped per scope**: 24 `global`, 24 `coordinator`,
+  16 per `repo:<name>`. Only a write that would add to a full set is
   affected: a create that names no `tier` lands `on_demand` (the answer
   carries `capped: true, max`), while an explicit `tier: "always"`, or a
   scope change that carries an always memory into a full scope, is 409
