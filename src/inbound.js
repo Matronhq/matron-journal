@@ -99,9 +99,14 @@ export function setSourceEnabled(db, id, enabled) {
 // A new key for the same source; the old one stops working at once.
 export function rotateSourceKey(db, id) {
   const key = INBOUND_KEY_PREFIX + randomBytes(32).toString('base64url')
-  // Upload addresses made under the old key go with it.
-  dropUploadAddresses(db, id)
-  return db.prepare('UPDATE inbound_sources SET token_hash=? WHERE id=?').run(sha256(key), id).changes > 0 ? key : null
+  // Upload addresses made under the old key go with it, in the same write:
+  // a request under the old key (reserveFile checks it) cannot slip one in
+  // between.
+  return db.transaction(() => {
+    if (!db.prepare('UPDATE inbound_sources SET token_hash=? WHERE id=?').run(sha256(key), id).changes) return null
+    dropUploadAddresses(db, id)
+    return key
+  })()
 }
 
 export function setSourceCaps(db, id, { hourlyMax, dailyMax }) {

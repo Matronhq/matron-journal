@@ -150,10 +150,13 @@ export function makeInboundHandler({ db, hub = null, pushPipeline = null, rateLi
     if (used + got.size > mediaUserQuotaBytes) { await drop(); log(`inbound: ${source.id} file quota_exceeded`); return json(res, 413, { error: 'quota_exceeded' }) }
     const dims = kind.contentType.startsWith('image/') ? imageSizeFromFile(got.diskPath) : null
     let kept = false
+    let locked = false
     try {
       kept = db.transaction(() => {
-        // The source may have been disabled, or the place filled, meanwhile.
+        // The source may have been disabled, the account locked
+        // (src/panic.js), or the place filled, while the bytes arrived.
         if (!getSource(db, source.id)?.enabled) return false
+        if (isPanicLocked(db, source.user_id)) { locked = true; return false }
         insertBlob(db, { id: got.id, ownerUserId: source.user_id, contentType: kind.contentType, size: got.size, sha256: got.sha256, diskPath: got.diskPath, width: dims?.width ?? 0, height: dims?.height ?? 0 })
         if (fillFile(db, fileId, { blobId: got.id, contentType: kind.contentType, ext: kind.ext, size: got.size })) return true
         db.prepare('DELETE FROM blobs WHERE id=?').run(got.id)
@@ -162,6 +165,7 @@ export function makeInboundHandler({ db, hub = null, pushPipeline = null, rateLi
     } finally {
       if (!kept) await drop()
     }
+    if (locked) { log(`inbound: ${source.id} file account_locked`); return json(res, 403, { error: 'account_locked' }) }
     if (!kept) { log(`inbound: ${source.id} file gone`); return json(res, 404, { error: 'not_found' }) }
     const row = db.prepare('SELECT name FROM inbound_files WHERE id=?').get(fileId)
     log(`inbound: ${source.id} file accepted bytes=${got.size} type=${kind.contentType}`)
@@ -225,6 +229,7 @@ export function makeInboundHandler({ db, hub = null, pushPipeline = null, rateLi
     if (files) {
       if (isPanicLocked(db, source.user_id)) { answer(req, res, 403, { error: 'account_locked' }, rejectEarly); return true }
       const place = reserveFile(db, source, { name: url.searchParams.get('name') ?? '' })
+      if (place.status === 'gone') { res.setHeader('www-authenticate', 'Bearer'); answer(req, res, 401, { error: 'unauthenticated' }, rejectEarly); return true }
       if (place.status !== 'ok') {
         res.setHeader('retry-after', String(place.retryAfter))
         answer(req, res, 429, { error: 'rate_limited', retry_after: place.retryAfter }, rejectEarly)
@@ -282,6 +287,7 @@ export function makeInboundHandler({ db, hub = null, pushPipeline = null, rateLi
         const text = place.status === 'ok'
           ? JSON.stringify({ file_id: place.id, upload_url: `${baseUrl(req)}${INBOUND_UPLOADS_PREFIX}${place.secret}`, method: 'PUT', expires_in_seconds: UPLOAD_TICKET_MS / 1000 })
           : place.status === 'account_locked' ? 'No upload address: the account is locked.'
+            : place.status === 'gone' ? 'No upload address: the source is no longer enabled, or its key changed.'
             : `No upload address: this source is over its limit for files. Try again in ${place.retryAfter} seconds.`
         json(res, 200, rpcResult(id, { content: [{ type: 'text', text }], isError: place.status !== 'ok' }))
         return true

@@ -5,8 +5,9 @@ import os from 'node:os'
 import path from 'node:path'
 import { startTestServer, makeWsClient } from './helpers.js'
 import { createUser, createAgent } from '../src/auth.js'
-import { createSource, setSourceEnabled, rotateSourceKey } from '../src/inbound.js'
-import { sniffType, cleanFileName, FILE_MAX_BYTES, FILE_ATTACH_MS, UPLOAD_TICKET_MS } from '../src/inbound-files.js'
+import http from 'node:http'
+import { createSource, setSourceEnabled, rotateSourceKey, getSource } from '../src/inbound.js'
+import { reserveFile, sniffType, cleanFileName, FILE_MAX_BYTES, FILE_ATTACH_MS, UPLOAD_TICKET_MS } from '../src/inbound-files.js'
 
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64')
 const PDF = Buffer.from('%PDF-1.4\n%%EOF\n')
@@ -173,4 +174,31 @@ test('a locked account takes no file and hands out no upload address', async (t)
   assert.equal((await fetch(before.upload_url, { method: 'PUT', body: PNG })).status, 403)
   assert.equal(w.s.db.prepare('SELECT COUNT(*) n FROM inbound_files').get().n, 1)
   assert.equal(w.s.db.prepare('SELECT COUNT(*) n FROM blobs').get().n, 0)
+})
+
+test('an account locked while a file is on its way keeps none of it', async (t) => {
+  const w = await world(t)
+  const u = new URL(`${w.s.base}/inbound/files?name=chart.png`)
+  const status = await new Promise((resolve, reject) => {
+    const req = http.request({ host: u.hostname, port: u.port, path: u.pathname + u.search, method: 'POST', headers: { authorization: `Bearer ${w.key}`, 'content-type': 'application/octet-stream', 'content-length': PNG.length } }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)) })
+    req.on('error', reject)
+    req.write(PNG.subarray(0, 20))
+    setTimeout(() => {
+      w.s.db.prepare('INSERT INTO panic_locks(user_id, since) VALUES(?,?)').run(w.alice.id, Date.now())
+      req.end(PNG.subarray(20))
+    }, 150)
+  })
+  assert.equal(status, 403)
+  assert.equal(w.s.db.prepare('SELECT COUNT(*) n FROM blobs').get().n, 0)
+  assert.equal(w.s.db.prepare('SELECT COUNT(*) n FROM inbound_files WHERE blob_id IS NOT NULL').get().n, 0)
+})
+
+test('a request that began under a replaced key gets no place for a file', async (t) => {
+  const w = await world(t)
+  const stale = getSource(w.s.db, w.source.id)
+  assert.equal(reserveFile(w.s.db, stale, { ticket: true }).status, 'ok')
+  rotateSourceKey(w.s.db, w.source.id)
+  assert.equal(w.s.db.prepare('SELECT COUNT(*) n FROM inbound_files WHERE secret_hash IS NOT NULL AND blob_id IS NULL').get().n, 0)
+  assert.deepEqual(reserveFile(w.s.db, stale, { ticket: true }), { status: 'gone' })
+  assert.deepEqual(reserveFile(w.s.db, stale), { status: 'gone' })
 })

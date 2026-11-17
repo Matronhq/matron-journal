@@ -70,6 +70,10 @@ export const fileCaps = (source) => ({ hourly: source.hourly_max * FILES_PER_REP
 // {status:'rate_limited', retryAfter}.
 export function reserveFile(db, source, { name = '', ticket = false, now = Date.now() } = {}) {
   return db.transaction(() => {
+    // The caller's row was loaded before this write: its key may have been
+    // replaced, or the source disabled, since.
+    const live = db.prepare('SELECT token_hash, enabled FROM inbound_sources WHERE id=?').get(source.id)
+    if (!live || !live.enabled || live.token_hash !== source.token_hash) return { status: 'gone' }
     // Rows of files that were shown stay: they are what keeps an agent
     // from reading the blob (isInboundFileBlob).
     db.prepare('DELETE FROM inbound_files WHERE source_id=? AND created_at<=? AND used_at IS NULL').run(source.id, now - 2 * DAY)
