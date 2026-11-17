@@ -2,8 +2,10 @@
 // workflow service) that the user lets post reports into Matron.
 //
 // A source has a name, a key and one conversation of its own. The key can
-// post a report and nothing else: it reads nothing, and it is not a device
-// token. Each report is one message in the source's conversation.
+// post a report and, when the user has turned replies on for the source,
+// read what the user typed in that one conversation since. It reads nothing
+// else, and it is not a device token. Each report is one message in the
+// source's conversation.
 //
 // That conversation is a system conversation (`conversations.system =
 // 'inbound:<source id>'`), so every guard the People conversation has
@@ -37,6 +39,8 @@ export const REPORT_LINK_MAX = 2000
 export const DEFAULT_HOURLY_MAX = 10
 export const DEFAULT_DAILY_MAX = 40
 export const CAP_MAX = 1000
+export const REPLIES_PER_READ_MAX = 20
+export const REPLY_MAX_CHARS = 4000
 const HOUR = 60 * 60 * 1000
 const DAY = 24 * HOUR
 const JOURNAL = 'journal'
@@ -259,7 +263,8 @@ export function acceptReport(ctx, source, input, { now = Date.now() } = {}) {
     if (count(DAY) >= source.daily_max) return refuseOverCap(db, fan, source, { windowMs: DAY, max: source.daily_max, per: 'a day', now })
     db.prepare('DELETE FROM inbound_posts WHERE source_id=? AND ts<=?').run(source.id, now - 2 * DAY)
     db.prepare('INSERT INTO inbound_posts(source_id, ts, body_hash, bytes) VALUES(?,?,?,?)').run(source.id, now, hash, built.bytes)
-    db.prepare('UPDATE inbound_sources SET last_post_at=? WHERE id=?').run(now, source.id)
+    // The report answers every reply the source has been handed.
+    db.prepare('UPDATE inbound_sources SET last_post_at=?, replies_done_seq=replies_seen_seq WHERE id=?').run(now, source.id)
     announceOnce(db, fan, source)
     // `from: 'source'` and `source` tell an app this is an outside tool's
     // text, not an agent's and not the user's.
@@ -286,4 +291,56 @@ export function latestReportBefore(db, source, beforeSeq) {
 
 export function sourceOfConvo(db, userId, convoId) {
   return db.prepare('SELECT * FROM inbound_sources WHERE user_id=? AND convo_id=?').get(userId, convoId) ?? null
+}
+
+// --- replies: what the user typed there, for the source to read ----------
+//
+// Off unless the user turns it on for the source, because it sends their
+// words out of Matron. On, the source's key can read the text messages the
+// user typed in the source's own conversation after that moment, and
+// nothing else. A message stays listed until the source posts its next
+// report: a lost answer costs nothing, and a message typed while a report
+// was being written is not skipped.
+
+// Says so in the conversation either way, so the user sees the change where
+// it matters. Returns false for an unknown source.
+export function setSourceReplies(db, id, on, { hub = null } = {}) {
+  const fan = []
+  const ok = db.transaction(() => {
+    const source = getSource(db, id)
+    if (!source) return false
+    if (!!source.replies === !!on) return true
+    announceOnce(db, fan, source)
+    const r = say(db, fan, source, JOURNAL, 'text', { body: on
+      ? `Replies are on. ${source.name} can read what you type in this conversation from now on, and nothing else in Matron. What you type here leaves Matron and goes to ${source.name}.`
+      : `Replies are off. ${source.name} can no longer read what you type in this conversation.` })
+    // Nothing typed before this line is ever handed over.
+    db.prepare('UPDATE inbound_sources SET replies=?, replies_seen_seq=?, replies_done_seq=? WHERE id=?').run(on ? 1 : 0, r.seq, r.seq, id)
+    return true
+  })()
+  if (hub) for (const f of fan) broadcastAppended(db, hub, f)
+  return ok
+}
+
+// `source` is a fresh row (sourceForKey). Returns {status: 'ok', replies:
+// [{at, text}], more} | {status: 'replies_off'} | {status: 'account_locked'}.
+export function readReplies(db, source) {
+  if (!source.replies) return { status: 'replies_off' }
+  if (isPanicLocked(db, source.user_id)) return { status: 'account_locked' }
+  return db.transaction(() => {
+    const now = getSource(db, source.id)
+    if (!now || !now.enabled || !now.replies || now.token_hash !== source.token_hash) return { status: 'replies_off' }
+    const rows = db.prepare(`SELECT seq, ts, payload FROM events WHERE user_id=? AND convo_id=? AND seq>? AND type='text' AND sender LIKE 'user:%'
+      ORDER BY seq LIMIT ?`).all(now.user_id, now.convo_id, now.replies_done_seq, REPLIES_PER_READ_MAX + 1)
+    const more = rows.length > REPLIES_PER_READ_MAX
+    const shown = rows.slice(0, REPLIES_PER_READ_MAX)
+    const replies = shown.map((row) => {
+      let text = ''
+      try { text = String(JSON.parse(row.payload)?.body ?? '') } catch { /* shown as empty */ }
+      return { at: new Date(row.ts).toISOString(), text: text.length > REPLY_MAX_CHARS ? `${text.slice(0, REPLY_MAX_CHARS)} […]` : text }
+    })
+    const last = shown.at(-1)?.seq
+    if (last != null && last > now.replies_seen_seq) db.prepare('UPDATE inbound_sources SET replies_seen_seq=? WHERE id=?').run(last, now.id)
+    return { status: 'ok', replies, more }
+  })()
 }
