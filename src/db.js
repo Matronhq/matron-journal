@@ -2066,10 +2066,14 @@ export function openDb(path) {
   // of the table, so it never walks the conversation content in between.
   // The index's WHERE must match the replay's type list exactly, or SQLite
   // will not use it: rebuilt when the list changes.
+  // One immediate transaction, so a second opener (the admin CLI next to
+  // the server) waits, then reads the rebuilt index and leaves it alone.
   const forYouWhere = `WHERE type IN (${FOR_YOU_TYPES_SQL})`
-  const forYouIndex = db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_events_for_you'").get()
-  if (forYouIndex && !forYouIndex.sql.endsWith(forYouWhere)) db.exec('DROP INDEX idx_events_for_you')
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_events_for_you ON events(user_id, seq) ${forYouWhere}`)
+  db.transaction(() => {
+    const forYouIndex = db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_events_for_you'").get()
+    if (forYouIndex && !forYouIndex.sql.endsWith(forYouWhere)) db.exec('DROP INDEX idx_events_for_you')
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_events_for_you ON events(user_id, seq) ${forYouWhere}`)
+  }).immediate()
   // Per-box defaults for new sessions (matron-bridge docs/specs/box-defaults.md,
   // src/box-defaults.js): the agent, model and effort a session started on
   // this box gets when nobody names one. Agent devices only; NULL = the
