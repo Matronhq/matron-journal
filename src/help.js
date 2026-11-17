@@ -226,9 +226,7 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   (agents: your conversation)}\` → 201 created / 200 updated \`{memory}\`.
   The same name overwrites — the whole memory, so send the body back when
   updating; tier and topic are kept when omitted. 409 \`too_many\` at 200
-  memories. The always tier holds at most 24 global, 24 coordinator and 16
-  per repo: a create naming no tier past that lands on_demand (\`capped:
-  true\`), an explicit \`tier: always\` is 409 \`always_full\`. \`DELETE /memories/:name\` →
+  memories. Neither tier has a size limit. \`DELETE /memories/:name\` →
   200 \`{memory}\`. Every change lands as a quiet \`memory\` event on your
   conversation and on the Coordinator's. An agent's save or delete applies
   at once only in a turn the user started in that conversation in the last
