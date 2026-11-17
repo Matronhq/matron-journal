@@ -22,7 +22,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import { sanitizeConsentText } from './peer-text.js'
 
-export const FILE_MAX_BYTES = 10 * 1024 * 1024
+export const FILE_MAX_BYTES = 50 * 1024 * 1024
 export const FILES_PER_REPORT_MAX = 4
 export const UPLOAD_TICKET_MS = 15 * 60 * 1000
 export const FILE_ATTACH_MS = 60 * 60 * 1000

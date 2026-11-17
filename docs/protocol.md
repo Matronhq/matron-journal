@@ -3775,7 +3775,7 @@ content_type, size, width?, height?}` plus `from` and `source` as above.
 - **Types:** PNG, JPEG, GIF, WebP and PDF, decided by the file's own first
   bytes. The type the sender claims and the name's ending are ignored, and
   the stored name is made plain and given the ending that fits.
-- **Size and number:** at most 10 MiB each (or the journal's media cap, if
+- **Size and number:** at most 50 MiB each (or the journal's media cap, if
   lower), 4 per report, and per source four times its report caps in files
   an hour and a day. The bytes count against the user's media quota.
 - **Unshown files:** a file no report names within an hour can no longer be
