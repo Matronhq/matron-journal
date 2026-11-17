@@ -306,6 +306,35 @@ CREATE TABLE IF NOT EXISTS device_status(
   status TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_device_status_user ON device_status(user_id);
+-- Usage history (src/usage-history.js): the past readings of each account's
+-- weekly meters. usage_windows has one row per account, meter and weekly
+-- window (named by its reset time): the last reading before the reset, the
+-- peak, and when the readings were taken. usage_samples has one row per
+-- account, meter and hour and is pruned by age; windows are kept.
+CREATE TABLE IF NOT EXISTS usage_windows(
+  user_id INTEGER NOT NULL,
+  account_key TEXT NOT NULL,
+  line_id TEXT NOT NULL,
+  reset_at INTEGER NOT NULL,
+  agent TEXT NOT NULL,
+  label TEXT NOT NULL,
+  percent INTEGER NOT NULL,
+  peak INTEGER NOT NULL,
+  first_at INTEGER NOT NULL,
+  last_at INTEGER NOT NULL,
+  devices TEXT NOT NULL,
+  PRIMARY KEY(user_id, account_key, line_id, reset_at)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS usage_samples(
+  user_id INTEGER NOT NULL,
+  account_key TEXT NOT NULL,
+  line_id TEXT NOT NULL,
+  hour INTEGER NOT NULL,
+  percent INTEGER NOT NULL,
+  reset_at INTEGER NOT NULL,
+  PRIMARY KEY(user_id, account_key, line_id, hour)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_usage_samples_hour ON usage_samples(hour);
 -- Per-conversation session header (spec 2026-09-29 coordinator session
 -- control §1): the persisted subset of the bridge's status op — model,
 -- context gauge, usage-limit stall, account meters — so the roster and a
@@ -327,6 +356,7 @@ CREATE TABLE IF NOT EXISTS user_settings(
   user_id INTEGER PRIMARY KEY REFERENCES users(id),
   coordinator_convo_id TEXT,
   coordinator_consent INTEGER NOT NULL DEFAULT 1,
+  auto_approve_coordinator_spawns INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL
 );
 -- Coordinator consent decisions (spec: matron-bridge 2026-09-29 coordinator
@@ -366,6 +396,8 @@ CREATE TABLE IF NOT EXISTS memories(
   created_at       INTEGER NOT NULL,
   updated_at       INTEGER NOT NULL,
   scope            TEXT NOT NULL DEFAULT 'global',
+  tier             TEXT NOT NULL DEFAULT 'always' CHECK(tier IN ('always','on_demand')),
+  topic            TEXT,
   UNIQUE(user_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(user_id, updated_at);
@@ -1071,7 +1103,11 @@ CREATE TABLE IF NOT EXISTS inbound_sources(
   announced         INTEGER NOT NULL DEFAULT 0,
   limit_notified_at INTEGER,
   last_post_at      INTEGER,
-  created_at        INTEGER NOT NULL
+  created_at        INTEGER NOT NULL,
+  replies           INTEGER NOT NULL DEFAULT 0,
+  replies_seen_seq  INTEGER NOT NULL DEFAULT 0,
+  replies_done_seq  INTEGER NOT NULL DEFAULT 0,
+  replies_live      INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_inbound_sources_name ON inbound_sources(user_id, name COLLATE NOCASE);
 CREATE TABLE IF NOT EXISTS inbound_posts(
@@ -1189,37 +1225,50 @@ export function openDb(path) {
   // MATRON_SQLITE_CACHE_MB.
   const cacheMb = Number(process.env.MATRON_SQLITE_CACHE_MB ?? defaultCacheMb())
   if (Number.isFinite(cacheMb) && cacheMb > 0) db.pragma(`cache_size = -${Math.floor(cacheMb * 1024)}`)
-  // The unstemmed search mirror is populated by trigger from here on; a
-  // database that predates it has rows to index. 'rebuild' reads the
-  // content table (seconds for a few hundred thousand prose rows).
-  const hadPlainFts = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_fts_plain'").get()
-  // Same "was this table already here" probe, for the is_diff migration
-  // below — taken before SCHEMA runs, since CREATE TABLE IF NOT EXISTS
-  // makes that the only moment a pre-existing search_messages can still be
-  // told apart from a table this call is creating for the first time.
-  const hadSearchMessages = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_messages'").get()
+  // Table rebuild needs foreign_keys OFF, which is a no-op inside a
+  // transaction, so it runs before the schema transaction below.
   migrateDeviceIds(db)
-  db.exec(SCHEMA)
-  if (!hadPlainFts) db.exec("INSERT INTO search_fts_plain(search_fts_plain) VALUES('rebuild')")
-  // search_messages.is_diff (spec 2026-10-12 unified search): a
-  // pre-existing table predates the column and needs the ALTER; SCHEMA's
-  // CREATE TABLE IF NOT EXISTS already includes it for a brand new one.
-  // Seed search_isdiff_state's cursor the first time either way (see the
-  // table's own comment above for the fresh-vs-migrated rule): 0 for an
-  // old table whose rows may be wrongly defaulted, or the current max
-  // events rowid for a table just created now — every row it will ever
-  // hold gets is_diff set correctly at insert time, live or via
-  // backfillSearchIndex's own INSERT, so there is nothing to fix.
-  const searchMessageCols = db.prepare('PRAGMA table_info(search_messages)').all()
-  if (!searchMessageCols.some((c) => c.name === 'is_diff')) {
-    db.exec('ALTER TABLE search_messages ADD COLUMN is_diff INTEGER NOT NULL DEFAULT 0')
-  }
-  if (!db.prepare('SELECT 1 FROM search_isdiff_state WHERE id=1').get()) {
-    const seedCursor = hadSearchMessages
-      ? 0
-      : db.prepare('SELECT COALESCE(MAX(rowid),0) AS r FROM events').get().r
-    db.prepare('INSERT INTO search_isdiff_state(id, last_rowid) VALUES(1, ?)').run(seedCursor)
-  }
+  // Schema creation and the search-index bootstrap run in one immediate
+  // transaction. db.exec(SCHEMA) is a run of statements, so on its own it is
+  // not atomic: if a later statement threw after search_fts_plain had been
+  // created but before its 'rebuild', the next open would find the table,
+  // skip the rebuild, and the existing rows would never be indexed. Inside
+  // the transaction the probes, the CREATE / rebuild / seed steps and the
+  // failure rollback go together. A second process opening the same file
+  // waits for the write lock (bounded by the busy timeout) instead of
+  // interleaving with the probes.
+  db.transaction(() => {
+    // The unstemmed search mirror is populated by trigger from here on; a
+    // database that predates it has rows to index. 'rebuild' reads the
+    // content table (seconds for a few hundred thousand prose rows).
+    const hadPlainFts = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_fts_plain'").get()
+    // Same "was this table already here" probe, for the is_diff migration
+    // below — taken before SCHEMA runs, since CREATE TABLE IF NOT EXISTS
+    // makes that the only moment a pre-existing search_messages can still be
+    // told apart from a table this call is creating for the first time.
+    const hadSearchMessages = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_messages'").get()
+    db.exec(SCHEMA)
+    if (!hadPlainFts) db.exec("INSERT INTO search_fts_plain(search_fts_plain) VALUES('rebuild')")
+    // search_messages.is_diff (spec 2026-10-12 unified search): a
+    // pre-existing table predates the column and needs the ALTER; SCHEMA's
+    // CREATE TABLE IF NOT EXISTS already includes it for a brand new one.
+    // Seed search_isdiff_state's cursor the first time either way (see the
+    // table's own comment above for the fresh-vs-migrated rule): 0 for an
+    // old table whose rows may be wrongly defaulted, or the current max
+    // events rowid for a table just created now — every row it will ever
+    // hold gets is_diff set correctly at insert time, live or via
+    // backfillSearchIndex's own INSERT, so there is nothing to fix.
+    const searchMessageCols = db.prepare('PRAGMA table_info(search_messages)').all()
+    if (!searchMessageCols.some((c) => c.name === 'is_diff')) {
+      db.exec('ALTER TABLE search_messages ADD COLUMN is_diff INTEGER NOT NULL DEFAULT 0')
+    }
+    if (!db.prepare('SELECT 1 FROM search_isdiff_state WHERE id=1').get()) {
+      const seedCursor = hadSearchMessages
+        ? 0
+        : db.prepare('SELECT COALESCE(MAX(rowid),0) AS r FROM events').get().r
+      db.prepare('INSERT INTO search_isdiff_state(id, last_rowid) VALUES(1, ?)').run(seedCursor)
+    }
+  }).immediate()
   // Older live DBs predate apns_env (only apns_token existed) — in-place
   // migration, never a destructive rebuild. Sygnal lesson: environment
   // ('sandbox'|'prod') has to be tracked per device, not assumed from topic.
@@ -1894,6 +1943,46 @@ export function openDb(path) {
   )`)
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_item_handovers_pending ON item_handovers(item_id) WHERE state IN ('awaiting_user','offered')")
   db.exec('CREATE INDEX IF NOT EXISTS idx_item_handovers_state ON item_handovers(state, expires_at)')
+  // Memory proposals (src/memory-proposals.js): a memory save or delete an
+  // agent asked for that waits for the user's answer on a tracker item
+  // (item_id). The row holds the change exactly as proposed. At most one
+  // pending proposal per (user, memory name). For a save, type and scope are
+  // the ones the memory will have (the proposed value, else the memory's at
+  // proposal time, else the default), fixed when the proposal is recorded.
+  // memory_id and base_updated_at are the memory the proposal was made
+  // against and its updated_at then (both NULL: there was none); an
+  // approval applies only while that still holds. told_at is when the
+  // proposing conversation was told the outcome (NULL: not yet).
+  db.exec(`CREATE TABLE IF NOT EXISTS memory_proposals(
+    id             TEXT PRIMARY KEY,
+    user_id        INTEGER NOT NULL,
+    name           TEXT NOT NULL,
+    action         TEXT NOT NULL CHECK(action IN ('save','delete')),
+    description    TEXT NOT NULL DEFAULT '',
+    body           TEXT NOT NULL DEFAULT '',
+    type           TEXT,
+    scope          TEXT,
+    memory_id      TEXT,
+    from_device_id INTEGER NOT NULL,
+    from_convo_id  TEXT,
+    item_id        TEXT,
+    state          TEXT NOT NULL CHECK(state IN ('pending','approved','declined','replaced','expired','stale')),
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    expires_at     INTEGER NOT NULL,
+    base_updated_at INTEGER,
+    told_at        INTEGER
+  )`)
+  const proposalCols = db.prepare('PRAGMA table_info(memory_proposals)').all()
+  if (!proposalCols.some((c) => c.name === 'base_updated_at')) db.exec('ALTER TABLE memory_proposals ADD COLUMN base_updated_at INTEGER')
+  if (!proposalCols.some((c) => c.name === 'told_at')) db.exec('ALTER TABLE memory_proposals ADD COLUMN told_at INTEGER')
+  // A proposed save's tier and topic, as asked (NULL tier = not named, so
+  // the cap may place a new memory on_demand when it is approved).
+  if (!proposalCols.some((c) => c.name === 'tier')) db.exec('ALTER TABLE memory_proposals ADD COLUMN tier TEXT')
+  if (!proposalCols.some((c) => c.name === 'topic')) db.exec('ALTER TABLE memory_proposals ADD COLUMN topic TEXT')
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_proposals_pending ON memory_proposals(user_id, name) WHERE state='pending'")
+  db.exec('CREATE INDEX IF NOT EXISTS idx_memory_proposals_state ON memory_proposals(state, expires_at)')
+  db.exec('CREATE INDEX IF NOT EXISTS idx_memory_proposals_item ON memory_proposals(item_id)')
   // Mission status (spec 2026-09-28 missions dashboard §1): one short
   // markdown paragraph agents keep current — who wrote it (status_by), from
   // which conversation (status_convo_id), and when. status_device_id is
@@ -1943,6 +2032,9 @@ export function openDb(path) {
   // ask tables who answered a parked row and why — 'coordinator' + reason
   // when the Coordinator did, NULL for a tap or a sweep. No backfill.
   const settingsCols = db.prepare('PRAGMA table_info(user_settings)').all()
+  if (!settingsCols.some((c) => c.name === 'auto_approve_coordinator_spawns')) {
+    db.exec('ALTER TABLE user_settings ADD COLUMN auto_approve_coordinator_spawns INTEGER NOT NULL DEFAULT 0')
+  }
   if (!settingsCols.some((c) => c.name === 'coordinator_consent')) {
     db.exec('ALTER TABLE user_settings ADD COLUMN coordinator_consent INTEGER NOT NULL DEFAULT 1')
   }
@@ -2047,6 +2139,8 @@ export function openDb(path) {
   // reads recent permission_request cards; partial, so ordinary appends
   // never touch it.
   db.exec("CREATE INDEX IF NOT EXISTS idx_events_permission_request ON events(ts) WHERE type='permission_request'")
+  // The same for held item pushes (push.js resumeHeldItems).
+  db.exec("CREATE INDEX IF NOT EXISTS idx_events_item ON events(ts) WHERE type='item'")
   for (const table of ['convo_agents', 'agent_spawn_requests']) {
     const cols = db.prepare(`PRAGMA table_info(${table})`).all()
     if (!cols.some((c) => c.name === 'answered_by')) db.exec(`ALTER TABLE ${table} ADD COLUMN answered_by TEXT`)
@@ -2099,7 +2193,9 @@ export function openDb(path) {
   addTransferConsentSetting(db)
   addPeerFailingSince(db)
   addProtectedDevices(db)
+  addInboundReplies(db)
   addApprovalLockdown(db)
+  addVerifierRefusals(db)
   addSecurityEvents(db)
   addPanicLocks(db)
   // A routine's envelope (JSON): the bounds on what an ask born of one of
@@ -2173,6 +2269,14 @@ export function openDb(path) {
   if (!memoryCols.some((c) => c.name === 'scope')) {
     db.exec("ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'global'")
   }
+  // Memory tiers: 'always' (listed in full in every session of the scope,
+  // what every memory was before the column) or 'on_demand' (named under
+  // its topic, read when the work needs it). Additive: every
+  // pre-migration row is 'always', which is exactly what it was.
+  if (!memoryCols.some((c) => c.name === 'tier')) {
+    db.exec("ALTER TABLE memories ADD COLUMN tier TEXT NOT NULL DEFAULT 'always' CHECK(tier IN ('always','on_demand'))")
+  }
+  if (!memoryCols.some((c) => c.name === 'topic')) db.exec('ALTER TABLE memories ADD COLUMN topic TEXT')
   // GitHub account linking. One GitHub identity per journal user and one
   // journal user per GitHub identity (the unique index). `token` is the
   // user's read:org OAuth token, stored as-is (spec: "Token at rest").
@@ -2279,6 +2383,15 @@ export function openDb(path) {
       sent_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS password_reset_sends_user ON password_reset_sends(user_id, sent_at);
+  `)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS web_push_subscriptions(
+      device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+      endpoint TEXT NOT NULL UNIQUE,
+      p256dh TEXT NOT NULL,
+      auth TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
   `)
   // One-time title cleanup (spec: agent box rename). Gated on user_version
   // inside, so this is a cheap pragma read on every subsequent open.
@@ -2500,11 +2613,37 @@ export function pruneApnsToken(db, deviceId, apnsToken, apnsEnv) {
     .run(deviceId, apnsToken, apnsEnv).changes > 0
 }
 
+// Claim an endpoint atomically so a browser moved to another account stops
+// receiving the previous account's notifications.
+export function setWebPushSubscription(db, deviceId, { endpoint, p256dh, auth }) {
+  db.transaction(() => {
+    db.prepare('DELETE FROM web_push_subscriptions WHERE endpoint=? AND device_id<>?').run(endpoint, deviceId)
+    db.prepare(`INSERT INTO web_push_subscriptions(device_id, endpoint, p256dh, auth, created_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(device_id) DO UPDATE SET endpoint=excluded.endpoint,
+        p256dh=excluded.p256dh, auth=excluded.auth, created_at=excluded.created_at
+      WHERE endpoint IS NOT excluded.endpoint OR p256dh IS NOT excluded.p256dh OR auth IS NOT excluded.auth`)
+      .run(deviceId, endpoint, p256dh, auth, Date.now())
+  })()
+}
+
+export function clearWebPushSubscription(db, deviceId) {
+  db.prepare('DELETE FROM web_push_subscriptions WHERE device_id=?').run(deviceId)
+}
+
+export function pruneWebPushSubscription(db, deviceId, endpoint) {
+  return db.prepare('DELETE FROM web_push_subscriptions WHERE device_id=? AND endpoint=?').run(deviceId, endpoint).changes > 0
+}
+
 // Client devices (never agent — agents are never pushed to) with a
 // registered token, for the push pipeline to fan a journal event out to.
 export function clientDevicesForPush(db, userId) {
   return db.prepare(
-    "SELECT id, kind, created_at, last_seen_at, apns_token, apns_env, cursor, push_level, sync_scope, push_key FROM devices WHERE user_id=? AND kind='client' AND apns_token IS NOT NULL"
+    `SELECT d.id, d.kind, d.created_at, d.last_seen_at, d.apns_token, d.apns_env,
+      d.cursor, d.push_level, d.sync_scope, d.push_key,
+      w.endpoint AS wp_endpoint, w.p256dh AS wp_p256dh, w.auth AS wp_auth
+      FROM devices d LEFT JOIN web_push_subscriptions w ON w.device_id=d.id
+      WHERE d.user_id=? AND d.kind='client' AND (d.apns_token IS NOT NULL OR w.device_id IS NOT NULL)`
   ).all(userId)
 }
 
@@ -2770,12 +2909,45 @@ export function addTransferRecipient(db) {
 // the ask's row until it is forwarded to the box: the spawn's `start`, the
 // chat invite (delivered later, on the box's hello, when it is asleep) and
 // the released transfer. NULL for every other answer. Idempotent.
+// Replies (src/inbound.js): whether a source may read what the user types
+// in its conversation, the newest message it has been handed, the newest
+// one its last report answered, and whether connected apps have been sent
+// the line that says replies are on. Idempotent.
+export function addInboundReplies(db) {
+  const has = (col) => db.prepare('PRAGMA table_info(inbound_sources)').all().some((c) => c.name === col)
+  for (const col of ['replies', 'replies_seen_seq', 'replies_done_seq', 'replies_live']) {
+    if (!has(col)) db.exec(`ALTER TABLE inbound_sources ADD COLUMN ${col} INTEGER NOT NULL DEFAULT 0`)
+  }
+}
+
 export function addProtectedDevices(db) {
   const has = (table, col) => db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === col)
   if (!has('devices', 'protected')) db.exec('ALTER TABLE devices ADD COLUMN protected INTEGER NOT NULL DEFAULT 0')
   if (!has('agent_spawn_requests', 'approval')) db.exec('ALTER TABLE agent_spawn_requests ADD COLUMN approval TEXT')
   if (!has('convo_agents', 'approval')) db.exec('ALTER TABLE convo_agents ADD COLUMN approval TEXT')
   if (!has('transfers', 'approval')) db.exec('ALTER TABLE transfers ADD COLUMN approval TEXT')
+}
+
+// The verifier's refusals of one parked ask (src/consent-own-ask.js): how
+// many times it said no to the Coordinator's approval of that ask, and what
+// it last said. ask_id is the spawn's request id or the chat ask's
+// '<room>/<device>' pair, as on consent_decisions; ask_created_at tells a
+// chat ask renewed in place from the one the count was kept for. The note
+// stays here: it is not part of any answer to the Coordinator.
+export function addVerifierRefusals(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS verifier_refusals(
+      user_id        INTEGER NOT NULL,
+      kind           TEXT NOT NULL,
+      ask_id         TEXT NOT NULL,
+      ask_created_at INTEGER NOT NULL,
+      refusals       INTEGER NOT NULL,
+      last_note      TEXT,
+      updated_at     INTEGER NOT NULL,
+      PRIMARY KEY(user_id, kind, ask_id)
+    );
+    CREATE INDEX IF NOT EXISTS verifier_refusals_age ON verifier_refusals(updated_at);
+  `)
 }
 
 // Lockdown after failures and locked boxes (src/approval-keys.js).

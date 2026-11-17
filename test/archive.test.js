@@ -170,7 +170,7 @@ test('/archive: client only, validation, live frame, hello and settings', async 
   // Settings.
   assert.equal((await s.http('/settings', { method: 'PATCH', token: client, body: { auto_archive_days: -1 } })).status, 400)
   const set = await s.http('/settings', { method: 'PATCH', token: client, body: { auto_archive_days: 0 } })
-  assert.deepEqual(set.json, { notices: true, auto_archive_days: 0 })
+  assert.deepEqual(set.json, { notices: true, auto_approve_coordinator_spawns: false, auto_archive_days: 0 })
 })
 
 test('hello archive_since: changes since, and a message unarchives live', async (t) => {

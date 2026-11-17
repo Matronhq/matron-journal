@@ -302,7 +302,7 @@ the machine-checkable version of this page.
   reads the displayed pixel size from the file's own header (PNG, JPEG with
   EXIF orientation, GIF, WebP, HEIC/HEIF with `irot`) and answers it as
   `width`/`height`; absent when it isn't an image it can size. 400 `{error:'empty'}` on a zero-byte
-  body; 413 `{error:'too_large'}` over `MATRON_MEDIA_MAX_BYTES` (default 50 MB);
+  body; 413 `{error:'too_large'}` over `MATRON_MEDIA_MAX_BYTES` (default 100 MB, 100000000 bytes);
   413 `{error:'quota_exceeded'}` when the user's total blob bytes would exceed
   `MATRON_MEDIA_USER_QUOTA_BYTES` (default 2 GiB) — checked up front (rejected
   before the body streams) when already at the ceiling, and precisely after the
@@ -423,6 +423,12 @@ the machine-checkable version of this page.
   `caption`) with `blob_ref: null` and `expired: true` — so fresh syncs
   render an "expired" attachment; clients that already hold the event learn
   from the 404 on `GET /media/:id`.
+  Separately from quota pressure, an optional scheduled orphan-blob reaper
+  deletes any blob that nothing references (no `events.blob_ref`, no `blob_ref`
+  anywhere inside an event payload, no item or item-comment attachment) once it
+  is older than `MATRON_ORPHAN_BLOB_GRACE_HOURS`. It is off unless that is set
+  to a positive integer; use a week (168) or more, since a client outbox can
+  resend a pending attachment after a long offline spell.
 - `GET /help` (Bearer, any authenticated device) -> `text/markdown`. A
   hand-maintained digest of this API surface (`src/help.js`), aimed at agent
   callers that arrive with a token and no repo checkout — it names the
@@ -913,7 +919,7 @@ carries that message's real `ts`.
 ```json
 { "verified": true, "convo_id": "…", "seq": 120, "cited_seq": 122,
   "ts": 1767225600000, "author": "user:alice", "kind": "voice",
-  "text": "Please find last month's invoice from the printer.",
+  "text": "Please find the notes from last week's planning call.",
   "before": { "seq": 118, "sender": "agent:box-a", "text": "…" } }
 { "verified": false, "convo_id": "…", "seq": 125,
   "sender": "agent:box-a", "reason": "agent_message" }
@@ -1065,6 +1071,18 @@ Rows from before the stamp carry neither, and don't count.
     It still sends the catch-up on every `viewing`, even for the
     conversation already viewed: clients re-send it to force a resync.
   When both keys are present, `convo_ids` defines the set.
+  - The catch-up also carries the conversation's current `activity`: the
+    last non-idle `{kind:'ephemeral', convo_id, activity:{state, detail}}`
+    the agent sent (held in memory in the same bounded cache as `status`,
+    dropped when that agent's connection closes; best effort, so an entry
+    evicted by the bound replays as idle), or `activity:{state:'idle'}` when there is none. Activity is
+    latest-wins and never journaled, so a client that was not viewing (a
+    tracker open over the chat, a hidden tab) would otherwise never learn
+    that its "thinking" indicator ended. The frame is sent directly, after
+    the `status` frame, and after any activity frame still queued for that
+    conversation on the connection is dropped, so it is the last word on
+    the socket. Likewise, an activity frame queued for a conversation when
+    the client stops viewing it is dropped rather than flushed afterwards.
 - Live journal frames (fan-out at append time) carry `sender_device_id` —
   the numeric device id of the connection that produced the event. Device
   names have no unique constraint, so this is the only exact own-echo test
@@ -1163,6 +1181,9 @@ Rows from before the stamp carry neither, and don't count.
   ephemeral frame `{kind: 'summary', convo_id, summary, summary_updated_at}`:
   not journaled, not replayed, no `seq`, no `last_seq` movement. `/snapshot`
   conversation rows carry `summary` and `summary_updated_at` for catch-up.
+  Because summary frames are never replayed, a client that missed any (it
+  was disconnected or backgrounded) should re-read `/snapshot` after each
+  reconnect to pick up the current summaries.
   `summary_updated_at` is Unix milliseconds when the server first observed
   the changed text, including a clear; it is not the producer's generation
   time. It stays unchanged on identical resends or omitted/null summaries.
@@ -1314,7 +1335,14 @@ Rows from before the stamp carry neither, and don't count.
   `text` event, so a client can tell which reply the lines belong to). The
   caps are the bridge's. The journal stores and replays the payload as it
   arrived, and a client that predates the keys ignores them.
-- Agent `publish` of a `text`, `file` or `image` into a room may name the
+- An agent's `publish` or `finalize` of a `file` or `image` into a room (a
+  conversation with agent participants) is `bad_request`, with a `detail`
+  naming the transfer path: a file reaches a room only through
+  `POST /transfers`, the user's approval and the journal's own release
+  (*File transfers*). A room with another person answers `files and images
+  do not cross to another person`. `text`, and `file`/`image` into a
+  conversation that is not a room, are unchanged.
+- Agent `publish` of a `text` into a room may name the
   session that wrote it and that session's turn causes:
   `from_convo_id` (a conversation the publishing device owns, not the room
   itself) and `causes` (the `[{kind, ref?, at?}]` list of a `spawn_request`).
@@ -1944,7 +1972,11 @@ Reply: `{kind:'spawn', event:'targets', request_id, boxes: [{device_id, name, on
 
 Folder discovery rides the RPC broker: for each *online* box the journal itself issues a **journal-originated** `recent_folders` RPC (see "Journal-originated requests" under "Agent RPC" below — `from_device_id: 0`, answered with `to_device_id: 0`) and waits up to `spawnFoldersTimeoutMs` for the reply. A bridge that never learns to answer this method will simply time out to `folders: []` for every request rather than erroring; offline boxes are listed with no RPC attempted at all — but with their last stored `activity`/`limits`/`disk` blocks and a `reported_at` when the box has ever reported (see "Box status" below), so a sleeping box still shows its last known usage.
 
-**Box status (`box_status`).** The same capacity blocks, reported by a bridge about its *own* box — `{op:'box_status', activity?, limits?, disk?, account?: {email}, defaults?: {agent, model, effort, source?}}` (agent connections only; `forbidden` for a client, `bad_request` when no block validates). Validated with the same all-or-nothing sanitisers as below (`sanitizeBoxStatus` in `src/spawns.js`: a malformed block is dropped, the rest kept), then **persisted per device** (`device_status`, latest report wins) and fanned as `{kind:'box_status', device_id, reported_at, ...blocks}` to the user's live *client* sockets only — it is not a conversation event, nothing is appended or replayed. The stored report is what `GET /devices` and `GET /roster` serve as `status` and what `spawn_targets` lists an *offline* box with (its blocks plus `reported_at`), so usage, allowances and reset times are the journal's to answer for every box, including one that is asleep or that a given client has never fanned out to. A live `spawn_targets` reply that carries capacity blocks is *merged* into the stored report — the blocks it carries are refreshed, the ones it omits are kept, so a `recent_folders` reply (which never carries `account`) cannot erase what the box's own `box_status` said; only `box_status` itself replaces the whole row. A `box_status` that lands while a box's `recent_folders` RPC is in flight is the newer of the two: the listing carries that row and the delayed reply is not merged over it. The row goes with the device: revoking a box drops its report (`ON DELETE CASCADE`), so a later box that reuses the id starts with no `status`. Bridges send it on every `hello_ok`, after each usage-limits refresh, and on shutdown (a box's last numbers land before the host idle-stops it).
+**Box status (`box_status`).** The same capacity blocks, reported by a bridge about its *own* box — `{op:'box_status', activity?, limits?, disk?, account?: {email}, vitals?: {cpu_pct, ram_pct, sampled_at_ms}, defaults?: {agent, model, effort, source?}, plugins?: [{name, methods}]}` (agent connections only; `forbidden` for a client, `bad_request` when no block validates). `vitals` is the box's host CPU and RAM use: `cpu_pct` and `ram_pct` finite numbers in 0..100 and `sampled_at_ms` a positive integer epoch-ms; all-or-nothing, extra keys are not copied. `plugins` lists the bridge plugins the box has loaded, as the bridge reports them in `hello`: at most 32 entries `{name, methods}`, `name` lowercase letters and digits (at most 32), `methods` at most 64 strings each at most 64 characters and shaped `x_<name>_...`; all-or-nothing, de-duplicated by name, and a bare-string entry is accepted as `{name, methods: []}`. A bridge sends it on its own, as a report whose only block is `vitals`, when CPU or RAM has moved by 8 points or more or about every 45 s; such a report is *merged* into the stored row (the other blocks and the stored `reported_at` are kept; the vitals carry their own `sampled_at_ms`) and the *merged* row is fanned out, so a client that replaces the whole box row on each frame keeps limits, activity and disk. A client should treat a reading older than a minute as stale. Validated with the same all-or-nothing sanitisers as below (`sanitizeBoxStatus` in `src/spawns.js`: a malformed block is dropped, the rest kept), then **persisted per device** (`device_status`, latest report wins) and fanned as `{kind:'box_status', device_id, reported_at, ...blocks}` to the user's live *client* sockets only — it is not a conversation event, nothing is appended or replayed. The stored report is what `GET /devices` and `GET /roster` serve as `status` and what `spawn_targets` lists an *offline* box with (its blocks plus `reported_at`), so usage, allowances and reset times are the journal's to answer for every box, including one that is asleep or that a given client has never fanned out to. A live `spawn_targets` reply that carries capacity blocks is *merged* into the stored report — the blocks it carries are refreshed, the ones it omits are kept, so a `recent_folders` reply (which never carries `account`) cannot erase what the box's own `box_status` said; only `box_status` itself replaces the whole row. A `box_status` that lands while a box's `recent_folders` RPC is in flight is the newer of the two: the listing carries that row and the delayed reply is not merged over it. The row goes with the device: revoking a box drops its report (`ON DELETE CASCADE`), so a later box that reuses the id starts with no `status`. Bridges send it on every `hello_ok`, after each usage-limits refresh, and on shutdown (a box's last numbers land before the host idle-stops it).
+
+**Usage history (`GET /usage/history`).** `device_status` keeps only a box's latest reading; the journal also files every reading of a *weekly* meter (`src/usage-history.js`), so a past week's unused allowance can still be answered. A reading is filed under its **account** — `claude:login:<email>` when the `box_status` names a login (boxes on one login spend one allowance and are one account), else `claude:device:<id>:<paired-at>` (the box's id and when it was paired, so a later box given the same id starts its own history) — and under the weekly **window** its `resets_at` names (rounded to the hour; a reading joins an open window whose reset is within two hours of its own, since boxes print the same reset a minute apart). Codex's weekly meters (`codex:…` ids labelled `… · Weekly`) are taken from a session's `status` op, which carries no login, and are filed under `codex:device:<id>:<paired-at>`. Per window the journal keeps the newest reading (`percent`), the highest (`peak`) and the times of the first and last readings; an older reading arriving late (a box that idled while others spent the meter) can raise the peak but never replaces a newer figure. Dropped rather than guessed at: a reading taken at or after its own reset, one whose reset is more than eight days out, one cached more than eight days ago, and a non-zero reading with no `resets_at`. A `0%` line with no `resets_at` (an untouched week prints no reset time) is filed in the next whole week on from the account's last known window, so an unused week counts as 100% unused once the weekly rhythm is known; it is never filed into a window that is still open or already has a row, so it cannot replace a real reading. One sample per account, meter and hour is also kept (the hour's highest reading) for two years; windows are kept indefinitely.
+
+`GET /usage/history?weeks=N` (bearer token, either device kind; `weeks` 1–104, default 12, else `400 bad_request`) → `{now, weeks, accounts: [{key, agent: 'claude'|'codex', email?, boxes: [name], meters: [{id, label, primary, current?: {resets_at, percent, unused, as_of}, windows: [{resets_at, percent, unused, peak, first_at, last_at}], average_unused?}]}]}`. `windows` are the finished weeks whose reset falls in the last N weeks, newest first; `unused` is `100 − percent`; `current` is the week in progress; `average_unused` is the mean over `windows` (omitted when there are none). `primary` marks the account's headline meter (`week_all` for Claude). `boxes` are the names of the boxes that reported into the listed windows and are still paired (a removed box's history stays, under no name). `key` is an opaque account id. Times are epoch milliseconds except the ISO `resets_at`. An ordinary (non-private) agent caller is not shown windows that only a private box reported, nor private boxes' names. Model-named weekly ids follow the label the agent CLI prints, so a relabel starts a new meter.
 
 **Defaults block (optional).** `defaults` is what a new session on the box starts with as the bridge resolves it — the journal's box defaults, else its own `MATRON_DEFAULT_*` env — with `source` saying which (e.g. `journal`, `env`). `agent` is required (`claude` | `codex`); `model` is null or a plain token (≤64 chars, `[A-Za-z0-9._[\]-]`); `effort` null or a short lowercase word (≤16; Codex has levels Claude lacks); `source` optional, `[a-z_]`, ≤32. All-or-nothing like the other blocks (`sanitizeBoxDefaults` in `src/spawns.js`); a report carrying only this block is valid. A `recent_folders` reply may carry it too.
 
@@ -2189,6 +2221,8 @@ reserved or written.
 
 **`POST /transfers`** `{room_id, from_convo_id, name, size, sha256, content_type?, reason?, scan?, causes?}` — `room_id` must be a room the caller's device owns or has joined; `from_convo_id` must be a conversation the caller's device owns (the session the file is "from", shown on the card). `name` is a bare file name (no `/`, `\`, `.` or `..` — it is written into a recipient's inbox verbatim) capped at 255 characters; `size` is the file's declared length in bytes, checked against the uploaded chunks and the final sha256 at `/complete` but never trusted before that. A declared size over the per-file cap (`MATRON_TRANSFER_MAX_BYTES`, default 10 GiB) is `413 too_large`; one that would push the sender's **user**, not the room's, outstanding declared bytes — summed over every transfer still `open` or `released`, plus every `delivered` one whose bytes the journal has not deleted yet, regardless of room — over the per-user quota (`MATRON_TRANSFER_USER_QUOTA_BYTES`, default 20 GiB, separate from the media/attachment quota) is `413 quota_exceeded`. The reservation is released when the journal's copy goes: at once for an expired, cancelled, declined or failed transfer, and for a delivered one when its copy is deleted an hour after the receipt (see Retention).
 
+A successful create answers `201 {transfer_id, chunk_bytes, chunks, item_id}`. `item_id` is the id of the approval item filed on the sender's conversation, or `null` when the item could not be filed (the transfer stands; it can still be answered through the Coordinator). A client that wants to tell its agent "an approval card exists" should check `item_id`; journals from before the field answer without it.
+
 **One recipient per transfer.** A transfer goes to exactly one agent device, fixed when it is created: the room's agent devices (its recorded owner and joined participants, agent devices of the room's user only) other than the sender's. When that leaves none and the sender's device is both the room's owner and a joined participant — a same-device room, two sessions of one bridge — the sender's own device is the recipient. Delivery is tracked per transfer, not per device, so a room with nobody to receive the file is `409 {error:'conflict', detail:'no_recipients'}` and a room with more than one possible recipient device is `409 {error:'conflict', detail:'multiple_recipients', message}`, both before any quota is reserved; send from a room with only the receiving box in it. A device that joins the room later is not a recipient: only the device stored at create may fetch, confirm or fail the transfer, receives its `ready` frame, finds it in `GET /transfers?for=me`, and is named on the card. A sending box may have at most `MATRON_TRANSFER_MAX_AWAITING_PER_SENDER` (default 50) transfers waiting for the user's approval at once (consent `awaiting_user`, phase `open`); the next create is `409 {error:'conflict', detail:'too_many_awaiting', message}`, until one of them is answered, cancelled or expires.
 
 `scan` is optional, pre-computed by the sender's bridge against the bytes before it ever asks the journal to hold them: `{verdict: 'clean' | 'flagged' | 'not_scanned', findings: [{kind, line}]}`. `line` is a 1-based line number, `member:line` for a match inside an archive, or a bare member name (e.g. `app/.env`) for a `sensitive_file` finding — an archive member whose name alone looks sensitive; any non-empty string up to 300 characters is accepted, flattened to one line; the matched text itself is never sent or stored, only what kind of secret it looks like and where. A `flagged` transfer still files its card for the user — only the *Coordinator's* automatic approval refuses it (below) — the user can always see and approve their own agents' traffic.
@@ -2335,7 +2369,9 @@ state: renaming the conversation does not bump the item's `updated_at`, so a
 `since` delta does not re-deliver the item. A client that also holds the
 conversation list should prefer that list's live title and use this field for
 origins it has not loaded. `consent` is `'spawn'` or `'chat'` on the journal's
-mirror of a consent card (see *Agent-spawned sessions → Tracker item*) and
+mirror of a consent card (see *Agent-spawned sessions → Tracker item*), `'memory'`
+on a memory proposal's question (*Memories* → *Memory proposals*; there is no
+card, the item's own buttons answer it) and
 `null` on every other item; clients may use it to embed the card. `mission_id`/`mission_num` are the mission this item belongs
 to — both `null` when it has none — set by `PATCH /items/:id {mission}` or
 inherited when the item's origin conversation joins a mission (see *Missions
@@ -2839,7 +2875,34 @@ frame: agent connection (`forbidden`); registered (`not_ready`);
 ordinary caller — all indistinguishable `not_found`; and its box is not
 **protected** (`forbidden`, detail `protected_device`, whether or not the
 account has an approval key; see *Approval keys (step-up)* → *Protected
-boxes*). Then the target box:
+boxes*); and, for a `carry_on` (either `when`), its box is not
+**user-only** unless the user started the turn that sends it (`forbidden`,
+detail `user_only`, with a fixed `why`; see *Consent approval* →
+*User-only boxes*): a carry-on's `message` becomes a turn in the target
+session, which on such a box is the user's alone to start. `set_model` and
+`compact` are not refused there: the journal relays no turn text for them,
+only the model, agent and effort names and the optional `reason`, which the
+target bridge shows as a notice in the session's chat.
+
+**A carry-on to a user-only box on the user's own word.** The carry-on
+goes through when its `causes` resolve, by the journal's own record and
+from the Coordinator's conversation (the resolver of *The Coordinator's own
+asks*, with its rules), to a message the user typed or spoke in that
+conversation, or to a comment or tap of theirs on an item that conversation
+owns, and that event is at most 10 minutes older than the request's arrival
+(`CARRY_ON_USER_ONLY_WINDOW_MS`). So the Coordinator can file an item
+asking whether to tell a stalled session to carry on, and send the carry-on
+in the turn the user's tap starts. Refused as before: no `causes`; a
+routine fire; a `spawn_outcome` cause, whatever ask it answers; any cause
+of a kind that cannot carry the user's authority (a room message other than
+the Coordinator's own echo, a reminder, an alert, another carry-on), even
+beside a user cause; a cited message in another conversation or an item
+another conversation owns; a user event older than the window. With
+`when: 'after_limit_reset'` the rule is the same and is applied once, when
+the request arrives: the target bridge holds the message until the limit
+resets, and the journal is not asked again at delivery.
+
+Then the target box:
 offline and unwakeable → `agent_unreachable`; otherwise the op is acked at
 once with `{kind:'session_control', event:'sent', request_id, target_waking?}`
 and, off the socket's message loop, the box is woken if needed and waited
@@ -2848,8 +2911,9 @@ for (`MATRON_SPAWN_WAKE_WAIT_MS`), a journal-originated RPC
 from_convo_id, from_name, carry_on_id?}` is issued (`MATRON_SESSION_CONTROL_TIMEOUT_MS`,
 default 30 s) and its reply delivered to every live socket of the caller's
 device as `{kind:'session_control', event:'result', request_id, ok,
-result?|error:{code, detail?}}` (`timeout` / `agent_unreachable` /
-`internal` when the bridge never answered). Strings in `params`
+result?|error:{code, detail?, why?}}` (`timeout` / `agent_unreachable` /
+`internal` when the bridge never answered; `why` only on the journal's own
+`user_only` refusal). Strings in `params`
 (including `from_name`) and in the relayed error are peer-text sanitised.
 At most 8 ops may be in flight per connection (each holds a wake waiter
 and a broker entry); a ninth is `conflict`. The shape checks run before
@@ -2915,10 +2979,18 @@ labelled `spare-allowance` and not `dispatched` — is empty), or
 `{kind:'allowance_expiring', tiers:[{unused_pct, hours_left}, …]}` (1–4
 tiers; `unused_pct` 1–99, `hours_left` 1–168: the same meter and subject,
 met when any tier has at least `unused_pct`% of it unused with its reset
-at most `hours_left` away, e.g. 50% with 12 h or 25% with 2 h — still once
-per weekly window, the first tier to be met firing it: an allowance
-subject is remembered until an hour after its reset, not just while it
-matches, so dropping between tiers does not re-arm it), evaluated against `conversation_status` and `device_status` by a
+at most `hours_left` away, e.g. 50% with 12 h or 25% with 2 h — each tier
+fires once per weekly window: the subject is
+`allowance:<account or device>@<reset iso>#<hours_left>h` for the most
+urgent tier met (fewest hours left), so a later tier still met fires the
+window again, while one fire spends every tier at least as far out as
+the one that fired, and a tier never fires after a more urgent one; an
+allowance subject is remembered until an hour after its reset, not just
+while it matches, so dropping between tiers does not re-arm a spent tier;
+a record from before tiers were in the subject spends the tiers whose
+`hours_left` is at least the hours that were left when it fired, read
+with half an hour of slack because the subject rounds its reset to the
+hour), evaluated against `conversation_status` and `device_status` by a
 sweep every five minutes (`src/routines-triggers.js`), as the Coordinator's
 box may see them (private-owned sessions and private boxes are invisible
 to a Coordinator on an ordinary box). Each matching subject (`convo:<id>`
@@ -2928,7 +3000,8 @@ The fire's `message` is the prompt plus a `Tripped by:` list, one line per
 fresh subject (`- [title](matron://convo/<id>) at 42% of its window
 (420k/1M, model)`, `- […] stalled on <model>, resets <iso> (in 5 h)` / `no reset
 time`, `- <box>: 15% free (15.0 GB of 100.0 GB)`, `- Week (all models) at
-32%, resets <iso> (in 9 h); boxes: a, b`). An `allowance_expiring` fire
+32%, resets <iso> (in 9 h); boxes: a, b`, and for a tiered trigger
+`; tier: 35% unused with 8 h left` after it). An `allowance_expiring` fire
 adds `Next in the spare-allowance backlog:` and the first three such tasks
 (`- #<num> <title>`). Pausing a triggered
 routine or changing its trigger clears its records. A triggered routine
@@ -3106,7 +3179,7 @@ nothing until the bridge is updated; against a bridge older than both the
 memories are stored and shown in the apps only.
 
 ```
-{ id: "me_<16 hex>", name, type, scope, description, body,
+{ id: "me_<16 hex>", name, type, scope, tier, topic, description, body,
   origin_convo_id, origin_device_id, created_by, updated_by, created_at, updated_at }
 ```
 
@@ -3123,6 +3196,18 @@ memories are stored and shown in the apps only.
   it; the **bridge** does the matching at spawn (global always, the repo
   scope of the session's workdir, `coordinator` for the Coordinator) and
   the Coordinator's `memory_list` sees every scope.
+- `tier`: how a session is given the memory — `always` (listed in full,
+  name and description, in every session of its scope; what every memory
+  was before the column existed, and the default on create) or
+  `on_demand` (a bridge with the **tiers update** names it under its
+  `topic` and lets the session read it with `GET /memories/:key` or find
+  it with `POST /memories/recall`). Kept when omitted on update.
+- `topic`: a short label (≤40 characters, one line) that groups on-demand
+  memories in a session's list, e.g. `couriers`. Optional; `""` or `null`
+  clears it; kept when omitted on update.
+- Neither tier has a size limit: a memory's tier is the one its writer
+  names, else the stored one, else `always`. How many memories a scope
+  holds in either tier never moves a memory or refuses a write.
 - `description`: 1–200 characters, trimmed, one line (no C0/C1 control
   characters, no U+2028/U+2029). It is the line the Coordinator sees at
   spawn, so it must be the actionable one-liner.
@@ -3141,11 +3226,38 @@ memories are stored and shown in the apps only.
 |---|---|---|
 | `GET /memories` | | 200 `{memories:[…]}` ordered by `name` (≤200 rows, no paging) |
 | `GET /memories/:key` | `:key` = `me_…` or the name | 200 `{memory}`; 404 |
-| `PUT /memories/:name` | `{description, body?, type?, scope?, convo_id?}` | 201 `{memory}` created / 200 `{memory}` updated; 400 `bad_request` (a `scope` outside the three forms included); 409 `too_many`; 404 |
-| `DELETE /memories/:key` | | 200 `{memory}` (the deleted row); 404 |
+| `POST /memories/recall` | `{text, mode?, scopes?, tier?, exclude?, limit?, min_score?, min_z?}` | 200 `{memories:[{…memory, score, why}], semantic}` (see *Recall* below); 400 |
+| `PUT /memories/:name` | `{description, body?, type?, scope?, tier?, topic?, convo_id?, causes?}` | 201 `{memory}` created / 200 `{memory}` updated; **202** `{pending:'owner', proposal, item}` when an agent's write waits for the user (*Memory proposals* below); 400 `bad_request` (a `scope` outside the three forms, or unusable `causes`, included); 409 `too_many`; 409 `conflict` `blocked_by:'too_many_asks'` (too many proposals waiting); 404 |
+| `DELETE /memories/:key` | agents may send `{convo_id?, causes?}` | 200 `{memory}` (the deleted row); **202** as for `PUT`; 400; 404 |
+
+### Recall
+
+`POST /memories/recall` answers with the memories that bear on a text,
+whole (the body included), best first. `text` is 1–4000 characters.
+`mode` is `query` (the default: an agent's own words) or `auto` (the text
+of a turn a bridge is about to hand its agent). A `query` of at most 256
+characters runs unified search's tiers over memories (exact, words,
+stemmed, similar, some words), so it works without the vector index; a
+longer one runs the similar pass alone. `auto` runs only the similar pass
+(any-word matching on a whole message would pull in every memory that
+shares a common word), and a match must clear two bars: cosine similarity
+at least `min_score` (0.5–0.95, default 0.62), and a z-score of at least
+`min_z` (1–6, default 3) against the similarity of every memory the caller
+can see — it must stand out from the rest. A small embedding model scores
+most pairs of texts alike, so a fixed floor alone either misses real
+matches or lets in near-misses. With fewer than 20 memories the floor
+alone applies. A memory's `topic` leads its search text, so a topic that
+names the situation (`booking couriers`) helps it be found. Filters: `scopes` (the session's
+audience, up to 20 scope strings), `tier`, and `exclude` (names already
+given to the session, up to 200). `limit` is 1–10, default 3. `semantic`
+reports the vector index: `ready`, `indexing` or `off`; while it is not
+ready, `auto` recalls nothing. The embedding model runs in the journal's
+process, as for search; no text leaves it. An ordinary agent never
+recalls a memory saved from a private device.
 
 `PUT` is the only write and is an **upsert by name**: the same name from
-any device overwrites `description`, `body`, `type` and `scope` and bumps
+any device overwrites `description`, `body`, `type`, `scope`, `tier` and
+`topic` (the last four kept when omitted) and bumps
 `updated_at` / `updated_by`. A `PUT` is the whole memory — an omitted
 `body` on an update **clears** it. Retries are therefore free; there is no
 `Idempotency-Key`. An invalid `:name` is 400, not 404.
@@ -3156,7 +3268,14 @@ and the marker lands on that timeline. It clears the gate every
 agent-authored write clears — the conversation is the user's, the agent
 owns or has joined it (`authorizeAgentWrite`), and an ordinary agent may
 not name a private-owned conversation — answering **404** otherwise, never
-403. A client sending `convo_id` is 400.
+403. A client sending `convo_id` is 400. A `DELETE` takes the same optional
+`convo_id` in a JSON body, under the same gate.
+
+`causes` is optional and an **agent's** only (400 from a client): the causes
+of the turn that made the write, in the shape the bridge stamps on a spawn
+or chat ask (*Consent approval* → **Causes**). Absent or `null` is "none"; any
+other value must be a usable list or the write is 400. They decide whether
+an agent's write applies now or becomes a proposal.
 
 **Privacy.** A memory saved from a private agent device is invisible to an
 ordinary (filtered) agent: absent from `GET /memories`, 404 on `GET`, `PUT`
@@ -3193,6 +3312,138 @@ private-owned — the payload carries `memory_id`, `action`, `created` and
 pushes, never wakes, and has no old-client text fallback: a client that
 predates it ignores the type.
 
+### Memory proposals
+
+A memory is a standing rule every later session reads, so an agent's save
+or delete applies at once only when the user asked for it. Otherwise the
+journal keeps the change as a **proposal** (`memory_proposals`,
+`src/memory-proposals.js`, `src/memory-proposals-http.js`) and files a
+question for the user; the change is applied only when they approve it.
+
+**Which writes wait**, in order:
+
+1. A client (the user's own app): never. Its `PUT` and `DELETE` are direct.
+2. An agent on a **user-only** or **protected** box (*User-only boxes*):
+   always, whatever the turn's causes.
+3. Any other agent: unless the write names its conversation (`convo_id`)
+   and its `causes` resolve, by the journal's own record
+   (`src/ask-cause.js`, the resolver the Coordinator's own asks go
+   through), to the **user's own input in that conversation** — a message
+   they typed or spoke there, or their comment or button tap on an item
+   that conversation owns — made no more than **30 minutes** before the
+   write (`MEMORY_DIRECT_WINDOW_MS`). No causes (an older bridge, or a
+   write with no `convo_id`), a routine fire, a reminder, a room message
+   from another session, an alert, a carry-on, a spawn outcome, a cited
+   message that is in another conversation, is not the user's or cannot be
+   found, or input older than the window: a proposal. A turn with several
+   causes follows the resolver's rule: one cause of a kind that cannot
+   carry the user's say makes the whole turn a proposal.
+
+The existing checks come first and are unchanged: a malformed field is 400,
+an unwritable `convo_id` or a memory hidden from the caller is 404, and a
+new name at the cap is 409 `too_many`. Reads are unaffected: the agent
+still lists and reads memories as before, and sees the stored memory, not
+the proposed one, until the user approves.
+
+**The answer to the agent** is `202`:
+
+```json
+{ "pending": "owner",
+  "proposal": { "id": "mp_…", "name": "avoid-opal", "action": "save" | "delete", "state": "pending", "expires_at": 1791154800000 },
+  "item": { "id": "it_…", "num": 41 } }
+```
+
+Nothing has been saved or deleted, and no `memory` event is written.
+
+**The question** is a tracker item on the proposing conversation (the
+Coordinator conversation, else the People conversation, when the write
+named none): kind `question`, awaiting the user, top of the open list, label
+`consent`, `consent: 'memory'`, `actions` `['Save it', 'Decline']` for a save
+and `['Delete it', 'Keep it']` for a delete. Its body names the proposing box
+and conversation, the memory's name, scope and type, the proposed
+description and body, and for an update the current description beside it;
+a delete shows the memory as it stands. The scope and type shown for a save
+are the ones it will have: the proposed value, else the memory's at that
+moment, else the default — fixed and stored when the proposal is recorded,
+and applied as stored. The proposal also records which memory it was made
+against and that memory's `updated_at` (or that there was none). The proposed text is the agent's
+words: each piece is shown verbatim inside its own fenced block (control
+characters dropped, a line that starts with a fence kept from closing it),
+box and conversation names are flattened to plain words, and the buttons
+are the journal's. Like every consent mirror the item is the user's alone:
+404 to every agent — the proposer and the Coordinator included — on read
+and on every mutation, absent from an agent's `GET /items`, and its markers
+are client-only. Its `created` marker pushes like any item filed for the
+user. A typed reply from the user on it reaches the proposing session as an
+ordinary item turn.
+
+**One pending proposal per (user, name).** A newer proposal for the same
+name — from the same session or any other — replaces the pending one: the
+older proposal becomes `replaced`, its item is closed `cancelled` in the
+same write, its conversation is told, and the new proposal gets a **new**
+item. A pending proposal is never rewritten, so an item always shows the
+change its buttons apply; a tap already on its way to the older item finds
+it closed and answers 409, changing nothing.
+
+**Caps.** At most **10** proposals may wait from one conversation (a write
+that names none counts against its device) and **50** for one user
+(`MAX_PENDING_PER_CONVO`, `MAX_PENDING_PER_USER`). Past either, the write
+answers **409** `{error:'conflict', blocked_by:'too_many_asks'}`, as a parked
+ask does at its cap: nothing is stored and no item is filed. A proposal that
+replaces a pending one for the same name adds nothing and is never refused.
+
+**The user's tap** (`POST /items/:id/comments {action}`, a client's only —
+an agent's `action` is 403 and the item is a 404 to it anyway) is the
+answer, applied by the journal:
+
+- *Save it* / *Delete it*, when the memory has **changed since the question
+  was filed** — updated or deleted by anyone, or created where there was
+  none — applies nothing: what the item shows is no longer what would
+  happen. The proposal settles as `stale`, the item closes `cancelled` with
+  a line saying so, the proposer is told and may propose again, and the tap
+  answers **409** `{error:'conflict', blocked_by:'memory_changed', item,
+  comment, proposal}`. A decline is unaffected.
+- *Save it* / *Delete it* otherwise: the change is applied exactly as stored, through
+  the same write a direct `PUT`/`DELETE` makes. A saved memory records the
+  proposing conversation and device as its origin and `created_by` /
+  `updated_by` `agent`; the `memory` event is the usual one, sent as the
+  user, with `by: 'user'` and `proposal: {id, proposed_by: 'agent'}` added.
+  The item closes `decided`. 409 `too_many` leaves the proposal pending.
+- *Decline* / *Keep it*: nothing changes; the item closes `decided`. Closing
+  the item by hand is the same "no".
+- 200 `{item, comment, proposal}`; 409 `conflict` when the proposal is no
+  longer pending; 400 `unknown_action` for another label. The tap settles
+  the proposal in one statement that succeeds only while it is still
+  `pending` and still bound to the tapped item, so of a tap and a
+  replacement (or two taps) exactly one takes effect.
+
+A proposal nobody answers **lapses after 7 days**: the sweep marks it
+`expired` and closes the item `cancelled`.
+
+**One write.** A settlement and the close of its item are one transaction
+— for a tap, a replacement and an expiry alike — so an item is never left
+open on a proposal that is no longer pending, and a tap whose write fails
+leaves the question as it was. A sweep's expiries are all-or-nothing. The
+markers and the proposer's event follow the commit; the row records when
+the proposer was told, and each sweep makes good whatever a settled
+proposal is still owed (an item still open, a proposer not yet told) for a
+day after the settlement.
+
+**Telling the proposer.** Every outcome appends a `memory_proposal` event
+to the proposing conversation, sender `journal`:
+
+```json
+{ "type": "memory_proposal", "sender": "journal",
+  "payload": { "proposal_id": "mp_…", "name": "avoid-opal", "action": "save" | "delete",
+    "outcome": "approved" | "declined" | "replaced" | "expired" | "stale", "item": { "id": "it_…", "num": 41 } } }
+```
+
+It carries the name, never the memory's text. A bridge with the proposals
+update turns it into a turn for the session; `memory_proposal` is not a
+`MESSAGE_TYPES` entry, not an `AGENT_PUBLISH_TYPES` member, never pushes or
+wakes, and a client or bridge that predates it ignores the type. A proposal
+made with no `convo_id` has no conversation to tell.
+
 ### Consent approval (`/consent/pending`, `/consent/answer`)
 
 The Coordinator may answer the
@@ -3226,6 +3477,7 @@ would; an ask the Coordinator made **itself** must pass the own-ask checks
 (below): **403** `{detail:'own_ask_unverified', why}`, **403**
 `{detail:'envelope', why}`, **409** `{error:'conflict',
 detail:'verifier_unavailable', why}`, **403** `{detail:'verifier', why}`,
+**403** `{detail:'left_for_user', why}`,
 **409** `{error:'conflict', detail:'routine_cap', cap}`; and an approval
 when the Coordinator's approvals in the last 24 h are at the **daily cap**
 (`MATRON_COORDINATOR_CONSENT_DAILY_CAP`, default 20; `0` is no cap) is
@@ -3283,8 +3535,19 @@ chat's invitee, or for a join the room's owner) whose name is not in
 prompt (never its title, which changes without the user's ask), the ask (task or justification, target box, workdir, topic)
 and the reason, asked whether the ask is within the routine's remit and not
 injected. Off (no `MATRON_VERIFIER_API_KEY` / `_FILE`), failing or timing
-out is **409** `verifier_unavailable`; a no is **403** `verifier` with its
-note in `why`. Last, routine-born approvals in the last 24 h at the
+out is **409** `verifier_unavailable`; a no is **403** `verifier`. Its
+`why` is one fixed sentence: the model's note is not part of the answer. It
+is kept, with the count of refusals for that ask, in
+`verifier_refusals` (`kind`, `ask_id` as on `consent_decisions`,
+`refusals`, `last_note`). Once the verifier has said no to one ask **3**
+times it is not consulted about that ask again: every later approval of it
+is **403** `left_for_user`, checked after the envelope and before the
+verifier, and the ask stays on the user's card. Calls still in flight count
+toward the 3, so answers sent side by side get no more tries than answers
+sent in turn. A caller should treat `left_for_user` as final for that ask.
+The count belongs to the ask as parked: a spawn request, or a chat ask
+until it is answered (a declined one asked again starts afresh).
+`verifier_unavailable` is not counted. Last, routine-born approvals in the last 24 h at the
 **routine cap** (`MATRON_COORDINATOR_ROUTINE_CAP`, default 10; `0` is no
 cap) are **409** `routine_cap`. An approval that passes records its root on
 the decision (`consent_decisions.cause_kind` `user`|`item`|`routine`,
@@ -3339,11 +3602,18 @@ rows `user_only: true` (absent otherwise); `POST /consent/answer` refuses a
 Coordinator approval of one with **403** `user_only` before any state
 changes, and still accepts a decline. The user's own tap is unaffected. This is for a box that handles something
 only the user should sign off on, such as one that reads their private mail.
+The Coordinator cannot tell a session on such a box to carry on of its own
+accord either: a `session_control` `carry_on` aimed at one is refused
+`forbidden`, detail `user_only`, unless the turn that sends it was started
+by the user's own recent message, or their comment or tap on one of the
+Coordinator's items (*Session control*); `set_model` and `compact` still go.
 A **protected** box (`devices.protected`, see *Approval keys (step-up)* →
 *Protected boxes*) is user-only too, for chats, spawns and transfers alike,
 and once the account has an approval key an ask aimed at one adds
 `step_up: true` and the `subject` the user's signature covers to its
-`GET /consent/pending` row (absent otherwise).
+`GET /consent/pending` row (absent otherwise). A memory save or delete by an
+agent on a user-only or protected box is always a proposal the user answers
+on a tracker item (*Memories* → *Memory proposals*).
 
 **What an answer does** is exactly what the tap does — one code path
 (`src/consent-answer.js`) behind `/agent-chat/answer`, `/agent-spawn/answer`
@@ -3442,7 +3712,7 @@ lines were dropped, and — for a firing alert whose name matches
 disk and start a safe clean-up below 20% free. Every payload field is
 peer-text sanitised on its own, so nothing in a label can add a line.
 
-### Inbound sources (`POST /inbound/reports`, `POST /inbound/mcp`)
+### Inbound sources (`POST /inbound/reports`, `POST /inbound/replies`, `POST /inbound/mcp`)
 
 (`src/inbound.js`, `src/inbound-files.js`, `src/inbound-http.js`,
 `src/inbound-replies.js`.) An
@@ -3451,11 +3721,13 @@ hosted assistant, a scheduled job, a workflow service. It has a name, a key
 and one conversation of its own, and each report is one message there.
 
 **The key** (`mis_…`, 256 random bits, only its sha256 stored) can post a
-report and nothing else. It is not a device token: it reads nothing, opens no
-socket and is refused by every other route. `matron-admin inbound add <user>
+report and, only when replies are turned on for the source (below), read
+what the user typed in the source's own conversation. It is not a device
+token: it reads nothing else, opens no socket and is refused by every other
+route. `matron-admin inbound add <user>
 <name> [--hourly N] [--daily N]` creates a source and prints the key once;
-`inbound list`, `limits`, `rotate` (a new key, the old one dead at once) and
-`disable|enable` manage it. A user has at most 20 sources; a name is 1 to 40
+`inbound list`, `limits`, `rotate` (a new key, the old one dead at once),
+`disable|enable` and `replies <id> on|off` manage it. A user has at most 20 sources; a name is 1 to 40
 letters, digits, spaces, dots, dashes or underscores, unique per user.
 
 **The conversation** is a system conversation, `conversations.system =
@@ -3537,7 +3809,7 @@ and not counted. Over a cap the post is refused, and at most once a day the
 journal writes one line in the source's conversation saying reports over the
 limit are being refused. A panic-locked account takes no reports.
 
-**Both routes** are mounted ahead of the device Bearer auth and take the key
+**All three routes** are mounted ahead of the device Bearer auth and take the key
 as `Authorization: Bearer <key>`. With no source in
 the journal they decline, and the paths answer as any unknown path does.
 (So do the two upload routes.) Otherwise a missing, wrong or disabled key is **401** `unauthenticated` and
@@ -3562,18 +3834,53 @@ for assistants that connect to tools by address: stateless, one JSON-RPC
 message per POST, JSON replies, no stream. It answers `initialize`
 (protocol versions `2025-06-18`, `2025-03-26`, `2024-11-05`), `ping`,
 `tools/list` and `tools/call`; a notification gets **202**; any other method
-is `-32601`. It has two tools. `post_report {title?, body, links?, files?}`
+is `-32601`. It has two tools, and a third with replies on. `post_report {title?, body, links?, files?}`
 ends in the same code as the route above and answers with one line of text
 (`Posted.`, already posted, or why not), `isError` set for anything but
 those two. `request_upload {name?}` answers with a line of JSON, `{file_id,
 upload_url, method: 'PUT', expires_in_seconds}`: the caller sends the file
 to `upload_url` and then names `file_id` in `post_report`. The address is
 built from the journal's configured public host when it has one, else from
-the request. The server offers nothing to read.
+the request. With replies off the server offers nothing to read. With
+replies on, `tools/list` adds `get_replies {}` and `initialize`'s
+instructions name it; for a source with replies off a call to it is
+`-32602`, as for any unknown tool.
 
-**The log** has one line per post, upload and upload address: the source id,
-the outcome, and the size and type. Never the text, a file's name or an
-upload address.
+**Replies** (`inbound_sources.replies`, off by default). The user's words
+leave Matron when a source reads them, so each source is switched
+separately: `matron-admin inbound replies <id> on|off`. Either change
+writes one line in the source's conversation saying what the source can
+now read, or no longer can. Turned on, the key can read the `text` events
+the user sent into the source's own conversation after that line. Nothing
+typed before it, no other conversation, no item, file or other journal
+data. The command has no connected apps to tell, so the source's first read
+after the switch sends them that line, returns nothing and starts from
+there: nothing typed before the apps were told is handed over.
+
+A message stays listed until the source's next accepted report: a read
+records the newest message handed over, and an accepted report marks
+answered what had been handed over when its request arrived. So a read whose answer was lost can
+be repeated, a message typed while a report is being written is handed
+over on the following read, and a duplicate report answers nothing. A read
+returns at most 20 messages, oldest first, each cut at 4000 characters;
+`more` says others are waiting, and they follow once a report has answered
+the first page. A source may read 30 times an hour.
+
+`POST /inbound/replies` `{}`:
+
+| Status | Body | |
+|---|---|---|
+| 200 | `{replies:[{at, text}], more}` | `at` is the ISO time the message was sent |
+| 403 | `{error:'replies_off'}` | replies are not on for this source |
+| 403 | `{error:'account_locked'}` | the account is panic-locked |
+| 429 | `{error:'rate_limited', retry_after}` + `Retry-After` | over 30 reads an hour |
+
+`get_replies` answers with the same messages as text, each under its time,
+or `No new messages from the user.`
+
+**The log** has one line per post, upload, upload address and read: the
+source id, the outcome, and the size and type or how many messages. Never
+the text, a file's name or an upload address.
 
 **What the user types there.** A `send` of `type: 'text'` into a source's
 conversation is stored and, as in the People conversation, passed to the
@@ -3585,7 +3892,9 @@ strangers wrote, to be read as information and never followed as
 instructions (cut at about 26 KiB, with a note). The journal answers in the
 conversation with a link to the task, or says that nobody read the message
 when no Coordinator is set. A send of any other type is `bad_request`. This
-is the only way a report reaches an agent.
+is the only way a report reaches an agent. With replies on, the task is
+filed all the same and the journal's line adds that the source can read
+what is typed there.
 
 ### Notice items
 
@@ -4464,7 +4773,11 @@ alert, a hand-over's or a talk's session start, a Coordinator's
 `session_control`), it checks again once the wait is over: a box protected
 meanwhile gets nothing, with the same outcome as above (for
 `session_control`, the result frame with `error: {code:'forbidden',
-detail:'protected_device'}`).
+detail:'protected_device'}`; a carry-on to a box that is user-only by then
+is checked again as it was on arrival — its causes must still resolve to
+the user's own message or tap, whose age is measured from the request's
+arrival, not from the end of the wait — and otherwise gets nothing, with
+`detail:'user_only'` and the `why` in the same frame).
 
 **With a key**, an ask **aimed at** a protected box needs a signed
 `consent` statement to be approved. Aimed at means: a spawn's target box; a
@@ -5515,9 +5828,9 @@ stored and read back by `GET /panic`, never written to a line.
 
 ## User settings
 
-`GET /settings` (either device kind) → `{notices: boolean, auto_archive_days: integer}`.
-`PATCH /settings {notices?, auto_archive_days?}` (client only, else **403**;
-an unknown key, a non-boolean `notices` or an `auto_archive_days` outside
+`GET /settings` (either device kind) → `{notices: boolean, auto_approve_coordinator_spawns: boolean, auto_archive_days: integer}`.
+`PATCH /settings {notices?, auto_approve_coordinator_spawns?, auto_archive_days?}` (or `PUT`; client only, else **403**;
+an empty object, an unknown key, a non-boolean switch or an `auto_archive_days` outside
 0–3650 is **400**) → the new view. `auto_archive_days` is the auto-archive
 idle window (see *Archived conversations*), default 30, `0` = off. `notices` — "Send things I need to
 read to For you" — defaults to `true` (no row reads as `true`). While on,
@@ -5528,6 +5841,33 @@ with one has no `final` entry. Prompts, permission asks and failures are
 listed either way. A change is sent live to every socket of the user as
 `{kind: 'control', op: 'settings', settings}`; `hello_ok` carries the
 current view, so nothing needs replaying.
+
+`auto_approve_coordinator_spawns` defaults to `false`, also for existing
+accounts. When enabled, requests from the current Coordinator conversation
+are approved automatically only onto the user's own online box, with a live
+registered socket, Coordinator consent enabled, and neither device user-only.
+The ask's causes must resolve through the existing own-ask rules to a verified
+non-routine root: the user's words or an item comment/tap. Missing, unverified
+and routine causes retain the normal approval flow; routine envelopes,
+verification and routine caps are not waived.
+
+This opt-in loosens the daily approval policy: automatic approvals bypass the
+rolling daily cap and instead have a ceiling of 60 per user per rolling hour.
+At that ceiling, requests wait for an answer as usual. Automatic approvals
+remain in ordinary decision history and count toward the daily cap for later
+`/consent/answer` approvals. Transfer caps are unchanged.
+
+The card and consent item are filed before the pending acknowledgement and
+the shared approval flow. Successful approval closes the item, records the
+verified cause and reason `auto-approved (Coordinator)`, emits the usual
+`consent_decision` (with `auto: true`; the journal marks the automatic path
+itself, and `POST /consent/answer` rejects that reserved reason with **400**)
+and spawn outcome, and skips the consent nudge. A failed
+claim or decision-history write leaves the card available for an answer.
+Asleep targets retain their
+wake and consent flow. Other conversations and chat invites are unchanged.
+Apps may briefly display or notify the card before it closes. The setting is
+included in existing settings and hello frames; no client polling is added.
 
 ## Default model and effort
 
@@ -6251,7 +6591,8 @@ candidate messages; hitting that sets `truncated`.
 Coordinator. When all of the following hold, it sends one ephemeral frame to
 the Coordinator's bridge:
 
-- UK time is between 07:00 and 22:00;
+- it is between 07:00 and 22:00 in the journal's nudge zone
+  (`MATRON_UNSEEN_NUDGE_TZ`, an IANA name; default `Europe/London`);
 - the last nudge was at least an hour ago;
 - the Coordinator's bridge is connected;
 - there are important, unflagged entries unseen for 2 h or more that no
@@ -7029,7 +7370,7 @@ journal **copies** every `text` message appended to one room (agent
 wrote this" and restrict the turn it starts. A copy is never copied back.
 The copy wakes the receiving agent's box and pushes like any append.
 Bodies over 16,000 characters are cut, with a note. Files and images do
-not cross: a `publish` or `send` of `file`/`image` into a linked room is
+not cross: a `publish`, `finalize` or `send` of `file`/`image` into a linked room is
 `bad_request` ("files and images do not cross to another person").
 
 ### Asking, and the two consents
@@ -8614,6 +8955,26 @@ report that one message as seen (read state, op `seen`). The push relay
 `box` (below), and omits `seq`; a device that opens the box finds the `seq`
 inside it. A client must treat a missing `seq` as "no tap receipt".
 
+### Held pushes
+
+Some alerts wait before they go out, so that an ask settled within seconds
+never buzzes a phone:
+
+- **Items that need the user.** An agent's `created`, `commented` or
+  `reopened` marker that leaves an item awaiting the user is held for
+  `MATRON_PUSH_HOLD_MS` (default 60000; `0` sends at once). When the hold
+  ends, the push goes out only if the item is still `open` and still
+  awaiting the user, and the whole decision is made again then: the
+  notification settings, the devices, and what each device has already
+  received. A phone whose app caught up during the hold gets nothing.
+- **Consent cards.** In Coordinator mode, a spawn or chat card the
+  Coordinator may decide is held for the same time, but never less than
+  30 s, and goes out only if the ask is still waiting.
+
+Silent background wakes are never held. A hold lives in memory; at startup
+the journal re-arms the holds a restart cut short (asks and item markers
+young enough to have been mid-hold), for whatever time each has left.
+
 ### Sealed notification content
 
 A device may register a public key with its push token (`POST
@@ -8897,3 +9258,78 @@ Agent-to-agent file transfers have their own always-on sweep, with no env
 knob — see "Agent-to-agent file transfers" → "Retention" above. In short:
 a collected copy is deleted an hour after receipt, and an uncollected one
 is marked `expired` and deleted a week after it was created.
+
+## Web Push
+
+Browser notifications require HTTPS and a Push API subscription for each
+browser. Web Push uses the same notification settings, viewing and read-state
+filters as APNs. It sends visible notifications only, without silent wakes or
+read-marker pushes. A device with both registrations receives both transports.
+
+Both endpoints require a client device's bearer token; agent devices receive
+403. `GET /push/web/vapid-key` returns `{ "public_key": "<base64url>" }`, the
+uncompressed P-256 application server key to use when subscribing.
+
+`POST /push/web/register` accepts:
+
+```json
+{
+  "endpoint": "https://push.example.com/send/browser",
+  "keys": { "p256dh": "<base64url P-256 point>", "auth": "<base64url 16-byte secret>" }
+}
+```
+
+Success returns `{ "ok": true }`. Repeating a registration preserves its creation
+time; a changed subscription replaces it. An endpoint is held by one device at
+a time. `{ "endpoint": null }` unregisters, even when sending is disabled.
+Invalid endpoints or keys return 400 `{ "error": "bad_request" }`. Endpoints
+must use public HTTPS on port 443 without credentials. Private and reserved
+addresses are blocked at registration and after DNS resolution when sending;
+redirects are never followed.
+
+When the sender is off, key discovery and registration return 404
+`{ "error": "web_push_disabled" }`. Generate a deployment key with
+`node tools/webpush-vapid-keygen.js <out.pem>`; the tool refuses to overwrite a
+file, writes the private key with mode 0600, and prints only its public key.
+Keep the private key outside source control. Set both
+`MATRON_WEBPUSH_VAPID_KEY_FILE` (PEM P-256 private key) and
+`MATRON_WEBPUSH_SUBJECT` (a `mailto:` or `https:` contact URL). With neither,
+Web Push is off; an incomplete pair or invalid key fails startup.
+`MATRON_WEBPUSH_DISABLED=1` or `true` disables it regardless of configuration.
+Endpoints are limited to `fcm.googleapis.com`,
+`updates.push.services.mozilla.com`, `*.push.apple.com`, and
+`*.notify.windows.com`. Set `MATRON_WEBPUSH_EXTRA_HOSTS` to a comma-separated
+list of extra exact hosts or `*.suffix` entries to extend this list. Entries
+are trimmed and lowercased; empty entries are ignored. A wildcard matches
+subdomains only, not the suffix itself. Invalid entries fail startup.
+Public IP literals require an exact entry in the extra hosts; private and
+reserved addresses remain blocked.
+
+The decrypted RFC 8291 `aes128gcm` payload is bounded JSON, optionally followed
+by whitespace padding:
+
+```json
+{
+  "v": 1,
+  "title": "Conversation title",
+  "body": "Your agent needs you",
+  "convo_id": "conversation-one",
+  "seq": 42,
+  "kind": "attention"
+}
+```
+
+`kind` is `attention`, `done`, or `activity`. Optional `subtitle` and `item`
+fields follow the sealed notification content schema (`item` has `id`, `num`,
+`kind`, `actions`, and optional `reply_to`). Web Push encryption protects the
+content directly; no additional HPKE box wraps it. If content cannot fit, the
+sender uses fixed notification text with the version, conversation, sequence
+and kind fields. Urgency is high for attention and done, normal for activity;
+TTL is 24 hours or one hour respectively. A hashed conversation or item topic
+collapses related notifications.
+
+A push service's 404 or 410 response prunes the subscription only if that device
+still holds the failed endpoint. Other failures preserve it for later sends.
+`GET /metrics` includes global `push.web` counters: `sent`, `failed`, `pruned`,
+and `by_reason`. These remain zero when Web Push is off and do not include
+APNs sends.

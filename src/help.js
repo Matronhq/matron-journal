@@ -183,7 +183,7 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
 - \`GET /settings\` → \`{notices}\` — whether the user wants things to read filed as \`notice\` items (default true; \`hello_ok\` carries it as \`settings\`, and a change arrives as \`{kind:'control', op:'settings', settings}\`). \`PATCH /settings {notices}\` is the user's alone.
 - \`GET /coordinator\` → \`{convo_id, consent}\` — the user's Coordinator, and whether it may approve chats and spawns
 - \`GET /consent/pending?convo_id=<coordinator convo>\` → \`{pending:[…]}\` — parked chat invites, join requests and spawn requests (Coordinator only)
-- \`POST /consent/answer\` \`{convo_id, kind: chat|spawn, id, decision: approve|decline, reason}\` — answer one on the user's behalf (Coordinator only; see /help's protocol for the guardrails). Approving the Coordinator's OWN ask needs its \`causes\` to resolve to the user's words or item reply/tap (else 403 own_ask_unverified), or to a routine fire inside the routine's envelope (403 envelope), passed by the verifier (403 verifier / 409 verifier_unavailable) and under the routine cap (409 routine_cap)
+- \`POST /consent/answer\` \`{convo_id, kind: chat|spawn, id, decision: approve|decline, reason}\` — answer one on the user's behalf (Coordinator only; see /help's protocol for the guardrails). Approving the Coordinator's OWN ask needs its \`causes\` to resolve to the user's words or item reply/tap (else 403 own_ask_unverified), or to a routine fire inside the routine's envelope (403 envelope), passed by the verifier (403 verifier / 409 verifier_unavailable; 403 left_for_user once the verifier has said no to that ask 3 times: stop answering it, it is the user's) and under the routine cap (409 routine_cap)
   conversation, or null. Only the user sets it; you hear a change as a
   \`coordinator\` event \`{role: 'assigned'|'released'}\` in the conversation.
 - \`GET /defaults\` → \`{default_model, default_effort}\` — the user's default
@@ -209,15 +209,38 @@ mutating routes append a \`mission\` or \`milestone\` marker event you cannot
   repo). A bridge with the scopes update gives a session only the memories
   whose scope matches it; an older bridge still gives every memory to
   every session, so a stored scope restricts nothing until the bridge is
-  updated. \`GET /memories/:name\` (or the \`me_…\` id) → \`{memory}\`.
+  updated. Each also has a \`tier\`: \`always\` (listed in full in every
+  session of its scope) or \`on_demand\` (named under its \`topic\` and read
+  when the work needs it). \`GET /memories/:name\` (or the \`me_…\` id) →
+  \`{memory}\`.
+- \`POST /memories/recall\` \`{text, mode?: query|auto, scopes?, tier?,
+  exclude?, limit? (≤10, default 3), min_score?, min_z?}\` →
+  \`{memories:[{…, score, why}], semantic}\` — the memories that bear on a
+  text, whole. \`query\` (default) is your own words; \`auto\` is a turn's
+  text, matched by meaning only: similarity ≥ \`min_score\` (default 0.62)
+  and standing out from your other memories (z ≥ \`min_z\`, default 3).
 - \`PUT /memories/:name\` \`{description (≤200 chars, one line), body?
   (markdown ≤8 KB), type?: user|feedback|project|reference, scope?:
   global|coordinator|repo:<name> (global on create, kept on update when
-  omitted), convo_id? (agents: your conversation)}\` → 201 created / 200
-  updated \`{memory}\`. The same name overwrites — the whole memory, so send
-  the body back when updating. 409 \`too_many\` at 200 memories. \`DELETE /memories/:name\` →
+  omitted), tier?: always|on_demand, topic? (≤40 chars), convo_id?
+  (agents: your conversation)}\` → 201 created / 200 updated \`{memory}\`.
+  The same name overwrites — the whole memory, so send the body back when
+  updating; tier and topic are kept when omitted. 409 \`too_many\` at 200
+  memories. Neither tier has a size limit. \`DELETE /memories/:name\` →
   200 \`{memory}\`. Every change lands as a quiet \`memory\` event on your
-  conversation and on the Coordinator's.
+  conversation and on the Coordinator's. An agent's save or delete applies
+  at once only in a turn the user started in that conversation in the last
+  30 minutes (their message, or their reply or tap on one of its items):
+  send \`causes\` (the turn's causes, as on a spawn ask) with \`convo_id\`,
+  on DELETE in a JSON body. Anything else, and every write from a
+  user-only or protected box, answers 202 \`{pending: 'owner', proposal,
+  item: {id, num}}\`: nothing changed, the user was asked on that item, and
+  the outcome arrives later as a \`memory_proposal\` event (\`outcome\`:
+  approved|declined|replaced|expired|stale — stale: the memory changed
+  before the user answered, propose again). Do not retry: a second write for
+  the same name replaces the first with a new item. 409 \`blocked_by:
+  'too_many_asks'\` when 10 from your conversation (50 for the user)
+  already wait.
 - \`GET /routines\` → \`{routines}\` — the user's Coordinator routines: a
   prompt the journal fires into the Coordinator conversation on a
   \`schedule\` (5-field cron in \`tz\`) or when a \`trigger\` trips

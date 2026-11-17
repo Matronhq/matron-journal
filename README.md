@@ -32,7 +32,7 @@ runs on the CPU, so the install line above sets it, as does
 `MATRON_SEMANTIC_SEARCH` below for memory use and the first-boot model
 download.
 
-Node 20+. A systemd unit template is in
+Node 22+. A systemd unit template is in
 [`deploy/matron-journal.service`](deploy/matron-journal.service).
 
 `npm start` runs `bin/matron-journal`, which starts `src/server.js`. On macOS
@@ -114,6 +114,7 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_SQLITE_CACHE_MB` | `64` (or 1/16 of RAM on hosts under 1 GiB, minimum 8) | SQLite page cache per connection, in MiB. Pages are cached as they are touched and never released, so a large value adds that much resident memory after a retention pass or search rebuild, on top of the OS page cache; `matron-admin` opens its own. Raise it on a large host with a busy disk. `0` or an invalid value keeps SQLite's stock cache |
 | `MATRON_BIND` | `127.0.0.1` | Bind address (put a TLS-terminating proxy in front for `wss://`) |
 | `MATRON_STALL_LOG` | on | Set to `0` to turn off the diagnostics that log event-loop stalls (`stall: …`), requests slower than 500 ms (`slow request: …`) and slow maintenance passes. The work itself is unaffected |
+| `MATRON_WS_DEFLATE` | on | Set to `0` to stop negotiating WebSocket permessage-deflate. When on, frames over 1 KiB are compressed for any peer that offers the extension (phones and bridges alike), with no context takeover and a 2 KiB server window. Costs some CPU per large frame and tens of KiB of zlib state per compressed connection |
 | `MATRON_GITHUB_CLIENT_ID` | Matron's published OAuth App id (`Ov23likaFmqoegaDMTtz`) | GitHub OAuth App client id for account linking (device flow works with the id alone). Set to the empty string to disable linking; set your own app's id, with its secret, for the web flow |
 | `MATRON_GITHUB_CLIENT_SECRET` | unset | Client secret of an OAuth App registered for this journal (callback `https://<journal>/github/callback`). Enables the one-click web flow |
 | `MATRON_GITHUB_DEVICE_FLOW` | on | Set to `0` to turn off the device flow (code entered on GitHub's site). It is always off when a client secret is set, so a journal with the web flow offers only that |
@@ -124,7 +125,7 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_ANDROID_PACKAGE` | unset (404) | Android package name for `/.well-known/assetlinks.json`; needs `MATRON_ANDROID_CERT_SHA256` too |
 | `MATRON_ANDROID_CERT_SHA256` | unset | Comma-separated signing-cert SHA-256 fingerprints (`AA:BB:…`) for assetlinks |
 | `MATRON_MEDIA_DIR` | `<db dir>/media` | Blob storage root |
-| `MATRON_MEDIA_MAX_BYTES` | 50 MiB (`52428800`) | Upload size limit |
+| `MATRON_MEDIA_MAX_BYTES` | 100 MB (`100000000`) | Upload size limit; explicit overrides still apply |
 | `MATRON_STT_AZURE_KEY` | unset (off) | Azure Speech resource key. Set it and every user's voice note, and the audio track of every user's video, is transcribed here on upload (Azure fast transcription), along with voice notes on tracker items; a bridge reads the words instead of running its own whisper, and can ask for a retry (`POST /media/:id/transcript`). Needs `ffmpeg` on `PATH`. With `MATRON_WHISPER_MODEL` set too, whisper is the fallback when the cloud call fails |
 | `MATRON_STT_AZURE_KEY_FILE` | unset | File holding the key, used when `MATRON_STT_AZURE_KEY` is unset; read at boot. Set but unreadable = cloud transcription off, said at boot |
 | `MATRON_STT_AZURE_MODEL` | `MAI-Transcribe-2` | Azure transcription model; the empty string = Azure's standard model |
@@ -177,6 +178,11 @@ on each dev box, then sign in from an app with your journal URL + username.
 | `MATRON_PANIC_TOKEN` | unset (panic lock off) | Token for `POST /panic` and `GET /panic`, with which an external watcher locks one account in one request: 32 to 128 characters of `A-Z a-z 0-9 _ -`. It can only lock that account and read whether it is locked; it is unlocked by `matron-admin panic clear` on the journal host, or by one of the account's devices that holds an approval key, with a signed statement. Needs `MATRON_PANIC_ACCOUNT`. See *Panic lock* in `docs/protocol.md` |
 | `MATRON_PANIC_ACCOUNT` | unset (panic lock off) | The user name the panic token is bound to |
 | `MATRON_APNS_KEY_FILE` / `_KEY_ID` / `_TEAM_ID` / `_TOPIC` | unset | All four set = push enabled; otherwise push is an inert no-op |
+| `MATRON_WEBPUSH_VAPID_KEY_FILE` | unset | PEM P-256 private key file for Web Push; set together with the subject |
+| `MATRON_WEBPUSH_SUBJECT` | unset | Web Push contact URL (`mailto:` or `https:`); set together with the key file |
+| `MATRON_WEBPUSH_DISABLED` | unset | `1` or `true` switches Web Push off |
+| `MATRON_WEBPUSH_EXTRA_HOSTS` | unset | Comma-separated extra push-service hosts beyond `fcm.googleapis.com`, `updates.push.services.mozilla.com`, `*.push.apple.com`, and `*.notify.windows.com`; exact hosts or `*.suffix` |
+| `MATRON_PUSH_HOLD_MS` | `60000` | How long a push about an item that needs the user waits; it goes out only if the item still needs them then. `0` sends at once. Consent cards in Coordinator mode wait as long, but at least 30 s |
 | `MATRON_PUSH_GATEWAY_URL` | unset | Push relay URL when you have no APNs key — see Push relay section |
 | `MATRON_RELAY_PORT` / `MATRON_RELAY_BIND` | `9821` / `127.0.0.1` | matron-push-relay only |
 
@@ -251,6 +257,20 @@ on each dev box, then sign in from an app with your journal URL + username.
 
 Dependencies: `better-sqlite3`, `ws`, `argon2`, `qrcode`, `qrcode-terminal`.
 That's the whole list.
+
+### Web Push
+
+Generate a VAPID key with `node tools/webpush-vapid-keygen.js <out.pem>`, then
+set `MATRON_WEBPUSH_VAPID_KEY_FILE` to that file and `MATRON_WEBPUSH_SUBJECT`
+to a `mailto:` or `https:` contact URL. Web Push is off unless both are set;
+an incomplete pair fails startup. The web app must be served over HTTPS with
+its `sw.js` at the root of its path.
+
+Only `fcm.googleapis.com`, `updates.push.services.mozilla.com`, subdomains of
+`push.apple.com`, and subdomains of `notify.windows.com` are accepted by
+default. Extend this list with `MATRON_WEBPUSH_EXTRA_HOSTS`, a comma-separated
+list of exact hosts or `*.suffix` entries. A wildcard matches subdomains
+only, not the suffix itself.
 
 ## Push relay (self-hosted journals)
 

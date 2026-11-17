@@ -669,31 +669,83 @@ export function sanitizeSpawnDisk(raw) {
   return { free_bytes: raw.free_bytes, total_bytes: raw.total_bytes }
 }
 
+// Vitals block: the box's host CPU and RAM use as percentages, with the time
+// of the sample so a client can grey a reading that has gone quiet. All-or-
+// nothing like the other blocks; only these three keys are copied.
+function isPct(v) { return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 100 }
+
+export function sanitizeBoxVitals(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  if (!isPct(raw.cpu_pct) || !isPct(raw.ram_pct)) return null
+  if (!Number.isInteger(raw.sampled_at_ms) || raw.sampled_at_ms <= 0 || raw.sampled_at_ms > AS_OF_MAX_MS) return null
+  return { cpu_pct: raw.cpu_pct, ram_pct: raw.ram_pct, sampled_at_ms: raw.sampled_at_ms }
+}
+
 // A bridge's own box-status report (`box_status` op): the same optional
 // capacity blocks a recent_folders reply may carry, plus the account it
 // burns quota against. Each block is all-or-nothing on its own; a report
 // with no valid block at all is rejected (nothing to store).
 const ACCOUNT_EMAIL_CAP = 254
 
+// `plugins`: the bridge plugins the box has loaded, as the bridge reports
+// them: `[{ name, methods }]`. `name` follows the bridge's plugin-name rule
+// (lowercase letters and digits, at most 32); `methods` is up to 64 strings,
+// each `x_<name>_...` and at most 64 characters. The older bare-string form
+// is still accepted and becomes `{ name, methods: [] }`. All-or-nothing like
+// the other blocks; entries are de-duplicated by name (first one wins).
+const PLUGINS_MAX = 32
+const PLUGIN_NAME_CAP = 32
+const PLUGIN_NAME_RE = /^[a-z0-9]+$/
+const PLUGIN_METHODS_MAX = 64
+const PLUGIN_METHOD_CAP = 64
+
+export function sanitizeBoxPlugins(raw) {
+  if (!Array.isArray(raw) || raw.length > PLUGINS_MAX) return null
+  const out = []
+  for (const entry of raw) {
+    let n = entry
+    let rawMethods = []
+    if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+      n = entry.name
+      rawMethods = entry.methods === undefined ? [] : entry.methods
+    }
+    if (typeof n !== 'string' || !n || n.length > PLUGIN_NAME_CAP || !PLUGIN_NAME_RE.test(n)) return null
+    if (!Array.isArray(rawMethods) || rawMethods.length > PLUGIN_METHODS_MAX) return null
+    const prefix = `x_${n}_`
+    const methods = []
+    for (const m of rawMethods) {
+      if (typeof m !== 'string' || m.length <= prefix.length || m.length > PLUGIN_METHOD_CAP
+        || !m.startsWith(prefix) || !/^[A-Za-z0-9_]+$/.test(m)) return null
+      if (!methods.includes(m)) methods.push(m)
+    }
+    if (!out.some((p) => p.name === n)) out.push({ name: n, methods })
+  }
+  return out
+}
+
 export function sanitizeBoxStatus(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
   const activity = sanitizeSpawnActivity(raw.activity)
   const limits = sanitizeSpawnLimits(raw.limits)
   const disk = sanitizeSpawnDisk(raw.disk)
+  const vitals = sanitizeBoxVitals(raw.vitals)
   const defaults = sanitizeBoxDefaults(raw.defaults)
+  const plugins = sanitizeBoxPlugins(raw.plugins)
   let account = null
   if (raw.account && typeof raw.account === 'object' && !Array.isArray(raw.account)
     && typeof raw.account.email === 'string' && raw.account.email.length <= ACCOUNT_EMAIL_CAP) {
     const email = sanitizePeerText(raw.account.email, ACCOUNT_EMAIL_CAP)
     if (email) account = { email }
   }
-  if (!activity && !limits && !disk && !account && !defaults) return null
+  if (!activity && !limits && !disk && !account && !vitals && !defaults && !plugins) return null
   return {
     ...(activity ? { activity } : {}),
     ...(limits ? { limits } : {}),
     ...(disk ? { disk } : {}),
     ...(account ? { account } : {}),
+    ...(vitals ? { vitals } : {}),
     ...(defaults ? { defaults } : {}),
+    ...(plugins ? { plugins } : {}),
   }
 }
 

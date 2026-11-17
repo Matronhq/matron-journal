@@ -16,12 +16,14 @@
 
     { "kind": "ws_open", "role": "agent", "conn": "agent" },
     { "kind": "ws_send", "role": "agent", "conn": "agent", "frame": { "op": "hello", "token": { "$ref": "bridge.token" }, "cursor": null } },
-    { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_archive_days": 30 }, "box_defaults": { "default_agent": null, "default_model": null, "default_effort": null }, "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "box-2" } },
+    { "kind": "ws_expect", "role": "agent", "conn": "agent", "frame": { "kind": "control", "op": "hello_ok", "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "box_defaults": { "default_agent": null, "default_model": null, "default_effort": null }, "coordinator_convo_id": null, "seq": 0, "device_id": { "$type": "integer" }, "name": "box-2" } },
     { "kind": "ws_open", "role": "client", "conn": "mac" },
     { "kind": "ws_send", "role": "client", "conn": "mac", "frame": { "op": "hello", "token": { "$ref": "mac_token" }, "cursor": 0 } },
-    { "kind": "ws_expect", "role": "client", "conn": "mac", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_archive_days": 30 }, "pins": [], "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
+    { "kind": "ws_expect", "role": "client", "conn": "mac", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "pins": [], "seq": 0, "device_id": { "$type": "integer" }, "name": "mac" } },
 
     { "kind": "ws_send", "role": "client", "conn": "mac", "frame": { "op": "viewing", "convo_ids": ["c1", "c2"] } },
+    { "kind": "ws_expect", "role": "client", "conn": "mac", "frame": { "kind": "ephemeral", "convo_id": "c1", "activity": { "state": "idle" } } },
+    { "kind": "ws_expect", "role": "client", "conn": "mac", "frame": { "kind": "ephemeral", "convo_id": "c2", "activity": { "state": "idle" } } },
     { "kind": "ws_send", "role": "client", "conn": "mac", "frame": { "op": "viewing", "convo_ids": ["c1", "c2", "c3", "c4", "c5"] } },
     { "kind": "ws_expect", "role": "client", "conn": "mac", "frame": { "kind": "control", "op": "error", "code": "bad_request", "ref": "viewing", "detail": "convo_ids must be an array of at most 4 non-empty convo id strings" } },
     { "kind": "ws_send", "role": "client", "conn": "mac", "frame": { "op": "send", "convo_id": "c1", "payload": { "body": "barrier: viewing applied" }, "local_id": "b1" } },

@@ -19,7 +19,7 @@
       } } },
     { "kind": "ws_open", "role": "client", "conn": "client" },
     { "kind": "ws_send", "role": "client", "conn": "client", "frame": { "op": "hello", "token": { "$ref": "token" }, "cursor": 0, "max_replay": 1 } },
-    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_archive_days": 30 }, "pins": [], "seq": 2, "device_id": { "$type": "integer" }, "name": "test" } },
+    { "kind": "ws_expect", "role": "client", "conn": "client", "frame": { "kind": "control", "op": "hello_ok", "coordinator_convo_id": null, "settings": { "notices": true, "auto_approve_coordinator_spawns": false, "auto_archive_days": 30 }, "pins": [], "seq": 2, "device_id": { "$type": "integer" }, "name": "test" } },
     { "kind": "ws_expect", "role": "client", "conn": "client", "frame": { "kind": "control", "op": "snapshot_required" } },
     { "kind": "ws_expect_close", "role": "client", "conn": "client", "code": 4009 }
   ]

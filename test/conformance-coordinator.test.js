@@ -65,7 +65,7 @@ test('a runner that reports a wrong frame fails that step, not a later one', asy
     fixture, base: booted.base, bindings: booted.bindings, control: booted.control,
     runner, play: ['client'], collect,
   })
-  const firstEphemeral = fixture.steps.findIndex((s) => s.kind === 'ws_expect' && s.frame.kind === 'ephemeral')
+  const firstEphemeral = fixture.steps.findIndex((s) => s.kind === 'ws_expect' && s.frame.kind === 'ephemeral' && s.frame.tool_stream)
   assert.equal(result.status, 'fail')
   assert.equal(result.failedStep, firstEphemeral)
   assert.match(result.error, new RegExp(`^step\\[${firstEphemeral}\\]`))
@@ -104,7 +104,7 @@ test('a fixture needing a capability the runner lacks is skipped, as is one newe
 const hello = (client, token, cursor) => [
   { kind: 'ws_open', role: 'client', client, conn: client },
   { kind: 'ws_send', role: 'client', client, conn: client, frame: { op: 'hello', token: { $ref: token }, cursor } },
-  { kind: 'ws_expect', role: 'client', client, conn: client, frame: { kind: 'control', op: 'hello_ok', coordinator_convo_id: null, settings: { notices: true, auto_archive_days: 30 }, pins: [], seq: { $type: 'integer' }, device_id: { $type: 'integer' }, name: client } },
+  { kind: 'ws_expect', role: 'client', client, conn: client, frame: { kind: 'control', op: 'hello_ok', coordinator_convo_id: null, settings: { notices: true, auto_approve_coordinator_spawns: false, auto_archive_days: 30 }, pins: [], seq: { $type: 'integer' }, device_id: { $type: 'integer' }, name: client } },
 ]
 const login = (client, tokenName) => ({
   kind: 'http', role: 'client', client, method: 'POST', path: '/login',
@@ -132,7 +132,7 @@ function lifecycleFixture(reconnectStep) {
       { kind: 'advance_clock', role: 'client', client: 'phone', ms: 30000 },
       send('mac', 'two', 'l2'), journal('mac', 2, 'two'),
       reconnectStep,
-      { kind: 'ws_expect', role: 'client', client: 'phone', conn: 'phone', frame: { kind: 'control', op: 'hello_ok', coordinator_convo_id: null, settings: { notices: true, auto_archive_days: 30 }, pins: [], seq: 2, device_id: { $type: 'integer' }, name: 'phone' } },
+      { kind: 'ws_expect', role: 'client', client: 'phone', conn: 'phone', frame: { kind: 'control', op: 'hello_ok', coordinator_convo_id: null, settings: { notices: true, auto_approve_coordinator_spawns: false, auto_archive_days: 30 }, pins: [], seq: 2, device_id: { $type: 'integer' }, name: 'phone' } },
       journal('phone', 2, 'two', true),
       { kind: 'ws_expect_none', role: 'client', client: 'phone', conn: 'phone', ms: 150 },
     ],
@@ -210,7 +210,7 @@ test('a reconnect after a live-only hello stays live-only', async (t) => {
       login('mac', 'mac_token'), ...hello('mac', 'mac_token', null),
       { kind: 'disconnect', role: 'client', client: 'mac', conn: 'mac' },
       { kind: 'reconnect_from_cursor', role: 'client', client: 'mac', conn: 'mac' },
-      { kind: 'ws_expect', role: 'client', client: 'mac', conn: 'mac', frame: { kind: 'control', op: 'hello_ok', coordinator_convo_id: null, settings: { notices: true, auto_archive_days: 30 }, pins: [], seq: 1, device_id: { $type: 'integer' }, name: 'mac' } },
+      { kind: 'ws_expect', role: 'client', client: 'mac', conn: 'mac', frame: { kind: 'control', op: 'hello_ok', coordinator_convo_id: null, settings: { notices: true, auto_approve_coordinator_spawns: false, auto_archive_days: 30 }, pins: [], seq: 1, device_id: { $type: 'integer' }, name: 'mac' } },
       { kind: 'ws_expect_none', role: 'client', client: 'mac', conn: 'mac', ms: 150 },
     ],
   }

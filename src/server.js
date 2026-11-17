@@ -1,3 +1,4 @@
+import { makeWebPushClient, webPushConfigFromEnv } from './webpush.js'
 import http from 'node:http'
 import { makeAgentCommentLimiter } from './agent-comment-limiter.js'
 import path from 'node:path'
@@ -18,9 +19,9 @@ import { attachWs } from './ws.js'
 import { makeToolStreamStore } from './tool-stream.js'
 import { makeApnsClient } from './apns.js'
 import { makeGatewayClient } from './gateway.js'
-import { makePushPipeline, BACKGROUND_WAKE_MS } from './push.js'
+import { makePushPipeline, BACKGROUND_WAKE_MS, CONSENT_HOLD_MS, FOR_YOU_HOLD_MS } from './push.js'
 import { resolveMediaDir } from './media.js'
-import { offloadPass, expireLogsPass, runReapMedia, runExpireVoiceNotes, runExpireDeviceContent, runExpireTransfers, drainSync, drainAsync } from './retention.js'
+import { offloadPass, expireLogsPass, runReapMedia, reapOrphanBlobsPass, runExpireVoiceNotes, runExpireDeviceContent, runExpireTransfers, drainSync, drainAsync } from './retention.js'
 import { startStallLog, timed, logSlowRequests } from './stall-log.js'
 import { backfillSearchIndex, backfillIsDiff } from './search.js'
 import { loadEmbedder } from './embedder.js'
@@ -62,7 +63,7 @@ import { warnAlertWebhookConfig } from './alerts-http.js'
 import { throttle, cancellableDelay } from './background.js'
 import { TRANSFER_MAX_BYTES_DEFAULT, TRANSFER_USER_QUOTA_BYTES_DEFAULT, TRANSFER_MAX_AWAITING_PER_SENDER_DEFAULT } from './transfers.js'
 
-export const DEFAULT_MEDIA_MAX_BYTES = 52428800 // 50 MB
+export const DEFAULT_MEDIA_MAX_BYTES = 100000000 // 100 MB (decimal bytes)
 // Per-user total blob budget (all uploads + retention-offloaded payloads for a
 // user, summed). Unlike tool_output, user-uploaded media has no TTL, so without
 // a ceiling a single valid device token could fill the disk. 2 GiB is ~75x the
@@ -157,6 +158,31 @@ const resolveToolLogTtlHours = (override) =>
   resolveWindow(override, { env: 'MATRON_TOOL_LOG_TTL_HOURS', opt: 'toolLogTtlHours', fallback: DEFAULT_TOOL_LOG_TTL_HOURS, what: 'retention' })
 const resolveVoiceNoteTtlDays = (override) =>
   resolveWindow(override, { env: 'MATRON_VOICE_NOTE_TTL_DAYS', opt: 'voiceNoteTtlDays', fallback: DEFAULT_VOICE_NOTE_TTL_DAYS, what: 'voice-note expiry' })
+
+// Grace window for the orphan-blob reaper (reapOrphanBlobsPass): how old an
+// unreferenced blob must be before it is deleted. OFF unless configured:
+// `override` is startServer's `orphanBlobGraceHours` opt and beats
+// MATRON_ORPHAN_BLOB_GRACE_HOURS; unset, empty or `0` disables, and so does
+// anything that is not a non-negative integer (with one warn line; this pass
+// deletes data, so fail closed means off). A week or more is sensible: a
+// client outbox can resend a pending attachment days later. Returns hours or
+// null.
+export function resolveOrphanBlobGraceHours(override) {
+  const fromEnv = override === undefined
+  const raw = fromEnv ? process.env.MATRON_ORPHAN_BLOB_GRACE_HOURS : override
+  if (raw === undefined) return null
+  const name = fromEnv ? 'MATRON_ORPHAN_BLOB_GRACE_HOURS' : 'orphanBlobGraceHours'
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 0) {
+    console.warn(`retention: ${name}=${JSON.stringify(raw)} is invalid — orphan-blob reaper disabled`)
+    return null
+  }
+  if (n === 0) {
+    console.warn(`retention: ${name}=${JSON.stringify(raw)} resolves to 0 — orphan-blob reaper disabled`)
+    return null
+  }
+  return n
+}
 
 // `override` is startServer's `deviceRetention` opt and beats
 // MATRON_DEVICE_RETENTION, as with the other retention resolvers. The value
@@ -256,11 +282,12 @@ export function resolveReapPcts({ mediaReapHighPct, mediaReapLowPct } = {}) {
 // once, here, at boot. The transfer-expiry pass (runExpireTransfers) runs
 // LAST and unconditionally — see the comment at its call site below.
 // Returns the interval handle (for close()).
-function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionIntervalMs, retentionInitialDelayMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, deviceRetention }) {
+function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionIntervalMs, retentionInitialDelayMs, toolLogTtlHours, voiceNoteTtlDays, mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes, deviceRetention, orphanBlobGraceHours }) {
   const days = resolveRetentionDays(retentionDays)
   const ttlHours = resolveToolLogTtlHours(toolLogTtlHours)
   const voiceDays = resolveVoiceNoteTtlDays(voiceNoteTtlDays)
   const reapPcts = resolveReapPcts({ mediaReapHighPct, mediaReapLowPct })
+  const orphanGraceHours = resolveOrphanBlobGraceHours(orphanBlobGraceHours)
   const deviceRules = resolveDeviceRetention(deviceRetention)
   if (deviceRules) {
     console.log(`retention: device content expiry on — ${deviceRules.map((r) => `device ${r.deviceId} after ${r.days}d`).join(', ')}`)
@@ -322,6 +349,15 @@ function scheduleRetention(db, { mediaDir, hub, retentionDays, retentionInterval
         if (r.reaped > 0) console.log(`retention: reaped ${r.reaped} attachment blob(s), ${r.bytesFreed} bytes, from user(s) over ${reapPcts.highPct}% of the media quota`)
       } catch (err) {
         console.error('retention: media reap run failed', err)
+      }
+      yield
+    }
+    if (orphanGraceHours !== null) {
+      try {
+        const r = yield* reapOrphanBlobsPass(db, { graceMs: orphanGraceHours * 3600000, mediaDir })
+        if (r.reaped > 0) console.log(`retention: reaped ${r.reaped} orphan blob(s), ${r.bytesFreed} bytes, unreferenced for over ${orphanGraceHours}h`)
+      } catch (err) {
+        console.error('retention: orphan-blob reap run failed', err)
       }
       yield
     }
@@ -485,16 +521,24 @@ function warnIfBindTrustsSpoofableIp(bind) {
   }
 }
 
+// Injected clients belong to the caller; configured clients belong to the server.
+export function resolveWebPushClient(injected) {
+  if (injected) return { client: injected, owned: false }
+  const config = webPushConfigFromEnv(process.env)
+  return config ? { client: makeWebPushClient(config), owned: true } : { client: undefined, owned: false }
+}
+
 export function startServer({
-  dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, apnsClient, replayBackpressureBytes,
+  dbPath, port = 0, bind = '127.0.0.1', mediaDir, mediaMaxBytes, mediaUserQuotaBytes, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, apnsClient, webPushClient, replayBackpressureBytes,
   retentionDays, retentionIntervalMs, retentionInitialDelayMs, maxReplay, revocationSweepMs, inviteTtlMs, walCheckpointIntervalMs, toolStreamOpts,
+  // Negotiate compression only with peers offering it; set MATRON_WS_DEFLATE=0 to disable.
+  wsDeflate = process.env.MATRON_WS_DEFLATE !== '0',
   toolLogTtlHours, voiceNoteTtlDays, deviceRetention, pairs, links, preapproveKey, preapproveKeyPath, spawnStartTimeoutMs = 30000, spawnFoldersTimeoutMs = 4000,
   // How long an approved spawn waits for a woken target box to attach
-  // before issuing `start` (wake-before-spawn). Sized for a cold VM boot:
-  // incus start + bridge start + journal dial is ~3 minutes on the shared
-  // hosts (the infra's timer_wake_lead_minutes). Only ever waited when a
-  // wake is actually under way, so a journal without MATRON_WAKE_CMD never
-  // pays it.
+  // before issuing `start` (wake-before-spawn). Sized for a cold box boot:
+  // starting the box, then the bridge starting and dialling the journal,
+  // can take a few minutes. Only ever waited when a wake is actually under
+  // way, so a journal without MATRON_WAKE_CMD never pays it.
   spawnWakeWaitMs = resolveNumericEnv('MATRON_SPAWN_WAKE_WAIT_MS', process.env.MATRON_SPAWN_WAKE_WAIT_MS, 240000),
   sessionControlTimeoutMs = resolveNumericEnv('MATRON_SESSION_CONTROL_TIMEOUT_MS', process.env.MATRON_SESSION_CONTROL_TIMEOUT_MS, 30000),
   // Coordinator consent approvals per rolling 24 h (spec: 2026-09-29
@@ -506,6 +550,10 @@ export function startServer({
   agentCommentClock = Date.now,
   // Client-token idle expiry (resolveClientIdleMs); the clock is a test seam.
   clientIdleDays, clientIdleClock = Date.now,
+  // How long a push about an item that needs the user waits, so items
+  // settled within it never notify (push.js FOR_YOU_HOLD_MS). 0 sends at
+  // once. A consent card's hold is this too, but never under 30 s.
+  pushHoldMs = resolveZeroableEnv('MATRON_PUSH_HOLD_MS', process.env.MATRON_PUSH_HOLD_MS, FOR_YOU_HOLD_MS),
   // Approvals of the Coordinator's own routine-born asks per rolling 24 h
   // (src/consent-own-ask.js), on top of the daily cap. 0 = no cap.
   consentRoutineCap = resolveZeroableEnv('MATRON_COORDINATOR_ROUTINE_CAP', process.env.MATRON_COORDINATOR_ROUTINE_CAP, CONSENT_ROUTINE_CAP_DEFAULT),
@@ -515,7 +563,8 @@ export function startServer({
   stallWakeIntervalMs = null,
   autoArchiveIntervalMs = null,
   autoArchive = process.env.MATRON_AUTO_ARCHIVE !== '0',
-  // The unseen nudge (src/unseen-nudge.js). MATRON_UNSEEN_NUDGE=0 turns it off.
+  // The unseen nudge (src/unseen-nudge.js). MATRON_UNSEEN_NUDGE=0 turns it
+  // off; MATRON_UNSEEN_NUDGE_TZ names the zone its daytime hours are in.
   unseenNudgeIntervalMs = null,
   unseenNudge = process.env.MATRON_UNSEEN_NUDGE !== '0',
   // Coordinator routines (src/routines-sweep.js). MATRON_ROUTINES=0 stops
@@ -523,7 +572,7 @@ export function startServer({
   routinesSweepIntervalMs = null,
   routinesTriggerIntervalMs = null,
   routinesSweep = process.env.MATRON_ROUTINES !== '0',
-  mediaReapHighPct, mediaReapLowPct, waker, transcriber, github, githubRefreshIntervalMs, webDir,
+  mediaReapHighPct, mediaReapLowPct, orphanBlobGraceHours, waker, transcriber, github, githubRefreshIntervalMs, webDir,
   // Cloud speech (src/cloud-tts.js). `tts` is the test seam; `null` forces
   // it off. `ttsCacheDir` overrides where the clips are kept.
   tts, ttsCacheDir, ttsSweepIntervalMs,
@@ -569,6 +618,7 @@ export function startServer({
   backgroundDelayMs = resolveZeroableEnv('MATRON_BACKGROUND_DELAY_MS', process.env.MATRON_BACKGROUND_DELAY_MS, 30000),
   backgroundPace = resolveZeroableEnv('MATRON_BACKGROUND_PACE', process.env.MATRON_BACKGROUND_PACE, 1),
 } = {}) {
+  const { client: resolvedWebPushClient, owned: ownsWebPushClient } = resolveWebPushClient(webPushClient)
   warnIfBindTrustsSpoofableIp(bind)
   const resolvedDbPath = dbPath || process.env.MATRON_DB || './matron.db'
   const db = openDb(resolvedDbPath)
@@ -663,7 +713,7 @@ export function startServer({
   })
   const { client: resolvedApnsClient, owned: ownsApnsClient } = resolveApnsClient(apnsClient)
   const clientIdleMs = resolveClientIdleMs(clientIdleDays)
-  const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient, backgroundWakeMs: BACKGROUND_WAKE_MS, clientIdleMs, now: clientIdleClock })
+  const pushPipeline = makePushPipeline({ db, hub, apnsClient: resolvedApnsClient, webPushClient: resolvedWebPushClient, backgroundWakeMs: BACKGROUND_WAKE_MS, itemHoldMs: pushHoldMs, consentHoldMs: Math.max(CONSENT_HOLD_MS, pushHoldMs), clientIdleMs, now: clientIdleClock })
   // A device signed out for invalid approval signatures: its notice and push.
   installApprovalLockdown({ db, hub, pushPipeline })
   // The security event log, one per journal: handed to the HTTP and
@@ -671,8 +721,9 @@ export function startServer({
   // database (the approval guard, the lockdown).
   const resolvedSecurityLog = makeSecurityLog({ db, ...(securityLog || {}) })
   installSecurityLog(db, resolvedSecurityLog)
-  // A consent-card push whose 30 s hold a restart swallowed still goes out.
+  // A consent-card or item push whose hold a restart swallowed still goes out.
   try { pushPipeline.resumeHeldConsent() } catch (err) { console.error('push: consent resume failed', err) }
+  try { pushPipeline.resumeHeldItems() } catch (err) { console.error('push: item resume failed', err) }
   // Voice notes are transcribed here when the journal has a transcriber: a
   // cloud one (MATRON_STT_AZURE_KEY; src/cloud-transcribe.js), or whisper
   // (MATRON_WHISPER_MODEL; src/transcribe.js). Neither: off, and the origin
@@ -799,7 +850,7 @@ export function startServer({
     mediaUserQuotaBytes: resolvedMediaUserQuotaBytes,
     // transferChunkBytes: tests only (small chunks); production uses TRANSFER_CHUNK_BYTES.
     transferMaxBytes: resolvedTransferMaxBytes, transferUserQuotaBytes: resolvedTransferUserQuotaBytes, transferMaxAwaitingPerSender: resolvedTransferMaxAwaiting, transferChunkBytes,
-    hub, pushPipeline, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
+    hub, pushPipeline, webPushClient: resolvedWebPushClient, dbPath: resolvedDbPath, pairs: resolvedPairs, links: resolvedLinks,
     preapproveKey: resolvedPreapproveKey, broker, spawnStartTimeoutMs, spawnWakeWaitMs: effectiveWakeWaitMs, waker: resolvedWaker, itemTranscription, blobTranscripts, consentDailyCap, consentTransferDailyCap, consentRoutineCap, verifier,
     agentCommentLimiter: makeAgentCommentLimiter({ now: agentCommentClock }),
     github: resolvedGithub, handleWellKnown, handleFederation, federationOutbox, federationContacts, federationGrants, federationContribute, federationMedia, handleStatic, tokenBox,
@@ -817,6 +868,7 @@ export function startServer({
   server.keepAliveTimeout = resolveNumericEnv('MATRON_KEEPALIVE_TIMEOUT_MS', process.env.MATRON_KEEPALIVE_TIMEOUT_MS, 120000)
   const wss = attachWs({
     server, db, hub, pushPipeline, replayBackpressureBytes, maxReplay: resolvedMaxReplay, toolStreams,
+    perMessageDeflate: wsDeflate,
     // 55s: under the common 60s proxy idle-timeout defaults, and a 2.75x
     // cut in heartbeat radio wakes for idle phone clients vs the old 20s.
     pingMs: resolveNumericEnv('MATRON_WS_PING_MS', process.env.MATRON_WS_PING_MS, 55000),
@@ -841,6 +893,7 @@ export function startServer({
       retentionInterval = scheduleRetention(db, {
         mediaDir: resolvedMediaDir, hub, retentionDays, retentionIntervalMs, retentionInitialDelayMs, toolLogTtlHours, voiceNoteTtlDays,
         mediaReapHighPct, mediaReapLowPct, mediaUserQuotaBytes: resolvedMediaUserQuotaBytes, deviceRetention,
+        orphanBlobGraceHours,
       })
       walCheckpointInterval = scheduleWalCheckpoint(db, walCheckpointIntervalMs)
       stallLog = startStallLog()
@@ -1005,6 +1058,7 @@ export function startServer({
             for (const c of wss.clients) c.terminate()
             pushPipeline.close()
             if (ownsApnsClient) resolvedApnsClient.close()
+            if (ownsWebPushClient) resolvedWebPushClient.close()
             // The transcription queue touches the DB between awaits: abort its
             // child and let it drain before the handle closes.
             const transcriptionDone = Promise.all([itemTranscription.close(), blobTranscripts.close()])

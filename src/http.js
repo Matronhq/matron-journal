@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import { pipeline } from 'node:stream/promises'
 import { checkPassword, makeRateLimiter, makeKeyedQueue, authToken, clientIdleExpired, preparePasswordChange, applyPasswordChange, revokeOwnedDevice, signOutOwnedDevice, renameOwnedDevice, setOwnedDeviceTag, createAgent, createClientDevice, authorizeAgentWrite } from './auth.js'
 import { snapshot, messagesBefore, messagesAround, messagesAroundIndexed, toEventShape, isClientOnlyEvent, MESSAGE_TYPES_SQL, byLastMessageThenId } from './journal.js'
-import { insertBlob, getBlob, setApnsRegistration, listDevices, userBlobBytes, isPrivateDevice, deviceStatuses, setDeviceProtected, deviceLocked } from './db.js'
+import { insertBlob, getBlob, setApnsRegistration, setWebPushSubscription, clearWebPushSubscription, listDevices, userBlobBytes, isPrivateDevice, deviceStatuses, setDeviceProtected, deviceLocked } from './db.js'
 import { receiveBlob } from './media.js'
 import { readBlobTranscript, isTranscribableType, transcriptWaitS } from './blob-transcripts.js'
 import { imageSizeFromFile } from './image-size.js'
@@ -42,6 +42,7 @@ import { handleCoordinatorRoute } from './coordinator-http.js'
 import { handleNotifyRoute } from './notify-http.js'
 import { handleDefaultsRoute } from './defaults-http.js'
 import { handleBoxDefaultsRoute } from './box-defaults-http.js'
+import { handleUsageHistoryRoute } from './usage-history-http.js'
 import { boxDefaultsByDevice } from './box-defaults.js'
 import { handlePinsRoute } from './pins-http.js'
 import { handleArchiveRoute } from './archive-http.js'
@@ -129,7 +130,7 @@ const rejectEarly = (req, res, status, obj) => {
   return json(res, status, obj)
 }
 
-export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, agentCommentLimiter = makeAgentCommentLimiter(), blobTranscripts = null, github = null, handleWellKnown = () => false, handleFederation = async () => false, federationOutbox = null, federationContacts = null, federationGrants = null, federationContribute = null, federationMedia = null, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null, journalHost = null, clientIdleMs, clientIdleClock = Date.now, securityLog = securityLogFor(db), securityFeed = null, panic = null }) {
+export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter, tickets, mediaDir, mediaMaxBytes, mediaUserQuotaBytes = Infinity, transferMaxBytes, transferUserQuotaBytes, transferMaxAwaitingPerSender, transferChunkBytes, hub, pushPipeline, webPushClient, dbPath, pairs, links, preapproveKey, broker, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, waker = null, consentDailyCap = null, consentTransferDailyCap = null, consentRoutineCap = null, verifier = null, itemTranscription = null, agentCommentLimiter = makeAgentCommentLimiter(), blobTranscripts = null, github = null, handleWellKnown = () => false, handleFederation = async () => false, federationOutbox = null, federationContacts = null, federationGrants = null, federationContribute = null, federationMedia = null, handleStatic = async () => false, tokenBox = null, sessionControlTimeoutMs = 30000, alertWebhook = null, routineFirer = null, semantic = { store: null, embedder: null }, summariser = null, mailer = null, resetLimiter = null, tts = null, journalHost = null, clientIdleMs, clientIdleClock = Date.now, securityLog = securityLogFor(db), securityFeed = null, panic = null }) {
   // Two-factor sign-in (src/two-factor-http.js). The server passes its own;
   // the defaults keep a bare handler (tests) working the same way.
   const twoFactorBox = tokenBox || PLAIN_BOX
@@ -430,7 +431,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       if (await handleMissionsRoute({ db, hub, pushPipeline, waker, federationContribute }, req, res, url, who)) return
       if (await handleProjectsRoute({ db, hub }, req, res, url, who)) return
       if (await handleTimelineRoute({ db }, req, res, url, who)) return
-      if (await handleMemoriesRoute({ db, hub }, req, res, url, who)) return
+      if (await handleMemoriesRoute({ db, hub, semantic }, req, res, url, who)) return
       if (await handleRoutinesRoute({ db, hub, routineFirer }, req, res, url, who)) return
       if (await handleBriefingsRoute({ db, hub, routineFirer }, req, res, url, who)) return
       if (await handleSeenRoute({ db }, req, res, url, who)) return
@@ -479,6 +480,7 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
       // Per-box defaults (src/box-defaults-http.js): GET/PUT /devices/:id/defaults,
       // open to agent tokens too, unlike the other /devices/:id routes.
       if (await handleBoxDefaultsRoute({ db, hub }, req, res, url, who)) return
+      if (handleUsageHistoryRoute({ db }, req, res, url, who)) return
       if (await handlePinsRoute({ db, hub }, req, res, url, who)) return
       if (await handleArchiveRoute({ db, hub }, req, res, url, who)) return
       if (await handleSettingsRoute({ db, hub }, req, res, url, who)) return
@@ -522,6 +524,39 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
         // private agent caller sees the full list, unchanged.
         const filtered = who.kind === 'agent' && !isPrivateDevice(db, who.deviceId)
         return json(res, 200, buildMetrics(db, { hub, pushPipeline, dbPath, userId: who.userId, excludePrivateDevices: filtered, summariser }))
+      }
+      if (req.method === 'GET' && url.pathname === '/push/web/vapid-key') {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        if (!webPushClient) return json(res, 404, { error: 'web_push_disabled' })
+        return json(res, 200, { public_key: webPushClient.publicKey })
+      }
+      if (req.method === 'POST' && url.pathname === '/push/web/register') {
+        if (who.kind !== 'client') return json(res, 403, { error: 'forbidden' })
+        const body = await readBody(req)
+        if (body?.endpoint === null) {
+          clearWebPushSubscription(db, who.deviceId)
+          return json(res, 200, { ok: true })
+        }
+        if (!webPushClient) return json(res, 404, { error: 'web_push_disabled' })
+        const endpoint = body?.endpoint
+        const p256dh = body?.keys?.p256dh
+        const auth = body?.keys?.auth
+        let stored
+        try {
+          // Stored as the parsed form, so two spellings of one host are one endpoint.
+          const checked = webPushClient.checkEndpoint(endpoint)
+          if (!checked.ok) throw new Error('endpoint')
+          stored = checked.url.href
+          if (typeof p256dh !== 'string' || !/^[A-Za-z0-9_-]+$/.test(p256dh)
+            || typeof auth !== 'string' || !/^[A-Za-z0-9_-]+$/.test(auth)) throw new Error('keys')
+          const point = Buffer.from(p256dh, 'base64url')
+          if (point.length !== 65 || point[0] !== 4 || Buffer.from(auth, 'base64url').length !== 16) throw new Error('keys')
+          const validator = crypto.createECDH('prime256v1')
+          validator.generateKeys()
+          validator.computeSecret(point)
+        } catch { return json(res, 400, { error: 'bad_request' }) }
+        setWebPushSubscription(db, who.deviceId, { endpoint: stored, p256dh, auth })
+        return json(res, 200, { ok: true })
       }
       if (req.method === 'POST' && url.pathname === '/push/register') {
         // Only client devices carry push tokens — agents run on the dev box
@@ -1399,8 +1434,12 @@ export function makeHttpHandler({ db, rateLimiter, loginGuard, twoFactorLimiter,
           // mislabeled blob into active content, and attachment forces a
           // download rather than inline rendering — so a blob can never execute
           // as script/HTML in this origin even though media is owner-scoped.
+          // The sandbox CSP is the backstop: should anything ever render the
+          // response anyway, the page runs with a unique opaque origin and
+          // cannot reach this origin's storage or API.
           'x-content-type-options': 'nosniff',
           'content-disposition': 'attachment',
+          'content-security-policy': 'sandbox',
         })
         // pipeline (not .pipe()) so a client abort mid-body destroys the read
         // stream promptly instead of leaking its fd (.pipe() never forwards a

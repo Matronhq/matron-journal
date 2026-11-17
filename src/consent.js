@@ -92,7 +92,7 @@ export function deviceState({ db, hub, waker }, userId, deviceId) {
 // for a box that handles something only the user should sign off on, such
 // as one that reads their private mail. A protected device
 // (devices.protected, src/consent-subject.js) is user-only while it is set.
-function userOnlyDevice(db, userId, deviceId) {
+export function userOnlyDevice(db, userId, deviceId) {
   if (!Number.isInteger(deviceId)) return false
   return !!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=? AND (consent_user_only=1 OR protected=1)').get(deviceId, userId)
 }
@@ -259,6 +259,13 @@ export function listPendingAsks({ db, hub, waker }, userId, { excludePrivate = f
 export function recordConsentDecision(db, { userId, kind, askId, decision, convoId, reason, causeKind = null, causeRef = null, verifierNote = null, now = Date.now() }) {
   db.prepare('INSERT INTO consent_decisions(user_id, kind, ask_id, decision, convo_id, reason, cause_kind, cause_ref, verifier_note, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)')
     .run(userId, kind, askId, decision, convoId, reason, causeKind, causeRef, verifierNote, now)
+}
+
+export const AUTO_APPROVE_REASON = 'auto-approved (Coordinator)'
+export const AUTO_APPROVE_WINDOW_MS = 60 * 60 * 1000
+export const AUTO_APPROVE_HOURLY_CAP = 60
+export function autoApprovalsSince(db, userId, since) {
+  return db.prepare("SELECT COUNT(*) c FROM consent_decisions WHERE user_id=? AND kind='spawn' AND decision='approve' AND reason=? AND created_at>?").get(userId, AUTO_APPROVE_REASON, since).c
 }
 
 export function coordinatorApprovalsSince(db, userId, since, { kind = null } = {}) {

@@ -4,24 +4,27 @@ import { authToken, touchDevice, authorizeAgentWrite } from './auth.js'
 import { getBoxDefaults, boxDefaultsByDevice, effectiveBoxDefaults, normaliseAgent } from './box-defaults.js'
 import { applyBridgePrivate, isPrivateDevice, upsertDeviceStatus, mergeDeviceStatus, getDeviceStatus, deviceStatuses, setDeviceSyncScope, parseLocked, setDeviceLocked, deviceLocked } from './db.js'
 import { parseSyncScope } from './sync-scope.js'
-import { settingsView } from './settings.js'
+import { settingsView, getAutoApproveCoordinatorSpawns } from './settings.js'
 import { eventsAfter, scopedEventsAfter, scopedReplayCount, append, appendAndBroadcast, markRead, upsertConversation, toEventShape, isClientOnlyEvent, agentTargetsFor, CONVO_ID_MAX_CHARS } from './journal.js'
 import { parseRepo, REPO_MAX } from './repo-identity.js'
 import { participantIds, participantConvoIds, joinedAgentIds, answerInvite, leaveConvo, leaveAllParticipants, hasParticipants, getParticipant, isKnownParticipant, expireInvites, parkInvite, expireAwaiting } from './participants.js'
 import { sanitizePeerText, sanitizeConsentText, PEER_NAME_CAP } from './peer-text.js'
 import { deliverPendingInvites } from './invite-delivery.js'
-import { countPendingAsks, createSpawnRequest, inheritedSpawnMission, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, sanitizeBoxDefaults, emitSpawnOutcome, refreshSpawnRoomTitle } from './spawns.js'
+import { countPendingAsks, createSpawnRequest, inheritedSpawnMission, discardSpawnRequest, expireSpawns, expireApproved, sanitizeSpawnActivity, sanitizeSpawnLimits, sanitizeSpawnDisk, sanitizeBoxStatus, sanitizeBoxDefaults, emitSpawnOutcome, refreshSpawnRoomTitle, getSpawn } from './spawns.js'
 import { fileSpawnConsentItem, fileChatConsentItem, closeChatConsentItem, reconcileConsentItems } from './consent-items.js'
-import { nudgeCoordinator, chatAskId } from './consent.js'
+import { nudgeCoordinator, chatAskId, getConsentEnabled, isUserOnlySpawn, autoApprovalsSince, AUTO_APPROVE_REASON, AUTO_APPROVE_WINDOW_MS, AUTO_APPROVE_HOURLY_CAP } from './consent.js'
 import { isProtectedDevice, consentSubject } from './consent-subject.js'
 import { hasActiveKey, requireApproval, approvalKeyIdOfDevice, refuse, ApprovalRefused } from './approval-keys.js'
 import { securityLogFor, boxTarget, convoTarget } from './security-log.js'
 import { agentJournalFrame } from './hub.js'
+import { answerSpawnAsk } from './consent-answer.js'
+import { resolveAskCause } from './ask-cause.js'
 import { expireContactAsks } from './contacts.js'
 import { expireInviteAsks, onInviteAskExpired } from './federation-invite-asks.js'
 import { expireGrantAsks } from './grants.js'
 import { onContactAskExpired, onGrantAskExpired, notifyGrantees } from './sharing-events.js'
 import { sweepExpiredHandovers } from './item-handover-http.js'
+import { sweepMemoryProposals } from './memory-proposals-http.js'
 import { parkPersonRoom, linkOfRoom, isGuestRoom, onGuestAgentAnswer, onGuestInviteExpired, expireSessionShareAsks, LIVE_ROOM_STATES } from './person-rooms.js'
 import { parkTalk } from './talk-requests.js'
 import { fedRoomsOf, fedLinked, isFedGuestRoom } from './federation-rooms.js'
@@ -40,7 +43,8 @@ import { emitMarker } from './items-http.js'
 import { withdrawForQueuedCancel } from './withdrawn-comments.js'
 import { getMission } from './missions.js'
 import { sanitizeConvoStatus, upsertConvoStatus } from './convo-status.js'
-import { validateSessionControl, authorizeSessionControl, sessionControlResultFrame } from './session-control.js'
+import { recordBoxUsage, recordSessionUsage } from './usage-history.js'
+import { validateSessionControl, authorizeSessionControl, sessionControlResultFrame, carryOnUserOnlyRefused, WHY_CARRY_ON_USER_ONLY } from './session-control.js'
 import { validRanges, addSeenRanges, markDeviceUsesRanges, legacyReadAsSeen, markItemSeen } from './seen.js'
 import { panicLock, isPanicLocked, panicHelloField, panicAnnounced, panicOnFrame, PANIC_OFF_FRAME, announcePanicClears, clientAuthDead, refuseLockedClient, isFrozenDevice, signOutLockedClient, lockedError, closeLockedSocket, closeFrozenSocket, markPanicTold, ACCOUNT_LOCKED } from './panic.js'
 
@@ -95,6 +99,14 @@ const AGENT_PUBLISH_TYPES = new Set([
 // so should start a joined peer whose box is asleep. Status, streams,
 // summaries and prompts are the publishing agent's own bookkeeping.
 const ROOM_WAKE_PUBLISH_TYPES = new Set(['text', 'file', 'image'])
+// A plain `file` or `image` frame from an agent into a room would skip the
+// user's approval card (nothing checks that an `image` blob is an image). A
+// file reaches a room only through a transfer (POST /transfers): the journal
+// writes the room's `file` event itself on release (transfer-consent.js),
+// never through publish or finalize.
+const ROOM_FILE_TYPES = new Set(['file', 'image'])
+const ROOM_FILE_REFUSAL = 'a file or image reaches a room only through an approved file transfer (POST /transfers), not a plain file or image frame'
+const PERSON_FILE_REFUSAL = 'files and images do not cross to another person'
 
 // activity op (typing/tool-use indicators, spec §6 ephemeral): the only
 // states a bridge may broadcast. Anything else is bad_request.
@@ -238,10 +250,43 @@ export function makeStatusCache(max = STATUS_CACHE_MAX) {
     get(userId, convoId) {
       return map.get(`${userId}:${convoId}`)
     },
+    delete(userId, convoId) {
+      map.delete(`${userId}:${convoId}`)
+    },
   }
 }
 
 const MAX_WS_PAYLOAD_BYTES = 1048576 // 1 MiB
+
+// Compress larger messages only for peers offering permessage-deflate. Avoid
+// cross-message history and bound zlib work; ws keeps the (reset) streams
+// until the socket closes, so each compressed connection holds a few tens to
+// a couple of hundred KiB of zlib state. A 2 KiB window (serverMaxWindowBits
+// 11) roughly halves that and still compresses JSON well. Client window bits
+// stay negotiable so bare offers and peers requesting smaller windows can
+// still connect.
+const WS_DEFLATE_OPTIONS = {
+  threshold: 1024,
+  zlibDeflateOptions: { level: 6, memLevel: 7 },
+  serverNoContextTakeover: true,
+  serverMaxWindowBits: 11,
+  clientNoContextTakeover: true,
+  concurrencyLimit: 10,
+}
+
+// An offer with `server_max_window_bits=N` for N below ours cannot be
+// accepted. Browsers and ws do not send the parameter; this only guards
+// unusual clients.
+function dropUnsatisfiableDeflateOffer(req) {
+  const header = req.headers['sec-websocket-extensions']
+  if (!header || !header.includes('server_max_window_bits')) return
+  const offers = header.split(',').map((offer) => offer.trim()).filter((offer) => {
+    const m = /server_max_window_bits\s*=\s*"?(\d+)"?/.exec(offer)
+    return !(m && Number(m[1]) < WS_DEFLATE_OPTIONS.serverMaxWindowBits)
+  })
+  if (offers.length === 0) delete req.headers['sec-websocket-extensions']
+  else req.headers['sec-websocket-extensions'] = offers.join(',')
+}
 
 // Between replay batches, a slow/paused reader must not let the server
 // buffer an unbounded amount of backlog in the socket's outgoing queue.
@@ -290,13 +335,23 @@ export function attachWs({
   revocationSweepMs = 60000, toolStreams, rpcMaxBytes = RPC_MAX_BYTES, inviteTtlMs = 1800000,
   broker, spawnFoldersTimeoutMs = 4000, spawnStartTimeoutMs = 30000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null,
   journalHost = null, clientIdleMs, clientIdleClock = Date.now, securityLog = securityLogFor(db),
+  perMessageDeflate = false,
 }) {
   // Derived, never raw: the orphan sweep must always outlast a live `start`
   // RPC still in flight (see APPROVED_ORPHAN_TTL_FLOOR_MS's comment) — and,
   // since wake-before-spawn, the wake wait that may precede it.
   const approvedOrphanTtlMs = Math.max(APPROVED_ORPHAN_TTL_FLOOR_MS, (spawnStartTimeoutMs + spawnWakeWaitMs) * 2)
-  const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES })
+  // ws rejects the whole handshake (400) when a deflate offer asks for a
+  // server window smaller than ours. Drop such an offer so that client
+  // connects uncompressed instead. Registered before ws's own listener.
+  if (perMessageDeflate) server.on('upgrade', dropUnsatisfiableDeflateOffer)
+  const wss = new WebSocketServer({
+    server, path: '/ws', maxPayload: MAX_WS_PAYLOAD_BYTES,
+    perMessageDeflate: perMessageDeflate ? { ...WS_DEFLATE_OPTIONS, zlibDeflateOptions: { ...WS_DEFLATE_OPTIONS.zlibDeflateOptions } } : false,
+  })
   const statusCache = makeStatusCache()
+  // Last non-idle activity per convo, replayed on `viewing` (see that case).
+  const activityCache = makeStatusCache()
   // Prepared once, reused for the per-frame revocation recheck below — one
   // cheap SELECT per inbound frame, not a fresh db.prepare() call each time.
   const deviceRowStmt = db.prepare('SELECT id, kind, created_at, last_seen_at FROM devices WHERE id=?')
@@ -439,6 +494,12 @@ export function attachWs({
         sweepExpiredHandovers({ db, hub, waker })
       } catch (err) {
         console.error('handover: expiry sweep failed', err)
+      }
+      // Memory proposals nobody answered in 7 days (src/memory-proposals.js).
+      try {
+        sweepMemoryProposals({ db, hub, pushPipeline })
+      } catch (err) {
+        console.error('memory proposals: expiry sweep failed', err)
       }
       // Stranded-'approved' recovery (see spawns.js expireApproved's doc
       // comment): a row a claimApprove won but whose orchestration never
@@ -853,7 +914,7 @@ export function attachWs({
         // reserialization, which JSON.parse's whitespace-stripping would
         // shrink. `data` is a Buffer here (ws delivers text frames as
         // Buffers), so .length is the byte count.
-        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker, journalHost, securityLog })
+        await handleOp({ db, hub, conn, msg, pushPipeline, toolStreams, statusCache, activityCache, rpcMaxBytes, frameBytes: data.length, broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs, spawnWakeWaitMs, sessionControlTimeoutMs, waker, journalHost, securityLog })
       } catch (err) {
         // Process-crash backstop: handleOp already has its own try/catch for authz
         // errors, so anything reaching here is unexpected. Never let it take the
@@ -889,6 +950,12 @@ export function attachWs({
       for (const ev of toolStreams.closeForProducer(conn)) {
         notifyStale(db, hub, ev, 'disconnected')
       }
+      // A producer that vanished mid-turn never sends its idle: forget the
+      // activity it left (unless a newer connection has since replaced it),
+      // so a later `viewing` catch-up does not replay a stale indicator.
+      for (const [convoId, entry] of conn._activityConvos ?? []) {
+        if (activityCache.get(conn.userId, convoId) === entry) activityCache.delete(conn.userId, convoId)
+      }
     })
   })
   return wss
@@ -909,7 +976,7 @@ export function notifyStale(db, hub, entry, reason = 'stale') {
 }
 
 // Extended by Tasks 7-8 with client and agent operations.
-export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs = 4000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null, journalHost = null, securityLog = securityLogFor(db) }) {
+export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipeline, toolStreams, statusCache = makeStatusCache(), activityCache = makeStatusCache(), rpcMaxBytes = RPC_MAX_BYTES, frameBytes = 0, broker, spawnFoldersTimeoutMs, spawnStartTimeoutMs = 4000, spawnWakeWaitMs = 0, sessionControlTimeoutMs = 30000, waker = null, journalHost = null, securityLog = securityLogFor(db) }) {
   const fail = (code, detail) => {
     conn.ws.send(JSON.stringify({
       kind: 'control', op: 'error', code, ref: msg.op,
@@ -1042,6 +1109,13 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
     const hit = linkOfRoom(db, roomId)
     return !!hit && LIVE_ROOM_STATES.includes(hit.link.state)
   }
+  // The detail to refuse an agent's file/image frame into `convoId` with, or
+  // null when the frame may go on. Shared by publish and finalize.
+  const roomFileRefusal = (type, convoId) => {
+    if (!ROOM_FILE_TYPES.has(type)) return null
+    if (personLinked(convoId)) return PERSON_FILE_REFUSAL
+    return hasParticipants(db, convoId) ? ROOM_FILE_REFUSAL : null
+  }
   // After an append into a room joined to another person's: their copy.
   const copyOut = (args, r) => {
     if (!r || r.duplicate) return
@@ -1115,7 +1189,12 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           next = new Set(msg.convo_id == null ? [] : [msg.convo_id])
           prev = new Set()
         }
+        const wasViewing = conn.viewingConvoIds
         conn.viewingConvoIds = next
+        // A coalesced activity frame still pending for a convo no longer on
+        // screen would flush after the client cleared its live state, and
+        // nothing would end it. Drop it; the catch-up below covers re-views.
+        for (const convoId of wasViewing) if (!next.has(convoId)) hub.discardPendingActivity(conn, convoId)
         // Catch-up for live tool-output streams: whoever just started viewing
         // gets full scrollback-so-far, one sync frame per active buffer, sent
         // directly (not via hub coalescing) and synchronously — no append can
@@ -1145,6 +1224,18 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
               kind: 'ephemeral', convo_id: convoId, status: cachedStatus,
             }))
           }
+          // Activity catch-up: activity is latest-wins, so a client that was
+          // not viewing (tracker open, tab hidden) missed the frame that
+          // would have ended or changed its indicator. Send the current
+          // state, or `idle` (the frame clients already treat as "clear the
+          // indicator") when none is cached. Sent directly, after any
+          // still-pending older frame for this convo is dropped, so the
+          // replay is the last word on this socket.
+          hub.discardPendingActivity(conn, convoId)
+          conn.ws.send(JSON.stringify({
+            kind: 'ephemeral', convo_id: convoId,
+            activity: activityCache.get(conn.userId, convoId) ?? { state: 'idle' },
+          }))
         }
         break
       }
@@ -1543,9 +1634,30 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         // commit point above; the item is best-effort and its own failure
         // never costs the ask (the row's item_id simply stays NULL).
         fileSpawnConsentItem({ db, hub }, { userId: conn.userId, fromDeviceId: conn.deviceId, fromName: conn.name, fromConvoId: msg.from_convo_id, spawnId, card: cardPayload })
-        // Then the Coordinator's bridge (spec: 2026-09-29 coordinator
-        // consent) — after the card, so the user is never second to it.
-        nudgeCoordinator({ db, hub, waker }, conn.userId, { kind: 'spawn', id: spawnId }, { askerConvoId: msg.from_convo_id })
+        // Opt-in auto-approval (user_settings.auto_approve_coordinator_spawns).
+        // Hourly ceiling so a looping Coordinator cannot start sessions without
+        // bound: the pending-ask cap never trips once a row is answered at once.
+        // The opt-in does not waive the Coordinator own-ask rule
+        // (src/consent-own-ask.js): the ask's causes must resolve to the
+        // user's verified words or a comment/tap on one of the Coordinator
+        // conversation's items. A routine-fire root (envelope + verifier +
+        // routine cap) and an unverified or absent cause both fall through to
+        // the filed card, for the user or the checked POST /consent/answer.
+        const autoCause = () => {
+          const row = getSpawn(db, spawnId)
+          if (!row) return null
+          const res = resolveAskCause(db, {
+            who: { userId: conn.userId, deviceId: conn.deviceId, kind: conn.kind, name: conn.name },
+            userId: conn.userId, causes: causes ?? [], createdAt: row.created_at, fromConvoId: msg.from_convo_id,
+          })
+          return res.ok && res.root.kind !== 'routine' ? res.root : null
+        }
+        const autoRoot = online && getAutoApproveCoordinatorSpawns(db, conn.userId)
+          && getConsentEnabled(db, conn.userId)
+          && getCoordinatorConvoId(db, conn.userId) === msg.from_convo_id
+          && !isUserOnlySpawn(db, conn.userId, { from_device_id: conn.deviceId, target_device_id: msg.target_device_id })
+          && autoApprovalsSince(db, conn.userId, Date.now() - AUTO_APPROVE_WINDOW_MS) < AUTO_APPROVE_HOURLY_CAP
+          && autoCause()
         // target_waking: the box was asleep and is being started; the parent's
         // tool copy can tell its user the session begins once the box is up
         // AND the card is answered. Omitted (never false) when it was online.
@@ -1557,6 +1669,21 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           ...(missionNum ? { mission_num: missionNum } : {}),
           ...(missionInherited ? { mission_inherited: true } : {}),
         }))
+        let autoApproved = false
+        if (autoRoot) {
+          // Keeps the shared answer path for claiming, audit and closing the
+          // item. Failure leaves the filed card available for a manual answer.
+          try {
+            const result = answerSpawnAsk({ db, hub, broker, waker, spawnStartTimeoutMs, spawnWakeWaitMs, journalHost, securityLog }, {
+              userId: conn.userId, requestId: spawnId, decision: 'approve',
+              decidedBy: { kind: 'coordinator', deviceId: conn.deviceId, convoId: msg.from_convo_id, reason: AUTO_APPROVE_REASON, automatic: true, causeKind: autoRoot.kind, causeRef: autoRoot.ref },
+            })
+            autoApproved = result.status === 200
+          } catch (err) {
+            console.error('spawn_request: auto-approval failed; card remains available', err)
+          }
+        }
+        if (!autoApproved) nudgeCoordinator({ db, hub, waker }, conn.userId, { kind: 'spawn', id: spawnId }, { askerConvoId: msg.from_convo_id })
         break
       }
       case 'spawn_targets': {
@@ -2433,9 +2560,8 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) {
           return fail('forbidden', 'not a participant of this conversation')
         }
-        if (msg.type !== 'text' && ROOM_WAKE_PUBLISH_TYPES.has(msg.type) && personLinked(msg.convo_id)) {
-          return fail('bad_request', 'files and images do not cross to another person')
-        }
+        const publishRefusal = roomFileRefusal(msg.type, msg.convo_id)
+        if (publishRefusal) return fail('bad_request', publishRefusal)
         const publishArgs = {
           userId: conn.userId, convoId: msg.convo_id,
           sender: `agent:${conn.name}`, type: msg.type, payload: msg.payload,
@@ -2535,6 +2661,17 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!ACTIVITY_STATES.has(msg.state)) return fail('bad_request')
         if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) return fail('forbidden')
         const detail = typeof msg.detail === 'string' ? msg.detail.slice(0, ACTIVITY_DETAIL_MAX_CHARS) : undefined
+        // Cached for the catch-up on `viewing`; idle is the absence of an
+        // entry. Remembered per agent connection so its close can clear it.
+        if (msg.state === 'idle') {
+          activityCache.delete(conn.userId, msg.convo_id)
+          conn._activityConvos?.delete(msg.convo_id)
+        }
+        else {
+          const entry = { state: msg.state, detail }
+          activityCache.set(conn.userId, msg.convo_id, entry)
+          ;(conn._activityConvos ??= new Map()).set(msg.convo_id, entry)
+        }
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id,
           activity: { state: msg.state, detail },
@@ -2561,8 +2698,23 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!status && lockedOk) break
         if (!status) return fail('bad_request', 'no valid status block')
         const reportedAt = Date.now()
-        upsertDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt })
-        hub.sendToClients(conn.userId, { kind: 'box_status', device_id: conn.deviceId, reported_at: reportedAt, ...status })
+        // A report carrying only `vitals` (the bridge's frequent load sample)
+        // refreshes that block and keeps the stored usage, activity and disk
+        // blocks and the stored reported_at (the vitals carry their own
+        // sampled_at_ms, so older limits do not look freshly reported); the
+        // clients get the merged row, since they replace the whole box row on
+        // each box_status frame. Any other report replaces the row as before.
+        let fan = { reported_at: reportedAt, ...status }
+        if (Object.keys(status).every((k) => k === 'vitals')) {
+          const prior = getDeviceStatus(db, conn.userId, conn.deviceId)
+          mergeDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt: prior ? prior.reported_at : reportedAt })
+          fan = getDeviceStatus(db, conn.userId, conn.deviceId) || fan
+        } else upsertDeviceStatus(db, { userId: conn.userId, deviceId: conn.deviceId, status, reportedAt })
+        // The same reading, filed in the usage history (best effort: a
+        // failed write must not cost the live report).
+        try { recordBoxUsage(db, { userId: conn.userId, deviceId: conn.deviceId, status, now: reportedAt }) }
+        catch (e) { console.warn(`box_status: usage history write failed: ${e.message}`) }
+        hub.sendToClients(conn.userId, { kind: 'box_status', device_id: conn.deviceId, ...fan })
         break
       }
       case 'session_control': {
@@ -2578,8 +2730,11 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         const failRpc = (code, detail, extra = {}) => conn.ws.send(JSON.stringify(
           { kind: 'control', op: 'error', code, ref: msg.op, ...(v.rid ? { request_id: v.rid } : {}), ...(detail ? { detail } : {}), ...extra }))
         if (!v.ok) return failRpc(v.code, v.detail)
-        const auth = authorizeSessionControl(db, conn, msg)
-        if (auth.code) return failRpc(auth.code, auth.detail, auth.since != null ? { since: auth.since } : {})
+        // When the request arrived: a carry-on to a user-only box rests on
+        // a user event recent at this moment (and again after a wake).
+        const arrivedAt = Date.now()
+        const auth = authorizeSessionControl(db, conn, msg, { causes: v.causes, now: arrivedAt })
+        if (auth.code) return failRpc(auth.code, auth.detail, { ...(auth.since != null ? { since: auth.since } : {}), ...(auth.why ? { why: auth.why } : {}) })
         const { target } = auth
         // Each op parks a wake waiter (minutes) and a broker entry; bound
         // them per connection so a looping Coordinator cannot stack them.
@@ -2614,9 +2769,15 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
           try {
             if (waking && spawnWakeWaitMs > 0) await hub.waitForDevice(conn.userId, target.device_id, spawnWakeWaitMs)
             // Locked, or the box protected, while it was being woken:
-            // nothing is sent.
+            // nothing is sent. Nor is a carry-on to a box that is user-only
+            // now (made so meanwhile, or all along) unless its causes still
+            // resolve to the user's own message or tap. The age of that
+            // event is measured from when the request arrived, not from
+            // now: the wake can take minutes, and the user's word was
+            // recent when the Coordinator acted on it.
             const refusal = isPanicLocked(db, conn.userId) ? ACCOUNT_LOCKED
-              : isProtectedDevice(db, conn.userId, target.device_id) ? 'protected_device' : null
+              : isProtectedDevice(db, conn.userId, target.device_id) ? 'protected_device'
+                : carryOnUserOnlyRefused(db, conn, { deviceId: target.device_id, action: v.params.action, fromConvoId: msg.from_convo_id, causes: v.causes, at: arrivedAt }) ? 'user_only' : null
             let r
             if (refusal) r = { ok: false, error: { code: 'forbidden', detail: refusal } }
             else {
@@ -2627,7 +2788,7 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
               if (live) recordCarryOnEvent()
               r = await issued
             }
-            frame = sessionControlResultFrame(rid, r)
+            frame = sessionControlResultFrame(rid, r, refusal === 'user_only' ? WHY_CARRY_ON_USER_ONLY : null)
           } catch (err) {
             console.error(`session_control: ${err?.message || err}`)
             frame = sessionControlResultFrame(rid, { ok: false, error: { code: 'internal' } })
@@ -2666,6 +2827,9 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (persisted) {
           try { upsertConvoStatus(db, { userId: conn.userId, convoId: msg.convo_id, status: persisted, reportedAt }) }
           catch (e) { console.warn(`status: persist failed for ${msg.convo_id}: ${e.message}`) }
+          // Codex's weekly meters only arrive on a session's status.
+          try { recordSessionUsage(db, { userId: conn.userId, deviceId: conn.deviceId, status: persisted, now: reportedAt }) }
+          catch (e) { console.warn(`status: usage history write failed: ${e.message}`) }
         }
         hub.sendEphemeral(conn.userId, msg.convo_id, {
           kind: 'ephemeral', convo_id: msg.convo_id, status: msg.status,
@@ -2689,6 +2853,8 @@ export async function handleOp({ db, hub, conn, msg, pushPipeline = noopPushPipe
         if (!authorizeAgentWrite(db, conn.userId, conn.deviceId, msg.convo_id)) {
           return fail('forbidden', 'not a participant of this conversation')
         }
+        const finalizeRefusal = roomFileRefusal(type, msg.convo_id)
+        if (finalizeRefusal) return fail('bad_request', finalizeRefusal)
         appendAndFan({
           userId: conn.userId, convoId: msg.convo_id,
           sender: `agent:${conn.name}`, type, payload: msg.payload,

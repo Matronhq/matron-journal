@@ -29,6 +29,7 @@ import { forwardMirrorReply, isPeopleConvo } from './people-replies.js'
 import { notifyGrantees } from './sharing-events.js'
 import { inlineRefsToText, knowsInlineRefs, strayInlineRef } from './inline-refs.js'
 import { presentWithdrawn } from './withdrawn-comments.js'
+import { handleMemoryProposalTap, declineOnClose, proposerOwnsMirror, MEMORY_CONSENT } from './memory-proposals-http.js'
 import { handleHandoverRoute, approvalQuestionOf, handleApprovalTap, withdrawOnClose } from './item-handover-http.js'
 import { getReplicaItem, getReplicaMission } from './federation-replica.js'
 import { requireApproval, hasActiveKey, refuse, ApprovalRefused } from './approval-keys.js'
@@ -147,6 +148,9 @@ function visibleItem(db, who, idOrNum) {
 // for this one: client-only.
 function replyReachesAsker(db, item) {
   if (item.consent === 'spawn') return true
+  // A memory proposal's mirror on the proposing conversation: a reply there
+  // is how the user says "word it differently".
+  if (item.consent === MEMORY_CONSENT) return proposerOwnsMirror(db, item)
   if (item.consent === 'handover') {
     return !!db.prepare(`SELECT 1 FROM grants g JOIN conversations c ON c.id = g.origin_convo_id
       WHERE g.owner_item_id = ? AND g.origin_convo_id = ? AND c.agent_device_id = g.origin_device_id`).get(item.id, item.origin_convo_id)
@@ -742,6 +746,9 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
         return true
       }
       if (isPeopleRoomMirror(item)) return handlePeopleRoomTap(ctx, res, who, item, action, body.reply_to ?? null)
+      // A memory proposal's question (src/memory-proposals-http.js): the tap
+      // saves, deletes or declines, applied by the journal itself.
+      if (item.consent === MEMORY_CONSENT) return handleMemoryProposalTap(ctx, res, who, item, action, body.reply_to ?? null)
     }
     // `reply_to` (2026-10-04 comment-actions contract): the id of the comment
     // whose button was tapped — a follow-up question in this thread. It only
@@ -923,6 +930,8 @@ async function handleItemSubRoute(ctx, req, res, who, item, sub, subId) {
     if (!out) return conflict(res)
     // As for a notice's Seen close above: the offer goes first.
     out.item = withdrawOnClose(ctx, who.userId, item.id) ?? out.item
+    // A memory proposal's question closed by hand is a "no" to it.
+    declineOnClose(ctx, who.userId, item)
     emitMarker(ctx, who, { item: out.item, action: 'closed', comment: out.comment })
     replyItems(who, res, 200, { item: out.item, comment: seenBy(out.comment) })
     return true
