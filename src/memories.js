@@ -34,8 +34,10 @@ export const TOPIC_MAX = 40
 // leaves it. Only a write that would ADD to a full set is affected: a
 // create without a tier lands on_demand instead, and an explicit
 // tier 'always' (or a scope change of an always memory) is refused with
-// 'always_full'. Rows already over the cap stay as they are.
-export const ALWAYS_MAX = { global: 25, coordinator: 30, repo: 15 }
+// 'always_full'. Rows already over the cap stay as they are. The sizes
+// leave room for about five more always memories over a set that has
+// been split once: a cap well above the set never pushes anyone to choose.
+export const ALWAYS_MAX = { global: 24, coordinator: 24, repo: 16 }
 export const alwaysMaxFor = (scope) => (scope.startsWith('repo:') ? ALWAYS_MAX.repo : (ALWAYS_MAX[scope] ?? ALWAYS_MAX.global))
 
 // C0/C1 controls (covers \n, \r, \t) and the Unicode line/paragraph
