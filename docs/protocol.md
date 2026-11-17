@@ -994,11 +994,12 @@ Rows from before the stamp carry neither, and don't count.
   and what a client that sends nothing gets) carries every event of every
   conversation. `'for_you'` is for a phone that follows only the tracker:
   its socket carries `item`, `mission`, `milestone`, `coordinator`,
-  `memory`, `routine`, `convo_meta` and `session_status` events from every
-  conversation, every event of the Coordinator conversation (following the
-  role when it moves), and every event of the conversations in its
-  `viewing` set. Everything else stays on the server; the app fetches a
-  conversation over `GET /convo/:id/messages` when it opens one. A client
+  `memory`, `routine` and `convo_meta` events from every conversation,
+  every event of the Coordinator conversation (following the role when it
+  moves), and every event of the conversations in its `viewing` set.
+  Everything else stays on the server, `session_status` included: the app
+  fetches a conversation over `GET /convo/:id/messages` when it opens one,
+  and the chat list's session states from `GET /snapshot`. A client
   that sends `sync` gets `hello_ok.sync` back, the scope it got, so it can
   tell a journal that predates the field. Any other value is
   `bad_request` (ref `hello`). Agents ignore the field.
