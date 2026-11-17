@@ -3196,14 +3196,9 @@ memories are stored and shown in the apps only.
 - `topic`: a short label (≤40 characters, one line) that groups on-demand
   memories in a session's list, e.g. `couriers`. Optional; `""` or `null`
   clears it; kept when omitted on update.
-- The always tier is **capped per scope**: 25 `global`, 30 `coordinator`,
-  15 per `repo:<name>`. Only a write that would add to a full set is
-  affected: a create that names no `tier` lands `on_demand` (the answer
-  carries `capped: true, max`), while an explicit `tier: "always"`, or a
-  scope change that carries an always memory into a full scope, is 409
-  `always_full` `{scope, max}`. An approved proposal never fails on the
-  cap; it lands `on_demand` and its item says so. Rows already over the
-  cap stay as they are.
+- Neither tier has a size limit: a memory's tier is the one its writer
+  names, else the stored one, else `always`. How many memories a scope
+  holds in either tier never moves a memory or refuses a write.
 - `description`: 1–200 characters, trimmed, one line (no C0/C1 control
   characters, no U+2028/U+2029). It is the line the Coordinator sees at
   spawn, so it must be the actionable one-liner.
@@ -3223,7 +3218,7 @@ memories are stored and shown in the apps only.
 | `GET /memories` | | 200 `{memories:[…]}` ordered by `name` (≤200 rows, no paging) |
 | `GET /memories/:key` | `:key` = `me_…` or the name | 200 `{memory}`; 404 |
 | `POST /memories/recall` | `{text, mode?, scopes?, tier?, exclude?, limit?, min_score?, min_z?}` | 200 `{memories:[{…memory, score, why}], semantic}` (see *Recall* below); 400 |
-| `PUT /memories/:name` | `{description, body?, type?, scope?, tier?, topic?, convo_id?, causes?}` | 201 `{memory}` created / 200 `{memory}` updated (`capped: true, max` when the cap placed a new memory on demand); **202** `{pending:'owner', proposal, item}` when an agent's write waits for the user (*Memory proposals* below); 400 `bad_request` (a `scope` outside the three forms, or unusable `causes`, included); 409 `too_many`; 409 `always_full`; 409 `conflict` `blocked_by:'too_many_asks'` (too many proposals waiting); 404 |
+| `PUT /memories/:name` | `{description, body?, type?, scope?, tier?, topic?, convo_id?, causes?}` | 201 `{memory}` created / 200 `{memory}` updated; **202** `{pending:'owner', proposal, item}` when an agent's write waits for the user (*Memory proposals* below); 400 `bad_request` (a `scope` outside the three forms, or unusable `causes`, included); 409 `too_many`; 409 `conflict` `blocked_by:'too_many_asks'` (too many proposals waiting); 404 |
 | `DELETE /memories/:key` | agents may send `{convo_id?, causes?}` | 200 `{memory}` (the deleted row); **202** as for `PUT`; 400; 404 |
 
 ### Recall

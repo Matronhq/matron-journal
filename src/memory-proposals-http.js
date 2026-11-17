@@ -235,12 +235,11 @@ function applyProposal(db, p) {
   }
   const out = upsertMemory(db, {
     userId: p.user_id, name: p.name, description: p.description, body: p.body, type: p.type, scope: p.scope,
-    tier: p.tier ?? undefined, topic: p.topic, softCap: true,
+    tier: p.tier ?? undefined, topic: p.topic,
     originConvoId: p.from_convo_id, originDeviceId: p.from_device_id, by: 'agent',
   })
   return {
-    line: (out.created ? 'Saved.' : 'Saved: the memory now reads as proposed.')
-      + (out.capped ? ` It is on demand: the always list for ${out.memory.scope} is full.` : ''),
+    line: out.created ? 'Saved.' : 'Saved: the memory now reads as proposed.',
     marker: { memory: out.memory, action: 'saved', created: out.created, writerConvoId: p.from_convo_id, extra },
   }
 }
