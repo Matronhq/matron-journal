@@ -2979,10 +2979,18 @@ labelled `spare-allowance` and not `dispatched` — is empty), or
 `{kind:'allowance_expiring', tiers:[{unused_pct, hours_left}, …]}` (1–4
 tiers; `unused_pct` 1–99, `hours_left` 1–168: the same meter and subject,
 met when any tier has at least `unused_pct`% of it unused with its reset
-at most `hours_left` away, e.g. 50% with 12 h or 25% with 2 h — still once
-per weekly window, the first tier to be met firing it: an allowance
-subject is remembered until an hour after its reset, not just while it
-matches, so dropping between tiers does not re-arm it), evaluated against `conversation_status` and `device_status` by a
+at most `hours_left` away, e.g. 50% with 12 h or 25% with 2 h — each tier
+fires once per weekly window: the subject is
+`allowance:<account or device>@<reset iso>#<hours_left>h` for the most
+urgent tier met (fewest hours left), so a later tier still met fires the
+window again, while one fire spends every tier at least as far out as
+the one that fired, and a tier never fires after a more urgent one; an
+allowance subject is remembered until an hour after its reset, not just
+while it matches, so dropping between tiers does not re-arm a spent tier;
+a record from before tiers were in the subject spends the tiers whose
+`hours_left` is at least the hours that were left when it fired, read
+with half an hour of slack because the subject rounds its reset to the
+hour), evaluated against `conversation_status` and `device_status` by a
 sweep every five minutes (`src/routines-triggers.js`), as the Coordinator's
 box may see them (private-owned sessions and private boxes are invisible
 to a Coordinator on an ordinary box). Each matching subject (`convo:<id>`
@@ -2992,7 +3000,8 @@ The fire's `message` is the prompt plus a `Tripped by:` list, one line per
 fresh subject (`- [title](matron://convo/<id>) at 42% of its window
 (420k/1M, model)`, `- […] stalled on <model>, resets <iso> (in 5 h)` / `no reset
 time`, `- <box>: 15% free (15.0 GB of 100.0 GB)`, `- Week (all models) at
-32%, resets <iso> (in 9 h); boxes: a, b`). An `allowance_expiring` fire
+32%, resets <iso> (in 9 h); boxes: a, b`, and for a tiered trigger
+`; tier: 35% unused with 8 h left` after it). An `allowance_expiring` fire
 adds `Next in the spare-allowance backlog:` and the first three such tasks
 (`- #<num> <title>`). Pausing a triggered
 routine or changing its trigger clears its records. A triggered routine
