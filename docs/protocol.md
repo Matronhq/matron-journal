@@ -2454,9 +2454,11 @@ caption form.
 shows for its own conversation. It is `null` when there is nothing to show,
 else `{state, since, until}`:
 
-- `state: "running"`: the owning conversation's `session_state` is `running`,
-  whether or not the turn is about this item. `since` is when that turn
-  started (`null` when not recorded); `until` is `null`.
+- `state: "running"`: the owning conversation's `session_state` is `running`
+  and the user's last write on the item that reaches the agent (below) came
+  before that turn started, or there is none. The turn may or may not be
+  about this item. `since` is when that turn started (`null` when not
+  recorded); `until` is `null`.
 - `state: "queued"`: the user wrote something on the item that reaches the
   agent as a turn (a comment, an action tap, a close, a reopen, or filing the
   item; the same writes that wake the box, so never a notice's Seen tap and
@@ -2468,6 +2470,13 @@ else `{state, since, until}`:
   wrote (the reply either starts the next turn at once or was taken into the
   one that ended). A client stops showing the indicator at `until` without
   asking again.
+- `behind_turn: true` on a `queued` state: the session is `running`, but on a
+  turn that started before the user wrote, so the reply is waiting for that
+  turn to end. `until` is `null` while the turn runs. A client says the agent
+  is busy with something else and the reply goes next, not that the agent is
+  working on it. Absent on every other state. (A bridge set to steer replies
+  into the running turn takes the reply in at once; the item still says
+  `queued` until that turn ends.)
 
 It is derived at read time from the item's last such write and the
 conversation's last turn start and end, like `origin_convo_title`: a turn
