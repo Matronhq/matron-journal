@@ -225,18 +225,29 @@ export const WORKING_HANDOFF_GRACE_MS = 15 * 1000
 // An item's `working` block: is the session that owns it busy? What an item
 // thread shows a working indicator from, the way a chat does from its own
 // conversation's state. Pure, so the rule is testable without a clock.
-//   running — the owning conversation is mid-turn (session_state 'running'),
-//             whether or not the turn is about this item.
+//   running — the owning conversation is mid-turn (session_state 'running')
+//             on a turn that started at or after the user's last ask on the
+//             item, or the item has no ask: the agent may be on this item or
+//             on something else.
 //   queued  — the user said something on the item that reaches the agent as a
 //             turn (turnRequestedAt), and no turn has started since: the box
 //             is being woken, the session resumed, or the reply is waiting
-//             behind the turn in flight.
+//             behind the turn in flight. That last case is `behind_turn:
+//             true`: the session is running, but on a turn that started
+//             before the ask, so the ask is not in it. It has no `until`
+//             while that turn runs (a long turn keeps it waiting), and is
+//             never `running`, which would read as the agent working on it.
 // `since` is when that state began (null when unknown); `until` is when a
 // queued state lapses if nothing else happens — a client drops the indicator
 // then without asking again. null = nothing to show.
 export function itemWorking({ sessionState, turnStartedAt, turnEndedAt, turnRequestedAt }, now = Date.now()) {
   if (sessionState == null) return null
-  if (sessionState === 'running') return { state: 'running', since: turnStartedAt ?? null, until: null }
+  if (sessionState === 'running') {
+    if (turnRequestedAt != null && turnStartedAt != null && turnRequestedAt > turnStartedAt) {
+      return { state: 'queued', since: turnRequestedAt, until: null, behind_turn: true }
+    }
+    return { state: 'running', since: turnStartedAt ?? null, until: null }
+  }
   if (turnRequestedAt == null) return null
   if (turnStartedAt != null && turnStartedAt > turnRequestedAt) return null
   let until = turnRequestedAt + WORKING_QUEUED_TTL_MS
