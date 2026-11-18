@@ -2456,7 +2456,7 @@ else `{state, since, until}`:
 
 - `state: "running"`: the owning conversation's `session_state` is `running`
   and the user's last write on the item that reaches the agent (below) came
-  before that turn started, or there is none. The turn may or may not be
+  at or before the moment that turn started, or there is none. The turn may or may not be
   about this item. `since` is when that turn started (`null` when not
   recorded); `until` is `null`.
 - `state: "queued"`: the user wrote something on the item that reaches the
