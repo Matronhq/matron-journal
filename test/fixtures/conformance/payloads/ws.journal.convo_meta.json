@@ -18,6 +18,7 @@
           "auto_title": "first title",
           "parent_convo_id": null,
           "agent_device_id": 9308,
+          "agent_kind": null,
           "repo": null
         }
       }
@@ -37,6 +38,7 @@
           "auto_title": "renamed",
           "parent_convo_id": null,
           "agent_device_id": 9308,
+          "agent_kind": null,
           "repo": null
         }
       }
@@ -56,6 +58,7 @@
           "auto_title": "final title",
           "parent_convo_id": null,
           "agent_device_id": 9308,
+          "agent_kind": null,
           "repo": null
         }
       }

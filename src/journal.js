@@ -176,6 +176,8 @@ function inheritableMission(db, { parentConvoId, ownerUserId, agentDeviceId }) {
 // created with a non-empty title, or a child was created (parent_convo_id
 // set: the linkage must ride the journal even titleless, or a live client
 // would list the child as a normal conversation until its next /snapshot).
+// `kindChanged`: agent_kind was set or switched; ws.js fans out `convo_meta` for
+// it as well, without the title-only pin hint.
 // Callers (ws.js) use the flag to decide whether to fan out a `convo_meta`
 // journal event; no event on an unchanged title, an absent title, or a
 // state-only upsert.
@@ -183,7 +185,7 @@ function inheritableMission(db, { parentConvoId, ownerUserId, agentDeviceId }) {
 // (undefined for a brand-new convo). Purely an in-memory hint for the push
 // pipeline's turn-finished detection (see push.js classify()) — never
 // stored or broadcast, so it carries no wire/protocol weight.
-export function upsertConversation(db, { id, ownerUserId, title, sessionState, agentDeviceId, parentConvoId, sessionOutcome, summary, repo }) {
+export function upsertConversation(db, { id, ownerUserId, title, sessionState, agentDeviceId, parentConvoId, sessionOutcome, summary, agentKind, repo }) {
   // repo: undefined = unchanged, null = clear, string = canonical host/org/name.
   let repoCols = null // { repo, scope } to write, or null to leave alone
   if (repo === null) repoCols = { repo: null, scope: null }
@@ -233,8 +235,8 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
       && !!db.prepare('SELECT 1 FROM convo_agents WHERE convo_id=? AND agent_device_id=?').get(id, agentDeviceId)
 
     db.prepare(
-      'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id), session_outcome=COALESCE(?, session_outcome), summary=COALESCE(?, summary), summary_updated_at=COALESCE(?, summary_updated_at) WHERE id=?'
-    ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), sessionOutcome ?? null, summary ?? null, summaryChanged ? Date.now() : null, id)
+      'UPDATE conversations SET title=COALESCE(?, title), session_state=COALESCE(?, session_state), agent_device_id=COALESCE(?, agent_device_id), session_outcome=COALESCE(?, session_outcome), summary=COALESCE(?, summary), summary_updated_at=COALESCE(?, summary_updated_at), agent_kind=COALESCE(?, agent_kind) WHERE id=?'
+    ).run(title ?? null, sessionState ?? null, guest ? null : (agentDeviceId ?? null), sessionOutcome ?? null, summary ?? null, summaryChanged ? Date.now() : null, agentKind ?? null, id)
     // When the session last entered and last left 'running' — a turn's start
     // and end, for an item thread's working indicator (items.js itemWorking).
     // Stamped on a real transition only: a bridge that repeats a state, or
@@ -261,8 +263,8 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
     // non-null mission_id has an active link" must hold from birth.
     db.transaction(() => {
       db.prepare(
-        'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, summary_updated_at, mission_id, created_at, turn_started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'
-      ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', summary ? createdAt : 0, inheritedMission, createdAt,
+        'INSERT INTO conversations(id, owner_user_id, title, session_state, agent_device_id, parent_convo_id, session_outcome, summary, summary_updated_at, agent_kind, mission_id, created_at, turn_started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)'
+      ).run(id, ownerUserId, initialTitle, sessionState || 'running', agentDeviceId ?? null, parentConvoId ?? null, sessionOutcome ?? null, summary || '', summary ? createdAt : 0, agentKind ?? null, inheritedMission, createdAt,
         (sessionState || 'running') === 'running' ? createdAt : null)
       db.prepare('UPDATE conversations SET auto_title=@auto_title, session_short=@session_short, title_marker=@title_marker WHERE id=@id')
         .run({ id, ...autoTitleColumns(initialTitle) })
@@ -277,7 +279,10 @@ export function upsertConversation(db, { id, ownerUserId, title, sessionState, a
   }
   const convo = db.prepare('SELECT * FROM conversations WHERE id=?').get(id)
   if (existing && convo.title !== existing.title) metaChanged = true
-  return { ...convo, metaChanged, summaryChanged: summaryChanged || (!existing && !!summary), prevSessionState }
+  // agent_kind is live meta too, but not a title: it gets its own flag so the
+  // pin hint (which keys off metaChanged and is title-only) stays untouched.
+  const kindChanged = agentKind != null && agentKind !== (existing?.agent_kind ?? null)
+  return { ...convo, metaChanged, kindChanged, summaryChanged: summaryChanged || (!existing && !!summary), prevSessionState }
 }
 
 // Fan a convo_meta for each conversation the journal itself retitled — a
@@ -449,7 +454,7 @@ export function snapshot(db, userId, { omitSnippet = false, excludePrivateOwned 
   const conversations = db.prepare(
     `SELECT id, title, auto_title, session_state, session_outcome, last_seq, unread_count,
             ${omitSnippet ? 'NULL' : 'snippet'} AS snippet,
-            parent_convo_id, summary, summary_updated_at, repo, created_at, agent_device_id, system,
+            parent_convo_id, summary, summary_updated_at, repo, created_at, agent_device_id, agent_kind, system,
             ${excludePrivateOwned
               ? `(CASE WHEN EXISTS (SELECT 1 FROM missions m WHERE m.id = conversations.mission_id AND ${ORIGIN_SIEVE}) THEN conversations.mission_id END)`
               : 'mission_id'} AS mission_id,
