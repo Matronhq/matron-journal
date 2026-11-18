@@ -922,16 +922,16 @@ export function addComment(db, { userId, itemId, author, deviceId, convoId = nul
 
 const statusOf = (row) => ({ state: row.state, resolution: row.resolution, awaiting: row.awaiting })
 
-export const NOTICE_TO_QUESTION_TEXT = 'Now a question: it waits for your answer'
-
 // A notice becomes a question: the kind changes, its built-in Seen goes (the
 // question's own buttons are on the comment that asked), and a status row
-// records the change. `row` is the item as it was before this write.
+// records the change. The row has no note: apps draw a status note as the
+// agent's own words, and the agent did not write one. The item's header
+// already says it is a question. `row` is the item as it was before this write.
 function promoteNotice(db, { row, userId, deviceId, convoId = null, now }) {
   db.prepare("UPDATE items SET kind='question', actions='[]', chosen_action=NULL, updated_at=? WHERE id=? AND kind='notice'").run(now, row.id)
   const to = { state: 'open', resolution: null, awaiting: 'user' }
   return insertComment(db, {
-    itemId: row.id, userId, author: 'agent', deviceId, convoId, kind: 'status', body: NOTICE_TO_QUESTION_TEXT, attachments: [],
+    itemId: row.id, userId, author: 'agent', deviceId, convoId, kind: 'status', body: '', attachments: [],
     meta: { from: statusOf(row), to, kind: { from: 'notice', to: 'question' } }, idemKey: null, now,
   })
 }

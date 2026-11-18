@@ -9,7 +9,7 @@ import { startTestServer, makeWsClient } from './helpers.js'
 import { openDb } from '../src/db.js'
 import { createUser, createAgent } from '../src/auth.js'
 import { upsertConversation } from '../src/journal.js'
-import { createItem, addComment, insertComment, closeItem, getItem, listComments, promoteAskingNotices, NOTICE_TO_QUESTION_TEXT } from '../src/items.js'
+import { createItem, addComment, insertComment, closeItem, getItem, listComments, promoteAskingNotices } from '../src/items.js'
 import { promoteAskingNoticesAndTell } from '../src/sharing-events.js'
 import { classify } from '../src/push.js'
 import { world, post, grantOf, incoming, offer } from './federation-world.js'
@@ -42,7 +42,7 @@ test('an agent asking with buttons on an open notice turns it into a question in
   const thread = listComments(db, n.id)
   assert.deepEqual(thread.map((c) => c.kind), ['comment', 'status'])
   const status = thread[1]
-  assert.equal(status.body, NOTICE_TO_QUESTION_TEXT)
+  assert.equal(status.body, '', 'no note in the agent\'s name')
   assert.deepEqual(status.meta.kind, { from: 'notice', to: 'question' })
   assert.deepEqual(status.meta.to, { state: 'open', resolution: null, awaiting: 'user' })
   // A second question on it changes nothing more.
@@ -139,7 +139,7 @@ test('one-off: open notices waiting on an unanswered button question become ques
   const w = getItem(db, alice.id, waiting.id)
   assert.deepEqual([w.kind, w.actions, w.awaiting, w.updated_at], ['question', [], 'user', 9000])
   const status = listComments(db, waiting.id).find((c) => c.kind === 'status')
-  assert.deepEqual([status.body, status.device_id, status.meta.kind], [NOTICE_TO_QUESTION_TEXT, agent.deviceId, { from: 'notice', to: 'question' }])
+  assert.deepEqual([status.body, status.device_id, status.meta.kind], ['', agent.deviceId, { from: 'notice', to: 'question' }])
   for (const it of [tapped, replied, reopened, closed, quiet, handover]) assert.equal(getItem(db, alice.id, it.id).kind, 'notice', it.id)
   assert.equal(db.pragma('user_version', { simple: true }), 3)
   // Once per database: a notice left like that later is not swept again.
