@@ -3935,6 +3935,17 @@ puts it back awaiting the user with `chosen_action` cleared. A push for a
 new notice falls under the `notices` event ("Things to read") of the
 notification settings.
 
+**A notice that gets a question becomes one.** An agent comment that offers
+`actions` on an open notice turns the item into a question in the same
+write: `kind` becomes `question`, `actions` becomes `[]` (the built-in Seen
+is gone, so a Seen tap is then 400 `unknown_action`), and a status comment
+follows the agent's comment with `meta.kind: {from: "notice", to:
+"question"}`. The `commented` marker and its push carry `kind: question`, and
+shared copies follow. The journal's own questions on an item (a hand-over
+offer) leave its kind alone. Once per database, at startup, open notices
+already waiting on an unanswered question an agent asked with buttons
+become questions the same way.
+
 **Older apps.** An app shows the kind only if it sends
 `X-Matron-Item-Kinds: notice` (a comma-separated list) on its `/items`
 requests. To a client device that does not, every `/items` response

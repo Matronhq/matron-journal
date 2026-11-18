@@ -913,6 +913,11 @@ export function addComment(db, { userId, itemId, author, deviceId, convoId = nul
       db.prepare("UPDATE items SET state='open', resolution=NULL, closed_at=NULL, awaiting='agent', updated_at=? WHERE id=?").run(now, itemId)
     } else if (asks) {
       db.prepare("UPDATE items SET awaiting='user', updated_at=? WHERE id=?").run(now, itemId)
+      // An agent asking with buttons on an open notice has turned it into a
+      // question: it becomes one in this write, so every app shows it as
+      // needing the user (not as something to read), the push goes out as a
+      // question, and a Seen tap can no longer close it unanswered.
+      if (row.kind === 'notice' && author === 'agent' && deviceId !== 0 && !keepStatus) promoteNotice(db, { row, userId, deviceId, convoId, now })
     } else {
       touch(db, itemId, now)
     }
@@ -927,6 +932,50 @@ export function addComment(db, { userId, itemId, author, deviceId, convoId = nul
 }
 
 const statusOf = (row) => ({ state: row.state, resolution: row.resolution, awaiting: row.awaiting })
+
+// A notice becomes a question: the kind changes, its built-in Seen goes (the
+// question's own buttons are on the comment that asked), and a status row
+// records the change. The row has no note: apps draw a status note as the
+// agent's own words, and the agent did not write one. The item's header
+// already says it is a question. `row` is the item as it was before this write.
+function promoteNotice(db, { row, userId, deviceId, convoId = null, now }) {
+  db.prepare("UPDATE items SET kind='question', actions='[]', chosen_action=NULL, updated_at=? WHERE id=? AND kind='notice'").run(now, row.id)
+  const to = { state: 'open', resolution: null, awaiting: 'user' }
+  return insertComment(db, {
+    itemId: row.id, userId, author: 'agent', deviceId, convoId, kind: 'status', body: '', attachments: [],
+    meta: { from: statusOf(row), to, kind: { from: 'notice', to: 'question' } }, idemKey: null, now,
+  })
+}
+
+// One-off: open notices that already wait on an unanswered question an agent
+// asked with buttons on a comment (from before notices became questions on
+// such a comment) become questions now. Unanswered: nobody tapped one of its
+// buttons and the user has not commented since. The journal's own questions
+// (device 0: a hand-over offer, a talk request) are not an agent asking, and
+// leave the kind alone, as they do live. Runs once per database
+// (user_version 3). Returns the items it changed, so the caller can tell
+// shared copies.
+export function promoteAskingNotices(db, now = Date.now()) {
+  if (db.pragma('user_version', { simple: true }) >= 3) return []
+  return db.transaction(() => {
+    const rows = db.prepare(`SELECT i.* FROM items i
+      WHERE i.kind='notice' AND i.state='open' AND i.awaiting='user'
+        AND EXISTS (SELECT 1 FROM item_comments a
+          WHERE a.item_id = i.id AND a.kind='comment' AND a.author='agent' AND a.device_id <> 0
+            AND a.actions IS NOT NULL AND a.actions <> '[]' AND a.chosen_action IS NULL
+            AND a.created_at >= COALESCE((SELECT MAX(u.created_at) FROM item_comments u
+              WHERE u.item_id = i.id AND u.author='user'), 0))`).all()
+    const out = []
+    for (const row of rows) {
+      const asker = db.prepare(`SELECT device_id, convo_id FROM item_comments
+        WHERE item_id=? AND kind='comment' AND author='agent' AND device_id <> 0 AND actions <> '[]' ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(row.id)
+      promoteNotice(db, { row, userId: row.user_id, deviceId: asker?.device_id ?? 0, convoId: asker?.convo_id ?? null, now })
+      out.push(getItem(db, row.user_id, row.id))
+    }
+    db.pragma('user_version = 3')
+    return out
+  })()
+}
 
 // `meta` is merged into the status row's own: a contributor's close
 // (src/contribute.js) says who closed it.
