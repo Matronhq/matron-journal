@@ -56,6 +56,8 @@ test('only an agent question with buttons changes the kind', async () => {
   assert.equal(ask(plain.id, { actions: [] }).item.kind, 'notice', 'a comment with no buttons')
   const typed = notice()
   assert.equal(addComment(db, { userId: alice.id, itemId: typed.id, author: 'user', deviceId: 1, body: 'Why?' }).item.kind, 'notice', 'the user\'s own words')
+  const deviceZero = notice()
+  assert.equal(addComment(db, { userId: alice.id, itemId: deviceZero.id, author: 'agent', deviceId: 0, body: 'Pick a box', actions: ['box-a'] }).item.kind, 'notice', 'a journal-written question')
   const journalOwn = notice()
   // The journal's own questions on an item (a hand-over offer) keep its status, and its kind.
   assert.equal(addComment(db, { userId: alice.id, itemId: journalOwn.id, author: 'agent', deviceId: 0, body: 'Hand this over?', actions: ['Yes'], keepStatus: true }).item.kind, 'notice')
@@ -128,6 +130,9 @@ test('one-off: open notices waiting on an unanswered button question become ques
   oldAsk(db, alice, agent, closed.id, 1000)
   closeItem(db, { userId: alice.id, itemId: closed.id, resolution: 'cancelled', author: 'agent', deviceId: agent.deviceId })
   const quiet = notice()
+  // The journal's own hand-over question, written as device 0.
+  const handover = notice()
+  insertComment(db, { itemId: handover.id, userId: alice.id, author: 'agent', deviceId: 0, kind: 'comment', body: 'Hand this over?', attachments: [], meta: { role: 'handover_approval' }, actions: ['Hand over', 'Keep it here'], idemKey: null, now: 1000 })
 
   const out = promoteAskingNotices(db, 9000)
   assert.deepEqual(out.map((i) => i.id), [waiting.id])
@@ -135,7 +140,7 @@ test('one-off: open notices waiting on an unanswered button question become ques
   assert.deepEqual([w.kind, w.actions, w.awaiting, w.updated_at], ['question', [], 'user', 9000])
   const status = listComments(db, waiting.id).find((c) => c.kind === 'status')
   assert.deepEqual([status.body, status.device_id, status.meta.kind], [NOTICE_TO_QUESTION_TEXT, agent.deviceId, { from: 'notice', to: 'question' }])
-  for (const it of [tapped, replied, reopened, closed, quiet]) assert.equal(getItem(db, alice.id, it.id).kind, 'notice', it.id)
+  for (const it of [tapped, replied, reopened, closed, quiet, handover]) assert.equal(getItem(db, alice.id, it.id).kind, 'notice', it.id)
   assert.equal(db.pragma('user_version', { simple: true }), 3)
   // Once per database: a notice left like that later is not swept again.
   const late = notice()

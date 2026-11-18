@@ -906,7 +906,7 @@ export function addComment(db, { userId, itemId, author, deviceId, convoId = nul
       // question: it becomes one in this write, so every app shows it as
       // needing the user (not as something to read), the push goes out as a
       // question, and a Seen tap can no longer close it unanswered.
-      if (row.kind === 'notice' && author === 'agent' && !keepStatus) promoteNotice(db, { row, userId, deviceId, convoId, now })
+      if (row.kind === 'notice' && author === 'agent' && deviceId !== 0 && !keepStatus) promoteNotice(db, { row, userId, deviceId, convoId, now })
     } else {
       touch(db, itemId, now)
     }
@@ -939,7 +939,9 @@ function promoteNotice(db, { row, userId, deviceId, convoId = null, now }) {
 // One-off: open notices that already wait on an unanswered question an agent
 // asked with buttons on a comment (from before notices became questions on
 // such a comment) become questions now. Unanswered: nobody tapped one of its
-// buttons and the user has not commented since. Runs once per database
+// buttons and the user has not commented since. The journal's own questions
+// (device 0: a hand-over offer, a talk request) are not an agent asking, and
+// leave the kind alone, as they do live. Runs once per database
 // (user_version 3). Returns the items it changed, so the caller can tell
 // shared copies.
 export function promoteAskingNotices(db, now = Date.now()) {
@@ -948,14 +950,14 @@ export function promoteAskingNotices(db, now = Date.now()) {
     const rows = db.prepare(`SELECT i.* FROM items i
       WHERE i.kind='notice' AND i.state='open' AND i.awaiting='user'
         AND EXISTS (SELECT 1 FROM item_comments a
-          WHERE a.item_id = i.id AND a.kind='comment' AND a.author='agent'
+          WHERE a.item_id = i.id AND a.kind='comment' AND a.author='agent' AND a.device_id <> 0
             AND a.actions IS NOT NULL AND a.actions <> '[]' AND a.chosen_action IS NULL
             AND a.created_at >= COALESCE((SELECT MAX(u.created_at) FROM item_comments u
               WHERE u.item_id = i.id AND u.author='user'), 0))`).all()
     const out = []
     for (const row of rows) {
       const asker = db.prepare(`SELECT device_id, convo_id FROM item_comments
-        WHERE item_id=? AND kind='comment' AND author='agent' AND actions <> '[]' ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(row.id)
+        WHERE item_id=? AND kind='comment' AND author='agent' AND device_id <> 0 AND actions <> '[]' ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(row.id)
       promoteNotice(db, { row, userId: row.user_id, deviceId: asker?.device_id ?? 0, convoId: asker?.convo_id ?? null, now })
       out.push(getItem(db, row.user_id, row.id))
     }
