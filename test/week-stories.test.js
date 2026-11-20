@@ -234,3 +234,17 @@ test('writeWeekEntries takes an already-normalised input directly', () => {
   assert.equal(writeWeekEntries(db, 1, keyOf(0), input({ entries: [{ project: a.id, sentence: 'direct', next: null, media_blob_id: null }] }), opts).ok, true)
   assert.equal(storedWeek(db, 1, keyOf(0)).stories[0].sentence, 'direct')
 })
+
+test('writeWeekEntries: a non-final week can be rewritten and then finished; after that only a final rewrite replaces it', () => {
+  const db = seeded()
+  const a = project(db, 'Alpha')
+  const says = (sentence, final = false) => ({ final, entries: [card(a.id, { sentence })] })
+  assert.equal(write(db, keyOf(-2), says('a')).ok, true)
+  assert.equal(write(db, keyOf(-2), says('b')).ok, true)
+  assert.equal(write(db, keyOf(-2), says('c', true)).ok, true)
+  assert.equal(storedWeek(db, 1, keyOf(-2)).final, true)
+  assert.deepEqual(write(db, keyOf(-2), says('d')), { error: 'conflict', detail: 'week_final' })
+  assert.equal(storedWeek(db, 1, keyOf(-2)).stories[0].sentence, 'c')
+  assert.equal(write(db, keyOf(-2), says('e', true)).ok, true)
+  assert.equal(storedWeek(db, 1, keyOf(-2)).stories[0].sentence, 'e')
+})
