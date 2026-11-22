@@ -30,8 +30,8 @@ const parse = (s) => { try { return JSON.parse(s) } catch { return null } }
 export function presentWithdrawn(c) {
   if (!c || c.withdrawn_at == null) return c
   const meta = c.meta && typeof c.meta === 'object' ? { ...c.meta } : c.meta
-  if (meta) delete meta.action
-  return { ...c, body: '', attachments: [], meta, action: null, withdrawn: true }
+  if (meta) { delete meta.action; delete meta.selected }
+  return { ...c, body: '', attachments: [], meta, action: null, selected: null, withdrawn: true }
 }
 
 // The bridge's cancel release for one of its queue cards (a `prompt_reply`
@@ -95,7 +95,11 @@ function undoTap(db, { itemId, meta }) {
     : db.prepare('SELECT actions FROM items WHERE id=?').get(itemId)?.actions
   // A multi-select answer stands only while every label it picked does.
   const picked = latest?.action == null ? null : (Array.isArray(parse(latest.selected)) ? parse(latest.selected) : [latest.action])
-  const ok = picked != null && picked.every((a) => (parse(offered) ?? []).includes(a))
+  // ...and, for more than one label, while the question still takes several.
+  const multiNow = replyTo
+    ? db.prepare('SELECT multi_select FROM item_comments WHERE id=? AND item_id=?').get(replyTo, itemId)?.multi_select
+    : db.prepare('SELECT multi_select FROM items WHERE id=?').get(itemId)?.multi_select
+  const ok = picked != null && (picked.length === 1 || !!multiNow) && picked.every((a) => (parse(offered) ?? []).includes(a))
   const restored = ok ? latest.action : null
   const restoredList = ok ? JSON.stringify(picked) : null
   if (replyTo) {
@@ -122,6 +126,7 @@ function scrubEvents(db, { userId, itemId, commentId, cardSeq, chosen }) {
     const p = parse(m.payload)
     if (!p?.comment) continue
     p.comment = { ...p.comment, body: '', attachments: [], action: null, withdrawn: true }
+    delete p.comment.selected
     update.run(JSON.stringify(p), m.user_id, m.seq)
     if (p.action !== 'commented') continue
     const fb = fallbackAfter.get(m.user_id, m.convo_id, m.sender, m.seq, m.seq + FALLBACK_WINDOW, itemId)

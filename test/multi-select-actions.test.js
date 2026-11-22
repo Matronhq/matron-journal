@@ -189,3 +189,37 @@ test('withdrawing a multi-select answer puts the previous answer back', async (t
   assert.equal(after.chosen_action, 'Docs')
   assert.deepEqual(after.chosen_actions, ['Docs', 'Search'])
 })
+
+test('a withdrawn multi-select answer shows none of its labels', async (t) => {
+  const { s, alice, agent, client } = await fleet(t)
+  const id = (await mkItem(s, agent.token, { actions: OPTIONS, multi_select: true })).json.item.id
+  const answer = (await comment(s, client, id, { selected: ['Docs', 'Search'] })).json.comment
+  withdrawComment(s.db, { userId: alice.id, itemId: id, commentId: answer.id })
+  const seen = (await s.http(`/items/${id}`, { token: agent.token })).json.comments.find((c) => c.id === answer.id)
+  assert.equal(seen.selected, null)
+  assert.equal(seen.meta?.selected, undefined)
+  const markers = s.db.prepare("SELECT payload FROM events WHERE type='item'").all().map((r) => JSON.parse(r.payload))
+  assert.ok(markers.every((m) => m.comment?.id !== answer.id || !('selected' in m.comment)))
+})
+
+test('step_up and multi_select never meet: PATCH either way, or a follow-up on a step-up item', async (t) => {
+  const { s, agent } = await fleet(t)
+  const multi = (await mkItem(s, agent.token, { actions: OPTIONS, multi_select: true })).json.item.id
+  const r = await s.http(`/items/${multi}`, { method: 'PATCH', token: agent.token, body: { step_up: true } })
+  // Without an approval key step_up is ignored; with one it would be refused.
+  assert.ok(r.status === 400 || r.json.step_up_ignored === true, JSON.stringify(r.json))
+  s.db.prepare('UPDATE items SET step_up=1 WHERE id=?').run(multi)
+  const p = await s.http(`/items/${multi}`, { method: 'PATCH', token: agent.token, body: { title: 'Renamed' } })
+  assert.equal(p.status, 400)
+  assert.deepEqual(p.json, { error: 'invalid_actions' })
+  const q = await comment(s, agent.token, multi, { body: 'Which?', actions: OPTIONS, multi_select: true })
+  assert.equal(q.status, 400)
+})
+
+test('a notice PATCH that resends its own Seen button is still a no-op', async (t) => {
+  const { s, agent } = await fleet(t)
+  const n = (await mkItem(s, agent.token, { kind: 'notice', title: 'FYI' })).json.item
+  const r = await s.http(`/items/${n.id}`, { method: 'PATCH', token: agent.token, body: { actions: ['Seen'] } })
+  assert.equal(r.status, 200)
+  assert.equal(r.json.item.updated_at, n.updated_at)
+})

@@ -76,11 +76,11 @@ function replyItems(who, res, code, body) {
 // The item transitions in items.js signal their one recoverable failure by
 // throwing a tagged Error; each maps to exactly one of the existing error
 // shapes. Anything else is a bug and must reach http.js's 500.
-const ERROR_STATUS = { bad_after_before: 400, bad_supersedes: 400, idem_key_conflict: 409, unknown_action: 400, item_closed: 409 }
+const ERROR_STATUS = { bad_after_before: 400, bad_supersedes: 400, idem_key_conflict: 409, unknown_action: 400, item_closed: 409, invalid_actions: 400 }
 // The failures the item-actions contract names answer with their own code
 // rather than the generic one, so an app can tell "that button is gone" (the
 // agent changed the offer under it) from a malformed request.
-const NAMED_ERRORS = new Set(['unknown_action'])
+const NAMED_ERRORS = new Set(['unknown_action', 'invalid_actions'])
 // Wake keys off the ACTION as well as the writer: a reorder is bookkeeping,
 // not something a sleeping box needs to be booted for.
 const WAKE_ACTIONS = new Set(['created', 'commented', 'closed', 'reopened'])
@@ -494,6 +494,7 @@ async function handlePatch(ctx, req, res, who, item) {
   // a patch of nothing else changes nothing.
   if (item.kind === 'notice' && 'actions' in fields) {
     delete fields.actions
+    delete fields.multi_select
     if (Object.keys(fields).length === 0 && body.awaiting === undefined && body.mission === undefined) {
       replyItems(who, res, 200, { item })
       return true
@@ -561,6 +562,7 @@ async function handlePatch(ctx, req, res, who, item) {
     })()
   } catch (err) {
     if (err instanceof ApprovalRefused) { json(res, err.refusal.status, err.refusal.body); return true }
+    if (err?.message === 'invalid_actions') return badFields(res, { error: 'invalid_actions' })
     throw err
   }
   // Every mutating route appends a marker, this one included: a retitle or a

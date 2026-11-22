@@ -917,6 +917,9 @@ export function addComment(db, { userId, itemId, author, deviceId, convoId = nul
     }
     const asks = actions.length > 0
     if (asks && row.state === 'closed') throw new Error('item_closed')
+    // A step-up item's mark covers its follow-ups' buttons, and a
+    // multi-select answer cannot be signed: decided on the row as it is now.
+    if (asks && multiSelect && row.step_up) throw new Error('invalid_actions')
     let asked = null
     if (selected != null && action != null) throw new Error('unknown_action')
     if (replyTo != null) {
@@ -1093,6 +1096,11 @@ export function updateItem(db, { userId, itemId, fields, missionId, now = Date.n
       sets.push('multi_select=?'); args.push(multi)
       if (next !== row.actions || multi !== (row.multi_select ? 1 : 0)) sets.push('chosen_action=NULL', 'chosen_actions=NULL')
     }
+    // A multi-select question cannot be signed: checked on the row as this
+    // transaction reads it, so a concurrent PATCH cannot pair the two.
+    const multiAfter = fields.actions !== undefined ? fields.multi_select === true : !!row.multi_select
+    const stepUpAfter = fields.step_up !== undefined ? fields.step_up : !!row.step_up
+    if (multiAfter && stepUpAfter) throw new Error('invalid_actions')
     if (fields.step_up !== undefined) {
       sets.push('step_up=?'); args.push(fields.step_up ? 1 : 0)
       if (!fields.step_up) sets.push('subject=NULL')
