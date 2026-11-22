@@ -186,12 +186,14 @@ test('a body that breaks after the headers is a transport failure, not a refused
 })
 
 test('a late 401 for an old token does not throw away a newer one', async (t) => {
-  let releaseFirst
+  let releaseFirst, markFirstArrived
   const firstHeld = new Promise((resolve) => { releaseFirst = resolve })
+  const firstArrived = new Promise((resolve) => { markFirstArrived = resolve })
   const fake = await fakeGoogle(t)
   let clock = 1_000_000
   const fetchImpl = async (url, init) => {
     if (String(url).includes('messages:send') && init.headers.authorization === 'Bearer access-1') {
+      markFirstArrived()
       await firstHeld
       return { status: 401, text: async () => JSON.stringify({ error: { status: 'UNAUTHENTICATED' } }) }
     }
@@ -199,7 +201,7 @@ test('a late 401 for an old token does not throw away a newer one', async (t) =>
   }
   const fcm = client(fake, { fetchImpl, now: () => clock })
   const first = fcm.send({ token: 'device-token-alice-0001', data: DATA })
-  await new Promise((resolve) => setTimeout(resolve, 50))
+  await firstArrived // access-1 is minted and in use before the clock moves
   clock += 60 * 60 * 1000 // access-1 expires; the next send mints access-2
   assert.deepEqual(await fcm.send({ token: 'device-token-alice-0001', data: DATA }), { status: 200, reason: null })
   assert.equal(fake.tokens.length, 2)
