@@ -289,8 +289,10 @@ The project id is read from the file; `MATRON_FCM_PROJECT_ID` overrides it.
 The journal mints a one-hour OAuth access token from the key (an RS256 JWT,
 `node:crypto` only), caches it, and sends each notification as a data-only,
 high-priority message. The app registers its token with
-`POST /push/fcm/register` and a public key, and what each notification
-says travels sealed to that key, exactly as for APNs. Tokens FCM reports as
+`POST /push/fcm/register` with a public key, and what each notification
+says travels sealed to that key, exactly as for APNs. A registration without
+a key (the key is optional, as for APNs) gets the title and text in the clear
+through FCM; the Matron Android app always registers one. Tokens FCM reports as
 `UNREGISTERED` are pruned. With no key file, Android push is off and the
 app's registration answers 404.
 

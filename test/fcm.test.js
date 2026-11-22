@@ -150,6 +150,65 @@ test('a dropped connection is retried once, and only once', async (t) => {
   assert.equal(always.sends.length, 2)
 })
 
+test('an unreachable token endpoint is a transport failure: retried once, with no back-off', async (t) => {
+  const fake = await fakeGoogle(t)
+  let tokenCalls = 0
+  const fetchImpl = async (url, init) => {
+    if (String(url).endsWith('/token')) {
+      tokenCalls += 1
+      if (tokenCalls === 1) throw new TypeError('fetch failed')
+    }
+    return fetch(url, init)
+  }
+  const original = console.error
+  console.error = () => {}
+  t.after(() => { console.error = original })
+  const fcm = client(fake, { fetchImpl })
+  assert.deepEqual(await fcm.send({ token: 'device-token-alice-0001', data: DATA }), { status: 200, reason: null })
+  assert.equal(tokenCalls, 2)
+})
+
+test('a body that breaks after the headers is a transport failure, not a refused key', async (t) => {
+  const fake = await fakeGoogle(t)
+  let tokenCalls = 0
+  const fetchImpl = async (url, init) => {
+    if (String(url).endsWith('/token') && ++tokenCalls === 1) {
+      return { status: 200, text: async () => { throw new TypeError('terminated') } }
+    }
+    return fetch(url, init)
+  }
+  const original = console.error
+  console.error = () => {}
+  t.after(() => { console.error = original })
+  const fcm = client(fake, { fetchImpl })
+  assert.deepEqual(await fcm.send({ token: 'device-token-alice-0001', data: DATA }), { status: 200, reason: null })
+  assert.equal(tokenCalls, 2)
+})
+
+test('a late 401 for an old token does not throw away a newer one', async (t) => {
+  let releaseFirst
+  const firstHeld = new Promise((resolve) => { releaseFirst = resolve })
+  const fake = await fakeGoogle(t)
+  let clock = 1_000_000
+  const fetchImpl = async (url, init) => {
+    if (String(url).includes('messages:send') && init.headers.authorization === 'Bearer access-1') {
+      await firstHeld
+      return { status: 401, text: async () => JSON.stringify({ error: { status: 'UNAUTHENTICATED' } }) }
+    }
+    return fetch(url, init)
+  }
+  const fcm = client(fake, { fetchImpl, now: () => clock })
+  const first = fcm.send({ token: 'device-token-alice-0001', data: DATA })
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  clock += 60 * 60 * 1000 // access-1 expires; the next send mints access-2
+  assert.deepEqual(await fcm.send({ token: 'device-token-alice-0001', data: DATA }), { status: 200, reason: null })
+  assert.equal(fake.tokens.length, 2)
+  releaseFirst()
+  assert.deepEqual(await first, { status: 200, reason: null })
+  // The late 401 retried with access-2, still cached: no third mint.
+  assert.equal(fake.tokens.length, 2)
+})
+
 test('server errors are not retried', async (t) => {
   const fake = await fakeGoogle(t, { onSend: () => ({ status: 503, body: { error: { status: 'UNAVAILABLE' } } }) })
   assert.deepEqual(await client(fake).send({ token: 'device-token-alice-0001', data: DATA }), { status: 503, reason: 'UNAVAILABLE' })

@@ -13,6 +13,14 @@ import { RECIPIENT, keyPairFrom } from './push-box-fixture.js'
 
 const tick = () => new Promise((resolve) => setImmediate(resolve))
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+// Polls instead of guessing how long a coalescing window takes on a busy runner.
+async function until(check, ms = 5000) {
+  const end = Date.now() + ms
+  while (!check()) {
+    if (Date.now() > end) throw new Error('timed out waiting')
+    await pause(10)
+  }
+}
 const TOKEN = 'fcm-token-alice-phone-0001'
 
 async function setup(t, { answer = () => ({ status: 200, reason: null }), key = RECIPIENT.key, coalesceMs = 40, apns = false } = {}) {
@@ -91,8 +99,7 @@ test('routine activity is coalesced per conversation and sent at normal TTL', as
   await tick()
   assert.equal(s.sends.length, 1)
   assert.equal(s.sends[0].ttlSeconds, 3600)
-  await pause(60)
-  assert.equal(s.sends.length, 2)
+  await until(() => s.sends.length === 2)
   assert.equal(JSON.parse(openBox(RECIPIENT, s.sends[1].data.box)).body, 'three')
 })
 
@@ -129,7 +136,7 @@ test('a read elsewhere sends a quiet read message to the phone, never to the dev
   const s = await setup(t)
   const tablet = createClientDevice(s.db, s.alice.id, 'tablet')
   const r = s.send({ type: 'text', payload: { body: 'hi' } })
-  await pause(60)
+  await until(() => s.pipeline._coalesceState.size === 0)
   s.sends.length = 0
   s.send({ type: 'read_marker', payload: { convo_id: 'c1', up_to_seq: r.seq }, sender: 'user:alice', origin: tablet.deviceId })
   await tick()
@@ -141,6 +148,18 @@ test('a read elsewhere sends a quiet read message to the phone, never to the dev
   s.send({ type: 'read_marker', payload: { convo_id: 'c1', up_to_seq: r.seq }, sender: 'user:alice', origin: s.phone.deviceId })
   await tick()
   assert.equal(s.sends.length, 1)
+})
+
+test('a read elsewhere drops a routine alert still waiting in that conversation', async (t) => {
+  const s = await setup(t, { coalesceMs: 30 })
+  const tablet = createClientDevice(s.db, s.alice.id, 'tablet')
+  s.send({ type: 'text', payload: { body: 'one' } })
+  const r = s.send({ type: 'text', payload: { body: 'two' } })
+  await tick()
+  assert.equal(s.sends.length, 1)
+  s.send({ type: 'read_marker', payload: { convo_id: 'c1', up_to_seq: r.seq }, sender: 'user:alice', origin: tablet.deviceId })
+  await until(() => s.pipeline._coalesceState.size === 0)
+  assert.deepEqual(s.sends.map((x) => x.data.type), ['alert', 'read'])
 })
 
 test('404 UNREGISTERED prunes the token; other failures keep it', async (t) => {
@@ -186,14 +205,18 @@ test('a push queued before the phone unregistered or changed key is not sent wit
   // A new key while the trailing push waits: the box is sealed to it.
   const next = keyPairFrom('alice phone, second key')
   setFcmRegistration(s.db, s.phone.deviceId, { token: TOKEN, pushKey: next.key })
-  await pause(60)
-  assert.equal(s.sends.length, 2)
+  await until(() => s.sends.length === 2)
   assert.equal(JSON.parse(openBox(next, s.sends[1].data.box)).body, 'two')
-  // Unregistered while the next one waits: nothing goes.
+  // A new token while one waits: it goes to the new token.
   s.send({ type: 'text', payload: { body: 'three' } })
+  setFcmRegistration(s.db, s.phone.deviceId, { token: 'fcm-token-alice-phone-0002', pushKey: next.key })
+  await until(() => s.sends.length === 3)
+  assert.equal(s.sends[2].token, 'fcm-token-alice-phone-0002')
+  // Unregistered while the next one waits: nothing goes.
+  s.send({ type: 'text', payload: { body: 'four' } })
   clearFcmRegistration(s.db, s.phone.deviceId)
-  await pause(60)
-  assert.equal(s.sends.length, 2)
+  await until(() => s.pipeline._coalesceState.size === 0)
+  assert.equal(s.sends.length, 3)
 })
 
 test('a phone with both an APNs and an FCM registration gets each once', async (t) => {
@@ -221,6 +244,12 @@ test('registering claims the token from any other device, and a revoked device t
 })
 
 async function server(t, { fcm = true } = {}) {
+  // Off means off, whatever the test process's own environment says.
+  if (!fcm) {
+    const saved = process.env.MATRON_FCM_DISABLED
+    process.env.MATRON_FCM_DISABLED = '1'
+    t.after(() => { if (saved === undefined) delete process.env.MATRON_FCM_DISABLED; else process.env.MATRON_FCM_DISABLED = saved })
+  }
   const fcmClient = fcm ? { send: async () => ({ status: 200, reason: null }), close() {} } : undefined
   const s = await startTestServer({ fcmClient })
   t.after(() => s.close())

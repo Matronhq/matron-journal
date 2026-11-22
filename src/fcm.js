@@ -101,8 +101,12 @@ export function makeFcmClient({
     timer.unref?.()
     try {
       const res = await fetchImpl(url, { ...init, signal: controller.signal })
+      // Reading the body can fail on its own (a connection that breaks after
+      // the headers): that is a transport failure, caught below. Only a body
+      // that arrived whole but is not JSON is tolerated.
+      const text = await res.text()
       let body = null
-      try { body = await res.json() } catch { /* non-JSON body */ }
+      try { body = JSON.parse(text) } catch { /* non-JSON body */ }
       return { status: res.status, body }
     } catch (err) {
       return { status: 0, body: null, reason: err?.name === 'AbortError' ? 'timeout' : 'transport' }
@@ -111,6 +115,9 @@ export function makeFcmClient({
     }
   }
 
+  // Resolves {token} or {token: null, reason}: 'auth' when the endpoint
+  // refused the key (and sends back off), 'transport' or 'timeout' when it
+  // could not be reached (and the send's one retry applies).
   async function mint() {
     const r = await post(serviceAccount.tokenUri, {
       method: 'POST',
@@ -126,32 +133,33 @@ export function makeFcmClient({
       if (r.status !== 0) authFailedUntil = now() + authRetryMs
       const why = r.status === 0 ? r.reason : `status=${r.status}${typeof r.body?.error === 'string' ? ' ' + r.body.error : ''}`
       console.error(`fcm: could not get an access token (${why})`)
-      return null
+      return { token: null, reason: r.status === 0 ? r.reason : 'auth' }
     }
     const lifetimeMs = (Number(r.body.expires_in) > 0 ? Number(r.body.expires_in) : 3600) * 1000
     cached = { token, expiresAt: now() + lifetimeMs - TOKEN_REFRESH_MARGIN_MS }
-    return token
+    return { token }
   }
 
-  // The cached access token, or a fresh one; null when none can be had.
+  // The cached access token, or a fresh one: {token} or {token: null, reason}.
   async function accessToken() {
-    if (cached && now() < cached.expiresAt) return cached.token
-    if (now() < authFailedUntil) return null
+    if (cached && now() < cached.expiresAt) return { token: cached.token }
+    if (now() < authFailedUntil) return { token: null, reason: 'auth' }
     minting ??= mint().finally(() => { minting = null })
     return minting
   }
 
+  // One attempt. `used` is the access token it went with, for send() alone.
   async function sendOnce(message) {
-    const token = await accessToken()
-    if (!token) return { status: 0, reason: 'auth' }
+    const { token, reason } = await accessToken()
+    if (!token) return { status: 0, reason }
     const r = await post(sendUrl, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
       body: JSON.stringify({ message }),
     })
-    if (r.status === 0) return { status: 0, reason: r.reason }
-    if (r.status >= 200 && r.status < 300) return { status: r.status, reason: null }
-    return { status: r.status, reason: fcmErrorReason(r.body) }
+    if (r.status === 0) return { status: 0, reason: r.reason, used: token }
+    if (r.status >= 200 && r.status < 300) return { status: r.status, reason: null, used: token }
+    return { status: r.status, reason: fcmErrorReason(r.body), used: token }
   }
 
   // Resolves {status, reason}; never rejects.
@@ -171,13 +179,15 @@ export function makeFcmClient({
       if (Number.isInteger(ttlSeconds) && ttlSeconds >= 0) android.ttl = `${ttlSeconds}s`
       if (collapseKey) android.collapse_key = collapseKey
       const message = { token, data, android }
+      const strip = ({ status, reason }) => ({ status, reason })
       const result = await sendOnce(message)
-      if (result.reason === 'transport') return sendOnce(message)
+      if (result.reason === 'transport') return strip(await sendOnce(message))
       if (result.status === 401) {
-        cached = null
-        return sendOnce(message)
+        // Only the token this request used: a newer one minted meanwhile stays.
+        if (cached?.token === result.used) cached = null
+        return strip(await sendOnce(message))
       }
-      return result
+      return strip(result)
     } catch (err) {
       console.error('fcm: send failed unexpectedly', err?.name || 'error')
       return { status: 0, reason: 'internal' }

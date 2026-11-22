@@ -337,8 +337,12 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, fcmClient
     if (!db.prepare("SELECT 1 FROM devices WHERE id=? AND user_id=? AND kind='client'").get(device.id, userId)) return
     // A trailing push must not use a token unregistered or claimed by
     // another device while it waited in the coalescing window.
+    // The registration as it is now: a push that waited in the coalescing
+    // window goes to the token the phone holds now, sealed to its key now.
+    // The row is this device's own, so a token claimed by another device has
+    // already left it; an unregistered phone gets nothing.
     const current = db.prepare('SELECT token, push_key FROM fcm_registrations WHERE device_id=?').get(device.id)
-    if (!current || current.token !== device.fcm_token) return
+    if (!current) return
     const failed = (reason) => {
       fcmCounters.failed += 1
       fcmCounters.byReason[reason] = (fcmCounters.byReason[reason] || 0) + 1
@@ -347,7 +351,7 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, fcmClient
       const data = opts.build(current.push_key ?? null)
       // Badge as of the send, as doSend does for APNs.
       data.badge = String(notifyBadge(db, userId, unreadBadge))
-      Promise.resolve(fcmClient.send({ token: device.fcm_token, data, priority: opts.priority, ttlSeconds: opts.ttlSeconds, collapseKey: opts.collapseKey }))
+      Promise.resolve(fcmClient.send({ token: current.token, data, priority: opts.priority, ttlSeconds: opts.ttlSeconds, collapseKey: opts.collapseKey }))
         .then((result) => {
           if (result.status >= 200 && result.status < 300) {
             fcmCounters.sent += 1
@@ -355,7 +359,7 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, fcmClient
           }
           failed(result.reason || (result.status === 0 ? 'transport' : String(result.status)))
           if (isDeadFcmToken(result)) {
-            if (pruneFcmToken(db, device.id, device.fcm_token)) {
+            if (pruneFcmToken(db, device.id, current.token)) {
               fcmCounters.pruned += 1
               console.error(`fcm: device ${device.id} token rejected (${result.status}${result.reason ? ' ' + result.reason : ''}) — token pruned until the app registers again`)
             }
@@ -514,6 +518,11 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, fcmClient
         // notifications off the shade and updates the badge. It shows
         // nothing, so it is sent whatever the notification settings say.
         if (fcmClient && device.fcm_token) {
+          // A routine alert still waiting in this conversation's coalescing
+          // window is about an event the read covers (events arrive in seq
+          // order): it must not land after the read and bring it back.
+          const pending = coalesceState.get(`${device.id}:fcm:${event.convo_id}`)
+          if (pending) pending.pendingBuild = null
           sendFcm(device, userId, {
             build: () => ({ type: 'read', convo_id: event.convo_id }),
             priority: 'normal',
