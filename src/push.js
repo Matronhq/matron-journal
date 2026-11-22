@@ -513,16 +513,17 @@ export function makePushPipeline({ db, hub, apnsClient, webPushClient, fcmClient
 
     if (event.type === 'read_marker') {
       for (const device of devices) {
+        // A routine alert still waiting in this conversation's coalescing
+        // window is about an event the read covers (events arrive in seq
+        // order): it must not land after the read and bring it back, on the
+        // device that read as much as on the others.
+        const pending = coalesceState.get(`${device.id}:fcm:${event.convo_id}`)
+        if (pending) pending.pendingBuild = null
         if (device.id === originDeviceId) continue // never push a device its own read_marker
         // An Android phone: a quiet message that takes the conversation's
         // notifications off the shade and updates the badge. It shows
         // nothing, so it is sent whatever the notification settings say.
         if (fcmClient && device.fcm_token) {
-          // A routine alert still waiting in this conversation's coalescing
-          // window is about an event the read covers (events arrive in seq
-          // order): it must not land after the read and bring it back.
-          const pending = coalesceState.get(`${device.id}:fcm:${event.convo_id}`)
-          if (pending) pending.pendingBuild = null
           sendFcm(device, userId, {
             build: () => ({ type: 'read', convo_id: event.convo_id }),
             priority: 'normal',

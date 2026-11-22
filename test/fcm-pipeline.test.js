@@ -162,6 +162,16 @@ test('a read elsewhere drops a routine alert still waiting in that conversation'
   assert.deepEqual(s.sends.map((x) => x.data.type), ['alert', 'read'])
 })
 
+test('a read on the phone itself drops its own waiting alert too', async (t) => {
+  const s = await setup(t, { coalesceMs: 30 })
+  s.send({ type: 'text', payload: { body: 'one' } })
+  const r = s.send({ type: 'text', payload: { body: 'two' } })
+  await tick()
+  s.send({ type: 'read_marker', payload: { convo_id: 'c1', up_to_seq: r.seq }, sender: 'user:alice', origin: s.phone.deviceId })
+  await until(() => s.pipeline._coalesceState.size === 0)
+  assert.deepEqual(s.sends.map((x) => x.data.type), ['alert'])
+})
+
 test('404 UNREGISTERED prunes the token; other failures keep it', async (t) => {
   const s = await setup(t, {
     answer: (_o, n) => (n === 1 ? { status: 400, reason: 'SENDER_ID_MISMATCH' } : { status: 404, reason: 'UNREGISTERED' }),
