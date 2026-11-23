@@ -3284,7 +3284,7 @@ memories are stored and shown in the apps only.
   device's privacy flag **snapshotted at save time** (a revoked device, or
   a new device reusing its id, never changes who may read the memory).
   `created_by` / `updated_by` are `user` or `agent`.
-- At most **200 memories per user**.
+- At most **400 memories per user**.
 
 ### Routes (Bearer, either device kind)
 
