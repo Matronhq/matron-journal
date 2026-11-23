@@ -1,6 +1,7 @@
 // Memory proposals (src/memory-proposals.js, src/memory-proposals-http.js):
 // which agent writes apply at once, which wait for the user, and what the
 // user's answer does.
+import { MEMORIES_MAX } from '../src/memories.js'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { startTestServer } from './helpers.js'
@@ -555,7 +556,7 @@ test('a proposal with no conversation lives on the Coordinator conversation; the
   assert.equal((await memory(s, client, 'loose')).json.memory.origin_convo_id, null)
   assert.deepEqual(outcomes(s), []) // no conversation to tell
   const ins = s.db.prepare(`INSERT INTO memories(id, user_id, name, type, description, created_by, updated_by, created_at, updated_at) VALUES(?,?,?,'feedback','x','user','user',1,1)`)
-  for (let i = 0; i < 199; i++) ins.run(`me_fill${i}`, alice.id, `fill-${i}`)
+  for (let i = 0; i < MEMORIES_MAX - 1; i++) ins.run(`me_fill${i}`, alice.id, `fill-${i}`)
   assert.equal((await put(s, a.token, 'one-too-many', { convo_id: 'c1' })).status, 409)
   assert.equal((await put(s, a.token, 'fill-1', { convo_id: 'c1' })).status, 202) // an update is never refused
 })
