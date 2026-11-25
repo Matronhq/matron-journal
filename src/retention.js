@@ -650,7 +650,15 @@ export function* reapMediaPass(db, { quotaBytes, highPct = 90, lowPct = 70, orph
     let used = user.bytes
     for (const copy of kept.all(user.userId)) {
       if (used <= target) break
-      if (!forget.run(copy.id, copy.disk_path).changes) continue
+      if (!forget.run(copy.id, copy.disk_path).changes) {
+        // Gone or forgotten by someone else while this pass yielded (the
+        // replica purge): it no longer counts, so it must not keep `used`
+        // high and push the reap into the user's own blobs. A copy that was
+        // pulled again to a new path still counts.
+        const now = db.prepare('SELECT disk_path FROM fed_media WHERE id=?').get(copy.id)
+        if (!now || now.disk_path == null) used -= copy.size
+        continue
+      }
       try {
         fs.unlinkSync(copy.disk_path)
       } catch (err) {
@@ -718,6 +726,9 @@ export function* reapMediaPass(db, { quotaBytes, highPct = 90, lowPct = 70, orph
         continue
       }
       index ??= commentsByBlob(db, user.userId)
+      // A comment whose attachments do not parse names it: keep the blob,
+      // and its readable holders keep their references too.
+      if (index.unreadable(cand.blobRef)) continue
       db.transaction(() => {
         // A voice note the journal transcribed keeps its words (stamped, so
         // said.js can still vouch for them; it takes audio only); everything

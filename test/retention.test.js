@@ -1790,3 +1790,48 @@ test('commentsByBlob indexes each comment once per blob it names and reports unr
   assert.equal(index.unreadable('blob-c'), true)
   assert.equal(index.unreadable('blob-a'), false)
 })
+
+test('a kept copy purged while the pass yields no longer counts, so the owner\'s own blobs stay', async () => {
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  // Two kept copies (300 each) and one own attachment (300): 900 used.
+  // Quota 1000, high 50% (500), low 40% (400): dropping both copies is enough.
+  const keep = (id, at) => {
+    const file = path.join(mediaDir, `${id}.bin`)
+    fs.writeFileSync(file, Buffer.alloc(300, 7))
+    db.prepare('INSERT INTO fed_media(id, fg_id, user_id, ref, mime, size, sha256, disk_path, fetched_at, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
+      .run(id, 'fg1', alice.id, id, 'image/png', 300, '0'.repeat(64), file, at, at)
+    return file
+  }
+  keep('copy-x', 1)
+  const y = keep('copy-y', 2)
+  const own = seedAttachment(db, mediaDir, { userId: alice.id, bytes: 300, daysAgo: 30 })
+  const gen = reapMediaPass(db, { quotaBytes: 1000, highPct: 50, lowPct: 40, sliceSize: 1 })
+  assert.equal(gen.next().done, false, 'yields after dropping copy-x')
+  // Meanwhile the replica purge removes copy-y (an inactive share).
+  db.prepare('DELETE FROM fed_media WHERE id=?').run('copy-y')
+  fs.unlinkSync(y)
+  const r = drainSync(gen)
+  assert.equal(r.reaped, 1, 'only copy-x was this pass\'s doing')
+  assert.ok(getBlob(db, own.blob.id), 'usage is 300 now: the owner\'s attachment must stay')
+})
+
+test('a blob that an unreadable comment names is never deleted, and its readable holders keep their references', async () => {
+  const { db, alice } = await setup()
+  const mediaDir = tmpMediaDir()
+  upsertConversation(db, { id: 'c1', ownerUserId: alice.id, title: 'T' })
+  const it = createItem(db, { userId: alice.id, kind: 'task', title: 'T', originConvoId: 'c1', originDeviceId: 1, createdBy: 'agent' }).item
+  const a = seedAttachment(db, mediaDir, { userId: alice.id, bytes: 600, daysAgo: 30 })
+  const ok = addComment(db, { userId: alice.id, itemId: it.id, author: 'user', deviceId: 1, body: '', attachments: [{ blob_ref: a.blob.id, mime: 'application/pdf', name: 'a.pdf', size: 600 }] }).comment
+  const bad = addComment(db, { userId: alice.id, itemId: it.id, author: 'user', deviceId: 1, body: '', attachments: [{ blob_ref: a.blob.id, mime: 'application/pdf', name: 'a.pdf', size: 600 }] }).comment
+  db.prepare('UPDATE item_comments SET attachments=? WHERE id=?').run(`[{"blob_ref":"${a.blob.id}", broken`, bad.id)
+  // The candidate queries read every comment with json_each, so today a
+  // malformed row stops the pass before anything is deleted; the
+  // unreadable() guard in the delete loop keeps it safe if that changes.
+  let r
+  try { r = runReapMedia(db, { quotaBytes: 1000, highPct: 50, lowPct: 10 }) } catch (err) { assert.match(String(err), /malformed JSON/) }
+  if (r) assert.equal(r.reaped, 0)
+  assert.ok(getBlob(db, a.blob.id))
+  assert.ok(fs.existsSync(a.blob.diskPath))
+  assert.equal(JSON.parse(db.prepare('SELECT attachments FROM item_comments WHERE id=?').get(ok.id).attachments)[0].expired, undefined)
+})
